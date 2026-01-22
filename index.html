@@ -1,0 +1,127 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>The Next Step</title>
+  <link rel="stylesheet" href="styles.css">
+
+  <!-- Preload key images -->
+  <link rel="preload" as="image" href="gallery/cover.png">
+  <link rel="preload" as="image" href="gallery/letter.png">
+  <link rel="preload" as="image" href="gallery/wall.png">
+  <link rel="preload" as="image" href="gallery/back.png">
+  <link rel="preload" as="image" href="gallery/icons/ppage.png">
+  <link rel="preload" as="image" href="gallery/icons/npage.png">
+  <link rel="preload" as="image" href="gallery/icons/cleft.png">
+  <link rel="preload" as="image" href="gallery/icons/cright.png">
+  <link rel="preload" as="image" href="gallery/icons/volon.png">
+  <link rel="preload" as="image" href="gallery/icons/voloff.png">
+  <link rel="preload" as="image" href="gallery/icons/showmessageicon.png">
+
+  <!-- Preload sounds -->
+  <link rel="preload" as="audio" href="gallery/sounds/glissando.mp3">
+  <link rel="preload" as="audio" href="gallery/sounds/flip1.mp3">
+  <link rel="preload" as="audio" href="gallery/sounds/flip2.mp3">
+  <link rel="preload" as="audio" href="gallery/sounds/flip3.mp3">
+  <link rel="preload" as="audio" href="gallery/sounds/flip4.mp3">
+  <link rel="preload" as="audio" href="gallery/sounds/flip5.mp3">
+  <link rel="preload" as="audio" href="gallery/sounds/flip6.mp3">
+  <link rel="preload" as="audio" href="gallery/sounds/flip7.mp3">
+  <link rel="preload" as="audio" href="gallery/sounds/flip8.mp3">
+  <link rel="preload" as="audio" href="gallery/sounds/flip9.mp3">
+  <link rel="preload" as="audio" href="gallery/sounds/flip10.mp3">
+</head>
+
+<body>
+  <!-- Curtain intro -->
+  <div id="curtain-overlay">
+    <img id="curtain-left"  src="gallery/icons/cleft.png"  alt="">
+    <img id="curtain-right" src="gallery/icons/cright.png" alt="">
+    <button id="begin-button" type="button">Tap to Begin</button>
+  </div>
+
+  <!-- Slides container -->
+  <div id="slideshow">
+    <section class="slide active" id="slide-0">
+      <img src="gallery/cover.png" alt="Cover Page">
+    </section>
+    <section class="slide" id="slide-1">
+      <img src="gallery/letter.png" alt="Main Letter">
+    </section>
+    <section class="slide" id="slide-2">
+      <img src="gallery/wall.png" alt="Text Wall Background">
+      <button id="close-text" title="Close Text">&times;</button>
+      <div class="text-wall" style="display:none;">
+        <div class="text-wall-content"><!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0//EN" "http://www.w3.org/TR/REC-html40/strict.dtd">
+<html><head><meta name="qrichtext" content="1" /><meta charset="utf-8" /><style type="text/css">
+p, li { white-space: pre-wrap; }
+hr { height: 1px; border-width: 0; }
+li.unchecked::marker { content: "\2610"; }
+li.checked::marker { content: "\2612"; }
+</style></head><body style=" font-family:'Segoe UI'; font-size:11px; font-weight:400; font-style:normal;">
+<p align="center" style="-qt-paragraph-type:empty; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:138%;"><br /></p>
+<p align="center" style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:138%;"><span style=" font-family:'Parchment'; font-size:60pt;">Dear Cassandra Mendoza,</span></p>
+<p align="center" style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:138%;"><span style=" font-family:'Comic Sans MS','sans-serif'; font-size:12pt; color:#00ffff; background-color:transparent;">Sorry this took so long. </span></p>
+<p align="center" style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:138%;"><span style=" font-family:'Comic Sans MS','sans-serif'; font-size:12pt; color:#00ffff; background-color:transparent;">Finals and a pile of school projects pushed this back, and then the holidays got busy with travel. But after our e-date, I really wanted to follow through and write you this letter to encourage you.</span></p>
+<p align="center" style="-qt-paragraph-type:empty; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:138%; font-family:'Comic Sans MS','sans-serif'; font-size:12pt; color:#00ffff;"><br /></p>
+<p align="center" style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:138%;"><span style=" font-family:'Comic Sans MS','sans-serif'; font-size:15pt; color:#ffffff; background-color:transparent;">Galatians 6:9</span><span style=" font-family:'Comic Sans MS','sans-serif'; font-size:12pt; color:#ffffff; background-color:transparent;"><br /></span><span style=" font-family:'Comic Sans MS','sans-serif'; font-size:12pt; color:#82fffb; background-color:transparent;">“Let us not become weary in doing good, for at the proper time we will reap a harvest if we do not give up.”</span></p>
+<p style="-qt-paragraph-type:empty; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; font-family:'Comic Sans MS','sans-serif'; font-size:12pt; font-style:italic; color:#7df9ff;"><br /></p>
+<p style="-qt-paragraph-type:empty; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><br /></p>
+<p align="center" style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:138%;"><span style=" font-family:'Comic Sans MS','sans-serif'; font-size:12pt; color:#00ffff; background-color:transparent;">One of the most memorable things you shared with me was that your parents and family don’t really approve of your faith. I can’t even count how many times I’ve seen sisters make it all the way through the studies, sometimes even get baptized, and then fall away almost immediately because of family pressure. Because of that, I genuinely think it’s awesome that you had strong enough faith to keep going anyway. That takes courage, conviction, and real trust in God.</span></p>
+<p align="center" style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:138%;"><span style=" font-family:'Comic Sans MS','sans-serif'; font-size:12pt; color:#00ffff; background-color:transparent;">I also want to remind you that when you watch your life and your doctrine closely, God can use that faithfulness to make a powerful impact on the people around you—including your family, even if it doesn’t feel like it right now.</span></p>
+<p style="-qt-paragraph-type:empty; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; font-family:'Comic Sans MS','sans-serif'; font-size:12pt; color:#00ffff;"><br /></p>
+<p style="-qt-paragraph-type:empty; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><br /></p>
+<p align="center" style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:138%;"><span style=" font-family:'Comic Sans MS','sans-serif'; font-size:12pt; color:#00ffff; background-color:transparent;">One last encouragement: during difficult seasons, it’s incredibly important to have people you can lean on. I’d really urge you to go after building close friendships in the Kingdom—relationships where you can be honest, supported, and strengthened. The good news is that you’re a very friendly person, so this is something you’ll do well in naturally.</span></p>
+<p align="center" style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:138%;"><span style=" font-family:'Comic Sans MS','sans-serif'; font-size:12pt; color:#00ffff; background-color:transparent;">I hope this encourages you. Don’t give up—God sees your faithfulness.</span></p>
+<p align="center" style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:138%;"><span style=" font-family:'Comic Sans MS','sans-serif'; font-size:12pt; color:#00ffff; background-color:transparent;">— Tola</span></p>
+<p align="center" style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><br /></p></body></html></div>
+      </div>
+    </section>
+    <section class="slide" id="slide-3">
+      <img src="gallery/back.png" alt="Final Backdrop">
+    </section>
+
+    <!-- Navigation -->
+    <button id="prev" type="button" title="Previous page">
+      <img src="gallery/icons/ppage.png" alt="">
+    </button>
+    <button id="next" type="button" title="Next page">
+      <img src="gallery/icons/npage.png" alt="">
+    </button>
+    <div id="progress">Page 1 of 4</div>
+
+    <!-- Show message (reopen) icon -->
+    <img
+      id="open-text"
+      src="gallery/icons/showmessageicon.png"
+      alt="Show Message"
+      style="display:none;"
+    />
+  </div>
+
+  <!-- Volume control (slider injected by JS) -->
+  <div id="volume-control">
+    <img id="volume-icon" src="gallery/icons/volon.png" alt="Volume">
+    <!-- slider injected at runtime -->
+  </div>
+
+  <!-- Background music (hard-wired; no <audio id="bg-music" autoplay loop><source src="gallery/sounds/archive/processed/Sanctuary.mp3" type="audio/mpeg">Your browser does not support the audio tag.</audio> needed) -->
+  <audio
+    id="bg-music"
+    src="gallery/sounds/music.mp3"
+    preload="auto"
+    loop
+    playsinline
+  ></audio>
+
+  <!-- Injected constant (0–100 int, at build time) -->
+  <script>
+    const INITIAL_VOLUME = 0.170;
+  </script>
+
+  <!-- App script -->
+  <script src="script.js"></script>
+</body>
+</html>

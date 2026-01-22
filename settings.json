@@ -1,0 +1,38 @@
+{
+  "exclude_dirs": [
+    ".venv",
+    ".vs",
+    "__pycache__",
+    "converted64"
+  ],
+  "exclude_exts": [
+    ".py",
+    ".html",
+    ".css"
+  ],
+  "flip_count": 10,
+  "flip_prefix": "flip",
+  "gallery_dir": "gallery",
+  "gliss_file": "glissando.mp3",
+  "icons_dir": "icons",
+  "last_audio": "music.mp3",
+  "last_sealed_path": "A:/A Letter to Rayna Scott.zip",
+  "max_audio_mb": 15,
+  "message_html_file": "message.html",
+  "message_image_file": "message.png",
+  "music_file": "music.mp3",
+  "music_volume": 17,
+  "output_dir": "converted64",
+  "recipient_name": "Cassandra Mendoza",
+  "recipient_title": "The Next Step",
+  "required_slides": [
+    "cover.png",
+    "letter.png",
+    "wall.png",
+    "back.png"
+  ],
+  "sound_gif": "sound.gif",
+  "sounds_dir": "sounds",
+  "starting_volume": 17,
+  "verbose": false
+}

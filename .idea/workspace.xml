@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="a60edd6c-db41-4be3-bf6f-7b9e47373a70" name="Changes" comment="" />
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="FileTemplateManagerImpl">
+    <option name="RECENT_TEMPLATES">
+      <list>
+        <option value="HTML File" />
+        <option value="Python Script" />
+      </list>
+    </option>
+  </component>
+  <component name="Git.Settings">
+    <option name="PUSH_AUTO_UPDATE" value="true" />
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;TheTola&quot;
+  }
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/TheTola/SmithLetter.git&quot;,
+    &quot;accountId&quot;: &quot;b9f9a48b-e717-4dcd-8a8d-9723b8dd031b&quot;
+  }
+}</component>
+  <component name="HighlightingSettingsPerFile">
+    <setting file="file://$PROJECT_DIR$/.venv/Lib/site-packages/cooker/__init__.py" root0="SKIP_INSPECTION" />
+    <setting file="file://$PROJECT_DIR$/PromptWriterPanel.py" root0="FORCE_HIGHLIGHTING" />
+  </component>
+  <component name="ProblemsViewState">
+    <option name="selectedTabId" value="ProjectErrors" />
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 2
+}</component>
+  <component name="ProjectId" id="2x4VHoFKfpdhSy0SCaVbKAjg8nQ" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "JavaScript Debug.index.html.executor": "Run",
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "Python.Cyber_Interface.executor": "Run",
+    "Python.Editor.executor": "Run",
+    "Python.Forge_Tab.executor": "Run",
+    "Python.Gen1.executor": "Run",
+    "Python.Generate.executor": "Run",
+    "Python.Image_tab.executor": "Run",
+    "Python.Interface.executor": "Run",
+    "Python.Main - Copy.executor": "Run",
+    "Python.Main.executor": "Run",
+    "Python.Nexus.executor": "Run",
+    "Python.Over_Nexus.executor": "Run",
+    "Python.PromptWriterPanel.executor": "Run",
+    "Python.Template.executor": "Run",
+    "Python.Transmuter.executor": "Run",
+    "Python.__init__.executor": "Run",
+    "Python.audio_visualizer.executor": "Run",
+    "Python.chan.executor": "Run",
+    "Python.command.executor": "Run",
+    "Python.convert64.executor": "Run",
+    "Python.el_Gen.py.executor": "Run",
+    "Python.gui.executor": "Run",
+    "Python.image_tab.executor": "Run",
+    "Python.main.executor": "Run",
+    "Python.message_tab.executor": "Run",
+    "Python.one-time-use.executor": "Run",
+    "Python.packaging.executor": "Run",
+    "Python.prompter.executor": "Run",
+    "Python.prompter_panel.executor": "Run",
+    "Python.safezone.executor": "Run",
+    "Python.seer.executor": "Run",
+    "Python.sound_preview.executor": "Run",
+    "Python.sound_tab.executor": "Run",
+    "Python.target.executor": "Run",
+    "Python.titlebar.executor": "Run",
+    "Python.visualizer_demo.executor": "Run",
+    "Python.wireframe.executor": "Run",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "deletionFromPopupRequiresConfirmation": "false",
+    "git-widget-placeholder": "master",
+    "junie.onboarding.icon.badge.shown": "true",
+    "last_opened_file_path": "C:/Users/Oluwatola Ayedun/Desktop/SmithLetter",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "run.code.analysis.last.selected.profile": "aDefault",
+    "settings.editor.selected.configurable": "project.propVCSSupport.DirectoryMappings",
+    "to.speed.mode.migration.done": "true",
+    "vue.rearranger.settings.migration": "true"
+  }
+}]]></component>
+  <component name="RecentsManager">
+    <key name="CopyFile.RECENT_KEYS">
+      <recent name="C:\Users\Oluwatola Ayedun\Desktop\SmithLetter" />
+    </key>
+  </component>
+  <component name="SharedIndexes">
+    <attachedChunks>
+      <set>
+        <option value="bundled-python-sdk-41e8cd69c857-64d779b69b7a-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-251.26927.90" />
+      </set>
+    </attachedChunks>
+  </component>
+  <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="a60edd6c-db41-4be3-bf6f-7b9e47373a70" name="Changes" comment="" />
+      <created>1747197247626</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1747197247626</updated>
+      <workItem from="1747197248678" duration="3764000" />
+      <workItem from="1747204552882" duration="2275000" />
+      <workItem from="1747255694280" duration="3402000" />
+      <workItem from="1747351267440" duration="18309000" />
+      <workItem from="1747403824945" duration="5499000" />
+      <workItem from="1747442386757" duration="4921000" />
+      <workItem from="1748216010611" duration="4738000" />
+      <workItem from="1748284384671" duration="3399000" />
+      <workItem from="1748651479809" duration="10697000" />
+      <workItem from="1748810125910" duration="2151000" />
+      <workItem from="1748879494173" duration="9562000" />
+      <workItem from="1748894297937" duration="27121000" />
+      <workItem from="1749333489887" duration="9649000" />
+      <workItem from="1749355965282" duration="10203000" />
+      <workItem from="1749428591410" duration="12541000" />
+      <workItem from="1750729106634" duration="15347000" />
+      <workItem from="1750775564045" duration="30643000" />
+      <workItem from="1750919165718" duration="17408000" />
+      <workItem from="1751087414122" duration="30000" />
+      <workItem from="1751087487146" duration="595000" />
+      <workItem from="1751088850465" duration="66000" />
+      <workItem from="1751089091786" duration="6331000" />
+      <workItem from="1751125388065" duration="541000" />
+      <workItem from="1751125941683" duration="7961000" />
+      <workItem from="1751143799822" duration="4420000" />
+      <workItem from="1751238892338" duration="49000" />
+      <workItem from="1751238951480" duration="11710000" />
+      <workItem from="1751258551487" duration="11044000" />
+      <workItem from="1751302711283" duration="4287000" />
+      <workItem from="1751307968885" duration="3217000" />
+      <workItem from="1751351636830" duration="3022000" />
+      <workItem from="1751394955402" duration="3433000" />
+      <workItem from="1751433519770" duration="889000" />
+      <workItem from="1751434418164" duration="264000" />
+      <workItem from="1753653519150" duration="1060000" />
+      <workItem from="1753660454904" duration="2285000" />
+      <workItem from="1753668344866" duration="936000" />
+      <workItem from="1753670801088" duration="804000" />
+      <workItem from="1753672217320" duration="8148000" />
+      <workItem from="1753680986434" duration="1000" />
+      <workItem from="1753681006460" duration="2214000" />
+      <workItem from="1753886837873" duration="10492000" />
+      <workItem from="1754019173845" duration="619000" />
+      <workItem from="1754527819690" duration="559000" />
+      <workItem from="1754528395343" duration="9535000" />
+      <workItem from="1754933530272" duration="19000" />
+    </task>
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <ignored-roots>
+      <path value="$PROJECT_DIR$" />
+      <path value="$PROJECT_DIR$/hide" />
+    </ignored-roots>
+  </component>
+  <component name="com.intellij.coverage.CoverageDataManagerImpl">
+    <SUITE FILE_PATH="coverage/Nexus_py$Main.coverage" NAME="Main Coverage Results" MODIFIED="1750751594868" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/image_tab_py$gui.coverage" NAME="gui Coverage Results" MODIFIED="1748317673988" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/../Time Killer" />
+    <SUITE FILE_PATH="coverage/Image_tab_py$packaging.coverage" NAME="packaging Coverage Results" MODIFIED="1753894026807" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Forge_Tab_py$Main.coverage" NAME="Main Coverage Results" MODIFIED="1754544980604" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Editor_py$Forge_Tab.coverage" NAME="Forge_Tab Coverage Results" MODIFIED="1751256804819" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Main_py$image_tab.coverage" NAME="image_tab Coverage Results" MODIFIED="1749338995943" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Forge_Tab_py$convert64.coverage" NAME="convert64 Coverage Results" MODIFIED="1751126051956" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Editor_py$Transmuter.coverage" NAME="Transmuter Coverage Results" MODIFIED="1750799711932" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Nexus_py$Template.coverage" NAME="Template Coverage Results" MODIFIED="1750749325721" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/SmithLetter$Main.coverage" NAME="Main Coverage Results" MODIFIED="1747201801283" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Editor_py$Generate.coverage" NAME="Generate Coverage Results" MODIFIED="1751242772689" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Main_py$Main___Copy.coverage" NAME="Main - Copy Coverage Results" MODIFIED="1750952919354" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/SmithLetter$Nexus.coverage" NAME="Nexus Coverage Results" MODIFIED="1747203802102" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Main_py$Editor.coverage" NAME="Editor Coverage Results" MODIFIED="1750949472496" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Editor_py$Main.coverage" NAME="Main Coverage Results" MODIFIED="1751258261066" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Image_tab_py$Main.coverage" NAME="Main Coverage Results" MODIFIED="1753897321803" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Main_py$Main.coverage" NAME="Main Coverage Results" MODIFIED="1754527821556" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Main_py$one_time_use.coverage" NAME="one-time-use Coverage Results" MODIFIED="1750953186057" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Nexus_py$Nexus.coverage" NAME="Nexus Coverage Results" MODIFIED="1747256895691" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Main_py$Nexus.coverage" NAME="Nexus Coverage Results" MODIFIED="1751260276734" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Main_py$el_Gen_py.coverage" NAME="el_Gen.py Coverage Results" MODIFIED="1747405529058" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Main_py$main.coverage" NAME="main Coverage Results" MODIFIED="1748879506916" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/../PythonProject" />
+    <SUITE FILE_PATH="coverage/Main_py$message_tab.coverage" NAME="message_tab Coverage Results" MODIFIED="1749343927660" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Main_py$Forge_Tab.coverage" NAME="Forge_Tab Coverage Results" MODIFIED="1747377368565" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Image_tab_py$command.coverage" NAME="command Coverage Results" MODIFIED="1753676155267" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/image_tab_py$main.coverage" NAME="main Coverage Results" MODIFIED="1748317666525" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/../Time Killer" />
+    <SUITE FILE_PATH="coverage/image_tab_py$Main.coverage" NAME="Main Coverage Results" MODIFIED="1748317755958" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Forge_Tab_py$target.coverage" NAME="target Coverage Results" MODIFIED="1751128039783" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Nexus_py$message_tab.coverage" NAME="message_tab Coverage Results" MODIFIED="1747258659480" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Editor_py$Template.coverage" NAME="Template Coverage Results" MODIFIED="1750790080063" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Image_tab_py$target.coverage" NAME="target Coverage Results" MODIFIED="1753680156836" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+  </component>
+</project>

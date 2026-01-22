@@ -1,0 +1,82 @@
+
+/* Global */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; background: #111; overflow: hidden; font-family: Inter, Segoe UI, Roboto, Arial, sans-serif; }
+
+/* Slideshow container */
+#slideshow { position: relative; width: 100%; height: 100%; perspective: 2000px; }
+
+/* Curtain overlay */
+#curtain-overlay { position: absolute; inset: 0; z-index: 9999; cursor: pointer; overflow: hidden; pointer-events: all; }
+#curtain-left, #curtain-right { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; z-index: 99999; pointer-events: none; }
+#begin-button {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  font-size: 42px; color: #fff; background: rgba(0,0,0,0.6);
+  padding: 16px 32px; border: 2px solid #00ffff; border-radius: 10px; cursor: pointer;
+  animation: pulse 2s infinite; z-index: 100001;
+}
+#begin-button:hover { background: rgba(0,0,0,0.8); border-color: #00ffff; }
+@keyframes pulse { 0%,100% { opacity: 0.6; transform: translate(-50%, -50%) scale(1); } 50% { opacity: 1; transform: translate(-50%, -50%) scale(1.05); } }
+
+/* Slides */
+.slide { display: none; position: absolute; inset: 0; transform-origin: left center; backface-visibility: hidden; transform-style: preserve-3d; }
+.slide.active { display: block; }
+.slide img {
+  max-width: 100%; max-height: 100%; position: absolute; inset: 0; margin: auto; object-fit: contain;
+  box-shadow: inset 0 0 40px rgba(0,0,0,.15), 0 0 30px rgba(0,0,0,.25);
+}
+
+/* Text wall */
+.text-wall {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  width: 80%; max-height: 80%; overflow-y: auto; background: rgba(0,0,0,0.5);
+  padding: 1rem; color: #fff; line-height: 1.55; border-radius: 10px; z-index: 105;
+}
+#close-text {
+  position: absolute; top: 40px; right: 40px;
+  background: rgba(255,255,255,0.2); border: none; color: #fff; font-size: 24px;
+  width: 32px; height: 32px; border-radius: 16px; cursor: pointer; display: none; z-index: 106;
+}
+#close-text:hover { background: rgba(255,255,255,0.4); }
+
+/* Nav arrows */
+#prev,#next { position: absolute; background: none; border: none; padding: 0; cursor: pointer; z-index: 100; }
+#prev { left: 50px; top: 50%; transform: translateY(-50%); }
+#next { right: 50px; top: 50%; transform: translateY(-50%); }
+#prev img,#next img { width: 120px; height: 120px; }
+
+/* Progress */
+#progress {
+  position: absolute; bottom: 20px; right: 20px;
+  background: rgba(0,0,0,0.5); color: #fff; padding: .3em .6em; border-radius: 6px;
+  font-weight: 600; letter-spacing: .2px;
+}
+
+/* Show-message icon (reopen only) */
+#open-text { position: absolute; bottom: 20px; left: 20px; width: 64px; height: 64px; cursor: pointer; z-index: 100; transition: transform .15s; display: none; }
+#open-text:hover { transform: scale(1.08); }
+
+/* Volume control */
+#volume-control { position: absolute; top: calc(50% + 20px); right: 50px; display: flex; align-items: center; gap: 10px; z-index: 99; }
+#volume-icon { width: 48px; height: 48px; cursor: pointer; }
+/* Slider (will be injected) */
+#volume-slider {
+  width: 140px; -webkit-appearance: none; appearance: none; height: 4px; background: rgba(255,255,255,0.28);
+  border-radius: 2px; outline: none; display: none;
+}
+#volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 16px; height: 16px; background: #00ffff; border: 2px solid #fff; border-radius: 50%; cursor: pointer;
+}
+#volume-slider::-moz-range-thumb {
+  width: 16px; height: 16px; background: #00ffff; border: 2px solid #fff; border-radius: 50%; cursor: pointer;
+}
+
+/* Flip anims */
+@keyframes flipOut { 0% { transform: perspective(2000px) rotateY(0deg); opacity: 1; } 100% { transform: perspective(2000px) rotateY(90deg); opacity: 0; } }
+@keyframes flipIn  { 0% { transform: perspective(2000px) rotateY(-90deg); opacity: 0; } 100% { transform: perspective(2000px) rotateY(0); opacity: 1; } }
+.slide.flip-out { animation: flipOut .6s ease-in forwards; }
+.slide.flip-in  { animation: flipIn  .6s ease-in forwards; }
+
+/* Curtain slide anims */
+@keyframes slideLeft  { from { transform: translateX(0); } to { transform: translateX(-100vw); } }
+@keyframes slideRight { from { transform: translateX(0); } to { transform: translateX(100vw); } }
