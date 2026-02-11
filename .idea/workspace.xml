@@ -4,243 +4,8 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="a60edd6c-db41-4be3-bf6f-7b9e47373a70" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_1_22_2026_12_04_PM_[Changes]/shelved.patch" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/shelf/Uncommitted_changes_before_Update_at_1_22_2026_12_04_PM__Changes_.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Editor.py" beforeDir="false" afterPath="$PROJECT_DIR$/Editor.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Forge_Tab.py" beforeDir="false" afterPath="$PROJECT_DIR$/Forge_Tab.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Generate.py" beforeDir="false" afterPath="$PROJECT_DIR$/generate.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Image_tab.py" beforeDir="false" afterPath="$PROJECT_DIR$/Image_tab.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Letter Smith.spec" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/Main.py" beforeDir="false" afterPath="$PROJECT_DIR$/Main.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Message_tab.py" beforeDir="false" afterPath="$PROJECT_DIR$/Message_tab.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Nexus.py" beforeDir="false" afterPath="$PROJECT_DIR$/Nexus.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Over_Nexus.py" beforeDir="false" afterPath="$PROJECT_DIR$/Over_Nexus.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/PromptWriterPanel.py" beforeDir="false" afterPath="$PROJECT_DIR$/PromptWriterPanel.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Prompter/modules/color.txt" beforeDir="false" afterPath="$PROJECT_DIR$/Prompter/modules/color.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Prompter/modules/type.txt" beforeDir="false" afterPath="$PROJECT_DIR$/Prompter/modules/type.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Template.py" beforeDir="false" afterPath="$PROJECT_DIR$/Template.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Transmuter.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/anima.py" beforeDir="false" afterPath="$PROJECT_DIR$/anima.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/chan.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/command.py" beforeDir="false" afterPath="$PROJECT_DIR$/command.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/config.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/convert64.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/converted64/__init__.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/converted64/convert64.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/back.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/cover.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icon/cover.ico" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icon/pic.ico" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/Anvil.ico" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/GO.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/HHelp.gif" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/Help.gif" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/Help.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/LSmith.ico" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/LSmith.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/Pwrite.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/Sounds/Glissando.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/cleft.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/command.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/cperp.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/cright.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/npage.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/ppage.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/reticle.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/showmessageicon.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/voloff.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/volon.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/icons/wallB.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/letter.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/originals/AMAZING GRACE  - Viola.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/originals/Clair de Lune.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/originals/Hanezeve Caradhina (ft.Takeshi Saito)  Made in Abyss.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/originals/JVKE - lavender ft. Pink Sweat$.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/originals/Naruto Shippuden Madara Uchiha English Dub Voice Clip.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/originals/Number One - Bankai.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/originals/Sanctuary performed by Maraia Lastra.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/originals/Sanctuary.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/originals/Violet Snow.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/originals/What It Sounds Like Song Clip  KPop Demon Hunters  Netflix Family.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/processed/AMAZING GRACE  - Viola.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/processed/Clair de Lune.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/processed/Hanezeve Caradhina (ft.Takeshi Saito)  Made in Abyss.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/processed/JVKE - lavender ft. Pink Sweat$.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/processed/Number One - Bankai.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/processed/Sanctuary performed by Maraia Lastra.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/processed/Sanctuary.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/processed/Violet Snow.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Archive/processed/What It Sounds Like Song Clip  KPop Demon Hunters  Netflix Family.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Wave/audio_visualizer.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Wave/requirements.txt" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/Wave/visualizer_demo.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/current.json" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/flip1.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/flip10.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/flip2.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/flip3.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/flip4.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/flip5.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/flip6.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/flip7.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/flip8.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/flip9.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/glissando.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/glissando_smooth.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/sounds/music.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/gallery/wall.png" beforeDir="false" />
+    <list default="true" id="a60edd6c-db41-4be3-bf6f-7b9e47373a70" name="Changes" comment="asd">
       <change beforePath="$PROJECT_DIR$/hide" beforeDir="false" afterPath="$PROJECT_DIR$/hide" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/index.html" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/message.html" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/message.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/File/A Letter for Cassandra Mendoza.html" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/File/A Letter for Gisselle Rios.html" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/File/A Letter for Oluwatobi Ayedun.html" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/File/A Letter for Romesha Guiton.html" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/File/A Letter for Shani Francis.html" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/Temp/back.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/Temp/cover.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/Temp/letter.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/Temp/wall.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/back.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/cover.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icon/cover.ico" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/Anvil.ico" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/Curtain_Left.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/Curtain_Right.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/En_Courage.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/GO.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/Help.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/LSmith.ico" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/LSmith.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/Pwrite.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/Sounds/Glissando.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/cleft.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/command.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/cperp.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/cright.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/npage.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/ppage.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/reticle.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/showmessageicon.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/voloff.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/volon.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/icons/wallB.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/letter.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Archive/originals/AMAZING GRACE  - Viola.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Archive/originals/JVKE - lavender ft. Pink Sweat$.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Archive/originals/Naruto Shippuden Madara Uchiha English Dub Voice Clip.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Archive/originals/Number One - Bankai.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Archive/originals/Sanctuary performed by Maraia Lastra.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Archive/originals/Sanctuary.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Archive/originals/Violet Snow.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Archive/processed/AMAZING GRACE  - Viola.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Archive/processed/JVKE - lavender ft. Pink Sweat$.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Archive/processed/Number One - Bankai.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Archive/processed/Sanctuary performed by Maraia Lastra.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Archive/processed/Sanctuary.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Archive/processed/Violet Snow.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Wave/audio_visualizer.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Wave/requirements.txt" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/Wave/visualizer_demo.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/current.json" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/flip1.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/flip10.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/flip2.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/flip3.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/flip4.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/flip5.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/flip6.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/flip7.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/flip8.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/flip9.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/glissando.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/glissando_smooth.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/sounds/music.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/gallery/wall.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/index.html" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/script.js" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Romesha Guiton/styles.css" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/back.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/cover.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icon/cover.ico" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icon/pic.ico" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/Anvil.ico" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/GO.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/HHelp.gif" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/Help.gif" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/Help.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/LSmith.ico" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/LSmith.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/Pwrite.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/Sounds/Glissando.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/cleft.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/command.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/cperp.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/cright.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/npage.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/ppage.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/reticle.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/showmessageicon.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/voloff.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/volon.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/icons/wallB.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/letter.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/originals/AMAZING GRACE  - Viola.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/originals/Clair de Lune.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/originals/Hanezeve Caradhina (ft.Takeshi Saito)  Made in Abyss.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/originals/JVKE - lavender ft. Pink Sweat$.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/originals/Naruto Shippuden Madara Uchiha English Dub Voice Clip.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/originals/Number One - Bankai.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/originals/Sanctuary performed by Maraia Lastra.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/originals/Sanctuary.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/originals/Violet Snow.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/originals/What It Sounds Like Song Clip  KPop Demon Hunters  Netflix Family.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/processed/AMAZING GRACE  - Viola.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/processed/Clair de Lune.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/processed/Hanezeve Caradhina (ft.Takeshi Saito)  Made in Abyss.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/processed/JVKE - lavender ft. Pink Sweat$.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/processed/Number One - Bankai.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/processed/Sanctuary performed by Maraia Lastra.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/processed/Sanctuary.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/processed/Violet Snow.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Archive/processed/What It Sounds Like Song Clip  KPop Demon Hunters  Netflix Family.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Wave/audio_visualizer.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Wave/requirements.txt" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/Wave/visualizer_demo.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/current.json" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/flip1.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/flip10.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/flip2.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/flip3.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/flip4.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/flip5.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/flip6.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/flip7.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/flip8.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/flip9.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/glissando.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/glissando_smooth.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/sounds/music.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/gallery/wall.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/index.html" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/script.js" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Play/Letter for Shani Francis/styles.css" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Zip/Letter for Cassandra Mendoza.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Zip/Letter for Gisselle Rios.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Zip/Letter for Oluwatobi Ayedun.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Zip/Letter for Romesha Guiton.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output/Zip/Letter for Shani Francis.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/script.js" beforeDir="false" afterPath="$PROJECT_DIR$/script.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/settings.json" beforeDir="false" afterPath="$PROJECT_DIR$/settings.json" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/sound_archive.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/sound_preview.py" beforeDir="false" afterPath="$PROJECT_DIR$/sound_preview.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/sound_tab.py" beforeDir="false" afterPath="$PROJECT_DIR$/sound_tab.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/sound_tab_archive_patch.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/target.py" beforeDir="false" afterPath="$PROJECT_DIR$/target.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/titlebar.py" beforeDir="false" afterPath="$PROJECT_DIR$/titlebar.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -257,6 +22,12 @@
   </component>
   <component name="Git.Settings">
     <option name="PUSH_AUTO_UPDATE" value="true" />
+    <option name="PUSH_TAGS">
+      <GitPushTagMode>
+        <option name="argument" value="--tags" />
+        <option name="title" value="All" />
+      </GitPushTagMode>
+    </option>
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
   <component name="GitHubPullRequestSearchHistory">{
@@ -355,7 +126,7 @@
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
-        <option value="bundled-python-sdk-41e8cd69c857-64d779b69b7a-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-251.26927.90" />
+        <option value="bundled-python-sdk-1f1b7bcced7d-64d779b69b7a-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-251.29188.22" />
       </set>
     </attachedChunks>
   </component>
@@ -414,6 +185,23 @@
       <workItem from="1754528395343" duration="9535000" />
       <workItem from="1754933530272" duration="19000" />
     </task>
+    <task id="LOCAL-00001" summary="asd">
+      <option name="closed" value="true" />
+      <created>1770844378979</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1770844378979</updated>
+    </task>
+    <task id="LOCAL-00002" summary="asd">
+      <option name="closed" value="true" />
+      <created>1770844719536</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1770844719536</updated>
+    </task>
+    <option name="localTasksCounter" value="3" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -424,6 +212,8 @@
       <path value="$PROJECT_DIR$" />
       <path value="$PROJECT_DIR$/hide" />
     </ignored-roots>
+    <MESSAGE value="asd" />
+    <option name="LAST_COMMIT_MESSAGE" value="asd" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/Nexus_py$Main.coverage" NAME="Main Coverage Results" MODIFIED="1750751594868" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
