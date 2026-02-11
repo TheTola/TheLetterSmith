@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QGraphicsDropShadowEffect, QMenu
 from anima import ParticleBurst, AnimatedIconButton
 from target import on_select_folder  # action for the optional reticle
 
-RETICLE_ICON_REL_DEFAULT = os.path.join("gallery", "icons", "reticle.png")
+RETICLE_ICON_REL_DEFAULT = os.path.join("gallery", "app", "icons", "reticle.png")
 
 
 def _resolve_path(candidate: Optional[str], parent: Optional[QtWidgets.QWidget]) -> Optional[str]:

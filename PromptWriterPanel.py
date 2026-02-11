@@ -36,9 +36,125 @@ _FILE_CACHE: Dict[str, Tuple[List[str], Optional[Path]]] = {}
 
 PROMPTER_ROOT = Path(__file__).resolve().parent
 
+# =========================
+# COLOR SYSTEM (UI + Prompt Preview)
+# =========================
+
+# Selector label colors
+COL_TYPE    = "#ff3b30"  # RED    (Graphics & Illustration (type))
+COL_SUBJECT = "#ff2d55"  # PINK   (Subject)
+COL_SCHEME  = "#af52de"  # PURPLE (Color Scheme)
+
+# Per-image label colors
+COL_COVER   = "#0a84ff"  # BLUE
+COL_LETTER  = "#32ade6"  # CYAN
+COL_WALL    = "#30d158"  # BLUE-GREEN
+COL_BACK    = "#64d2ff"  # SKY BLUE
+
+# Checkbox checkmark color
+COL_CHECK   = "#00d0ff"  # BLUE
+
+# Map image prompt name -> color
+IMAGE_COLOR_MAP = {
+    "Cover Prompt": COL_COVER,
+    "Letter Prompt": COL_LETTER,
+    "Wall Prompt": COL_WALL,
+    "Back Prompt": COL_BACK,
+}
+
+def _html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def _span(text: str, color: str, bold: bool = False) -> str:
+    t = _html_escape(text)
+    if bold:
+        return f'<span style="color:{color}; font-weight:900;">{t}</span>'
+    return f'<span style="color:{color};">{t}</span>'
+
+def render_prompt_html(
+    *,
+    image_name: str,
+    subject: str,
+    type_choice: str | None,
+    scheme: str | None,
+    global_extra: str,
+    image_extra: str,
+    role_sentence: str,
+    baseline: str,
+    effort_line: str,
+    guidance_lines: list[str],
+    format_paragraph: str,
+) -> str:
+    """
+    OLD FORMAT (paragraph order + phrasing), but with colored VALUES.
+    No extra labels like 'Subject:' or 'Global ideas:'.
+    """
+    col_img = IMAGE_COLOR_MAP.get(image_name, COL_BACK)
+
+    parts: list[str] = []
+
+    # 1) First paragraph: role sentence + subject appended inline
+    first = role_sentence.strip()
+    if subject.strip():
+        first = (first + " " if first else "") + _span(subject.strip(), COL_SUBJECT, bold=True)
+    if first:
+        parts.append(first)
+
+    # 2) Baseline paragraph
+    if baseline.strip():
+        parts.append(_html_escape(baseline.strip()))
+
+    # 3) Color scheme line (old phrasing) with colored value
+    if scheme:
+        parts.append("The color scheme is " + _span(scheme, COL_SCHEME, bold=True) + ".")
+
+    # 4) Type/style line (old phrasing) with colored value
+    if type_choice:
+        parts.append("Create in a " + _span(type_choice, COL_TYPE, bold=True) + " design & illustration style.")
+
+    # 5) Global motifs line (old phrasing)
+    if global_extra.strip():
+        parts.append("Motifs to add: " + _span(global_extra.strip(), COL_SCHEME))
+
+    # 6) Per-image extras line (old phrasing)
+    if image_extra.strip():
+        parts.append("Additionally: " + _span(image_extra.strip(), col_img))
+
+    # 7) Effort line (old phrasing)
+    if effort_line.strip():
+        parts.append(_html_escape(f"When making this image, {effort_line.strip()}"))
+
+    # 8) Guidance block
+    if guidance_lines:
+        lines = [x.strip() for x in guidance_lines if x and x.strip()]
+        if lines:
+            g = "<br>".join(_html_escape(f"- {x}") for x in lines)
+            parts.append(_html_escape("Guidance:") + "<br>" + g)
+
+    # 9) Format paragraph
+    if format_paragraph.strip():
+        parts.append(_html_escape(format_paragraph.strip()))
+
+    return "<br><br>".join(p for p in parts if str(p).strip())
+
+
+CHECKBOX_QSS = f"""
+QCheckBox {{ color: #dcdce0; }}
+QCheckBox::indicator {{
+    width: 16px;
+    height: 16px;
+    border-radius: 3px;
+    border: 1px solid #2b2b31;
+    background: #0d0e11;
+}}
+QCheckBox::indicator:checked {{
+    background: {COL_CHECK};
+    border: 1px solid {COL_CHECK};
+}}
+"""
+
 # ---------------------------------------
 # Baseline descriptions per image role
-# (These are the one-sentence identities for each panel)
 # ---------------------------------------
 _IMAGE_BASELINES: Dict[str, str] = {
     "cover": "The Cover Page is a bold, decorative opening image that captures attention and sets the tone.",
@@ -48,10 +164,6 @@ _IMAGE_BASELINES: Dict[str, str] = {
 }
 
 def _baseline_for(image_name: str) -> str:
-    """
-    Resolve the per-image baseline sentence for any reasonable label:
-    accepts 'Cover Prompt', 'cover.png', 'cover', etc.
-    """
     key = image_name.strip().lower()
     if "cover" in key:
         return _IMAGE_BASELINES["cover"]
@@ -93,17 +205,10 @@ def _candidate_paths_for(name: str) -> List[Path]:
 
 
 def _read_list_file(name: str) -> Tuple[List[str], Optional[Path]]:
-    """
-    Try to read `name` from multiple likely locations.
-    Returns (lines, path_used_or_None). Lines are raw lines including blank ones.
-    Uses utf-8-sig to handle BOMs.
-    Normalizes line endings.
-    """
     for p in _candidate_paths_for(name):
         try:
             if p.exists() and p.is_file():
                 with p.open("r", encoding="utf-8-sig") as fh:
-                    # strip both \r and \n to handle CRLF
                     lines = [ln.rstrip("\r\n") for ln in fh.readlines()]
                     return lines, p
         except Exception:
@@ -112,7 +217,6 @@ def _read_list_file(name: str) -> Tuple[List[str], Optional[Path]]:
 
 
 def _read_list_file_cached(name: str) -> Tuple[List[str], Optional[Path]]:
-    # return cached result if present
     if name in _FILE_CACHE:
         return _FILE_CACHE[name]
     lines, path = _read_list_file(name)
@@ -121,7 +225,6 @@ def _read_list_file_cached(name: str) -> Tuple[List[str], Optional[Path]]:
 
 
 def _clean_choice_line(line: str) -> str:
-    """Strip bullet markers and surrounding whitespace."""
     s = line.strip()
     if not s:
         return ""
@@ -131,9 +234,6 @@ def _clean_choice_line(line: str) -> str:
 
 
 def _pick_random_nonempty_line(name: str) -> Tuple[Optional[str], Optional[Path]]:
-    """
-    Return a random non-empty cleaned line from the given file (if exists), else (None, None).
-    """
     lines, used_path = _read_list_file_cached(name)
     cleaned = [_clean_choice_line(l) for l in lines if l and l.strip()]
     if not cleaned:
@@ -142,16 +242,9 @@ def _pick_random_nonempty_line(name: str) -> Tuple[Optional[str], Optional[Path]
 
 
 def _pick_random_order(name: str) -> Tuple[Optional[List[str]], Optional[Path]]:
-    """
-    For order-like files: pick a random non-empty cleaned line and return as a list.
-    If the line contains separators (comma, |, ;), split into multiple fragments.
-    Otherwise treat the whole picked line as a single fragment (preserve multi-word phrases).
-    Returns (list_of_fragments or None, path)
-    """
     pick, used_path = _pick_random_nonempty_line(name)
     if not pick:
         return None, used_path
-    # split by common separators first
     if "," in pick:
         items = [t.strip() for t in pick.split(",") if t.strip()]
     elif "|" in pick:
@@ -159,22 +252,15 @@ def _pick_random_order(name: str) -> Tuple[Optional[List[str]], Optional[Path]]:
     elif ";" in pick:
         items = [t.strip() for t in pick.split(";") if t.strip()]
     else:
-        # Treat the entire line as one fragment (preserve multi-word fragment)
         items = [pick.strip()]
     return items or None, used_path
 
 
 def _random_combo_choice(combo: QtWidgets.QComboBox) -> Optional[str]:
-    """
-    Pick a random enabled, meaningful item from the combo and set it as current.
-    Ignores placeholders such as '— none —', '────────', and '(no color entries found)'.
-    Returns the chosen text or None if nothing suitable.
-    """
     valid = []
     for i in range(combo.count()):
         txt = combo.itemText(i).strip()
         item = combo.model().item(i)
-        # skip the placeholder/separators and disabled items
         if txt in ("— none —", "", "────────", "(no color entries found)"):
             continue
         if item is not None and not item.isEnabled():
@@ -188,7 +274,7 @@ def _random_combo_choice(combo: QtWidgets.QComboBox) -> Optional[str]:
 
 
 # ---------------------------
-# Build single-image prompt
+# Build single-image prompt (plain text, for copy/export)
 # ---------------------------
 
 def assemble_prompt_for_image(subject: str,
@@ -200,25 +286,8 @@ def assemble_prompt_for_image(subject: str,
                               guidance: Optional[List[str]] = None,
                               global_extra: Optional[str] = None,
                               image_extra: Optional[str] = None) -> Tuple[str, dict]:
-    """
-    Compose a prompt for a single image (cover/letter/wall/back).
-
-    Order of sections (each becomes its own paragraph):
-      1) Role + order + subject (single paragraph)
-      2) BASELINE (one-sentence identity for this image role)  <-- inserted right after #1
-      3) Color scheme (if any)
-      4) Type/style (if any)
-      5) Global motifs (if any)
-      6) Per-image extras (if any)
-      7) Effort line (quality standard)
-      8) Guidance bullets (if any)
-      9) Format paragraph (explicit size/quality rules)
-
-    Returns (final_prompt, debug_dict)
-    """
     paragraphs: List[str] = []
 
-    # Resolve normalized baseline for this image name
     baseline_text = _baseline_for(image_name)
 
     dbg = {
@@ -239,27 +308,23 @@ def assemble_prompt_for_image(subject: str,
     effort_line = data.get("effort", "")
     format_paragraph = data.get("format", "")
 
-    # role_text and sentence
     role_text = role.strip()
     if role_text and not role_text.endswith("."):
         role_text = role_text + "."
     role_sentence = f"You are {role_text}" if role_text else ""
 
-    # Build the leading fragment from order items (no trailing punctuation)
     order_core = ""
     if order:
         joined = ' '.join(item.strip().rstrip(' .') for item in order).strip()
         if joined:
             order_core = joined[0].upper() + joined[1:] if len(joined) > 0 else joined
 
-    # Build subject core (no trailing dot). Use lowercase so it reads like a natural continuation.
     subject_core = ""
     if subject:
         s = subject.strip().rstrip(' .')
         if s:
             subject_core = s.lower()
 
-    # Combine: order_core first, then subject_core as the ender (no terminal period).
     combined_fragment = ""
     if order_core and subject_core:
         combined_fragment = f"{order_core} {subject_core}"
@@ -268,7 +333,6 @@ def assemble_prompt_for_image(subject: str,
     elif subject_core:
         combined_fragment = subject_core
 
-    # 1) Role + combined fragment paragraph
     if role_sentence and combined_fragment:
         paragraphs.append(f"{role_sentence}  {combined_fragment}")
     elif role_sentence:
@@ -276,49 +340,45 @@ def assemble_prompt_for_image(subject: str,
     elif combined_fragment:
         paragraphs.append(combined_fragment)
 
-    # 2) BASELINE — insert immediately after the opening paragraph
-    # (If the opening paragraph didn't exist for some reason, we still append the baseline now.)
     if baseline_text:
         paragraphs.append(baseline_text)
 
-    # 3) Color & 4) Type as separate paragraph(s)
     if color_choice:
         paragraphs.append(f"The color scheme is {color_choice}.")
     if type_choice:
         paragraphs.append(f"Create in a {type_choice} design & illustration style.")
 
-    # 5) Global + 6) Image-specific extras
     if global_extra and global_extra.strip():
         paragraphs.append("Motifs to add: " + global_extra.strip())
 
     if image_extra and image_extra.strip():
         paragraphs.append(f"Additionally: " + image_extra.strip())
 
-    # 7) Quality standard (effort)
     if effort_line:
         paragraphs.append(f"When making this image, {effort_line.strip()}")
 
-    # 8) Guidance insertion (always insert if present, after effort)
     if guidance:
         lines = [g.strip() for g in guidance if g and g.strip()]
         if lines:
             guidance_block = "Guidance:\n" + "\n".join(f"- {line}" for line in lines)
             paragraphs.append(guidance_block)
 
-    # 9) Format paragraph (explicit)
     if format_paragraph:
         paragraphs.append(format_paragraph.strip())
 
-    # Final join with two newlines between logical blocks (clean paragraphs)
     final = "\n".join(p for p in paragraphs if p.strip()).replace("\n\n\n", "\n\n")
     return final, dbg
 
 
 # ---------------------------
-# Focusable editor so we can track which prompt the user clicked
+# Focusable rich editor for previews (HTML rendering)
 # ---------------------------
-class FocusablePlainTextEdit(QtWidgets.QPlainTextEdit):
+class FocusablePlainTextEdit(QtWidgets.QTextEdit):
     focused = QtCore.Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAcceptRichText(True)
 
     def focusInEvent(self, event):
         super().focusInEvent(event)
@@ -335,7 +395,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self.setObjectName("PromptWriterPanel")
-        # Keep frameless look but allow top-level window behavior (so we can maximize)
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
@@ -343,7 +402,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._drag_pos: Optional[QtCore.QPoint] = None
         self._is_maximized: bool = False
         self._normal_geometry: Optional[QtCore.QRect] = None
-        # Height (px) of the draggable header area — double-click here to maximize/restore
         self._header_draggable_height = 44
 
         # animation placeholders
@@ -366,7 +424,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "and focus. If any demands conflict, resolution fidelity, clarity, and cohesion take precedence."
         )
 
-        # Ultra effort: highest-level thinking + full verbosity
         ultra_effort = (
             "Operate at the absolute highest standard. Think at the highest creative and technical level, "
             "reason through composition, lighting, color, texture, and mood in exhaustive detail, and produce "
@@ -380,29 +437,17 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "format": default_format
         }
 
-        # names shown in the UI and used as keys
         self._images = ["Cover Prompt", "Letter Prompt", "Wall Prompt", "Back Prompt"]
 
-        # track color path used
         self._colors_path_used: Optional[Path] = None
-
-        # track last focused preview widget (for per-area copy fallback)
-        self._last_focused_widget: Optional[QtWidgets.QPlainTextEdit] = None
-
-        # dictionary mapping image name -> widget
-        self.preview_widgets: Dict[str, QtWidgets.QPlainTextEdit] = {}
+        self._last_focused_widget: Optional[QtWidgets.QTextEdit] = None
+        self.preview_widgets: Dict[str, QtWidgets.QTextEdit] = {}
 
         self._build_ui()
         self._apply_styles()
         self._connect_signals()
 
-        # load colors into combo after UI exists
         self._load_colors_into_combo()
-
-        # create legacy aliases so the central verifier finds expected names
-        self._add_legacy_widget_aliases()
-
-        # start Visionary pulse after UI exists
         self._start_visionary_pulse()
 
     # -----------------------
@@ -420,11 +465,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
         cl.setSpacing(10)
         root.addWidget(container)
 
-        # Header: close X on right, action buttons left (no title)
+        # Header
         header = QtWidgets.QHBoxLayout()
         header.setSpacing(8)
 
-        # Left: action buttons
         self.btn_generate = QtWidgets.QPushButton("Generate")
         self.btn_generate.setObjectName("gen_btn")
         self.btn_generate.setFixedHeight(28)
@@ -435,7 +479,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.btn_refresh = QtWidgets.QPushButton("Refresh")
         self.btn_refresh.setFixedHeight(28)
 
-        # Global copy-all button (was btn_copy previously)
         self.btn_copy = QtWidgets.QPushButton("Copy All")
         self.btn_copy.setFixedHeight(28)
 
@@ -449,7 +492,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         header.addWidget(self.btn_copy)
         header.addWidget(self.btn_erase)
 
-        # Visionary CTA — "For best results, use " (regular text) + clickable "The Visionary"
         self.lbl_visionary_prefix = QtWidgets.QLabel("For best results, use")
         self.lbl_visionary_prefix.setStyleSheet("color:#cfd3da; padding-left:6px;")
         header.addWidget(self.lbl_visionary_prefix)
@@ -459,7 +501,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.btn_visionary.setCursor(Qt.PointingHandCursor)
         self.btn_visionary.setFlat(True)
         self.btn_visionary.setToolTip("Open The Visionary (recommended guide)")
-        # base style; color animated at runtime
         self.btn_visionary.setStyleSheet(
             "QPushButton#visionary_btn{"
             "background:transparent;border:none;padding:0 6px;"
@@ -467,7 +508,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "}"
             "QPushButton#visionary_btn:hover{opacity:0.95;}"
         )
-        # glow effect
         self._visionary_effect = QGraphicsDropShadowEffect(self.btn_visionary)
         self._visionary_effect.setBlurRadius(32)
         self._visionary_effect.setOffset(0, 0)
@@ -476,10 +516,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.btn_visionary.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(VISIONARY_URL)))
 
         header.addWidget(self.btn_visionary)
-
         header.addStretch(1)
 
-        # Right: close X
         self.btn_close = QtWidgets.QPushButton("✕")
         self.btn_close.setFixedSize(28, 28)
         self.btn_close.setToolTip("Close")
@@ -487,52 +525,48 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         cl.addLayout(header)
 
-        # Main: left selectors + helpful + extras ; right = stacked preview windows (scroll)
+        # Main split
         main_h = QtWidgets.QHBoxLayout()
         main_h.setSpacing(12)
         cl.addLayout(main_h, 1)
 
-        # Left column (selectors & extras)
+        # Left column
         left_v = QtWidgets.QVBoxLayout()
         left_v.setSpacing(10)
         main_h.addLayout(left_v, 1)
 
-        # Selectors grid: Type / Subject / Color
         sel_grid = QtWidgets.QGridLayout()
         sel_grid.setHorizontalSpacing(8)
         sel_grid.setVerticalSpacing(8)
 
         lbl_type = QtWidgets.QLabel("Graphic & Illustration (type)")
-        lbl_type.setStyleSheet("font-weight:700;")
+        lbl_type.setStyleSheet(f"font-weight:900; color:{COL_TYPE};")
         self.cmb_type = QtWidgets.QComboBox()
         self.cmb_type.setEditable(False)
-        # populate type combo (selectable lines are ones WITHOUT leading '-' or '•')
+
         types, _ = _read_list_file_cached("type.txt")
         self.cmb_type.addItem("— none —")
         for t in types:
             s = t.rstrip("\r\n")
             if not s.strip():
-                # blank line -> visual separator
                 idx = self.cmb_type.count()
                 self.cmb_type.addItem("────────")
                 it = self.cmb_type.model().item(idx)
                 if it is not None:
                     it.setEnabled(False)
             elif s.startswith("-") or s.startswith("•"):
-                # lines that begin with bullet/marker -> treat as non-selectable heading/separator
                 idx = self.cmb_type.count()
                 self.cmb_type.addItem(s.lstrip("-• ").strip())
                 it = self.cmb_type.model().item(idx)
                 if it is not None:
                     it.setEnabled(False)
             else:
-                # normal selectable entry
                 self.cmb_type.addItem(s.strip())
         sel_grid.addWidget(lbl_type, 0, 0)
         sel_grid.addWidget(self.cmb_type, 0, 1)
 
         lbl_subject = QtWidgets.QLabel("Subject")
-        lbl_subject.setStyleSheet("font-weight:700;")
+        lbl_subject.setStyleSheet(f"font-weight:900; color:{COL_SUBJECT};")
         self.cmb_subject = QtWidgets.QComboBox()
         self.cmb_subject.setEditable(True)
         subjects, _ = _read_list_file_cached("topic.txt")
@@ -542,7 +576,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         sel_grid.addWidget(self.cmb_subject, 1, 1)
 
         lbl_color = QtWidgets.QLabel("Color Scheme (optional)")
-        lbl_color.setStyleSheet("font-weight:700;")
+        lbl_color.setStyleSheet(f"font-weight:900; color:{COL_SCHEME};")
         self.cmb_color = QtWidgets.QComboBox()
         self.cmb_color.setEditable(False)
         self.cmb_color.addItem("— none —")
@@ -555,8 +589,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         left_v.addLayout(sel_grid)
 
-        # Helpful options group
-        self.gb_helpful = QtWidgets.QGroupBox("Helpful options")
+        self.gb_helpful = QtWidgets.QGroupBox("Helpful option")
+        self.gb_helpful.setStyleSheet("QGroupBox { font-weight:900; }")
         self.gb_helpful.setObjectName("gb_helpful")
 
         gb_layout = QtWidgets.QGridLayout()
@@ -604,18 +638,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         left_v.addWidget(self.gb_helpful)
 
-        # Global additional wants (PlainTextEdit)
-        lbl_global = QtWidgets.QLabel("Global ideas (applies to ALL images)")
-        lbl_global.setStyleSheet("font-weight:700;")
+        lbl_global = QtWidgets.QLabel("Global ideas")
+        lbl_global.setStyleSheet("font-weight:900; color:#ffffff;")
         left_v.addWidget(lbl_global)
         self.txt_global = QtWidgets.QPlainTextEdit()
         self.txt_global.setPlaceholderText("Write ideas that should apply across the whole project (theme, time-of-day, mood, etc.)")
         self.txt_global.setMaximumHeight(120)
         left_v.addWidget(self.txt_global)
 
-        # Per-image extras (PlainTextEdit each)
         per_lbl = QtWidgets.QLabel("Per-image extras")
-        per_lbl.setStyleSheet("font-weight:700;")
+        per_lbl.setStyleSheet("font-weight:900; color:#ffffff;")
         left_v.addWidget(per_lbl)
 
         self.txt_cover = QtWidgets.QPlainTextEdit()
@@ -631,21 +663,31 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.txt_back.setPlaceholderText("back.png — extra instructions")
         self.txt_back.setMaximumHeight(70)
 
-        left_v.addWidget(QtWidgets.QLabel("cover.png"))
+        lbl = QtWidgets.QLabel("cover.png")
+        lbl.setStyleSheet(f"font-weight:900; color:{COL_COVER};")
+        left_v.addWidget(lbl)
         left_v.addWidget(self.txt_cover)
-        left_v.addWidget(QtWidgets.QLabel("letter.png"))
+
+        lbl = QtWidgets.QLabel("letter.png")
+        lbl.setStyleSheet(f"font-weight:900; color:{COL_LETTER};")
+        left_v.addWidget(lbl)
         left_v.addWidget(self.txt_letter)
-        left_v.addWidget(QtWidgets.QLabel("wall.png"))
+
+        lbl = QtWidgets.QLabel("wall.png")
+        lbl.setStyleSheet(f"font-weight:900; color:{COL_WALL};")
+        left_v.addWidget(lbl)
         left_v.addWidget(self.txt_wall)
-        left_v.addWidget(QtWidgets.QLabel("back.png"))
+
+        lbl = QtWidgets.QLabel("back.png")
+        lbl.setStyleSheet(f"font-weight:900; color:{COL_BACK};")
+        left_v.addWidget(lbl)
         left_v.addWidget(self.txt_back)
 
-        # Right column: stacked "windows" (label + read-only editor) inside a scroll area
+        # Right column
         right_v = QtWidgets.QVBoxLayout()
         right_v.setSpacing(8)
         main_h.addLayout(right_v, 1)
 
-        # scroll area to hold stacked preview windows
         self._preview_scroll = QtWidgets.QScrollArea()
         self._preview_scroll.setWidgetResizable(True)
         preview_container = QtWidgets.QWidget()
@@ -653,7 +695,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._preview_layout.setContentsMargins(0, 0, 0, 0)
         self._preview_layout.setSpacing(12)
 
-        # create four "window" style preview blocks, each with its own copy button
         for img in self._images:
             block = QtWidgets.QFrame()
             block.setFrameShape(QtWidgets.QFrame.Box)
@@ -663,7 +704,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             bl.setContentsMargins(8, 8, 8, 8)
             bl.setSpacing(6)
 
-            # header row: label + copy button (right)
             header_row = QtWidgets.QHBoxLayout()
             header_label = QtWidgets.QLabel(img)
             header_label.setStyleSheet("font-weight:700; color: #dcdce0;")
@@ -677,21 +717,18 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
             editor = FocusablePlainTextEdit()
             editor.setReadOnly(True)
+            editor.setAcceptRichText(True)
             editor.setPlaceholderText(f"Prompt for {img}")
             editor.setMinimumHeight(140)
             editor.setMaximumHeight(260)
             bl.addWidget(editor)
 
-            # keep references
             self._preview_layout.addWidget(block)
             self.preview_widgets[img] = editor
 
-            # wire per-area copy
             copy_btn.clicked.connect(lambda _, w=editor: QtWidgets.QApplication.clipboard().setText(w.toPlainText()))
-            # focus tracking
             editor.focused.connect(lambda ed=editor: self._set_last_focused(ed))
 
-        # spacer so content hugs top
         self._preview_layout.addStretch(1)
         self._preview_scroll.setWidget(preview_container)
         right_v.addWidget(self._preview_scroll, 1)
@@ -707,12 +744,29 @@ class PromptWriterPanel(QtWidgets.QWidget):
             border: 1px solid #23232a;
             border-radius: 10px;
         }
-        QGroupBox#gb_helpful, QGroupBox { border: 1px solid #26262b; border-radius: 6px; padding: 8px; }
+        QGroupBox#gb_helpful, QGroupBox {
+            border: 1px solid #26262b;
+            border-radius: 6px;
+            padding: 8px;
+        }
         QLabel { color: #dcdce0; }
-        QPushButton { padding: 6px 12px; background: #1e1f24; border: 1px solid #2b2b31; color: #eaeaf0; border-radius: 6px;}
+        QPushButton {
+            padding: 6px 12px;
+            background: #1e1f24;
+            border: 1px solid #2b2b31;
+            color: #eaeaf0;
+            border-radius: 6px;
+        }
         QPushButton:hover { border-color: #3b7cf0; }
-        QLineEdit, QComboBox, QPlainTextEdit { background: #0d0e11; color: #e8e8ea; border: 1px solid #242428; border-radius: 6px; padding: 6px;}
-        """)
+
+        QLineEdit, QComboBox, QPlainTextEdit, QTextEdit {
+            background: #0d0e11;
+            color: #e8e8ea;
+            border: 1px solid #242428;
+            border-radius: 6px;
+            padding: 6px;
+        }
+        """ + CHECKBOX_QSS)
 
     # -----------------------
     # Signals
@@ -729,10 +783,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
     # Colors loader & status
     # -----------------------
     def _load_colors_into_combo(self):
-        """
-        Load colors.txt robustly and update the combo and status label.
-        Accept both 'colors.txt' and fall back to 'color.txt' if plural missing.
-        """
         lines, used_path = _read_list_file_cached("colors.txt")
         if not lines:
             lines, used_path = _read_list_file_cached("color.txt")
@@ -802,9 +852,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             phrases.append("No text, no letters, no numbers, no glyphs, no typography, no captions, no signage, no logos, no watermarks.")
         return phrases
 
-    # -----------------------
-    # Color robust getter
-    # -----------------------
     def _get_color_choice(self) -> Optional[str]:
         idx = self.cmb_color.currentIndex()
         text = self.cmb_color.currentText().strip()
@@ -826,24 +873,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
     # -----------------------
     # Focus handling
     # -----------------------
-    def _set_last_focused(self, widget: QtWidgets.QPlainTextEdit):
+    def _set_last_focused(self, widget: QtWidgets.QTextEdit):
         self._last_focused_widget = widget
 
     # -----------------------
     # Actions
     # -----------------------
     def _on_random(self):
-        """
-        Randomize UI selections and internal data only — do NOT generate prompts.
-        Subject is NOT touched (user-selected).
-        """
-        # pick a random type (graphic) from the combo (only enabled entries)
         _random_combo_choice(self.cmb_type)
-
-        # pick a random color from the color combo (only enabled entries)
         _random_combo_choice(self.cmb_color)
 
-        # Randomize other list-driven values (stored in self._data) but do not call _on_generate()
         role_pick, _ = _pick_random_nonempty_line("role.txt")
         if role_pick:
             self._data["role"] = role_pick
@@ -860,17 +899,14 @@ class PromptWriterPanel(QtWidgets.QWidget):
         if format_pick:
             self._data["format"] = format_pick
 
-        # update a minimal debug-like status in color_status label so user can see selections
         color_src = str(self._colors_path_used) if self._colors_path_used else "none"
         t = self.cmb_type.currentText() if self.cmb_type.currentIndex() >= 0 else ""
         c = self._get_color_choice()
         self.lbl_color_status.setText(f"role={self._data.get('role','')} | type={t or ''} | color={c or ''} | color_src={color_src}")
 
     def _on_refresh(self):
-        # clear cache and reload list-driven UI elements
         _FILE_CACHE.clear()
 
-        # re-populate type combo
         self.cmb_type.clear()
         self.cmb_type.addItem("— none —")
         types, _ = _read_list_file_cached("type.txt")
@@ -891,13 +927,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
             else:
                 self.cmb_type.addItem(s.strip())
 
-        # reload subjects
         self.cmb_subject.clear()
         subjects, _ = _read_list_file_cached("topic.txt")
         for s in [l for l in subjects if l.strip()]:
             self.cmb_subject.addItem(s)
 
-        # reload colors
         self._load_colors_into_combo()
 
     def _on_generate(self):
@@ -907,29 +941,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Missing subject", "Please enter a Subject.")
             return
 
-        # type & color are user-selected and NOT randomized
+        # type & color are user-selected (same across all images)
         t = self.cmb_type.currentText()
-        if t == "— none —" or t == "────────":
+        if t in ("— none —", "────────"):
             t = None
         c = self._get_color_choice()
-
-        # Randomize other list-driven values for this generation:
-        # - role: role.txt
-        # - order: order.txt -> list
-        # - effort: effort.txt
-        # - format: format.txt (full paragraph)
-        role_pick, _ = _pick_random_nonempty_line("role.txt")
-        if role_pick:
-            self._data["role"] = role_pick
-        order_pick, _ = _pick_random_order("order.txt")
-        if order_pick:
-            self._data["order"] = order_pick
-        effort_pick, _ = _pick_random_nonempty_line("effort.txt")
-        if effort_pick:
-            self._data["effort"] = effort_pick
-        format_pick, _ = _pick_random_nonempty_line("format.txt")
-        if format_pick:
-            self._data["format"] = format_pick
 
         guidance = self._collect_guidance()
         global_extra = self.txt_global.toPlainText().strip()
@@ -937,37 +953,78 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "Cover Prompt": self.txt_cover.toPlainText().strip(),
             "Letter Prompt": self.txt_letter.toPlainText().strip(),
             "Wall Prompt": self.txt_wall.toPlainText().strip(),
-            "Back Prompt": self.txt_back.toPlainText().strip()
+            "Back Prompt": self.txt_back.toPlainText().strip(),
         }
 
         prompts: Dict[str, str] = {}
         debug_map: Dict[str, dict] = {}
+        per_data_map: Dict[str, dict] = {}
 
+        # Each image gets its own randomized role/order/effort/format roll.
         for img in self._images:
+            per_image_data = self._roll_data_for_image()
+            per_data_map[img] = per_image_data
+
             prompt, dbg = assemble_prompt_for_image(
                 subject,
-                self._data,
+                per_image_data,
                 img,
                 type_choice=t,
                 color_choice=c,
                 guidance=guidance,
                 global_extra=global_extra,
-                image_extra=per_extras.get(img, "")
+                image_extra=per_extras.get(img, ""),
             )
             prompts[img] = prompt
             debug_map[img] = dbg
 
-        # Put prompts into the stacked editors
-        for img, txt in prompts.items():
+        # Render OLD-format preview, but color-coded values
+        for img in self._images:
             w = self.preview_widgets.get(img)
-            if w:
-                w.setPlainText(txt)
+            if not w:
+                continue
+
+            d = per_data_map.get(img, {})
+            html_view = render_prompt_html(
+                image_name=img,
+                subject=subject,
+                type_choice=t,
+                scheme=c,
+                global_extra=global_extra,
+                image_extra=per_extras.get(img, ""),
+                role_sentence=f"You are {d.get('role','').strip().rstrip('.')}. Create a richly detailed image of ----",
+                baseline=_baseline_for(img),
+                effort_line=d.get("effort", ""),
+                guidance_lines=guidance or [],
+                format_paragraph=d.get("format", ""),
+            )
+            w.setHtml(html_view)
 
         # emit signal for external consumers
         self.prompts_generated.emit(prompts, debug_map)
 
+    def _roll_data_for_image(self) -> dict:
+        data = dict(self._data)
+
+        role_pick, _ = _pick_random_nonempty_line("role.txt")
+        if role_pick:
+            data["role"] = role_pick
+
+        order_pick, _ = _pick_random_order("order.txt")
+        if order_pick:
+            data["order"] = order_pick
+
+        effort_pick, _ = _pick_random_nonempty_line("effort.txt")
+        if effort_pick:
+            data["effort"] = effort_pick
+
+        format_pick, _ = _pick_random_nonempty_line("format.txt")
+        if format_pick:
+            data["format"] = format_pick
+
+        return data
+
     def _copy_all_prompts(self):
-        # Join prompts in the canonical order and copy to clipboard
         parts: List[str] = []
         for key in self._images:
             w = self.preview_widgets.get(key)
@@ -978,20 +1035,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         if all_text:
             QtWidgets.QApplication.clipboard().setText(all_text)
 
-    def _copy_current_prompt(self):
-        # copy the last-focused preview editor if present, otherwise the first preview
-        src = None
-        if isinstance(self._last_focused_widget, QtWidgets.QPlainTextEdit):
-            src = self._last_focused_widget
-        else:
-            for w in self.preview_widgets.values():
-                src = w
-                break
-        if src:
-            QtWidgets.QApplication.clipboard().setText(src.toPlainText())
-
     def _on_erase_all(self):
-        # Clear selectors, helpful options, extras, previews
         self.cmb_subject.setCurrentText("")
         self.cmb_type.setCurrentIndex(0)
         self.cmb_color.setCurrentIndex(0)
@@ -1007,7 +1051,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.txt_back.clear()
         for w in self.preview_widgets.values():
             w.clear()
-        # reload colors to update status (in case files changed)
         self._load_colors_into_combo()
 
     def _on_close(self):
@@ -1015,91 +1058,19 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.closed.emit()
 
     # -----------------------
-    # Legacy compatibility: create aliases expected by prompter.verify_required_widgets
-    # -----------------------
-    def _add_legacy_widget_aliases(self):
-        """
-        Create backwards-compatible attribute names/objectNames expected by legacy verifier.
-        Call after UI construction (we do this at end of __init__).
-        """
-        try:
-            # gen_btn alias for header generate button
-            if hasattr(self, "btn_generate"):
-                self.gen_btn = self.btn_generate
-                try:
-                    self.gen_btn.setObjectName("gen_btn")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        try:
-            # export_btn: prefer a "copy all" style button; fall back to btn_copy (global copy)
-            if hasattr(self, "btn_copy_all"):
-                self.export_btn = self.btn_copy_all
-            elif hasattr(self, "btn_copy"):
-                self.export_btn = self.btn_copy
-            else:
-                # create a hidden placeholder if nothing exists
-                self.export_btn = QtWidgets.QPushButton("Export")
-                self.export_btn.hide()
-            try:
-                self.export_btn.setObjectName("export_btn")
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-        # Map preview widgets to legacy editor names and out_* names
-        try:
-            pw = getattr(self, "preview_widgets", None)
-            if isinstance(pw, dict):
-                if "Cover Prompt" in pw and not hasattr(self, "cover_edit"):
-                    self.cover_edit = pw["Cover Prompt"]
-                    try: self.cover_edit.setObjectName("cover_edit")
-                    except Exception: pass
-                if "Letter Prompt" in pw and not hasattr(self, "letter_edit"):
-                    self.letter_edit = pw["Letter Prompt"]
-                    try: self.letter_edit.setObjectName("letter_edit")
-                    except Exception: pass
-                if "Back Prompt" in pw and not hasattr(self, "back_edit"):
-                    self.back_edit = pw["Back Prompt"]
-                    try: self.back_edit.setObjectName("back_edit")
-                    except Exception: pass
-
-                if "Cover Prompt" in pw and not hasattr(self, "out_cover"):
-                    self.out_cover = pw["Cover Prompt"]
-                    try: self.out_cover.setObjectName("out_cover")
-                    except Exception: pass
-                if "Letter Prompt" in pw and not hasattr(self, "out_letter"):
-                    self.out_letter = pw["Letter Prompt"]
-                    try: self.out_letter.setObjectName("out_letter")
-                    except Exception: pass
-                if "Back Prompt" in pw and not hasattr(self, "out_back"):
-                    self.out_back = pw["Back Prompt"]
-                    try: self.out_back.setObjectName("out_back")
-                    except Exception: pass
-                if "Wall Prompt" in pw and not hasattr(self, "out_wall"):
-                    self.out_wall = pw["Wall Prompt"]
-                    try: self.out_wall.setObjectName("out_wall")
-                    except Exception: pass
-        except Exception:
-            pass
-
-    # -----------------------
-    # Visionary pulse (deep blue → cyan → white → cyan → deep blue …)
+    # Visionary pulse
     # -----------------------
     def _start_visionary_pulse(self):
         try:
             self._visionary_colors = [
-                QColor("#2d6bff"),  # deep blue
-                QColor("#03d5ff"),  # cyan
-                QColor("#ffffff"),  # white
-                QColor("#03d5ff"),  # cyan
+                QColor("#2d6bff"),
+                QColor("#03d5ff"),
+                QColor("#ffffff"),
+                QColor("#03d5ff"),
             ]
             self._visionary_index = 0
             self._visionary_timer = QtCore.QTimer(self)
-            self._visionary_timer.setInterval(520)  # ms
+            self._visionary_timer.setInterval(520)
             self._visionary_timer.timeout.connect(self._tick_visionary_pulse)
             self._visionary_timer.start()
         except Exception:
@@ -1112,12 +1083,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
         except Exception:
             return
 
-        # update glow color
         eff = getattr(self, "_visionary_effect", None)
         if isinstance(eff, QGraphicsDropShadowEffect):
             eff.setColor(col)
 
-        # rebuild style using % formatting to avoid brace escaping issues
         style = (
             "QPushButton#visionary_btn{"
             "background:transparent;border:none;padding:0 6px;"
@@ -1132,7 +1101,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             pass
 
     # -----------------------
-    # Popup / hide animations (basic)
+    # Popup / hide animations
     # -----------------------
     def popup(self):
         if self.isVisible():
@@ -1141,7 +1110,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.show()
         self.raise_()
 
-        # Use the widget's current screen (better for multi-monitor) instead of primaryScreen()
         screen_obj = self.screen() or QtGui.QGuiApplication.primaryScreen()
         avail = screen_obj.availableGeometry() if screen_obj else QtGui.QGuiApplication.primaryScreen().availableGeometry()
 
@@ -1187,7 +1155,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
     # Frameless move & maximize support
     # -----------------------
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        # Qt 6: prefer position() over deprecated pos()
         try:
             y = event.position().y() if hasattr(event, "position") else event.pos().y()
             if event.button() == Qt.LeftButton and y <= self._header_draggable_height:
@@ -1203,7 +1170,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             if self._drag_pos and not self._is_maximized:
                 new_top_left = event.globalPosition().toPoint() - self._drag_pos
 
-                # Clamp to the widget's current screen
                 screen_obj = self.screen() or QtGui.QGuiApplication.primaryScreen()
                 screen_geom = (screen_obj.availableGeometry()
                                if screen_obj else QtGui.QGuiApplication.primaryScreen().availableGeometry())
@@ -1226,11 +1192,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
-        # Qt 6: prefer position() over deprecated pos()
         try:
             y = event.position().y() if hasattr(event, "position") else event.pos().y()
             if y <= self._header_draggable_height:
-                # Maximize/restore to the current screen's available geometry
                 screen_obj = self.screen() or QtGui.QGuiApplication.primaryScreen()
                 avail = (screen_obj.availableGeometry()
                          if screen_obj else QtGui.QGuiApplication.primaryScreen().availableGeometry())

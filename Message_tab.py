@@ -1,20 +1,6 @@
 # ===============================
 # File: Message_tab.py
-# Purpose: Message authoring + render to message.png (no visible wall/cperp toolbar)
-# Notes:
-#   • The two visible toolbar buttons were removed on purpose.
-#   • Hidden buttons managed by Over_Nexus.py still work:
-#       - Clarifier/wall (slot 4) is handled elsewhere.
-#       - cperp/Title helper toggles this tab's title_sister_container via toggle_title_sister_area().
-#   • Micro improvements:
-#       - Safer reads/writes (atomic write for message.html and message.png).
-#       - Clearer status updates, early guards, and type hints.
-#       - Robust defaults: current_html exists even when nothing is loaded yet.
-#       - Tiny UX polish on drag/drop and file selection.
-#       - Optional library fallbacks (DOCX/PDF/ODT) so the tab never hard-crashes.
-#   • Update:
-#       - Removed the "Open message.html" link (not needed; previews already exist).
-#       - Kept auto-save when the editor closes (Accepted or Cancelled).
+# Purpose: Message authoring + render to message.png
 # ===============================
 
 from __future__ import annotations
@@ -22,23 +8,25 @@ from __future__ import annotations
 import html as _html
 import os
 import re
+import json
+import shutil
 from pathlib import Path
 from typing import Optional
 
 # Optional converters (prefer mammoth for DOCX → HTML)
 try:
     import mammoth  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:
     mammoth = None
 
 try:
     from docx import Document  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:
     Document = None  # type: ignore
 
 try:
     from PyPDF2 import PdfReader  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:
     PdfReader = None  # type: ignore
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -52,10 +40,10 @@ from PySide6.QtGui import (
     QFont,
 )
 
-from Editor import Editor  # our rich-text editor dialog
+from Editor import Editor
 from config import (
-    GALLERY_DIR,
     SETTINGS_FILE,
+    USER_PAGES_DIR,
     MESSAGE_HTML_FILE,
     MESSAGE_IMAGE_FILE,
 )
@@ -65,7 +53,6 @@ from config import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _atomic_write_text(path: str | os.PathLike, data: str) -> None:
-    """Write text atomically (best effort): path.tmp → replace(path)."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
@@ -73,26 +60,52 @@ def _atomic_write_text(path: str | os.PathLike, data: str) -> None:
     try:
         os.replace(tmp, p)
     except Exception:
-        # Fallback if replace fails on some FS
         p.write_text(data, encoding="utf-8")
 
 
 def _atomic_save_image(img: QImage, path: str) -> bool:
-    """Atomic save for images: path.tmp → replace(path)."""
+    """
+    Windows-safe atomic PNG save using QtCore.QSaveFile.
+    Uses QBuffer + QByteArray to encode first, then commits atomically.
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = str(p) + ".tmp"
-    if not img.save(tmp):
+
+    # Encode into memory
+    ba = QtCore.QByteArray()
+    buf = QtCore.QBuffer(ba)
+    if not buf.open(QtCore.QIODevice.WriteOnly):
         return False
-    try:
-        os.replace(tmp, str(p))
-        return True
-    except Exception:
-        return img.save(str(p))
+
+    ok = img.save(buf, "PNG")
+    buf.close()
+
+    if not ok or ba.isEmpty():
+        return False
+
+    # Commit with retries (Windows transient locks)
+    for _ in range(8):
+        sf = QtCore.QSaveFile(str(p))
+        if not sf.open(QtCore.QIODevice.WriteOnly):
+            QtCore.QThread.msleep(80)
+            continue
+
+        written = sf.write(ba)
+        if written != ba.size():
+            sf.cancelWriting()
+            QtCore.QThread.msleep(80)
+            continue
+
+        if sf.commit():
+            return True
+
+        sf.cancelWriting()
+        QtCore.QThread.msleep(80)
+
+    return False
 
 
 def _strip_html_for_word_count(html: str) -> str:
-    """Very lightweight tag stripper (for counting words)."""
     no_tags = re.sub(r"<[^>]+>", " ", html)
     return _html.unescape(no_tags)
 
@@ -204,19 +217,22 @@ class DropMessageButton(QtWidgets.QPushButton):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main Message Tab (NO visible wall/cperp toolbar here)
+# Main Message Tab
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MessageTab(QtWidgets.QWidget):
+    # Public contract used by Nexus/Over_Nexus — DO NOT REMOVE
     text_selected = Signal(str)
     preview_image = Signal(QPixmap)
-    wall_preview = Signal(QPixmap)  # reserved for Nexus overlay previews
+    wall_preview = Signal(QPixmap)
 
     def __init__(self, project_root: str) -> None:
         super().__init__()
         self.project_root = project_root
         self.settings_path = os.path.join(project_root, SETTINGS_FILE)
-        self.current_html: str = ""  # always defined
+
+        # Compatibility cache (disk is authoritative)
+        self.current_html: str = ""
 
         self._load_settings()
 
@@ -224,14 +240,12 @@ class MessageTab(QtWidgets.QWidget):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
 
-        # Header
         header = QtWidgets.QLabel("Your Letter’s Message")
         header.setFont(QFont("Lucida Handwriting", 14))
         header.setStyleSheet("color:#00d0ff;")
         header.setAlignment(Qt.AlignCenter)
         layout.addWidget(header)
 
-        # Title/Recipient container — toggled by the hidden "cperp" button from Over_Nexus.py
         self.title_sister_container = QtWidgets.QWidget(self)
         title_sister_layout = QtWidgets.QFormLayout(self.title_sister_container)
         title_sister_layout.setContentsMargins(0, 0, 0, 0)
@@ -244,18 +258,17 @@ class MessageTab(QtWidgets.QWidget):
 
         title_sister_layout.addRow("Letter Title:", self.title_input)
         title_sister_layout.addRow("Sister:", self.name_input)
+
         self.title_input.editingFinished.connect(self._save_settings)
         self.name_input.editingFinished.connect(self._save_settings)
 
         layout.addWidget(self.title_sister_container)
 
-        # Select / drop message file
         self.btn = DropMessageButton()
         self.btn.clicked.connect(self.select_file)
         self.btn.file_dropped.connect(self.handle_drop)
         layout.addWidget(self.btn)
 
-        # Status + action buttons
         self.status = QtWidgets.QLabel()
         self.status.setFont(QFont("Lucida Handwriting", 10))
         self.status.setStyleSheet("color:#bfc5d1;")
@@ -275,49 +288,37 @@ class MessageTab(QtWidgets.QWidget):
         btns.addWidget(self.view_btn)
         layout.addLayout(btns)
 
-        self.open_root_btn = QtWidgets.QPushButton("📂 Open Project Folder")
-        self.open_root_btn.setFont(QFont("Lucida Handwriting", 11))
-        self.open_root_btn.setStyleSheet(
-            "QPushButton { background-color:#1c1e26; border:1px solid #00d0ff;"
-            " border-radius:8px; padding:8px; color:#e6e6e6;}"
-            "QPushButton:hover { background-color:#00d0ff; color:#0e0f12;}"
-        )
-        self.open_root_btn.clicked.connect(self.open_project_folder)
-        layout.addWidget(self.open_root_btn)
-
+        # Ensure fallback assets + show something immediately
         self._check_existing()
 
     # ──────────────────────────────────────────────────────────────────
-    # Hidden-button integration (Over_Nexus.py calls this)
+    # Show hook: every time user clicks into Message tab
     # ──────────────────────────────────────────────────────────────────
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        # When user lands on the tab: force wall fallback, then show message.png if present else wall.
+        self._ensure_wall_exists()
+        self._ensure_message_exists()
+        self._emit_best_preview()
 
+    # ──────────────────────────────────────────────────────────────────
+    # Nexus / Over_Nexus hooks
+    # ──────────────────────────────────────────────────────────────────
     def toggle_title_sister_area(self) -> None:
         self.title_sister_container.setVisible(not self.title_sister_container.isVisible())
 
-    # Nexus double-click compatibility wrapper (no UI change)
     def open_message_editor(self) -> None:
         self.open_editor()
 
     # ──────────────────────────────────────────────────────────────────
-    # Core actions
+    # Settings
     # ──────────────────────────────────────────────────────────────────
-
-    def open_project_folder(self) -> None:
-        QDesktopServices.openUrl(QUrl.fromLocalFile(self.project_root))
-
     def _load_settings(self) -> None:
         try:
             with open(self.settings_path, "r", encoding="utf-8") as f:
-                self.settings = QtCore.QJsonDocument.fromJson(f.read().encode("utf-8")).object()  # type: ignore
+                self.settings = json.load(f)
         except Exception:
-            # Fallback: plain json
-            import json
-            try:
-                with open(self.settings_path, "r", encoding="utf-8") as f:
-                    self.settings = json.load(f)
-            except Exception:
-                self.settings = {}
-
+            self.settings = {}
         if not isinstance(self.settings, dict):
             self.settings = {}
 
@@ -326,39 +327,161 @@ class MessageTab(QtWidgets.QWidget):
         self.settings["recipient_name"] = self.name_input.text().strip()
         try:
             Path(self.settings_path).parent.mkdir(parents=True, exist_ok=True)
-            import json
             with open(self.settings_path, "w", encoding="utf-8") as f:
                 json.dump(self.settings, f, indent=2)
             self.status.setText("💾 Recipient info saved.")
         except Exception as e:
             self.status.setText(f"❌ Error saving settings: {e}")
 
-    def _check_existing(self) -> None:
-        html_path = os.path.join(self.project_root, MESSAGE_HTML_FILE)
-        png_path = os.path.join(self.project_root, MESSAGE_IMAGE_FILE)
-        loaded = False
+    # ──────────────────────────────────────────────────────────────────
+    # Paths (AUTHORITATIVE)
+    # ──────────────────────────────────────────────────────────────────
+    def _html_path(self) -> Path:
+        # SOURCE OF TRUTH: gallery/user/message/message.html
+        return Path(self.project_root) / "gallery" / "user" / "message" / "message.html"
 
-        if os.path.isfile(html_path):
+    def _png_path(self) -> Path:
+        # SOURCE OF TRUTH: gallery/user/message/message.png
+        return Path(self.project_root) / "gallery" / "user" / "message" / "message.png"
+
+    def _wall_path(self) -> Path:
+        # SOURCE OF TRUTH: gallery/user/pages/wall.png
+        return Path(self.project_root) / USER_PAGES_DIR / "wall.png"
+
+    def _default_message_bg_path(self) -> Path:
+        # DEFAULT FALLBACK: gallery/app/pages/Dmessage.png
+        return Path(self.project_root) / "gallery" / "app" / "pages" / "Dmessage.png"
+
+    # ──────────────────────────────────────────────────────────────────
+    # Fallback pipeline (Dmessage → wall, then wall → message.png if needed)
+    # ──────────────────────────────────────────────────────────────────
+    def _ensure_wall_exists(self) -> bool:
+        """
+        Guarantees wall.png exists by copying:
+            gallery/app/pages/Dmessage.png -> gallery/user/pages/wall.png
+        if wall.png is missing.
+        """
+        wall_path = self._wall_path()
+        if wall_path.exists():
+            return True
+
+        src = self._default_message_bg_path()
+        try:
+            wall_path.parent.mkdir(parents=True, exist_ok=True)
+            if src.exists():
+                shutil.copyfile(str(src), str(wall_path))
+                return True
+        except Exception:
+            pass
+        return wall_path.exists()
+
+    def _ensure_message_exists(self) -> None:
+        """
+        Guarantees message.png exists.
+        - If missing, render using current_html if available,
+          else render a blank message (wall-only).
+        - If render fails, force message.png = wall.png (scaled).
+        """
+        out_png = self._png_path()
+        if out_png.exists():
+            return
+
+        # Ensure wall is there first
+        self._ensure_wall_exists()
+
+        # Try render from HTML if any, else blank
+        try:
+            html = (self._html_path().read_text(encoding="utf-8") if self._html_path().exists() else "").strip()
+            if not html:
+                html = "<p></p>"
+            self._generate_image(html)
+            if out_png.exists():
+                return
+        except Exception:
+            pass
+
+        # Hard fallback: copy wall into message.png (scaled to 2048×3072)
+        try:
+            wall_path = self._wall_path()
+            if wall_path.exists():
+                wall_img = QImage(str(wall_path))
+                if not wall_img.isNull():
+                    FULL_W, FULL_H = 2048, 3072
+                    wall_img = wall_img.scaled(
+                        FULL_W, FULL_H,
+                        Qt.KeepAspectRatioByExpanding,
+                        Qt.SmoothTransformation
+                    )
+                    canvas = QImage(FULL_W, FULL_H, QImage.Format_ARGB32)
+                    canvas.fill(QtGui.QColor(14, 14, 18, 255))
+                    p = QPainter(canvas)
+                    p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                    p.drawImage(0, 0, wall_img)
+                    p.end()
+                    _atomic_save_image(canvas, str(out_png))
+        except Exception:
+            pass
+
+    # ──────────────────────────────────────────────────────────────────
+    # Existing content load
+    # ──────────────────────────────────────────────────────────────────
+    def _check_existing(self) -> None:
+        # Force the fallback pipeline first so the tab never shows black/empty.
+        self._ensure_wall_exists()
+        self._ensure_message_exists()
+
+        html_path = self._html_path()
+        loaded_html = False
+
+        if html_path.is_file():
             try:
-                with open(html_path, "r", encoding="utf-8") as f:
-                    self.current_html = f.read()
+                self.current_html = html_path.read_text(encoding="utf-8")
                 self.edit_btn.setEnabled(True)
-                self.view_btn.setEnabled(os.path.exists(png_path))
-                self.status.setText("✅ Loaded existing message.html")
-                loaded = True
+                loaded_html = True
             except Exception as e:
                 self.status.setText(f"⚠️ Failed to read message.html: {e}")
 
-        if os.path.isfile(png_path):
-            full_pix = QPixmap(png_path)
-            if not full_pix.isNull():
-                small_pix = full_pix.scaled(169, 253, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.preview_image.emit(small_pix)
-                self.view_btn.setEnabled(True)
+        # Emit best preview immediately (message.png if exists, else wall)
+        self._emit_best_preview()
 
-        if loaded:
+        if loaded_html:
             self.text_selected.emit(self.current_html)
 
+    # ──────────────────────────────────────────────────────────────────
+    # Preview helpers
+    # ──────────────────────────────────────────────────────────────────
+    def _emit_best_preview(self) -> None:
+        """
+        Rule:
+        - If message.png exists, show it.
+        - Else show wall.png (which is guaranteed by Dmessage fallback).
+        """
+        png_path = self._png_path()
+        if png_path.is_file():
+            full_pix = QPixmap(str(png_path))
+            if not full_pix.isNull():
+                thumb = full_pix.scaled(169, 253, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.preview_image.emit(thumb)
+                self.view_btn.setEnabled(True)
+                self.status.setText("🖼️ Showing message.png")
+                return
+
+        wall_path = self._wall_path()
+        if wall_path.is_file():
+            full_pix = QPixmap(str(wall_path))
+            if not full_pix.isNull():
+                thumb = full_pix.scaled(169, 253, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.preview_image.emit(thumb)
+                self.view_btn.setEnabled(False)
+                self.status.setText("🧱 Showing wall.png (fallback)")
+                return
+
+        # If we get here, fallback assets are missing/corrupt
+        self.status.setText("❌ No message.png or wall.png available (fallback missing).")
+
+    # ──────────────────────────────────────────────────────────────────
+    # File selection / drop
+    # ──────────────────────────────────────────────────────────────────
     def select_file(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
@@ -373,71 +496,73 @@ class MessageTab(QtWidgets.QWidget):
         if os.path.exists(path):
             self._process_file(path)
 
+    # ──────────────────────────────────────────────────────────────────
+    # Editor
+    # ──────────────────────────────────────────────────────────────────
     def open_editor(self) -> None:
-        html_for_editor = self.current_html or ""
-        full_pix: Optional[QPixmap] = None
+        html_path = self._html_path()
+        if html_path.is_file():
+            try:
+                html_for_editor = html_path.read_text(encoding="utf-8")
+            except Exception:
+                html_for_editor = self.current_html or ""
+        else:
+            html_for_editor = self.current_html or ""
 
-        png_path = os.path.join(self.project_root, MESSAGE_IMAGE_FILE)
-        if os.path.isfile(png_path):
-            candidate = QPixmap(png_path)
+        full_pix: Optional[QPixmap] = None
+        png_path = self._png_path()
+        if png_path.is_file():
+            candidate = QPixmap(str(png_path))
             if not candidate.isNull():
                 full_pix = candidate
 
         dlg = Editor(html_for_editor, full_pix, parent=self)
-
-        # Auto-save on ANY close (Accepted or Rejected)
-        dlg.finished.connect(lambda _result: self._handle_editor_finished(dlg))
+        dlg.accepted.connect(lambda: self._handle_editor_accepted(dlg))
         dlg.exec()
 
-    def _handle_editor_finished(self, dlg: QtWidgets.QDialog) -> None:
-        """Autosave editor contents on close (OK or Cancel)."""
-        # Try preferred API first
-        new_html = None
+    def _handle_editor_accepted(self, dlg: QtWidgets.QDialog) -> None:
+        new_html: Optional[str] = None
         try:
             new_html = dlg.get_edited_html()  # type: ignore[attr-defined]
         except Exception:
             try:
                 new_html = dlg.editor.toHtml()  # type: ignore[attr-defined]
             except Exception:
-                pass
+                new_html = None
 
-        if new_html is None:
-            # nothing retrievable; keep current
-            self.status.setText("ℹ️ Editor closed with no changes detected.")
+        if not new_html:
+            self.status.setText("ℹ️ Editor accepted, but HTML not Found.")
             return
 
-        html_path = os.path.join(self.project_root, MESSAGE_HTML_FILE)
+        html_path = self._html_path()
         try:
             _atomic_write_text(html_path, new_html)
             self.current_html = new_html
-            self.status.setText("💾 message.html auto-saved.")
+            self.status.setText("💾 message.html saved.")
             self.edit_btn.setEnabled(True)
         except Exception as e:
-            self.status.setText(f"❌ Error saving edited HTML: {e}")
+            self.status.setText(f"❌ Error saving HTML: {e}")
             return
 
-        # Update Nexus HTML preview immediately
+        # Always guarantee wall before rendering
+        self._ensure_wall_exists()
+
         self.text_selected.emit(new_html)
-
-        # Re-generate image snapshot
         self._generate_image(new_html)
+        self._emit_best_preview()
 
+    # ──────────────────────────────────────────────────────────────────
+    # Preview button
+    # ──────────────────────────────────────────────────────────────────
     def _emit_preview(self) -> None:
-        png_path = os.path.join(self.project_root, MESSAGE_IMAGE_FILE)
-        if os.path.exists(png_path):
-            pix = QPixmap(png_path)
-            if not pix.isNull():
-                thumb = pix.scaled(169, 253, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.preview_image.emit(thumb)
-                self.status.setText("🔍 Preview updated.")
-                return
-        QtWidgets.QMessageBox.warning(self, "No Image", "No message.png found to preview.")
-        self.status.setText("❌ No message.png to preview.")
+        # Preview button should prefer message.png; if missing, show wall fallback.
+        self._ensure_wall_exists()
+        self._ensure_message_exists()
+        self._emit_best_preview()
 
     # ──────────────────────────────────────────────────────────────────
     # Extraction + processing
     # ──────────────────────────────────────────────────────────────────
-
     def extract_text(self, path: str) -> str:
         low = path.lower()
         try:
@@ -459,7 +584,6 @@ class MessageTab(QtWidgets.QWidget):
                         return res.value
                     except Exception:
                         pass
-                # Fallback to python-docx → naive paragraph HTML
                 if Document is not None:
                     try:
                         doc = Document(path)
@@ -471,11 +595,9 @@ class MessageTab(QtWidgets.QWidget):
                         return "<br>".join(parts)
                     except Exception:
                         pass
-                # last resort
                 return ""
 
             if low.endswith(".pdf"):
-                # Prefer PyPDF2
                 if PdfReader is not None:
                     try:
                         reader = PdfReader(path)
@@ -483,7 +605,6 @@ class MessageTab(QtWidgets.QWidget):
                         return "<br><br>".join(pages)
                     except Exception:
                         pass
-                # Fallback to pdfplumber if available
                 try:
                     import pdfplumber  # type: ignore
                     txt_pages = []
@@ -521,19 +642,17 @@ class MessageTab(QtWidgets.QWidget):
             self.status.setText("⚠️ That file had no extractable text.")
             return
 
-        # Guard: 1000-word cap (best-effort). Counting is done on tag-stripped content.
         wc = _word_count(_strip_html_for_word_count(html))
         if wc > 1000:
             dlg = ConfirmTruncateDialog(wc)
             if dlg.exec() == QtWidgets.QDialog.Rejected:
                 self.status.setText("✋ Import canceled.")
                 return
-            # Simple truncation by words — prioritizes safety over rich formatting
             words = re.findall(r"\b\w+\b", _strip_html_for_word_count(html))[:1000]
             html = _html.escape(" ".join(words)).replace("\n", "<br>")
             self.status.setText("✂️ Truncated to 1000 words and saved.")
 
-        html_path = os.path.join(self.project_root, MESSAGE_HTML_FILE)
+        html_path = self._html_path()
         try:
             _atomic_write_text(html_path, html)
             self.current_html = html
@@ -544,14 +663,28 @@ class MessageTab(QtWidgets.QWidget):
             self.status.setText(f"❌ Error saving message.html: {e}")
             return
 
+        # Always guarantee wall before rendering
+        self._ensure_wall_exists()
+
         self._generate_image(html)
+        self._emit_best_preview()
 
     # ──────────────────────────────────────────────────────────────────
-    # Render message.png (text over optional gallery/wall.png)
+    # Render message.png (stable, saved in same folder as message.html)
     # ──────────────────────────────────────────────────────────────────
-
     def _generate_image(self, html: str) -> None:
+        """
+        Produces (SOURCE):
+            gallery/user/message/message.png
+
+        Fallback rules:
+        - wall.png is guaranteed (Dmessage -> wall if missing)
+        - if save fails, we also ensure message.png exists via _ensure_message_exists()
+        """
         try:
+            # Guarantee wall exists first
+            self._ensure_wall_exists()
+
             FULL_W, FULL_H = 2048, 3072
             MARGIN_LR = 100
             MARGIN_TOP = 100
@@ -559,32 +692,41 @@ class MessageTab(QtWidgets.QWidget):
             TEXT_WIDTH = FULL_W - 2 * MARGIN_LR
             TEXT_HEIGHT = FULL_H - MARGIN_TOP - MARGIN_BOTTOM
 
+            out_png = self._png_path()
+            out_png.parent.mkdir(parents=True, exist_ok=True)
+
+            # Opaque base first (prevents “transparent saved as black” surprises)
             canvas = QImage(FULL_W, FULL_H, QImage.Format_ARGB32)
-            canvas.setDevicePixelRatio(self.devicePixelRatioF() if hasattr(self, "devicePixelRatioF") else 1.0)
-            canvas.fill(Qt.transparent)
+            canvas.fill(QtGui.QColor(14, 14, 18, 255))
+
             painter = QPainter(canvas)
             painter.setRenderHint(QPainter.Antialiasing, True)
             painter.setRenderHint(QPainter.TextAntialiasing, True)
             painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
 
-            # Optional background (gallery/wall.png)
-            gallery_wall = os.path.join(self.project_root, GALLERY_DIR, "wall.png")
-            if os.path.exists(gallery_wall):
-                wall_img = QImage(gallery_wall).scaled(
-                    FULL_W, FULL_H,
-                    Qt.KeepAspectRatioByExpanding,
-                    Qt.SmoothTransformation
-                )
-                painter.drawImage(0, 0, wall_img)
-            else:
-                # Subtle dark parchment if no wall; keeps legibility consistent.
-                painter.fillRect(0, 0, FULL_W, FULL_H, QtGui.QColor(14, 14, 18, 235))
+            # Background wall (SOURCE): gallery/user/pages/wall.png
+            wall_path = self._wall_path()
+            if wall_path.exists():
+                wall_img = QImage(str(wall_path))
+                if not wall_img.isNull():
+                    wall_img = wall_img.scaled(
+                        FULL_W,
+                        FULL_H,
+                        Qt.KeepAspectRatioByExpanding,
+                        Qt.SmoothTransformation
+                    )
+                    painter.drawImage(0, 0, wall_img)
 
-            # Draw HTML text
+            # HTML text
             doc = QTextDocument()
             doc.setDefaultFont(QFont("Lucida Handwriting", 12))
-            # White text, transparent background
-            doc.setDefaultStyleSheet("body { color: white; background: transparent; }")
+
+            doc.setDefaultStyleSheet(
+                "body { color: #ffffff; background: transparent; }"
+                "p { margin: 0 0 12px 0; }"
+                "br { line-height: 1.4; }"
+            )
+
             doc.setHtml(html)
             doc.setTextWidth(TEXT_WIDTH)
             doc.setPageSize(QSizeF(TEXT_WIDTH, TEXT_HEIGHT))
@@ -594,17 +736,15 @@ class MessageTab(QtWidgets.QWidget):
             painter.setClipRect(0, 0, TEXT_WIDTH, TEXT_HEIGHT)
             doc.drawContents(painter, QtCore.QRectF(0, 0, TEXT_WIDTH, TEXT_HEIGHT))
             painter.restore()
+
             painter.end()
 
-            png_path = os.path.join(self.project_root, MESSAGE_IMAGE_FILE)
-            if not _atomic_save_image(canvas, png_path):
+            if not _atomic_save_image(canvas, str(out_png)):
                 raise RuntimeError("Failed to save message.png")
 
             self.view_btn.setEnabled(True)
-
-            full_pix = QPixmap.fromImage(canvas)
-            small_pix = full_pix.scaled(169, 253, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.preview_image.emit(small_pix)
             self.status.setText("🔍 message.png generated.")
         except Exception as e:
+            # Force existence (wall->message) if generation fails
             self.status.setText(f"❌ Error generating message.png: {e}")
+            self._ensure_message_exists()

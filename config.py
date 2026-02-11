@@ -2,11 +2,15 @@
 """
 Central configuration for the eLetter project.
 
-- Backward compatible constants used across the app (Image_tab, Message_tab,
-  sound_tab, Forge_Tab, Transmuter, etc.)
-- Loads settings.json (with defaults), writes back missing keys.
-- Standardized /output layout with helpers to create per-build work folders.
-- Safe filename/slug utilities and asset validation helpers.
+Permanent design:
+- Canonical SOURCE assets live in: gallery/user/*
+- Generated viewer bundles use normalized RUNTIME layout under: <build>/gallery/*
+  (pages/, controls/, sounds/, message/)
+
+Important:
+Some tabs (ex: sound_tab) import folder-name constants like SOUNDS_DIR.
+Those constants are kept as RUNTIME folder names (not “legacy” behavior).
+They do not point to old source locations.
 """
 
 from __future__ import annotations
@@ -14,243 +18,288 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
-# File and Folder Names (BC: used by existing modules)
+# Project + settings
 # ─────────────────────────────────────────────────────────────────────────────
-SETTINGS_FILE        = "settings.json"
-GALLERY_DIR          = "gallery"
-ICONS_DIR            = "icons"
-SOUNDS_DIR           = "sounds"
-MESSAGE_HTML_FILE    = "message.html"
-MESSAGE_IMAGE_FILE   = "message.png"
+SETTINGS_FILE = "settings.json"
 
-# Standardized output locations
-OUTPUT_DIR       = "output"
-OUTPUT_PLAY_DIR  = os.path.join(OUTPUT_DIR, "Play")   # browsable bundle
-OUTPUT_FILE_DIR  = os.path.join(OUTPUT_DIR, "File")   # single-file HTML
-OUTPUT_ZIP_DIR   = os.path.join(OUTPUT_DIR, "Zip")    # packaged zips
+DEFAULT_VOLUME = 31        # 0–100 (0 is valid)
+DEFAULT_AUDIO = "music.mp3"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Required Images & Audio (BC constants)
-# ─────────────────────────────────────────────────────────────────────────────
-REQUIRED_SLIDES = ["cover.png", "letter.png", "wall.png", "back.png"]
 
-GLISS_FILE     = "glissando.mp3"
-FLIP_PREFIX    = "flip"
-FLIP_COUNT     = 10
-MUSIC_FILE     = "music.mp3"
-SOUND_GIF      = "sound.gif"
-MAX_AUDIO_MB   = 15
-
-# Template defaults
-DEFAULT_VOLUME = 31    # percent (0–100), used if not in settings.json
-DEFAULT_AUDIO  = MUSIC_FILE
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Internal helpers for settings
-# ─────────────────────────────────────────────────────────────────────────────
 def _project_root() -> Path:
     return Path(__file__).resolve().parent
 
+
+_PROJECT_ROOT = _project_root()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Normalized RUNTIME folder names (used inside Play/File builds)
+# These are simple directory names under <build>/gallery/
+# ─────────────────────────────────────────────────────────────────────────────
+GALLERY_DIR = "gallery"
+
+# These names are required by existing tabs (e.g., sound_tab imports SOUNDS_DIR).
+# They represent RUNTIME layout, not source layout.
+PAGES_DIR = "pages"
+CONTROLS_DIR = "controls"
+SOUNDS_DIR = "sounds"
+MESSAGE_DIR = "message"
+
+# Keep these names as well because other files may import them.
+# They are also RUNTIME folder names (not the old gallery/icons concept).
+ICONS_DIR = CONTROLS_DIR  # runtime uses "controls" (we do not use "icons" anymore)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Canonical SOURCE asset tree (single source of truth on disk)
+# ─────────────────────────────────────────────────────────────────────────────
+GALLERY_USER_DIR = "gallery/user"
+
+USER_PAGES_DIR = f"{GALLERY_USER_DIR}/pages"
+USER_CONTROLS_DIR = f"{GALLERY_USER_DIR}/card/controls"
+USER_MESSAGE_DIR = f"{GALLERY_USER_DIR}/message"
+USER_SOUNDS_DIR = f"{GALLERY_USER_DIR}/sounds"
+
+# Message (SOURCE)
+MESSAGE_HTML_FILE = f"{USER_MESSAGE_DIR}/message.html"
+MESSAGE_IMAGE_FILE = f"{USER_MESSAGE_DIR}/message.png"
+
+# Pages (SOURCE)
+REQUIRED_SLIDES = ["cover.png", "letter.png", "wall.png", "back.png"]
+
+# Controls (SOURCE)
+CONTROL_FILES = [
+    "npage.png",
+    "ppage.png",
+    "cleft.png",
+    "cright.png",
+    "volon.png",
+    "voloff.png",
+    "showmessageicon.png",
+]
+
+# Audio (SOURCE)
+GLISS_FILE = "glissando.mp3"
+MUSIC_FILE = "music.mp3"
+FLIP_PREFIX = "flip"
+FLIP_COUNT = 10
+
+MAX_AUDIO_MB = 15
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Output layout (Zip removed)
+# ─────────────────────────────────────────────────────────────────────────────
+OUTPUT_DIR = "output"
+OUTPUT_PLAY_DIR = os.path.join(OUTPUT_DIR, "Play")  # browsable bundle
+OUTPUT_FILE_DIR = os.path.join(OUTPUT_DIR, "File")  # single-file HTML (inlined)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Settings
+# ─────────────────────────────────────────────────────────────────────────────
 def _load_settings(project_root: str | Path) -> Dict:
-    """
-    Load settings.json (if present), inject defaults for missing keys,
-    and write back to disk if we added anything.
-    """
     pr = Path(project_root)
     path = pr / SETTINGS_FILE
+
     try:
         data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except json.JSONDecodeError:
+    except Exception:
         data = {}
 
     updated = False
-    if "starting_volume" not in data:
-        data["starting_volume"] = DEFAULT_VOLUME
+
+    # starting_volume (0–100)
+    try:
+        v = int(data.get("starting_volume", DEFAULT_VOLUME))
+        v = max(0, min(100, v))
+    except Exception:
+        v = DEFAULT_VOLUME
+
+    if data.get("starting_volume") != v:
+        data["starting_volume"] = v
         updated = True
-    if "last_audio" not in data:
-        data["last_audio"] = DEFAULT_AUDIO
+
+    # last_audio (store filename only)
+    last_audio = data.get("last_audio", DEFAULT_AUDIO)
+    try:
+        last_audio = Path(str(last_audio)).name
+    except Exception:
+        last_audio = DEFAULT_AUDIO
+
+    if data.get("last_audio") != last_audio:
+        data["last_audio"] = last_audio
         updated = True
 
     if updated:
         try:
             path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
-            # Non-fatal: continue with in-memory defaults
             pass
 
     return data
 
-# Module init
-_PROJECT_ROOT = _project_root()
-_SETTINGS     = _load_settings(_PROJECT_ROOT)
 
-# Exposed configuration values (BC names)
-STARTING_VOLUME = _SETTINGS.get("starting_volume", DEFAULT_VOLUME)
-LAST_AUDIO      = _SETTINGS.get("last_audio", DEFAULT_AUDIO)
+_SETTINGS = _load_settings(_PROJECT_ROOT)
 
-# Optional: access the full config dict
+STARTING_VOLUME = int(_SETTINGS.get("starting_volume", DEFAULT_VOLUME))
+LAST_AUDIO = str(_SETTINGS.get("last_audio", DEFAULT_AUDIO))
 CONFIG_DICT = dict(_SETTINGS)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Output & build planning
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def ensure_output_dirs(project_root: str | Path) -> None:
-    """
-    Make sure /output/Play, /output/File, /output/Zip exist.
-    Safe to call repeatedly.
-    """
     pr = Path(project_root)
-    for sub in (OUTPUT_PLAY_DIR, OUTPUT_FILE_DIR, OUTPUT_ZIP_DIR):
+    for sub in (OUTPUT_PLAY_DIR, OUTPUT_FILE_DIR):
         (pr / sub).mkdir(parents=True, exist_ok=True)
 
-def ensure_gallery_dirs(root: str | Path) -> None:
-    """
-    Ensure the working gallery structure exists under `root`.
-    (Useful both at the project root and inside a per-build Play folder.)
-    """
-    r = Path(root)
-    (r / GALLERY_DIR / ICONS_DIR ).mkdir(parents=True, exist_ok=True)
-    (r / GALLERY_DIR / SOUNDS_DIR).mkdir(parents=True, exist_ok=True)
 
-def safe_slug(text: str | None, fallback: str = "eLetter") -> str:
+def ensure_gallery_dirs(project_root: str | Path) -> None:
     """
-    Convert arbitrary text to a filesystem-safe slug.
+    Ensures the canonical SOURCE directories exist (gallery/user/*).
+    Does not create runtime Play bundle directories; plan_build() does.
     """
+    pr = Path(project_root)
+    (pr / USER_PAGES_DIR).mkdir(parents=True, exist_ok=True)
+    (pr / USER_CONTROLS_DIR).mkdir(parents=True, exist_ok=True)
+    (pr / USER_MESSAGE_DIR).mkdir(parents=True, exist_ok=True)
+    (pr / USER_SOUNDS_DIR).mkdir(parents=True, exist_ok=True)
+
+
+def safe_slug(text: Optional[str], fallback: str = "eletter") -> str:
     if not text:
         return fallback
-    # Normalize whitespace, strip, lower
     t = re.sub(r"\s+", " ", text).strip().lower()
-    # Replace disallowed chars with hyphens
     t = re.sub(r"[^a-z0-9\-_. ]+", "", t)
     t = t.replace(" ", "-")
     return t or fallback
 
-def display_name(text: str | None, fallback: str = "eLetter") -> str:
-    """
-    Human-readable name for files like 'A Letter for {Name}.html'
-    """
+
+def display_name(text: Optional[str], fallback: str = "eLetter") -> str:
     if not text:
         return fallback
-    # Collapse whitespace and strip control characters
     name = re.sub(r"\s+", " ", text).strip()
     return name or fallback
 
-def _timestamp() -> str:
-    # yyyy-mm-dd_hh-mm-ss for readability/sorting
-    from datetime import datetime
-    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
+def _safe_clear_dir_contents(dir_path: Path) -> None:
+    """
+    Remove all files/folders inside dir_path, keeping dir_path itself.
+    This enforces: Generate overwrites the same save location (no dated folders).
+    """
+    if not dir_path.exists() or not dir_path.is_dir():
+        return
+    for entry in dir_path.iterdir():
+        try:
+            if entry.is_file() or entry.is_symlink():
+                entry.unlink(missing_ok=True)
+            elif entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build planning (Play bundle normalized layout)
+# ─────────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class BuildPaths:
-    """
-    Describes where to build/run a single output.
-    """
-    # Workspace for the Play build (everything self-contained inside here)
     play_dir: Path
     play_gallery_dir: Path
-    play_icons_dir: Path
+    play_pages_dir: Path
+    play_controls_dir: Path
+    play_message_dir: Path
     play_sounds_dir: Path
 
-    # Final single-file HTML output
-    single_file_html: Path
 
-    # ZIP output (when packaging)
-    zip_path: Path
-
-def plan_build(project_root: str | Path, recipient: str | None = None, label: str | None = None) -> BuildPaths:
+def plan_build(project_root: str | Path, *, recipient: str, title: str) -> BuildPaths:
     """
-    Create a brand-new Play workspace folder under /output/Play and
-    return paths for this build. You should write *all* generated files
-    (index.html, styles.css, script.js, gallery/...) inside `play_dir`.
+    Deterministic output path (NO timestamp):
+      output/Play/<recipient_slug>/<title_slug>/
 
-    Example layout:
-      output/
-        Play/
-          angel-hill-2025-08-11_14-03-22/
-            index.html
-            styles.css
-            script.js
-            gallery/...
-        File/
-          A Letter for Angel Hill.html
-        Zip/
-          Letter for Angel Hill.zip
+    Every Generate overwrites that folder (clears it first).
+
+    Normalized runtime layout:
+      <play_dir>/
+        index.html
+        styles.css
+        script.js
+        gallery/
+          pages/
+          controls/
+          message/
+          sounds/
     """
     pr = Path(project_root)
     ensure_output_dirs(pr)
 
-    nice_name = display_name(recipient or label, fallback="eLetter")
-    slug      = safe_slug(recipient or label, fallback="eletter")
-    stamp     = _timestamp()
+    rec_slug = safe_slug(recipient, fallback="friend")
+    ttl_slug = safe_slug(title, fallback="letter")
 
-    # Fresh workspace for this run
-    play_dir = pr / OUTPUT_PLAY_DIR / f"{slug}-{stamp}"
+    play_dir = pr / OUTPUT_PLAY_DIR / rec_slug / ttl_slug
     play_dir.mkdir(parents=True, exist_ok=True)
 
-    # Ensure the internal gallery structure lives *inside* the new play_dir
-    play_gallery = play_dir / GALLERY_DIR
-    play_icons   = play_gallery / ICONS_DIR
-    play_sounds  = play_gallery / SOUNDS_DIR
-    play_icons.mkdir(parents=True, exist_ok=True)
-    play_sounds.mkdir(parents=True, exist_ok=True)
+    # Overwrite behavior: clear previous build contents
+    _safe_clear_dir_contents(play_dir)
 
-    # Pre-resolve final outputs (outside the workspace, but stable targets)
-    single_file_html = pr / OUTPUT_FILE_DIR / f"A Letter for {nice_name}.html"
-    zip_path         = pr / OUTPUT_ZIP_DIR  / f"Letter for {nice_name}.zip"
+    play_gallery = play_dir / GALLERY_DIR
+    play_pages = play_gallery / PAGES_DIR
+    play_controls = play_gallery / CONTROLS_DIR
+    play_message = play_gallery / MESSAGE_DIR
+    play_sounds = play_gallery / SOUNDS_DIR
+
+    play_pages.mkdir(parents=True, exist_ok=True)
+    play_controls.mkdir(parents=True, exist_ok=True)
+    play_message.mkdir(parents=True, exist_ok=True)
+    play_sounds.mkdir(parents=True, exist_ok=True)
 
     return BuildPaths(
         play_dir=play_dir,
         play_gallery_dir=play_gallery,
-        play_icons_dir=play_icons,
+        play_pages_dir=play_pages,
+        play_controls_dir=play_controls,
+        play_message_dir=play_message,
         play_sounds_dir=play_sounds,
-        single_file_html=single_file_html,
-        zip_path=zip_path,
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Validation helpers (optional but handy in Forge_Tab before building)
-# ─────────────────────────────────────────────────────────────────────────────
-def validate_required_images(root: str | Path) -> List[str]:
-    """
-    Return a list of missing required slide image filenames
-    under `<root>/gallery/`.
-    """
-    base = Path(root) / GALLERY_DIR
-    missing = []
-    for fname in REQUIRED_SLIDES:
-        if not (base / fname).is_file():
-            missing.append(fname)
-    return missing
 
-def validate_audio_assets(root: str | Path) -> List[str]:
-    """
-    Check for glissando and flip sounds under `<root>/gallery/sounds/`.
-    Returns a list of missing filenames (empty if all good).
-    """
-    snd = Path(root) / GALLERY_DIR / SOUNDS_DIR
-    missing = []
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation (canonical SOURCE tree)
+# ─────────────────────────────────────────────────────────────────────────────
+def validate_required_images(project_root: str | Path) -> List[str]:
+    base = Path(project_root) / USER_PAGES_DIR
+    return [f for f in REQUIRED_SLIDES if not (base / f).is_file()]
+
+
+def validate_controls(project_root: str | Path) -> List[str]:
+    base = Path(project_root) / USER_CONTROLS_DIR
+    return [f for f in CONTROL_FILES if not (base / f).is_file()]
+
+
+def validate_audio_assets(project_root: str | Path) -> List[str]:
+    snd = Path(project_root) / USER_SOUNDS_DIR
+    missing: List[str] = []
+
     if not (snd / GLISS_FILE).is_file():
         missing.append(GLISS_FILE)
+
+    if not (snd / MUSIC_FILE).is_file():
+        missing.append(MUSIC_FILE)
+
     for i in range(1, FLIP_COUNT + 1):
         name = f"{FLIP_PREFIX}{i}.mp3"
         if not (snd / name).is_file():
             missing.append(name)
+
     return missing
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Optional object-style access
-# ─────────────────────────────────────────────────────────────────────────────
+
 class Config:
-    """
-    Object-based dynamic config that reads/writes settings.json
-    at the given project_root.
-    """
-    def __init__(self, project_root: str | Path = _PROJECT_ROOT):
+    def __init__(self, project_root: str | Path = _PROJECT_ROOT, **_ignored):
         self.project_root = Path(project_root)
         self._settings = _load_settings(self.project_root)
 
@@ -265,23 +314,53 @@ class Config:
     def as_dict(self) -> Dict:
         return dict(self._settings)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# What this module exports
-# ─────────────────────────────────────────────────────────────────────────────
+
 __all__ = [
-    # constants (BC)
-    "SETTINGS_FILE", "GALLERY_DIR", "ICONS_DIR", "SOUNDS_DIR",
-    "MESSAGE_HTML_FILE", "MESSAGE_IMAGE_FILE",
-    "OUTPUT_DIR", "OUTPUT_PLAY_DIR", "OUTPUT_FILE_DIR", "OUTPUT_ZIP_DIR",
+    # settings
+    "SETTINGS_FILE",
+    "DEFAULT_VOLUME",
+    "DEFAULT_AUDIO",
+    "STARTING_VOLUME",
+    "LAST_AUDIO",
+    "CONFIG_DICT",
+    # runtime folder names
+    "GALLERY_DIR",
+    "PAGES_DIR",
+    "CONTROLS_DIR",
+    "SOUNDS_DIR",
+    "MESSAGE_DIR",
+    "ICONS_DIR",
+    # canonical source tree
+    "GALLERY_USER_DIR",
+    "USER_PAGES_DIR",
+    "USER_CONTROLS_DIR",
+    "USER_MESSAGE_DIR",
+    "USER_SOUNDS_DIR",
     "REQUIRED_SLIDES",
-    "GLISS_FILE", "FLIP_PREFIX", "FLIP_COUNT", "MUSIC_FILE", "SOUND_GIF", "MAX_AUDIO_MB",
-    "DEFAULT_VOLUME", "DEFAULT_AUDIO",
-    "STARTING_VOLUME", "LAST_AUDIO", "CONFIG_DICT",
+    "CONTROL_FILES",
+    "MESSAGE_HTML_FILE",
+    "MESSAGE_IMAGE_FILE",
+    # audio
+    "GLISS_FILE",
+    "MUSIC_FILE",
+    "FLIP_PREFIX",
+    "FLIP_COUNT",
+    "MAX_AUDIO_MB",
+    # output
+    "OUTPUT_DIR",
+    "OUTPUT_PLAY_DIR",
+    "OUTPUT_FILE_DIR",
     # helpers
-    "ensure_output_dirs", "ensure_gallery_dirs",
-    "safe_slug", "display_name",
-    "plan_build", "BuildPaths",
-    "validate_required_images", "validate_audio_assets",
-    # object access
+    "ensure_output_dirs",
+    "ensure_gallery_dirs",
+    "safe_slug",
+    "display_name",
+    "plan_build",
+    "BuildPaths",
+    # validation
+    "validate_required_images",
+    "validate_controls",
+    "validate_audio_assets",
+    # wrapper
     "Config",
 ]

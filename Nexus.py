@@ -14,7 +14,7 @@ Notes
 
 from __future__ import annotations
 
-import os, sys, subprocess
+import os, sys, subprocess, json
 from pathlib import Path
 from typing import Optional
 
@@ -60,10 +60,11 @@ except Exception:
 # ─────────────────────────────────────────────────────────────
 # Relative asset hints & sizing
 # ─────────────────────────────────────────────────────────────
-REL_RETICLE_ICON = "gallery/icons/reticle.png"   # optional (title bar icon)
-REL_HELP_GIF     = "gallery/icons/Help.gif"      # idle (plays constantly)
-REL_HELP_HOVER   = "gallery/icons/HHelp.gif"     # hover variant (plays on hover)
-REL_HELP_PNG     = "gallery/icons/Help.png"      # final static fallback
+
+REL_RETICLE_ICON = "gallery/app/icons/reticle.png"   # optional (title bar icon)
+REL_HELP_GIF     = "gallery/app/icons/Help.gif"      # idle (plays constantly)
+REL_HELP_HOVER   = "gallery/app/icons/HHelp.gif"     # hover variant (plays on hover)
+REL_HELP_PNG     = "gallery/app/icons/Help.png"      # final static fallback
 
 WIN_W, WIN_H = 1400, 900
 _PREVIEW_AR = 169 / 253  # preview frame aspect (matches your 169×253 scaling)
@@ -292,6 +293,7 @@ class Nexus(QtWidgets.QMainWindow):
         super().__init__()
         self.project_root = str(project_root)
 
+
         # Frameless + QSS
         self.setWindowFlag(QtCore.Qt.FramelessWindowHint)
         self.setStyleSheet("""
@@ -359,6 +361,14 @@ class Nexus(QtWidgets.QMainWindow):
 
         pf_layout.addWidget(self.preview_stack)
         body_layout.addWidget(self.preview_frame, alignment=Qt.AlignHCenter)
+
+        # Caption under preview (Forge tab: project title)
+        self.preview_caption = QLabel("", alignment=Qt.AlignCenter)
+        self.preview_caption.setVisible(False)
+        self.preview_caption.setStyleSheet(
+            "color:#e0ffff; font:12px 'Segoe UI Semibold'; padding:4px 6px;"
+        )
+        body_layout.addWidget(self.preview_caption, alignment=Qt.AlignHCenter)
 
         # ─────────────────────────────────────────────────────────
         # Help (top-right above the feature panel) — dual-GIF swap
@@ -451,6 +461,8 @@ class Nexus(QtWidgets.QMainWindow):
             self.page_stack.addWidget(w)
         body_layout.addWidget(self.page_stack)
 
+        self.forge_tab.letter_loaded.connect(lambda _payload=None: self._show_forge_preview())
+
         main_layout.addWidget(self.body)
         self.setCentralWidget(main_widget)
 
@@ -468,17 +480,9 @@ class Nexus(QtWidgets.QMainWindow):
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(lambda: self._toast.setVisible(False))
 
-        # Window icon
-        ico_candidates = (
-            os.path.join(self.project_root, "gallery", "icon",  "ls-icon.ico"),   # preferred
-            os.path.join(self.project_root, "gallery", "icon",  "LSmith.ico"),
-            os.path.join(self.project_root, "gallery", "icons", "LSmith.ico"),
-            os.path.join(self.project_root, "gallery", "icons", "ls-icon.ico"),
-        )
-        for _ico in ico_candidates:
-            if os.path.exists(_ico):
-                self.setWindowIcon(QIcon(_ico))
-                break
+        # Preview fade state
+        self._fade_timer: Optional[QtCore.QTimer] = None
+        self._fade_anim: Optional[QtCore.QPropertyAnimation] = None
 
         # Overlay installer — show_prompter_launcher=False (no button)
         self._over = None
@@ -520,12 +524,25 @@ class Nexus(QtWidgets.QMainWindow):
         # Cross-tab preview wiring
         self.image_tab.image_selected.connect(self._show_image)
         self.image_tab.hover_preview_image.connect(self._show_image)
+
+        # ImageTab reset -> clear preview immediately
+        try:
+            self.image_tab.clear_preview.connect(self._on_image_tab_clear_preview)
+        except Exception:
+            pass
+
         self.message_tab.preview_image.connect(self._show_image)
         self.message_tab.wall_preview.connect(self._show_image)
         self.message_tab.text_selected.connect(self._show_html)
 
         self.sound_tab.preview_movie.connect(self._show_movie)
         self.sound_tab.preview_widget.connect(self._mount_sound_preview)
+
+        # Command: after wipe, hard-clear preview state (redundancy)
+        try:
+            self.command_tab.wiped.connect(self._on_command_wiped)
+        except Exception:
+            pass
 
         # Reflect wall image chosen in Message tab into Images tab as slot 4
         try:
@@ -570,105 +587,183 @@ class Nexus(QtWidgets.QMainWindow):
               f"over_panel={'yes' if panel else 'no'}")
 
     # ─────────────────────────────────────────────────────────
-    # Public helper: release HTML preview handles
-    # ─────────────────────────────────────────────────────────
-    def release_preview_handles(self) -> None:
-        try:
-            if self.html_preview:
-                self.html_preview.setUrl(QUrl("about:blank"))
-                self.html_preview.setHtml("")
-        except Exception:
-            pass
-
-    # ─────────────────────────────────────────────────────────
-    # Status / Toast helpers
-    # ─────────────────────────────────────────────────────────
-    def status(self, text: str) -> None:
-        if self._status:
-            self._status.showMessage(text, 5000)
-
-    def toast(self, text: str, ms: int = 1800) -> None:
-        self._toast.setText(text)
-        self._toast.adjustSize()
-        geo = self.rect()
-        m = 16
-        self._toast.move(geo.right() - self._toast.width() - m, geo.bottom() - self._toast.height() - m)
-        self._toast.setVisible(True)
-        self._toast_timer.start(ms)
-
-    # ─────────────────────────────────────────────────────────
-    # Overlay signal wiring
+    # Overlay signal plumbing (safe no-ops if overlay missing)
     # ─────────────────────────────────────────────────────────
     def _connect_overlay_signals(self) -> None:
-        panel = getattr(self, "_over", None)
-        panel = getattr(panel, "panel", None) if panel is not None else None
-        if not panel:
+        over = getattr(self, "_over", None)
+        if over is None:
+            return
+
+        # If overlay has helper / wall buttons and we need to sync them, do it here.
+        # Over_Nexus already wires these internally; this is kept for future add-ons.
+        try:
+            float_bar = getattr(over, "float_bar", None)
+            if float_bar is not None and hasattr(self, "preview_frame"):
+                self.preview_frame.installEventFilter(over)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
+    # ─────────────────────────────────────────────────────────
+    # Shortcuts
+    # ─────────────────────────────────────────────────────────
+    def _install_shortcuts(self) -> None:
+        # Ctrl+Alt+P opens prompt writer (no button)
+        sc = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Alt+P"), self)
+        sc.activated.connect(self.open_prompt_writer)
+
+        # Ctrl+H toggles help popover
+        sc2 = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+H"), self)
+        sc2.activated.connect(lambda: (self._show_help_from_icon() if not self.help_pop.isVisible() else self._hide_help_popover()))
+
+    # ─────────────────────────────────────────────────────────
+    # Status / Toast utilities
+    # ─────────────────────────────────────────────────────────
+    def status(self, msg: str) -> None:
+        try:
+            self._status.showMessage(msg, 5000)
+        except Exception:
+            pass
+
+    def toast(self, msg: str, ms: int = 1200) -> None:
+        if not msg:
             return
         try:
-            panel.wallFileSelected.connect(self._on_wall_selected)
-        except Exception:
-            pass
-        try:
-            panel.toggleSister.connect(self._toggle_message_sister)
-        except Exception:
-            pass
-        try:
-            panel.requestOpenPM.connect(self.open_prompt_writer)
+            self._toast.setText(msg)
+            self._toast.adjustSize()
+            # place top-center, below title bar
+            x = max(10, (self.width() - self._toast.width()) // 2)
+            y = 48
+            self._toast.move(x, y)
+            self._toast.setVisible(True)
+            self._toast.raise_()
+            self._toast_timer.start(ms)
         except Exception:
             pass
 
+    # ─────────────────────────────────────────────────────────
+    # Wall chosen in Message tab → store in ImageTab slot 4 (source of truth)
+    # ─────────────────────────────────────────────────────────
     def _on_wall_selected(self, path: str) -> None:
-        """Update Clarifier (Wall) image across the app (Images tab + preview)."""
         try:
-            self.image_tab.set_image_path(4, path)  # slot 4 = Wall / Clarifier
+            # ImageTab has set_image_path(slot, path)
+            self.image_tab.set_image_path(4, path)
         except Exception:
             pass
-        try:
-            pix = QPixmap(path)
-            if not pix.isNull():
-                thumb = pix.scaled(169, 253, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self._last_pixmap = thumb
-                self.message_tab.wall_preview.emit(thumb)
-        except Exception:
-            pass
-        self.status("Clarifier (Wall) updated.")
-        self.toast("Wall updated")
-
-    def _toggle_message_sister(self) -> None:
-        toggle = getattr(self.message_tab, "toggle_title_sister_area", None)
-        if callable(toggle):
-            toggle()
-            self.status("Message: Sister/Title area toggled.")
 
     # ─────────────────────────────────────────────────────────
-    # Sound visualizer → mount into preview_stack
+    # Sound preview mounting (widget-based visualizer)
     # ─────────────────────────────────────────────────────────
-    def _mount_sound_preview(self, w: QtWidgets.QWidget):
+    def _mount_sound_preview(self, widget: QtWidgets.QWidget) -> None:
+        if widget is None:
+            return
         try:
-            if w is None:
+            # Only mount once; replace if changed
+            if self._sound_preview_widget is widget and self._sound_preview_index is not None:
                 return
-            self._sound_preview_widget = w
-            idx = self.preview_stack.indexOf(w)
-            if idx == -1:
-                self.preview_stack.addWidget(w)
-                idx = self.preview_stack.indexOf(w)
-            self._sound_preview_index = idx
-            if self.tabbar.currentIndex() == 1 and self._sound_preview_index is not None:
+
+            self._sound_preview_widget = widget
+            self._sound_preview_index = self.preview_stack.addWidget(widget)
+
+            # If currently on Sound tab, show it now
+            if self.tabbar.currentIndex() == 1:
                 self.preview_stack.setCurrentIndex(self._sound_preview_index)
         except Exception as ex:
-            print(f"[SoundPreview] failed to mount: {ex}")
+            self.status(f"⚠️ Sound preview mount failed: {ex}")
+
+    def _show_movie(self, movie: QMovie):
+        if movie is None:
+            return
+        try:
+            self._clear_preview()
+            self.image_preview.setMovie(movie)
+            self.preview_stack.setCurrentWidget(self.image_preview)
+            movie.start()
+        except Exception:
+            pass
 
     # ─────────────────────────────────────────────────────────
-    # Previews (movie/image/html) + subtle fade polish
+    # Message double-click → full dialog preview
     # ─────────────────────────────────────────────────────────
-    def _show_movie(self, movie):
+    def _on_message_double_click(self):
+        try:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Message Preview")
+            dlg.resize(900, 700)
+
+            lay = QVBoxLayout(dlg)
+            view = QWebEngineView(dlg)
+            lay.addWidget(view)
+
+            # Clone current html from main view
+            url = getattr(self.message_tab, "last_preview_url", None)
+            if isinstance(url, QUrl):
+                view.setUrl(url)
+            else:
+                view.setHtml("<html><body style='background:#1e1e1e; color:#e0ffff; font-family:Segoe UI;'>"
+                             "<h3>No preview URL available</h3></body></html>")
+
+            self.status("Message preview opened.")
+            dlg.exec()
+        except Exception as ex:
+            self.status(f"❌ Message preview failed: {ex}")
+
+    # ─────────────────────────────────────────────────────────
+    # Tabs — show correct preview per tab + update help visibility/content
+    # ─────────────────────────────────────────────────────────
+    def _tab_changed(self, idx: int):
+        # Always hard-clear any previous preview when switching tabs.
+        # (Sound tab is the only one that can intentionally re-mount its widget.)
+        self._last_pixmap = None
         self._clear_preview()
-        self.image_preview.clear()
-        self.preview_stack.setCurrentWidget(self.image_preview)
-        self.image_preview.setMovie(movie)
-        movie.start()
-        self.status("Playing movie preview…")
+        self.preview_stack.setCurrentIndex(0)  # blank
+        self.preview_caption.setVisible(False)
 
+        # Hide preview only on "Command" tab (index 4)
+        self.preview_frame.setVisible(idx != 4)
+
+        if self._tabswitch:
+            self._tabswitch.go_to(idx)
+        else:
+            self.page_stack.setCurrentIndex(idx)
+
+        tab_name = self.tabbar.tabText(idx)
+        self.status(f"Switched to: {tab_name}")
+
+        # Per-tab preview rules:
+        # - Images: start blank; ImageTab will emit preview on hover/selection.
+        # - Sound: show the mounted visualizer widget.
+        # - Message: show current message state (message.png if present; else wall fallback).
+        # - Forge: show cover.png + project title underneath.
+        # - Command: preview hidden; still hard-cleared.
+        if idx == 0:
+            self.preview_stack.setCurrentIndex(0)  # blank
+
+        elif idx == 1:
+            if self._sound_preview_index is not None:
+                self.preview_stack.setCurrentIndex(self._sound_preview_index)
+            else:
+                self.preview_stack.setCurrentIndex(0)
+
+        elif idx == 2:
+            # Let MessageTab decide what to show; it will emit preview_image.
+            QtCore.QTimer.singleShot(0, self._request_message_preview)
+
+        elif idx == 3:
+            # Forge: show cover + title
+            QtCore.QTimer.singleShot(0, self._show_forge_preview)
+
+        else:
+            self.preview_stack.setCurrentIndex(0)
+
+        # Help: show on all tabs except Command
+        self.help_icon.setVisible(idx != 4)
+        if self.help_pop.isVisible():
+            self._refresh_help_text(idx)
+            self._reposition_help_popover()
+
+    # ─────────────────────────────────────────────────────────
+    # Preview rendering (image/html) + fade behavior
+    # ─────────────────────────────────────────────────────────
     def _show_image(self, pixmap: QPixmap):
         if not isinstance(pixmap, QPixmap) or pixmap.isNull():
             return
@@ -703,6 +798,11 @@ class Nexus(QtWidgets.QMainWindow):
         self._fade_anim.finished.connect(self._clear_preview)
         self._fade_anim.start()
 
+    def _on_image_tab_clear_preview(self) -> None:
+        # Hard-clear: also drop last pixmap so resize can't resurrect it
+        self._last_pixmap = None
+        self._clear_preview()
+
     def _clear_preview(self):
         if hasattr(self, "_fade_timer") and self._fade_timer and self._fade_timer.isActive():
             self._fade_timer.stop()
@@ -715,128 +815,64 @@ class Nexus(QtWidgets.QMainWindow):
             self.image_preview.setGraphicsEffect(None)
         self.image_preview.clear()
 
-    # ─────────────────────────────────────────────────────────
-    # Tabs — show correct preview per tab + update help visibility/content
-    # ─────────────────────────────────────────────────────────
-    def _tab_changed(self, idx: int):
-        # Hide preview only on "Command" tab (index 4)
-        self.preview_frame.setVisible(idx != 4)
-
-        if self._tabswitch:
-            self._tabswitch.go_to(idx)
-        else:
-            self.page_stack.setCurrentIndex(idx)
-
-        tab_name = self.tabbar.tabText(idx)
-        self.status(f"Switched to: {tab_name}")
-
-        if idx == 1 and self._sound_preview_index is not None:
-            # Sound tab: show mounted visualizer
-            self.preview_stack.setCurrentIndex(self._sound_preview_index)
-        else:
-            # Default to image preview (if we have one)
-            self.preview_stack.setCurrentWidget(self.image_preview)
-
-        # Help: show on all tabs except Command
-        self.help_icon.setVisible(idx != 4)
-        if self.help_pop.isVisible():
-            # Update content live when switching tabs while the window is open
-            self._refresh_help_text(idx)
-            self._reposition_help_popover()
-
-    # ─────────────────────────────────────────────────────────
-    # Shortcuts (no visible PWriter button)
-    # ─────────────────────────────────────────────────────────
-    def _install_shortcuts(self) -> None:
-        QtGui.QShortcut(QtGui.QKeySequence(Qt.Key_Escape), self, activated=self._esc_handler)
+    def _on_command_wiped(self) -> None:
+        """Redundancy: Command tab wiped data; also hard-clear any preview residue."""
+        self._last_pixmap = None
+        self._clear_preview()
         try:
-            # Over_Nexus overlay control
-            QtGui.QShortcut(QtGui.QKeySequence("Ctrl+P"), self, activated=self._open_over_nexus)
-            QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+P"), self, activated=self._toggle_over_nexus)
-            # Optional: open Prompt Writer inline (no launcher button)
-            QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Alt+P"), self, activated=self.open_prompt_writer)
+            self.preview_stack.setCurrentIndex(0)
+        except Exception:
+            pass
+        try:
+            self.preview_caption.setVisible(False)
         except Exception:
             pass
 
-    def _esc_handler(self) -> None:
-        # Close Help popover first if visible
-        if self.help_pop.isVisible():
-            self._hide_help_popover()
-            return
-        # Then overlay
-        over = getattr(self, "_over", None)
-        if over and hasattr(over, "panel") and over.panel and over.panel.isVisible():
-            try:
-                over.panel.popdown()
-                return
-            except Exception:
-                pass
-
-    def _open_over_nexus(self) -> None:
-        over = getattr(self, "_over", None)
-        if over and hasattr(over, "panel") and over.panel and not over.panel.isVisible():
-            try:
-                over.panel.popup()
-            except Exception:
-                over.panel.show()
-
-    def _toggle_over_nexus(self) -> None:
-        over = getattr(self, "_over", None)
-        if over and hasattr(over, "panel") and over.panel:
-            try:
-                over.panel.toggle()
-            except Exception:
-                over.panel.setVisible(not over.panel.isVisible())
-
-    # ─────────────────────────────────────────────────────────
-    # Message double-click → full view dialog
-    # ─────────────────────────────────────────────────────────
-    def _on_message_double_click(self):
+    def _request_message_preview(self) -> None:
+        """Ask MessageTab to emit whichever preview it thinks is correct."""
         try:
-            # Preferred: open your editor if provided by Message tab
-            if hasattr(self.message_tab, "open_message_editor") and callable(self.message_tab.open_message_editor):
-                self.message_tab.open_message_editor()
-                self.status("Message editor opened.")
-                self.toast("Editor opened")
+            if hasattr(self.message_tab, "refresh_preview"):
+                self.message_tab.refresh_preview()  # type: ignore[attr-defined]
+                return
+            if hasattr(self.message_tab, "_emit_best_preview"):
+                self.message_tab._emit_best_preview()  # type: ignore[attr-defined]
+                return
+            if hasattr(self.message_tab, "_emit_preview"):
+                self.message_tab._emit_preview()  # type: ignore[attr-defined]
                 return
         except Exception:
             pass
 
-        # Fallback: snapshot HTML into a simple dialog for copying
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Message (Full View)")
-        dlg.resize(720, 540)
+    def _show_forge_preview(self) -> None:
+        """Forge tab: show cover.png and the project title underneath."""
+        cover_path = os.path.join(self.project_root, "gallery", "user", "pages", "cover.png")
+        pm = QPixmap(cover_path)
+        if not pm.isNull():
+            self._show_image(pm)
+        else:
+            self._last_pixmap = None
+            self._clear_preview()
+            self.preview_stack.setCurrentIndex(0)
 
-        layout = QVBoxLayout(dlg)
-        view = QWebEngineView(dlg)
-        layout.addWidget(view)
+        title_text = self._read_project_title()
+        if title_text:
+            self.preview_caption.setText(title_text)
+            self.preview_caption.setVisible(True)
+        else:
+            self.preview_caption.setVisible(False)
 
-        box = QDialogButtonBox(QDialogButtonBox.Close)
-        btn_copy = QPushButton("Copy HTML")
-        box.addButton(btn_copy, QDialogButtonBox.ActionRole)
-        layout.addWidget(box)
-
+    def _read_project_title(self) -> str:
+        """Read recipient_title from settings.json (best available 'project title' signal)."""
         try:
-            self.html_preview.page().toHtml(lambda html: view.setHtml(html))
+            settings_path = os.path.join(self.project_root, "settings.json")
+            if os.path.exists(settings_path):
+                data = json.loads(Path(settings_path).read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    t = str(data.get("recipient_title", "")).strip()
+                    return t
         except Exception:
-            view.setHtml("<p><em>No content available.</em></p>")
-
-        def _copy_html():
-            try:
-                def _got_html(html: str):
-                    cb = QtWidgets.QApplication.clipboard()
-                    cb.setText(html or "", mode=cb.Clipboard)
-                    self.status("Message HTML copied.")
-                    self.toast("Copied")
-                view.page().toHtml(_got_html)
-            except Exception:
-                pass
-
-        btn_copy.clicked.connect(_copy_html)
-        box.rejected.connect(dlg.reject)
-
-        self.status("Message preview opened.")
-        dlg.exec()
+            pass
+        return ""
 
     # ─────────────────────────────────────────────────────────
     # Resize/Move: keep preview aspect; keep popover aligned

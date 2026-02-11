@@ -1,20 +1,49 @@
 # ===============================
 # File: command.py
-# Purpose: "The Commandment" — project reset + compatibility helpers
-# Exports: CommandTab (for Nexus), confirm_and_reset, reset_everything, open_saved_letters
-# Framework: PySide6
+# Purpose: "The Commandment" — UI + surgical reset
+#
+# REQUIRED EXPORTS (Forge_Tab.py imports these):
+#   - confirm_and_reset
+#   - open_saved_letters
+#
+# POLICY (FINAL):
+# ✅ Delete ONLY:
+#   - contents of gallery/user/pages/
+#   - contents of gallery/user/message/
+#   - gallery/user/sounds/music.mp3
+#
+# ❌ Must NOT delete:
+#   - glissando.mp3
+#   - flip1..flip10.mp3
+#   - gallery/user/sounds/appssong/ (or anything inside it)
+#   - gallery/user/card/controls/
+#
+# Also:
+# - Clear recipient + title in settings.json (recipient_name + recipient_title)
+# - Force starting_volume to 30
+# - If music_volume exists, force it to 30 as well
+#
+# COMMAND TAB UI (FINAL):
+# - command.png is BACKGROUND (not clickable)
+# - GO.png is the BUTTON, centered (clickable)
+# - GO press animation only: depress on mouse down, pop back on release
+# - GO is truly transparent (no gray square ever)
+# - Entire tab is NOT clickable
+# - Popup: single sentence only (no list)
+# - Popup: no corner squares (zero outer margins + translucent)
 # ===============================
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import shutil
 from pathlib import Path
 from typing import Optional, Tuple
 
-from PySide6 import QtCore, QtWidgets
-from PySide6.QtCore import Qt
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import Qt, QUrl
 
 __all__ = [
     "CommandTab",
@@ -24,115 +53,53 @@ __all__ = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config integration (safe fallbacks)
+# Config (authoritative; safe fallbacks)
 # ─────────────────────────────────────────────────────────────────────────────
-
-# We prefer pulling paths from config, but gracefully fall back to literals.
 try:
     from config import (
         SETTINGS_FILE,
-        GALLERY_DIR,
-        SOUNDS_DIR,
-        OUTPUT_PLAY_DIR,
+        USER_PAGES_DIR,
+        USER_MESSAGE_DIR,
+        USER_SOUNDS_DIR,
+        MUSIC_FILE,
         OUTPUT_FILE_DIR,
-        OUTPUT_ZIP_DIR,
-        ensure_output_dirs,
     )
 except Exception:
     SETTINGS_FILE = "settings.json"
-    GALLERY_DIR = "gallery"
-    SOUNDS_DIR = "sounds"
-    OUTPUT_PLAY_DIR = Path("output") / "Play"
-    OUTPUT_FILE_DIR = Path("output") / "File"
-    OUTPUT_ZIP_DIR = Path("output") / "Zip"
-
-    def ensure_output_dirs(_root: Path) -> None:
-        for p in (OUTPUT_PLAY_DIR, OUTPUT_FILE_DIR, OUTPUT_ZIP_DIR):
-            (_root / p).mkdir(parents=True, exist_ok=True)
+    USER_PAGES_DIR = "gallery/user/pages"
+    USER_MESSAGE_DIR = "gallery/user/message"
+    USER_SOUNDS_DIR = "gallery/user/sounds"
+    MUSIC_FILE = "music.mp3"
+    OUTPUT_FILE_DIR = os.path.join("output", "File")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Root resolver
 # ─────────────────────────────────────────────────────────────────────────────
-
 def app_root() -> Path:
-    """
-    Resolve the project root robustly:
-      1) Frozen bundle base (PyInstaller) if present
-      2) Folder that contains Main.py or Nexus.py (search upward)
-      3) Parent of this file
-    """
-    # 1) PyInstaller bundle directory
     base = getattr(sys, "_MEIPASS", None)
     if base:
-        base = Path(base)
-        if (base / "Main.py").exists() or (base / "Nexus.py").exists():
-            return base
+        cwd = Path.cwd()
+        if (cwd / "gallery").exists() or (cwd / SETTINGS_FILE).exists():
+            return cwd
+        return Path(base)
 
-    # 2) Walk upward from this file
     here = Path(__file__).resolve()
     for up in (here.parent, here.parent.parent, here.parent.parent.parent):
-        if (up / "Main.py").exists() or (up / "Nexus.py").exists():
+        if (up / "Main.py").exists() or (up / "Nexus.py").exists() or (up / SETTINGS_FILE).exists():
             return up
-
-    # 3) Fallback
     return here.parent
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Reset policy (whitelists)
+# File helpers (surgical)
 # ─────────────────────────────────────────────────────────────────────────────
-
-# Only delete these files inside gallery/
-GALLERY_DELETE_FILES = [
-    "cover.png",
-    "letter.png",
-    "wall.png",
-    "back.png",
-    "message.html",
-    "message.png",
-    "music.mp3",
-]
-
-# Only these directories inside gallery/
-GALLERY_DELETE_DIRS = [
-    SOUNDS_DIR,  # contains flip 1–10, glissando, etc. (rebuilt as needed)
-]
-
-# Output pipeline: clear contents but keep the folders themselves.
-OUTPUT_FOLDERS_TO_CLEAR = [
-    OUTPUT_PLAY_DIR,
-    OUTPUT_FILE_DIR,
-    OUTPUT_ZIP_DIR,
-]
-
-# Temp/build artifacts safe to remove; recreated by the app as needed.
-TEMP_ITEMS_TO_CLEAR = [
-    Path("converted64"),
-    Path("build_temp"),
-    Path("dist_temp"),
-    Path("MAX") / "temp",
-]
-TEMP_FILES_TO_CLEAR = [
-    Path("converted64") / "convert64.py",
-]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _safe_clear_dir_contents(dir_path: Path) -> Tuple[int, int]:
-    """
-    Remove all files and subfolders inside dir_path, keeping dir_path itself.
-    Returns (files_deleted, dirs_deleted).
-    """
     files_deleted = 0
     dirs_deleted = 0
     if not dir_path.exists() or not dir_path.is_dir():
         return files_deleted, dirs_deleted
 
-    # Iterate defensively; ignore per-entry errors
     for entry in dir_path.iterdir():
         try:
             if entry.is_file() or entry.is_symlink():
@@ -142,256 +109,116 @@ def _safe_clear_dir_contents(dir_path: Path) -> Tuple[int, int]:
                 shutil.rmtree(entry, ignore_errors=True)
                 dirs_deleted += 1
         except Exception:
-            # Non-fatal; continue
             pass
-    return files_deleted, dirs_deleted
-
-
-def _wipe_gallery(gallery_dir: Path) -> Tuple[int, int]:
-    files_deleted = 0
-    dirs_deleted = 0
-
-    # Delete whitelisted files
-    for name in GALLERY_DELETE_FILES:
-        target = gallery_dir / name
-        if target.exists() and target.is_file():
-            try:
-                target.unlink()
-                files_deleted += 1
-            except Exception:
-                pass
-
-    # Delete whitelisted subdirectories (e.g., gallery/sounds/)
-    for name in GALLERY_DELETE_DIRS:
-        target = gallery_dir / name
-        if target.exists() and target.is_dir():
-            try:
-                shutil.rmtree(target, ignore_errors=True)
-                dirs_deleted += 1
-            except Exception:
-                pass
 
     return files_deleted, dirs_deleted
 
 
-def _wipe_outputs(root: Path) -> Tuple[int, int]:
-    files_deleted = 0
-    dirs_deleted = 0
-    # Ensure output folder skeleton exists before clearing
-    ensure_output_dirs(root)
-    for rel in OUTPUT_FOLDERS_TO_CLEAR:
-        target = (root / rel).resolve()
-        f, d = _safe_clear_dir_contents(target)
-        files_deleted += f
-        dirs_deleted += d
-    return files_deleted, dirs_deleted
+def _safe_delete_file(path: Path) -> int:
+    try:
+        if path.exists() and path.is_file():
+            path.unlink(missing_ok=True)
+            return 1
+    except Exception:
+        pass
+    return 0
 
 
-def _wipe_temps(root: Path) -> Tuple[int, int]:
-    files_deleted = 0
-    dirs_deleted = 0
+def _read_settings(path: Path) -> dict:
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
 
-    # Remove listed directories/files if present
-    for rel in TEMP_ITEMS_TO_CLEAR:
-        target = (root / rel).resolve()
-        if target.exists():
-            if target.is_dir():
-                try:
-                    shutil.rmtree(target, ignore_errors=True)
-                    dirs_deleted += 1
-                except Exception:
-                    pass
-            else:
-                try:
-                    target.unlink(missing_ok=True)
-                    files_deleted += 1
-                except Exception:
-                    pass
 
-    for rel in TEMP_FILES_TO_CLEAR:
-        target = (root / rel).resolve()
-        if target.exists() and target.is_file():
-            try:
-                target.unlink(missing_ok=True)
-                files_deleted += 1
-            except Exception:
-                pass
+def _write_settings(path: Path, data: dict) -> None:
+    try:
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
-    return files_deleted, dirs_deleted
+
+def _reset_settings(root: Path) -> None:
+    """
+    - Clear recipient/title
+    - Force starting_volume to 30
+    - If music_volume exists, force to 30
+    """
+    settings_path = (root / SETTINGS_FILE).resolve()
+    data = _read_settings(settings_path)
+
+    data["recipient_name"] = ""
+    data["recipient_title"] = ""
+
+    data["starting_volume"] = 30
+    if "music_volume" in data:
+        data["music_volume"] = 30
+
+    _write_settings(settings_path, data)
+
+
+def _poke_ui_clear_fields(parent: Optional[QtWidgets.QWidget]) -> None:
+    """
+    Best-effort UI cleanup: if the confirm dialog was launched from within the app,
+    clear any LineEdits that look like recipient/title fields.
+    """
+    if parent is None:
+        return
+    win = parent.window()
+    try:
+        for e in win.findChildren(QtWidgets.QLineEdit):
+            n = (e.objectName() or "").lower()
+            if ("recipient" in n) or ("title" in n):
+                e.setText("")
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public API
+# Public: reset action
 # ─────────────────────────────────────────────────────────────────────────────
-
 def reset_everything(*, parent: Optional[QtWidgets.QWidget] = None) -> Tuple[int, int]:
-    """
-    Wipe all progress artifacts according to the policy above.
-    Returns (files_deleted, dirs_deleted).
-    """
     root = app_root()
+
+    pages_dir = (root / USER_PAGES_DIR).resolve()
+    msg_dir = (root / USER_MESSAGE_DIR).resolve()
+    snd_dir = (root / USER_SOUNDS_DIR).resolve()
+    music_path = (snd_dir / MUSIC_FILE).resolve()
+
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    msg_dir.mkdir(parents=True, exist_ok=True)
+    snd_dir.mkdir(parents=True, exist_ok=True)
+
     total_files = 0
     total_dirs = 0
 
-    # 1) Gallery (whitelist-based)
-    gallery = root / GALLERY_DIR
-    f, d = _wipe_gallery(gallery)
+    # Wipe user pages
+    f, d = _safe_clear_dir_contents(pages_dir)
     total_files += f
     total_dirs += d
 
-    # 2) Output pipeline (clear contents, keep folders)
-    f, d = _wipe_outputs(root)
+    # Wipe user message folder (THIS IS THE MISSING PIECE YOU ASKED FOR)
+    f, d = _safe_clear_dir_contents(msg_dir)
     total_files += f
     total_dirs += d
 
-    # 3) Temp/build artifacts
-    f, d = _wipe_temps(root)
-    total_files += f
-    total_dirs += d
+    # Wipe only music.mp3 (do NOT touch appssong, glissando, flips)
+    total_files += _safe_delete_file(music_path)
+
+    _reset_settings(root)
+    _poke_ui_clear_fields(parent)
 
     return total_files, total_dirs
 
 
-def confirm_and_reset(parent: Optional[QtWidgets.QWidget] = None) -> None:
-    """
-    Frameless, minimal confirmation dialog.
-    On "Yes": perform reset and show a brief toast. On "No": close silently.
-    """
-    dlg = QtWidgets.QDialog(parent)
-    dlg.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
-    dlg.setModal(True)
-    dlg.setAttribute(Qt.WA_TranslucentBackground, True)
-    dlg.setObjectName("CommandmentDialog")
-
-    # ── Styling ─────────────────────────────────────────────────────────────
-    container = QtWidgets.QFrame()
-    container.setObjectName("container")
-    container.setStyleSheet("""
-        QFrame#container {
-            background-color: #1b1b1d;
-            border: 1px solid #2b2b2e;
-            border-radius: 10px;
-        }
-        QLabel#title {
-            color: #eaeaf0;
-            font-size: 14px;
-            font-weight: 600;
-        }
-        QPushButton {
-            background: #2a2a2e;
-            border: 1px solid #3a3a3f;
-            border-radius: 8px;
-            padding: 6px 14px;
-            color: #e2e2e8;
-        }
-        QPushButton:hover { border-color: #56565f; }
-        QPushButton:pressed { background: #222226; }
-        QPushButton#danger {
-            background: #3a1f23;
-            border-color: #6b2a31;
-            color: #ffdee2;
-        }
-        QPushButton#danger:hover { background: #4a272c; }
-    """)
-
-    v = QtWidgets.QVBoxLayout(container)
-    v.setContentsMargins(16, 16, 16, 12)
-    v.setSpacing(10)
-
-    label = QtWidgets.QLabel("Are you sure? This will erase everything.")
-    label.setObjectName("title")
-    label.setWordWrap(True)
-    v.addWidget(label)
-
-    btns = QtWidgets.QHBoxLayout()
-    btns.setSpacing(10)
-    btn_no = QtWidgets.QPushButton("No")
-    btn_yes = QtWidgets.QPushButton("Yes")
-    btn_yes.setObjectName("danger")
-    btn_no.setAutoDefault(True)   # Default focus on “No” to reduce accidents
-    btns.addStretch(1)
-    btns.addWidget(btn_no)
-    btns.addWidget(btn_yes)
-    v.addLayout(btns)
-
-    root_layout = QtWidgets.QVBoxLayout(dlg)
-    root_layout.setContentsMargins(6, 6, 6, 6)
-    root_layout.addWidget(container)
-
-    # ── Wiring & keys ───────────────────────────────────────────────────────
-    btn_no.clicked.connect(dlg.reject)
-    btn_yes.clicked.connect(dlg.accept)
-
-    # Escape → No, Enter → Yes
-    dlg.reject = lambda: QtWidgets.QDialog.reject(dlg)  # type: ignore
-    dlg.accept = lambda: QtWidgets.QDialog.accept(dlg)  # type: ignore
-    dlg.setTabOrder(btn_no, btn_yes)
-
-    # Size/position small and centered over parent
-    dlg.resize(380, 120)
-    if parent is not None:
-        cp = parent.mapToGlobal(parent.rect().center())
-        dlg.move(cp.x() - dlg.width() // 2, cp.y() - dlg.height() // 2)
-
-    if dlg.exec() == QtWidgets.QDialog.Accepted:
-        files, dirs = reset_everything(parent=parent)
-        _toast(parent, f"Reset complete — removed {files} files, {dirs} folders.")
-    else:
-        # No-op
-        pass
-
-
-def _toast(parent: Optional[QtWidgets.QWidget], text: str, msecs: int = 1800) -> None:
-    """
-    Simple ephemeral toast using a frameless, auto-closing dialog.
-    """
-    tip = QtWidgets.QDialog(parent)
-    tip.setWindowFlags(Qt.FramelessWindowHint | Qt.ToolTip)
-    tip.setAttribute(Qt.WA_TranslucentBackground, True)
-
-    body = QtWidgets.QFrame()
-    body.setObjectName("toast")
-    body.setStyleSheet("""
-        QFrame#toast {
-            background-color: #17171a;
-            border: 1px solid #2c2c31;
-            border-radius: 8px;
-        }
-        QLabel {
-            color: #eaeaf0;
-            padding: 8px 12px;
-        }
-    """)
-    lbl = QtWidgets.QLabel(text)
-    lay = QtWidgets.QVBoxLayout(body)
-    lay.setContentsMargins(10, 6, 10, 6)
-    lay.addWidget(lbl)
-
-    outer = QtWidgets.QVBoxLayout(tip)
-    outer.setContentsMargins(6, 6, 6, 6)
-    outer.addWidget(body)
-
-    # Position near bottom-right of parent (or screen)
-    if parent is not None:
-        pos = parent.mapToGlobal(parent.rect().bottomRight())
-    else:
-        scr = QtWidgets.QApplication.primaryScreen().availableGeometry()
-        pos = scr.bottomRight()
-
-    tip.adjustSize()
-    tip.move(pos.x() - tip.width() - 24, pos.y() - tip.height() - 24)
-
-    QtCore.QTimer.singleShot(msecs, tip.close)
-    tip.show()
-
-
-def open_saved_letters() -> None:
-    """
-    Legacy helper kept for compatibility with older Forge_Tab.py.
-    Opens output/File in the OS file explorer.
-    """
+# ─────────────────────────────────────────────────────────────────────────────
+# Public: open_saved_letters (Forge_Tab.py import compatibility)
+# ─────────────────────────────────────────────────────────────────────────────
+def open_saved_letters(parent: Optional[QtWidgets.QWidget] = None) -> None:
     root = app_root()
-    target = root / OUTPUT_FILE_DIR if isinstance(OUTPUT_FILE_DIR, Path) else root / Path(OUTPUT_FILE_DIR)
+    target = (root / OUTPUT_FILE_DIR).resolve()
     target.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -404,95 +231,309 @@ def open_saved_letters() -> None:
             import subprocess
             subprocess.run(["xdg-open", str(target)], check=False)
     except Exception:
-        # Best-effort fallback
-        QtWidgets.QDesktopWidget()  # ensure QApplication exists if possible
         try:
-            from PySide6.QtGui import QDesktopServices
-            from PySide6.QtCore import QUrl
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+            QtGui.QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
         except Exception:
             pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UI: CommandTab (for Nexus import)
+# Frameless confirm dialog (single sentence, no list)
 # ─────────────────────────────────────────────────────────────────────────────
-
-class CommandTab(QtWidgets.QWidget):
-    """
-    Minimal, professional Command tab that shows a short explanation and a single
-    “Commandment” button. Clicking it opens the frameless confirmation dialog and,
-    on Yes, wipes progress (gallery whitelist, outputs, temps).
-    """
-    def __init__(self, project_root: Path, parent: Optional[QtWidgets.QWidget] = None):
+class _ConfirmDialog(QtWidgets.QDialog):
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
-        self.project_root = Path(project_root)
 
-        self.setObjectName("CommandTab")
-        self.setStyleSheet("""
-        QWidget#CommandTab {
-            background-color: #111113;
-        }
-        QLabel#title {
-            color: #eaeaf0;
-            font-size: 14px;
-            font-weight: 600;
-        }
-        QLabel#desc {
-            color: #b9bac4;
-        }
-        QPushButton {
-            background: #232327;
-            border: 1px solid #37373d;
-            border-radius: 10px;
-            color: #e8e8ee;
-            padding: 10px 14px;
-            font-weight: 600;
-        }
-        QPushButton:hover { border-color: #54545c; }
-        QPushButton:pressed { background: #1d1d21; }
-        QPushButton#danger {
-            background: #3a1f23;
-            border-color: #6b2a31;
-            color: #ffdde2;
-        }
-        QPushButton#danger:hover { background: #4a272c; }
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setModal(True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        panel = QtWidgets.QFrame(self)
+        panel.setObjectName("panel")
+        panel.setStyleSheet("""
+            QFrame#panel {
+                background: rgba(15, 17, 22, 246);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 14px;
+            }
+            QLabel {
+                color: #e6e6e6;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QPushButton {
+                background: rgba(27, 31, 42, 1.0);
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                border-radius: 10px;
+                padding: 8px 14px;
+                color: #e6e6e6;
+                font-weight: 700;
+                min-width: 86px;
+            }
+            QPushButton:hover { border-color: rgba(255, 77, 79, 0.85); }
+            QPushButton#danger { border-color: rgba(255, 77, 79, 0.55); }
+            QPushButton#danger:hover { border-color: rgba(255, 77, 79, 1.0); }
         """)
 
-        v = QtWidgets.QVBoxLayout(self)
-        v.setContentsMargins(16, 16, 16, 16)
-        v.setSpacing(10)
+        inner = QtWidgets.QVBoxLayout(panel)
+        inner.setContentsMargins(18, 16, 18, 14)
+        inner.setSpacing(12)
 
-        title = QtWidgets.QLabel("The Commandment")
-        title.setObjectName("title")
-        desc = QtWidgets.QLabel(
-            "Reset the project’s progress artifacts. This erases gallery images (whitelist), "
-            "output folders’ contents, and temp/build caches. Source code and icons are untouched."
-        )
-        desc.setObjectName("desc")
-        desc.setWordWrap(True)
+        title = QtWidgets.QLabel("Are you sure you want to wipe the letter?")
+        title.setWordWrap(True)
 
-        v.addWidget(title)
-        v.addWidget(desc)
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        btn_no = QtWidgets.QPushButton("No")
+        btn_yes = QtWidgets.QPushButton("Yes")
+        btn_yes.setObjectName("danger")
+        row.addWidget(btn_no)
+        row.addWidget(btn_yes)
 
-        btn = QtWidgets.QPushButton("Commandment — Reset Now")
-        btn.setObjectName("danger")
-        btn.setFixedHeight(40)
-        btn.clicked.connect(lambda: confirm_and_reset(self))
+        inner.addWidget(title)
+        inner.addLayout(row)
 
-        v.addSpacing(6)
-        v.addWidget(btn, 0, Qt.AlignLeft)
-        v.addStretch(1)
+        outer.addWidget(panel)
+
+        btn_no.clicked.connect(self.reject)
+        btn_yes.clicked.connect(self.accept)
+
+        self.resize(420, 140)
+
+
+def _toast(parent: Optional[QtWidgets.QWidget], text: str, msecs: int = 1400) -> None:
+    tip = QtWidgets.QDialog(parent)
+    tip.setWindowFlags(Qt.FramelessWindowHint | Qt.ToolTip)
+    tip.setAttribute(Qt.WA_TranslucentBackground, True)
+
+    outer = QtWidgets.QVBoxLayout(tip)
+    outer.setContentsMargins(0, 0, 0, 0)
+
+    body = QtWidgets.QFrame()
+    body.setStyleSheet("""
+        QFrame {
+            background: rgba(15, 17, 22, 246);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+        }
+        QLabel {
+            color:#e6e6e6;
+            padding: 10px 12px;
+            font-weight: 700;
+        }
+    """)
+    lbl = QtWidgets.QLabel(text)
+    lay = QtWidgets.QVBoxLayout(body)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.addWidget(lbl)
+    outer.addWidget(body)
+
+    tip.adjustSize()
+
+    if parent is not None:
+        pos = parent.mapToGlobal(parent.rect().bottomRight())
+        tip.move(pos.x() - tip.width() - 22, pos.y() - tip.height() - 22)
+    else:
+        scr = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        tip.move(scr.right() - tip.width() - 22, scr.bottom() - tip.height() - 22)
+
+    QtCore.QTimer.singleShot(msecs, tip.close)
+    tip.show()
+
+
+def confirm_and_reset(parent: Optional[QtWidgets.QWidget] = None) -> None:
+    dlg = _ConfirmDialog(parent)
+    if parent is not None:
+        cp = parent.mapToGlobal(parent.rect().center())
+        dlg.move(cp.x() - dlg.width() // 2, cp.y() - dlg.height() // 2)
+
+    if dlg.exec() == QtWidgets.QDialog.Accepted:
+        files, _dirs = reset_everything(parent=parent)
+        _toast(parent, f"Wiped. ({files} files)")
+
+        # IMPORTANT: tell Nexus to hard-clear preview (redundancy)
+        try:
+            if parent is not None and hasattr(parent, "wiped"):
+                parent.wiped.emit()  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI entrypoint (optional)
+# Press-only GO button (depress on mouse down, pop back on release)
 # ─────────────────────────────────────────────────────────────────────────────
+class _PressGoLabel(QtWidgets.QLabel):
+    clicked = QtCore.Signal()
 
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.PointingHandCursor)
+
+        # CRITICAL: true transparency (no gray square ever)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet("background: transparent;")
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+
+        self._base_rect = QtCore.QRect(0, 0, 0, 0)
+        self._pix_base: Optional[QtGui.QPixmap] = None
+
+        self._scale_anim = QtCore.QVariantAnimation(self)
+        self._scale_anim.setEasingCurve(QtCore.QEasingCurve.InOutQuad)
+        self._scale_anim.valueChanged.connect(self._apply_scale)
+
+        self._scale = 1.0
+        self._pressed = False
+
+    def set_base(self, base_rect: QtCore.QRect, pix: QtGui.QPixmap) -> None:
+        self._base_rect = QtCore.QRect(base_rect)
+        self._pix_base = pix
+        self._set_scaled_geometry_and_pixmap(1.0)
+
+    def _set_scaled_geometry_and_pixmap(self, scale: float) -> None:
+        if self._pix_base is None or self._pix_base.isNull():
+            self.setGeometry(self._base_rect)
+            self.clear()
+            return
+
+        scale = float(scale)
+        bw = self._base_rect.width()
+        bh = self._base_rect.height()
+
+        nw = max(1, int(round(bw * scale)))
+        nh = max(1, int(round(bh * scale)))
+
+        cx = self._base_rect.x() + bw / 2
+        cy = self._base_rect.y() + bh / 2
+
+        pm = self._pix_base.scaled(nw, nh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        pw = pm.width()
+        ph = pm.height()
+        x = int(round(cx - pw / 2))
+        y = int(round(cy - ph / 2))
+
+        self.setPixmap(pm)
+        self.setGeometry(x, y, pw, ph)
+
+    def _apply_scale(self, v: object) -> None:
+        try:
+            self._scale = float(v)
+        except Exception:
+            self._scale = 1.0
+        self._set_scaled_geometry_and_pixmap(self._scale)
+
+    def _animate_to(self, target: float, ms: int) -> None:
+        self._scale_anim.stop()
+        self._scale_anim.setDuration(int(ms))
+        self._scale_anim.setStartValue(float(self._scale))
+        self._scale_anim.setEndValue(float(target))
+        self._scale_anim.start()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self._pressed = True
+            self._animate_to(0.92, 85)  # depress
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._pressed and event.button() == Qt.LeftButton:
+            self._pressed = False
+            self._animate_to(1.0, 110)  # pop back
+
+            if self.rect().contains(event.position().toPoint()):
+                QtCore.QTimer.singleShot(0, self.clicked.emit)
+
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        if self._pressed:
+            self._pressed = False
+            self._animate_to(1.0, 110)
+        super().leaveEvent(event)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CommandTab: command.png background + centered GO.png press-animated button
+# ─────────────────────────────────────────────────────────────────────────────
+class CommandTab(QtWidgets.QWidget):
+    """
+    - command.png is BACKGROUND only (fit, no crop)
+    - GO.png is the CLICKABLE button (centered)
+    - Press animation only (no bounce/idle motion)
+    """
+
+    wiped = QtCore.Signal()  # Nexus listens to this to hard-clear preview
+
+    def __init__(self, project_root: Path, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.project_root = Path(project_root).resolve()
+        self.setObjectName("CommandTab")
+        self.setStyleSheet("QWidget#CommandTab { background:#0b0c10; }")
+
+        icons_dir = self.project_root / "gallery" / "app" / "icons"
+        self._bg_path = (icons_dir / "command.png").resolve()
+        self._go_path = (icons_dir / "GO.png").resolve()
+
+        self._bg_pix = QtGui.QPixmap(str(self._bg_path))
+        self._go_pix = QtGui.QPixmap(str(self._go_path))
+
+        # Background label (NOT clickable)
+        self.bg_label = QtWidgets.QLabel(self)
+        self.bg_label.setAlignment(Qt.AlignCenter)
+        self.bg_label.setScaledContents(False)
+        self.bg_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        # GO button label (clickable)
+        self.go_btn = _PressGoLabel(self)
+        self.go_btn.setToolTip("Wipe the letter")
+        self.go_btn.clicked.connect(lambda: confirm_and_reset(self))
+
+        self._relayout()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._relayout()
+
+    def _relayout(self) -> None:
+        w = max(1, self.width())
+        h = max(1, self.height())
+
+        # Background: fit, no crop, no overflow
+        self.bg_label.setGeometry(0, 0, w, h)
+        if not self._bg_pix.isNull():
+            bg_scaled = self._bg_pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.bg_label.setPixmap(bg_scaled)
+
+        # GO: centered, sized relative to window (never spills)
+        if self._go_pix.isNull():
+            self.go_btn.set_base(QtCore.QRect(0, 0, 0, 0), self._go_pix)
+            return
+
+        target = int(min(w, h) * 0.28)
+        target = max(140, min(460, target))  # clamp
+
+        go_base = self._go_pix.scaled(target, target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        bw = go_base.width()
+        bh = go_base.height()
+
+        base_rect = QtCore.QRect((w - bw) // 2, (h - bh) // 2, bw, bh)
+        self.go_btn.set_base(base_rect, go_base)
+        self.go_btn.raise_()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Optional CLI entry
+# ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    """
-    Running this module directly will show the confirmation dialog and perform reset.
-    """
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     confirm_and_reset(None)
     QtCore.QTimer.singleShot(0, app.quit)

@@ -21,10 +21,10 @@
   "message_html_file": "message.html",
   "message_image_file": "message.png",
   "music_file": "music.mp3",
-  "music_volume": 17,
+  "music_volume": 20,
   "output_dir": "converted64",
-  "recipient_name": "Cassandra Mendoza",
-  "recipient_title": "The Next Step",
+  "recipient_name": "Leilanie Chilado",
+  "recipient_title": "Engine of Future",
   "required_slides": [
     "cover.png",
     "letter.png",
@@ -33,6 +33,6 @@
   ],
   "sound_gif": "sound.gif",
   "sounds_dir": "sounds",
-  "starting_volume": 17,
+  "starting_volume": 20,
   "verbose": false
 }

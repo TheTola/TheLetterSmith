@@ -3,142 +3,62 @@
 # ===============================
 from __future__ import annotations
 
-"""
-Sound Preview / Visualizer Wrapper (polished)
-
-Purpose
--------
-Provide a single, durable widget the app can mount in the global Preview area.
-It prefers the high-end `AudioVisualizerUltra` implementation, but degrades
-gracefully to a lightweight, dependency-free bar visualizer when the advanced
-module cannot be imported.
-
-Design Notes
-------------
-• Zero hard failures — always renders *something*.
-• API stable with prior versions:
-    - class SoundPreviewWidget(QtWidgets.QFrame)
-    - __init__(media_player, parent=None)
-    - set_audio_file(path: str) -> None
-    - set_media_player(player)  -> None (new public pass-through)
-• Dark UI by default; rounded border and subtle frame.
-• No external deps beyond PySide6.
-• DPI-aware painting; layout-stable.
-"""
-
-from typing import Optional
+from typing import Optional, Any, Dict
+from pathlib import Path
+import base64
+import zlib
+import math
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
+# Try to import QMediaPlayer constants for robust state comparisons.
+try:
+    from PySide6.QtMultimedia import QMediaPlayer  # type: ignore
+except Exception:
+    QMediaPlayer = None  # type: ignore
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Try to import the premium visualizer. Fall back to project-local Wave path.
-# If both fail, provide a minimal placeholder visualizer.
+# Try to import the premium visualizer.
+# Prefer the unified sound_visualizer module; fall back to legacy audio_visualizer.
+# If both fail, use the built-in minimal visualizer.
 # ─────────────────────────────────────────────────────────────────────────────
 _AudioVisualizerUltra = None  # type: ignore[var-annotated]
 
 try:
-    from audio_visualizer import AudioVisualizerUltra as _AudioVisualizerUltra  # type: ignore
+    from sound_visualizer import AudioVisualizerUltra as _AudioVisualizerUltra  # type: ignore
 except Exception:
-    # Fallback: try project-local Wave module (gallery/sounds/Wave)
     try:
-        import sys
-        from pathlib import Path
-
-        _alt = Path(__file__).resolve().parent / "gallery" / "sounds" / "Wave"
-        sys.path.insert(0, str(_alt))
-        from audio_visualizer import AudioVisualizerUltra as _AudioVisualizerUltra  # type: ignore
+        from audio_visualizer import AudioVisualizerUltra as _AudioVisualizerUltra  # type: ignore  # legacy
     except Exception:
         _AudioVisualizerUltra = None
 
 
+def _b64z_unpack_u8(s: str) -> bytes:
+    """Decode base64(zlib(bytes)) => raw bytes."""
+    raw = base64.b64decode(s.encode("ascii"))
+    return zlib.decompress(raw)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Minimal, dependency-free visualizer (placeholder)
+# Blank stage: draws background/grid only (the "vanished" state)
 # ─────────────────────────────────────────────────────────────────────────────
-class _MiniBarVisualizer(QtWidgets.QWidget):
-    """
-    Lightweight fallback: animated EQ bars while audio is "playing".
-    We don't inspect real audio; we mirror the player's playback state
-    and generate deterministic pseudo-motion for a calm, premium feel.
-    """
+class _BlankStage(QtWidgets.QWidget):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-
-        self._bars = [0.2, 0.35, 0.5, 0.75, 0.55, 0.4, 0.3, 0.45, 0.6, 0.32]
-        self._phase = 0.0
-        self._timer = QtCore.QTimer(self)
-        self._timer.setInterval(33)  # ~30 FPS
-        self._timer.timeout.connect(self._tick)
-
-        self._player = None  # QMediaPlayer-like (duck typed)
-        self._active = False
-        self._hint_text = "No track selected"
-
         self._bg_color = QtGui.QColor("#0f1116")
-        self._bar_color = QtGui.QColor(0, 210, 255, 180)
-        self._bar_bg = QtGui.QColor(255, 255, 255, 18)
         self._grid_color = QtGui.QColor(255, 255, 255, 12)
 
-    # Public (parity with premium)
-    def set_media_player(self, player) -> None:
-        # Disconnect old player if present
-        try:
-            if self._player:
-                self._player.playbackStateChanged.disconnect(self._on_state_changed)  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-        self._player = player
-        try:
-            # Connect new player; start anim if already playing
-            self._player.playbackStateChanged.connect(self._on_state_changed)  # type: ignore[attr-defined]
-            self._on_state_changed(getattr(self._player, "playbackState", lambda: 0)())
-        except Exception:
-            # If player doesn't expose Qt signal, keep simple idle animation
-            self._active = False
-            self._timer.stop()
-            self.update()
-
-    def set_audio_file(self, path: str) -> None:
-        # Only used for UX hints in fallback
-        self._hint_text = path or "No track selected"
-        self.update()
-
-    # Internals
-    def _on_state_changed(self, state) -> None:
-        # QtMultimedia playback states (Qt 6): 0=Stopped, 1=Playing, 2=Paused
-        playing = int(state) == 1
-        self._active = playing
-        if playing:
-            if not self._timer.isActive():
-                self._timer.start()
-        else:
-            self._timer.stop()
-        self.update()
-
-    def _tick(self) -> None:
-        self._phase += 0.055
-        # Soft, smooth motion
-        import math
-        for i, _ in enumerate(self._bars):
-            w = 0.85 + 0.15 * math.sin(self._phase * (1.5 + 0.17 * i))
-            self._bars[i] = 0.18 + 0.72 * abs(math.sin(self._phase * (0.8 + 0.13 * i))) * w
-        self.update()
-
-    def paintEvent(self, ev: QtGui.QPaintEvent) -> None:
+    def paintEvent(self, _ev: QtGui.QPaintEvent) -> None:
         r = self.rect()
         if not r.isValid():
             return
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-
-        # Background
         p.fillRect(r, self._bg_color)
 
-        # Subtle grid
         p.setPen(QtGui.QPen(self._grid_color, 1))
         step = max(24, int(min(r.width(), r.height()) * 0.06))
         for x in range(r.left() + step, r.right(), step):
@@ -146,68 +66,502 @@ class _MiniBarVisualizer(QtWidgets.QWidget):
         for y in range(r.top() + step, r.bottom(), step):
             p.drawLine(r.left(), y, r.right(), y)
 
-        # Bars
+        p.end()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Minimal dependency-free visualizer fallback
+# ─────────────────────────────────────────────────────────────────────────────
+class _MiniBarVisualizer(QtWidgets.QWidget):
+    """
+    Lightweight fallback: animated EQ bars while active.
+
+    - `set_active(True)` starts motion.
+    - `set_active(False)` collapses immediately.
+    """
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+
+        self._bars = [0.0] * 12
+        self._phase = 0.0
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._tick)
+
+        self._active = False
+
+        self._bg_color = QtGui.QColor("#0f1116")
+        self._bar_color = QtGui.QColor(0, 210, 255, 180)
+        self._grid_color = QtGui.QColor(255, 255, 255, 12)
+
+    # Compatibility no-ops
+    def set_media_player(self, _player) -> None:
+        return
+
+    def set_audio_file(self, _path: str) -> None:
+        return
+
+    def set_analysis_payload(self, _payload: Optional[Dict[str, Any]]) -> None:
+        return
+
+    def set_active(self, active: bool) -> None:
+        active = bool(active)
+        if active == self._active:
+            return
+        self._active = active
+        if active:
+            self._timer.start()
+        else:
+            self._timer.stop()
+            self._bars = [0.0] * len(self._bars)
+            self._phase = 0.0
+            self.update()
+
+    def _tick(self) -> None:
+        if not self._active:
+            return
+        self._phase += 0.055
+        for i in range(len(self._bars)):
+            w = 0.85 + 0.15 * math.sin(self._phase * (1.5 + 0.17 * i))
+            self._bars[i] = 0.18 + 0.72 * abs(math.sin(self._phase * (0.8 + 0.13 * i))) * w
+        self.update()
+
+    def paintEvent(self, _ev: QtGui.QPaintEvent) -> None:
+        r = self.rect()
+        if not r.isValid():
+            return
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.fillRect(r, self._bg_color)
+
+        p.setPen(QtGui.QPen(self._grid_color, 1))
+        step = max(24, int(min(r.width(), r.height()) * 0.06))
+        for x in range(r.left() + step, r.right(), step):
+            p.drawLine(x, r.top(), x, r.bottom())
+        for y in range(r.top() + step, r.bottom(), step):
+            p.drawLine(r.left(), y, r.right(), y)
+
+        if not self._active:
+            p.end()
+            return
+
         n = len(self._bars)
         gap = max(4, int(r.width() * 0.006))
         total_gap = gap * (n + 1)
         bar_w = max(6, (r.width() - total_gap) // n)
 
-        base_y = int(r.bottom() - max(8, r.height() * 0.08))
-        max_h = int(r.height() * 0.65)
+        base_y = int(r.bottom() - max(8, r.height() * 0.10))
+        max_h = int(r.height() * 0.64)
         x = r.left() + gap
 
-        # Bar background track
         p.setPen(Qt.NoPen)
-        p.setBrush(self._bar_bg)
-        for _ in range(n):
-            p.drawRoundedRect(QtCore.QRectF(x, base_y - max_h, bar_w, max_h), 3, 3)
-            x += bar_w + gap
-
-        # Foreground bars
-        x = r.left() + gap
         p.setBrush(self._bar_color)
         for h_ratio in self._bars:
-            h = int(max(3, max_h * h_ratio))
+            h = int(max(3, max_h * float(h_ratio)))
             p.drawRoundedRect(QtCore.QRectF(x, base_y - h, bar_w, h), 3, 3)
             x += bar_w + gap
 
-        # Hint (only when not active)
-        if not self._active:
-            p.setPen(QtGui.QPen(QtGui.QColor(220, 230, 235, 160)))
-            f = QtGui.QFont("Segoe UI", 10)
-            f.setLetterSpacing(QtGui.QFont.PercentageSpacing, 102)
-            p.setFont(f)
-            text = self._hint_text if isinstance(self._hint_text, str) else "No track selected"
-            p.drawText(r.adjusted(8, 8, -8, -8), Qt.AlignBottom | Qt.AlignLeft, text)
-
         p.end()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gate controller: decides whether the visualizer should be shown or "vanished".
+# Uses offline analysis payload for silence detection.
+# ─────────────────────────────────────────────────────────────────────────────
+class _VisualizerGate(QtCore.QObject):
+    visibleChanged = QtCore.Signal(bool)
+
+    def __init__(self, parent: Optional[QtCore.QObject] = None):
+        super().__init__(parent)
+
+        self._player = None
+        self._audio_out = None
+
+        self._audio_path = ""
+
+        # Offline analysis (per-track)
+        self._hop_ms: int = 20
+        self._frames: int = 0
+        self._lvl: Optional[bytes] = None  # u8 levels (0..255)
+
+        self._position_ms = 0
+        self._last_pos_ms = 0
+        self._stale_pos_ticks = 0
+
+        self._playing = False
+        self._volume = 1.0  # 0..1
+        self._muted = False
+
+        # Gate thresholds
+        self._silence_threshold = 0.01
+
+        self._visible = False
+
+        self._poll = QtCore.QTimer(self)
+        self._poll.setInterval(120)
+        self._poll.timeout.connect(self._poll_tick)
+
+    def is_visible(self) -> bool:
+        return self._visible
+
+    def shutdown(self) -> None:
+        try:
+            self._poll.stop()
+        except Exception:
+            pass
+
+    # ───────────────────────── robust playing-state detection ─────────────────
+    @staticmethod
+    def _state_is_playing(state_obj: object) -> bool:
+        # Best: direct enum compare
+        if QMediaPlayer is not None:
+            try:
+                return state_obj == QMediaPlayer.PlayingState  # Qt6 PlaybackState enum
+            except Exception:
+                pass
+
+        # Fallback: int coercion
+        try:
+            return int(state_obj) == 1
+        except Exception:
+            pass
+
+        # Last resort: string contains "playing"
+        try:
+            s = str(state_obj).lower()
+            return "playing" in s
+        except Exception:
+            return False
+
+    # ── Public wiring ─────────────────────────────────────────────
+    def set_media_player(self, player) -> None:
+        self._disconnect_player()
+        self._disconnect_audio_out()
+
+        self._player = player
+        self._audio_out = None
+
+        self._playing = False
+        self._position_ms = 0
+        self._last_pos_ms = 0
+        self._stale_pos_ticks = 0
+
+        if self._player is None:
+            self._poll.stop()
+            self._set_visible(False)
+            return
+
+        self._try_connect("playbackStateChanged", self._on_state_changed)  # Qt6
+        self._try_connect("stateChanged", self._on_state_changed)          # Qt5
+        self._try_connect("positionChanged", self._on_pos_changed)
+
+        self._wire_audio_out()
+
+        self._poll.start()
+        self._poll_tick()
+
+    def set_audio_file(self, path: str) -> None:
+        self._audio_path = path or ""
+        self._position_ms = 0
+        self._last_pos_ms = 0
+        self._stale_pos_ticks = 0
+        self._recompute()
+
+    def set_analysis_payload(self, payload: Optional[Dict[str, Any]]) -> None:
+        """Provide offline analysis for silence gating."""
+        if not payload:
+            self._lvl = None
+            self._frames = 0
+            self._hop_ms = 20
+            self._recompute()
+            return
+
+        try:
+            hop_ms = int(payload.get("hop_ms", 20))
+            frames = int(payload.get("frames", 0))
+            q = payload.get("q", {}) or {}
+            lvl_b64z = q.get("lvl", "")
+            lvl = _b64z_unpack_u8(str(lvl_b64z)) if lvl_b64z else b""
+
+            if frames and len(lvl) >= frames:
+                self._hop_ms = max(10, hop_ms)
+                self._frames = frames
+                self._lvl = lvl[:frames]
+            else:
+                self._lvl = None
+                self._frames = 0
+                self._hop_ms = max(10, hop_ms)
+        except Exception:
+            self._lvl = None
+            self._frames = 0
+
+        self._recompute()
+
+    # ── Connection helpers ─────────────────────────────────────────
+    def _try_connect(self, signal_name: str, slot) -> None:
+        try:
+            sig = getattr(self._player, signal_name, None)
+            if sig is not None:
+                sig.connect(slot)
+        except Exception:
+            pass
+
+    def _try_disconnect(self, signal_name: str, slot) -> None:
+        try:
+            sig = getattr(self._player, signal_name, None)
+            if sig is not None:
+                sig.disconnect(slot)
+        except Exception:
+            pass
+
+    def _disconnect_player(self) -> None:
+        if not self._player:
+            return
+        self._try_disconnect("playbackStateChanged", self._on_state_changed)
+        self._try_disconnect("stateChanged", self._on_state_changed)
+        self._try_disconnect("positionChanged", self._on_pos_changed)
+
+    def _disconnect_audio_out(self) -> None:
+        ao = self._audio_out
+        if ao is None:
+            return
+        try:
+            if hasattr(ao, "volumeChanged"):
+                ao.volumeChanged.disconnect(self._on_volume_changed)
+        except Exception:
+            pass
+        try:
+            if hasattr(ao, "mutedChanged"):
+                ao.mutedChanged.disconnect(self._on_muted_changed)
+        except Exception:
+            pass
+        self._audio_out = None
+
+    def _wire_audio_out(self) -> None:
+        self._audio_out = None
+        self._volume = 1.0
+        self._muted = False
+
+        p = self._player
+        if p is None:
+            return
+
+        # Qt6: QMediaPlayer.audioOutput() -> QAudioOutput
+        try:
+            fn = getattr(p, "audioOutput", None)
+            ao = fn() if callable(fn) else None
+            if ao is not None:
+                self._audio_out = ao
+                try:
+                    self._volume = float(ao.volume())
+                except Exception:
+                    self._volume = 1.0
+                try:
+                    self._muted = bool(ao.isMuted())
+                except Exception:
+                    self._muted = False
+
+                try:
+                    if hasattr(ao, "volumeChanged"):
+                        ao.volumeChanged.connect(self._on_volume_changed)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(ao, "mutedChanged"):
+                        ao.mutedChanged.connect(self._on_muted_changed)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
+        # Fallback: player.volume() 0..100, player.isMuted()
+        try:
+            v = getattr(p, "volume", None)
+            if callable(v):
+                self._volume = float(v()) / 100.0
+            elif v is not None:
+                self._volume = float(v) / 100.0
+        except Exception:
+            self._volume = 1.0
+
+        try:
+            m = getattr(p, "isMuted", None)
+            if callable(m):
+                self._muted = bool(m())
+            elif m is not None:
+                self._muted = bool(m)
+        except Exception:
+            self._muted = False
+
+    # ── Signals ───────────────────────────────────────────────────
+    def _on_state_changed(self, state) -> None:
+        self._playing = self._state_is_playing(state)
+        if not self._playing:
+            self._stale_pos_ticks = 0
+        self._recompute()
+
+    def _on_pos_changed(self, pos) -> None:
+        try:
+            self._position_ms = int(pos)
+        except Exception:
+            return
+        self._recompute()
+
+    def _on_volume_changed(self, v) -> None:
+        try:
+            self._volume = float(v)
+        except Exception:
+            return
+        self._recompute()
+
+    def _on_muted_changed(self, m) -> None:
+        try:
+            self._muted = bool(m)
+        except Exception:
+            return
+        self._recompute()
+
+    # ── Poll fallback ─────────────────────────────────────────────
+    def _read_state(self) -> Optional[object]:
+        p = self._player
+        if p is None:
+            return None
+        for name in ("playbackState", "state"):
+            try:
+                attr = getattr(p, name, None)
+                if callable(attr):
+                    return attr()
+                if attr is not None:
+                    return attr
+            except Exception:
+                continue
+        return None
+
+    def _read_position(self) -> Optional[int]:
+        p = self._player
+        if p is None:
+            return None
+        try:
+            attr = getattr(p, "position", None)
+            if callable(attr):
+                return int(attr())
+            if attr is not None:
+                return int(attr)
+        except Exception:
+            pass
+        return None
+
+    def _poll_tick(self) -> None:
+        if self._player is None:
+            self._set_visible(False)
+            return
+
+        # refresh audio output state defensively
+        if self._audio_out is not None:
+            try:
+                self._volume = float(self._audio_out.volume())
+            except Exception:
+                pass
+            try:
+                self._muted = bool(self._audio_out.isMuted())
+            except Exception:
+                pass
+
+        st = self._read_state()
+        if st is not None:
+            self._playing = self._state_is_playing(st)
+
+        pos = self._read_position()
+        if pos is not None:
+            # position-stall inference: if "playing" but position doesn't move,
+            # treat as paused within ~360ms (3 ticks @ 120ms).
+            if self._playing:
+                if pos == self._last_pos_ms:
+                    self._stale_pos_ticks += 1
+                else:
+                    self._stale_pos_ticks = 0
+                if self._stale_pos_ticks >= 3:
+                    self._playing = False
+            else:
+                self._stale_pos_ticks = 0
+
+            self._last_pos_ms = pos
+            self._position_ms = pos
+
+        self._recompute()
+
+    # ── Gating logic ──────────────────────────────────────────────
+    @staticmethod
+    def _clamp01(x: float) -> float:
+        return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+    def _effective_volume(self) -> float:
+        if self._muted:
+            return 0.0
+        return self._clamp01(self._volume)
+
+    def _analysis_level(self) -> Optional[float]:
+        if not self._lvl or self._frames <= 0 or self._hop_ms <= 0:
+            return None
+        idx = int(self._position_ms / self._hop_ms)
+        if idx < 0:
+            idx = 0
+        elif idx >= self._frames:
+            idx = self._frames - 1
+        try:
+            return float(self._lvl[idx]) / 255.0
+        except Exception:
+            return None
+
+    def _recompute(self) -> None:
+        # pause/stop or no track: hide
+        if not self._playing or not self._audio_path:
+            self._set_visible(False)
+            return
+
+        vol = self._effective_volume()
+        if vol <= 0.0:
+            self._set_visible(False)
+            return
+
+        # If we have analysis, hide on *true* near-silence.
+        lvl = self._analysis_level()
+        if lvl is not None:
+            amp = lvl * vol
+            self._set_visible(amp >= self._silence_threshold)
+            return
+
+        # No analysis yet: show while playing.
+        self._set_visible(True)
+
+    def _set_visible(self, v: bool) -> None:
+        v = bool(v)
+        if v == self._visible:
+            return
+        self._visible = v
+        self.visibleChanged.emit(v)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public Widget
 # ─────────────────────────────────────────────────────────────────────────────
 class SoundPreviewWidget(QtWidgets.QFrame):
-    """
-    A self-contained preview frame that hosts the audio visualizer.
+    """A self-contained preview frame that hosts the audio visualizer.
 
-    Parameters
-    ----------
-    media_player : QMediaPlayer-like object
-        The player's output drives the visualizer. This is the same object
-        your Sound tab uses for playback.
-    parent : QWidget | None
-        Parent widget (optional).
-
-    Public Methods
-    --------------
-    set_media_player(player)  -> None
-    set_audio_file(path:str) -> None
+    Public API:
+    - set_media_player(player) -> None
+    - set_audio_file(path) -> None
+    - set_analysis_payload(payload) -> None
+    - shutdown() -> None
     """
 
     def __init__(self, media_player, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self.setObjectName("sound_preview_frame")
-        # Subtle, dark, rounded frame. (Color tokens kept local to avoid globals.)
         self.setStyleSheet(
             "#sound_preview_frame {"
             "  background: #101014;"
@@ -218,55 +572,105 @@ class SoundPreviewWidget(QtWidgets.QFrame):
         self.setAccessibleName("Sound Preview Frame")
         self.setToolTip("Music visualizer")
 
-        # Choose best available visualizer implementation
+        # Build both stages: blank (vanished) and visualizer (active)
+        self._blank = _BlankStage(self)
+
         if _AudioVisualizerUltra is not None:
             self._visualizer = _AudioVisualizerUltra(self)
         else:
             self._visualizer = _MiniBarVisualizer(self)
 
-        # Ensure it expands nicely within layouts
+        self._blank.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self._visualizer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
-        # Mount
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.addWidget(self._visualizer, 1)
+        # Stacked layout to keep size stable while "vanishing"
+        stack = QtWidgets.QStackedLayout()
+        stack.setContentsMargins(8, 8, 8, 8)
+        stack.addWidget(self._blank)       # index 0
+        stack.addWidget(self._visualizer)  # index 1
+        stack.setCurrentIndex(0)
 
-        # Wire player if provided
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addLayout(stack, 1)
+        self._stack = stack
+
+        # Gate decides whether to show visualizer or blank
+        self._gate = _VisualizerGate(self)
+        self._gate.visibleChanged.connect(self._on_gate_visible)
+
         if media_player is not None:
             self.set_media_player(media_player)
 
+    def _on_gate_visible(self, show: bool) -> None:
+        # Switch stage
+        self._stack.setCurrentIndex(1 if show else 0)
+
+        # Make the visualizer actually run/stop (critical).
+        try:
+            if hasattr(self._visualizer, "set_active"):
+                self._visualizer.set_active(bool(show))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
     # ── Public API ──────────────────────────────────────────────────────────
     def set_media_player(self, player) -> None:
-        """
-        Re/wire the media player after construction.
-        Delegates to the inner visualizer if supported, else to the fallback.
-        """
+        # Wire gate FIRST (controls visibility)
         try:
-            # Premium visualizer API
+            self._gate.set_media_player(player)
+        except Exception as e:
+            print(f"[SoundPreview] gate set_media_player warning: {e!r}")
+
+        # Then pass through to visualizer if it supports it
+        try:
             if hasattr(self._visualizer, "set_media_player"):
                 self._visualizer.set_media_player(player)  # type: ignore[call-arg]
         except Exception as e:
-            # In worst case, ignore but keep widget alive
-            print(f"[SoundPreview] set_media_player warning: {e!r}")
+            print(f"[SoundPreview] visualizer set_media_player warning: {e!r}")
+
+        # Sync current visible state into visualizer active flag
+        self._on_gate_visible(self._gate.is_visible())
 
     def set_audio_file(self, path: str) -> None:
-        """
-        Convenience pass-through; callers don't need to touch the inner widget.
-        """
+        # Update gate so it can silence-detect
+        try:
+            self._gate.set_audio_file(path)
+        except Exception as e:
+            print(f"[SoundPreview] gate set_audio_file warning: {e!r}")
+
+        # Pass through to visualizer
         try:
             if hasattr(self._visualizer, "set_audio_file"):
                 self._visualizer.set_audio_file(path)  # type: ignore[call-arg]
         except Exception as e:
-            print(f"[SoundPreview] set_audio_file warning: {e!r}")
+            print(f"[SoundPreview] visualizer set_audio_file warning: {e!r}")
 
-    # ── Optional helpers ───────────────────────────────────────────────────
+        self._on_gate_visible(self._gate.is_visible())
+
+    def set_analysis_payload(self, payload: Optional[Dict[str, Any]]) -> None:
+        # Gate uses this for silence collapse
+        try:
+            self._gate.set_analysis_payload(payload)
+        except Exception as e:
+            print(f"[SoundPreview] gate set_analysis_payload warning: {e!r}")
+
+        # Visualizer uses this for drawing
+        try:
+            if hasattr(self._visualizer, "set_analysis_payload"):
+                self._visualizer.set_analysis_payload(payload)  # type: ignore[attr-defined]
+        except Exception as e:
+            print(f"[SoundPreview] visualizer set_analysis_payload warning: {e!r}")
+
+        self._on_gate_visible(self._gate.is_visible())
+
     def visualizer(self) -> QtWidgets.QWidget:
-        """Return the inner visualizer widget (advanced or fallback)."""
         return self._visualizer
 
     def shutdown(self) -> None:
-        """Best-effort cleanup hook (safe to call multiple times)."""
+        try:
+            self._gate.shutdown()
+        except Exception:
+            pass
         try:
             if hasattr(self._visualizer, "shutdown"):
                 self._visualizer.shutdown()  # type: ignore[attr-defined]

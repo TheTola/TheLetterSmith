@@ -1,64 +1,80 @@
--Comic / Manga Style
- Cartooning
- Caricature
- Line Art
- Flat Design
- Stencil / Graffiti Style
-
--Experimental & Thematic
- Surrealist Automatism
- Outsider Art (Art Brut)
- Collage / Assemblage
- Mixed Media
- Vaporwave / Synthwave Aesthetic
- Cyberpunk Neon Style
- Contemporary & Digital
-
--Concept Art
- Matte Painting
- Pixel Art
- Vector Art
- 3D Modeling / CGI
- LowPoly Style
- Glitch Art
- Isometric Game Art
-
--Cultural & Traditional Styles
- Byzantine Iconography
- Islamic Geometric Art
- Japanese Ukiyoe
- Chinese Ink Wash
- Indian Mughal Miniature
- African Tribal Art
- Indigenous American Symbolic Art
-
--Abstract & Non Representational
- Abstract Expressionism
- Color Field Painting
- Minimalism
- Op Art
- Geometric Abstraction
- Lyrical Abstraction
+-Stylized & Illustrated
+Comic / Manga Style
+Cartooning
+Anime
+Cyperpunk
+candy crush Cute Girl Dance
+Vaporwave / Synthwave Aesthetic
+Cyberpunk Neon Style
+Cell-Shaded Style
+Graphic Novel Ink Style
+Neon Noir
+Retro-Futurism
+Sci-Fi Concept Art
+Fantasy Concept Art
+Dark Fantasy
+High-Contrast Lighting Style
+Chibi Style
+Caricature
+Line Art
+Flat Design
+Stencil / Graffiti Style
 
 -Painterly & Expressive Styles
- Impressionism
- PostImpressionism
- Expressionism
- Fauvism
- Symbolism
+Impressionism
+PostImpressionism
+Expressionism
+Fauvism
+Symbolism
+
+-Experimental & Thematic
+Surrealist Automatism
+Outsider Art (Art Brut)
+Collage / Assemblage
+Mixed Media
+Contemporary & Digital
+
+-2D Illustration & Game Art
+2D Concept Art
+2D Matte Painting
+2D Pixel Art
+2D Vector Art
+Hand-Drawn Illustration
+Digital Painting
+Ink & Pen Illustration
+Watercolor (Digital)
+Gouache Style
+Pastel / Chalk Illustration
+Flat Illustration
+Minimal Line Illustration
+Poster Art Style
+Editorial Illustration
+Storyboard Art
+Visual Novel Art Style
+2D Game Art (Sprites & Backgrounds)
+Parallax Background Art
+UI Illustration Style
+Icon Illustration Style
+
+-Cultural & Traditional Styles
+Japanese Ukiyoe
+Chinese Ink Wash
+Indian Mughal Miniature
+African Tribal Art
+Byzantine Iconography
+Islamic Geometric Art
+
+-Abstract & Non Representational
+Abstract Expressionism
+Color Field Painting
+Minimalism
+Op Art
+Geometric Abstraction
+Lyrical Abstraction
 
 -Realistic & Representational Styles
- Photorealism
- Hyperrealism
- Naturalism
- Classical Realism
- Academic Art
-
--Modernist Movements
- Cubism
- Futurism
- Constructivism
- De Stijl
- Suprematism
- Surrealism
- Dada
+Photorealism
+Hyperrealism
+Naturalism
+Classical Realism
+Academic Art

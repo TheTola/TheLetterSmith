@@ -1,33 +1,42 @@
-RainbowVomit
-UnicornAura
+Redcore Prismatic Burst
+star bound Prismatic  explosion 
+Sapphire Prismatic Storm
+Violet Prismatic Dream
 
-Lavender Lighting Storm
-Crimson Flame
-Amber Dawn
-Sunburst Gold
-Emerald Grove
-Sapphire Tide
-Indigo Eclipse
-Violet Twilight
+Crimson Crown
+Scarlet Dominion
+Amber Radiance
+Golden Flare
+Emerald Dominion
+Viridian Oath
+Sapphire Surge
+Cerulean Tempest
+Indigo Veil
+Ultramarine Depths
+Violet Ascension
+Royal Amethyst
 
-Star Light 
-Stormlight
-Blood and Sky
-Golden Sunset
-Verdant Blaze
-Royal Clash
-Shadow Eclipse
-Mystic Rose
+Crimson & Emerald
+Scarlet & Viridian
+Red & Cyan
+Amber & Azure
+Yellow & Indigo
+Gold & Ultramarine
+Green & Magenta
+Emerald & Fuchsia
+Blue & Orange
+Sapphire & Burnt Amber
+Violet & Chartreuse
+Purple & Lime
 
-Solar Bloom
-Autumn Grove
-Fiery Ocean
-Dusklight Ember
-Twilight Bloom
+Crimson, Amber, & Sapphire
+Scarlet, Gold, & Ultramarine
+Red, Yellow, & Blue
+Emerald, Violet, & Orange
+Viridian, Magenta, & Amber
+Cyan, Magenta, & Yellow
+Sapphire, Crimson, & Gold
+Indigo, Emerald, & Vermilion
+Violet, Chartreuse, & Azure
+Teal, Orange, & Royal Purple
 
-Soft Pastel
-Noir
-Golden Hour
-Cyber Neon
-Parchment Warm
-Moonlit Blue

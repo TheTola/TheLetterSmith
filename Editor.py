@@ -3,16 +3,40 @@
 """
 Letter Smith — Rich Text Editor (dark mode, professional polish)
 
-Highlights
-- Writes atomically to the project message HTML (config.MESSAGE_HTML_FILE)
-- Loads recipient/title hints from settings.json
-- Drag & drop / paste images: copies into gallery/message_assets/ and inserts relative <img>
-- Find/Replace dialog (Ctrl+F), Undo/Redo, Bold/Italic/Underline (Ctrl+B/I/U)
-- Font family + size controls with live sync
-- Word/char counter, persistent window geometry & last chosen text color (QSettings)
-- Live preview over the wall.png background or a provided pixmap
+Public contract (required by Message_tab.py)
+-------------------------------------------
+Message_tab.py calls:
+    dlg = Editor(self.current_html, full_pix, parent=self)
+    if dlg.exec() == QDialog.Accepted:
+        new_html = dlg.get_edited_html()
 
-Safe paths/filenames come from config: SETTINGS_FILE, GALLERY_DIR, MESSAGE_HTML_FILE
+Therefore this module provides:
+    class Editor(QDialog):
+        __init__(message_html: str, preview_pixmap: Optional[QPixmap] = None, parent=None)
+        get_edited_html() -> str
+        apply_changes() -> None   (Save -> accept)
+
+What this editor does
+---------------------
+- Writes atomically to the canonical message file:
+    gallery/user/message/message.html
+- Find/Replace (wrap-around, Enter-to-find, match-case).
+- Toolbar:
+    - Format dropdown: Bold / Italic / Underline / Strike / Clear
+    - Lists dropdown: Bullet list / Numbered list
+    - Spacing dropdown: (1.0, 1.15, 1.5, 2.0, 2.5, 3.0)
+- Font family + size with live sync.
+- Color picker (persists last color).
+- Word/char counter.
+- Live preview painted over wall.png (letter background) or provided pixmap.
+- Paste/drag-drop images into:
+    <project_root>/gallery/message_assets/
+
+Critical export fix
+-------------------
+To make browser output match line spacing selected in the editor, we inject:
+    <div class="ls-linewrap" style="line-height:X;"> ... </div>
+into the saved HTML body.
 """
 
 from __future__ import annotations
@@ -24,22 +48,45 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from PySide6 import QtWidgets, QtGui, QtCore
-from PySide6.QtCore import Qt, QSize, QSettings, QEvent, QMimeData
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import Qt, QSize, QSettings, QMimeData
 from PySide6.QtGui import (
-    QFont, QColor, QIcon, QAction, QKeySequence,
-    QTextCharFormat, QTextListFormat, QTextCursor, QDragEnterEvent, QDropEvent,
-    QPixmap, QImage
+    QFont,
+    QColor,
+    QAction,
+    QKeySequence,
+    QTextCharFormat,
+    QTextCursor,
+    QTextListFormat,
+    QTextBlockFormat,
+    QTextDocument,
+    QPixmap,
+    QImage,
 )
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QTextEdit, QToolBar,
-    QFontComboBox, QSpinBox, QLabel, QColorDialog,
-    QPushButton, QMessageBox, QDialogButtonBox, QLineEdit, QToolButton, QMenu, QSplitter
+    QDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QTextEdit,
+    QToolBar,
+    QFontComboBox,
+    QSpinBox,
+    QLabel,
+    QColorDialog,
+    QPushButton,
+    QMessageBox,
+    QDialogButtonBox,
+    QLineEdit,
+    QToolButton,
+    QMenu,
+    QSplitter,
+    QCheckBox,
 )
 
 from config import (
     SETTINGS_FILE,
     GALLERY_DIR,
+    USER_PAGES_DIR,
     MESSAGE_HTML_FILE,
 )
 
@@ -58,13 +105,32 @@ SETTINGS_KEY_GEOMETRY = "windowGeometry"
 
 ASSET_SUBDIR = "message_assets"  # under gallery/
 
-# Atomic write for safety on Windows (replace in place)
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_name(filename: str) -> str:
+    bad = '<>:"/\\|?*\0'
+    out = "".join(("_" if ch in bad else ch) for ch in filename)
+    out = out.strip().strip(".")
+    return out or "asset"
+
+
+def _read_json(fp: Path) -> dict:
+    try:
+        return json.loads(fp.read_text(encoding="utf-8")) if fp.exists() else {}
+    except Exception:
+        return {}
+
+
 def _atomic_write(path: Path, data: str, *, encoding: str = "utf-8") -> None:
-    tmp = path.with_suffix(path.suffix + f".tmp.{int(time.time()*1000)}")
+    _ensure_dir(path.parent)
+    tmp = path.with_suffix(path.suffix + f".tmp.{int(time.time() * 1000)}")
     tmp.write_text(data, encoding=encoding)
-    # Try a couple retries for Windows replace corner cases
-    tries = 3
-    for i in range(tries):
+
+    tries = 4
+    for _ in range(tries):
         try:
             if path.exists():
                 tmp.replace(path)
@@ -73,85 +139,109 @@ def _atomic_write(path: Path, data: str, *, encoding: str = "utf-8") -> None:
             return
         except Exception:
             time.sleep(0.05)
-    # final attempt or raise
+
     if path.exists():
         tmp.replace(path)
     else:
         tmp.rename(path)
 
-def _ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-def _safe_name(filename: str) -> str:
-    # Basic guard: strip control chars and replace path separators
-    bad = '<>:"/\\|?*'
-    out = "".join(("_" if ch in bad else ch) for ch in filename)
-    out = out.strip().strip(".")
-    return out or "asset"
-
-def _read_json(fp: Path) -> dict:
-    try:
-        return json.loads(fp.read_text(encoding="utf-8")) if fp.exists() else {}
-    except Exception:
-        return {}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Find / Replace
+# Find / Replace Dialog
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FindReplaceDialog(QDialog):
-    """Dialog for finding & replacing text."""
-    def __init__(self, parent: 'Editor') -> None:
+    """
+    Robust find/replace:
+      - Wrap-around search
+      - Enter in Find triggers find-next
+      - Optional match-case
+    """
+    def __init__(self, parent: "Editor") -> None:
         super().__init__(parent)
         self.setWindowTitle("Find / Replace")
         self.setModal(True)
-        self.editor: QTextEdit = parent.editor
-        self._init_ui()
+
+        self._editor: QTextEdit = parent.editor
+
+        self.find_input = QLineEdit(placeholderText="Find…")
+        self.replace_input = QLineEdit(placeholderText="Replace with…")
+        self.match_case = QCheckBox("Match case")
+        self.match_case.setChecked(False)
+
+        self.find_input.returnPressed.connect(self.find_next)
+        self.replace_input.returnPressed.connect(self.replace_one)
+
+        row = QHBoxLayout()
+        row.addWidget(self.find_input)
+        row.addWidget(self.replace_input)
+
+        opts = QHBoxLayout()
+        opts.addWidget(self.match_case)
+        opts.addStretch(1)
+
+        box = QDialogButtonBox(QDialogButtonBox.Find | QDialogButtonBox.Replace | QDialogButtonBox.Close)
+        box.button(QDialogButtonBox.Find).clicked.connect(self.find_next)
+        box.button(QDialogButtonBox.Replace).clicked.connect(self.replace_one)
+        box.rejected.connect(self.reject)
+
+        root = QVBoxLayout(self)
+        root.addLayout(row)
+        root.addLayout(opts)
+        root.addWidget(box)
+
         self.setStyleSheet(
             "QDialog{background:#141414;border:1px solid #00d0ff;border-radius:8px;}"
             "QLineEdit{background:#1e1e1e;color:#eee;border:1px solid #2a2a2a;padding:6px;border-radius:4px;}"
-            "QLabel{color:#ddd}"
+            "QCheckBox{color:#ddd; padding-left:2px;}"
             "QPushButton{background:#232323;color:#fff;border:1px solid #00d0ff;border-radius:4px;padding:6px 12px;}"
             "QPushButton:hover{background:#00d0ff;color:#111}"
         )
 
-    def _init_ui(self) -> None:
-        vbox = QVBoxLayout(self)
-        hbox = QHBoxLayout()
-        self.find_input = QLineEdit(placeholderText="Find…")
-        self.replace_input = QLineEdit(placeholderText="Replace with…")
-        hbox.addWidget(self.find_input)
-        hbox.addWidget(self.replace_input)
-        vbox.addLayout(hbox)
-
-        box = QDialogButtonBox(
-            QDialogButtonBox.Find | QDialogButtonBox.Replace | QDialogButtonBox.Close
-        )
-        box.button(QDialogButtonBox.Find).clicked.connect(self.find_next)
-        box.button(QDialogButtonBox.Replace).clicked.connect(self.replace)
-        box.rejected.connect(self.reject)
-        vbox.addWidget(box)
+    def _find_options(self) -> QTextDocument.FindFlags:
+        flags = QTextDocument.FindFlags()
+        if self.match_case.isChecked():
+            flags |= QTextDocument.FindCaseSensitively
+        return flags
 
     def find_next(self) -> None:
         term = self.find_input.text()
         if not term:
             return
-        cursor = self.editor.textCursor()
-        start = cursor.selectionEnd() if cursor.hasSelection() else cursor.position()
-        found = self.editor.document().find(term, start)
-        if found.isNull():
-            found = self.editor.document().find(term, 0)
-        if not found.isNull():
-            self.editor.setTextCursor(found)
 
-    def replace(self) -> None:
-        cursor = self.editor.textCursor()
-        if cursor.hasSelection():
-            cursor.insertText(self.replace_input.text())
+        doc = self._editor.document()
+        flags = self._find_options()
+
+        cur = self._editor.textCursor()
+        start_cursor = QTextCursor(cur)
+        if cur.hasSelection():
+            start_cursor.setPosition(cur.selectionEnd())
+        else:
+            start_cursor.setPosition(cur.position())
+
+        found = doc.find(term, start_cursor, flags)
+
+        if found.isNull():
+            top = QTextCursor(doc)
+            top.movePosition(QTextCursor.Start)
+            found = doc.find(term, top, flags)
+
+        if found.isNull():
+            QtWidgets.QApplication.beep()
+            return
+
+        self._editor.setTextCursor(found)
+
+    def replace_one(self) -> None:
+        cur = self._editor.textCursor()
+        if cur.hasSelection():
+            cur.insertText(self.replace_input.text())
+            self._editor.setTextCursor(cur)
         self.find_next()
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Custom TextEdit that handles image paste/drop into gallery/message_assets/
+# RichTextEdit: paste/drop images into <project_root>/gallery/message_assets/
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RichTextEdit(QTextEdit):
@@ -161,16 +251,19 @@ class RichTextEdit(QTextEdit):
         self.setAcceptRichText(True)
         self.setAcceptDrops(True)
 
-    # Centralized asset copy -> returns relative URI for HTML (gallery/...)
+    def _assets_dir(self) -> Path:
+        return self.project_root / GALLERY_DIR / ASSET_SUBDIR
+
     def _copy_into_assets(self, src_path: Path) -> Optional[str]:
         if not src_path.is_file():
             return None
-        gallery = self.project_root / GALLERY_DIR
-        assets_dir = gallery / ASSET_SUBDIR
+
+        assets_dir = self._assets_dir()
         _ensure_dir(assets_dir)
+
         base = _safe_name(src_path.name)
         dst = assets_dir / base
-        # Avoid collisions by appending a counter
+
         if dst.exists():
             stem, suf = dst.stem, dst.suffix
             n = 2
@@ -180,10 +273,11 @@ class RichTextEdit(QTextEdit):
                     dst = cand
                     break
                 n += 1
+
         try:
             shutil.copy2(src_path, dst)
-            rel = (gallery / ASSET_SUBDIR / dst.name).as_posix()
-            return rel  # e.g. 'gallery/message_assets/foo.png'
+            rel = (Path(GALLERY_DIR) / ASSET_SUBDIR / dst.name).as_posix()
+            return rel
         except Exception:
             return None
 
@@ -191,14 +285,13 @@ class RichTextEdit(QTextEdit):
         c = self.textCursor()
         c.insertHtml(f'<img src="{rel_uri}" width="{int(width_px)}"/>')
 
-    # Drag & drop files
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             super().dragEnterEvent(event)
 
-    def dropEvent(self, event: QDropEvent) -> None:
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
         handled = False
         for url in event.mimeData().urls():
             p = Path(url.toLocalFile())
@@ -213,22 +306,19 @@ class RichTextEdit(QTextEdit):
         else:
             super().dropEvent(event)
 
-    # Paste images from clipboard (QImage) or file URLs
     def insertFromMimeData(self, source: QMimeData) -> None:
-        # Image in clipboard
         if source.hasImage():
             img = source.imageData()
             if isinstance(img, QImage) and not img.isNull():
-                gallery = self.project_root / GALLERY_DIR
-                assets_dir = gallery / ASSET_SUBDIR
+                assets_dir = self._assets_dir()
                 _ensure_dir(assets_dir)
-                name = f"pasted_{int(time.time()*1000)}.png"
+                name = f"pasted_{int(time.time() * 1000)}.png"
                 out = assets_dir / name
                 img.save(str(out), "PNG")
-                rel = (gallery / ASSET_SUBDIR / name).as_posix()
+                rel = (Path(GALLERY_DIR) / ASSET_SUBDIR / name).as_posix()
                 self.insert_image_html(rel, 320)
                 return
-        # File URLs
+
         if source.hasUrls():
             for url in source.urls():
                 p = Path(url.toLocalFile())
@@ -237,169 +327,219 @@ class RichTextEdit(QTextEdit):
                     if rel:
                         self.insert_image_html(rel, 320)
                         return
+
         super().insertFromMimeData(source)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Preview Widget
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PreviewWidget(QtWidgets.QWidget):
-    """HTML preview painted over a background image or provided pixmap."""
-    def __init__(self, background_path: Optional[Path], editor: QTextEdit,
-                 preview_pixmap: Optional[QPixmap] = None, parent=None) -> None:
+    def __init__(
+        self,
+        background_path: Optional[Path],
+        editor: QTextEdit,
+        preview_pixmap: Optional[QPixmap] = None,
+        parent=None
+    ) -> None:
         super().__init__(parent)
         self._bg_path = Path(background_path) if background_path else None
         self._bg_pm: Optional[QPixmap] = preview_pixmap if (preview_pixmap and not preview_pixmap.isNull()) else None
         self._editor = editor
         self.setMinimumWidth(320)
 
-    def setBackgroundPixmap(self, pm: Optional[QPixmap]) -> None:
-        self._bg_pm = pm if (pm and not pm.isNull()) else None
-        self.update()
-
-    def paintEvent(self, event) -> None:
+    def paintEvent(self, _event) -> None:
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
         w, h = self.width(), self.height()
 
-        # Draw background
         pm = self._bg_pm
         if pm is None and self._bg_path and self._bg_path.exists():
             pm = QPixmap(str(self._bg_path))
+
         if pm and not pm.isNull():
             bg = pm.scaled(w, h, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
             painter.drawPixmap(0, 0, bg)
         else:
             painter.fillRect(self.rect(), Qt.black)
 
-        # Draw HTML document
         doc = QtGui.QTextDocument()
-        doc.setDefaultStyleSheet("body{color:#f4f4f4;font-family:serif;line-height:1.5;} img{max-width:100%;}")
         doc.setHtml(self._editor.toHtml())
+
         margin = 16
-        doc.setTextWidth(w - (margin * 2))
+        doc.setTextWidth(max(1, w - margin * 2))
+
         painter.save()
         painter.translate(margin, margin)
-        doc.drawContents(painter, QtCore.QRectF(0, 0, w - (margin * 2), h - (margin * 2)))
+        doc.drawContents(painter, QtCore.QRectF(0, 0, w - margin * 2, h - margin * 2))
         painter.restore()
-        painter.end()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Editor Dialog
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Editor(QDialog):
-    """Rich-text editor dialog for Letter Smith."""
-    def __init__(
-        self,
-        message_html: str,
-        preview_pixmap: Optional[QtGui.QPixmap] = None,
-        parent: Optional[QtWidgets.QWidget] = None,
-    ) -> None:
+    def __init__(self, message_html: str, preview_pixmap: Optional[QPixmap] = None, parent=None) -> None:
         super().__init__(parent)
 
-        # Resolve project root from parent or cwd
-        self.project_root = Path(getattr(parent, 'project_root', os.getcwd()))
-        self.settings_json = self.project_root / SETTINGS_FILE
-        self.message_path = self.project_root / MESSAGE_HTML_FILE
+        # Resolve project root (authoritative)
+        self.project_root = Path(getattr(parent, "project_root", os.getcwd()))
 
-        # Load recipient name (for Salutation)
-        data = _read_json(self.settings_json)
-        self.recipient_name = data.get("recipient_name") or "Friend"
+        # Canonical message location (SOURCE OF TRUTH)
+        self.message_path = (self.project_root / MESSAGE_HTML_FILE).resolve()
+        self.message_path.parent.mkdir(parents=True, exist_ok=True)
+        self.settings_path = (self.project_root / SETTINGS_FILE).resolve()
 
-        # QSettings for small UI prefs
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
-        self.setWindowTitle("Letter Smith — Editor")
-        self.resize(1000, 650)
-        self._apply_dark_style()
-        self._load_geometry()
+        s = _read_json(self.settings_path)
+        self.recipient_name = (s.get("recipient_name") or "Friend").strip() or "Friend"
+
+        saved = self.settings.value(SETTINGS_KEY_COLOR, QColor("#eeeeee"))
+        self.last_color = saved if isinstance(saved, QColor) else QColor("#eeeeee")
 
         self.message_html = message_html or ""
-        self._init_ui(preview_pixmap)
 
-    # ── Window dressing ──────────────────────────────────
-    def _apply_dark_style(self) -> None:
-        self.setStyleSheet(
-            "QDialog{background:#121212;}"
-            "QToolBar{background:#161616;border:1px solid #242424;border-radius:6px;margin:2px;padding:2px;}"
-            "QTextEdit{background:#0f0f0f;color:#eee;border:1px solid #222;border-radius:6px;padding:8px;}"
-            "QLabel{color:#bbb}"
-            "QSplitter::handle{background:#1e1e1e}"
-            "QPushButton{background:#1d1d1d;color:#fff;border:1px solid #00d0ff;border-radius:6px;padding:6px 12px;}"
-            "QPushButton:hover{background:#00d0ff;color:#111}"
-            "QSpinBox{background:#181818;color:#eee;border:1px solid #333;border-radius:4px;padding:2px;}"
-            "QFontComboBox{background:#181818;color:#eee;border:1px solid #333;border-radius:4px;}"
-            "QMenu{background:#141414;color:#eee;border:1px solid #2a2a2a;}"
-            "QToolButton{color:#eee}"
-        )
+        # Tracks the most recent spacing selection (used to force identical browser output)
+        self._export_line_spacing: Optional[float] = None
 
-    def _load_geometry(self) -> None:
-        geom = self.settings.value(SETTINGS_KEY_GEOMETRY)
-        if isinstance(geom, QtCore.QByteArray):
-            self.restoreGeometry(geom)
+        self.setWindowTitle("Letter Smith — Editor")
+        self.setModal(True)
+        self.resize(1100, 720)
 
-    def closeEvent(self, event: QEvent) -> None:
-        self.settings.setValue(SETTINGS_KEY_GEOMETRY, self.saveGeometry())
-        super().closeEvent(event)
+        self._apply_styles()
+        self._restore_geometry()
+        self._build_ui(preview_pixmap)
 
-    # ── UI build ─────────────────────────────────────────
-    def _init_ui(self, preview_pixmap: Optional[QPixmap]) -> None:
+    def _build_ui(self, preview_pixmap: Optional[QPixmap]) -> None:
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(8)
 
-        # Toolbar
         self.toolbar = QToolBar()
         self.toolbar.setIconSize(TOOLBAR_ICON_SIZE)
         self.toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         main_layout.addWidget(self.toolbar)
 
-        # restore last color
-        saved_color = self.settings.value(SETTINGS_KEY_COLOR, QColor("#eeeeee"), type=QColor)
-        self.last_color: QColor = saved_color
+        splitter = QSplitter(Qt.Horizontal)
 
-        # Salutation
+        self.editor = RichTextEdit(self.project_root)
+        self.editor.setHtml(self.message_html)
+        splitter.addWidget(self.editor)
+
+        # Preview background should be the letter background image (wall.png)
+        wall_path = (self.project_root / USER_PAGES_DIR / "wall.png").resolve()
+        self.preview = PreviewWidget(wall_path, editor=self.editor, preview_pixmap=preview_pixmap, parent=self)
+        splitter.addWidget(self.preview)
+
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+        main_layout.addWidget(splitter)
+
+        self._build_toolbar_actions()
+
+        self.editor.textChanged.connect(self.preview.update)
+        self.editor.textChanged.connect(self.update_word_count)
+        self.editor.currentCharFormatChanged.connect(self.preview.update)
+        self.editor.currentCharFormatChanged.connect(self._sync_format)
+
+        hb = QHBoxLayout()
+        self.word_label = QLabel()
+        hb.addWidget(self.word_label)
+        hb.addStretch()
+
+        btn_save = QPushButton("Save")
+        btn_save.setShortcut(QKeySequence.Save)
+        btn_save.clicked.connect(self.apply_changes)
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+
+        hb.addWidget(btn_save)
+        hb.addWidget(btn_cancel)
+        main_layout.addLayout(hb)
+
+        self.update_word_count()
+
+    def _build_toolbar_actions(self) -> None:
         act_sal = QAction("Salutation", self)
-        act_sal.setToolTip("Insert 'Dear <Name>,' at the top")
         act_sal.triggered.connect(self.insert_salutation)
         self.toolbar.addAction(act_sal)
 
-        # Style menu
-        btn_style = QToolButton(self)
-        btn_style.setText("Style")
-        btn_style.setPopupMode(QToolButton.MenuButtonPopup)
-        btn_style.setAutoRaise(True)
-        btn_style.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        menu_style = QMenu(self)
-        menu_style.addAction("Bold", self.toggle_bold).setShortcut(QKeySequence.Bold)
-        menu_style.addAction("Italic", self.toggle_italic).setShortcut(QKeySequence.Italic)
-        menu_style.addAction("Underline", self.toggle_underline).setShortcut(QKeySequence.Underline)
-        menu_style.addAction("Strike", self.toggle_strikethrough)
-        menu_style.addSeparator()
-        menu_style.addAction("Clear Formatting", self.clear_formatting)
-        btn_style.setMenu(menu_style)
-        self.toolbar.addWidget(btn_style)
+        self.toolbar.addSeparator()
 
-        # Lists menu
-        btn_list = QToolButton(self)
-        btn_list.setText("Lists")
-        btn_list.setPopupMode(QToolButton.MenuButtonPopup)
-        btn_list.setAutoRaise(True)
-        btn_list.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        menu_list = QMenu(self)
-        menu_list.addAction("Bullet List", self.insert_bullet_list)
-        menu_list.addAction("Number List", self.insert_number_list)
-        btn_list.setMenu(menu_list)
-        self.toolbar.addWidget(btn_list)
+        # Format dropdown
+        self.btn_format = QToolButton(self)
+        self.btn_format.setText("Format")
+        self.btn_format.setPopupMode(QToolButton.InstantPopup)
+        self.btn_format.setAutoRaise(True)
 
-        # Align menu
+        fmt_menu = QMenu(self)
+        a_bold = fmt_menu.addAction("Bold")
+        a_bold.setShortcut(QKeySequence.Bold)
+        a_bold.triggered.connect(self.toggle_bold)
+
+        a_italic = fmt_menu.addAction("Italic")
+        a_italic.setShortcut(QKeySequence.Italic)
+        a_italic.triggered.connect(self.toggle_italic)
+
+        a_underline = fmt_menu.addAction("Underline")
+        a_underline.setShortcut(QKeySequence.Underline)
+        a_underline.triggered.connect(self.toggle_underline)
+
+        a_strike = fmt_menu.addAction("Strike")
+        a_strike.triggered.connect(self.toggle_strikethrough)
+
+        fmt_menu.addSeparator()
+
+        a_clear = fmt_menu.addAction("Clear")
+        a_clear.triggered.connect(self.clear_formatting)
+
+        self.btn_format.setMenu(fmt_menu)
+        self.toolbar.addWidget(self.btn_format)
+
+        # Lists dropdown
+        self.btn_lists = QToolButton(self)
+        self.btn_lists.setText("Lists")
+        self.btn_lists.setPopupMode(QToolButton.InstantPopup)
+        self.btn_lists.setAutoRaise(True)
+
+        list_menu = QMenu(self)
+        list_menu.addAction("Bullet list", self.insert_bullet_list)
+        list_menu.addAction("Numbered list", self.insert_number_list)
+
+        self.btn_lists.setMenu(list_menu)
+        self.toolbar.addWidget(self.btn_lists)
+
+        # Spacing dropdown (browser-matching export)
+        self.btn_spacing = QToolButton(self)
+        self.btn_spacing.setText("Spacing")
+        self.btn_spacing.setPopupMode(QToolButton.InstantPopup)
+        self.btn_spacing.setAutoRaise(True)
+
+        sp_menu = QMenu(self)
+        sp_menu.addAction("Single (1.0)",  lambda: self.set_line_spacing(1.0))
+        sp_menu.addAction("1.15",          lambda: self.set_line_spacing(1.15))
+        sp_menu.addAction("1.5",           lambda: self.set_line_spacing(1.5))
+        sp_menu.addAction("Double (2.0)",  lambda: self.set_line_spacing(2.0))
+        sp_menu.addSeparator()
+        sp_menu.addAction("2.5",           lambda: self.set_line_spacing(2.5))
+        sp_menu.addAction("3.0",           lambda: self.set_line_spacing(3.0))
+
+        self.btn_spacing.setMenu(sp_menu)
+        self.toolbar.addWidget(self.btn_spacing)
+
+        self.toolbar.addSeparator()
+
+        # Align dropdown
         btn_align = QToolButton(self)
         btn_align.setText("Align")
-        btn_align.setPopupMode(QToolButton.MenuButtonPopup)
+        btn_align.setPopupMode(QToolButton.InstantPopup)
         btn_align.setAutoRaise(True)
-        btn_align.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+
         menu_align = QMenu(self)
         menu_align.addAction("Left",   lambda: self.editor.setAlignment(Qt.AlignLeft))
         menu_align.addAction("Center", lambda: self.editor.setAlignment(Qt.AlignCenter))
@@ -408,28 +548,24 @@ class Editor(QDialog):
         self.toolbar.addWidget(btn_align)
 
         # Color
-        act_col = QAction(QIcon.fromTheme("format-text-color"), "Color", self)
+        act_col = QAction("Color", self)
         act_col.triggered.connect(self.choose_color)
         self.toolbar.addAction(act_col)
 
-        # Insert Image (file dialog)
-        act_img = QAction("Insert Image…", self)
-        act_img.setShortcut("Ctrl+Shift+I")
-        act_img.triggered.connect(self._insert_image_dialog)
-        self.toolbar.addAction(act_img)
+        self.toolbar.addSeparator()
 
         # Undo / Redo / Find
         act_undo = QAction("Undo", self)
         act_undo.setShortcut(QKeySequence.Undo)
-        act_undo.triggered.connect(lambda: self.editor.undo())
+        act_undo.triggered.connect(self.editor.undo)
         self.toolbar.addAction(act_undo)
 
         act_redo = QAction("Redo", self)
         act_redo.setShortcut(QKeySequence.Redo)
-        act_redo.triggered.connect(lambda: self.editor.redo())
+        act_redo.triggered.connect(self.editor.redo)
         self.toolbar.addAction(act_redo)
 
-        act_find = QAction("Find/Replace", self)
+        act_find = QAction("Find", self)
         act_find.setShortcut(QKeySequence.Find)
         act_find.triggered.connect(self.open_find_replace)
         self.toolbar.addAction(act_find)
@@ -437,82 +573,147 @@ class Editor(QDialog):
         self.toolbar.addSeparator()
 
         # Font family + size
-        self.font_combo = QFontComboBox(currentFontChanged=self.set_font_family)
-        self.font_size_spin = QSpinBox(
-            value=DEFAULT_FONT_SIZE, minimum=FONT_SIZE_MIN, maximum=FONT_SIZE_MAX
-        )
+        self.font_combo = QFontComboBox()
+        self.font_combo.currentFontChanged.connect(self.set_font_family)
+
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(FONT_SIZE_MIN, FONT_SIZE_MAX)
+        self.font_size_spin.setValue(DEFAULT_FONT_SIZE)
         self.font_size_spin.valueChanged.connect(self.set_font_size)
+
         self.toolbar.addWidget(self.font_combo)
         self.toolbar.addWidget(self.font_size_spin)
 
-        # Split editor/preview
-        splitter = QSplitter(Qt.Horizontal)
-        # Editor as custom class (handles images to assets)
-        self.editor = RichTextEdit(self.project_root)
-        self.editor.setHtml(self.message_html)
-        splitter.addWidget(self.editor)
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            "QDialog{background:#121212;}"
+            "QToolBar{background:#161616;border:1px solid #242424;border-radius:6px;margin:2px;padding:2px;}"
+            "QTextEdit{background:#0f0f0f;color:#eee;border:1px solid #222;border-radius:6px;padding:8px;}"
+            "QLabel{color:#bbb;}"
+            "QSplitter::handle{background:#1e1e1e;}"
+            "QPushButton{background:#1d1d1d;color:#fff;border:1px solid #00d0ff;border-radius:6px;padding:6px 12px;}"
+            "QPushButton:hover{background:#00d0ff;color:#111;}"
+            "QSpinBox{background:#181818;color:#eee;border:1px solid #333;border-radius:4px;padding:2px;}"
+            "QFontComboBox{background:#181818;color:#eee;border:1px solid #333;border-radius:4px;}"
+            "QMenu{background:#141414;color:#eee;border:1px solid #2a2a2a;}"
+            "QToolButton{color:#e6e6e6; padding:4px 8px; border:1px solid #2a2a2a; border-radius:6px; background:#101010;}"
+            "QToolButton:hover{border-color:#00d0ff;}"
+            "QCheckBox{color:#ddd;}"
+        )
 
-        wall_path = (self.project_root / GALLERY_DIR / "wall.png")
-        self.preview = PreviewWidget(wall_path, editor=self.editor, preview_pixmap=preview_pixmap, parent=self)
-        splitter.addWidget(self.preview)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 1)
-        main_layout.addWidget(splitter)
+    def _restore_geometry(self) -> None:
+        geom = self.settings.value(SETTINGS_KEY_GEOMETRY)
+        if isinstance(geom, QtCore.QByteArray):
+            self.restoreGeometry(geom)
 
-        # Connect signals
-        self.editor.textChanged.connect(self.preview.update)
-        self.editor.textChanged.connect(self.update_word_count)
-        self.editor.currentCharFormatChanged.connect(self.preview.update)
-        self.editor.currentCharFormatChanged.connect(self._sync_format)
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        try:
+            self.settings.setValue(SETTINGS_KEY_GEOMETRY, self.saveGeometry())
+        except Exception:
+            pass
+        super().closeEvent(event)
 
-        # Bottom bar: word count + Save/Cancel
-        hb = QHBoxLayout()
-        self.word_label = QLabel()
-        hb.addWidget(self.word_label)
-        hb.addStretch()
-        btn_save = QPushButton("Save")
-        btn_save.setShortcut(QKeySequence.Save)  # Ctrl+S
-        btn_save.clicked.connect(self.apply_changes)
-        btn_cancel = QPushButton("Cancel")
-        btn_cancel.clicked.connect(self.reject)
-        hb.addWidget(btn_save)
-        hb.addWidget(btn_cancel)
-        main_layout.addLayout(hb)
+    # ──────────────────────────────────────────────────────────────────────
+    # Public API
+    # ──────────────────────────────────────────────────────────────────────
 
-        self.update_word_count()
+    def get_edited_html(self) -> str:
+        return self.editor.toHtml()
 
-    # ── Commands ─────────────────────────────────────────
+    def apply_changes(self) -> None:
+        """
+        Save to message.html, but force browser to match spacing chosen in editor by
+        injecting a wrapper with inline line-height.
+        """
+        content = self.get_edited_html()
+        content = self._inject_export_line_spacing_wrapper(content)
+        try:
+            _atomic_write(self.message_path, content, encoding="utf-8")
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"Could not save:\n{type(e).__name__}: {e}")
+
+    def _inject_export_line_spacing_wrapper(self, html: str) -> str:
+        if not html:
+            return html
+        if not self._export_line_spacing:
+            return html
+
+        lh = max(0.5, min(4.0, float(self._export_line_spacing)))
+        wrapper_open = f'<div class="ls-linewrap" style="line-height:{lh};">'
+        wrapper_close = "</div>"
+
+        lower = html.lower()
+        body_open = lower.find("<body")
+        if body_open == -1:
+            return wrapper_open + html + wrapper_close
+
+        body_tag_end = lower.find(">", body_open)
+        if body_tag_end == -1:
+            return html
+
+        body_close = lower.rfind("</body>")
+        if body_close == -1:
+            return html[:body_tag_end + 1] + wrapper_open + html[body_tag_end + 1:] + wrapper_close
+
+        inner = html[body_tag_end + 1:body_close]
+        if 'class="ls-linewrap"' in inner:
+            return html
+
+        new_inner = wrapper_open + inner + wrapper_close
+        return html[:body_tag_end + 1] + new_inner + html[body_close:]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Commands
+    # ──────────────────────────────────────────────────────────────────────
+
     def insert_salutation(self) -> None:
         cursor = self.editor.textCursor()
         cursor.movePosition(QTextCursor.Start)
+
         fmt = QTextCharFormat()
         fmt.setFontFamily("Parchment")
-        fmt.setFontPointSize(48)
+        fmt.setFontPointSize(48.0)
+
         cursor.insertText(f"Dear {self.recipient_name},", fmt)
         cursor.insertBlock()
         self.editor.setTextCursor(cursor)
 
-    def _insert_image_dialog(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select Image", str(self.project_root),
-            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp)"
-        )
-        if not path:
-            return
-        rel = self.editor._copy_into_assets(Path(path))
-        if rel:
-            self.editor.insert_image_html(rel, 360)
+    def open_find_replace(self) -> None:
+        FindReplaceDialog(self).exec()
 
+    # ──────────────────────────────────────────────────────────────────────
     # Formatting
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _apply_char_format(self, fmt: QTextCharFormat) -> None:
+        c = self.editor.textCursor()
+        if c.hasSelection():
+            c.mergeCharFormat(fmt)
+            self.editor.mergeCurrentCharFormat(fmt)
+        else:
+            self.editor.mergeCurrentCharFormat(fmt)
+            self.editor.setCurrentCharFormat(self.editor.currentCharFormat())
+
+    def _toggle_weight(self, wt: int) -> None:
+        fmt = self.editor.currentCharFormat()
+        fmt.setFontWeight(QFont.Normal if fmt.fontWeight() == wt else wt)
+        self._apply_char_format(fmt)
+
     def set_font_family(self, font: QFont) -> None:
         fmt = QTextCharFormat()
         fmt.setFontFamily(font.family())
-        self._apply_format(fmt)
+        self._apply_char_format(fmt)
 
     def set_font_size(self, size: int) -> None:
+        size_i = int(max(FONT_SIZE_MIN, min(FONT_SIZE_MAX, size)))
+        try:
+            self.editor.setFontPointSize(float(size_i))
+        except Exception:
+            pass
         fmt = QTextCharFormat()
-        fmt.setFontPointSize(size)
-        self._apply_format(fmt)
+        fmt.setFontPointSize(float(size_i))
+        self._apply_char_format(fmt)
 
     def toggle_bold(self) -> None:
         self._toggle_weight(QFont.Bold)
@@ -520,25 +721,25 @@ class Editor(QDialog):
     def toggle_italic(self) -> None:
         fmt = self.editor.currentCharFormat()
         fmt.setFontItalic(not fmt.fontItalic())
-        self.editor.setCurrentCharFormat(fmt)
+        self._apply_char_format(fmt)
 
     def toggle_underline(self) -> None:
         fmt = self.editor.currentCharFormat()
         fmt.setFontUnderline(not fmt.fontUnderline())
-        self.editor.setCurrentCharFormat(fmt)
+        self._apply_char_format(fmt)
 
     def toggle_strikethrough(self) -> None:
         fmt = self.editor.currentCharFormat()
         fmt.setFontStrikeOut(not fmt.fontStrikeOut())
-        self.editor.setCurrentCharFormat(fmt)
+        self._apply_char_format(fmt)
 
     def clear_formatting(self) -> None:
         c = self.editor.textCursor()
         if c.hasSelection():
             txt = c.selectedText()
-            c.insertText(txt)  # inserts plain text, clearing formatting
+            c.insertText(txt)
+            self.editor.setTextCursor(c)
         else:
-            # apply default format going forward
             self.editor.setCurrentCharFormat(QTextCharFormat())
 
     def choose_color(self) -> None:
@@ -546,10 +747,14 @@ class Editor(QDialog):
         if not color.isValid():
             return
         self.last_color = color
-        self.settings.setValue(SETTINGS_KEY_COLOR, color)
+        try:
+            self.settings.setValue(SETTINGS_KEY_COLOR, color)
+        except Exception:
+            pass
+
         fmt = QTextCharFormat()
         fmt.setForeground(color)
-        self._apply_format(fmt)
+        self._apply_char_format(fmt)
 
     def insert_bullet_list(self) -> None:
         c = self.editor.textCursor()
@@ -567,46 +772,72 @@ class Editor(QDialog):
         c.createList(lf)
         c.endEditBlock()
 
-    def open_find_replace(self) -> None:
-        FindReplaceDialog(self).exec()
+    def set_line_spacing(self, multiplier: float) -> None:
+        self._export_line_spacing = float(multiplier)
 
-    def get_edited_html(self) -> str:
-        return self.editor.toHtml() if self.editor.acceptRichText() else self.editor.toPlainText()
+        pct = float(max(0.5, float(multiplier)) * 100.0)
+        pct = max(50.0, min(400.0, pct))
+        height_type = QTextBlockFormat.ProportionalHeight.value
+
+        cursor = self.editor.textCursor()
+
+        if not cursor.hasSelection():
+            bf = cursor.blockFormat()
+            bf.setLineHeight(pct, height_type)
+            cursor.setBlockFormat(bf)
+            self.editor.setTextCursor(cursor)
+            return
+
+        start = cursor.selectionStart()
+        end = cursor.selectionEnd()
+
+        doc = self.editor.document()
+        work = QTextCursor(doc)
+        work.beginEditBlock()
+        try:
+            work.setPosition(start)
+            blk = work.block()
+
+            work.setPosition(end)
+            end_blk = work.block()
+
+            while blk.isValid():
+                bc = QTextCursor(blk)
+                bf = bc.blockFormat()
+                bf.setLineHeight(pct, height_type)
+                bc.setBlockFormat(bf)
+
+                if blk == end_blk:
+                    break
+                blk = blk.next()
+        finally:
+            work.endEditBlock()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Misc
+    # ──────────────────────────────────────────────────────────────────────
 
     def update_word_count(self) -> None:
         t = self.editor.toPlainText()
-        # Basic token split; this keeps it fast and robust
         w = len([s for s in t.split() if s.strip()])
         c = len(t)
         self.word_label.setText(f"Words: {w:,}  |  Chars: {c:,}")
 
-    def apply_changes(self) -> None:
-        content = self.get_edited_html()
-        try:
-            _ensure_dir(self.message_path.parent)
-            _atomic_write(self.message_path, content, encoding="utf-8")
-            self.accept()
-        except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"Could not save:\n{type(e).__name__}: {e}")
-
-    # Internals
-    def _apply_format(self, fmt: QTextCharFormat) -> None:
-        c = self.editor.textCursor()
-        if c.hasSelection():
-            c.mergeCharFormat(fmt)
-        else:
-            self.editor.setCurrentCharFormat(fmt)
-
-    def _toggle_weight(self, wt: int) -> None:
-        fmt = self.editor.currentCharFormat()
-        fmt.setFontWeight(QFont.Normal if fmt.fontWeight() == wt else wt)
-        self.editor.setCurrentCharFormat(fmt)
-
     def _sync_format(self, fmt: QTextCharFormat) -> None:
-        self.font_combo.blockSignals(True)
-        self.font_size_spin.blockSignals(True)
-        self.font_combo.setCurrentFont(fmt.font())
-        sz = int(fmt.fontPointSize()) if fmt.fontPointSize() > 0 else DEFAULT_FONT_SIZE
-        self.font_size_spin.setValue(sz)
-        self.font_combo.blockSignals(False)
-        self.font_size_spin.blockSignals(False)
+        try:
+            self.font_combo.blockSignals(True)
+            self.font_size_spin.blockSignals(True)
+
+            self.font_combo.setCurrentFont(fmt.font())
+
+            pt = fmt.fontPointSize()
+            if pt and pt > 0:
+                sz = int(round(pt))
+            else:
+                eff = self.editor.fontPointSize()
+                sz = int(round(eff)) if eff and eff > 0 else DEFAULT_FONT_SIZE
+
+            self.font_size_spin.setValue(max(FONT_SIZE_MIN, min(FONT_SIZE_MAX, sz)))
+        finally:
+            self.font_combo.blockSignals(False)
+            self.font_size_spin.blockSignals(False)

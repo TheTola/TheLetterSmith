@@ -1,11 +1,8 @@
 ﻿# ===============================
 # File: sound_tab.py
-# Streamlined archive (names-only), movable/clamped popup, delete mode,
-# Windows-safe atomic replace with short retries, and player-handle release.
-# Glissando is now played from the ORIGINAL file, unmodified and untrimmed.
-# Also supports overlapping gliss plays via one-shot SFX players so it never
-# gets cut off by a subsequent trigger.
-# ===============================
+# Purpose: Sound tab (archive + playback + analysis + visualizer)
+
+
 from __future__ import annotations
 
 import errno
@@ -22,7 +19,7 @@ from typing import Optional, List, Tuple, Dict
 # --- Qt ---
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QAudio
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSlider,
     QFileDialog, QMessageBox
@@ -30,6 +27,12 @@ from PySide6.QtWidgets import (
 
 # --- Visualizer (shared preview widget) ---
 from sound_preview import SoundPreviewWidget
+
+# --- Analysis (offline MP3 -> cached) ---
+try:
+    from sound_analyzer import AudioAnalysisManager
+except Exception:
+    AudioAnalysisManager = None  # type: ignore
 
 # --- Audio utils ---
 from mutagen import File as MutagenFile
@@ -46,9 +49,16 @@ if _FFPROBE_BIN and os.path.exists(_FFPROBE_BIN):
 
 # --- Project config ---
 from config import (
-    GALLERY_DIR, SOUNDS_DIR, GLISS_FILE, SETTINGS_FILE, MUSIC_FILE,
-    MAX_AUDIO_MB, STARTING_VOLUME
+    SETTINGS_FILE,
+    MAX_AUDIO_MB,
+    STARTING_VOLUME,
+    MUSIC_FILE,
+    GLISS_FILE,
+    FLIP_PREFIX,
+    FLIP_COUNT,
+    USER_SOUNDS_DIR,
 )
+
 
 # Supported formats
 VALID_AUDIO_EXTS = [".mp3", ".wav", ".ogg", ".aac", ".m4a", ".flac"]
@@ -58,8 +68,56 @@ GLISS_VOLUME_PERCENT = 10
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NEW PATH MODEL (single source of truth)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _user_sounds_dir(project_root: Path) -> Path:
+    # gallery/user/sounds
+        return project_root / USER_SOUNDS_DIR
+
+
+def _user_archive_root(project_root: Path) -> Path:
+    # gallery/user/sounds/appssong
+    return _user_sounds_dir(project_root) / "appssong"
+
+
+def _user_archive_originals(project_root: Path) -> Path:
+    # gallery/user/sounds/appssong/originals
+    return _user_archive_root(project_root) / "originals"
+
+
+def _user_archive_processed(project_root: Path) -> Path:
+    # gallery/user/sounds/appssong/processed
+    return _user_archive_root(project_root) / "processed"
+
+
+def _user_archive_analysis(project_root: Path) -> Path:
+    # gallery/user/sounds/appssong/analysis
+    return _user_archive_root(project_root) / "analysis"
+
+
+def _user_current_manifest(project_root: Path) -> Path:
+    # gallery/user/sounds/appssong/current.json
+    return _user_archive_root(project_root) / "current.json"
+
+
+def _user_current_music(project_root: Path) -> Path:
+    # gallery/user/sounds/music.mp3
+    return _user_sounds_dir(project_root) / MUSIC_FILE
+
+
+def _user_gliss_path(project_root: Path) -> Path:
+    return _user_sounds_dir(project_root) / GLISS_FILE
+
+
+def _user_flip_path(project_root: Path, i: int) -> Path:
+    return _user_sounds_dir(project_root) / f"{FLIP_PREFIX}{i}.mp3"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────────────────────────────────────
+
 def _atomic_copy(src: Path, dst: Path) -> None:
     """Atomic write via *.tmp then os.replace."""
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -95,8 +153,11 @@ def _open_folder(path: Path) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Archive manager (current-only target under gallery/sounds/music.mp3)
+# Archive manager (CURRENT target: gallery/user/sounds/music.mp3)
+# Archive: gallery/user/sounds/appssong/{originals,processed}
+# Manifest: gallery/user/sounds/appssong/current.json
 # ─────────────────────────────────────────────────────────────────────────────
+
 @dataclass
 class AddResult:
     action: str
@@ -113,15 +174,20 @@ class SoundArchiveManager(QtCore.QObject):
     def __init__(self, project_root: Path):
         super().__init__()
         self.project_root = Path(project_root).resolve()
-        base = self.project_root / GALLERY_DIR / SOUNDS_DIR / "archive"
-        self.dir_originals = base / "originals"
-        self.dir_processed = base / "processed"
+
+        self.sounds_root = _user_sounds_dir(self.project_root)
+        self.dir_originals = _user_archive_originals(self.project_root)
+        self.dir_processed = _user_archive_processed(self.project_root)
+        self.current_manifest = _user_current_manifest(self.project_root)
+
+        self.sounds_root.mkdir(parents=True, exist_ok=True)
         self.dir_originals.mkdir(parents=True, exist_ok=True)
         self.dir_processed.mkdir(parents=True, exist_ok=True)
-        self.current_manifest = (self.project_root / GALLERY_DIR / SOUNDS_DIR / "current.json")
 
-        # Single source of truth for live audio
-        self.current_target = self.project_root / GALLERY_DIR / SOUNDS_DIR / MUSIC_FILE
+        # Single source of truth for live audio used by viewer
+        self.current_target = _user_current_music(self.project_root)
+
+
 
     # Names-only listing (newest first)
     def list_archive(self) -> List[str]:
@@ -130,49 +196,46 @@ class SoundArchiveManager(QtCore.QObject):
             return names
         items = sorted(self.dir_processed.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
         for p in items:
-            if p.is_file():
+            if p.is_file() and p.suffix.lower() == ".mp3":
                 names.append(p.name)
         return names
 
     def add_song_from_path(self, source: Path) -> AddResult:
         """
         Two-copy flow:
-          • originals/<originalname.ext> (rename if name collision with different size)
-          • processed/<originalname>.mp3 (normalize→mp3; if normalize fails and source is .mp3, atomic-copy it)
-        Then set current by copying to gallery/sounds/music.mp3 and write a minimal manifest.
+          • appssong/originals/<originalname.ext>
+          • appssong/processed/<originalname>.mp3  (normalize→mp3; fallback copy if mp3)
+        Then set current by copying to gallery/user/sounds/music.mp3 and write manifest.
         """
         source = Path(source)
         if not source.exists() or not source.is_file():
             return AddResult("error", None, None, -1, "Source file does not exist or is not a file.")
 
         incoming_size = _file_size(source)
+        if incoming_size > MAX_AUDIO_MB * 1024 * 1024:
+            return AddResult("error", None, None, incoming_size, f"File exceeds {MAX_AUDIO_MB} MB limit.")
 
-        # Resolve original filename (name+size dedupe)
         final_original_name, action = self._decide_original_name(source.name, incoming_size)
         if action == "cancel":
             return AddResult("canceled", None, None, incoming_size, "User canceled rename due to conflict.")
-        orig_path = self.dir_originals / final_original_name
 
+        orig_path = self.dir_originals / final_original_name
         if action != "skipped":
             try:
                 _atomic_copy(source, orig_path)
             except Exception as e:
                 return AddResult("error", None, None, incoming_size, f"Failed to archive original: {e!r}")
 
-        # Prepare processed mp3
         processed_name = Path(final_original_name).stem + ".mp3"
         processed_path = self.dir_processed / processed_name
         try:
-            audio = AudioSegment.from_file(source)
-            # Mild dynamic range control, then normalize (prevents surprise peaks)
+            audio = AudioSegment.from_file(str(source))
             audio = effects.compress_dynamic_range(audio, threshold=-18.0, ratio=2.0, attack=5.0, release=50.0)
             normalized = effects.normalize(audio)
             tmp_mp3 = processed_path.with_suffix(".mp3.tmp")
             normalized.export(tmp_mp3, format="mp3")
             os.replace(tmp_mp3, processed_path)
         except Exception as e:
-            # Hardened fallback: if .mp3 input and conversion failed (e.g., ffmpeg missing),
-            # copy straight through so the pipeline stays usable.
             if source.suffix.lower() == ".mp3":
                 try:
                     _atomic_copy(source, processed_path)
@@ -205,34 +268,31 @@ class SoundArchiveManager(QtCore.QObject):
 
     def delete_processed(self, processed_filename: str) -> bool:
         """
-        Delete one processed item by name. If it was the current track,
-        auto-fallback to the newest remaining, else clear music.mp3.
+        Delete one processed item by name. If it was current, fall back to newest remaining,
+        else clear music.mp3 + manifest.
         """
         target = self.dir_processed / processed_filename
         if not target.exists():
             return False
 
-        # Was it current?
         is_current = False
         try:
             data = json.loads(self.current_manifest.read_text(encoding="utf-8"))
             current_rel = data.get("current_rel", "")
-            expected_rel = f"{GALLERY_DIR}/{SOUNDS_DIR}/archive/processed/{processed_filename}"
+            expected_rel = f"{USER_SOUNDS_DIR}/appssong/processed/{processed_filename}"
             is_current = (current_rel == expected_rel)
         except Exception:
             pass
 
-        # Delete
         try:
             target.unlink()
         except Exception:
             return False
 
-        # Retarget if needed
         if is_current:
             remaining = self.list_archive()
             if remaining:
-                self.set_current(remaining[0])   # newest
+                self.set_current(remaining[0])  # newest
             else:
                 try:
                     if self.current_target.exists():
@@ -244,7 +304,7 @@ class SoundArchiveManager(QtCore.QObject):
                         self.current_manifest.unlink()
                 except Exception:
                     pass
-                self.current_changed.emit("")  # cleared
+                self.current_changed.emit("")
 
         self.archive_changed.emit()
         return True
@@ -272,10 +332,8 @@ class SoundArchiveManager(QtCore.QObject):
         if src == dst:
             return
 
-        # Atomic copy with a short retry on Windows to avoid transient [WinError 5]
-        # if some process briefly holds music.mp3 (Explorer preview, AV, sync, or player).
         tries = 5
-        delay = 0.15  # 150 ms
+        delay = 0.15
         for _ in range(tries):
             try:
                 _atomic_copy(src, dst)
@@ -297,7 +355,7 @@ class SoundArchiveManager(QtCore.QObject):
 
     def _write_manifest(self, processed_name: str, size: int) -> None:
         data = {
-            "current_rel": f"{GALLERY_DIR}/{SOUNDS_DIR}/archive/processed/{processed_name}",
+            "current_rel": f"gallery/user/sounds/appssong/processed/{processed_name}",
             "link_mode": "copy",
             "size": size,
             "set_at": datetime.now().isoformat(timespec="seconds"),
@@ -309,6 +367,7 @@ class SoundArchiveManager(QtCore.QObject):
 # ─────────────────────────────────────────────────────────────────────────────
 # Minimal frameless rename dialog (keeps ext)
 # ─────────────────────────────────────────────────────────────────────────────
+
 class RenameDialog(QtWidgets.QDialog):
     def __init__(self, current_name: str, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
@@ -361,16 +420,20 @@ class RenameDialog(QtWidgets.QDialog):
         name = self._edit.text().strip()
         if not name:
             return
+
         ext = Path(self._current_name).suffix
         if not name.endswith(ext):
             name += ext
 
-        # Windows-incompatible characters & reserved basenames
         if any(ch in name for ch in '<>:"/\\|?*'):
             return
+
         base = Path(name).stem.upper()
-        if base in {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-                    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}:
+        if base in {
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+        }:
             return
 
         self._final = name
@@ -383,9 +446,9 @@ class RenameDialog(QtWidgets.QDialog):
 # ─────────────────────────────────────────────────────────────────────────────
 # Frameless confirm (“Are you sure?”) used by delete
 # ─────────────────────────────────────────────────────────────────────────────
+
 class ConfirmDialog(QtWidgets.QDialog):
     def __init__(self, message: str, parent=None):
-        # Top-level dialog that can sit above a popup and accept clicks
         super().__init__(parent or None)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setModal(True)
@@ -423,15 +486,11 @@ class ConfirmDialog(QtWidgets.QDialog):
         btn_no.clicked.connect(self.reject)
         btn_yes.clicked.connect(self.accept)
 
-    def showEvent(self, e: QtGui.QShowEvent) -> None:
-        super().showEvent(e)
-        self.raise_()
-        self.activateWindow()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Archive dropdown (movable + clamped + names-only + delete mode)
 # ─────────────────────────────────────────────────────────────────────────────
+
 class ArchiveDropdown(QtWidgets.QFrame):
     use_requested = QtCore.Signal(str)
     request_release = QtCore.Signal()  # ask parent to release player handle before file ops
@@ -462,7 +521,6 @@ class ArchiveDropdown(QtWidgets.QFrame):
         inner.setContentsMargins(10, 10, 10, 10)
         inner.setSpacing(8)
 
-        # Header
         header = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("Archive")
         title.setStyleSheet("font-weight:600; font-size:14px;")
@@ -492,7 +550,6 @@ class ArchiveDropdown(QtWidgets.QFrame):
         inner.addWidget(self._scroll, 1)
         outer.addWidget(panel)
 
-        # Fade in
         self._opacity = QtWidgets.QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(self._opacity)
         self._anim = QtCore.QPropertyAnimation(self._opacity, b"opacity", self)
@@ -503,7 +560,6 @@ class ArchiveDropdown(QtWidgets.QFrame):
         self._mgr.archive_changed.connect(self.refresh)
         self.refresh()
 
-    # Movement + clamp
     def _available_geom_at(self, global_pos: QtCore.QPoint) -> QtCore.QRect:
         screen = QtGui.QGuiApplication.screenAt(global_pos)
         if not screen:
@@ -539,7 +595,6 @@ class ArchiveDropdown(QtWidgets.QFrame):
         else:
             super().mouseMoveEvent(e)
 
-    # Build
     def refresh(self) -> None:
         while self._list_layout.count():
             item = self._list_layout.takeAt(0)
@@ -587,7 +642,6 @@ class ArchiveDropdown(QtWidgets.QFrame):
     def _confirm_delete(self, name: str) -> None:
         dlg = ConfirmDialog(f"Are you sure you want to remove “{name}” from archive?", self)
         if dlg.exec() == QtWidgets.QDialog.Accepted:
-            # Ask parent to release the player handle (important on Windows)
             self.request_release.emit()
             ok = self._mgr.delete_processed(name)
             if not ok:
@@ -596,26 +650,23 @@ class ArchiveDropdown(QtWidgets.QFrame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WaveHandler (player + persisted volume, obeys STARTING_VOLUME default)
-# Glissando policy: ALWAYS play the ORIGINAL file at fixed 10% volume.
+# WaveHandler (player + persisted volume)
+# Gliss policy: ALWAYS play the ORIGINAL file at fixed 10% volume.
 # Supports overlapping one-shot SFX so a new play never cuts a previous one.
 # ─────────────────────────────────────────────────────────────────────────────
+
 class WaveHandler(QtCore.QObject):
     def __init__(self, project_root, archive_mgr: Optional[SoundArchiveManager] = None):
         super().__init__()
         self.project_root = Path(project_root).resolve()
         self.settings_path = self.project_root / SETTINGS_FILE
 
-        self.gallery_dir = self.project_root / GALLERY_DIR
-        self.sounds_dir = self.gallery_dir / SOUNDS_DIR
-        self.sounds_dir.mkdir(parents=True, exist_ok=True)
-
         # Music player (persistent)
         self.audio_output = QAudioOutput()
         self.player = QMediaPlayer()
         self.player.setAudioOutput(self.audio_output)
 
-        # One-shot SFX pool for gliss plays (so they never cut each other off)
+        # One-shot SFX pool for gliss plays
         self._sfx_pool: List[Tuple[QMediaPlayer, QAudioOutput]] = []
 
         # Volume: load saved; else use STARTING_VOLUME from config
@@ -625,7 +676,6 @@ class WaveHandler(QtCore.QObject):
         self._archive = archive_mgr
         self._muted = False
 
-    # Settings
     def _read_settings(self) -> Dict:
         try:
             return json.loads(self.settings_path.read_text(encoding="utf-8"))
@@ -646,7 +696,6 @@ class WaveHandler(QtCore.QObject):
                 return v / 100.0
             except Exception:
                 pass
-        # fallback to project default
         try:
             v = max(0, min(100, int(STARTING_VOLUME)))
         except Exception:
@@ -654,7 +703,6 @@ class WaveHandler(QtCore.QObject):
         return v / 100.0
 
     def save_music_volume(self, volume_percent: int) -> None:
-        # Clamp and persist for BOTH live player and template build
         v = max(0, min(100, int(volume_percent)))
         settings = self._read_settings()
         settings["music_volume"] = v
@@ -664,7 +712,6 @@ class WaveHandler(QtCore.QObject):
         self._music_volume = v / 100.0
         self.audio_output.setVolume(self._music_volume)
 
-    # Validation
     def validate_audio(self, path: str) -> Tuple[bool, str]:
         if not os.path.exists(path):
             return False, "File does not exist."
@@ -680,7 +727,6 @@ class WaveHandler(QtCore.QObject):
         except Exception as e:
             return False, f"Metadata error: {e}"
 
-    # Player controls
     def load_audio(self, path: str) -> None:
         self.player.setSource(QUrl.fromLocalFile(path))
 
@@ -699,7 +745,6 @@ class WaveHandler(QtCore.QObject):
     def toggle_mute(self) -> bool:
         self._muted = not self._muted
         self.audio_output.setMuted(self._muted)
-        # SFX pool: also honor mute state
         try:
             for _p, out in list(self._sfx_pool):
                 out.setMuted(self._muted)
@@ -710,7 +755,6 @@ class WaveHandler(QtCore.QObject):
     def is_playing(self) -> bool:
         return self.player.playbackState() == QMediaPlayer.PlayingState
 
-    # Release file handle so Windows can replace music.mp3
     def release_current_file_handle(self) -> None:
         """Stop playback and detach source to release OS file handle."""
         try:
@@ -719,16 +763,12 @@ class WaveHandler(QtCore.QObject):
         except Exception:
             pass
 
-    # Gliss helper — ALWAYS uses ORIGINAL file, never smoothed/trimmed, at fixed 10% volume.
-    # Supports overlapping one-shots so a new play does not interrupt a previous one.
     def play_gliss(self) -> bool:
-        gliss_raw = self.sounds_dir / GLISS_FILE
+        gliss_raw = _user_gliss_path(self.project_root)
         if not gliss_raw.exists():
             return False
         try:
-            # Build one-shot pair
             out = QAudioOutput()
-            # Prefer music output device for consistency; else default
             try:
                 out.setDevice(self.audio_output.device())
             except Exception:
@@ -740,7 +780,6 @@ class WaveHandler(QtCore.QObject):
             p.setAudioOutput(out)
             p.setSource(QUrl.fromLocalFile(str(gliss_raw)))
 
-            # Keep refs alive until finished
             self._sfx_pool.append((p, out))
 
             def _cleanup_when_done(_status: QMediaPlayer.MediaStatus) -> None:
@@ -752,9 +791,7 @@ class WaveHandler(QtCore.QObject):
                     try:
                         self._sfx_pool.remove((p, out))
                     except Exception:
-                        # Best-effort cleanup
                         self._sfx_pool[:] = [(pp, oo) for (pp, oo) in self._sfx_pool if pp is not p]
-                # No else: let it live while playing/buffering
 
             p.mediaStatusChanged.connect(_cleanup_when_done)
             p.play()
@@ -762,21 +799,12 @@ class WaveHandler(QtCore.QObject):
         except Exception:
             return False
 
-    def get_audio_tag(self) -> str:
-        source_path = f"{GALLERY_DIR}/{SOUNDS_DIR}/{MUSIC_FILE}"
-        return (
-            '<audio id="bg-music" autoplay loop>'
-            f'<source src="{source_path}" type="audio/mpeg">'
-            'Your browser does not support the audio tag.'
-            '</audio>'
-        )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SoundTab (UI kept intact; archive popup has requested features only)
+# SoundTab
 # ─────────────────────────────────────────────────────────────────────────────
+
 class SoundTab(QtWidgets.QWidget):
-    # Nexus compatibility
     preview_movie = QtCore.Signal(QtGui.QMovie)        # legacy signal (kept)
     preview_widget = QtCore.Signal(QtWidgets.QWidget)  # visualizer widget
 
@@ -791,29 +819,94 @@ class SoundTab(QtWidgets.QWidget):
         self._preview = SoundPreviewWidget(self.wave.player, parent=self)
         self._archive_mgr.current_changed.connect(self._on_current_changed)
 
+        # Analysis manager (override its default dirs to appssong paths)
+        self._analysis = AudioAnalysisManager(self.project_root, parent=self) if AudioAnalysisManager is not None else None
+        self._analysis_bootstrapped = False
+        self._current_processed = ""
+        self._current_analysis_key = ""
+
+        if self._analysis is not None:
+            try:
+                self._analysis.ensure_analyzed(stable, priority=True)
+
+                _user_archive_analysis(self.project_root).mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+            self._analysis.busyChanged.connect(self._on_analysis_busy)
+            self._analysis.batchProgress.connect(self._on_analysis_progress)
+            self._analysis.analysisReady.connect(self._on_analysis_ready)
+            self._analysis.analysisFailed.connect(self._on_analysis_failed)
+
         self._init_ui()
         self._init_shortcuts()
 
         # Prime current track if present
-        current_track = self.project_root / GALLERY_DIR / SOUNDS_DIR / MUSIC_FILE
+        current_track = _user_current_music(self.project_root)
         if current_track.exists():
             self.wave.load_audio(str(current_track))
-            if hasattr(self._preview, "set_audio_file"):
-                self._preview.set_audio_file(str(current_track))
+            self._current_processed = self._read_current_processed_from_manifest()
+
+            stable_path = self._stable_audio_path_for_preview()
+            if stable_path is not None:
+                try:
+                    self._preview.set_audio_file(str(stable_path))
+                except Exception:
+                    pass
+
+            self._prime_analysis_for_current()
 
         # Hand to Nexus
         self.preview_widget.emit(self._preview)
 
+        # Warn if SFX missing
+        self._warn_if_missing_sfx()
+
+    def _warn_if_missing_sfx(self) -> None:
+        misses = []
+        if not _user_gliss_path(self.project_root).exists():
+            misses.append(str(_user_gliss_path(self.project_root)))
+        for i in range(1, 11):
+            p = _user_flip_path(self.project_root, i)
+            if not p.exists():
+                misses.append(str(p))
+        if misses:
+            try:
+                self.status.setText("⚠ Missing sound assets:\n" + "\n".join(misses))
+            except Exception:
+                pass
+
+    # ─────────────────────────────────────────────────────────────────────
+    # UI
+    # ─────────────────────────────────────────────────────────────────────
     def showEvent(self, e: QtGui.QShowEvent) -> None:
         super().showEvent(e)
         self.preview_widget.emit(self._preview)
+
+        if (self._analysis is not None) and (not self._analysis_bootstrapped):
+            self._analysis_bootstrapped = True
+            try:
+                self.status.setText("⏳ Building audio analysis cache…")
+            except Exception:
+                pass
+
+            # Kick sweep
+            try:
+                self._analysis.enqueue_missing()
+            except Exception:
+                pass
+
+            try:
+                if not self._analysis.is_busy():
+                    self.status.setText("Audio cache ready.")
+            except Exception:
+                pass
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(14)
 
-        # Header
         header = QHBoxLayout()
         title = QLabel("Sound")
         title.setStyleSheet("font-weight:600; font-size:14px;")
@@ -828,15 +921,12 @@ class SoundTab(QtWidgets.QWidget):
         )
         self._dropdown = ArchiveDropdown(self._archive_mgr, parent=self)
         self.btn_archive.clicked.connect(self._open_archive_dropdown)
-
-        # If the dropdown needs us to release the player (Windows lock), connect it:
         self._dropdown.request_release.connect(self.wave.release_current_file_handle)
 
         header.addWidget(title, 1)
         header.addWidget(self.btn_archive, 0)
         layout.addLayout(header)
 
-        # Volume row
         vol_row = QHBoxLayout()
         vol_row.setSpacing(10)
 
@@ -868,7 +958,6 @@ class SoundTab(QtWidgets.QWidget):
         vol_row.addStretch(1)
         layout.addLayout(vol_row)
 
-        # Buttons: Add/Open
         btn_row1 = QHBoxLayout()
         btn_row1.setSpacing(12)
         self.add_btn = QPushButton("🎵 Add Music")
@@ -878,7 +967,6 @@ class SoundTab(QtWidgets.QWidget):
         btn_row1.addStretch(1)
         layout.addLayout(btn_row1)
 
-        # Buttons: Play/Restart/Mute
         btn_row2 = QHBoxLayout()
         btn_row2.setSpacing(12)
         self.playpause_btn = QPushButton("▶️ Play")
@@ -890,7 +978,19 @@ class SoundTab(QtWidgets.QWidget):
         btn_row2.addStretch(1)
         layout.addLayout(btn_row2)
 
-        # Status
+        self.analysis_progress = QtWidgets.QProgressBar()
+        self.analysis_progress.setRange(0, 100)
+        self.analysis_progress.setValue(0)
+        self.analysis_progress.setTextVisible(True)
+        self.analysis_progress.setFormat("Analyzing audio… %p%")
+        self.analysis_progress.setFixedHeight(18)
+        self.analysis_progress.setStyleSheet(
+            "QProgressBar { background:#0d0f14; border:1px solid #2b3344; border-radius:6px; color:#e6e6e6; }"
+            "QProgressBar::chunk { background:#00c8ff; border-radius:6px; }"
+        )
+        self.analysis_progress.hide()
+        layout.addWidget(self.analysis_progress)
+
         self.status = QLabel()
         self.status.setWordWrap(True)
         self.status.setAlignment(Qt.AlignLeft)
@@ -900,7 +1000,6 @@ class SoundTab(QtWidgets.QWidget):
         )
         layout.addWidget(self.status)
 
-        # Hooks
         self.add_btn.clicked.connect(self.select_music)
         self.open_btn.clicked.connect(self.open_sounds_folder)
         self.playpause_btn.clicked.connect(self.play_pause_audio)
@@ -908,7 +1007,6 @@ class SoundTab(QtWidgets.QWidget):
         self.mute_btn.clicked.connect(self.toggle_mute)
         self._dropdown.use_requested.connect(self._on_use_from_archive)
 
-        # Volume hooks
         self.vol_slider.valueChanged.connect(self._on_volume_changed)
         self.vol_slider.sliderReleased.connect(self._on_volume_released)
 
@@ -926,18 +1024,152 @@ class SoundTab(QtWidgets.QWidget):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+L"), self, activated=self.select_music)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+O"), self, activated=self.open_sounds_folder)
 
-    # Interactions
+    # ─────────────────────────────────────────────────────────────────────
+    # Stable path policy (preview + analysis use same stable path)
+    # ─────────────────────────────────────────────────────────────────────
+    def _read_current_processed_from_manifest(self) -> str:
+        try:
+            manifest = _user_current_manifest(self.project_root)
+            if not manifest.exists():
+                return ""
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            rel = str(data.get("current_rel", ""))
+            return Path(rel).name if rel else ""
+        except Exception:
+            return ""
+
+    def _processed_path_for(self, processed_filename: str) -> Path:
+        return _user_archive_processed(self.project_root) / processed_filename
+
+    def _stable_audio_path_for_preview(self) -> Optional[Path]:
+        """
+        Rule:
+          - If we have a processed archive filename and it exists, use it.
+          - Else fall back to gallery/user/sounds/music.mp3
+        """
+        if self._current_processed:
+            p = self._processed_path_for(self._current_processed)
+            if p.exists():
+                return p
+
+        p2 = _user_current_music(self.project_root)
+        if p2.exists():
+            return p2
+        return None
+
+    def _push_analysis_payload(self, payload: dict) -> None:
+        try:
+            self._preview.set_analysis_payload(payload)
+        except Exception:
+            try:
+                vis = self._preview.visualizer()
+                if hasattr(vis, "set_analysis_payload"):
+                    vis.set_analysis_payload(payload)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    def _prime_analysis_for_current(self) -> None:
+        if self._analysis is None:
+            return
+
+        stable = self._stable_audio_path_for_preview()
+        if stable is None or not stable.exists():
+            return
+
+        key = str(stable.resolve())
+        self._current_analysis_key = key
+
+        # Apply cached instantly
+        try:
+            cached = self._analysis.load_cached(stable)
+            if cached is not None:
+                self._push_analysis_payload(cached)
+        except Exception:
+            pass
+
+        # Ensure analysis exists in background
+        try:
+            self._analysis.ensure_analyzed(stable, priority=True)
+        except Exception:
+            pass
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Analysis callbacks
+    # ─────────────────────────────────────────────────────────────────────
+    def _on_analysis_busy(self, busy: bool) -> None:
+        try:
+            if busy:
+                try:
+                    self.status.setText("⏳ Building audio analysis cache…")
+                except Exception:
+                    pass
+                self.analysis_progress.show()
+                self.analysis_progress.setValue(0)
+            else:
+                self.analysis_progress.hide()
+                try:
+                    t = self.status.text()
+                except Exception:
+                    t = ""
+                if "Analysis failed" not in t:
+                    self.status.setText("Audio cache ready.")
+        except Exception:
+            pass
+
+    def _on_analysis_progress(self, done: int, total: int, current_name: str, current_pct: int) -> None:
+        try:
+            t = max(1, int(total))
+            d = max(0, int(done))
+            cp = max(0, min(100, int(current_pct)))
+            overall = int(round(((d + (cp / 100.0)) / t) * 100.0))
+            overall = max(0, min(100, overall))
+            self.analysis_progress.setValue(overall)
+            if current_name:
+                self.analysis_progress.setFormat(f"Analyzing {current_name}… {overall}%")
+            else:
+                self.analysis_progress.setFormat(f"Analyzing audio… {overall}%")
+        except Exception:
+            pass
+
+    def _on_analysis_ready(self, path_key: str, payload: dict) -> None:
+        try:
+            if self._current_analysis_key and (str(path_key) == self._current_analysis_key):
+                self._push_analysis_payload(payload)
+        except Exception:
+            pass
+
+    def _on_analysis_failed(self, _path_key: str, msg: str) -> None:
+        try:
+            self.status.setText(f"⚠️ Analysis failed: {msg}")
+        except Exception:
+            pass
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Current selection changes
+    # ─────────────────────────────────────────────────────────────────────
     def _on_current_changed(self, processed_filename: str) -> None:
-        music_path = self.project_root / GALLERY_DIR / SOUNDS_DIR / MUSIC_FILE
+        self._current_processed = processed_filename or ""
+
+        # Live playback is always music.mp3 (copy-mode)
+        music_path = _user_current_music(self.project_root)
         if music_path.exists():
             self.wave.load_audio(str(music_path))
-            if hasattr(self._preview, "set_audio_file"):
-                self._preview.set_audio_file(str(music_path))
+
+        # Preview must use stable path (processed if possible)
+        stable = self._stable_audio_path_for_preview()
+        if stable is not None:
+            try:
+                self._preview.set_audio_file(str(stable))
+            except Exception:
+                pass
+
+        # Prime analysis and keep keys aligned
+        self._prime_analysis_for_current()
+
         self.playpause_btn.setText("▶️ Play")
         self.status.setText(f"✅ Current set: {processed_filename or '(cleared)'}")
 
     def _on_use_from_archive(self, processed_filename: str) -> None:
-        # IMPORTANT: release file handle before replacing music.mp3
         self.wave.release_current_file_handle()
         try:
             self._archive_mgr.set_current(processed_filename)
@@ -946,6 +1178,9 @@ class SoundTab(QtWidgets.QWidget):
             return
         self._on_current_changed(processed_filename)
 
+    # ─────────────────────────────────────────────────────────────────────
+    # Volume
+    # ─────────────────────────────────────────────────────────────────────
     def _on_volume_changed(self, val: int) -> None:
         self.vol_value.setText(f"{val}%")
         self.wave.audio_output.setVolume(max(0, min(100, val)) / 100.0)
@@ -954,8 +1189,11 @@ class SoundTab(QtWidgets.QWidget):
         v = self.vol_slider.value()
         self.wave.save_music_volume(v)
 
+    # ─────────────────────────────────────────────────────────────────────
+    # UI actions
+    # ─────────────────────────────────────────────────────────────────────
     def update_status(self):
-        music_path = self.project_root / GALLERY_DIR / SOUNDS_DIR / MUSIC_FILE
+        music_path = _user_current_music(self.project_root)
         if music_path.exists():
             self.status.setText(f"✅ Music loaded: {MUSIC_FILE}")
         else:
@@ -973,23 +1211,38 @@ class SoundTab(QtWidgets.QWidget):
             self.wave.pause_audio()
             self.playpause_btn.setText("▶️ Play")
             self.status.setText("⏸️ Paused.")
-        else:
-            if self.wave.player.source().isEmpty():
-                path = self.project_root / GALLERY_DIR / SOUNDS_DIR / MUSIC_FILE
-                if path.exists():
-                    self.wave.load_audio(str(path))
-                    if hasattr(self._preview, "set_audio_file"):
-                        self._preview.set_audio_file(str(path))
-            self.wave.play_audio()
-            self.playpause_btn.setText("⏸️ Pause")
-            self.status.setText("🎧 Playing")
+            return
+
+        if self.wave.player.source().isEmpty():
+            music_path = _user_current_music(self.project_root)
+            if music_path.exists():
+                self.wave.load_audio(str(music_path))
+
+        stable = self._stable_audio_path_for_preview()
+        if stable is not None:
+            try:
+                self._preview.set_audio_file(str(stable))
+            except Exception:
+                pass
+            self._prime_analysis_for_current()
+
+        self.wave.play_audio()
+        self.playpause_btn.setText("⏸️ Pause")
+        self.status.setText("🎧 Playing")
 
     def startover_audio(self):
-        path = self.project_root / GALLERY_DIR / SOUNDS_DIR / MUSIC_FILE
-        if path.exists():
-            self.wave.load_audio(str(path))
-            if hasattr(self._preview, "set_audio_file"):
-                self._preview.set_audio_file(str(path))
+        music_path = _user_current_music(self.project_root)
+        if music_path.exists():
+            self.wave.load_audio(str(music_path))
+
+        stable = self._stable_audio_path_for_preview()
+        if stable is not None:
+            try:
+                self._preview.set_audio_file(str(stable))
+            except Exception:
+                pass
+            self._prime_analysis_for_current()
+
         self.wave.start_over_audio()
         self.playpause_btn.setText("⏸️ Pause")
         self.status.setText("⏮️ Start over.")
@@ -1000,7 +1253,7 @@ class SoundTab(QtWidgets.QWidget):
         self.update_status()
 
     def open_sounds_folder(self):
-        _open_folder(self.project_root / GALLERY_DIR / SOUNDS_DIR)
+        _open_folder(self.project_root / USER_SOUNDS_DIR)
 
     # Drag & drop
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent):
@@ -1032,15 +1285,31 @@ class SoundTab(QtWidgets.QWidget):
             QMessageBox.warning(self, "Invalid Audio", msg)
             return
         try:
-            _ = self._archive_mgr.add_song_from_path(Path(path))
+            res = self._archive_mgr.add_song_from_path(Path(path))
         except Exception as e:
             self.status.setText(f"❌ Failed to process audio: {e}")
             QMessageBox.critical(self, "Conversion Error", str(e))
             return
 
-        music_path = self.project_root / GALLERY_DIR / SOUNDS_DIR / MUSIC_FILE
-        self.wave.load_audio(str(music_path))
-        if hasattr(self._preview, "set_audio_file"):
-            self._preview.set_audio_file(str(music_path))
-        self.status.setText(f"✅ Music added: {os.path.basename(str(music_path))}")
+        # Playback always points to live music.mp3
+        music_path = _user_current_music(self.project_root)
+        if music_path.exists():
+            self.wave.load_audio(str(music_path))
+
+        # Preview/analyzer should use stable processed path when possible
+        self._current_processed = res.archive_processed or self._read_current_processed_from_manifest()
+        stable = self._stable_audio_path_for_preview()
+        if stable is not None:
+            try:
+                self._preview.set_audio_file(str(stable))
+            except Exception:
+                pass
+
+        self._prime_analysis_for_current()
+
+        try:
+            self.status.setText(f"✅ {res.message}")
+        except Exception:
+            self.status.setText(f"✅ Music added: {music_path.name}")
+
         self.playpause_btn.setText("▶️ Play")

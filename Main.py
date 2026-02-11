@@ -1,281 +1,250 @@
 #!/usr/bin/env python3
 # File: Main.py
 # -*- coding: utf-8 -*-
+
 """
-Letter Smith — Application Entry Point (Professional, Streamlined, Non-Destructive)
+Letter Smith — Application Entry Point (Clean, Non-Legacy)
 
-Goals (no feature removals):
-• Create QApplication exactly once (reuse if embedding launches us).
-• Resolve project root reliably (frozen EXE vs source run).
-• Pick a sane app icon (multi-path fallback) and log the chosen one.
-• Regenerate a base64 bundle module from gallery/sounds (source runs only), atomically.
-• Verify a distributable EXE exists in MAX/ and write a timestamped backup (source runs only).
-• Launch Nexus (Over_Nexus-driven shell).
+This file is intentionally boring.
 
-Notes:
-• No deprecated Qt6 HiDPI attributes are set (Qt6 handles DPI automatically).
-• Logging is concise by default but includes a startup banner for quick diagnostics.
-• All “maintenance” steps (bundle regen / backup) are best-effort and never fatal.
+It exists to:
+  1) Put the process in a known-good execution state (root, sys.path).
+  2) Bring up Qt safely (one QApplication, proper app identity, icon).
+  3) Make crashes impossible to miss (console traceback + modal dialog).
+  4) Launch the main window (Nexus) and hand over control to Qt.
+
+What does NOT belong here:
+  - Export pipeline logic (Forge/Generate/Transmuter)
+  - Asset processing / base64 packing / build automation
+  - Any filesystem mutation beyond "set CWD" and reading settings
+
+If you ever feel tempted to add "just one more helper" here:
+  - Put it in the module that owns the feature.
+  - Keep this entrypoint as pure orchestration.
 """
 
 from __future__ import annotations
 
-import sys
-import os
 import json
-import time
-import shutil
-import base64
-import hashlib
 import logging
-import tempfile
+import os
+import sys
+import traceback
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
 
-APP_NAME         = "Letter Smith"
-ORG_NAME         = "Infini Works"
-ORG_DOMAIN       = "infini.works"
+# =============================================================================
+# App Identity
+# =============================================================================
+# These values become visible in OS dialogs / settings storage / etc.
+# Keep them stable unless you are intentionally migrating user settings.
 
-DIST_DIRNAME     = "MAX"
-BACKUPS_DIRNAME  = "Backups"
-CONVERTED_DIR    = "converted64"
-CONVERTED_FILE   = "convert64.py"
-SETTINGS_FILE    = "settings.json"
+APP_NAME: str = "Letter Smith"
+ORG_NAME: str = "Infini Works"
+ORG_DOMAIN: str = "infini.works"
 
-_IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".svg"}
-_AUD_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac"}
+# Optional configuration file (safe to delete; app boots without it).
+SETTINGS_FILE: str = "settings.json"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ─────────────────────────────────────────────────────────────────────────────
+
+# =============================================================================
+# Environment & Root Resolution
+# =============================================================================
 
 def is_frozen() -> bool:
-    """True when running from a PyInstaller bundle."""
+    """
+    Returns True if running from a frozen executable (e.g., PyInstaller).
+    When frozen, __file__ may not behave like a normal source run.
+    """
     return bool(getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"))
 
 
-def project_root_from_argv() -> Path:
+def resolve_project_root() -> Path:
     """
+    The single most important invariant in the app: ROOT.
+
     Root rules:
-      • Frozen (PyInstaller): exe directory
-      • Source run          : script's parent directory
+      - Frozen: directory containing the executable
+      - Source : directory containing Main.py
+
+    Everything else in the project assumes "root-relative paths" from here.
     """
     if is_frozen():
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
 
-def chdir_root(root: Path) -> None:
-    """Best-effort CWD swap to project root (non-fatal if denied)."""
+def set_cwd(root: Path) -> None:
+    """
+    Best-effort sets process working directory to project root.
+
+    Why:
+      - Relative path code becomes predictable.
+      - Running from IDE / terminal / file explorer behaves the same.
+
+    Non-fatal on purpose:
+      - If the OS denies it, we still allow boot to continue.
+    """
     try:
         os.chdir(str(root))
     except Exception:
         pass
 
 
-def load_settings(root: Path) -> Dict:
-    """Read settings.json (if present). Invalid JSON falls back to {}."""
-    sfile = root / SETTINGS_FILE
-    if not sfile.exists():
+def ensure_root_on_syspath(root: Path) -> None:
+    """
+    Ensures local imports work even when launched from odd working directories.
+
+    Why:
+      - On Windows especially, sys.path can vary depending on how the user
+        launches the program (IDE vs shell vs file association).
+      - Injecting root at index 0 ensures the project modules are always found
+        before any similarly-named installed packages.
+    """
+    root_str = str(root)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
+
+
+# =============================================================================
+# Settings (Optional)
+# =============================================================================
+
+def load_settings(root: Path) -> dict:
+    """
+    Loads settings.json if present.
+
+    Rules:
+      - Missing settings file is normal and should not warn.
+      - Invalid JSON should not prevent boot (return {}).
+      - Settings should only influence cosmetic/boot-level toggles (debug, icon),
+        not core behavior that could surprise users.
+    """
+
+    path = root / SETTINGS_FILE
+    if not path.exists():
         return {}
+
     try:
-        return json.loads(sfile.read_text(encoding="utf-8", errors="ignore"))
+        return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
     except Exception:
         return {}
 
 
-def pick_icon(root: Path) -> Optional[Path]:
+# =============================================================================
+# Logging
+# =============================================================================
+
+def setup_logging(settings: dict) -> None:
     """
-    Resolve an .ico file with robust fallbacks (both naming & folder variants).
-    Preference order reflects the project’s canonical convention.
+    Configures console logging.
+
+    Policy:
+      - Keep default logs terse and readable.
+      - Enable deeper logs only if settings.json sets "debug": true.
+
+    Notes:
+      - `force=True` ensures we control logging even if some imported module
+        configured logging earlier (common in larger apps).
     """
+    debug = bool(settings.get("debug", False))
+    level = logging.DEBUG if debug else logging.INFO
+
+    logging.basicConfig(
+        level=level,
+        format="%(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True,
+    )
+
+
+def log_startup(root: Path, icon: Optional[Path], settings: dict) -> None:
+    """
+    One clean startup banner.
+
+    This is the fastest sanity check for:
+      - Python version
+      - Qt version
+      - frozen/source mode
+      - resolved root
+      - chosen icon
+    """
+    qt_ver = QtCore.qVersion()
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    mode = "frozen" if is_frozen() else "source"
+
+    logging.info(f"— {APP_NAME} —")
+    logging.info(f"[Env] Python {py_ver} | Qt {qt_ver} | Mode: {mode}")
+    logging.info(f"[Root] {root}")
+    logging.info(f"[Icon] {icon if icon else 'None'}")
+
+    if bool(settings.get("debug", False)):
+        logging.info(f"[Args] {' '.join(sys.argv)}")
+
+
+# =============================================================================
+# Icon Selection
+# =============================================================================
+
+def pick_icon(root: Path, settings: dict) -> Optional[Path]:
+    """
+    Returns the best icon file path, or None.
+
+    Supports an explicit override:
+      settings.json: { "app_icon": "relative/or/absolute/path/to.ico" }
+
+    If override is missing/invalid, use conventional project fallbacks.
+
+    Notes:
+      - Windows expects .ico for application icons.
+      - The selection order should match your canonical convention.
+    """
+    override = settings.get("app_icon")
+    if isinstance(override, str) and override.strip():
+        p = Path(override)
+        if not p.is_absolute():
+            p = (root / p).resolve()
+        if p.exists():
+            logging.info(f"[Icon] Using (settings override): {p}")
+            return p
+        logging.info(f"[Icon] Override not found: {p}")
+
     candidates: Tuple[Path, ...] = (
-        root / "gallery" / "icon"  / "ls-icon.ico",   # canonical path (preferred)
-        root / "gallery" / "icon"  / "LSmith.ico",
+        # preferred canonical path
+        root / "gallery" / "icon" / "ls-icon.ico",
+        # compatibility fallbacks
+        root / "gallery" / "icon" / "LSmith.ico",
         root / "gallery" / "icons" / "LSmith.ico",
         root / "gallery" / "icons" / "ls-icon.ico",
     )
+
     for p in candidates:
         if p.exists():
             logging.info(f"[Icon] Using: {p}")
             return p
-    logging.info("[Icon] No icon found (window will use default).")
+
+    logging.info("[Icon] No icon found (default will be used).")
     return None
 
 
-def _iter_files(folder: Path, include_exts: Iterable[str]) -> Iterable[Path]:
-    """Yield files under folder (recursively) whose extension is in include_exts."""
-    if not folder.exists():
-        return []
-    exts = {e.lower() for e in include_exts}
-    for root, _, files in os.walk(folder):
-        for f in files:
-            if Path(f).suffix.lower() in exts:
-                yield Path(root) / f
+# =============================================================================
+# Qt Bootstrap + Crash Visibility
+# =============================================================================
 
-
-def _b64_of(path: Path) -> str:
-    """Return standard Base64 (ascii) for file bytes."""
-    data = path.read_bytes()
-    return base64.b64encode(data).decode("ascii")
-
-
-def _atomic_write_text(target: Path, text: str, encoding: str = "utf-8") -> None:
+def bootstrap_qt(icon: Optional[Path]) -> QtWidgets.QApplication:
     """
-    Write a text blob atomically:
-      • write to NamedTemporaryFile in same directory
-      • os.replace() into final path
-    Ensures readers never see a partially written module.
-    """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding=encoding, delete=False, dir=str(target.parent), suffix=".tmp") as tf:
-        temp_name = tf.name
-        tf.write(text)
-        tf.flush()
-        os.fsync(tf.fileno())
-    os.replace(temp_name, target)
+    Creates a QApplication exactly once.
 
+    Why:
+      - Some workflows embed the app or relaunch components.
+      - Using QApplication.instance() prevents "QApplication already exists" errors.
 
-def _sha1(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8", "ignore")).hexdigest()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Base64 bundle (source runs only)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def regenerate_base64_bundle(root: Path, settings: Dict) -> None:
-    """
-    Scan gallery/ and sounds/ (from settings.json), plus fallbacks,
-    and write converted64/convert64.py with two dicts: IMAGES, AUDIO.
-
-    The module is intentionally tiny and static so other modules can import it cheaply.
-    Only runs on source launches (frozen builds embed their own resources).
-    """
-    if is_frozen():
-        return
-
-    gallery_dir = settings.get("gallery_dir", "gallery")
-    icons_dir   = settings.get("icons_dir", "icons")
-    sounds_dir  = settings.get("sounds_dir", "sounds")
-
-    g_base   = root / gallery_dir
-    g_icons  = g_base / icons_dir
-    g_sounds = g_base / sounds_dir
-
-    # Fallbacks (if settings are incomplete)
-    scan_images = [g_base, g_icons]
-    scan_sounds = [g_sounds, root / "sounds"]
-
-    images: Dict[str, str] = {}
-    audio:  Dict[str, str] = {}
-
-    for folder in scan_images:
-        for f in _iter_files(folder, _IMG_EXTS):
-            rel = f.relative_to(root).as_posix()
-            try:
-                images[rel] = _b64_of(f)
-            except Exception:
-                # Skip unreadable files; keep regeneration non-fatal.
-                pass
-
-    for folder in scan_sounds:
-        for f in _iter_files(folder, _AUD_EXTS):
-            rel = f.relative_to(root).as_posix()
-            try:
-                audio[rel] = _b64_of(f)
-            except Exception:
-                pass
-
-    out_dir = root / CONVERTED_DIR
-    out_py  = out_dir / CONVERTED_FILE
-
-    # Compose the module as a compact, deterministic string (stable sort for diff-friendliness)
-    lines = []
-    lines.append("# Auto-generated — DO NOT EDIT BY HAND")
-    lines.append("# Provides: IMAGES (dict[str,str]), AUDIO (dict[str,str])")
-    lines.append("")
-    lines.append("IMAGES = {")
-    for k in sorted(images.keys()):
-        lines.append(f"    {k!r}: {images[k]!r},")
-    lines.append("}")
-    lines.append("")
-    lines.append("AUDIO = {")
-    for k in sorted(audio.keys()):
-        lines.append(f"    {k!r}: {audio[k]!r},")
-    lines.append("}")
-    content = "\n".join(lines) + "\n"
-
-    # Only rewrite if contents differ (avoid needless churn in git)
-    if out_py.exists():
-        try:
-            current = out_py.read_text(encoding="utf-8")
-        except Exception:
-            current = ""
-        if _sha1(current) == _sha1(content):
-            logging.info(f"✅ Base64 bundle up-to-date at {CONVERTED_DIR}\\{CONVERTED_FILE} "
-                         f"({len(images)} images, {len(audio)} audio).")
-            return
-
-    _atomic_write_text(out_py, content, encoding="utf-8")
-    logging.info(f"✅ Wrote module with {len(images)} images & {len(audio)} audio URIs to "
-                 f"{CONVERTED_DIR}\\{CONVERTED_FILE}")
-    logging.info("[Base64] Regenerated base64 bundle.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Build / Backup convenience (non-intrusive)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def ensure_built_exe_and_backup(root: Path) -> Optional[Path]:
-    """
-    If a distributable EXE exists in MAX/, log its presence and write a
-    timestamped backup into Backups/. Non-fatal, non-blocking. Source runs only.
-    """
-    if is_frozen():
-        return None
-
-    dist_dir = root / DIST_DIRNAME
-    dist_dir.mkdir(parents=True, exist_ok=True)
-
-    preferred = dist_dir / f"{APP_NAME}.exe"
-    exe_path: Optional[Path] = preferred if preferred.exists() else None
-
-    if exe_path is None:
-        cand = sorted(dist_dir.glob("*.exe"), key=lambda p: p.stat().st_mtime, reverse=True)
-        exe_path = cand[0] if cand else None
-
-    if exe_path and exe_path.exists():
-        logging.info(f"[Build] EXE present: {exe_path}")
-        backups = root / BACKUPS_DIRNAME
-        backups.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        backup_exe = backups / f"{exe_path.stem}-{stamp}.exe"
-        try:
-            shutil.copy2(exe_path, backup_exe)
-            logging.info(f"[Backup] Saved backup: {backup_exe}")
-        except Exception as e:
-            logging.info(f"[Backup] Skipped (copy failed): {e}")
-        return exe_path
-
-    # Not an error; just no exe yet.
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Qt bootstrap
-# ─────────────────────────────────────────────────────────────────────────────
-
-def bootstrap_qt(app_icon_path: Optional[Path]) -> QtWidgets.QApplication:
-    """
-    Create and configure the QApplication once. No deprecated Qt6 attributes
-    are used (Qt6 enables HiDPI automatically). We still set app name/domain.
+    Also sets:
+      - App identity (names/domains)
+      - Window icon (if available)
     """
     app = QtWidgets.QApplication.instance()
     if app is None:
@@ -285,80 +254,113 @@ def bootstrap_qt(app_icon_path: Optional[Path]) -> QtWidgets.QApplication:
     app.setOrganizationName(ORG_NAME)
     app.setOrganizationDomain(ORG_DOMAIN)
 
-    if app_icon_path and app_icon_path.exists():
-        app.setWindowIcon(QtGui.QIcon(str(app_icon_path)))
+    if icon and icon.exists():
+        app.setWindowIcon(QtGui.QIcon(str(icon)))
+
     return app
 
 
-def _startup_banner(root: Path, icon: Optional[Path]) -> None:
-    """Emit a compact, informative startup banner to the log."""
-    qt_ver   = QtCore.qVersion()
-    py_ver   = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    mode     = "frozen" if is_frozen() else "source"
-    icon_str = str(icon) if icon else "None"
-    logging.info(f"— {APP_NAME} —")
-    logging.info(f"[Env] Python {py_ver} | Qt {qt_ver} | Mode: {mode}")
-    logging.info(f"[Root] {root}")
-    logging.info(f"[Icon] {icon_str}")
+def _show_critical(title: str, message: str) -> None:
+    """
+    Best-effort modal error dialog. Never raises.
+
+    Used for:
+      - Startup failures (cannot import Nexus)
+      - Unhandled exceptions after Qt event loop begins
+    """
+    try:
+        QtWidgets.QMessageBox.critical(None, title, message)
+    except Exception:
+        # If Qt is in a broken state, still don't crash while trying to report.
+        pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def install_exception_hook(app_name: str) -> None:
+    """
+    Makes exceptions visible.
+
+    Without this:
+      - Exceptions inside Qt callbacks can get swallowed or become silent.
+      - Users only see "it closed" or "it froze".
+
+    With this:
+      - Console gets full traceback
+      - User gets a minimal modal dialog
+    """
+    def _hook(exc_type, exc, tb) -> None:
+        # Let Ctrl+C behave normally in terminals/IDEs.
+        if exc_type is KeyboardInterrupt:
+            raise exc
+
+        trace = "".join(traceback.format_exception(exc_type, exc, tb))
+        logging.error("[Crash] Unhandled exception:")
+        logging.error(trace.rstrip())
+
+        _show_critical(
+            f"{app_name} — Crash",
+            "An unexpected error occurred:\n\n"
+            f"{exc}\n\n"
+            "A traceback was printed to the console."
+        )
+
+    sys.excepthook = _hook
+
+
+# =============================================================================
 # Main
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def main() -> None:
-    # Logging: clean, concise, visible in terminal
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-        force=True,
-    )
+    """
+    Boot sequence (ordered intentionally):
 
-    root = project_root_from_argv()
-    chdir_root(root)
+      1) Resolve ROOT and normalize execution context (CWD + sys.path)
+         - prevents path and import weirdness.
 
-    # Load settings (non-fatal if missing)
+      2) Load settings (optional)
+         - used only for logging verbosity and icon override.
+
+      3) Initialize logging BEFORE most work
+         - guarantees everything prints consistently.
+
+      4) Pick icon and print the startup banner
+         - immediate diagnostics when something is wrong.
+
+      5) Create QApplication + install exception hook
+         - Qt is now ready and crashes are visible.
+
+      6) Late-import Nexus and show it
+         - keeps entrypoint dependency surface small.
+    """
+    root = resolve_project_root()
+    set_cwd(root)
+    ensure_root_on_syspath(root)
+
     settings = load_settings(root)
+    setup_logging(settings)
 
-    # Icon selection (log happens inside pick_icon)
-    app_icon = pick_icon(root)
+    icon = pick_icon(root, settings)
+    log_startup(root, icon, settings)
 
-    # Show a quick environment banner up front
-    _startup_banner(root, app_icon)
+    app = bootstrap_qt(icon)
+    install_exception_hook(APP_NAME)
 
-    # Base64 bundle (source runs only; non-fatal)
-    try:
-        regenerate_base64_bundle(root, settings)
-    except Exception as e:
-        logging.info(f"[Base64] Skipped (error): {e}")
 
-    # Presence + backup of a built EXE (non-blocking; source runs only)
-    try:
-        ensure_built_exe_and_backup(root)
-    except Exception as e:
-        logging.info(f"[Build] Skipped (error): {e}")
-
-    # Create QApplication and launch Nexus
-    app = bootstrap_qt(app_icon)
-
-    # Import here to avoid early import errors if optional deps (e.g., WebEngine) are missing
+    # Late import:
+    # - avoids importing half the app before logging + crash handling exists
+    # - reduces failure blast radius on boot
     try:
         from Nexus import Nexus  # noqa: E402
     except Exception as ex:
-        # If Nexus import fails, show a friendly dialog and exit gracefully.
-        try:
-            QtWidgets.QMessageBox.critical(
-                None,
-                f"{APP_NAME} — Startup Error",
-                f"Failed to import main window (Nexus):\n\n{ex}"
-            )
-        finally:
-            raise
+        msg = f"Failed to import Nexus:\n\n{ex}"
+        logging.error(msg)
+        _show_critical(f"{APP_NAME} — Startup Error", msg)
+        raise
 
     win = Nexus(root)
     win.show()
 
+    # Control transfers to Qt; this call blocks until the app exits.
     sys.exit(app.exec())
 
 
