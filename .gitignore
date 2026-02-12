@@ -1,0 +1,21 @@
+﻿# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# Virtual environments
+.venv/
+venv/
+# IDE / tooling
+.idea/
+.vscode/
+.ruff_cache/
+# OS junk
+Thumbs.db
+.DS_Store
+# Build/output artifacts
+output/
+dist/
+build/
+# Optional
+hide/
