@@ -19,3 +19,8 @@ dist/
 build/
 # Optional
 hide/
+# Generated user content
+gallery/user/message/
+gallery/user/pages/
+gallery/user/sounds/archive/
+gallery/user/sounds/appssong/
