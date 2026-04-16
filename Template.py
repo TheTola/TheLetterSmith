@@ -64,7 +64,7 @@ TEMPLATE_HTML = r"""
   </div>
 
   <!-- Main stage -->
-  <div id="slideshow">
+  <div id="slideshow" style="opacity:0;visibility:hidden;pointer-events:none;">
     <!-- Page-turn overlay (JS sizes to the ACTIVE page-image rect) -->
     <div id="turn" aria-hidden="true">
       <div class="sheet sheet-front visible" id="sheetFront">
@@ -119,7 +119,7 @@ TEMPLATE_HTML = r"""
   </div>
 
   <!-- Volume control (slider injected by JS) -->
-  <div id="volume-control">
+  <div id="volume-control" style="opacity:0;visibility:hidden;pointer-events:none;">
     <img id="volume-icon" src="gallery/controls/volon.png" alt="Volume" title="Volume">
   </div>
 
@@ -145,6 +145,10 @@ html,body{width:100%;height:100%;background:#0b0c12;overflow:hidden;font-family:
   position:relative;width:100%;height:100%;
   perspective: 6000px;
   perspective-origin: 50% 50%;
+  opacity:0;
+  visibility:hidden;
+  pointer-events:none;
+  transition:opacity 180ms ease;
   background:
     radial-gradient(900px 600px at 30% 25%, rgba(255,255,255,.08), transparent 60%),
     radial-gradient(900px 600px at 80% 70%, rgba(0,0,0,.35), transparent 60%),
@@ -152,6 +156,7 @@ html,body{width:100%;height:100%;background:#0b0c12;overflow:hidden;font-family:
   transform-style:preserve-3d;
   -webkit-transform-style:preserve-3d;
 }
+body.stage-ready #slideshow{opacity:1; visibility:visible; pointer-events:auto}
 
 /* Curtain overlay */
 #curtain-overlay{
@@ -310,7 +315,12 @@ html,body{width:100%;height:100%;background:#0b0c12;overflow:hidden;font-family:
   align-items:center;
   gap:10px;
   z-index:99;
+  opacity:0;
+  visibility:hidden;
+  pointer-events:none;
+  transition:opacity 180ms ease;
 }
+body.stage-ready #volume-control{opacity:1; visibility:visible; pointer-events:auto}
 #volume-icon{width:48px;height:48px;cursor:pointer}
 #volume-slider{
   width:140px;
@@ -455,6 +465,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const closeText  = document.getElementById('close-text');
   const openText   = document.getElementById('open-text');
 
+  const slideshowEl = document.getElementById('slideshow');
+  const volumeControl = document.getElementById('volume-control');
   const volIcon   = document.getElementById('volume-icon');
   const music     = document.getElementById('bg-music');
 
@@ -476,8 +488,34 @@ document.addEventListener('DOMContentLoaded', () => {
   // Audio pool
   const flipPool = Array.from({length: 10}, (_, i) => `gallery/sounds/flip${i+1}.mp3`);
   const glissSrc = 'gallery/sounds/glissando.mp3';
+  let stageReady = false;
+
+  function revealStage(){
+    if (stageReady) return;
+    stageReady = true;
+    slideshowEl.style.opacity = '';
+    slideshowEl.style.visibility = '';
+    slideshowEl.style.pointerEvents = '';
+    volumeControl.style.opacity = '';
+    volumeControl.style.visibility = '';
+    volumeControl.style.pointerEvents = '';
+    document.body.classList.add('stage-ready');
+    setActiveIndex(0);
+    syncButtons();
+    syncWallUI();
+    setTurnVisible(false);
+  }
 
   function startCurtainIntro(){
+    function onIntroEnd(e){
+      if (e.animationName !== 'curtainIntroFadeIn') return;
+      overlay.removeEventListener('animationend', onIntroEnd);
+      revealStage();
+    }
+
+    overlay.addEventListener('animationend', onIntroEnd);
+    setTimeout(revealStage, 650);
+
     requestAnimationFrame(() => {
       overlay.classList.add('is-visible');
     });
@@ -868,9 +906,5 @@ document.addEventListener('DOMContentLoaded', () => {
   setVolume0to100(loadVolume0to100());
 
   startCurtainIntro();
-  setActiveIndex(0);
-  syncButtons();
-  syncWallUI();
-  setTurnVisible(false);
 });
 """
