@@ -57,53 +57,53 @@ TEMPLATE_HTML = r"""
 
 <body>
   <!-- Curtain intro -->
-  <div id="curtain-overlay" aria-hidden="false">
-    <img id="curtain-left"  src="gallery/controls/cleft.png"  alt="">
-    <img id="curtain-right" src="gallery/controls/cright.png" alt="">
+  <div id="curtain-overlay" aria-hidden="false" role="dialog" aria-modal="true" aria-labelledby="begin-button">
+    <img id="curtain-left"  src="gallery/controls/cleft.png"  alt="" aria-hidden="true" decoding="async" fetchpriority="high">
+    <img id="curtain-right" src="gallery/controls/cright.png" alt="" aria-hidden="true" decoding="async" fetchpriority="high">
     <button id="begin-button" type="button">Tap to Begin</button>
   </div>
 
   <!-- Main stage -->
-  <div id="slideshow" style="opacity:0;visibility:hidden;pointer-events:none;">
+  <div id="slideshow" style="opacity:0;visibility:hidden;pointer-events:none;" aria-hidden="true">
     <!-- Page-turn overlay (JS sizes to the ACTIVE page-image rect) -->
     <div id="turn" aria-hidden="true">
       <div class="sheet sheet-front visible" id="sheetFront">
-        <img id="turnFrontImg" alt="">
+        <img id="turnFrontImg" alt="" aria-hidden="true">
       </div>
       <!-- kept for compatibility; never shown after this fix -->
       <div class="sheet sheet-back hidden" id="sheetBack">
-        <img id="turnBackImg" alt="">
+        <img id="turnBackImg" alt="" aria-hidden="true">
       </div>
     </div>
     <div id="turnShadow" aria-hidden="true"></div>
 
     <!-- Slides -->
     <section class="slide active" data-index="0" id="slide-0">
-      <img src="gallery/pages/cover.png" alt="Cover Page">
+      <img src="gallery/pages/cover.png" alt="Cover Page" decoding="async" fetchpriority="high">
     </section>
 
     <section class="slide" data-index="1" id="slide-1">
-      <img src="gallery/pages/letter.png" alt="Main Letter">
+      <img src="gallery/pages/letter.png" alt="Main Letter" decoding="async">
     </section>
 
     <section class="slide" data-index="2" id="slide-2">
-      <img src="gallery/pages/wall.png" alt="Text Wall Background">
+      <img src="gallery/pages/wall.png" alt="Text Wall Background" decoding="async">
       <button id="close-text" type="button" title="Close Text" aria-label="Close message">&times;</button>
-      <div class="text-wall" id="textWall" style="display:none;">
+      <div class="text-wall" id="textWall" style="display:none;" role="dialog" aria-modal="false" aria-label="Message text" aria-hidden="true" tabindex="-1">
         <div class="text-wall-content" id="textWallContent">{{MESSAGE_HTML}}</div>
       </div>
     </section>
 
     <section class="slide" data-index="3" id="slide-3">
-      <img src="gallery/pages/back.png" alt="Final Backdrop">
+      <img src="gallery/pages/back.png" alt="Final Backdrop" decoding="async">
     </section>
 
     <!-- Navigation -->
     <button id="prev" type="button" title="Previous page" aria-label="Previous page">
-      <img src="gallery/controls/ppage.png" alt="">
+      <img src="gallery/controls/ppage.png" alt="" aria-hidden="true">
     </button>
     <button id="next" type="button" title="Next page" aria-label="Next page">
-      <img src="gallery/controls/npage.png" alt="">
+      <img src="gallery/controls/npage.png" alt="" aria-hidden="true">
     </button>
 
     <div id="progress" aria-live="polite">Page 1 of 4</div>
@@ -112,15 +112,18 @@ TEMPLATE_HTML = r"""
     <img
       id="open-text"
       src="gallery/controls/showmessageicon.png"
-      alt="Show Message"
+      alt=""
       title="Show Message"
+      role="button"
+      tabindex="0"
+      aria-label="Show message"
       style="display:none;"
     />
   </div>
 
   <!-- Volume control (slider injected by JS) -->
-  <div id="volume-control" style="opacity:0;visibility:hidden;pointer-events:none;">
-    <img id="volume-icon" src="gallery/controls/volon.png" alt="Volume" title="Volume">
+  <div id="volume-control" style="opacity:0;visibility:hidden;pointer-events:none;" aria-hidden="true">
+    <img id="volume-icon" src="gallery/controls/volon.png" alt="" title="Volume" role="button" tabindex="0" aria-label="Toggle volume slider">
   </div>
 
   <!-- Background music -->
@@ -184,6 +187,8 @@ body.stage-ready #slideshow{opacity:1; visibility:visible; pointer-events:auto}
 }
 #curtain-overlay.is-visible #curtain-left,
 #curtain-overlay.is-visible #curtain-right{animation:curtainPanelFadeIn 420ms ease-out forwards}
+#curtain-overlay.curtain-fallback #curtain-left,
+#curtain-overlay.curtain-fallback #curtain-right{display:none}
 #begin-button{
   position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
   font-size:42px; color:#fff;
@@ -221,6 +226,23 @@ body.stage-ready #slideshow{opacity:1; visibility:visible; pointer-events:auto}
 .slide.active{opacity:1; pointer-events:auto;}
 .slide.peek{opacity:1; pointer-events:none; z-index:4;}
 .slide.ghost{opacity:0; pointer-events:none;}
+.slide.asset-failed img{opacity:0}
+.slide.asset-failed::after{
+  content:attr(data-fallback-label);
+  position:absolute;
+  inset:50% auto auto 50%;
+  transform:translate(-50%,-50%);
+  width:min(520px, 72%);
+  padding:18px 22px;
+  color:#fff;
+  text-align:center;
+  font:700 20px/1.4 'Segoe UI', Arial, sans-serif;
+  background:rgba(0,0,0,.58);
+  border:1px solid rgba(255,255,255,.14);
+  border-radius:14px;
+  box-shadow:0 18px 40px rgba(0,0,0,.45);
+  z-index:6;
+}
 
 .slide img{
   max-width:100%;
@@ -279,6 +301,15 @@ body.stage-ready #slideshow{opacity:1; visibility:visible; pointer-events:auto}
   transition:transform 0.18s ease;
 }
 #open-text:hover{transform:scale(1.08)}
+#open-text:focus-visible,
+#volume-icon:focus-visible,
+#begin-button:focus-visible,
+#close-text:focus-visible,
+#prev:focus-visible,
+#next:focus-visible{
+  outline:3px solid #fff;
+  outline-offset:4px;
+}
 
 /* Navigation */
 #prev,#next{
@@ -436,6 +467,17 @@ body.stage-ready #volume-control{opacity:1; visibility:visible; pointer-events:a
       rgba(0,0,0,0) 62%);
   filter: blur(var(--sb));
 }
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{scroll-behavior:auto !important}
+  #slideshow,#volume-control,#open-text{transition:none}
+  #begin-button{animation:none}
+  #curtain-overlay.is-visible,
+  #curtain-overlay.is-visible #curtain-left,
+  #curtain-overlay.is-visible #curtain-right{
+    animation-duration:0.01ms !important;
+    animation-iteration-count:1 !important;
+  }
+}
 """
 
 TEMPLATE_JS = r"""
@@ -469,6 +511,12 @@ document.addEventListener('DOMContentLoaded', () => {
   const volumeControl = document.getElementById('volume-control');
   const volIcon   = document.getElementById('volume-icon');
   const music     = document.getElementById('bg-music');
+  const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const curtainIntroRevealMs = prefersReducedMotion ? 80 : 650;
+  const curtainOpenMs = prefersReducedMotion ? 140 : 1100;
+  const curtainCleanupMs = curtainOpenMs + 150;
+  const flipDurationMs = prefersReducedMotion ? 0 : 620;
+  const musicFadeMs = prefersReducedMotion ? 120 : 900;
 
   // ─────────────────────────────────────────────────────────────
   // State
@@ -489,6 +537,85 @@ document.addEventListener('DOMContentLoaded', () => {
   const flipPool = Array.from({length: 10}, (_, i) => `gallery/sounds/flip${i+1}.mp3`);
   const glissSrc = 'gallery/sounds/glissando.mp3';
   let stageReady = false;
+  let introStarted = false;
+
+  function setHiddenState(el, hidden){
+    if (!el) return;
+    el.setAttribute('aria-hidden', hidden ? 'true' : 'false');
+  }
+
+  function bindPress(el, handler){
+    el.addEventListener('click', handler);
+    el.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      e.preventDefault();
+      handler(e);
+    });
+  }
+
+  function markSlideAssetFailed(slide, img){
+    if (!slide || slide.classList.contains('asset-failed')) return;
+    slide.classList.add('asset-failed');
+    slide.dataset.fallbackLabel = img?.getAttribute('alt') || 'Page image unavailable';
+  }
+
+  function installImageFallbacks(){
+    slides.forEach((slide) => {
+      const img = slideImageEl(slide);
+      if (!img) return;
+
+      const handleError = () => markSlideAssetFailed(slide, img);
+      img.addEventListener('error', handleError, { once: true });
+      if (img.complete && img.naturalWidth === 0){
+        handleError();
+      }
+    });
+
+    [cLeft, cRight].forEach((img) => {
+      const handleError = () => {
+        img.style.display = 'none';
+        overlay.classList.add('curtain-fallback');
+      };
+      img.addEventListener('error', handleError, { once: true });
+      if (img.complete && img.naturalWidth === 0){
+        handleError();
+      }
+    });
+  }
+
+  function waitForImageReady(img){
+    if (!img) return Promise.resolve(false);
+
+    if (img.complete){
+      if (img.naturalWidth === 0) return Promise.resolve(false);
+      if (typeof img.decode === 'function'){
+        return img.decode().then(() => true).catch(() => true);
+      }
+      return Promise.resolve(true);
+    }
+
+    return new Promise((resolve) => {
+      const handleLoad = () => {
+        if (typeof img.decode === 'function'){
+          img.decode().then(() => resolve(true)).catch(() => resolve(true));
+          return;
+        }
+        resolve(true);
+      };
+
+      img.addEventListener('load', handleLoad, { once: true });
+      img.addEventListener('error', () => resolve(false), { once: true });
+    });
+  }
+
+  function waitForCriticalAssets(){
+    const criticalImages = [cLeft, cRight, slideImageEl(slides[0])].filter(Boolean);
+    const assetWait = Promise.allSettled(criticalImages.map(waitForImageReady));
+    const timeoutWait = new Promise((resolve) => {
+      setTimeout(resolve, prefersReducedMotion ? 120 : 1600);
+    });
+    return Promise.race([assetWait, timeoutWait]);
+  }
 
   function revealStage(){
     if (stageReady) return;
@@ -499,6 +626,8 @@ document.addEventListener('DOMContentLoaded', () => {
     volumeControl.style.opacity = '';
     volumeControl.style.visibility = '';
     volumeControl.style.pointerEvents = '';
+    setHiddenState(slideshowEl, false);
+    setHiddenState(volumeControl, false);
     document.body.classList.add('stage-ready');
     setActiveIndex(0);
     syncButtons();
@@ -507,6 +636,9 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function startCurtainIntro(){
+    if (introStarted) return;
+    introStarted = true;
+
     function onIntroEnd(e){
       if (e.animationName !== 'curtainIntroFadeIn') return;
       overlay.removeEventListener('animationend', onIntroEnd);
@@ -514,7 +646,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     overlay.addEventListener('animationend', onIntroEnd);
-    setTimeout(revealStage, 650);
+    setTimeout(revealStage, curtainIntroRevealMs);
 
     requestAnimationFrame(() => {
       overlay.classList.add('is-visible');
@@ -569,22 +701,32 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function isWallPage(){ return idx === 2; }
 
+  function setWallOpen(open){
+    wall.style.display = open ? 'block' : 'none';
+    setHiddenState(wall, !open);
+    openText.style.display = open ? 'none' : 'block';
+    setHiddenState(openText, open);
+    closeText.style.display = open ? 'block' : 'none';
+    setHiddenState(closeText, !open);
+  }
+
   function syncWallUI(){
     const onWall = isWallPage();
-    closeText.style.display = onWall ? 'block' : 'none';
 
     if (!onWall){
       wall.style.display = 'none';
       openText.style.display = 'none';
+      closeText.style.display = 'none';
+      setHiddenState(wall, true);
+      setHiddenState(openText, true);
+      setHiddenState(closeText, true);
       return;
     }
 
     if (!wallClosedByUser){
-      wall.style.display = 'block';
-      openText.style.display = 'none';
+      setWallOpen(true);
     } else {
-      wall.style.display = 'none';
-      openText.style.display = 'block';
+      setWallOpen(false);
     }
   }
 
@@ -743,7 +885,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
     playFlip();
 
-    const DURATION = 620;
+    const DURATION = flipDurationMs;
+    if (DURATION <= 0){
+      cleanupTransient(curSlide, tgtSlide);
+      setActiveIndex(tIdx);
+      setTurnVisible(false);
+      turn.style.width = '0px';
+      turn.style.height = '0px';
+      turnShadow.style.width = '0px';
+      turnShadow.style.height = '0px';
+      flipping = false;
+      syncButtons();
+      return;
+    }
+
     const t0 = performance.now();
 
     function step(now){
@@ -808,7 +963,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }catch(_){}
 
       const target = clamp(v / 100, 0, 1);
-      const fadeMs = 900;
+      const fadeMs = musicFadeMs;
       const start = performance.now();
 
       function fadeStep(now){
@@ -838,9 +993,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Curtains move
-    cLeft.style.animation = 'curtainLeftOut 1100ms cubic-bezier(.2,.9,.1,1) forwards';
-    cRight.style.animation = 'curtainRightOut 1100ms cubic-bezier(.2,.9,.1,1) forwards';
-    overlay.style.animation = 'curtainOverlayFadeOut 1100ms cubic-bezier(.2,.9,.1,1) forwards';
+    cLeft.style.animation = `curtainLeftOut ${curtainOpenMs}ms cubic-bezier(.2,.9,.1,1) forwards`;
+    cRight.style.animation = `curtainRightOut ${curtainOpenMs}ms cubic-bezier(.2,.9,.1,1) forwards`;
+    overlay.style.animation = `curtainOverlayFadeOut ${curtainOpenMs}ms cubic-bezier(.2,.9,.1,1) forwards`;
 
     beginBtn.disabled = true;
     beginBtn.style.opacity = '0';
@@ -851,10 +1006,10 @@ document.addEventListener('DOMContentLoaded', () => {
       overlay.setAttribute('aria-hidden', 'true');
       setTimeout(() => overlay.remove(), 250);
       syncButtons();
-    }, 1250);
+    }, curtainCleanupMs);
   }
 
-  beginBtn.addEventListener('click', (e) => {
+  bindPress(beginBtn, (e) => {
     e.preventDefault();
     openCurtain();
   });
@@ -874,28 +1029,28 @@ document.addEventListener('DOMContentLoaded', () => {
       flipTo(idx + 1);
     } else if (e.key === 'Escape'){
       if (isWallPage() && wall.style.display !== 'none'){
-        wall.style.display = 'none';
-        openText.style.display = 'block';
+        setWallOpen(false);
         wallClosedByUser = true;
+        openText.focus({preventScroll:true});
       }
     }
   });
 
   closeText.addEventListener('click', () => {
     if (!isWallPage()) return;
-    wall.style.display = 'none';
-    openText.style.display = 'block';
+    setWallOpen(false);
     wallClosedByUser = true;
+    openText.focus({preventScroll:true});
   });
 
-  openText.addEventListener('click', () => {
+  bindPress(openText, () => {
     if (!isWallPage()) return;
-    wall.style.display = 'block';
-    openText.style.display = 'none';
+    setWallOpen(true);
     wallClosedByUser = false;
+    closeText.focus({preventScroll:true});
   });
 
-  volIcon.addEventListener('click', () => {
+  bindPress(volIcon, () => {
     const s = ensureSlider();
     s.style.display = (s.style.display === 'none' || !s.style.display) ? 'block' : 'none';
   });
@@ -904,7 +1059,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Initialize immediately (still session-only)
   setVolume0to100(loadVolume0to100());
+  setHiddenState(wall, true);
+  setHiddenState(openText, true);
+  setHiddenState(closeText, true);
 
-  startCurtainIntro();
+  installImageFallbacks();
+  waitForCriticalAssets().finally(startCurtainIntro);
 });
 """

@@ -49,6 +49,8 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from message_html import normalize_message_document_html, read_text_normalized
+
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QSize, QSettings, QMimeData
 from PySide6.QtGui import (
@@ -624,7 +626,7 @@ class Editor(QDialog):
         saved = self.settings.value(SETTINGS_KEY_COLOR, QColor("#eeeeee"))
         self.last_color = saved if isinstance(saved, QColor) else QColor("#eeeeee")
 
-        self.message_html = message_html or ""
+        self.message_html = normalize_message_document_html(message_html or "")
         self._last_saved_html = self.message_html
         self._dirty = False
 
@@ -661,8 +663,8 @@ class Editor(QDialog):
 
     def _build_ui(self, preview_pixmap: Optional[QPixmap]) -> None:
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(8, 4, 8, 8)
+        main_layout.setSpacing(2)
 
         self.title_bar = StandardTitleBar(
             self,
@@ -673,6 +675,7 @@ class Editor(QDialog):
             on_toggle_maximize=self._toggle_max_restore,
             is_maximized=self.isMaximized,
         )
+        self.title_bar.setFixedHeight(34)
         self.title_bar.insert_control_button("?", "Editor Help", self.show_shortcuts_help, object_name="windowHelpButton")
         main_layout.addWidget(self.title_bar)
 
@@ -680,7 +683,7 @@ class Editor(QDialog):
         toolbar_host.setObjectName("editorToolbarHost")
         toolbar_layout = QVBoxLayout(toolbar_host)
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
-        toolbar_layout.setSpacing(6)
+        toolbar_layout.setSpacing(2)
 
         self.command_toolbar = self._create_toolbar_row("editorCommandToolbar")
         self.format_toolbar = self._create_toolbar_row("editorFormatToolbar")
@@ -693,7 +696,7 @@ class Editor(QDialog):
 
         self.editor = RichTextEdit(self.project_root)
         self.editor.setPlaceholderText("Write your message here...")
-        self.editor.document().setDocumentMargin(18)
+        self.editor.document().setDocumentMargin(10)
         self.editor.setHtml(self.message_html)
         splitter.addWidget(self.editor)
 
@@ -705,7 +708,7 @@ class Editor(QDialog):
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([740, 360])
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(splitter, 1)
 
         self._build_toolbar_actions()
 
@@ -717,6 +720,8 @@ class Editor(QDialog):
         self.editor.textChanged.connect(self._on_editor_text_changed)
 
         hb = QHBoxLayout()
+        hb.setContentsMargins(0, 0, 0, 0)
+        hb.setSpacing(8)
         self.word_label = QLabel()
         hb.addWidget(self.word_label)
         hb.addStretch()
@@ -936,18 +941,18 @@ class Editor(QDialog):
         self.setStyleSheet(
             "QDialog#EditorDialog{background:#111318;border:1px solid #2b3038;border-radius:14px;}"
             "QWidget#editorToolbarHost{background:transparent;}"
-            "QToolBar{background:#181b20;border:1px solid #2b3038;border-radius:8px;margin:0px;padding:4px 6px;spacing:4px;}"
-            "QToolBar::separator{background:#2b3038;width:1px;margin:6px 4px;}"
-            "QTextEdit{background:#0f1115;color:#edf1f7;border:1px solid #2b3038;border-radius:8px;padding:10px;selection-background-color:#2f6fed;}"
+            "QToolBar{background:#181b20;border:1px solid #2b3038;border-radius:8px;margin:0px;padding:2px 4px;spacing:3px;}"
+            "QToolBar::separator{background:#2b3038;width:1px;margin:4px 3px;}"
+            "QTextEdit{background:#0f1115;color:#edf1f7;border:1px solid #2b3038;border-radius:8px;padding:8px;selection-background-color:#2f6fed;}"
             "QLabel{color:#c5ccd6;}"
             "QSplitter::handle{background:#1b1f25;}"
-            "QPushButton{background:#1c2128;color:#f2f4f8;border:1px solid #303744;border-radius:6px;padding:6px 12px;}"
+            "QPushButton{background:#1c2128;color:#f2f4f8;border:1px solid #303744;border-radius:6px;padding:5px 10px;}"
             "QPushButton:hover{background:#263244;border-color:#4d6b95;}"
-            "QPushButton#toolbarMiniButton{padding:0px;font-size:14px;min-width:28px;max-width:28px;min-height:28px;max-height:28px;}"
-            "QSpinBox{background:#181b20;color:#edf1f7;border:1px solid #313845;border-radius:6px;padding:2px 8px;min-height:28px;}"
-            "QFontComboBox{background:#181b20;color:#edf1f7;border:1px solid #313845;border-radius:6px;min-height:28px;}"
+            "QPushButton#toolbarMiniButton{padding:0px;font-size:14px;min-width:26px;max-width:26px;min-height:26px;max-height:26px;}"
+            "QSpinBox{background:#181b20;color:#edf1f7;border:1px solid #313845;border-radius:6px;padding:1px 8px;min-height:26px;}"
+            "QFontComboBox{background:#181b20;color:#edf1f7;border:1px solid #313845;border-radius:6px;min-height:26px;}"
             "QMenu{background:#14171c;color:#edf1f7;border:1px solid #2b3038;}"
-            "QToolButton{color:#e6ebf2;padding:5px 10px;border:1px solid transparent;border-radius:6px;background:transparent;}"
+            "QToolButton{color:#e6ebf2;padding:3px 8px;border:1px solid transparent;border-radius:6px;background:transparent;}"
             "QToolButton:hover{background:#222831;border-color:#374355;}"
             "QToolButton:checked{background:#273142;border-color:#4f78aa;}"
             "QToolButton#colorSwatch{min-width:22px;max-width:22px;min-height:22px;max-height:22px;padding:0;}"
@@ -999,7 +1004,11 @@ class Editor(QDialog):
             return
 
         try:
-            _atomic_write(self.autosave_path, self._current_editor_html(), encoding="utf-8")
+            _atomic_write(
+                self.autosave_path,
+                normalize_message_document_html(self._current_editor_html()),
+                encoding="utf-8",
+            )
         except Exception:
             pass
 
@@ -1008,7 +1017,7 @@ class Editor(QDialog):
             return
 
         try:
-            draft_html = self.autosave_path.read_text(encoding="utf-8")
+            draft_html = read_text_normalized(self.autosave_path)
         except Exception:
             return
 
@@ -1030,10 +1039,14 @@ class Editor(QDialog):
             self._remove_autosave_draft()
 
     def _save_current_document(self) -> bool:
-        content = self._current_editor_html()
+        content = normalize_message_document_html(self._current_editor_html())
         export_content = self._inject_export_line_spacing_wrapper(content)
         try:
-            _atomic_write(self.message_path, export_content, encoding="utf-8")
+            _atomic_write(
+                self.message_path,
+                normalize_message_document_html(export_content),
+                encoding="utf-8",
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Save Error", f"Could not save:\n{type(exc).__name__}: {exc}")
             return False
@@ -1106,7 +1119,7 @@ class Editor(QDialog):
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def get_edited_html(self) -> str:
-        return self.editor.toHtml()
+        return normalize_message_document_html(self.editor.toHtml())
 
     def apply_changes(self) -> None:
         """

@@ -50,6 +50,7 @@ PAGES_DIR = "pages"
 CONTROLS_DIR = "controls"
 SOUNDS_DIR = "sounds"
 MESSAGE_DIR = "message"
+FONTS_DIR = "fonts"
 
 # Keep these names as well because other files may import them.
 # They are also RUNTIME folder names (not the old gallery/icons concept).
@@ -214,6 +215,7 @@ class BuildPaths:
     play_controls_dir: Path
     play_message_dir: Path
     play_sounds_dir: Path
+    play_fonts_dir: Path
 
 
 def plan_build(project_root: str | Path, *, recipient: str, title: str) -> BuildPaths:
@@ -251,11 +253,13 @@ def plan_build(project_root: str | Path, *, recipient: str, title: str) -> Build
     play_controls = play_gallery / CONTROLS_DIR
     play_message = play_gallery / MESSAGE_DIR
     play_sounds = play_gallery / SOUNDS_DIR
+    play_fonts = play_gallery / FONTS_DIR
 
     play_pages.mkdir(parents=True, exist_ok=True)
     play_controls.mkdir(parents=True, exist_ok=True)
     play_message.mkdir(parents=True, exist_ok=True)
     play_sounds.mkdir(parents=True, exist_ok=True)
+    play_fonts.mkdir(parents=True, exist_ok=True)
 
     return BuildPaths(
         play_dir=play_dir,
@@ -264,6 +268,7 @@ def plan_build(project_root: str | Path, *, recipient: str, title: str) -> Build
         play_controls_dir=play_controls,
         play_message_dir=play_message,
         play_sounds_dir=play_sounds,
+        play_fonts_dir=play_fonts,
     )
 
 
@@ -329,6 +334,7 @@ __all__ = [
     "CONTROLS_DIR",
     "SOUNDS_DIR",
     "MESSAGE_DIR",
+    "FONTS_DIR",
     "ICONS_DIR",
     # canonical source tree
     "GALLERY_USER_DIR",

@@ -13,6 +13,8 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
+from message_html import normalize_message_document_html, read_text_normalized
+
 # Optional converters (prefer mammoth for DOCX → HTML)
 try:
     import mammoth  # type: ignore
@@ -56,11 +58,12 @@ def _atomic_write_text(path: str | os.PathLike, data: str) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(data, encoding="utf-8")
+    normalized = normalize_message_document_html(data)
+    tmp.write_text(normalized, encoding="utf-8")
     try:
         os.replace(tmp, p)
     except Exception:
-        p.write_text(data, encoding="utf-8")
+        p.write_text(normalized, encoding="utf-8")
 
 
 def _atomic_save_image(img: QImage, path: str) -> bool:
@@ -391,7 +394,7 @@ class MessageTab(QtWidgets.QWidget):
 
         # Try render from HTML if any, else blank
         try:
-            html = (self._html_path().read_text(encoding="utf-8") if self._html_path().exists() else "").strip()
+            html = (read_text_normalized(self._html_path()) if self._html_path().exists() else "").strip()
             if not html:
                 html = "<p></p>"
             self._generate_image(html)
@@ -435,7 +438,7 @@ class MessageTab(QtWidgets.QWidget):
 
         if html_path.is_file():
             try:
-                self.current_html = html_path.read_text(encoding="utf-8")
+                self.current_html = read_text_normalized(html_path)
                 self.edit_btn.setEnabled(True)
                 loaded_html = True
             except Exception as e:
@@ -503,7 +506,7 @@ class MessageTab(QtWidgets.QWidget):
         html_path = self._html_path()
         if html_path.is_file():
             try:
-                html_for_editor = html_path.read_text(encoding="utf-8")
+                html_for_editor = read_text_normalized(html_path)
             except Exception:
                 html_for_editor = self.current_html or ""
         else:
@@ -536,8 +539,11 @@ class MessageTab(QtWidgets.QWidget):
 
         html_path = self._html_path()
         try:
-            _atomic_write_text(html_path, new_html)
-            self.current_html = new_html
+            if html_path.is_file():
+                self.current_html = read_text_normalized(html_path)
+            else:
+                _atomic_write_text(html_path, new_html)
+                self.current_html = normalize_message_document_html(new_html)
             self.status.setText("💾 message.html saved.")
             self.edit_btn.setEnabled(True)
         except Exception as e:
@@ -547,8 +553,8 @@ class MessageTab(QtWidgets.QWidget):
         # Always guarantee wall before rendering
         self._ensure_wall_exists()
 
-        self.text_selected.emit(new_html)
-        self._generate_image(new_html)
+        self.text_selected.emit(self.current_html)
+        self._generate_image(self.current_html)
         self._emit_best_preview()
 
     # ──────────────────────────────────────────────────────────────────
@@ -637,7 +643,7 @@ class MessageTab(QtWidgets.QWidget):
         return ""
 
     def _process_file(self, path: str) -> None:
-        html = self.extract_text(path)
+        html = normalize_message_document_html(self.extract_text(path))
         if not html.strip():
             self.status.setText("⚠️ That file had no extractable text.")
             return
@@ -655,7 +661,7 @@ class MessageTab(QtWidgets.QWidget):
         html_path = self._html_path()
         try:
             _atomic_write_text(html_path, html)
-            self.current_html = html
+            self.current_html = normalize_message_document_html(html)
             self.edit_btn.setEnabled(True)
             self.status.setText(f"💾 message.html saved ({Path(path).name}).")
             self.text_selected.emit(html)
@@ -727,7 +733,7 @@ class MessageTab(QtWidgets.QWidget):
                 "br { line-height: 1.4; }"
             )
 
-            doc.setHtml(html)
+            doc.setHtml(normalize_message_document_html(html))
             doc.setTextWidth(TEXT_WIDTH)
             doc.setPageSize(QSizeF(TEXT_WIDTH, TEXT_HEIGHT))
 

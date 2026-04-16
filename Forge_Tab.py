@@ -43,6 +43,7 @@ from PySide6.QtGui import QFont, QColor
 from PySide6.QtCore import Qt, QUrl
 
 import generate  # <-- IMPORTANT: module import only
+from message_html import read_text_normalized
 
 from config import (
     SETTINGS_FILE,
@@ -62,7 +63,7 @@ from config import (
 
 def _read_text(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8", errors="ignore")
+        return read_text_normalized(path)
     except Exception:
         return ""
 
@@ -475,7 +476,7 @@ class ForgeTab(QtWidgets.QWidget):
         try:
             if not msg_path.exists():
                 return ""
-            return msg_path.read_text(encoding="utf-8", errors="ignore")
+            return read_text_normalized(msg_path)
         except Exception:
             return ""
 

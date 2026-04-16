@@ -35,15 +35,22 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import webbrowser
 import html as html_lib
+import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Iterable
 
 from Template import TEMPLATE_HTML, TEMPLATE_CSS, TEMPLATE_JS
+from message_html import (
+    extract_font_families,
+    normalize_message_fragment,
+    read_text_normalized,
+    rewrite_font_families,
+)
 from config import (
     SETTINGS_FILE,
     DEFAULT_VOLUME,
@@ -56,6 +63,7 @@ from config import (
     USER_CONTROLS_DIR,
     USER_MESSAGE_DIR,
     USER_SOUNDS_DIR,
+    FONTS_DIR,
     REQUIRED_SLIDES,
     CONTROL_FILES,
     MESSAGE_HTML_FILE,
@@ -68,7 +76,48 @@ from config import (
 
 # App-owned SFX live here (relative to project root)
 APP_SOUNDS_DIR = Path("gallery") / "app" / "sounds"
-BODY_RE = re.compile(r"<body\b[^>]*>(.*?)</body>", re.IGNORECASE | re.DOTALL)
+FONT_REGISTRY_SUFFIX_RE = re.compile(r"\s*\([^)]*\)\s*$")
+FONT_EXPORT_EXTENSIONS = {".ttf", ".otf", ".woff", ".woff2", ".ttc"}
+FONT_DISPLAY_NAME_SUFFIXES = (
+    "",
+    " Regular",
+    " Roman",
+    " Italic",
+    " Oblique",
+    " Bold",
+    " Bold Italic",
+    " Bold Oblique",
+)
+FONT_STYLE_TOKENS = {
+    "thin",
+    "extralight",
+    "ultralight",
+    "light",
+    "semilight",
+    "demilight",
+    "book",
+    "normal",
+    "regular",
+    "roman",
+    "medium",
+    "demibold",
+    "semibold",
+    "bold",
+    "extrabold",
+    "ultrabold",
+    "black",
+    "heavy",
+    "italic",
+    "oblique",
+}
+
+
+@dataclass(frozen=True)
+class ResolvedFontFace:
+    display_name: str
+    source_path: Path
+    weight: int
+    style: str
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,18 +166,241 @@ def _copy_required_files(src_dir: Path, dst_dir: Path, names: list[str]) -> None
 
 def _read_text_safe(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8", errors="ignore")
+        return read_text_normalized(path)
     except Exception:
         return ""
 
 
-def _normalize_message_html(raw: str) -> str:
-    text = (raw or "").strip()
-    if not text:
-        return ""
+def _normalize_font_display_name(value: str) -> str:
+    return re.sub(r"\s+", " ", FONT_REGISTRY_SUFFIX_RE.sub("", (value or "").strip())).strip()
 
-    match = BODY_RE.search(text)
-    return (match.group(1) if match else text).strip()
+
+def _font_registry_keys():
+    try:
+        import winreg
+    except Exception:
+        return ()
+
+    return (
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+    )
+
+
+def _font_search_dirs() -> list[Path]:
+    dirs: list[Path] = []
+
+    windir = os.environ.get("WINDIR")
+    if windir:
+        dirs.append(Path(windir) / "Fonts")
+    else:
+        dirs.append(Path(r"C:\Windows") / "Fonts")
+
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        dirs.append(Path(local) / "Microsoft" / "Windows" / "Fonts")
+
+    return dirs
+
+
+def _resolve_font_file_path(value: str, search_dirs: list[Path]) -> Optional[Path]:
+    raw = str(value or "").strip().strip('"')
+    if not raw:
+        return None
+
+    candidate = Path(raw)
+    if candidate.is_file():
+        return candidate
+
+    for base in search_dirs:
+        probe = base / raw
+        if probe.is_file():
+            return probe
+        probe = base / candidate.name
+        if probe.is_file():
+            return probe
+
+    return None
+
+
+@lru_cache(maxsize=1)
+def _load_font_registry() -> tuple[tuple[str, Path], ...]:
+    entries: list[tuple[str, Path]] = []
+    keys = _font_registry_keys()
+    if not keys:
+        return tuple(entries)
+
+    try:
+        import winreg
+    except Exception:
+        return tuple(entries)
+
+    search_dirs = _font_search_dirs()
+    seen: set[tuple[str, str]] = set()
+
+    for root, key_path in keys:
+        try:
+            key = winreg.OpenKey(root, key_path)
+        except OSError:
+            continue
+
+        idx = 0
+        while True:
+            try:
+                name, value, _ = winreg.EnumValue(key, idx)
+            except OSError:
+                break
+
+            idx += 1
+            display_name = _normalize_font_display_name(name)
+            source_path = _resolve_font_file_path(str(value), search_dirs)
+            if not display_name or source_path is None:
+                continue
+
+            source_key = (display_name.casefold(), str(source_path).casefold())
+            if source_key in seen:
+                continue
+            seen.add(source_key)
+            entries.append((display_name, source_path))
+
+    return tuple(entries)
+
+
+def _classify_font_face(display_name: str) -> tuple[int, str]:
+    name = _normalize_font_display_name(display_name).casefold()
+    tokens = set(part for part in re.split(r"[\s-]+", name) if part)
+
+    if "black" in tokens or "heavy" in tokens:
+        weight = 900
+    elif "extrabold" in tokens or "ultrabold" in tokens:
+        weight = 800
+    elif "bold" in tokens:
+        weight = 700
+    elif "demibold" in tokens or "semibold" in tokens:
+        weight = 600
+    elif "medium" in tokens:
+        weight = 500
+    elif "light" in tokens or "book" in tokens:
+        weight = 300
+    elif "thin" in tokens or "extralight" in tokens or "ultralight" in tokens:
+        weight = 200
+    else:
+        weight = 400
+
+    if "italic" in tokens:
+        style = "italic"
+    elif "oblique" in tokens:
+        style = "oblique"
+    else:
+        style = "normal"
+
+    return weight, style
+
+
+def _is_style_suffix_only(display_name: str, family: str) -> bool:
+    normalized_name = _normalize_font_display_name(display_name)
+    normalized_family = _normalize_font_display_name(family)
+    if normalized_name.casefold() == normalized_family.casefold():
+        return True
+    if not normalized_name.lower().startswith(normalized_family.lower() + " "):
+        return False
+
+    suffix = normalized_name[len(normalized_family):].strip()
+    if not suffix:
+        return True
+
+    tokens = [part for part in re.split(r"[\s-]+", suffix.casefold()) if part]
+    return bool(tokens) and all(token in FONT_STYLE_TOKENS for token in tokens)
+
+
+def _resolve_font_faces_for_family(family: str) -> list[ResolvedFontFace]:
+    family_name = _normalize_font_display_name(family)
+    if not family_name:
+        return []
+
+    resolved: dict[tuple[int, str], ResolvedFontFace] = {}
+    registry_entries = _load_font_registry()
+    registry_map = {name.casefold(): path for name, path in registry_entries}
+
+    def register_face(display_name: str, source_path: Path) -> None:
+        ext = source_path.suffix.lower()
+        if ext not in FONT_EXPORT_EXTENSIONS:
+            return
+        weight, style = _classify_font_face(display_name)
+        key = (weight, style)
+        if key not in resolved:
+            resolved[key] = ResolvedFontFace(
+                display_name=display_name,
+                source_path=source_path,
+                weight=weight,
+                style=style,
+            )
+
+    for suffix in FONT_DISPLAY_NAME_SUFFIXES:
+        display_name = f"{family_name}{suffix}"
+        source_path = registry_map.get(display_name.casefold())
+        if source_path is not None:
+            register_face(display_name, source_path)
+
+    for display_name, source_path in registry_entries:
+        if _is_style_suffix_only(display_name, family_name):
+            register_face(display_name, source_path)
+
+    return sorted(resolved.values(), key=lambda face: (face.weight, face.style, face.display_name.casefold()))
+
+
+def _font_face_format(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext == ".ttf":
+        return " format('truetype')"
+    if ext == ".otf":
+        return " format('opentype')"
+    if ext == ".woff":
+        return " format('woff')"
+    if ext == ".woff2":
+        return " format('woff2')"
+    return ""
+
+
+def _build_embedded_font_payload(message_html: str, fonts_dst: Path) -> tuple[str, str]:
+    families = extract_font_families(message_html)
+    if not families:
+        return message_html, ""
+
+    family_aliases: dict[str, str] = {}
+    css_rules: list[str] = []
+    unresolved: list[str] = []
+
+    for family_index, family in enumerate(families, start=1):
+        faces = _resolve_font_faces_for_family(family)
+        if not faces:
+            unresolved.append(family)
+            continue
+
+        alias = f"LetterSmithEmbeddedFont{family_index}"
+        family_aliases[family] = alias
+
+        for face_index, face in enumerate(faces, start=1):
+            out_name = f"font-{family_index}-{face_index}{face.source_path.suffix.lower()}"
+            _atomic_copy_file(face.source_path, fonts_dst / out_name)
+            css_rules.append(
+                "@font-face{"
+                f"font-family:'{alias}';"
+                f"src:url('gallery/{FONTS_DIR}/{out_name}'){_font_face_format(face.source_path)};"
+                f"font-style:{face.style};"
+                f"font-weight:{face.weight};"
+                "font-display:block;"
+                "}"
+            )
+
+    if unresolved:
+        raise FileNotFoundError(
+            "Could not bundle the selected font files for export:\n"
+            + "\n".join(f"  - {name}" for name in unresolved)
+            + "\nChoose a different font or install the missing font locally before generating."
+        )
+
+    return rewrite_font_families(message_html, family_aliases), "\n".join(css_rules)
 
 
 def _load_settings(project_root: Path) -> dict:
@@ -318,6 +590,7 @@ def generate_play_bundle(
     controls_dst = bp.play_controls_dir
     message_dst = bp.play_message_dir
     sounds_dst = bp.play_sounds_dir
+    fonts_dst = bp.play_fonts_dir
 
     # Source dirs (user)
     pages_src = pr / USER_PAGES_DIR
@@ -347,15 +620,17 @@ def generate_play_bundle(
         allow_user_sfx_fallback=allow_user_sfx_fallback,
     )
 
-    # Write CSS/JS
-    _atomic_write_text(bp.play_dir / "styles.css", TEMPLATE_CSS)
-    _atomic_write_text(bp.play_dir / "script.js", TEMPLATE_JS)
-
     # Message HTML injection (prefer passed string, else disk)
     if message_html is None:
         message_html = _read_text_safe(msg_html_src)
-    message_html = _normalize_message_html(message_html)
+    message_html = normalize_message_fragment(message_html)
+    message_html, embedded_font_css = _build_embedded_font_payload(message_html, fonts_dst)
     safe_title = html_lib.escape(title, quote=False)
+
+    # Write CSS/JS
+    styles_css = TEMPLATE_CSS if not embedded_font_css else f"{embedded_font_css}\n\n{TEMPLATE_CSS}"
+    _atomic_write_text(bp.play_dir / "styles.css", styles_css)
+    _atomic_write_text(bp.play_dir / "script.js", TEMPLATE_JS)
 
     built_html = (
         TEMPLATE_HTML
