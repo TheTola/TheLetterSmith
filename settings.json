@@ -15,16 +15,14 @@
   "gallery_dir": "gallery",
   "gliss_file": "glissando.mp3",
   "icons_dir": "icons",
-  "last_audio": "music.mp3",
+  "last_audio": "none",
   "last_sealed_path": "A:/A Letter to Rayna Scott.zip",
   "max_audio_mb": 15,
   "message_html_file": "message.html",
   "message_image_file": "message.png",
-  "music_file": "music.mp3",
-  "music_volume": 20,
+  "music_file": "",
+  "music_volume": 60,
   "output_dir": "converted64",
-  "recipient_name": "Leilanie Chilado",
-  "recipient_title": "Engine of Future",
   "required_slides": [
     "cover.png",
     "letter.png",
@@ -33,6 +31,31 @@
   ],
   "sound_gif": "sound.gif",
   "sounds_dir": "sounds",
-  "starting_volume": 20,
-  "verbose": false
+  "starting_volume": 60,
+  "verbose": false,
+  "recipient_title": "Glitter & Gold",
+  "recipient_name": "Beyiu Ray",
+  "prompt_writer_state": {
+    "type": "\u2014 none \u2014",
+    "subject": "----",
+    "color": "",
+    "global": "",
+    "cover": "",
+    "letter": "",
+    "wall": "",
+    "back": "",
+    "checks": {
+      "black": false,
+      "white": false,
+      "frame": false,
+      "vignette": false,
+      "polaroid": false,
+      "cardshadow": false,
+      "real": false,
+      "paint": false,
+      "minimal": false,
+      "forbid_text": false
+    },
+    "generated_prompts": {}
+  }
 }

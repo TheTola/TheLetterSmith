@@ -13,9 +13,8 @@
 # - PREV: the turning sheet is the PREVIOUS page rotating back in over the CURRENT page.
 #
 # CHANGE REQUEST (THIS TURN):
-# - Do NOT remove anything.
-# - Add curtain overlay fade-out so it "makes sense" visually.
-# - Also prevent pitch-black start by using stage gradient behind curtains.
+# - Viewer volume must NEVER be persisted.
+# - Letter must ALWAYS initialize from injected INITIAL_VOLUME.
 # ===============================
 
 TEMPLATE_HTML = r"""
@@ -158,17 +157,16 @@ html,body{width:100%;height:100%;background:#0b0c12;overflow:hidden;font-family:
 #curtain-overlay{
   position:absolute; inset:0; z-index:9999;
   overflow:hidden; pointer-events:all;
+  opacity:0;
 
-  /* CHANGED: was background:#000; (pitch black)
-     Now matches stage so it "makes sense" visually behind curtains. */
   background:
     radial-gradient(900px 600px at 30% 25%, rgba(255,255,255,.08), transparent 60%),
     radial-gradient(900px 600px at 80% 70%, rgba(0,0,0,.35), transparent 60%),
     linear-gradient(180deg, #0b0c12, #05060a);
 
-  /* Added: makes fade smooth / reduces repaint jitter */
   will-change: opacity;
 }
+#curtain-overlay.is-visible{animation:curtainIntroFadeIn 520ms ease-out forwards}
 
 #curtain-left,#curtain-right{
   position:absolute; top:0; left:0;
@@ -176,7 +174,11 @@ html,body{width:100%;height:100%;background:#0b0c12;overflow:hidden;font-family:
   object-fit:cover;
   z-index:10000;
   pointer-events:none;
+  opacity:0;
+  will-change:opacity,transform;
 }
+#curtain-overlay.is-visible #curtain-left,
+#curtain-overlay.is-visible #curtain-right{animation:curtainPanelFadeIn 420ms ease-out forwards}
 #begin-button{
   position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
   font-size:42px; color:#fff;
@@ -188,15 +190,16 @@ html,body{width:100%;height:100%;background:#0b0c12;overflow:hidden;font-family:
   z-index:10001;
   animation:pulse 2s infinite;
 }
+#curtain-overlay:not(.is-visible) #begin-button{opacity:0}
 #begin-button:hover{background:rgba(0,0,0,0.78)}
+@keyframes curtainIntroFadeIn{from{opacity:0}to{opacity:1}}
+@keyframes curtainPanelFadeIn{from{opacity:0}to{opacity:1}}
 @keyframes pulse{
   0%,100%{opacity:.65; transform:translate(-50%,-50%) scale(1)}
   50%{opacity:1; transform:translate(-50%,-50%) scale(1.05)}
 }
 @keyframes curtainLeftOut{from{transform:translateX(0)}to{transform:translateX(-100vw)}}
 @keyframes curtainRightOut{from{transform:translateX(0)}to{transform:translateX(100vw)}}
-
-/* ADDED: overlay fade that runs alongside curtain slide */
 @keyframes curtainOverlayFadeOut{from{opacity:1}to{opacity:0}}
 
 /* Slides */
@@ -211,10 +214,7 @@ html,body{width:100%;height:100%;background:#0b0c12;overflow:hidden;font-family:
   z-index:5;
 }
 .slide.active{opacity:1; pointer-events:auto;}
-
-/* allow a “next page underneath” without changing idx early */
 .slide.peek{opacity:1; pointer-events:none; z-index:4;}
-/* hide the real active slide when the overlay is representing it */
 .slide.ghost{opacity:0; pointer-events:none;}
 
 .slide img{
@@ -339,9 +339,6 @@ html,body{width:100%;height:100%;background:#0b0c12;overflow:hidden;font-family:
 
 /* ==============================
    PAGE TURN OVERLAY (SPINE LEFT)
-   - Overlay bounded to active page image rect by JS.
-   - Hinge ALWAYS LEFT edge.
-   - Turning sheet ALWAYS single image.
    ============================== */
 #turn{
   position:absolute;
@@ -382,12 +379,8 @@ html,body{width:100%;height:100%;background:#0b0c12;overflow:hidden;font-family:
   border-radius:14px;
   display:block;
 }
-
-/* Deterministic visibility */
 .sheet.hidden{opacity:0; visibility:hidden}
 .sheet.visible{opacity:1; visibility:visible}
-
-/* Edge highlight */
 .sheet::after{
   content:"";
   position:absolute;
@@ -413,8 +406,6 @@ html,body{width:100%;height:100%;background:#0b0c12;overflow:hidden;font-family:
       rgba(255,255,255,0) 62%);
   mix-blend-mode: overlay;
 }
-
-/* Shadow under the turning sheet */
 #turnShadow{
   position:absolute;
   left:0; top:0;
@@ -479,13 +470,18 @@ document.addEventListener('DOMContentLoaded', () => {
   // wall overlay behavior (index 2)
   let wallClosedByUser = false;
 
-  // Volume
+  // Volume (NO persistence allowed)
   let slider = null;
-  const VOL_KEY = 'ls_volume_0_100';
 
   // Audio pool
   const flipPool = Array.from({length: 10}, (_, i) => `gallery/sounds/flip${i+1}.mp3`);
   const glissSrc = 'gallery/sounds/glissando.mp3';
+
+  function startCurtainIntro(){
+    requestAnimationFrame(() => {
+      overlay.classList.add('is-visible');
+    });
+  }
 
   // ─────────────────────────────────────────────────────────────
   // Helpers
@@ -582,23 +578,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
     slider.addEventListener('input', () => {
       const v = clamp(parseInt(slider.value || '0', 10), 0, 100);
-      setVolume0to100(v, true);
+      setVolume0to100(v);
     });
 
     return slider;
   }
 
+  // IMPORTANT: NO persistence. Always comes from injected INITIAL_VOLUME.
   function loadVolume0to100(){
-    const raw = localStorage.getItem(VOL_KEY);
-    if (raw !== null){
-      const v = parseInt(raw, 10);
-      if (!Number.isNaN(v)) return clamp(v, 0, 100);
-    }
-    const v0 = (typeof INITIAL_VOLUME === 'number') ? INITIAL_VOLUME : 30;
+    const v0 = (typeof INITIAL_VOLUME === 'number') ? INITIAL_VOLUME : 50;
     return clamp(Math.round(v0), 0, 100);
   }
 
-  function setVolume0to100(v, persist){
+  // IMPORTANT: NO persistence. Session-only changes.
+  function setVolume0to100(v){
     const vv = clamp(Math.round(v), 0, 100);
     const vol01 = vv / 100;
 
@@ -607,10 +600,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     volIcon.src = (vv === 0) ? 'gallery/controls/voloff.png' : 'gallery/controls/volon.png';
     if (slider) slider.value = String(vv);
-
-    if (persist){
-      try{ localStorage.setItem(VOL_KEY, String(vv)); }catch(_){}
-    }
   }
 
   function rectForActiveImage(){
@@ -758,83 +747,74 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   function openCurtain(){
-  if (started) return;
-  started = true;
-  syncButtons();
+    if (started) return;
+    started = true;
+    syncButtons();
 
-  // --- Gliss: play and THEN start music when it actually ends ---
-  let musicStarted = false;
+    // --- Gliss: play and THEN start music when it actually ends ---
+    let musicStarted = false;
 
-  function startMusicAfterGliss(){
-    if (musicStarted) return;
-    musicStarted = true;
+    function startMusicAfterGliss(){
+      if (musicStarted) return;
+      musicStarted = true;
 
-    const v = loadVolume0to100();
-    setVolume0to100(v, false);
+      // ALWAYS initialize from injected INITIAL_VOLUME
+      const v = loadVolume0to100();
+      setVolume0to100(v);
+
+      try{
+        music.currentTime = 0;
+        music.volume = 0;
+        music.muted = (v === 0);
+        music.play().catch(()=>{});
+      }catch(_){}
+
+      const target = clamp(v / 100, 0, 1);
+      const fadeMs = 900;
+      const start = performance.now();
+
+      function fadeStep(now){
+        const t = clamp((now - start) / fadeMs, 0, 1);
+        const e = easeInOutCubic(t);
+        music.volume = target * e;
+        if (t < 1) requestAnimationFrame(fadeStep);
+      }
+      requestAnimationFrame(fadeStep);
+    }
 
     try{
-      music.currentTime = 0;
-      music.volume = 0;
-      music.muted = (v === 0);
-      music.play().catch(()=>{});
-    }catch(_){}
+      const g = new Audio(glissSrc);
+      g.preload = 'auto';
+      g.volume = 0.10;
 
-    const target = clamp(v / 100, 0, 1);
-    const fadeMs = 900;
-    const start = performance.now();
+      g.addEventListener('ended', startMusicAfterGliss, { once: true });
+      g.addEventListener('error', startMusicAfterGliss, { once: true });
 
-    function fadeStep(now){
-      const t = clamp((now - start) / fadeMs, 0, 1);
-      const e = easeInOutCubic(t);
-      music.volume = target * e;
-      if (t < 1) requestAnimationFrame(fadeStep);
-    }
-    requestAnimationFrame(fadeStep);
-  }
+      g.play().catch(() => {
+        startMusicAfterGliss();
+      });
 
-  // Play gliss as an Audio element so we can listen for "ended"
-  try{
-    const g = new Audio(glissSrc);
-    g.preload = 'auto';
-    g.volume = 0.10;
-
-    // If it ends normally, start music immediately after
-    g.addEventListener('ended', startMusicAfterGliss, { once: true });
-
-    // If it errors or can't load, don't stall forever
-    g.addEventListener('error', startMusicAfterGliss, { once: true });
-
-    g.play().catch(() => {
-      // If play fails (rare after a click, but possible), just start music
+      setTimeout(startMusicAfterGliss, 2500);
+    } catch(_){
       startMusicAfterGliss();
-    });
+    }
 
-    // Fallback: if "ended" doesn't fire for any reason, start anyway after a hard limit
-    // Set this to slightly longer than your gliss file length.
-    setTimeout(startMusicAfterGliss, 2500);
-  } catch(_){
-    startMusicAfterGliss();
+    // Curtains move
+    cLeft.style.animation = 'curtainLeftOut 1100ms cubic-bezier(.2,.9,.1,1) forwards';
+    cRight.style.animation = 'curtainRightOut 1100ms cubic-bezier(.2,.9,.1,1) forwards';
+    overlay.style.animation = 'curtainOverlayFadeOut 1100ms cubic-bezier(.2,.9,.1,1) forwards';
+
+    beginBtn.disabled = true;
+    beginBtn.style.opacity = '0';
+    beginBtn.style.pointerEvents = 'none';
+
+    setTimeout(() => {
+      overlay.style.pointerEvents = 'none';
+      overlay.setAttribute('aria-hidden', 'true');
+      setTimeout(() => overlay.remove(), 250);
+      syncButtons();
+    }, 1250);
   }
-
-  // Curtains move
-  cLeft.style.animation = 'curtainLeftOut 1100ms cubic-bezier(.2,.9,.1,1) forwards';
-  cRight.style.animation = 'curtainRightOut 1100ms cubic-bezier(.2,.9,.1,1) forwards';
-
-  // If you already added this fade line, keep it here:
-  overlay.style.animation = 'curtainOverlayFadeOut 1100ms cubic-bezier(.2,.9,.1,1) forwards';
-
-  beginBtn.disabled = true;
-  beginBtn.style.opacity = '0';
-  beginBtn.style.pointerEvents = 'none';
-
-  setTimeout(() => {
-    overlay.style.pointerEvents = 'none';
-    overlay.setAttribute('aria-hidden', 'true');
-    setTimeout(() => overlay.remove(), 250);
-    syncButtons();
-  }, 1250);
-}
-
 
   beginBtn.addEventListener('click', (e) => {
     e.preventDefault();
@@ -884,12 +864,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   ensureSlider().style.display = 'none';
 
-  setVolume0to100(loadVolume0to100(), false);
+  // Initialize immediately (still session-only)
+  setVolume0to100(loadVolume0to100());
 
+  startCurtainIntro();
   setActiveIndex(0);
   syncButtons();
   syncWallUI();
   setTurnVisible(false);
 });
 """
-

@@ -363,10 +363,5 @@ def main() -> None:
     # Control transfers to Qt; this call blocks until the app exits.
     sys.exit(app.exec())
 
-
-
-
-
-
 if __name__ == "__main__":
     main()

@@ -1,4 +1,5 @@
 -Stylized & Illustrated
+
 Comic / Manga Style
 Cartooning
 Anime
@@ -21,6 +22,7 @@ Flat Design
 Stencil / Graffiti Style
 
 -Painterly & Expressive Styles
+
 Impressionism
 PostImpressionism
 Expressionism
@@ -35,6 +37,7 @@ Mixed Media
 Contemporary & Digital
 
 -2D Illustration & Game Art
+
 2D Concept Art
 2D Matte Painting
 2D Pixel Art
@@ -57,6 +60,7 @@ UI Illustration Style
 Icon Illustration Style
 
 -Cultural & Traditional Styles
+
 Japanese Ukiyoe
 Chinese Ink Wash
 Indian Mughal Miniature
@@ -65,6 +69,7 @@ Byzantine Iconography
 Islamic Geometric Art
 
 -Abstract & Non Representational
+
 Abstract Expressionism
 Color Field Painting
 Minimalism
@@ -73,6 +78,7 @@ Geometric Abstraction
 Lyrical Abstraction
 
 -Realistic & Representational Styles
+
 Photorealism
 Hyperrealism
 Naturalism

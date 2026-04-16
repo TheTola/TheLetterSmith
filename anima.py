@@ -9,7 +9,6 @@ Design goals
 - Zero project imports (no circular coupling).
 - No side effects on import (no prints, no filesystem, no timers until used).
 - Safe defaults: do not destroy existing graphics effects unless unavoidable.
-- Backward-compatible surface: keeps older symbols used by the project.
 
 Public API (stable)
 - ParticleBurst            : transparent overlay for sparks + rings + flash
@@ -17,11 +16,6 @@ Public API (stable)
 - install_click_fx         : global hover glow + press pulse installer
 - set_excitement_level     : global intensity scalar for bursts
 - get_excitement_level
-
-Compatibility exports (kept for existing imports)
-- AnimatedIconButton       : small icon-only button (used by titlebar.py)
-- ButtonPulseFilter        : press feedback filter (used by prompter_nexus.py and optional panels)
-- AnimatedPrompterButton   : big icon-only button (optional use)
 
 Important Qt constraint
 - A QWidget can have ONLY ONE graphicsEffect at a time. This module:
@@ -67,10 +61,7 @@ __all__ = [
     "ParticleBurst",
     "TabSwitcher",
     "install_click_fx",
-    # Compatibility:
-    "AnimatedIconButton",
     "ButtonPulseFilter",
-    "AnimatedPrompterButton",
 ]
 
 
@@ -483,7 +474,7 @@ class ParticleBurst(QtWidgets.QWidget):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Press feedback filter (compat: ButtonPulseFilter)
+# Press feedback filter
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ButtonPulseFilter(QtCore.QObject):
@@ -630,163 +621,12 @@ class _HoverGlowFilter(QtCore.QObject):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AnimatedIconButton (compat: used by titlebar.py)
+# Removed unused titlebar button helpers.
 # ─────────────────────────────────────────────────────────────────────────────
 
-class AnimatedIconButton(QtWidgets.QToolButton):
-    """
-    Small icon-only button for chrome (TitleBar etc).
-    - Transparent background, no border.
-    - Optional ParticleBurst overlay: bursts at center on click.
-    - Uses icon-size micro-pulse on click without changing geometry.
-    """
-
-    def __init__(
-        self,
-        *,
-        icon_path: str,
-        tooltip: str = "",
-        size: int = 26,
-        parent: Optional[QtWidgets.QWidget] = None,
-    ) -> None:
-        super().__init__(parent)
-        self._overlay: Optional[ParticleBurst] = None
-
-        self.setCursor(Qt.PointingHandCursor)
-        self.setAutoRaise(True)
-        self.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        self.setStyleSheet("QToolButton { background: transparent; border: none; padding: 0px; }")
-        if tooltip:
-            self.setToolTip(tooltip)
-
-        px = max(18, int(size))
-        self.setFixedSize(px, px)
-
-        self._base_icon = QSize(int(px * 0.72), int(px * 0.72))
-        self.setIconSize(self._base_icon)
-
-        if icon_path:
-            self.setIcon(QtGui.QIcon(icon_path))
-
-        # Opt out of install_click_fx hover glow by default
-        self.setProperty("anima.NoHoverGlow", True)
-
-        self.clicked.connect(self._pulse_and_burst)
-
-    def setParticleOverlay(self, overlay: ParticleBurst) -> None:
-        self._overlay = overlay
-
-    def _pulse_and_burst(self) -> None:
-        bw, bh = self._base_icon.width(), self._base_icon.height()
-
-        anim = QtCore.QVariantAnimation(self)
-        anim.setDuration(FX.PRESS_MS)
-        anim.setStartValue(0.0)
-        anim.setEndValue(1.0)
-        anim.setEasingCurve(QEasingCurve.InOutSine)
-
-        def _apply(v: Any) -> None:
-            t = float(v)
-            tri = 1.0 - abs(2.0 * t - 1.0)
-            k = 1.0 - 0.10 * tri
-            self.setIconSize(QSize(max(1, int(bw * k)), max(1, int(bh * k))))
-
-        anim.valueChanged.connect(_apply)  # type: ignore[attr-defined]
-        anim.finished.connect(lambda: self.setIconSize(self._base_icon))  # type: ignore[attr-defined]
-        _keep_anim(self, anim)
-        anim.start(QtCore.QAbstractAnimation.DeleteWhenStopped)
-
-        if self._overlay and self.isVisible():
-            pos = self.mapTo(self._overlay, self.rect().center())
-            self._overlay.burst_at(pos, excitement=get_excitement_level())
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# AnimatedPrompterButton (optional large icon button)
+# Removed unused prompter button helpers.
 # ─────────────────────────────────────────────────────────────────────────────
-
-class AnimatedPrompterButton(QtWidgets.QPushButton):
-    """
-    Large icon-only button:
-    - fixed geometry
-    - icon-size pulse on click
-    - dedicated glow effect
-    - optional ParticleBurst overlay
-    """
-
-    def __init__(
-        self,
-        icon: QtGui.QIcon,
-        *,
-        size: int = 160,
-        overlay: Optional[ParticleBurst] = None,
-        excitement_level: Optional[int] = None,
-        parent: Optional[QtWidgets.QWidget] = None,
-    ) -> None:
-        super().__init__(parent)
-        self._overlay = overlay
-        self._excite = excitement_level
-
-        self.setCursor(Qt.PointingHandCursor)
-        self.setFlat(True)
-        self.setStyleSheet("QPushButton{border:none; background:transparent;}")
-        self.setProperty("anima.NoHoverGlow", True)
-        self.setProperty("anima.NoPressPulse", True)
-
-        base = max(48, int(size))
-        self.setFixedSize(base, base)
-        self._base_icon = QSize(base, base)
-
-        self.setIcon(icon)
-        self.setIconSize(self._base_icon)
-
-        glow = QtWidgets.QGraphicsDropShadowEffect(self)
-        glow.setOffset(0, 0)
-        glow.setBlurRadius(FX.PROMPTER_GLOW_BLUR)
-        c = QtGui.QColor(FX.PROMPTER_GLOW_COLOR)
-        c.setAlpha(FX.PROMPTER_GLOW_ALPHA_REST)
-        glow.setColor(c)
-        self.setGraphicsEffect(glow)
-        self._glow = glow
-
-    def enterEvent(self, e: QtGui.QEnterEvent) -> None:  # type: ignore[override]
-        super().enterEvent(e)
-        c = QtGui.QColor(self._glow.color())
-        c.setAlpha(FX.PROMPTER_GLOW_ALPHA_HOVER)
-        self._glow.setColor(c)
-
-    def leaveEvent(self, e: QtCore.QEvent) -> None:  # type: ignore[override]
-        super().leaveEvent(e)
-        c = QtGui.QColor(self._glow.color())
-        c.setAlpha(FX.PROMPTER_GLOW_ALPHA_REST)
-        self._glow.setColor(c)
-
-    def mouseReleaseEvent(self, e: QtGui.QMouseEvent) -> None:
-        super().mouseReleaseEvent(e)
-
-        bw, bh = self._base_icon.width(), self._base_icon.height()
-
-        anim = QtCore.QVariantAnimation(self)
-        anim.setDuration(int(FX.PRESS_MS * 1.5))
-        anim.setStartValue(0.0)
-        anim.setEndValue(1.0)
-        anim.setEasingCurve(QEasingCurve.OutBack)
-
-        def _apply(v: Any) -> None:
-            t = float(v)
-            k = 1.0 + 0.14 * min(1.0, t)
-            self.setIconSize(QSize(int(bw * k), int(bh * k)))
-
-        anim.valueChanged.connect(_apply)  # type: ignore[attr-defined]
-        anim.finished.connect(lambda: self.setIconSize(self._base_icon))  # type: ignore[attr-defined]
-        _keep_anim(self, anim)
-        anim.start(QtCore.QAbstractAnimation.DeleteWhenStopped)
-
-        if self._overlay and self.isVisible():
-            pos = self.mapTo(self._overlay, self.rect().center())
-            lvl = self._excite if self._excite is not None else get_excitement_level()
-            self._overlay.burst_at(pos, excitement=lvl)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TabSwitcher (QStackedWidget transitions)

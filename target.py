@@ -788,8 +788,6 @@ class TargetApp(tk.Tk):
 
         self.titlebar.create_text(14, h // 2, text="TARGET", anchor="w", fill="#00ffff",
                                   font=("Segoe UI Semibold", 12))
-        self.titlebar.create_text(88, h // 2, text="Folder Structure Extractor",
-                                  anchor="w", fill="#aab2c8", font=("Segoe UI", 10))
 
         self._btn_min_rect = self.titlebar.create_rectangle(0, 0, 0, 0, fill="#141724", outline="")
         self._btn_min_text = self.titlebar.create_text(0, 0, text="–", fill="#e6e6e6", font=("Segoe UI", 12))

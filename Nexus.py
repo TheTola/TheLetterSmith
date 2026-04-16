@@ -417,9 +417,6 @@ class Nexus(QtWidgets.QMainWindow):
         else:
             self._set_help_fallback_icon(_abs(REL_HELP_PNG))
 
-        # Legacy-compat shim (prevents AttributeError in any old slots)
-        self._help_movie = None
-
         help_row.addWidget(self.help_icon, 0, Qt.AlignRight)
         body_layout.addLayout(help_row)
 
@@ -461,7 +458,7 @@ class Nexus(QtWidgets.QMainWindow):
             self.page_stack.addWidget(w)
         body_layout.addWidget(self.page_stack)
 
-        self.forge_tab.letter_loaded.connect(lambda _payload=None: self._show_forge_preview())
+        self.forge_tab.letter_loaded.connect(self._on_letter_loaded)
 
         main_layout.addWidget(self.body)
         self.setCentralWidget(main_widget)
@@ -720,6 +717,14 @@ class Nexus(QtWidgets.QMainWindow):
 
         # Hide preview only on "Command" tab (index 4)
         self.preview_frame.setVisible(idx != 4)
+        # Prompt Writer FAB: hide ONLY on Command tab
+        try:
+            if hasattr(self, "image_tab") and hasattr(self.image_tab, "pwrite_fab"):
+                self.image_tab.pwrite_fab.setVisible(idx != 4)
+                if idx != 4:
+                    self.image_tab.pwrite_fab.raise_()
+        except Exception:
+            pass
 
         if self._tabswitch:
             self._tabswitch.go_to(idx)
@@ -816,7 +821,11 @@ class Nexus(QtWidgets.QMainWindow):
         self.image_preview.clear()
 
     def _on_command_wiped(self) -> None:
-        """Redundancy: Command tab wiped data; also hard-clear any preview residue."""
+        """Command tab wipe occurred.
+
+        - Clear preview residue (existing behavior)
+        - Clear Prompt Writer persistence so Prompt Writer resets on wipe (requested)
+        """
         self._last_pixmap = None
         self._clear_preview()
         try:
@@ -827,6 +836,21 @@ class Nexus(QtWidgets.QMainWindow):
             self.preview_caption.setVisible(False)
         except Exception:
             pass
+
+        # Clear Prompt Writer persisted state
+        try:
+            from pathlib import Path
+
+            root = Path(getattr(self, "project_root", "") or Path.cwd())
+            state_path = root / "prompt_writer_state.json"
+            if state_path.exists():
+                try:
+                    state_path.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 
     def _request_message_preview(self) -> None:
         """Ask MessageTab to emit whichever preview it thinks is correct."""
@@ -842,6 +866,63 @@ class Nexus(QtWidgets.QMainWindow):
                 return
         except Exception:
             pass
+
+    def _on_letter_loaded(self, payload=None) -> None:
+        """When a saved Play build is loaded, push recipient/title into MessageTab UI and refresh preview."""
+        try:
+            name = ""
+            title = ""
+            if isinstance(payload, dict):
+                name = str(payload.get("recipient_name", "")).strip()
+                title = str(payload.get("recipient_title", "")).strip()
+
+            # Fallback to disk if payload incomplete
+            if not (name and title):
+                try:
+                    settings_path = Path(self.project_root) / "settings.json"
+                    if settings_path.exists():
+                        import json as _json
+                        data = _json.loads(settings_path.read_text(encoding="utf-8"))
+                        if isinstance(data, dict):
+                            name = name or str(data.get("recipient_name", "")).strip()
+                            title = title or str(data.get("recipient_title", "")).strip()
+                except Exception:
+                    pass
+
+            # Update MessageTab inputs live
+            try:
+                mt = getattr(self, "message_tab", None)
+                if mt is not None:
+                    if hasattr(mt, "title_input"):
+                        mt.title_input.setText(title)
+                    if hasattr(mt, "name_input"):
+                        mt.name_input.setText(name)
+                    if hasattr(mt, "_save_settings"):
+                        mt._save_settings()
+            except Exception:
+                pass
+
+            # Refresh Forge preview caption + image
+            self._show_forge_preview()
+
+            # Optional: refresh message preview if user is currently on Message tab
+            try:
+                if self.page_stack.currentWidget() is getattr(self, "message_tab", None):
+                    self._request_message_preview()
+            except Exception:
+                pass
+
+            try:
+                if title or name:
+                    self.toast(f"Loaded: {name} — {title}")
+            except Exception:
+                pass
+        except Exception:
+            # Never crash the UI from a load hook
+            try:
+                self._show_forge_preview()
+            except Exception:
+                pass
 
     def _show_forge_preview(self) -> None:
         """Forge tab: show cover.png and the project title underneath."""

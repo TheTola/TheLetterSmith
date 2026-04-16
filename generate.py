@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import webbrowser
+import html as html_lib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Iterable
@@ -66,6 +68,7 @@ from config import (
 
 # App-owned SFX live here (relative to project root)
 APP_SOUNDS_DIR = Path("gallery") / "app" / "sounds"
+BODY_RE = re.compile(r"<body\b[^>]*>(.*?)</body>", re.IGNORECASE | re.DOTALL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,6 +120,15 @@ def _read_text_safe(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return ""
+
+
+def _normalize_message_html(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+
+    match = BODY_RE.search(text)
+    return (match.group(1) if match else text).strip()
 
 
 def _load_settings(project_root: Path) -> dict:
@@ -342,14 +354,16 @@ def generate_play_bundle(
     # Message HTML injection (prefer passed string, else disk)
     if message_html is None:
         message_html = _read_text_safe(msg_html_src)
+    message_html = _normalize_message_html(message_html)
+    safe_title = html_lib.escape(title, quote=False)
 
-    html = (
+    built_html = (
         TEMPLATE_HTML
-        .replace("{{TITLE}}", title)
-        .replace("{{MESSAGE_HTML}}", message_html or "")
+        .replace("{{TITLE}}", safe_title)
+        .replace("{{MESSAGE_HTML}}", message_html)
         .replace("{{INITIAL_VOLUME}}", str(starting_vol))
     )
-    _atomic_write_text(bp.play_dir / "index.html", html)
+    _atomic_write_text(bp.play_dir / "index.html", built_html)
 
     if open_in_browser:
         try:

@@ -1,36 +1,27 @@
 # ===============================
 # File: command.py
-# Purpose: "The Commandment" — UI + surgical reset
+# Purpose: Erase/Reset command for eLetter
 #
-# REQUIRED EXPORTS (Forge_Tab.py imports these):
-#   - confirm_and_reset
-#   - open_saved_letters
+# Fixes:
+# 1) Recipient/title not clearing (UI + settings)
+# 2) Music still plays after erase (WaveHandler player not parented + archive manifest fallback)
 #
-# POLICY (FINAL):
-# ✅ Delete ONLY:
-#   - contents of gallery/user/pages/
-#   - contents of gallery/user/message/
-#   - gallery/user/sounds/music.mp3
-#
-# ❌ Must NOT delete:
-#   - glissando.mp3
-#   - flip1..flip10.mp3
-#   - gallery/user/sounds/appssong/ (or anything inside it)
-#   - gallery/user/card/controls/
-#
-# Also:
-# - Clear recipient + title in settings.json (recipient_name + recipient_title)
-# - Force starting_volume to 30
-# - If music_volume exists, force it to 30 as well
-#
-# COMMAND TAB UI (FINAL):
-# - command.png is BACKGROUND (not clickable)
-# - GO.png is the BUTTON, centered (clickable)
-# - GO press animation only: depress on mouse down, pop back on release
-# - GO is truly transparent (no gray square ever)
-# - Entire tab is NOT clickable
-# - Popup: single sentence only (no list)
-# - Popup: no corner squares (zero outer margins + translucent)
+# Guarantees after reset:
+# - settings.json:
+#     recipient_name = ""
+#     recipient_title = ""
+#     music_file = ""
+#     last_audio = "none"
+#     starting_volume = 50
+#     music_volume = 50
+# - deletes:
+#     gallery/user/sounds/music.mp3
+#     gallery/sounds/music.mp3   (if it exists in your build)
+#     gallery/user/sounds/appssong/current.json   (critical)
+# - does NOT delete:
+#     glissando.mp3
+#     flip1..flip10.mp3
+#     appssong/originals, processed, analysis
 # ===============================
 
 from __future__ import annotations
@@ -49,11 +40,10 @@ __all__ = [
     "CommandTab",
     "confirm_and_reset",
     "reset_everything",
-    "open_saved_letters",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config (authoritative; safe fallbacks)
+# Config (prefer real project config; safe fallbacks)
 # ─────────────────────────────────────────────────────────────────────────────
 try:
     from config import (
@@ -62,7 +52,6 @@ try:
         USER_MESSAGE_DIR,
         USER_SOUNDS_DIR,
         MUSIC_FILE,
-        OUTPUT_FILE_DIR,
     )
 except Exception:
     SETTINGS_FILE = "settings.json"
@@ -70,7 +59,6 @@ except Exception:
     USER_MESSAGE_DIR = "gallery/user/message"
     USER_SOUNDS_DIR = "gallery/user/sounds"
     MUSIC_FILE = "music.mp3"
-    OUTPUT_FILE_DIR = os.path.join("output", "File")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,13 +74,13 @@ def app_root() -> Path:
 
     here = Path(__file__).resolve()
     for up in (here.parent, here.parent.parent, here.parent.parent.parent):
-        if (up / "Main.py").exists() or (up / "Nexus.py").exists() or (up / SETTINGS_FILE).exists():
+        if (up / SETTINGS_FILE).exists() or (up / "gallery").exists():
             return up
     return here.parent
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# File helpers (surgical)
+# File helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _safe_clear_dir_contents(dir_path: Path) -> Tuple[int, int]:
     files_deleted = 0
@@ -140,40 +128,172 @@ def _write_settings(path: Path, data: dict) -> None:
         pass
 
 
-def _reset_settings(root: Path) -> None:
+# ─────────────────────────────────────────────────────────────────────────────
+# UI / runtime hooks (this is the part that actually fixes the audio + inputs)
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_nexus_window(parent: Optional[QtWidgets.QWidget]) -> Optional[QtWidgets.QWidget]:
+    if parent is None:
+        return None
+    try:
+        return parent.window()
+    except Exception:
+        return None
+
+
+def _hard_stop_sound_system(win: Optional[QtWidgets.QWidget]) -> None:
     """
-    - Clear recipient/title
-    - Force starting_volume to 30
-    - If music_volume exists, force to 30
+    SoundTab uses WaveHandler.player = QMediaPlayer() with NO parent.
+    findChildren() will NOT find it. So we must reach it through Nexus.
     """
+    if win is None:
+        return
+
+    # Stop SoundTab WaveHandler music player (and detach source)
+    try:
+        st = getattr(win, "sound_tab", None)
+        if st is not None and hasattr(st, "wave"):
+            wave = getattr(st, "wave", None)
+            if wave is not None and hasattr(wave, "release_current_file_handle"):
+                wave.release_current_file_handle()
+    except Exception:
+        pass
+
+    # If preview widget uses another player, stop it too (best-effort)
+    try:
+        st = getattr(win, "sound_tab", None)
+        if st is not None and hasattr(st, "_preview"):
+            pv = getattr(st, "_preview", None)
+            # Some implementations store player as pv._player
+            p = getattr(pv, "_player", None)
+            if p is not None:
+                try:
+                    p.stop()
+                except Exception:
+                    pass
+                try:
+                    p.setSource(QUrl())
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _force_soundtab_no_audio(win: Optional[QtWidgets.QWidget]) -> None:
+    """
+    After wiping files/manifests, force SoundTab UI to reflect "no audio"
+    and clear its internal current selection so Play cannot silently use archive.
+    """
+    if win is None:
+        return
+    try:
+        st = getattr(win, "sound_tab", None)
+        if st is None:
+            return
+
+        # Clear the "current processed" pointer and refresh preview/analyzer
+        if hasattr(st, "_on_current_changed"):
+            try:
+                st._on_current_changed("")  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        # Reset visible UI labels if present
+        try:
+            if hasattr(st, "playpause_btn"):
+                st.playpause_btn.setText("▶️ Play")
+        except Exception:
+            pass
+        try:
+            if hasattr(st, "status"):
+                st.status.setText("No audio loaded.")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _clear_message_tab_inputs(win: Optional[QtWidgets.QWidget]) -> None:
+    """
+    The Message tab fields are not guaranteed to have objectNames,
+    so clear them explicitly via message_tab.title_input/name_input if present.
+    """
+    if win is None:
+        return
+    try:
+        mt = getattr(win, "message_tab", None)
+        if mt is None:
+            return
+
+        # Clear UI inputs
+        try:
+            if hasattr(mt, "title_input"):
+                mt.title_input.setText("")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            if hasattr(mt, "name_input"):
+                mt.name_input.setText("")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        # Clear its in-memory settings dict so it won't re-save old values later
+        try:
+            if hasattr(mt, "settings") and isinstance(mt.settings, dict):  # type: ignore[attr-defined]
+                mt.settings["recipient_title"] = ""
+                mt.settings["recipient_name"] = ""
+        except Exception:
+            pass
+
+        # Force it to write the cleared state if it has a saver
+        try:
+            if hasattr(mt, "_save_settings"):
+                mt._save_settings()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _reset_settings_on_disk(root: Path) -> None:
     settings_path = (root / SETTINGS_FILE).resolve()
     data = _read_settings(settings_path)
 
+    # Explicitly blank (don’t just pop; other code expects keys to exist)
     data["recipient_name"] = ""
     data["recipient_title"] = ""
 
-    data["starting_volume"] = 30
-    if "music_volume" in data:
-        data["music_volume"] = 30
+    # Volumes to 50%
+    data["starting_volume"] = 50
+    data["music_volume"] = 50
+
+    # Neutralize music selection (prevents accidental reload)
+    data["music_file"] = ""
+    data["last_audio"] = "none"
 
     _write_settings(settings_path, data)
 
 
-def _poke_ui_clear_fields(parent: Optional[QtWidgets.QWidget]) -> None:
+def _delete_music_and_manifest(root: Path) -> int:
     """
-    Best-effort UI cleanup: if the confirm dialog was launched from within the app,
-    clear any LineEdits that look like recipient/title fields.
+    Deletes:
+      - gallery/user/sounds/music.mp3
+      - gallery/sounds/music.mp3 (if present)
+      - gallery/user/sounds/appssong/current.json   <-- critical
     """
-    if parent is None:
-        return
-    win = parent.window()
-    try:
-        for e in win.findChildren(QtWidgets.QLineEdit):
-            n = (e.objectName() or "").lower()
-            if ("recipient" in n) or ("title" in n):
-                e.setText("")
-    except Exception:
-        pass
+    total = 0
+
+    user_snd_dir = (root / USER_SOUNDS_DIR).resolve()
+    user_music = (user_snd_dir / MUSIC_FILE).resolve()
+
+    runtime_music = (root / "gallery" / "sounds" / MUSIC_FILE).resolve()  # optional location
+
+    current_manifest = (user_snd_dir / "appssong" / "current.json").resolve()
+
+    total += _safe_delete_file(user_music)
+    total += _safe_delete_file(runtime_music)
+    total += _safe_delete_file(current_manifest)
+
+    return total
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,61 +304,47 @@ def reset_everything(*, parent: Optional[QtWidgets.QWidget] = None) -> Tuple[int
 
     pages_dir = (root / USER_PAGES_DIR).resolve()
     msg_dir = (root / USER_MESSAGE_DIR).resolve()
-    snd_dir = (root / USER_SOUNDS_DIR).resolve()
-    music_path = (snd_dir / MUSIC_FILE).resolve()
 
     pages_dir.mkdir(parents=True, exist_ok=True)
     msg_dir.mkdir(parents=True, exist_ok=True)
-    snd_dir.mkdir(parents=True, exist_ok=True)
 
     total_files = 0
     total_dirs = 0
 
-    # Wipe user pages
+    win = _get_nexus_window(parent)
+
+    # 1) Stop audio FIRST (buffering + unparented player)
+    _hard_stop_sound_system(win)
+
+    # 2) Wipe user pages + message
     f, d = _safe_clear_dir_contents(pages_dir)
     total_files += f
     total_dirs += d
 
-    # Wipe user message folder (THIS IS THE MISSING PIECE YOU ASKED FOR)
     f, d = _safe_clear_dir_contents(msg_dir)
     total_files += f
     total_dirs += d
 
-    # Wipe only music.mp3 (do NOT touch appssong, glissando, flips)
-    total_files += _safe_delete_file(music_path)
+    # 3) Delete music.mp3 AND clear current.json (prevents archive fallback play)
+    total_files += _delete_music_and_manifest(root)
 
-    _reset_settings(root)
-    _poke_ui_clear_fields(parent)
+    # 4) Reset settings.json on disk
+    _reset_settings_on_disk(root)
+
+    # 5) Clear live UI fields so the app visually resets immediately
+    _clear_message_tab_inputs(win)
+
+    # 6) Force SoundTab to "no audio loaded" state
+    _force_soundtab_no_audio(win)
 
     return total_files, total_dirs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public: open_saved_letters (Forge_Tab.py import compatibility)
+# Reset flow continues below
 # ─────────────────────────────────────────────────────────────────────────────
-def open_saved_letters(parent: Optional[QtWidgets.QWidget] = None) -> None:
-    root = app_root()
-    target = (root / OUTPUT_FILE_DIR).resolve()
-    target.mkdir(parents=True, exist_ok=True)
-
-    try:
-        if sys.platform.startswith("win"):
-            os.startfile(str(target))  # type: ignore[attr-defined]
-        elif sys.platform.startswith("darwin"):
-            import subprocess
-            subprocess.run(["open", str(target)], check=False)
-        else:
-            import subprocess
-            subprocess.run(["xdg-open", str(target)], check=False)
-    except Exception:
-        try:
-            QtGui.QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
-        except Exception:
-            pass
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Frameless confirm dialog (single sentence, no list)
+# Frameless confirm dialog (no title bar; only Yes/No)
 # ─────────────────────────────────────────────────────────────────────────────
 class _ConfirmDialog(QtWidgets.QDialog):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
@@ -253,7 +359,8 @@ class _ConfirmDialog(QtWidgets.QDialog):
 
         panel = QtWidgets.QFrame(self)
         panel.setObjectName("panel")
-        panel.setStyleSheet("""
+        panel.setStyleSheet(
+            """
             QFrame#panel {
                 background: rgba(15, 17, 22, 246);
                 border: 1px solid rgba(255, 255, 255, 0.08);
@@ -276,14 +383,15 @@ class _ConfirmDialog(QtWidgets.QDialog):
             QPushButton:hover { border-color: rgba(255, 77, 79, 0.85); }
             QPushButton#danger { border-color: rgba(255, 77, 79, 0.55); }
             QPushButton#danger:hover { border-color: rgba(255, 77, 79, 1.0); }
-        """)
+        """
+        )
 
         inner = QtWidgets.QVBoxLayout(panel)
         inner.setContentsMargins(18, 16, 18, 14)
         inner.setSpacing(12)
 
-        title = QtWidgets.QLabel("Are you sure you want to wipe the letter?")
-        title.setWordWrap(True)
+        label = QtWidgets.QLabel("Are you sure? This will erase everything.")
+        label.setWordWrap(True)
 
         row = QtWidgets.QHBoxLayout()
         row.addStretch(1)
@@ -293,7 +401,7 @@ class _ConfirmDialog(QtWidgets.QDialog):
         row.addWidget(btn_no)
         row.addWidget(btn_yes)
 
-        inner.addWidget(title)
+        inner.addWidget(label)
         inner.addLayout(row)
 
         outer.addWidget(panel)
@@ -313,7 +421,8 @@ def _toast(parent: Optional[QtWidgets.QWidget], text: str, msecs: int = 1400) ->
     outer.setContentsMargins(0, 0, 0, 0)
 
     body = QtWidgets.QFrame()
-    body.setStyleSheet("""
+    body.setStyleSheet(
+        """
         QFrame {
             background: rgba(15, 17, 22, 246);
             border: 1px solid rgba(255,255,255,0.08);
@@ -324,7 +433,8 @@ def _toast(parent: Optional[QtWidgets.QWidget], text: str, msecs: int = 1400) ->
             padding: 10px 12px;
             font-weight: 700;
         }
-    """)
+    """
+    )
     lbl = QtWidgets.QLabel(text)
     lay = QtWidgets.QVBoxLayout(body)
     lay.setContentsMargins(0, 0, 0, 0)
@@ -354,7 +464,7 @@ def confirm_and_reset(parent: Optional[QtWidgets.QWidget] = None) -> None:
         files, _dirs = reset_everything(parent=parent)
         _toast(parent, f"Wiped. ({files} files)")
 
-        # IMPORTANT: tell Nexus to hard-clear preview (redundancy)
+        # Signal to Nexus (if connected) to hard-clear preview
         try:
             if parent is not None and hasattr(parent, "wiped"):
                 parent.wiped.emit()  # type: ignore[attr-defined]
@@ -373,7 +483,7 @@ class _PressGoLabel(QtWidgets.QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setCursor(Qt.PointingHandCursor)
 
-        # CRITICAL: true transparency (no gray square ever)
+        # True transparency
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAutoFillBackground(False)
         self.setStyleSheet("background: transparent;")
@@ -437,7 +547,7 @@ class _PressGoLabel(QtWidgets.QLabel):
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == Qt.LeftButton:
             self._pressed = True
-            self._animate_to(0.92, 85)  # depress
+            self._animate_to(0.92, 85)
             event.accept()
             return
         super().mousePressEvent(event)
@@ -445,7 +555,7 @@ class _PressGoLabel(QtWidgets.QLabel):
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         if self._pressed and event.button() == Qt.LeftButton:
             self._pressed = False
-            self._animate_to(1.0, 110)  # pop back
+            self._animate_to(1.0, 110)
 
             if self.rect().contains(event.position().toPoint()):
                 QtCore.QTimer.singleShot(0, self.clicked.emit)
@@ -465,13 +575,7 @@ class _PressGoLabel(QtWidgets.QLabel):
 # CommandTab: command.png background + centered GO.png press-animated button
 # ─────────────────────────────────────────────────────────────────────────────
 class CommandTab(QtWidgets.QWidget):
-    """
-    - command.png is BACKGROUND only (fit, no crop)
-    - GO.png is the CLICKABLE button (centered)
-    - Press animation only (no bounce/idle motion)
-    """
-
-    wiped = QtCore.Signal()  # Nexus listens to this to hard-clear preview
+    wiped = QtCore.Signal()
 
     def __init__(self, project_root: Path, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
@@ -486,18 +590,24 @@ class CommandTab(QtWidgets.QWidget):
         self._bg_pix = QtGui.QPixmap(str(self._bg_path))
         self._go_pix = QtGui.QPixmap(str(self._go_path))
 
-        # Background label (NOT clickable)
         self.bg_label = QtWidgets.QLabel(self)
         self.bg_label.setAlignment(Qt.AlignCenter)
         self.bg_label.setScaledContents(False)
         self.bg_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
-        # GO button label (clickable)
         self.go_btn = _PressGoLabel(self)
         self.go_btn.setToolTip("Wipe the letter")
-        self.go_btn.clicked.connect(lambda: confirm_and_reset(self))
+        self.go_btn.clicked.connect(lambda: self._do_reset())
 
         self._relayout()
+
+    def _do_reset(self) -> None:
+        confirm_and_reset(self)
+        # bubble signal for any listeners
+        try:
+            self.wiped.emit()
+        except Exception:
+            pass
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -507,19 +617,17 @@ class CommandTab(QtWidgets.QWidget):
         w = max(1, self.width())
         h = max(1, self.height())
 
-        # Background: fit, no crop, no overflow
         self.bg_label.setGeometry(0, 0, w, h)
         if not self._bg_pix.isNull():
             bg_scaled = self._bg_pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.bg_label.setPixmap(bg_scaled)
 
-        # GO: centered, sized relative to window (never spills)
         if self._go_pix.isNull():
             self.go_btn.set_base(QtCore.QRect(0, 0, 0, 0), self._go_pix)
             return
 
         target = int(min(w, h) * 0.28)
-        target = max(140, min(460, target))  # clamp
+        target = max(140, min(460, target))
 
         go_base = self._go_pix.scaled(target, target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         bw = go_base.width()
@@ -530,9 +638,6 @@ class CommandTab(QtWidgets.QWidget):
         self.go_btn.raise_()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Optional CLI entry
-# ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     confirm_and_reset(None)
