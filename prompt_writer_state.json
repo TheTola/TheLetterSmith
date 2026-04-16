@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "type": "— none —",
+  "subject": "----",
+  "color": "",
+  "global": "",
+  "cover": "",
+  "letter": "",
+  "wall": "",
+  "back": "",
+  "checks": {
+    "black": false,
+    "white": false,
+    "frame": false,
+    "vignette": false,
+    "polaroid": false,
+    "cardshadow": false,
+    "real": false,
+    "paint": false,
+    "minimal": false,
+    "forbid_text": false,
+    "clean_composition": false,
+    "strong_focal_point": false,
+    "dynamic_angle": false,
+    "cinematic_framing": false,
+    "close_up_focus": false,
+    "full_body_view": false,
+    "wide_scene": false,
+    "simplified_details": false
+  },
+  "generated_prompts": {}
+}
