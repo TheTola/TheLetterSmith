@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # File: Main.py
 # -*- coding: utf-8 -*-
-
+ 
 """
 Letter Smith — Application Entry Point (Clean, Non-Legacy)
 
