@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 # File: Main.py
 # -*- coding: utf-8 -*-
- 
 """
 Letter Smith — Application Entry Point (Clean, Non-Legacy)
 
 This file is intentionally boring.
-
 It exists to:
   1) Put the process in a known-good execution state (root, sys.path).
   2) Bring up Qt safely (one QApplication, proper app identity, icon).
