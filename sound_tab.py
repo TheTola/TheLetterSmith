@@ -1,4 +1,4 @@
-﻿# ===============================
+# ===============================
 # File: sound_tab.py
 # Purpose: Sound tab (archive + playback + analysis + visualizer)
 
@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox
 )
 
+from audio_export import _export_apple_safe_mp3
+
 # --- Visualizer (shared preview widget) ---
 from sound_preview import SoundPreviewWidget
 
@@ -36,16 +38,6 @@ except Exception:
 
 # --- Audio utils ---
 from mutagen import File as MutagenFile
-from pydub import AudioSegment, effects
-import pydub
-
-# Optional ffmpeg/ffprobe binding if not in PATH (uses env first, then common local)
-_FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "")
-_FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "")
-if _FFMPEG_BIN and os.path.exists(_FFMPEG_BIN):
-    pydub.AudioSegment.converter = _FFMPEG_BIN  # type: ignore[attr-defined]
-if _FFPROBE_BIN and os.path.exists(_FFPROBE_BIN):
-    pydub.AudioSegment.ffprobe = _FFPROBE_BIN  # type: ignore[attr-defined]
 
 # --- Project config ---
 from config import (
@@ -62,6 +54,7 @@ from config import (
 
 # Supported formats
 VALID_AUDIO_EXTS = [".mp3", ".wav", ".ogg", ".aac", ".m4a", ".flac"]
+
 
 # Gliss always at 10% (independent of music volume)
 GLISS_VOLUME_PERCENT = 10
@@ -189,7 +182,7 @@ class SoundArchiveManager(QtCore.QObject):
 
 
 
-    # Names-only listing (newest first)
+    # Names-only listing (newest first by normal archive/file order)
     def list_archive(self) -> List[str]:
         names: List[str] = []
         if not self.dir_processed.exists():
@@ -198,6 +191,28 @@ class SoundArchiveManager(QtCore.QObject):
         for p in items:
             if p.is_file() and p.suffix.lower() == ".mp3":
                 names.append(p.name)
+        return names
+
+    def current_processed_name(self) -> str:
+        """Return the current processed archive filename from current.json, if valid."""
+        try:
+            if not self.current_manifest.exists():
+                return ""
+            data = json.loads(self.current_manifest.read_text(encoding="utf-8"))
+            rel = str(data.get("current_processed_rel") or data.get("current_rel") or "")
+            name = Path(rel).name if rel else ""
+            if name and (self.dir_processed / name).is_file():
+                return name
+        except Exception:
+            pass
+        return ""
+
+    def list_archive_for_display(self) -> List[str]:
+        """Current song first; all other songs remain in normal archive order."""
+        names = self.list_archive()
+        current = self.current_processed_name()
+        if current and current in names:
+            return [current] + [name for name in names if name != current]
         return names
 
     def add_song_from_path(self, source: Path) -> AddResult:
@@ -228,25 +243,30 @@ class SoundArchiveManager(QtCore.QObject):
 
         processed_name = Path(final_original_name).stem + ".mp3"
         processed_path = self.dir_processed / processed_name
+
         try:
-            audio = AudioSegment.from_file(str(source))
-            audio = effects.compress_dynamic_range(audio, threshold=-18.0, ratio=2.0, attack=5.0, release=50.0)
-            normalized = effects.normalize(audio)
-            tmp_mp3 = processed_path.with_suffix(".mp3.tmp")
-            normalized.export(tmp_mp3, format="mp3")
-            os.replace(tmp_mp3, processed_path)
+            _export_apple_safe_mp3(source, processed_path)
         except Exception as e:
-            if source.suffix.lower() == ".mp3":
-                try:
-                    _atomic_copy(source, processed_path)
-                except Exception as ee:
-                    return AddResult("error", final_original_name, None, incoming_size, f"Copy fallback failed: {ee!r}")
-            else:
-                return AddResult("error", final_original_name, None, incoming_size, f"Failed to normalize/export: {e!r}")
+            return AddResult(
+                "error",
+                final_original_name,
+                None,
+                incoming_size,
+                f"Failed to export Apple-safe MP3: {e}",
+            )
 
         # Set current (Windows-safe with short retries)
-        self._set_current_by_copy(processed_path)
-        self._write_manifest(processed_name, _file_size(processed_path))
+        try:
+            self._set_current_by_copy(processed_path)
+        except Exception as e:
+            return AddResult(
+                "error",
+                final_original_name,
+                processed_name,
+                incoming_size,
+                f"Failed to set current Apple-safe music: {e}",
+            )
+        self._write_manifest(processed_name, _file_size(processed_path), final_original_name)
 
         self.archive_changed.emit()
         self.current_changed.emit(processed_name)
@@ -263,7 +283,7 @@ class SoundArchiveManager(QtCore.QObject):
         if not src.exists():
             raise FileNotFoundError(f"Not in processed archive: {processed_filename}")
         self._set_current_by_copy(src)
-        self._write_manifest(processed_filename, _file_size(src))
+        self._write_manifest(processed_filename, _file_size(src), self._original_name_for_processed(processed_filename))
         self.current_changed.emit(processed_filename)
 
     def delete_processed(self, processed_filename: str) -> bool:
@@ -278,7 +298,7 @@ class SoundArchiveManager(QtCore.QObject):
         is_current = False
         try:
             data = json.loads(self.current_manifest.read_text(encoding="utf-8"))
-            current_rel = data.get("current_rel", "")
+            current_rel = data.get("current_processed_rel") or data.get("current_rel", "")
             expected_rel = f"{USER_SOUNDS_DIR}/appssong/processed/{processed_filename}"
             is_current = (current_rel == expected_rel)
         except Exception:
@@ -336,7 +356,7 @@ class SoundArchiveManager(QtCore.QObject):
         delay = 0.15
         for _ in range(tries):
             try:
-                _atomic_copy(src, dst)
+                _export_apple_safe_mp3(src, dst)
                 return
             except PermissionError:
                 if os.name == "nt":
@@ -353,8 +373,30 @@ class SoundArchiveManager(QtCore.QObject):
             "Is it open in another app or being previewed/synced?"
         )
 
-    def _write_manifest(self, processed_name: str, size: int) -> None:
+    def _original_name_for_processed(self, processed_name: str) -> str:
+        exact = self.dir_originals / processed_name
+        if exact.is_file():
+            return processed_name
+
+        stem = Path(processed_name).stem
+        try:
+            matches = [p for p in self.dir_originals.iterdir() if p.is_file() and p.stem == stem]
+        except Exception:
+            matches = []
+
+        for p in matches:
+            if p.suffix.lower() == ".mp3":
+                return p.name
+        if matches:
+            return sorted(matches, key=lambda p: p.name.lower())[0].name
+        return processed_name
+
+    def _write_manifest(self, processed_name: str, size: int, original_name: Optional[str] = None) -> None:
+        original_name = original_name or self._original_name_for_processed(processed_name)
         data = {
+            "current_original_rel": f"gallery/user/sounds/appssong/originals/{original_name}",
+            "current_processed_rel": f"gallery/user/sounds/appssong/processed/{processed_name}",
+            "current_live_rel": "gallery/user/sounds/music.mp3",
             "current_rel": f"gallery/user/sounds/appssong/processed/{processed_name}",
             "link_mode": "copy",
             "size": size,
@@ -488,59 +530,344 @@ class ConfirmDialog(QtWidgets.QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Archive dropdown (movable + clamped + names-only + delete mode)
+# Archive dropdown (movable + clamped + clickable song names + delete mode)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+class _ArchivePaintButton(QtWidgets.QWidget):
+    """
+    Custom-painted clickable control for the archive popup.
+
+    This intentionally does NOT inherit QPushButton.
+    Reason: global/app QPushButton:hover styles were overriding the archive text
+    paint state and making labels appear to vanish on hover/highlight.
+    """
+
+    clicked = QtCore.Signal()
+
+    def __init__(
+        self,
+        text: str,
+        *,
+        kind: str = "normal",
+        elide: bool = False,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._text = text
+        self._kind = kind
+        self._elide = elide
+        self._hover = False
+        self._pressed = False
+        self._active = False
+
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WA_Hover, True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setToolTip(text)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+        font = QtGui.QFont("Segoe UI", 9)
+        if kind in {"danger", "delete"}:
+            font.setWeight(QtGui.QFont.DemiBold)
+        self.setFont(font)
+
+        if kind == "danger":
+            self.setFixedSize(26, 26)
+        elif kind == "delete":
+            self.setFixedSize(74, 28)
+        elif kind == "song":
+            self.setFixedHeight(30)
+        else:
+            self.setFixedHeight(28)
+
+    def set_active(self, active: bool) -> None:
+        self._active = bool(active)
+        self.update()
+
+    def is_active(self) -> bool:
+        return self._active
+
+    def enterEvent(self, event: QtCore.QEvent) -> None:  # type: ignore[override]
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:  # type: ignore[override]
+        self._hover = False
+        self._pressed = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self._pressed = True
+            self.update()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            was_pressed = self._pressed
+            self._pressed = False
+            self.update()
+            if was_pressed and self.rect().contains(event.position().toPoint()):
+                self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:  # type: ignore[override]
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # type: ignore[override]
+        del event
+
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        radius = 8 if self._kind != "song" else 6
+
+        bg, border, fg = self._colors()
+
+        if bg.alpha() > 0:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(bg)
+            painter.drawRoundedRect(rect, radius, radius)
+
+        if border.alpha() > 0:
+            pen = QtGui.QPen(border)
+            pen.setWidth(1)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(rect, radius, radius)
+
+        painter.setPen(fg)
+        painter.setFont(self.font())
+
+        if self._kind == "danger":
+            text = self._text
+            align = Qt.AlignCenter
+            text_rect = rect
+        elif self._kind == "delete":
+            text = self._text
+            align = Qt.AlignCenter
+            text_rect = rect
+        else:
+            metrics = QtGui.QFontMetrics(self.font())
+            usable = max(20, rect.width() - 16)
+            text = metrics.elidedText(self._text, Qt.ElideRight, usable) if self._elide else self._text
+            align = Qt.AlignVCenter | Qt.AlignLeft
+            text_rect = rect.adjusted(8, 0, -8, 0)
+
+        painter.drawText(text_rect, align, text)
+
+    def _colors(self) -> Tuple[QtGui.QColor, QtGui.QColor, QtGui.QColor]:
+        if self._kind == "song":
+            bg = QtGui.QColor(0, 0, 0, 0)
+            border = QtGui.QColor(0, 0, 0, 0)
+            fg = QtGui.QColor("#e6e6e6")
+
+            if self._active:
+                # Current song: subtle, visible distinction without making the row loud.
+                bg = QtGui.QColor(0, 200, 255, 28)
+                border = QtGui.QColor(0, 200, 255, 92)
+                fg = QtGui.QColor("#dffaff")
+
+            if self._hover or self.hasFocus():
+                bg = QtGui.QColor(0, 200, 255, 54 if self._active else 46)
+                border = QtGui.QColor(0, 200, 255, 130 if self._active else 0)
+                fg = QtGui.QColor("#ffffff")
+
+            if self._pressed:
+                bg = QtGui.QColor(0, 200, 255, 82 if self._active else 72)
+                border = QtGui.QColor(0, 229, 255, 170 if self._active else 0)
+                fg = QtGui.QColor("#ffffff")
+
+            return bg, border, fg
+
+        if self._kind == "delete":
+            bg = QtGui.QColor("#1b1f2a")
+            border = QtGui.QColor(255, 77, 79, 140)
+            fg = QtGui.QColor("#ffd7d9")
+            if self._hover or self.hasFocus():
+                bg = QtGui.QColor("#3a1b20")
+                border = QtGui.QColor("#ff6b6d")
+                fg = QtGui.QColor("#ffffff")
+            if self._pressed:
+                bg = QtGui.QColor("#451e25")
+                border = QtGui.QColor("#ff7c7e")
+                fg = QtGui.QColor("#ffffff")
+            return bg, border, fg
+
+        if self._kind == "danger":
+            if self._active:
+                bg = QtGui.QColor("#2a171b")
+                border = QtGui.QColor("#ff4d4f")
+                fg = QtGui.QColor("#ffb8bd")
+                if self._hover or self.hasFocus():
+                    bg = QtGui.QColor("#3a1b20")
+                    border = QtGui.QColor("#ff6b6d")
+                    fg = QtGui.QColor("#ffffff")
+                if self._pressed:
+                    bg = QtGui.QColor("#451e25")
+                    border = QtGui.QColor("#ff7c7e")
+                    fg = QtGui.QColor("#ffffff")
+                return bg, border, fg
+
+            bg = QtGui.QColor("#1b1f2a")
+            border = QtGui.QColor("#2a2f3e")
+            fg = QtGui.QColor("#e6e6e6")
+            if self._hover or self.hasFocus():
+                bg = QtGui.QColor("#223040")
+                border = QtGui.QColor("#00c8ff")
+                fg = QtGui.QColor("#ffffff")
+            if self._pressed:
+                bg = QtGui.QColor("#182536")
+                border = QtGui.QColor("#00e5ff")
+                fg = QtGui.QColor("#ffffff")
+            return bg, border, fg
+
+        bg = QtGui.QColor("#1b1f2a")
+        border = QtGui.QColor("#2a2f3e")
+        fg = QtGui.QColor("#e6e6e6")
+        if self._hover or self.hasFocus():
+            bg = QtGui.QColor("#223040")
+            border = QtGui.QColor("#00c8ff")
+            fg = QtGui.QColor("#ffffff")
+        if self._pressed:
+            bg = QtGui.QColor("#182536")
+            border = QtGui.QColor("#00e5ff")
+            fg = QtGui.QColor("#ffffff")
+        return bg, border, fg
+
 
 class ArchiveDropdown(QtWidgets.QFrame):
     use_requested = QtCore.Signal(str)
     request_release = QtCore.Signal()  # ask parent to release player handle before file ops
+
+    _STYLE = """
+        QFrame#panel {
+            background: rgba(15,17,22,242);
+            border-radius: 12px;
+            border: 1px solid #2b3344;
+        }
+        QFrame#row {
+            background: #121520;
+            border: 1px solid #2b3344;
+            border-radius: 8px;
+        }
+        QLabel {
+            color: #dcdfe4;
+            background: transparent;
+        }
+        QScrollArea {
+            border: none;
+            background: transparent;
+        }
+        QScrollArea QWidget {
+            background: transparent;
+        }
+        QScrollBar:vertical {
+            background: transparent;
+            width: 5px;
+            margin: 2px 0 2px 0;
+        }
+        QScrollBar::handle:vertical {
+            background: rgba(255,255,255,42);
+            border-radius: 2px;
+            min-height: 24px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: rgba(0,200,255,90);
+        }
+        QScrollBar::add-line:vertical,
+        QScrollBar::sub-line:vertical {
+            height: 0px;
+            background: transparent;
+            border: none;
+        }
+        QScrollBar::add-page:vertical,
+        QScrollBar::sub-page:vertical {
+            background: transparent;
+        }
+        QScrollBar:horizontal {
+            height: 0px;
+            background: transparent;
+        }
+        QScrollBar::handle:horizontal,
+        QScrollBar::add-line:horizontal,
+        QScrollBar::sub-line:horizontal,
+        QScrollBar::add-page:horizontal,
+        QScrollBar::sub-page:horizontal {
+            height: 0px;
+            width: 0px;
+            background: transparent;
+            border: none;
+        }
+    """
 
     def __init__(self, mgr: SoundArchiveManager, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self._mgr = mgr
         self.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setMouseTracking(True)
+        self.setMinimumSize(520, 260)
+        self.resize(600, 360)
 
         self._delete_mode = False
         self._drag_offset = QtCore.QPoint(0, 0)
+        self._outside_filter_installed = False
+
+        # Auto-refresh sources:
+        # - manager signals after add/delete/current changes
+        # - QFileSystemWatcher catches direct filesystem changes while the app is open
+        # - show_at() still refreshes immediately before display
+        self._refresh_pending = False
+        self._watcher = QtCore.QFileSystemWatcher(self)
+        self._watcher.directoryChanged.connect(self._schedule_refresh)
+        self._watcher.fileChanged.connect(self._schedule_refresh)
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
 
-        panel = QtWidgets.QFrame(self)
-        panel.setObjectName("panel")
-        panel.setStyleSheet(
-            "#panel { background: rgba(15,17,22,240); border-radius: 12px; border: 1px solid #2b3344; }"
-            "QLabel { color: #dcdfe4; }"
-            "QScrollArea { border: none; background: transparent; }"
-            "QPushButton { background: #1b1f2a; border: 1px solid #2a2f3e; border-radius: 8px; padding: 5px 8px; color: #e6e6e6; }"
-            "QPushButton:hover { border-color: #00c8ff; }"
-        )
+        self._panel = QtWidgets.QFrame(self)
+        self._panel.setObjectName("panel")
+        self._panel.setStyleSheet(self._STYLE)
 
-        inner = QtWidgets.QVBoxLayout(panel)
+        inner = QtWidgets.QVBoxLayout(self._panel)
         inner.setContentsMargins(10, 10, 10, 10)
         inner.setSpacing(8)
 
         header = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("Archive")
         title.setStyleSheet("font-weight:600; font-size:14px;")
-        btn_refresh = QtWidgets.QPushButton("Refresh")
-        btn_refresh.setFixedHeight(26)
-        btn_refresh.clicked.connect(self.refresh)
 
-        self.btn_delete_mode = QtWidgets.QPushButton("–")
-        self.btn_delete_mode.setFixedSize(26, 26)
+        self.btn_delete_mode = _ArchivePaintButton("–", kind="danger", parent=self._panel)
         self.btn_delete_mode.setToolTip("Toggle delete mode")
         self.btn_delete_mode.clicked.connect(self._toggle_delete_mode)
 
         header.addWidget(title)
         header.addStretch(1)
         header.addWidget(self.btn_delete_mode)
-        header.addWidget(btn_refresh)
 
         self._scroll = QtWidgets.QScrollArea()
         self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.viewport().setAutoFillBackground(False)
+
         self._list_holder = QtWidgets.QWidget()
+        self._list_holder.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum)
         self._list_layout = QtWidgets.QVBoxLayout(self._list_holder)
         self._list_layout.setContentsMargins(0, 0, 0, 0)
         self._list_layout.setSpacing(6)
@@ -548,7 +875,7 @@ class ArchiveDropdown(QtWidgets.QFrame):
 
         inner.addLayout(header)
         inner.addWidget(self._scroll, 1)
-        outer.addWidget(panel)
+        outer.addWidget(self._panel)
 
         self._opacity = QtWidgets.QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(self._opacity)
@@ -557,8 +884,64 @@ class ArchiveDropdown(QtWidgets.QFrame):
         self._anim.setStartValue(0.0)
         self._anim.setEndValue(1.0)
 
-        self._mgr.archive_changed.connect(self.refresh)
+        self._mgr.archive_changed.connect(self._schedule_refresh)
+        self._mgr.current_changed.connect(self._schedule_refresh)
+        self._setup_auto_refresh()
         self.refresh()
+
+    def _setup_auto_refresh(self) -> None:
+        self._ensure_watched_paths()
+
+    def _ensure_watched_paths(self) -> None:
+        paths: list[str] = []
+        for p in (
+            self._mgr.dir_processed,
+            self._mgr.dir_originals,
+            self._mgr.current_manifest.parent,
+            self._mgr.current_manifest,
+        ):
+            try:
+                if p.exists():
+                    paths.append(str(p.resolve()))
+            except Exception:
+                pass
+
+        current = set(self._watcher.files()) | set(self._watcher.directories())
+        wanted = set(paths)
+
+        # Drop dead watches; QFileSystemWatcher can silently lose file watches
+        # after atomic replace/delete, so rebuild the set conservatively.
+        stale = [p for p in current if p not in wanted]
+        if stale:
+            try:
+                self._watcher.removePaths(stale)
+            except Exception:
+                pass
+
+        missing = [p for p in paths if p not in current]
+        if missing:
+            try:
+                self._watcher.addPaths(missing)
+            except Exception:
+                for p in missing:
+                    try:
+                        self._watcher.addPath(p)
+                    except Exception:
+                        pass
+
+    def _schedule_refresh(self, *_args) -> None:
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+        QtCore.QTimer.singleShot(60, self._run_scheduled_refresh)
+
+    def _run_scheduled_refresh(self) -> None:
+        self._refresh_pending = False
+        self._ensure_watched_paths()
+        self.refresh()
+
+    def sizeHint(self) -> QtCore.QSize:  # type: ignore[override]
+        return QtCore.QSize(600, 360)
 
     def _available_geom_at(self, global_pos: QtCore.QPoint) -> QtCore.QRect:
         screen = QtGui.QGuiApplication.screenAt(global_pos)
@@ -568,17 +951,72 @@ class ArchiveDropdown(QtWidgets.QFrame):
 
     def _clamp_to_screen(self, pos: QtCore.QPoint) -> QtCore.QPoint:
         geom = self._available_geom_at(pos)
-        w, h = self.sizeHint().width(), self.sizeHint().height()
+        hint = self.sizeHint()
+        w = max(self.width(), hint.width())
+        h = max(self.height(), hint.height())
         x = max(geom.left(), min(pos.x(), geom.right() - w))
         y = max(geom.top(),  min(pos.y(), geom.bottom() - h))
         return QtCore.QPoint(x, y)
 
+    def _install_outside_filter(self) -> None:
+        if self._outside_filter_installed:
+            return
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+            self._outside_filter_installed = True
+
+    def _remove_outside_filter(self) -> None:
+        if not self._outside_filter_installed:
+            return
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            try:
+                app.removeEventFilter(self)
+            except Exception:
+                pass
+        self._outside_filter_installed = False
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:  # type: ignore[override]
+        if not self.isVisible():
+            return False
+
+        et = event.type()
+        if et == QtCore.QEvent.KeyPress:
+            try:
+                if event.key() == Qt.Key_Escape:  # type: ignore[attr-defined]
+                    self.hide()
+                    return True
+            except Exception:
+                return False
+
+        if et in (QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseButtonDblClick):
+            try:
+                global_pos = event.globalPosition().toPoint()  # type: ignore[attr-defined]
+            except Exception:
+                try:
+                    global_pos = QtGui.QCursor.pos()
+                except Exception:
+                    return False
+
+            if not self.frameGeometry().contains(global_pos):
+                self.hide()
+                return False
+
+        return False
+
     def show_at(self, global_pos: QtCore.QPoint) -> None:
+        self.refresh()
         p = self._clamp_to_screen(global_pos)
         self.move(p)
         self._opacity.setOpacity(0.0)
         super().show()
+        self._install_outside_filter()
         self._anim.start()
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:  # type: ignore[override]
+        self._remove_outside_filter()
+        super().hideEvent(event)
 
     def mousePressEvent(self, e: QtGui.QMouseEvent) -> None:
         if e.button() == Qt.LeftButton:
@@ -596,48 +1034,67 @@ class ArchiveDropdown(QtWidgets.QFrame):
             super().mouseMoveEvent(e)
 
     def refresh(self) -> None:
+        self._ensure_watched_paths()
+
         while self._list_layout.count():
             item = self._list_layout.takeAt(0)
             w = item.widget()
             if w:
                 w.deleteLater()
 
-        for name in self._mgr.list_archive():
-            self._list_layout.addWidget(self._make_row(name))
+        names = self._mgr.list_archive_for_display()
+        current = self._mgr.current_processed_name()
+        if not names:
+            empty = QtWidgets.QLabel("No archived music yet.")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setStyleSheet("color:#8f98a8; padding:18px;")
+            self._list_layout.addWidget(empty)
+        else:
+            for name in names:
+                self._list_layout.addWidget(self._make_row(name, is_current=(name == current)))
+
         self._list_layout.addStretch(1)
 
     def _toggle_delete_mode(self) -> None:
         self._delete_mode = not self._delete_mode
-        self.btn_delete_mode.setStyleSheet("QPushButton { border-color:#ff4d4f; }" if self._delete_mode else "")
+        self.btn_delete_mode.set_active(self._delete_mode)
         self.refresh()
 
-    def _make_row(self, name: str) -> QtWidgets.QWidget:
+    def _make_row(self, name: str, *, is_current: bool = False) -> QtWidgets.QWidget:
         row = QtWidgets.QFrame()
         row.setObjectName("row")
-        row.setStyleSheet("#row { background: #121520; border: 1px solid #2b3344; border-radius: 8px; }")
+        row.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+        if is_current:
+            row.setStyleSheet(
+                "QFrame#row { "
+                "background: rgba(0, 200, 255, 18); "
+                "border: 1px solid rgba(0, 200, 255, 82); "
+                "border-radius: 8px; "
+                "}"
+            )
+
         h = QtWidgets.QHBoxLayout(row)
-        h.setContentsMargins(8, 6, 8, 6)
-        h.setSpacing(8)
+        h.setContentsMargins(6, 5, 6, 5)
+        h.setSpacing(6)
 
-        lbl_name = QtWidgets.QLabel(name)
-        lbl_name.setToolTip(name)
-
-        btn_use = QtWidgets.QPushButton("Use")
-        btn_use.setFixedHeight(26)
-        btn_use.clicked.connect(lambda: self.use_requested.emit(name))
-
-        h.addWidget(lbl_name, 1)
+        btn_name = _ArchivePaintButton(name, kind="song", elide=True, parent=row)
+        btn_name.set_active(is_current)
+        if is_current:
+            btn_name.setToolTip(f"Current song: {name}")
+        btn_name.clicked.connect(lambda n=name: self._select_song(n))
+        h.addWidget(btn_name, 1)
 
         if self._delete_mode:
-            btn_del = QtWidgets.QPushButton("× Delete")
-            btn_del.setFixedHeight(26)
-            btn_del.setStyleSheet("QPushButton { border-color:#ff4d4f; }")
-            btn_del.clicked.connect(lambda: self._confirm_delete(name))
+            btn_del = _ArchivePaintButton("Delete", kind="delete", parent=row)
+            btn_del.clicked.connect(lambda n=name: self._confirm_delete(n))
             h.addWidget(btn_del, 0)
 
-        h.addStretch(1)
-        h.addWidget(btn_use, 0)
         return row
+
+    def _select_song(self, name: str) -> None:
+        self.use_requested.emit(name)
+        self.hide()
 
     def _confirm_delete(self, name: str) -> None:
         dlg = ConfirmDialog(f"Are you sure you want to remove “{name}” from archive?", self)
@@ -646,7 +1103,8 @@ class ArchiveDropdown(QtWidgets.QFrame):
             ok = self._mgr.delete_processed(name)
             if not ok:
                 QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Delete failed.")
-            self.refresh()
+            else:
+                self._schedule_refresh()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -819,7 +1277,9 @@ class SoundTab(QtWidgets.QWidget):
         self._preview = SoundPreviewWidget(self.wave.player, parent=self)
         self._archive_mgr.current_changed.connect(self._on_current_changed)
 
-        # Analysis manager (override its default dirs to appssong paths)
+        # Analysis manager. The project archive lives under:
+        #   gallery/user/sounds/appssong/{processed,analysis}
+        # Keep this explicit so analysis never drifts back to the old archive path.
         self._analysis = AudioAnalysisManager(self.project_root, parent=self) if AudioAnalysisManager is not None else None
         self._analysis_bootstrapped = False
         self._current_processed = ""
@@ -827,9 +1287,10 @@ class SoundTab(QtWidgets.QWidget):
 
         if self._analysis is not None:
             try:
-                self._analysis.ensure_analyzed(stable, priority=True)
-
-                _user_archive_analysis(self.project_root).mkdir(parents=True, exist_ok=True)
+                self._analysis.processed_dir = _user_archive_processed(self.project_root)
+                self._analysis.analysis_dir = _user_archive_analysis(self.project_root)
+                self._analysis.processed_dir.mkdir(parents=True, exist_ok=True)
+                self._analysis.analysis_dir.mkdir(parents=True, exist_ok=True)
             except Exception:
                 pass
 
@@ -885,98 +1346,151 @@ class SoundTab(QtWidgets.QWidget):
 
         if (self._analysis is not None) and (not self._analysis_bootstrapped):
             self._analysis_bootstrapped = True
+            # Do not sweep/analyze every archived song just because the tab opened.
+            # The current track is primed on demand, and cached tracks load instantly.
             try:
-                self.status.setText("⏳ Building audio analysis cache…")
-            except Exception:
-                pass
-
-            # Kick sweep
-            try:
-                self._analysis.enqueue_missing()
-            except Exception:
-                pass
-
-            try:
+                self._prime_analysis_for_current()
                 if not self._analysis.is_busy():
                     self.status.setText("Audio cache ready.")
             except Exception:
                 pass
 
     def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(14)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(10)
 
-        header = QHBoxLayout()
+        # Centered compact control card. The preview is owned by Nexus;
+        # this card is intentionally narrow so the Sound tab does not sprawl.
+        center_row = QHBoxLayout()
+        center_row.setContentsMargins(0, 0, 0, 0)
+        center_row.setSpacing(0)
+        center_row.addStretch(1)
+
+        self.sound_card = QtWidgets.QFrame(self)
+        self.sound_card.setObjectName("soundControlCard")
+        self.sound_card.setFixedWidth(620)
+        self.sound_card.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Maximum)
+        self.sound_card.setStyleSheet(
+            "QFrame#soundControlCard {"
+            " background:#151821;"
+            " border:1px solid #2b3344;"
+            " border-radius:14px;"
+            "}"
+            "QLabel#soundTitle {"
+            " color:#e6f7ff;"
+            " font-size:18px;"
+            " font-weight:800;"
+            " letter-spacing:0.5px;"
+            "}"
+            "QLabel#soundVolumeLabel {"
+            " color:#b0e0e6;"
+            " font-weight:700;"
+            "}"
+            "QLabel#soundVolumeValue {"
+            " background:#222936;"
+            " border:1px solid #3a4558;"
+            " border-radius:7px;"
+            " padding:3px 8px;"
+            " color:#e6e6e6;"
+            "}"
+            "QPushButton {"
+            " background:#1e2230;"
+            " border:1px solid #2f3a4d;"
+            " border-radius:9px;"
+            " color:#e6e6e6;"
+            " padding:7px 14px;"
+            " min-height:22px;"
+            "}"
+            "QPushButton:hover {"
+            " border-color:#00c8ff;"
+            " background:#232b3a;"
+            "}"
+            "QPushButton:pressed {"
+            " background:#10141d;"
+            "}"
+        )
+
+        card = QVBoxLayout(self.sound_card)
+        card.setContentsMargins(24, 18, 24, 20)
+        card.setSpacing(14)
+
         title = QLabel("Sound")
-        title.setStyleSheet("font-weight:600; font-size:14px;")
+        title.setObjectName("soundTitle")
+        title.setAlignment(Qt.AlignCenter)
+        card.addWidget(title)
+
+        top_buttons = QHBoxLayout()
+        top_buttons.setSpacing(12)
+        top_buttons.addStretch(1)
+
         self.btn_archive = QPushButton("Archive")
         self.btn_archive.setObjectName("btn_sound_archive")
-        self.btn_archive.setFixedHeight(26)
+        self.btn_archive.setFixedHeight(34)
+        self.btn_archive.setMinimumWidth(126)
         self.btn_archive.setCursor(Qt.PointingHandCursor)
-        self.btn_archive.setStyleSheet(
-            "QPushButton#btn_sound_archive { background:#1e2230; border:1px solid #2b3344; "
-            "border-radius: 8px; color:#e6e6e6; padding: 3px 10px; }"
-            "QPushButton#btn_sound_archive:hover { border-color:#00c8ff; }"
-        )
+
+        self.add_btn = QPushButton("🎵 Add Music")
+        self.add_btn.setFixedHeight(34)
+        self.add_btn.setMinimumWidth(144)
+        self.add_btn.setCursor(Qt.PointingHandCursor)
+
+        top_buttons.addWidget(self.btn_archive, 0)
+        top_buttons.addWidget(self.add_btn, 0)
+        top_buttons.addStretch(1)
+        card.addLayout(top_buttons)
+
         self._dropdown = ArchiveDropdown(self._archive_mgr, parent=self)
         self.btn_archive.clicked.connect(self._open_archive_dropdown)
         self._dropdown.request_release.connect(self.wave.release_current_file_handle)
 
-        header.addWidget(title, 1)
-        header.addWidget(self.btn_archive, 0)
-        layout.addLayout(header)
+        volume_label = QLabel("Volume")
+        volume_label.setObjectName("soundVolumeLabel")
+        volume_label.setAlignment(Qt.AlignCenter)
+        card.addWidget(volume_label)
 
         vol_row = QHBoxLayout()
         vol_row.setSpacing(10)
-
-        lbl_vol = QLabel("Volume")
-        lbl_vol.setStyleSheet("QLabel{color:#b0e0e6; font-weight:600;}")
+        vol_row.addStretch(1)
 
         self.vol_slider = QSlider(Qt.Horizontal)
         self.vol_slider.setRange(0, 100)
         init_percent = int(round(self.wave._music_volume * 100))
         self.vol_slider.setValue(init_percent)
-        self.vol_slider.setFixedWidth(260)
+        self.vol_slider.setFixedWidth(360)
         self.vol_slider.setStyleSheet(
-            "QSlider::groove:horizontal { height:6px; background:#333; border-radius:3px; }"
-            "QSlider::handle:horizontal { width:14px; height:14px; margin:-5px 0; "
-            "background:#00b2b2; border:1px solid #089; border-radius:7px; }"
+            "QSlider::groove:horizontal { height:7px; background:#303744; border-radius:3px; }"
+            "QSlider::handle:horizontal { width:16px; height:16px; margin:-5px 0; "
+            "background:#00b2b2; border:1px solid #089; border-radius:8px; }"
             "QSlider::sub-page:horizontal { background:#0aa; border-radius:3px; }"
         )
 
         self.vol_value = QLabel(f"{init_percent}%")
-        self.vol_value.setMinimumWidth(40)
+        self.vol_value.setObjectName("soundVolumeValue")
+        self.vol_value.setMinimumWidth(48)
         self.vol_value.setAlignment(Qt.AlignCenter)
-        self.vol_value.setStyleSheet(
-            "QLabel{background:#222; border:1px solid #444; border-radius:6px; padding:2px 6px;}"
-        )
 
-        vol_row.addWidget(lbl_vol, 0)
         vol_row.addWidget(self.vol_slider, 0)
         vol_row.addWidget(self.vol_value, 0)
         vol_row.addStretch(1)
-        layout.addLayout(vol_row)
+        card.addLayout(vol_row)
 
-        btn_row1 = QHBoxLayout()
-        btn_row1.setSpacing(12)
-        self.add_btn = QPushButton("🎵 Add Music")
-        self.open_btn = QPushButton("📂 Open Sounds Folder")
-        btn_row1.addWidget(self.add_btn)
-        btn_row1.addWidget(self.open_btn)
-        btn_row1.addStretch(1)
-        layout.addLayout(btn_row1)
+        playback_row = QHBoxLayout()
+        playback_row.setSpacing(12)
+        playback_row.addStretch(1)
 
-        btn_row2 = QHBoxLayout()
-        btn_row2.setSpacing(12)
         self.playpause_btn = QPushButton("▶️ Play")
         self.startover_btn = QPushButton("⏮️ Start Over")
         self.mute_btn = QPushButton("🔇 Mute")
-        btn_row2.addWidget(self.playpause_btn)
-        btn_row2.addWidget(self.startover_btn)
-        btn_row2.addWidget(self.mute_btn)
-        btn_row2.addStretch(1)
-        layout.addLayout(btn_row2)
+
+        for btn in (self.playpause_btn, self.startover_btn, self.mute_btn):
+            btn.setFixedHeight(36)
+            btn.setMinimumWidth(124)
+            btn.setCursor(Qt.PointingHandCursor)
+            playback_row.addWidget(btn, 0)
+
+        playback_row.addStretch(1)
+        card.addLayout(playback_row)
 
         self.analysis_progress = QtWidgets.QProgressBar()
         self.analysis_progress.setRange(0, 100)
@@ -989,19 +1503,24 @@ class SoundTab(QtWidgets.QWidget):
             "QProgressBar::chunk { background:#00c8ff; border-radius:6px; }"
         )
         self.analysis_progress.hide()
-        layout.addWidget(self.analysis_progress)
+        card.addWidget(self.analysis_progress)
 
         self.status = QLabel()
         self.status.setWordWrap(True)
-        self.status.setAlignment(Qt.AlignLeft)
+        self.status.setAlignment(Qt.AlignCenter)
         self.status.setFont(QtGui.QFont("Consolas", 10))
         self.status.setStyleSheet(
-            "QLabel { background-color: #111; color: #bbb; border-top: 1px solid #00d0ff; padding: 8px; }"
+            "QLabel { background-color:#10131a; color:#bbb; border:1px solid #242c3a; "
+            "border-radius:8px; padding:8px; }"
         )
-        layout.addWidget(self.status)
+        card.addWidget(self.status)
+
+        center_row.addWidget(self.sound_card, 0, Qt.AlignTop | Qt.AlignHCenter)
+        center_row.addStretch(1)
+        root.addLayout(center_row)
+        root.addStretch(1)
 
         self.add_btn.clicked.connect(self.select_music)
-        self.open_btn.clicked.connect(self.open_sounds_folder)
         self.playpause_btn.clicked.connect(self.play_pause_audio)
         self.startover_btn.clicked.connect(self.startover_audio)
         self.mute_btn.clicked.connect(self.toggle_mute)
@@ -1015,14 +1534,12 @@ class SoundTab(QtWidgets.QWidget):
 
     def _open_archive_dropdown(self):
         gp = self.btn_archive.mapToGlobal(QtCore.QPoint(0, self.btn_archive.height()))
-        self._dropdown.refresh()
         self._dropdown.show_at(gp)
 
     def _init_shortcuts(self) -> None:
         QtGui.QShortcut(QtGui.QKeySequence(Qt.Key_Space), self, activated=self.play_pause_audio)
         QtGui.QShortcut(QtGui.QKeySequence(Qt.Key_M), self, activated=self.toggle_mute)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+L"), self, activated=self.select_music)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+O"), self, activated=self.open_sounds_folder)
 
     # ─────────────────────────────────────────────────────────────────────
     # Stable path policy (preview + analysis use same stable path)
@@ -1033,7 +1550,7 @@ class SoundTab(QtWidgets.QWidget):
             if not manifest.exists():
                 return ""
             data = json.loads(manifest.read_text(encoding="utf-8"))
-            rel = str(data.get("current_rel", ""))
+            rel = str(data.get("current_processed_rel") or data.get("current_rel") or "")
             return Path(rel).name if rel else ""
         except Exception:
             return ""
@@ -1041,23 +1558,109 @@ class SoundTab(QtWidgets.QWidget):
     def _processed_path_for(self, processed_filename: str) -> Path:
         return _user_archive_processed(self.project_root) / processed_filename
 
+    def _resolve_manifest_path(self, rel_or_path: str) -> Optional[Path]:
+        rel_or_path = str(rel_or_path or "").strip()
+        if not rel_or_path:
+            return None
+        p = Path(rel_or_path)
+        if not p.is_absolute():
+            p = self.project_root / p
+        return p.resolve()
+
+    def _read_current_original_from_manifest(self) -> str:
+        """
+        Return the current original archive filename/path from current.json.
+        Prefer current_original_rel.
+        Fall back to current_processed_rel/current_rel only for old manifests.
+        """
+        try:
+            manifest = _user_current_manifest(self.project_root)
+            if not manifest.exists():
+                return ""
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            return str(
+                data.get("current_original_rel")
+                or data.get("current_processed_rel")
+                or data.get("current_rel")
+                or ""
+            )
+        except Exception:
+            return ""
+
+    def _original_path_for_processed(self, processed_filename: str) -> Optional[Path]:
+        if not processed_filename:
+            return None
+
+        originals = _user_archive_originals(self.project_root)
+        exact = originals / processed_filename
+        if exact.is_file():
+            return exact.resolve()
+
+        stem = Path(processed_filename).stem
+        try:
+            matches = [p for p in originals.iterdir() if p.is_file() and p.stem == stem]
+        except Exception:
+            matches = []
+
+        for p in matches:
+            if p.suffix.lower() == ".mp3":
+                return p.resolve()
+        if matches:
+            return sorted(matches, key=lambda p: p.name.lower())[0].resolve()
+        return None
+
+    def _current_original_path_for_preview(self) -> Optional[Path]:
+        """
+        Resolve the current original song path from the manifest.
+        Normal expected path:
+            gallery/user/sounds/appssong/originals/<song>.mp3
+        """
+        rel = self._read_current_original_from_manifest()
+        p = self._resolve_manifest_path(rel)
+        if p is not None and p.is_file() and "originals" in p.parts:
+            return p
+
+        if self._current_processed:
+            p = self._original_path_for_processed(self._current_processed)
+            if p is not None and p.is_file():
+                return p
+
+        processed_name = self._read_current_processed_from_manifest()
+        if processed_name:
+            p = self._original_path_for_processed(processed_name)
+            if p is not None and p.is_file():
+                return p
+
+        return None
+
     def _stable_audio_path_for_preview(self) -> Optional[Path]:
         """
-        Rule:
-          - If we have a processed archive filename and it exists, use it.
-          - Else fall back to gallery/user/sounds/music.mp3
+        Priority:
+          1. gallery/user/sounds/appssong/originals/<current song>.mp3
+          2. gallery/user/sounds/appssong/processed/<current song>.mp3
+          3. gallery/user/sounds/music.mp3
         """
+        p0 = self._current_original_path_for_preview()
+        if p0 is not None and p0.exists():
+            return p0
+
         if self._current_processed:
             p = self._processed_path_for(self._current_processed)
             if p.exists():
-                return p
+                return p.resolve()
+
+        processed_name = self._read_current_processed_from_manifest()
+        if processed_name:
+            p = self._processed_path_for(processed_name)
+            if p.exists():
+                return p.resolve()
 
         p2 = _user_current_music(self.project_root)
         if p2.exists():
-            return p2
+            return p2.resolve()
         return None
 
-    def _push_analysis_payload(self, payload: dict) -> None:
+    def _push_analysis_payload(self, payload: Optional[dict]) -> None:
         try:
             self._preview.set_analysis_payload(payload)
         except Exception:
@@ -1074,24 +1677,43 @@ class SoundTab(QtWidgets.QWidget):
 
         stable = self._stable_audio_path_for_preview()
         if stable is None or not stable.exists():
+            print("[Sound] Preview source missing.")
             return
 
-        key = str(stable.resolve())
+        stable = stable.resolve()
+        key = str(stable)
         self._current_analysis_key = key
 
-        # Apply cached instantly
         try:
-            cached = self._analysis.load_cached(stable)
-            if cached is not None:
-                self._push_analysis_payload(cached)
+            original = self._current_original_path_for_preview()
+            if original is not None:
+                print(f"[Sound] Current original: {original.resolve()}")
         except Exception:
             pass
 
-        # Ensure analysis exists in background
+        print(f"[Sound] Playback source: {_user_current_music(self.project_root).resolve()}")
+        print(f"[Sound] Preview source: {stable}")
+        print(f"[Sound] Analysis source: {stable}")
+
         try:
-            self._analysis.ensure_analyzed(stable, priority=True)
+            cache_path = self._analysis.analysis_file_for_debug(stable)
+            print(f"[Sound] Analysis cache path: {cache_path}")
         except Exception:
             pass
+
+        cached = self._analysis.load_cached(stable)
+        print(f"[Sound] Cache loaded: {'yes' if cached is not None else 'no'}")
+
+        if cached is not None:
+            self._push_analysis_payload(cached)
+        else:
+            self._push_analysis_payload(None)
+
+        print(f"[Sound] Analysis started: {stable}")
+        try:
+            self._analysis.ensure_analyzed(stable, priority=True)
+        except Exception as e:
+            print(f"[Sound] Analysis failed: {stable} | {e!r}")
 
     # ─────────────────────────────────────────────────────────────────────
     # Analysis callbacks
@@ -1133,14 +1755,23 @@ class SoundTab(QtWidgets.QWidget):
 
     def _on_analysis_ready(self, path_key: str, payload: dict) -> None:
         try:
-            if self._current_analysis_key and (str(path_key) == self._current_analysis_key):
+            print(f"[Sound] Analysis ready: {path_key}")
+            if self._current_analysis_key and str(path_key) == self._current_analysis_key:
                 self._push_analysis_payload(payload)
-        except Exception:
-            pass
+                self.status.setText("Audio analysis ready.")
+            else:
+                print(f"[Sound] Ignored analysis payload. Current key: {self._current_analysis_key}")
+        except Exception as e:
+            print(f"[Sound] Analysis ready handler failed: {e!r}")
 
-    def _on_analysis_failed(self, _path_key: str, msg: str) -> None:
+    def _on_analysis_failed(self, path_key: str, msg: str) -> None:
+        print(f"[Sound] Analysis failed: {path_key} | {msg}")
         try:
-            self.status.setText(f"⚠️ Analysis failed: {msg}")
+            if self._current_analysis_key and (str(path_key) == self._current_analysis_key):
+                self._push_analysis_payload(None)
+            # Playback and analysis are separate systems. Qt may play a file even
+            # when the offline analyzer cannot decode it. Do not stop playback.
+            self.status.setText(f"⚠️ Analysis failed: {msg}\nPlayback can still continue.")
         except Exception:
             pass
 
@@ -1176,7 +1807,6 @@ class SoundTab(QtWidgets.QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Archive Error", str(e))
             return
-        self._on_current_changed(processed_filename)
 
     # ─────────────────────────────────────────────────────────────────────
     # Volume
@@ -1248,9 +1878,18 @@ class SoundTab(QtWidgets.QWidget):
         self.status.setText("⏮️ Start over.")
 
     def toggle_mute(self):
+        """Mute/unmute audio output without pausing playback or changing position."""
         muted = self.wave.toggle_mute()
         self.mute_btn.setText("🔊 Unmute" if muted else "🔇 Mute")
-        self.update_status()
+
+        # Mute must not alter the play/pause state. Keep the visible playback
+        # button synced to the actual QMediaPlayer state.
+        if self.wave.is_playing():
+            self.playpause_btn.setText("⏸️ Pause")
+            self.status.setText("🔇 Muted — playback continues." if muted else "🎧 Playing")
+        else:
+            self.playpause_btn.setText("▶️ Play")
+            self.status.setText("🔇 Muted." if muted else "Audio unmuted.")
 
     def open_sounds_folder(self):
         _open_folder(self.project_root / USER_SOUNDS_DIR)
@@ -1289,6 +1928,15 @@ class SoundTab(QtWidgets.QWidget):
         except Exception as e:
             self.status.setText(f"❌ Failed to process audio: {e}")
             QMessageBox.critical(self, "Conversion Error", str(e))
+            return
+
+        if res.action == "error":
+            self.status.setText(f"❌ {res.message}")
+            QMessageBox.critical(self, "Audio Import Error", res.message)
+            return
+
+        if res.action == "canceled":
+            self.status.setText("Import canceled.")
             return
 
         # Playback always points to live music.mp3

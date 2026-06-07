@@ -4,8 +4,7 @@
 """
 Letter Smith — Application Entry Point (Clean, Non-Legacy)
 
-This file is intentionally boring.
-It exists to:
+This file exists to:
   1) Put the process in a known-good execution state (root, sys.path).
   2) Bring up Qt safely (one QApplication, proper app identity, icon).
   3) Make crashes impossible to miss (console traceback + modal dialog).
@@ -16,9 +15,6 @@ What does NOT belong here:
   - Asset processing / base64 packing / build automation
   - Any filesystem mutation beyond "set CWD" and reading settings
 
-If you ever feel tempted to add "just one more helper" here:
-  - Put it in the module that owns the feature.
-  - Keep this entrypoint as pure orchestration.
 """
 
 from __future__ import annotations
@@ -159,6 +155,18 @@ def setup_logging(settings: dict) -> None:
     )
 
 
+def configure_qt_logging() -> None:
+    """
+    Suppress verbose QtMultimedia FFmpeg backend probe logs.
+
+    Real media failures should be reported by the app, not raw backend dumps.
+    """
+    try:
+        QtCore.QLoggingCategory.setFilterRules("qt.multimedia.ffmpeg*=false")
+    except Exception:
+        pass
+
+
 def log_startup(root: Path, icon: Optional[Path], settings: dict) -> None:
     """
     One clean startup banner.
@@ -217,6 +225,8 @@ def pick_icon(root: Path, settings: dict) -> Optional[Path]:
         root / "gallery" / "icon" / "LSmith.ico",
         root / "gallery" / "icons" / "LSmith.ico",
         root / "gallery" / "icons" / "ls-icon.ico",
+        root / "gallery" / "app" / "icons" / "folder" / "LSmith.ico",
+        root / "gallery" / "app" / "icons" / "folder" / "LSmith.png",
     )
 
     for p in candidates:
@@ -286,9 +296,20 @@ def install_exception_hook(app_name: str) -> None:
       - User gets a minimal modal dialog
     """
     def _hook(exc_type, exc, tb) -> None:
-        # Let Ctrl+C behave normally in terminals/IDEs.
-        if exc_type is KeyboardInterrupt:
-            raise exc
+        # Normal close / IDE stop should not be treated as a crash.
+        try:
+            is_interrupt = issubclass(exc_type, KeyboardInterrupt)
+        except Exception:
+            is_interrupt = exc_type is KeyboardInterrupt
+
+        if is_interrupt:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                try:
+                    app.quit()
+                except Exception:
+                    pass
+            return
 
         trace = "".join(traceback.format_exception(exc_type, exc, tb))
         logging.error("[Crash] Unhandled exception:")
@@ -336,6 +357,7 @@ def main() -> None:
 
     settings = load_settings(root)
     setup_logging(settings)
+    configure_qt_logging()
 
     icon = pick_icon(root, settings)
     log_startup(root, icon, settings)
@@ -357,6 +379,11 @@ def main() -> None:
 
     win = Nexus(root)
     win.show()
+
+    try:
+        app.aboutToQuit.connect(win.shutdown)
+    except Exception:
+        pass
 
     # Control transfers to Qt; this call blocks until the app exits.
     sys.exit(app.exec())

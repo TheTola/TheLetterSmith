@@ -1,35 +1,23 @@
-# ===============================
-# File: command.py
-# Purpose: Erase/Reset command for eLetter
-#
-# Fixes:
-# 1) Recipient/title not clearing (UI + settings)
-# 2) Music still plays after erase (WaveHandler player not parented + archive manifest fallback)
-#
-# Guarantees after reset:
-# - settings.json:
-#     recipient_name = ""
-#     recipient_title = ""
-#     music_file = ""
-#     last_audio = "none"
-#     starting_volume = 50
-#     music_volume = 50
-# - deletes:
-#     gallery/user/sounds/music.mp3
-#     gallery/sounds/music.mp3   (if it exists in your build)
-#     gallery/user/sounds/appssong/current.json   (critical)
-# - does NOT delete:
-#     glissando.mp3
-#     flip1..flip10.mp3
-#     appssong/originals, processed, analysis
-# ===============================
+# command.py
+"""
+Reset controller for Letter Smith.
+
+The Command tab performs the app's destructive current-letter reset. It clears
+current user page images, the active message folder, selected music, live tab
+state, Prompt Writer state, and active editor state while preserving saved
+letters and app-owned sound effects. After every reset, the canonical blank
+message.html is restored from gallery/app/pages/Emessage.docx through
+message_html.ensure_message_html_from_emessage().
+
+The public entry points are CommandTab, confirm_and_reset(), and
+reset_everything().
+"""
 
 from __future__ import annotations
 
 import json
-import os
-import sys
 import shutil
+import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -42,28 +30,19 @@ __all__ = [
     "reset_everything",
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config (prefer real project config; safe fallbacks)
-# ─────────────────────────────────────────────────────────────────────────────
-try:
-    from config import (
-        SETTINGS_FILE,
-        USER_PAGES_DIR,
-        USER_MESSAGE_DIR,
-        USER_SOUNDS_DIR,
-        MUSIC_FILE,
-    )
-except Exception:
-    SETTINGS_FILE = "settings.json"
-    USER_PAGES_DIR = "gallery/user/pages"
-    USER_MESSAGE_DIR = "gallery/user/message"
-    USER_SOUNDS_DIR = "gallery/user/sounds"
-    MUSIC_FILE = "music.mp3"
+from config import (
+    SETTINGS_FILE,
+    PUBLISHED_PAGE_URL_KEY,
+    CURTAIN_STYLE_KEY,
+    CURTAIN_STYLE_WHITE,
+    USER_PAGES_DIR,
+    USER_MESSAGE_DIR,
+    USER_SOUNDS_DIR,
+    MESSAGE_HTML_FILE,
+    MUSIC_FILE,
+)
+from message_html import ensure_message_html_from_emessage
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Root resolver
-# ─────────────────────────────────────────────────────────────────────────────
 def app_root() -> Path:
     base = getattr(sys, "_MEIPASS", None)
     if base:
@@ -78,10 +57,6 @@ def app_root() -> Path:
             return up
     return here.parent
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# File helpers
-# ─────────────────────────────────────────────────────────────────────────────
 def _safe_clear_dir_contents(dir_path: Path) -> Tuple[int, int]:
     files_deleted = 0
     dirs_deleted = 0
@@ -101,7 +76,6 @@ def _safe_clear_dir_contents(dir_path: Path) -> Tuple[int, int]:
 
     return files_deleted, dirs_deleted
 
-
 def _safe_delete_file(path: Path) -> int:
     try:
         if path.exists() and path.is_file():
@@ -111,7 +85,6 @@ def _safe_delete_file(path: Path) -> int:
         pass
     return 0
 
-
 def _read_settings(path: Path) -> dict:
     try:
         if path.exists():
@@ -120,17 +93,12 @@ def _read_settings(path: Path) -> dict:
         pass
     return {}
 
-
 def _write_settings(path: Path, data: dict) -> None:
     try:
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception:
         pass
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UI / runtime hooks (this is the part that actually fixes the audio + inputs)
-# ─────────────────────────────────────────────────────────────────────────────
 def _get_nexus_window(parent: Optional[QtWidgets.QWidget]) -> Optional[QtWidgets.QWidget]:
     if parent is None:
         return None
@@ -139,16 +107,13 @@ def _get_nexus_window(parent: Optional[QtWidgets.QWidget]) -> Optional[QtWidgets
     except Exception:
         return None
 
-
 def _hard_stop_sound_system(win: Optional[QtWidgets.QWidget]) -> None:
     """
-    SoundTab uses WaveHandler.player = QMediaPlayer() with NO parent.
-    findChildren() will NOT find it. So we must reach it through Nexus.
+    Stop every live audio handle that can lock the selected music file.
     """
     if win is None:
         return
 
-    # Stop SoundTab WaveHandler music player (and detach source)
     try:
         st = getattr(win, "sound_tab", None)
         if st is not None and hasattr(st, "wave"):
@@ -158,12 +123,10 @@ def _hard_stop_sound_system(win: Optional[QtWidgets.QWidget]) -> None:
     except Exception:
         pass
 
-    # If preview widget uses another player, stop it too (best-effort)
     try:
         st = getattr(win, "sound_tab", None)
         if st is not None and hasattr(st, "_preview"):
             pv = getattr(st, "_preview", None)
-            # Some implementations store player as pv._player
             p = getattr(pv, "_player", None)
             if p is not None:
                 try:
@@ -177,32 +140,30 @@ def _hard_stop_sound_system(win: Optional[QtWidgets.QWidget]) -> None:
     except Exception:
         pass
 
-
 def _force_soundtab_no_audio(win: Optional[QtWidgets.QWidget]) -> None:
     """
-    After wiping files/manifests, force SoundTab UI to reflect "no audio"
-    and clear its internal current selection so Play cannot silently use archive.
+    Put SoundTab into the same state as an app session with no selected music.
     """
     if win is None:
         return
+
     try:
         st = getattr(win, "sound_tab", None)
         if st is None:
             return
 
-        # Clear the "current processed" pointer and refresh preview/analyzer
         if hasattr(st, "_on_current_changed"):
             try:
                 st._on_current_changed("")  # type: ignore[attr-defined]
             except Exception:
                 pass
 
-        # Reset visible UI labels if present
         try:
             if hasattr(st, "playpause_btn"):
                 st.playpause_btn.setText("▶️ Play")
         except Exception:
             pass
+
         try:
             if hasattr(st, "status"):
                 st.status.setText("No audio loaded.")
@@ -211,40 +172,44 @@ def _force_soundtab_no_audio(win: Optional[QtWidgets.QWidget]) -> None:
     except Exception:
         pass
 
-
 def _clear_message_tab_inputs(win: Optional[QtWidgets.QWidget]) -> None:
     """
-    The Message tab fields are not guaranteed to have objectNames,
-    so clear them explicitly via message_tab.title_input/name_input if present.
+    Clear the Message tab fields that mirror reset-sensitive settings.
     """
     if win is None:
         return
+
     try:
         mt = getattr(win, "message_tab", None)
         if mt is None:
             return
 
-        # Clear UI inputs
         try:
             if hasattr(mt, "title_input"):
                 mt.title_input.setText("")  # type: ignore[attr-defined]
         except Exception:
             pass
+
         try:
             if hasattr(mt, "name_input"):
                 mt.name_input.setText("")  # type: ignore[attr-defined]
         except Exception:
             pass
 
-        # Clear its in-memory settings dict so it won't re-save old values later
+        try:
+            if hasattr(mt, "set_published_page_url"):
+                mt.set_published_page_url("", persist=False, announce=False)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
         try:
             if hasattr(mt, "settings") and isinstance(mt.settings, dict):  # type: ignore[attr-defined]
                 mt.settings["recipient_title"] = ""
                 mt.settings["recipient_name"] = ""
+                mt.settings[PUBLISHED_PAGE_URL_KEY] = ""
         except Exception:
             pass
 
-        # Force it to write the cleared state if it has a saver
         try:
             if hasattr(mt, "_save_settings"):
                 mt._save_settings()  # type: ignore[attr-defined]
@@ -253,53 +218,596 @@ def _clear_message_tab_inputs(win: Optional[QtWidgets.QWidget]) -> None:
     except Exception:
         pass
 
+PROMPT_WRITER_CHECK_KEYS = (
+    "black",
+    "white",
+    "frame",
+    "vignette",
+    "polaroid",
+    "cardshadow",
+    "real",
+    "paint",
+    "minimal",
+    "forbid_text",
+    "clean_composition",
+    "strong_focal_point",
+    "dynamic_angle",
+    "cinematic_framing",
+    "close_up_focus",
+    "full_body_view",
+    "wide_scene",
+    "simplified_details",
+)
+
+def _blank_prompt_writer_state() -> dict:
+    return {
+        "version": 2,
+        "type": "",
+        "subject": "",
+        "color": "",
+        "global": "",
+        "cover": "",
+        "letter": "",
+        "wall": "",
+        "back": "",
+        "checks": {key: False for key in PROMPT_WRITER_CHECK_KEYS},
+        "generated_prompts": {},
+        "reference_images": [],
+    }
+
+def _reset_prompt_writer_state_on_disk(root: Path) -> None:
+    """
+    Persist an explicitly blank Prompt Writer state for the next panel load.
+    """
+    try:
+        state_path = (root / "prompt_writer_state.json").resolve()
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+
+        temp_path = state_path.with_name(f".{state_path.name}.tmp")
+        temp_path.write_text(
+            json.dumps(_blank_prompt_writer_state(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temp_path.replace(state_path)
+    except Exception:
+        pass
+
+def _is_prompt_writer_panel(widget: object) -> bool:
+    try:
+        if getattr(widget, "objectName", lambda: "")() == "PromptWriterPanel":
+            return True
+    except Exception:
+        pass
+
+    try:
+        if widget.__class__.__name__ == "PromptWriterPanel":
+            return True
+    except Exception:
+        pass
+
+    return bool(
+        hasattr(widget, "_state_path")
+        and hasattr(widget, "_checkbox_state_specs")
+        and hasattr(widget, "preview_widgets")
+    )
+
+def _iter_prompt_writer_panels(win: Optional[QtWidgets.QWidget]):
+    seen = set()
+
+    def add_candidate(obj: object):
+        if obj is None or not _is_prompt_writer_panel(obj):
+            return
+
+        key = id(obj)
+        if key in seen:
+            return
+
+        seen.add(key)
+        yield obj
+
+    if win is not None:
+        for attr in (
+            "prompt_writer_panel",
+            "prompt_writer",
+            "promptWriterPanel",
+            "prompt_writer_window",
+            "prompter_panel",
+            "prompter",
+        ):
+            try:
+                yield from add_candidate(getattr(win, attr, None))
+            except Exception:
+                pass
+
+        try:
+            for child in win.findChildren(QtWidgets.QWidget):
+                yield from add_candidate(child)
+        except Exception:
+            pass
+
+    try:
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            for top in app.topLevelWidgets():
+                yield from add_candidate(top)
+
+                try:
+                    for child in top.findChildren(QtWidgets.QWidget):
+                        yield from add_candidate(child)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+def _clear_prompt_writer_panel_by_widgets(panel: object) -> None:
+    """Clear a live Prompt Writer panel that exposes individual widgets instead of one reset method."""
+    try:
+        timer = getattr(panel, "_persist_timer", None)
+        if timer is not None:
+            timer.stop()
+    except Exception:
+        pass
+
+    try:
+        for name in ("cmb_type", "cmb_color"):
+            combo = getattr(panel, name, None)
+            if combo is not None:
+                combo.setCurrentIndex(-1)
+    except Exception:
+        pass
+
+    try:
+        combo = getattr(panel, "cmb_subject", None)
+        if combo is not None:
+            combo.setCurrentText("")
+            try:
+                if combo.lineEdit() is not None:
+                    combo.lineEdit().clear()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        specs = panel._checkbox_state_specs()  # type: ignore[attr-defined]
+    except Exception:
+        specs = []
+
+    for checkbox, _key in specs:
+        try:
+            checkbox.setChecked(False)
+        except Exception:
+            pass
+
+    for name in ("txt_global", "txt_cover", "txt_letter", "txt_wall", "txt_back"):
+        try:
+            editor = getattr(panel, name, None)
+            if editor is not None:
+                editor.clear()
+        except Exception:
+            pass
+
+    try:
+        panel._generated_prompts = {}  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    try:
+        panel._reference_images = []  # type: ignore[attr-defined]
+        refresher = getattr(panel, "_refresh_reference_image_panel", None)
+        if callable(refresher):
+            refresher()
+    except Exception:
+        pass
+
+    try:
+        panel._last_focused_widget = None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    try:
+        previews = getattr(panel, "preview_widgets", {})
+        if isinstance(previews, dict):
+            for w in previews.values():
+                try:
+                    w.clear()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        saver = getattr(panel, "_persist_state_now", None)
+        if callable(saver):
+            saver()
+    except Exception:
+        pass
+
+def _clear_prompt_writer(win: Optional[QtWidgets.QWidget], root: Path) -> None:
+    """Clear Prompt Writer state on disk and in any live Prompt Writer panel."""
+    _reset_prompt_writer_state_on_disk(root)
+
+    for panel in _iter_prompt_writer_panels(win):
+        try:
+            resetter = getattr(panel, "reset_to_blank", None)
+            if callable(resetter):
+                resetter(persist=True)
+            else:
+                _clear_prompt_writer_panel_by_widgets(panel)
+        except Exception:
+            pass
+
+EDITOR_DOCK_FILE_NAMES = (
+    "editor_dock.json",
+    "editor_dock_state.json",
+    "editor_state.json",
+    "dock_state.json",
+    "letter_editor_dock.json",
+    "letter_editor_state.json",
+    "message_editor_dock.json",
+    "message_editor_state.json",
+    "current_editor_dock.json",
+    "current_editor_state.json",
+)
+
+EDITOR_DOCK_SEARCH_DIRS = (
+    "",
+    "gallery/user",
+    "gallery/user/message",
+    "gallery/user/pages",
+    "gallery/user/editor",
+    "gallery/user/dock",
+    "gallery/user/state",
+)
+
+def _delete_editor_dock_files(root: Path) -> int:
+    """Delete current editor dock/state files without touching saved letters."""
+    deleted = 0
+    seen = set()
+
+    def delete_candidate(path: Path) -> None:
+        nonlocal deleted
+
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+
+        key = str(resolved)
+        if key in seen:
+            return
+
+        seen.add(key)
+        deleted += _safe_delete_file(resolved)
+
+    for rel_dir in EDITOR_DOCK_SEARCH_DIRS:
+        base = (root / rel_dir).resolve() if rel_dir else root.resolve()
+        for name in EDITOR_DOCK_FILE_NAMES:
+            delete_candidate(base / name)
+
+    # Remove only files whose names identify them as current editor dock/state data.
+    for rel_dir in (
+        "gallery/user",
+        "gallery/user/message",
+        "gallery/user/editor",
+        "gallery/user/dock",
+        "gallery/user/state",
+    ):
+        base = (root / rel_dir).resolve()
+        if not base.exists() or not base.is_dir():
+            continue
+
+        try:
+            for path in base.glob("*.json"):
+                name = path.name.casefold()
+                if "editor" in name and ("dock" in name or "state" in name or "current" in name):
+                    delete_candidate(path)
+        except Exception:
+            pass
+
+    return deleted
+
+def _is_editor_widget(widget: object) -> bool:
+    try:
+        object_name = getattr(widget, "objectName", lambda: "")() or ""
+    except Exception:
+        object_name = ""
+
+    try:
+        class_name = widget.__class__.__name__
+    except Exception:
+        class_name = ""
+
+    text = f"{object_name} {class_name}".casefold()
+
+    if "promptwriter" in text or "prompt_writer" in text or "sound" in text:
+        return False
+
+    if "editor" in text:
+        return True
+
+    return bool(
+        hasattr(widget, "dock_file")
+        or hasattr(widget, "dock_path")
+        or hasattr(widget, "dock_state_path")
+        or hasattr(widget, "_dock_file")
+        or hasattr(widget, "_dock_path")
+        or hasattr(widget, "_dock_state_path")
+        or hasattr(widget, "editor_dock_path")
+        or hasattr(widget, "_editor_dock_path")
+    )
+
+def _iter_editor_widgets(win: Optional[QtWidgets.QWidget]):
+    seen = set()
+
+    def add_candidate(obj: object):
+        if obj is None or not _is_editor_widget(obj):
+            return
+
+        key = id(obj)
+        if key in seen:
+            return
+
+        seen.add(key)
+        yield obj
+
+    if win is not None:
+        for attr in (
+            "editor",
+            "editor_tab",
+            "letter_editor",
+            "letter_editor_tab",
+            "message_editor",
+            "message_editor_tab",
+            "dock_editor",
+            "editor_panel",
+            "editor_window",
+            "text_editor",
+            "writer_editor",
+        ):
+            try:
+                yield from add_candidate(getattr(win, attr, None))
+            except Exception:
+                pass
+
+        try:
+            for child in win.findChildren(QtWidgets.QWidget):
+                yield from add_candidate(child)
+        except Exception:
+            pass
+
+    try:
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            for top in app.topLevelWidgets():
+                yield from add_candidate(top)
+
+                try:
+                    for child in top.findChildren(QtWidgets.QWidget):
+                        yield from add_candidate(child)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+def _call_first_available(obj: object, names: Tuple[str, ...]) -> bool:
+    for name in names:
+        try:
+            fn = getattr(obj, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                    return True
+                except TypeError:
+                    try:
+                        fn(True)
+                        return True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return False
+
+def _clear_editor_widget(editor: object) -> None:
+    """Reset a live editor widget without touching saved letters."""
+    try:
+        for attr in (
+            "_persist_timer",
+            "_autosave_timer",
+            "autosave_timer",
+            "save_timer",
+            "_save_timer",
+        ):
+            timer = getattr(editor, attr, None)
+            if timer is not None and hasattr(timer, "stop"):
+                timer.stop()
+    except Exception:
+        pass
+
+    if _call_first_available(
+        editor,
+        (
+            "reset_to_blank",
+            "reset_to_empty",
+            "clear_all",
+            "clear_editor",
+            "clear_document",
+            "new_blank_document",
+            "new_document",
+            "reset_editor",
+        ),
+    ):
+        return
+
+    # Widget-level reset path for editor panels that do not expose a public reset method.
+    try:
+        if isinstance(editor, QtWidgets.QWidget):
+            for widget in editor.findChildren(QtWidgets.QTextEdit):
+                try:
+                    widget.clear()
+                except Exception:
+                    pass
+
+            for widget in editor.findChildren(QtWidgets.QPlainTextEdit):
+                try:
+                    widget.clear()
+                except Exception:
+                    pass
+
+            for widget in editor.findChildren(QtWidgets.QLineEdit):
+                try:
+                    widget.clear()
+                except Exception:
+                    pass
+
+            for widget in editor.findChildren(QtWidgets.QCheckBox):
+                try:
+                    widget.setChecked(False)
+                except Exception:
+                    pass
+
+            for widget in editor.findChildren(QtWidgets.QComboBox):
+                try:
+                    widget.setCurrentIndex(-1)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    for attr in (
+        "current_file",
+        "current_path",
+        "current_document",
+        "current_doc",
+        "dock_file",
+        "dock_path",
+        "dock_state_path",
+        "editor_dock_path",
+        "_current_file",
+        "_current_path",
+        "_current_document",
+        "_current_doc",
+        "_dock_file",
+        "_dock_path",
+        "_dock_state_path",
+        "_editor_dock_path",
+    ):
+        try:
+            if hasattr(editor, attr):
+                setattr(editor, attr, None)
+        except Exception:
+            pass
+
+def _clear_editor(win: Optional[QtWidgets.QWidget], root: Path) -> int:
+    """Clear live editor UI and remove current editor dock/state files."""
+    for editor in _iter_editor_widgets(win):
+        try:
+            _clear_editor_widget(editor)
+        except Exception:
+            pass
+
+    # Delete after clearing too, in case a clear signal caused a blank dock save.
+    return _delete_editor_dock_files(root)
 
 def _reset_settings_on_disk(root: Path) -> None:
     settings_path = (root / SETTINGS_FILE).resolve()
     data = _read_settings(settings_path)
 
-    # Explicitly blank (don’t just pop; other code expects keys to exist)
     data["recipient_name"] = ""
     data["recipient_title"] = ""
+    data[PUBLISHED_PAGE_URL_KEY] = ""
 
-    # Volumes to 50%
     data["starting_volume"] = 50
     data["music_volume"] = 50
 
-    # Neutralize music selection (prevents accidental reload)
     data["music_file"] = ""
     data["last_audio"] = "none"
+    data[CURTAIN_STYLE_KEY] = CURTAIN_STYLE_WHITE
 
     _write_settings(settings_path, data)
 
-
 def _delete_music_and_manifest(root: Path) -> int:
     """
-    Deletes:
-      - gallery/user/sounds/music.mp3
-      - gallery/sounds/music.mp3 (if present)
-      - gallery/user/sounds/appssong/current.json   <-- critical
+    Delete the active user-selected music file and its current-selection manifest.
     """
     total = 0
 
     user_snd_dir = (root / USER_SOUNDS_DIR).resolve()
     user_music = (user_snd_dir / MUSIC_FILE).resolve()
-
-    runtime_music = (root / "gallery" / "sounds" / MUSIC_FILE).resolve()  # optional location
-
     current_manifest = (user_snd_dir / "appssong" / "current.json").resolve()
 
     total += _safe_delete_file(user_music)
-    total += _safe_delete_file(runtime_music)
     total += _safe_delete_file(current_manifest)
 
     return total
 
+def _write_minimal_blank_message_html(root: Path) -> Path:
+    target = (root / MESSAGE_HTML_FILE).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("<p></p>", encoding="utf-8")
+    return target
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Public: reset action
-# ─────────────────────────────────────────────────────────────────────────────
+def _restore_default_message_html(root: Path) -> Path:
+    """
+    Recreate gallery/user/message/message.html from the app-owned Emessage.docx template.
+    """
+    try:
+        return ensure_message_html_from_emessage(root, overwrite=True)
+    except Exception:
+        return _write_minimal_blank_message_html(root)
+
+def _refresh_message_tab_after_restore(win: Optional[QtWidgets.QWidget], root: Path) -> None:
+    if win is None:
+        return
+
+    try:
+        mt = getattr(win, "message_tab", None)
+        if mt is None:
+            return
+
+        html_path = (root / MESSAGE_HTML_FILE).resolve()
+        html = html_path.read_text(encoding="utf-8") if html_path.is_file() else "<p></p>"
+
+        try:
+            mt.current_html = html
+        except Exception:
+            pass
+
+        try:
+            if hasattr(mt, "edit_btn"):
+                mt.edit_btn.setEnabled(True)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(mt, "_ensure_wall_exists"):
+                mt._ensure_wall_exists()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        try:
+            if hasattr(mt, "text_selected"):
+                mt.text_selected.emit(html)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        try:
+            if hasattr(mt, "_generate_image"):
+                mt._generate_image(html)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        try:
+            if hasattr(mt, "_emit_best_preview"):
+                mt._emit_best_preview()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 def reset_everything(*, parent: Optional[QtWidgets.QWidget] = None) -> Tuple[int, int]:
+    """Reset the active letter workspace and return deleted file/directory counts."""
     root = app_root()
 
     pages_dir = (root / USER_PAGES_DIR).resolve()
@@ -313,10 +821,8 @@ def reset_everything(*, parent: Optional[QtWidgets.QWidget] = None) -> Tuple[int
 
     win = _get_nexus_window(parent)
 
-    # 1) Stop audio FIRST (buffering + unparented player)
     _hard_stop_sound_system(win)
 
-    # 2) Wipe user pages + message
     f, d = _safe_clear_dir_contents(pages_dir)
     total_files += f
     total_dirs += d
@@ -325,28 +831,26 @@ def reset_everything(*, parent: Optional[QtWidgets.QWidget] = None) -> Tuple[int
     total_files += f
     total_dirs += d
 
-    # 3) Delete music.mp3 AND clear current.json (prevents archive fallback play)
+    _restore_default_message_html(root)
+
     total_files += _delete_music_and_manifest(root)
 
-    # 4) Reset settings.json on disk
     _reset_settings_on_disk(root)
 
-    # 5) Clear live UI fields so the app visually resets immediately
     _clear_message_tab_inputs(win)
 
-    # 6) Force SoundTab to "no audio loaded" state
+    _refresh_message_tab_after_restore(win, root)
+
+    _clear_prompt_writer(win, root)
+
+    total_files += _clear_editor(win, root)
+
     _force_soundtab_no_audio(win)
 
     return total_files, total_dirs
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Reset flow continues below
-# ─────────────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
-# Frameless confirm dialog (no title bar; only Yes/No)
-# ─────────────────────────────────────────────────────────────────────────────
 class _ConfirmDialog(QtWidgets.QDialog):
+    """Frameless confirmation dialog for the destructive reset action."""
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
 
@@ -383,7 +887,7 @@ class _ConfirmDialog(QtWidgets.QDialog):
             QPushButton:hover { border-color: rgba(255, 77, 79, 0.85); }
             QPushButton#danger { border-color: rgba(255, 77, 79, 0.55); }
             QPushButton#danger:hover { border-color: rgba(255, 77, 79, 1.0); }
-        """
+            """
         )
 
         inner = QtWidgets.QVBoxLayout(panel)
@@ -395,9 +899,11 @@ class _ConfirmDialog(QtWidgets.QDialog):
 
         row = QtWidgets.QHBoxLayout()
         row.addStretch(1)
+
         btn_no = QtWidgets.QPushButton("No")
         btn_yes = QtWidgets.QPushButton("Yes")
         btn_yes.setObjectName("danger")
+
         row.addWidget(btn_no)
         row.addWidget(btn_yes)
 
@@ -410,7 +916,6 @@ class _ConfirmDialog(QtWidgets.QDialog):
         btn_yes.clicked.connect(self.accept)
 
         self.resize(420, 140)
-
 
 def _toast(parent: Optional[QtWidgets.QWidget], text: str, msecs: int = 1400) -> None:
     tip = QtWidgets.QDialog(parent)
@@ -433,12 +938,15 @@ def _toast(parent: Optional[QtWidgets.QWidget], text: str, msecs: int = 1400) ->
             padding: 10px 12px;
             font-weight: 700;
         }
-    """
+        """
     )
+
     lbl = QtWidgets.QLabel(text)
+
     lay = QtWidgets.QVBoxLayout(body)
     lay.setContentsMargins(0, 0, 0, 0)
     lay.addWidget(lbl)
+
     outer.addWidget(body)
 
     tip.adjustSize()
@@ -453,9 +961,10 @@ def _toast(parent: Optional[QtWidgets.QWidget], text: str, msecs: int = 1400) ->
     QtCore.QTimer.singleShot(msecs, tip.close)
     tip.show()
 
-
 def confirm_and_reset(parent: Optional[QtWidgets.QWidget] = None) -> None:
+    """Ask for confirmation, run the reset, and notify the active Command tab."""
     dlg = _ConfirmDialog(parent)
+
     if parent is not None:
         cp = parent.mapToGlobal(parent.rect().center())
         dlg.move(cp.x() - dlg.width() // 2, cp.y() - dlg.height() // 2)
@@ -464,26 +973,22 @@ def confirm_and_reset(parent: Optional[QtWidgets.QWidget] = None) -> None:
         files, _dirs = reset_everything(parent=parent)
         _toast(parent, f"Wiped. ({files} files)")
 
-        # Signal to Nexus (if connected) to hard-clear preview
         try:
             if parent is not None and hasattr(parent, "wiped"):
                 parent.wiped.emit()  # type: ignore[attr-defined]
         except Exception:
             pass
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Press-only GO button (depress on mouse down, pop back on release)
-# ─────────────────────────────────────────────────────────────────────────────
 class _PressGoLabel(QtWidgets.QLabel):
+    """Image-backed reset button with press-scale feedback."""
     clicked = QtCore.Signal()
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
+
         self.setAlignment(Qt.AlignCenter)
         self.setCursor(Qt.PointingHandCursor)
 
-        # True transparency
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAutoFillBackground(False)
         self.setStyleSheet("background: transparent;")
@@ -511,6 +1016,7 @@ class _PressGoLabel(QtWidgets.QLabel):
             return
 
         scale = float(scale)
+
         bw = self._base_rect.width()
         bh = self._base_rect.height()
 
@@ -524,6 +1030,7 @@ class _PressGoLabel(QtWidgets.QLabel):
 
         pw = pm.width()
         ph = pm.height()
+
         x = int(round(cx - pw / 2))
         y = int(round(cy - ph / 2))
 
@@ -535,6 +1042,7 @@ class _PressGoLabel(QtWidgets.QLabel):
             self._scale = float(v)
         except Exception:
             self._scale = 1.0
+
         self._set_scaled_geometry_and_pixmap(self._scale)
 
     def _animate_to(self, target: float, ms: int) -> None:
@@ -550,6 +1058,7 @@ class _PressGoLabel(QtWidgets.QLabel):
             self._animate_to(0.92, 85)
             event.accept()
             return
+
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
@@ -562,24 +1071,25 @@ class _PressGoLabel(QtWidgets.QLabel):
 
             event.accept()
             return
+
         super().mouseReleaseEvent(event)
 
     def leaveEvent(self, event: QtCore.QEvent) -> None:
         if self._pressed:
             self._pressed = False
             self._animate_to(1.0, 110)
+
         super().leaveEvent(event)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CommandTab: command.png background + centered GO.png press-animated button
-# ─────────────────────────────────────────────────────────────────────────────
 class CommandTab(QtWidgets.QWidget):
+    """Command page containing the image-backed reset control."""
     wiped = QtCore.Signal()
 
     def __init__(self, project_root: Path, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
+
         self.project_root = Path(project_root).resolve()
+
         self.setObjectName("CommandTab")
         self.setStyleSheet("QWidget#CommandTab { background:#0b0c10; }")
 
@@ -603,7 +1113,7 @@ class CommandTab(QtWidgets.QWidget):
 
     def _do_reset(self) -> None:
         confirm_and_reset(self)
-        # bubble signal for any listeners
+
         try:
             self.wiped.emit()
         except Exception:
@@ -618,6 +1128,7 @@ class CommandTab(QtWidgets.QWidget):
         h = max(1, self.height())
 
         self.bg_label.setGeometry(0, 0, w, h)
+
         if not self._bg_pix.isNull():
             bg_scaled = self._bg_pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.bg_label.setPixmap(bg_scaled)
@@ -630,20 +1141,20 @@ class CommandTab(QtWidgets.QWidget):
         target = max(140, min(460, target))
 
         go_base = self._go_pix.scaled(target, target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
         bw = go_base.width()
         bh = go_base.height()
 
         base_rect = QtCore.QRect((w - bw) // 2, (h - bh) // 2, bw, bh)
+
         self.go_btn.set_base(base_rect, go_base)
         self.go_btn.raise_()
-
 
 def main() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     confirm_and_reset(None)
     QtCore.QTimer.singleShot(0, app.quit)
     app.exec()
-
 
 if __name__ == "__main__":
     main()

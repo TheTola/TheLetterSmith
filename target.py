@@ -456,6 +456,7 @@ def find_app_icon(base_dir: Path) -> Optional[Path]:
         base_dir / "gallery" / "icon" / "LSmith.ico",
         base_dir / "gallery" / "icons" / "LSmith.ico",
         base_dir / "gallery" / "icons" / "ls-icon.ico",
+        base_dir / "gallery" / "app" / "icons" / "folder" / "LSmith.ico",
     )
     for p in candidates:
         if p.exists():

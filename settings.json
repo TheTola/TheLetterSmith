@@ -21,7 +21,7 @@
   "message_html_file": "message.html",
   "message_image_file": "message.png",
   "music_file": "",
-  "music_volume": 60,
+  "music_volume": 25,
   "output_dir": "converted64",
   "required_slides": [
     "cover.png",
@@ -31,10 +31,10 @@
   ],
   "sound_gif": "sound.gif",
   "sounds_dir": "sounds",
-  "starting_volume": 60,
+  "starting_volume": 25,
   "verbose": false,
-  "recipient_title": "Heraldry",
-  "recipient_name": "Angel Hill",
+  "recipient_title": "The One Piece",
+  "recipient_name": "Marjella Lajuan",
   "prompt_writer_state": {
     "type": "\u2014 none \u2014",
     "subject": "----",
@@ -57,5 +57,11 @@
       "forbid_text": false
     },
     "generated_prompts": {}
-  }
+  },
+  "published_page_url": "https://thetola.github.io/Pirates-of-Light/",
+  "message_overlay_preset": "black",
+  "message_overlay_opacity": 95,
+  "recipient_name_locked": true,
+  "published_page_url_locked": true,
+  "curtain_style": "average_color"
 }

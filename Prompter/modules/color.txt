@@ -1,10 +1,13 @@
+-Strange / Interpretive Color Schemes
 Redcore Prismatic Burst
-star bound Prismatic  explosion 
+Star-Bound Prismatic Explosion
 Sapphire Prismatic Storm
 Violet Prismatic Dream
 
+-Themed / Occasion Color Schemes
 Valentines Day: Pink / Red Surprise
 
+-Basic Single-Color Schemes
 Crimson Crown
 Scarlet Dominion
 Amber Radiance
@@ -18,6 +21,7 @@ Ultramarine Depths
 Violet Ascension
 Royal Amethyst
 
+-Two-Color Combinations
 Crimson & Emerald
 Scarlet & Viridian
 Red & Cyan
@@ -31,6 +35,7 @@ Sapphire & Burnt Amber
 Violet & Chartreuse
 Purple & Lime
 
+-Three-Color / Multi-Color Combinations
 Crimson, Amber, & Sapphire
 Scarlet, Gold, & Ultramarine
 Red, Yellow, & Blue
@@ -42,3 +47,6 @@ Indigo, Emerald, & Vermilion
 Violet, Chartreuse, & Azure
 Teal, Orange, & Royal Purple
 
+-User Added
+Turquoise, Gold, Deep Violet, Kintsugi
+Turquoise, Black, Gold, Kintsugi

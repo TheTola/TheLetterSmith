@@ -7,6 +7,8 @@ import base64
 import json
 import math
 import os
+import shutil
+import tempfile
 
 from config import USER_SOUNDS_DIR
 
@@ -19,11 +21,11 @@ from collections import deque
 from PySide6 import QtCore
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Analysis format
 # - We store quantized uint8 arrays packed as bytes -> zlib -> base64
 # - This keeps files small and load fast.
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _b64z_pack_u8(raw_u8: bytes, level: int = 6) -> str:
     comp = zlib.compress(raw_u8, level)
@@ -41,6 +43,70 @@ def _safe_mtime_size(path: Path) -> Tuple[float, int]:
         return float(st.st_mtime), int(st.st_size)
     except Exception:
         return 0.0, -1
+
+
+def _same_audio_identity(cached_mtime: float, cached_size: int, current_mtime: float, current_size: int) -> bool:
+    """
+    Decide whether an analysis cache still belongs to the current audio file.
+
+    Exact mtime matching is too brittle on Windows because copying/normalizing a
+    file can preserve size while shifting timestamp precision. Size mismatch is
+    a real invalidation. Same size with only timestamp drift is accepted so the
+    app can keep using an existing cache instead of forcing ffmpeg/ffprobe to
+    re-analyze a song that is already cached.
+    """
+    if int(cached_size) != int(current_size):
+        return False
+    if current_size < 0:
+        return False
+    if abs(float(current_mtime) - float(cached_mtime)) <= 1e-3:
+        return True
+    return True
+
+
+def _find_audio_tool(env_name: str, exe_name: str) -> str:
+    """Locate ffmpeg/ffprobe without importing pydub."""
+    env_path = os.environ.get(env_name, "").strip().strip('"')
+    if env_path and os.path.isfile(env_path):
+        return env_path
+
+    found = shutil.which(exe_name)
+    if found:
+        return found
+
+    root = Path(__file__).resolve().parent
+    candidates = [
+        root / "ffmpeg" / "bin" / exe_name,
+        root / "tools" / "ffmpeg" / "bin" / exe_name,
+        root / "gallery" / "app" / "ffmpeg" / "bin" / exe_name,
+    ]
+    for cand in candidates:
+        if cand.is_file():
+            return str(cand)
+    return ""
+
+
+def _ffmpeg_pair() -> Tuple[str, str]:
+    exe_ffmpeg = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    exe_ffprobe = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+    return (
+        _find_audio_tool("FFMPEG_BIN", exe_ffmpeg),
+        _find_audio_tool("FFPROBE_BIN", exe_ffprobe),
+    )
+
+
+def _has_ffmpeg_pair() -> bool:
+    ffmpeg, ffprobe = _ffmpeg_pair()
+    return bool(ffmpeg and ffprobe)
+
+
+def _missing_ffmpeg_message(path: Path) -> str:
+    return (
+        "Offline audio analysis is disabled because ffmpeg/ffprobe was not found. "
+        "Qt playback can still play the MP3. Existing .analysis.json cache files will still be used. "
+        "Install ffmpeg later if you want new songs analyzed automatically. "
+        f"Skipped: {path}"
+    )
 
 
 def _percentile_fallback(vals: List[float], pct: float) -> float:
@@ -193,16 +259,60 @@ class AudioAnalysisWorker(QtCore.QObject):
             self.failed.emit(str(self._path), f"{type(e).__name__}: {e}")
 
     # --- analysis core ---
-    def _analyze_mp3(self, path: Path, hop_ms: int, nbands: int) -> dict:
-        mtime, size = _safe_mtime_size(path)
+    def _decode_audio_segment(self, path: Path):
+        """
+        Decode audio through pydub/ffmpeg.
 
-        # Decode (pydub -> ffmpeg). This is already a project dependency.
+        Qt playback can succeed even when the offline analyzer fails, because they
+        use different backends. For stubborn filenames or paths, retry by copying
+        the file to a short ASCII temp path before giving up.
+        """
+        path = Path(path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Audio file not found: {path}")
+
+        ffmpeg, ffprobe = _ffmpeg_pair()
+        if not ffmpeg or not ffprobe:
+            raise RuntimeError(_missing_ffmpeg_message(path))
+
         try:
             from pydub import AudioSegment  # type: ignore
+            import pydub  # type: ignore
+            pydub.AudioSegment.converter = ffmpeg  # type: ignore[attr-defined]
+            pydub.AudioSegment.ffprobe = ffprobe  # type: ignore[attr-defined]
         except Exception as e:
             raise RuntimeError(f"pydub missing: {e!r}")
 
-        seg = AudioSegment.from_file(str(path))
+        try:
+            return AudioSegment.from_file(str(path))
+        except Exception as first_error:
+            tmp_dir: Optional[Path] = None
+            try:
+                tmp_dir = Path(tempfile.mkdtemp(prefix="lettersmith_audio_"))
+                suffix = path.suffix.lower() or ".mp3"
+                tmp_path = tmp_dir / f"input{suffix}"
+                shutil.copy2(path, tmp_path)
+                return AudioSegment.from_file(str(tmp_path))
+            except Exception as second_error:
+                raise RuntimeError(
+                    "Audio decode failed. The file exists and can still play through Qt, "
+                    "but the offline analyzer could not decode it. If the message includes "
+                    "WinError 2, Windows is usually missing ffmpeg/ffprobe - not the MP3. "
+                    "Install ffmpeg or keep using the cached analysis when available. "
+                    f"File: {path} | First error: {type(first_error).__name__}: {first_error} | "
+                    f"Retry error: {type(second_error).__name__}: {second_error}"
+                ) from second_error
+            finally:
+                if tmp_dir is not None:
+                    try:
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+
+    def _analyze_mp3(self, path: Path, hop_ms: int, nbands: int) -> dict:
+        mtime, size = _safe_mtime_size(path)
+
+        seg = self._decode_audio_segment(path)
         seg = seg.set_channels(1)
 
         # Target SR for analysis (keep light, still believable)
@@ -467,9 +577,13 @@ class AudioAnalysisManager(QtCore.QObject):
         super().__init__(parent)
         self.project_root = Path(project_root).resolve()
 
-        base = self.project_root / USER_SOUNDS_DIR / "archive"
+        # Current Letter Smith archive path. Older builds used "archive"; the
+        # active Sound tab archive uses "appssong". Keeping the manager aligned
+        # prevents analysis jobs from searching a dead folder.
+        base = self.project_root / USER_SOUNDS_DIR / "appssong"
         self.processed_dir = base / "processed"
         self.analysis_dir = base / "analysis"
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
         self.analysis_dir.mkdir(parents=True, exist_ok=True)
 
         self._queue: Deque[_Job] = deque()
@@ -484,13 +598,29 @@ class AudioAnalysisManager(QtCore.QObject):
 
         self._hop_ms = 20
         self._nbands = 32
+        self._decoder_missing_notified: set[str] = set()
 
-    # ───────────────────── public ─────────────────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ public â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def is_busy(self) -> bool:
         return self._busy
 
+    def shutdown(self) -> None:
+        self._queue.clear()
+        self._pending.clear()
+        self._cleanup_thread()
+        self._set_busy(False)
+
     def enqueue_missing(self) -> None:
+        """
+        Archive-wide analysis is intentionally conservative.
+
+        If ffmpeg/ffprobe is unavailable, do not enqueue anything. Cached files
+        are loaded on demand, and playback still works through Qt. This prevents
+        repeated failed analyzer jobs every time the Sound tab opens.
+        """
         if not self.processed_dir.exists():
+            return
+        if not _has_ffmpeg_pair():
             return
 
         mp3s = sorted(self.processed_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -506,6 +636,12 @@ class AudioAnalysisManager(QtCore.QObject):
         cached = self.load_cached(p)
         if cached is not None:
             self.analysisReady.emit(key, cached)
+            return
+
+        if not _has_ffmpeg_pair():
+            if key not in self._decoder_missing_notified:
+                self._decoder_missing_notified.add(key)
+                self.analysisFailed.emit(key, _missing_ffmpeg_message(p))
             return
 
         if key in self._pending:
@@ -527,6 +663,7 @@ class AudioAnalysisManager(QtCore.QObject):
     def load_cached(self, path: Path) -> Optional[dict]:
         p = Path(path).resolve()
         out = self._analysis_file_for(p)
+
         if not out.exists():
             return None
 
@@ -537,20 +674,37 @@ class AudioAnalysisManager(QtCore.QObject):
 
         try:
             src = payload.get("src", {})
-            mtime = float(src.get("mtime", -1.0))
-            size = int(src.get("size", -1))
+            cached_mtime = float(src.get("mtime", -1.0))
+            cached_size = int(src.get("size", -1))
             cur_mtime, cur_size = _safe_mtime_size(p)
-            if abs(cur_mtime - mtime) > 1e-6 or cur_size != size:
+
+            if not _same_audio_identity(cached_mtime, cached_size, cur_mtime, cur_size):
                 return None
+
+            src["path"] = str(p)
+            src["mtime"] = cur_mtime
+            src["size"] = cur_size
+            payload["src"] = src
+
+            try:
+                out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
+            return payload
         except Exception:
             return None
 
-        return payload
+    # internals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    def analysis_file_for_debug(self, path: Path) -> Path:
+        return self._analysis_file_for(path)
 
-    # ───────────────────── internals ─────────────────────
     def _analysis_file_for(self, path: Path) -> Path:
-        # name-based, but also invalidated by mtime/size check in payload
-        return self.analysis_dir / (path.name + ".analysis.json")
+        p = Path(path).resolve()
+        return self.analysis_dir / f"{p.name}.analysis.json"
+
+    def _candidate_analysis_files_for(self, path: Path) -> List[Path]:
+        return [self._analysis_file_for(path)]
 
     def _needs_analysis(self, path: Path) -> bool:
         return self.load_cached(path) is None
@@ -648,3 +802,4 @@ class AudioAnalysisManager(QtCore.QObject):
         self.analysisFailed.emit(path_str, msg)
 
         QtCore.QTimer.singleShot(0, self._start_next)
+

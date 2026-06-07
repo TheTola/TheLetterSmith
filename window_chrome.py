@@ -43,6 +43,12 @@ class StandardTitleBar(QtWidgets.QFrame):
         self.title_label.setObjectName("windowTitleLabel")
         self.title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self._layout.addWidget(self.title_label)
+
+        self._content_layout = QtWidgets.QHBoxLayout()
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(6)
+        self._layout.addLayout(self._content_layout)
+
         self._layout.addStretch(1)
 
         self._controls_layout = QtWidgets.QHBoxLayout()
@@ -155,6 +161,19 @@ class StandardTitleBar(QtWidgets.QFrame):
         button = self._make_button(text, tooltip, object_name, slot)
         self._controls_layout.insertWidget(0, button)
         return button
+
+    def add_content_widget(
+        self,
+        widget: QtWidgets.QWidget,
+        *,
+        stretch: int = 0,
+        alignment: Qt.AlignmentFlag = Qt.AlignmentFlag(0),
+    ) -> QtWidgets.QWidget:
+        self._content_layout.addWidget(widget, stretch, alignment)
+        return widget
+
+    def add_content_spacing(self, spacing: int) -> None:
+        self._content_layout.addSpacing(max(0, int(spacing)))
 
     def sync_window_state(self) -> None:
         if not self.btn_maximize.isVisible():

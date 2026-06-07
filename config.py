@@ -27,9 +27,29 @@ from typing import Dict, List, Optional
 # Project + settings
 # ─────────────────────────────────────────────────────────────────────────────
 SETTINGS_FILE = "settings.json"
+PUBLISHED_PAGE_URL_KEY = "published_page_url"
+PLAY_METADATA_FILE = "lettersmith-metadata.json"
 
 DEFAULT_VOLUME = 31        # 0–100 (0 is valid)
 DEFAULT_AUDIO = "music.mp3"
+
+# Curtain style settings
+CURTAIN_STYLE_KEY = "curtain_style"
+CURTAIN_STYLE_WHITE = "pure_white"
+CURTAIN_STYLE_AVERAGE = "average_color"
+CURTAIN_STYLE_COMPLEMENTARY = "complementary_average_color"
+DEFAULT_CURTAIN_STYLE = CURTAIN_STYLE_WHITE
+VALID_CURTAIN_STYLES = {
+    CURTAIN_STYLE_WHITE,
+    CURTAIN_STYLE_AVERAGE,
+    CURTAIN_STYLE_COMPLEMENTARY,
+}
+CURTAIN_STYLE_LABELS = {
+    CURTAIN_STYLE_WHITE: "Pure White",
+    CURTAIN_STYLE_AVERAGE: "Average Color",
+    CURTAIN_STYLE_COMPLEMENTARY: "Complementary Average Color",
+}
+
 
 
 def _project_root() -> Path:
@@ -79,6 +99,8 @@ CONTROL_FILES = [
     "ppage.png",
     "cleft.png",
     "cright.png",
+    "R_cleft.png",
+    "R_cright.png",
     "volon.png",
     "voloff.png",
     "showmessageicon.png",
@@ -133,6 +155,32 @@ def _load_settings(project_root: str | Path) -> Dict:
 
     if data.get("last_audio") != last_audio:
         data["last_audio"] = last_audio
+        updated = True
+
+    # curtain_style
+    style = str(data.get(CURTAIN_STYLE_KEY, DEFAULT_CURTAIN_STYLE)).strip().lower()
+    aliases = {
+        "white": CURTAIN_STYLE_WHITE,
+        "pure white": CURTAIN_STYLE_WHITE,
+        "pure_white": CURTAIN_STYLE_WHITE,
+        "blank": CURTAIN_STYLE_WHITE,
+        "original": CURTAIN_STYLE_WHITE,
+        "average": CURTAIN_STYLE_AVERAGE,
+        "average color": CURTAIN_STYLE_AVERAGE,
+        "average_color": CURTAIN_STYLE_AVERAGE,
+        "common": CURTAIN_STYLE_AVERAGE,
+        "common color": CURTAIN_STYLE_AVERAGE,
+        "complementary": CURTAIN_STYLE_COMPLEMENTARY,
+        "complementary average": CURTAIN_STYLE_COMPLEMENTARY,
+        "complementary average color": CURTAIN_STYLE_COMPLEMENTARY,
+        "complementary_average_color": CURTAIN_STYLE_COMPLEMENTARY,
+    }
+    style = aliases.get(style, style)
+    if style not in VALID_CURTAIN_STYLES:
+        style = DEFAULT_CURTAIN_STYLE
+
+    if data.get(CURTAIN_STYLE_KEY) != style:
+        data[CURTAIN_STYLE_KEY] = style
         updated = True
 
     if updated:
@@ -323,8 +371,17 @@ class Config:
 __all__ = [
     # settings
     "SETTINGS_FILE",
+    "PUBLISHED_PAGE_URL_KEY",
+    "PLAY_METADATA_FILE",
     "DEFAULT_VOLUME",
     "DEFAULT_AUDIO",
+    "CURTAIN_STYLE_KEY",
+    "CURTAIN_STYLE_WHITE",
+    "CURTAIN_STYLE_AVERAGE",
+    "CURTAIN_STYLE_COMPLEMENTARY",
+    "DEFAULT_CURTAIN_STYLE",
+    "VALID_CURTAIN_STYLES",
+    "CURTAIN_STYLE_LABELS",
     "STARTING_VOLUME",
     "LAST_AUDIO",
     "CONFIG_DICT",

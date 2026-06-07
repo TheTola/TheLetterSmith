@@ -13,8 +13,6 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from message_html import normalize_message_document_html, read_text_normalized
-
 # Optional converters (prefer mammoth for DOCX → HTML)
 try:
     import mammoth  # type: ignore
@@ -50,6 +48,38 @@ from config import (
     MESSAGE_IMAGE_FILE,
 )
 
+from message_html import ensure_message_html_from_emessage
+
+PUBLISHED_PAGE_URL_KEY = "published_page_url"
+
+
+def _normalize_page_url(value: str) -> tuple[str, str]:
+    """
+    Normalize a user-entered page URL.
+
+    Returns:
+        (normalized_url, error_message)
+
+    Empty input is valid and clears the saved URL.
+    Non-empty input must resolve to http or https and include a host.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return "", ""
+
+    parsed = QUrl.fromUserInput(raw)
+    if not parsed.isValid() or parsed.isEmpty():
+        return "", "Enter a valid http or https URL."
+
+    scheme = parsed.scheme().lower().strip()
+    if scheme not in {"http", "https"}:
+        return "", "URL must start with http:// or https://."
+
+    if not parsed.host().strip():
+        return "", "URL must include a domain name."
+
+    return parsed.toString(), ""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,12 +88,11 @@ def _atomic_write_text(path: str | os.PathLike, data: str) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
-    normalized = normalize_message_document_html(data)
-    tmp.write_text(normalized, encoding="utf-8")
+    tmp.write_text(data, encoding="utf-8")
     try:
         os.replace(tmp, p)
     except Exception:
-        p.write_text(normalized, encoding="utf-8")
+        p.write_text(data, encoding="utf-8")
 
 
 def _atomic_save_image(img: QImage, path: str) -> bool:
@@ -114,7 +143,42 @@ def _strip_html_for_word_count(html: str) -> str:
 
 
 def _word_count(text_like: str) -> int:
-    return len(re.findall(r"\b\w+\b", text_like))
+    return len(re.findall(r"\w+", text_like))
+
+
+MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
+MESSAGE_OVERLAY_OPACITY_KEY = "message_overlay_opacity"
+DEFAULT_MESSAGE_OVERLAY_PRESET = "paper"
+DEFAULT_MESSAGE_OVERLAY_OPACITY = 68
+MESSAGE_OVERLAY_PRESETS: dict[str, tuple[tuple[int, int, int], str]] = {
+    "black": ((0, 0, 0), "#ffffff"),
+    "white": ((255, 255, 255), "#221710"),
+    "paper": ((245, 235, 210), "#221710"),
+    "clear": ((255, 255, 255), "#221710"),
+}
+
+
+def _message_overlay_settings(settings_path: str | os.PathLike) -> tuple[str, int, tuple[int, int, int], str]:
+    try:
+        data = json.loads(Path(settings_path).read_text(encoding="utf-8")) if Path(settings_path).exists() else {}
+    except Exception:
+        data = {}
+
+    preset = str(data.get(MESSAGE_OVERLAY_PRESET_KEY, DEFAULT_MESSAGE_OVERLAY_PRESET)).strip().lower()
+    if preset not in MESSAGE_OVERLAY_PRESETS:
+        preset = DEFAULT_MESSAGE_OVERLAY_PRESET
+
+    try:
+        opacity = int(data.get(MESSAGE_OVERLAY_OPACITY_KEY, DEFAULT_MESSAGE_OVERLAY_OPACITY))
+    except Exception:
+        opacity = DEFAULT_MESSAGE_OVERLAY_OPACITY
+    opacity = max(0, min(100, opacity))
+
+    if preset == "clear":
+        opacity = 0
+
+    rgb, ink = MESSAGE_OVERLAY_PRESETS[preset]
+    return preset, opacity, rgb, ink
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -219,15 +283,97 @@ class DropMessageButton(QtWidgets.QPushButton):
                 break
 
 
+
+
+class _CommitLockedLineEdit(QtWidgets.QLineEdit):
+    """
+    QLineEdit that becomes read-only after an explicit Enter commit.
+
+    Double-click unlocks it for correction. This is used for fields where a
+    value should not be accidentally changed by tab switching or focus loss.
+    """
+
+    unlocked = Signal()
+
+    def __init__(self, text: str = "", parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(text, parent)
+        self._commit_locked = False
+        self._base_tooltip = ""
+
+    def setToolTip(self, text: str) -> None:  # type: ignore[override]
+        self._base_tooltip = text or ""
+        super().setToolTip(self._locked_tooltip() if self._commit_locked else self._base_tooltip)
+
+    def is_commit_locked(self) -> bool:
+        return self._commit_locked
+
+    def set_commit_locked(self, locked: bool) -> None:
+        locked = bool(locked)
+        self._commit_locked = locked
+        self.setReadOnly(locked)
+        self.setCursor(Qt.ArrowCursor if locked else Qt.IBeamCursor)
+        self.setClearButtonEnabled(not locked)
+        super().setToolTip(self._locked_tooltip() if locked else self._base_tooltip)
+        self._apply_lock_style()
+
+    def _locked_tooltip(self) -> str:
+        base = self._base_tooltip.strip()
+        suffix = "Double-click to unlock and edit. Press Enter to set again."
+        return f"{base}\n{suffix}" if base else suffix
+
+    def _apply_lock_style(self) -> None:
+        if self._commit_locked:
+            self.setStyleSheet(
+                "QLineEdit {"
+                " background:#151821;"
+                " border:1px solid #3a4558;"
+                " border-radius:6px;"
+                " color:#bfc5d1;"
+                " padding:4px 7px;"
+                "}"
+            )
+        else:
+            self.setStyleSheet("")
+
+    def mark_invalid(self) -> None:
+        self._commit_locked = False
+        self.setReadOnly(False)
+        self.setCursor(Qt.IBeamCursor)
+        self.setClearButtonEnabled(True)
+        self.setStyleSheet(
+            "QLineEdit {"
+            " border:1px solid #ff4d4f;"
+            " border-radius:6px;"
+            " padding:4px 7px;"
+            "}"
+        )
+
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
+        if self._commit_locked:
+            self.set_commit_locked(False)
+            self.selectAll()
+            self.unlocked.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main Message Tab
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MessageTab(QtWidgets.QWidget):
-    # Public contract used by Nexus/Over_Nexus — DO NOT REMOVE
+    """
+    Message authoring tab.
+
+    Public signals consumed by Nexus:
+    - text_selected: emits HTML for the shared HTML preview.
+    - preview_image: emits message.png or wall.png thumbnails for the shared image preview.
+    - published_page_url_changed: notifies Forge when the saved page URL changes.
+    """
     text_selected = Signal(str)
     preview_image = Signal(QPixmap)
-    wall_preview = Signal(QPixmap)
+    published_page_url_changed = Signal(str)
 
     def __init__(self, project_root: str) -> None:
         super().__init__()
@@ -250,20 +396,47 @@ class MessageTab(QtWidgets.QWidget):
         layout.addWidget(header)
 
         self.title_sister_container = QtWidgets.QWidget(self)
-        title_sister_layout = QtWidgets.QFormLayout(self.title_sister_container)
+        title_sister_layout = QtWidgets.QHBoxLayout(self.title_sister_container)
         title_sister_layout.setContentsMargins(0, 0, 0, 0)
-        title_sister_layout.setSpacing(8)
+        title_sister_layout.setSpacing(10)
+
+        def _field_label(text: str) -> QtWidgets.QLabel:
+            lbl = QtWidgets.QLabel(text)
+            lbl.setFont(QFont("Lucida Handwriting", 10))
+            lbl.setStyleSheet("color:#d7e7ef;")
+            lbl.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
+            return lbl
 
         self.title_input = QtWidgets.QLineEdit(self.settings.get("recipient_title", ""))
-        self.title_input.setPlaceholderText("e.g. Letter Title")
-        self.name_input = QtWidgets.QLineEdit(self.settings.get("recipient_name", ""))
+        self.title_input.setPlaceholderText("Letter title")
+        self.title_input.setMinimumWidth(170)
+
+        saved_name = str(self.settings.get("recipient_name", "")).strip()
+        self.name_input = _CommitLockedLineEdit(saved_name)
         self.name_input.setPlaceholderText("Name")
+        self.name_input.setMinimumWidth(150)
+        self.name_input.setToolTip("Press Enter to set Sister. Double-click later to edit.")
+        self._set_name_locked(bool(saved_name and self.settings.get("recipient_name_locked", True)))
 
-        title_sister_layout.addRow("Letter Title:", self.title_input)
-        title_sister_layout.addRow("Sister:", self.name_input)
+        saved_url, _url_error = _normalize_page_url(str(self.settings.get(PUBLISHED_PAGE_URL_KEY, "")))
+        self.url_input = _CommitLockedLineEdit(saved_url)
+        self.url_input.setPlaceholderText("https://username.github.io/page/")
+        self.url_input.setMinimumWidth(260)
+        self.url_input.setToolTip("Press Enter to set the GitHub Pages URL used by Forge → Go to Page.")
+        self._set_url_locked(bool(saved_url and self.settings.get("published_page_url_locked", True)))
 
-        self.title_input.editingFinished.connect(self._save_settings)
-        self.name_input.editingFinished.connect(self._save_settings)
+        title_sister_layout.addWidget(_field_label("Letter Title:"), 0)
+        title_sister_layout.addWidget(self.title_input, 2)
+        title_sister_layout.addWidget(_field_label("Sister:"), 0)
+        title_sister_layout.addWidget(self.name_input, 2)
+        title_sister_layout.addWidget(_field_label("URL:"), 0)
+        title_sister_layout.addWidget(self.url_input, 4)
+
+        self.title_input.editingFinished.connect(self._save_title_settings)
+        self.name_input.returnPressed.connect(self._commit_sister_name)
+        self.url_input.returnPressed.connect(self._commit_page_url)
+        self.name_input.unlocked.connect(lambda: self.status.setText("Sister unlocked. Press Enter to set again."))
+        self.url_input.unlocked.connect(lambda: self.status.setText("URL unlocked. Press Enter to set again."))
 
         layout.addWidget(self.title_sister_container)
 
@@ -299,19 +472,12 @@ class MessageTab(QtWidgets.QWidget):
     # ──────────────────────────────────────────────────────────────────
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
         super().showEvent(event)
-        # When user lands on the tab: force wall fallback, then show message.png if present else wall.
+        self._sync_inputs_from_settings()
+        # When user lands on the tab: force wall/html fallback, then show message.png if present else wall.
         self._ensure_wall_exists()
+        self._ensure_message_html_exists()
         self._ensure_message_exists()
         self._emit_best_preview()
-
-    # ──────────────────────────────────────────────────────────────────
-    # Nexus / Over_Nexus hooks
-    # ──────────────────────────────────────────────────────────────────
-    def toggle_title_sister_area(self) -> None:
-        self.title_sister_container.setVisible(not self.title_sister_container.isVisible())
-
-    def open_message_editor(self) -> None:
-        self.open_editor()
 
     # ──────────────────────────────────────────────────────────────────
     # Settings
@@ -325,16 +491,128 @@ class MessageTab(QtWidgets.QWidget):
         if not isinstance(self.settings, dict):
             self.settings = {}
 
-    def _save_settings(self) -> None:
-        self.settings["recipient_title"] = self.title_input.text().strip()
-        self.settings["recipient_name"] = self.name_input.text().strip()
+    def _sync_inputs_from_settings(self) -> None:
+        """Refresh visible fields from settings.json without emitting changes."""
+        self._load_settings()
         try:
-            Path(self.settings_path).parent.mkdir(parents=True, exist_ok=True)
-            with open(self.settings_path, "w", encoding="utf-8") as f:
-                json.dump(self.settings, f, indent=2)
-            self.status.setText("💾 Recipient info saved.")
+            self.title_input.setText(str(self.settings.get("recipient_title", "")).strip())
+
+            saved_name = str(self.settings.get("recipient_name", "")).strip()
+            self.name_input.setText(saved_name)
+            self._set_name_locked(bool(saved_name and self.settings.get("recipient_name_locked", True)))
+
+            saved_url, _ = _normalize_page_url(str(self.settings.get(PUBLISHED_PAGE_URL_KEY, "")).strip())
+            self.url_input.setText(saved_url)
+            self._set_url_locked(bool(saved_url and self.settings.get("published_page_url_locked", True)))
+        except Exception:
+            pass
+
+    def _write_settings(self) -> None:
+        Path(self.settings_path).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            disk_settings = json.loads(Path(self.settings_path).read_text(encoding="utf-8"))
+        except Exception:
+            disk_settings = {}
+        if not isinstance(disk_settings, dict):
+            disk_settings = {}
+
+        for key in (MESSAGE_OVERLAY_PRESET_KEY, MESSAGE_OVERLAY_OPACITY_KEY):
+            if key in disk_settings:
+                self.settings[key] = disk_settings[key]
+
+        with open(self.settings_path, "w", encoding="utf-8") as f:
+            json.dump(self.settings, f, indent=2)
+
+    def _set_name_locked(self, locked: bool) -> None:
+        try:
+            self.name_input.set_commit_locked(bool(locked))
+        except Exception:
+            pass
+
+    def _set_url_locked(self, locked: bool) -> None:
+        try:
+            self.url_input.set_commit_locked(bool(locked))
+        except Exception:
+            pass
+
+    def _save_title_settings(self) -> None:
+        self.settings["recipient_title"] = self.title_input.text().strip()
+        try:
+            self._write_settings()
+            self.status.setText("💾 Letter title saved.")
         except Exception as e:
-            self.status.setText(f"❌ Error saving settings: {e}")
+            self.status.setText(f"❌ Error saving title: {e}")
+
+    def _commit_sister_name(self) -> None:
+        """Set Sister only when Enter is pressed, then lock it until double-click."""
+        name = self.name_input.text().strip()
+        self.name_input.setText(name)
+
+        self.settings["recipient_title"] = self.title_input.text().strip()
+        self.settings["recipient_name"] = name
+        self.settings["recipient_name_locked"] = bool(name)
+
+        try:
+            self._write_settings()
+            self._set_name_locked(bool(name))
+            self.status.setText("💾 Sister set. Double-click to edit." if name else "Sister cleared.")
+        except Exception as e:
+            self.status.setText(f"❌ Error saving Sister: {e}")
+
+    def _commit_page_url(self) -> None:
+        """Set URL only when Enter is pressed, then lock it until double-click."""
+        normalized_url, url_error = _normalize_page_url(self.url_input.text())
+        if url_error:
+            self.url_input.mark_invalid()
+            self.status.setText(f"❌ {url_error}")
+            return
+
+        self.settings["recipient_title"] = self.title_input.text().strip()
+        self.settings[PUBLISHED_PAGE_URL_KEY] = normalized_url
+        self.settings["published_page_url_locked"] = bool(normalized_url)
+
+        try:
+            self.url_input.setText(normalized_url)
+            self._write_settings()
+            self._set_url_locked(bool(normalized_url))
+            self.published_page_url_changed.emit(normalized_url)
+            self.status.setText("💾 Page URL set. Double-click to edit." if normalized_url else "Page URL cleared.")
+        except Exception as e:
+            self.status.setText(f"❌ Error saving URL: {e}")
+
+    def _save_settings(self) -> None:
+        """Backward-compatible save hook. Explicit fields still use Enter commits."""
+        self._save_title_settings()
+
+    def set_published_page_url(self, url: str, *, persist: bool = True, announce: bool = True) -> bool:
+        normalized_url, url_error = _normalize_page_url(url)
+        if url_error:
+            if announce:
+                self.status.setText(f"❌ {url_error}")
+            return False
+
+        self.settings["recipient_title"] = self.title_input.text().strip()
+        self.settings[PUBLISHED_PAGE_URL_KEY] = normalized_url
+        self.settings["published_page_url_locked"] = bool(normalized_url)
+
+        try:
+            self.url_input.setText(normalized_url)
+            self._set_url_locked(bool(normalized_url))
+        except Exception:
+            pass
+
+        if persist:
+            try:
+                self._write_settings()
+            except Exception as e:
+                if announce:
+                    self.status.setText(f"❌ Error saving URL: {e}")
+                return False
+
+        self.published_page_url_changed.emit(normalized_url)
+        if announce:
+            self.status.setText("💾 Page URL set. Double-click to edit." if normalized_url else "Page URL cleared.")
+        return True
 
     # ──────────────────────────────────────────────────────────────────
     # Paths (AUTHORITATIVE)
@@ -354,6 +632,22 @@ class MessageTab(QtWidgets.QWidget):
     def _default_message_bg_path(self) -> Path:
         # DEFAULT FALLBACK: gallery/app/pages/Dmessage.png
         return Path(self.project_root) / "gallery" / "app" / "pages" / "Dmessage.png"
+
+    def _ensure_message_html_exists(self, *, overwrite: bool = False) -> bool:
+        """Guarantee message.html exists by rebuilding it from Emessage.docx when needed."""
+        try:
+            html_path = ensure_message_html_from_emessage(self.project_root, overwrite=overwrite)
+            if html_path.is_file():
+                self.current_html = html_path.read_text(encoding="utf-8")
+                if hasattr(self, "edit_btn"):
+                    self.edit_btn.setEnabled(True)
+                return True
+        except Exception as e:
+            try:
+                self.status.setText(f"⚠️ Could not rebuild message.html from Emessage.docx: {e}")
+            except Exception:
+                pass
+        return False
 
     # ──────────────────────────────────────────────────────────────────
     # Fallback pipeline (Dmessage → wall, then wall → message.png if needed)
@@ -381,10 +675,13 @@ class MessageTab(QtWidgets.QWidget):
     def _ensure_message_exists(self) -> None:
         """
         Guarantees message.png exists.
+        - If message.html is missing, recreate it from Emessage.docx first.
         - If missing, render using current_html if available,
           else render a blank message (wall-only).
         - If render fails, force message.png = wall.png (scaled).
         """
+        self._ensure_message_html_exists()
+
         out_png = self._png_path()
         if out_png.exists():
             return
@@ -394,7 +691,7 @@ class MessageTab(QtWidgets.QWidget):
 
         # Try render from HTML if any, else blank
         try:
-            html = (read_text_normalized(self._html_path()) if self._html_path().exists() else "").strip()
+            html = (self._html_path().read_text(encoding="utf-8") if self._html_path().exists() else "").strip()
             if not html:
                 html = "<p></p>"
             self._generate_image(html)
@@ -431,6 +728,7 @@ class MessageTab(QtWidgets.QWidget):
     def _check_existing(self) -> None:
         # Force the fallback pipeline first so the tab never shows black/empty.
         self._ensure_wall_exists()
+        self._ensure_message_html_exists()
         self._ensure_message_exists()
 
         html_path = self._html_path()
@@ -438,7 +736,7 @@ class MessageTab(QtWidgets.QWidget):
 
         if html_path.is_file():
             try:
-                self.current_html = read_text_normalized(html_path)
+                self.current_html = html_path.read_text(encoding="utf-8")
                 self.edit_btn.setEnabled(True)
                 loaded_html = True
             except Exception as e:
@@ -504,13 +802,16 @@ class MessageTab(QtWidgets.QWidget):
     # ──────────────────────────────────────────────────────────────────
     def open_editor(self) -> None:
         html_path = self._html_path()
+        if not html_path.is_file() or html_path.stat().st_size <= 0:
+            self._ensure_message_html_exists()
+
         if html_path.is_file():
             try:
-                html_for_editor = read_text_normalized(html_path)
+                html_for_editor = html_path.read_text(encoding="utf-8")
             except Exception:
                 html_for_editor = self.current_html or ""
         else:
-            html_for_editor = self.current_html or ""
+            html_for_editor = self.current_html or "<p></p>"
 
         full_pix: Optional[QPixmap] = None
         png_path = self._png_path()
@@ -539,11 +840,8 @@ class MessageTab(QtWidgets.QWidget):
 
         html_path = self._html_path()
         try:
-            if html_path.is_file():
-                self.current_html = read_text_normalized(html_path)
-            else:
-                _atomic_write_text(html_path, new_html)
-                self.current_html = normalize_message_document_html(new_html)
+            _atomic_write_text(html_path, new_html)
+            self.current_html = new_html
             self.status.setText("💾 message.html saved.")
             self.edit_btn.setEnabled(True)
         except Exception as e:
@@ -553,8 +851,8 @@ class MessageTab(QtWidgets.QWidget):
         # Always guarantee wall before rendering
         self._ensure_wall_exists()
 
-        self.text_selected.emit(self.current_html)
-        self._generate_image(self.current_html)
+        self.text_selected.emit(new_html)
+        self._generate_image(new_html)
         self._emit_best_preview()
 
     # ──────────────────────────────────────────────────────────────────
@@ -643,7 +941,7 @@ class MessageTab(QtWidgets.QWidget):
         return ""
 
     def _process_file(self, path: str) -> None:
-        html = normalize_message_document_html(self.extract_text(path))
+        html = self.extract_text(path)
         if not html.strip():
             self.status.setText("⚠️ That file had no extractable text.")
             return
@@ -661,7 +959,7 @@ class MessageTab(QtWidgets.QWidget):
         html_path = self._html_path()
         try:
             _atomic_write_text(html_path, html)
-            self.current_html = normalize_message_document_html(html)
+            self.current_html = html
             self.edit_btn.setEnabled(True)
             self.status.setText(f"💾 message.html saved ({Path(path).name}).")
             self.text_selected.emit(html)
@@ -723,17 +1021,24 @@ class MessageTab(QtWidgets.QWidget):
                     )
                     painter.drawImage(0, 0, wall_img)
 
+            # User-controlled text background overlay.
+            _preset, overlay_opacity, overlay_rgb, ink_color = _message_overlay_settings(self.settings_path)
+            if overlay_opacity > 0:
+                r, g, b = overlay_rgb
+                overlay = QtGui.QColor(r, g, b, int(round(255 * (overlay_opacity / 100.0))))
+                painter.fillRect(0, 0, FULL_W, FULL_H, overlay)
+
             # HTML text
             doc = QTextDocument()
             doc.setDefaultFont(QFont("Lucida Handwriting", 12))
 
             doc.setDefaultStyleSheet(
-                "body { color: #ffffff; background: transparent; }"
+                f"body {{ color: {ink_color}; background: transparent; }}"
                 "p { margin: 0 0 12px 0; }"
                 "br { line-height: 1.4; }"
             )
 
-            doc.setHtml(normalize_message_document_html(html))
+            doc.setHtml(html)
             doc.setTextWidth(TEXT_WIDTH)
             doc.setPageSize(QSizeF(TEXT_WIDTH, TEXT_HEIGHT))
 

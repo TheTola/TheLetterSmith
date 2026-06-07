@@ -7,7 +7,7 @@
 #       index.html, styles.css, script.js
 #       gallery/
 #         pages/      (cover/letter/wall/back)
-#         controls/   (npage/ppage/cleft/cright/volon/voloff/showmessageicon)
+#         controls/   (npage/ppage/cleft/cright/R_cleft/R_cright/volon/voloff/showmessageicon)
 #         message/    (message.html, message.png optional)
 #         sounds/     (music, glissando, flip1..flip10)
 #
@@ -36,25 +36,37 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 import webbrowser
 import html as html_lib
-import re
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Iterable
 
+from audio_export import _export_apple_safe_mp3
 from Template import TEMPLATE_HTML, TEMPLATE_CSS, TEMPLATE_JS
+from curtain_color import (
+    FALLBACK_CURTAIN_RGB,
+    extract_deep_dominant_color_from_images,
+    write_tinted_curtain_image,
+)
 from message_html import (
-    extract_font_families,
+    message_html_has_content,
     normalize_message_fragment,
     read_text_normalized,
-    rewrite_font_families,
 )
 from config import (
     SETTINGS_FILE,
+    PUBLISHED_PAGE_URL_KEY,
+    PLAY_METADATA_FILE,
     DEFAULT_VOLUME,
     STARTING_VOLUME,
+    CURTAIN_STYLE_KEY,
+    CURTAIN_STYLE_WHITE,
+    CURTAIN_STYLE_AVERAGE,
+    CURTAIN_STYLE_COMPLEMENTARY,
+    DEFAULT_CURTAIN_STYLE,
+    VALID_CURTAIN_STYLES,
     ensure_output_dirs,
     plan_build,
     validate_required_images,
@@ -63,7 +75,6 @@ from config import (
     USER_CONTROLS_DIR,
     USER_MESSAGE_DIR,
     USER_SOUNDS_DIR,
-    FONTS_DIR,
     REQUIRED_SLIDES,
     CONTROL_FILES,
     MESSAGE_HTML_FILE,
@@ -76,48 +87,8 @@ from config import (
 
 # App-owned SFX live here (relative to project root)
 APP_SOUNDS_DIR = Path("gallery") / "app" / "sounds"
-FONT_REGISTRY_SUFFIX_RE = re.compile(r"\s*\([^)]*\)\s*$")
-FONT_EXPORT_EXTENSIONS = {".ttf", ".otf", ".woff", ".woff2", ".ttc"}
-FONT_DISPLAY_NAME_SUFFIXES = (
-    "",
-    " Regular",
-    " Roman",
-    " Italic",
-    " Oblique",
-    " Bold",
-    " Bold Italic",
-    " Bold Oblique",
-)
-FONT_STYLE_TOKENS = {
-    "thin",
-    "extralight",
-    "ultralight",
-    "light",
-    "semilight",
-    "demilight",
-    "book",
-    "normal",
-    "regular",
-    "roman",
-    "medium",
-    "demibold",
-    "semibold",
-    "bold",
-    "extrabold",
-    "ultrabold",
-    "black",
-    "heavy",
-    "italic",
-    "oblique",
-}
-
-
-@dataclass(frozen=True)
-class ResolvedFontFace:
-    display_name: str
-    source_path: Path
-    weight: int
-    style: str
+CURTAIN_FILES = {"cleft.png", "cright.png"}
+CURTAIN_ANALYSIS_PAGE_ORDER = ("wall.png", "cover.png", "letter.png", "back.png")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,238 +142,6 @@ def _read_text_safe(path: Path) -> str:
         return ""
 
 
-def _normalize_font_display_name(value: str) -> str:
-    return re.sub(r"\s+", " ", FONT_REGISTRY_SUFFIX_RE.sub("", (value or "").strip())).strip()
-
-
-def _font_registry_keys():
-    try:
-        import winreg
-    except Exception:
-        return ()
-
-    return (
-        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
-    )
-
-
-def _font_search_dirs() -> list[Path]:
-    dirs: list[Path] = []
-
-    windir = os.environ.get("WINDIR")
-    if windir:
-        dirs.append(Path(windir) / "Fonts")
-    else:
-        dirs.append(Path(r"C:\Windows") / "Fonts")
-
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        dirs.append(Path(local) / "Microsoft" / "Windows" / "Fonts")
-
-    return dirs
-
-
-def _resolve_font_file_path(value: str, search_dirs: list[Path]) -> Optional[Path]:
-    raw = str(value or "").strip().strip('"')
-    if not raw:
-        return None
-
-    candidate = Path(raw)
-    if candidate.is_file():
-        return candidate
-
-    for base in search_dirs:
-        probe = base / raw
-        if probe.is_file():
-            return probe
-        probe = base / candidate.name
-        if probe.is_file():
-            return probe
-
-    return None
-
-
-@lru_cache(maxsize=1)
-def _load_font_registry() -> tuple[tuple[str, Path], ...]:
-    entries: list[tuple[str, Path]] = []
-    keys = _font_registry_keys()
-    if not keys:
-        return tuple(entries)
-
-    try:
-        import winreg
-    except Exception:
-        return tuple(entries)
-
-    search_dirs = _font_search_dirs()
-    seen: set[tuple[str, str]] = set()
-
-    for root, key_path in keys:
-        try:
-            key = winreg.OpenKey(root, key_path)
-        except OSError:
-            continue
-
-        idx = 0
-        while True:
-            try:
-                name, value, _ = winreg.EnumValue(key, idx)
-            except OSError:
-                break
-
-            idx += 1
-            display_name = _normalize_font_display_name(name)
-            source_path = _resolve_font_file_path(str(value), search_dirs)
-            if not display_name or source_path is None:
-                continue
-
-            source_key = (display_name.casefold(), str(source_path).casefold())
-            if source_key in seen:
-                continue
-            seen.add(source_key)
-            entries.append((display_name, source_path))
-
-    return tuple(entries)
-
-
-def _classify_font_face(display_name: str) -> tuple[int, str]:
-    name = _normalize_font_display_name(display_name).casefold()
-    tokens = set(part for part in re.split(r"[\s-]+", name) if part)
-
-    if "black" in tokens or "heavy" in tokens:
-        weight = 900
-    elif "extrabold" in tokens or "ultrabold" in tokens:
-        weight = 800
-    elif "bold" in tokens:
-        weight = 700
-    elif "demibold" in tokens or "semibold" in tokens:
-        weight = 600
-    elif "medium" in tokens:
-        weight = 500
-    elif "light" in tokens or "book" in tokens:
-        weight = 300
-    elif "thin" in tokens or "extralight" in tokens or "ultralight" in tokens:
-        weight = 200
-    else:
-        weight = 400
-
-    if "italic" in tokens:
-        style = "italic"
-    elif "oblique" in tokens:
-        style = "oblique"
-    else:
-        style = "normal"
-
-    return weight, style
-
-
-def _is_style_suffix_only(display_name: str, family: str) -> bool:
-    normalized_name = _normalize_font_display_name(display_name)
-    normalized_family = _normalize_font_display_name(family)
-    if normalized_name.casefold() == normalized_family.casefold():
-        return True
-    if not normalized_name.lower().startswith(normalized_family.lower() + " "):
-        return False
-
-    suffix = normalized_name[len(normalized_family):].strip()
-    if not suffix:
-        return True
-
-    tokens = [part for part in re.split(r"[\s-]+", suffix.casefold()) if part]
-    return bool(tokens) and all(token in FONT_STYLE_TOKENS for token in tokens)
-
-
-def _resolve_font_faces_for_family(family: str) -> list[ResolvedFontFace]:
-    family_name = _normalize_font_display_name(family)
-    if not family_name:
-        return []
-
-    resolved: dict[tuple[int, str], ResolvedFontFace] = {}
-    registry_entries = _load_font_registry()
-    registry_map = {name.casefold(): path for name, path in registry_entries}
-
-    def register_face(display_name: str, source_path: Path) -> None:
-        ext = source_path.suffix.lower()
-        if ext not in FONT_EXPORT_EXTENSIONS:
-            return
-        weight, style = _classify_font_face(display_name)
-        key = (weight, style)
-        if key not in resolved:
-            resolved[key] = ResolvedFontFace(
-                display_name=display_name,
-                source_path=source_path,
-                weight=weight,
-                style=style,
-            )
-
-    for suffix in FONT_DISPLAY_NAME_SUFFIXES:
-        display_name = f"{family_name}{suffix}"
-        source_path = registry_map.get(display_name.casefold())
-        if source_path is not None:
-            register_face(display_name, source_path)
-
-    for display_name, source_path in registry_entries:
-        if _is_style_suffix_only(display_name, family_name):
-            register_face(display_name, source_path)
-
-    return sorted(resolved.values(), key=lambda face: (face.weight, face.style, face.display_name.casefold()))
-
-
-def _font_face_format(path: Path) -> str:
-    ext = path.suffix.lower()
-    if ext == ".ttf":
-        return " format('truetype')"
-    if ext == ".otf":
-        return " format('opentype')"
-    if ext == ".woff":
-        return " format('woff')"
-    if ext == ".woff2":
-        return " format('woff2')"
-    return ""
-
-
-def _build_embedded_font_payload(message_html: str, fonts_dst: Path) -> tuple[str, str]:
-    families = extract_font_families(message_html)
-    if not families:
-        return message_html, ""
-
-    family_aliases: dict[str, str] = {}
-    css_rules: list[str] = []
-    unresolved: list[str] = []
-
-    for family_index, family in enumerate(families, start=1):
-        faces = _resolve_font_faces_for_family(family)
-        if not faces:
-            unresolved.append(family)
-            continue
-
-        alias = f"LetterSmithEmbeddedFont{family_index}"
-        family_aliases[family] = alias
-
-        for face_index, face in enumerate(faces, start=1):
-            out_name = f"font-{family_index}-{face_index}{face.source_path.suffix.lower()}"
-            _atomic_copy_file(face.source_path, fonts_dst / out_name)
-            css_rules.append(
-                "@font-face{"
-                f"font-family:'{alias}';"
-                f"src:url('gallery/{FONTS_DIR}/{out_name}'){_font_face_format(face.source_path)};"
-                f"font-style:{face.style};"
-                f"font-weight:{face.weight};"
-                "font-display:block;"
-                "}"
-            )
-
-    if unresolved:
-        raise FileNotFoundError(
-            "Could not bundle the selected font files for export:\n"
-            + "\n".join(f"  - {name}" for name in unresolved)
-            + "\nChoose a different font or install the missing font locally before generating."
-        )
-
-    return rewrite_font_families(message_html, family_aliases), "\n".join(css_rules)
-
-
 def _load_settings(project_root: Path) -> dict:
     fp = project_root / SETTINGS_FILE
     try:
@@ -429,6 +168,138 @@ def _starting_volume_from_settings(settings: dict) -> int:
     return max(0, min(100, v))
 
 
+def _curtain_style_from_settings(settings: dict) -> str:
+    style = str(settings.get(CURTAIN_STYLE_KEY, DEFAULT_CURTAIN_STYLE)).strip().lower()
+    aliases = {
+        "white": CURTAIN_STYLE_WHITE,
+        "pure white": CURTAIN_STYLE_WHITE,
+        "pure_white": CURTAIN_STYLE_WHITE,
+        "blank": CURTAIN_STYLE_WHITE,
+        "original": CURTAIN_STYLE_WHITE,
+        "average": CURTAIN_STYLE_AVERAGE,
+        "average color": CURTAIN_STYLE_AVERAGE,
+        "average_color": CURTAIN_STYLE_AVERAGE,
+        "common": CURTAIN_STYLE_AVERAGE,
+        "common color": CURTAIN_STYLE_AVERAGE,
+        "complementary": CURTAIN_STYLE_COMPLEMENTARY,
+        "complementary average": CURTAIN_STYLE_COMPLEMENTARY,
+        "complementary average color": CURTAIN_STYLE_COMPLEMENTARY,
+        "complementary_average_color": CURTAIN_STYLE_COMPLEMENTARY,
+    }
+    style = aliases.get(style, style)
+    return style if style in VALID_CURTAIN_STYLES else DEFAULT_CURTAIN_STYLE
+
+
+def _curtain_analysis_paths(project_root: Path) -> list[Path]:
+    pages_dir = project_root / USER_PAGES_DIR
+    return [pages_dir / name for name in CURTAIN_ANALYSIS_PAGE_ORDER]
+
+
+def _curtain_rgb_for_style(project_root: Path, settings: dict) -> tuple[str, tuple[int, int, int]]:
+    style = _curtain_style_from_settings(settings)
+    if style == CURTAIN_STYLE_WHITE:
+        return style, FALLBACK_CURTAIN_RGB
+
+    hue_shift = 0.5 if style == CURTAIN_STYLE_COMPLEMENTARY else 0.0
+    rgb = extract_deep_dominant_color_from_images(_curtain_analysis_paths(project_root), hue_shift=hue_shift)
+    return style, rgb
+
+
+def _copy_control_files(
+    src_dir: Path,
+    dst_dir: Path,
+    names: list[str],
+    *,
+    curtain_rgb: tuple[int, int, int],
+) -> None:
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        src = src_dir / name
+        dst = dst_dir / name
+        if name in CURTAIN_FILES:
+            write_tinted_curtain_image(src, dst, curtain_rgb)
+        else:
+            _atomic_copy_file(src, dst)
+
+
+def _write_play_metadata(
+    play_dir: Path,
+    *,
+    settings: dict,
+    recipient: str,
+    title: str,
+    curtain_style: str,
+    curtain_rgb: tuple[int, int, int],
+) -> None:
+    metadata = {
+        "recipient_name": recipient,
+        "recipient_title": title,
+        PUBLISHED_PAGE_URL_KEY: str(settings.get(PUBLISHED_PAGE_URL_KEY, "")).strip(),
+        CURTAIN_STYLE_KEY: curtain_style,
+        "curtain_rgb": list(curtain_rgb),
+    }
+    _atomic_write_text(play_dir / PLAY_METADATA_FILE, json.dumps(metadata, indent=2))
+
+
+MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
+MESSAGE_OVERLAY_OPACITY_KEY = "message_overlay_opacity"
+DEFAULT_MESSAGE_OVERLAY_PRESET = "paper"
+DEFAULT_MESSAGE_OVERLAY_OPACITY = 68
+MESSAGE_OVERLAY_PRESETS: dict[str, tuple[tuple[int, int, int], str]] = {
+    "black": ((0, 0, 0), "#ffffff"),
+    "white": ((255, 255, 255), "#221710"),
+    "paper": ((245, 235, 210), "#221710"),
+    "clear": ((255, 255, 255), "#221710"),
+}
+
+
+def _message_overlay_preset_from_settings(settings: dict) -> str:
+    preset = str(settings.get(MESSAGE_OVERLAY_PRESET_KEY, DEFAULT_MESSAGE_OVERLAY_PRESET)).strip().lower()
+    return preset if preset in MESSAGE_OVERLAY_PRESETS else DEFAULT_MESSAGE_OVERLAY_PRESET
+
+
+def _message_overlay_style_from_settings(settings: dict) -> str:
+    preset = _message_overlay_preset_from_settings(settings)
+
+    try:
+        opacity = int(settings.get(MESSAGE_OVERLAY_OPACITY_KEY, DEFAULT_MESSAGE_OVERLAY_OPACITY))
+    except Exception:
+        opacity = DEFAULT_MESSAGE_OVERLAY_OPACITY
+    opacity = max(0, min(100, opacity))
+    if preset == "clear":
+        opacity = 0
+
+    (r, g, b), ink = MESSAGE_OVERLAY_PRESETS[preset]
+    alpha = max(0.0, min(1.0, opacity / 100.0))
+    return (
+        f"--message-overlay-rgb:{r},{g},{b};"
+        f"--message-overlay-opacity:{alpha:.3f};"
+        f"--message-ink:{ink};"
+        f"--wall-fade-ms:900ms;"
+    )
+
+
+def _message_overlay_html(message_html: str, overlay_style: str) -> str:
+    return (
+        '<button id="close-text" class="hud-button hud-button-close" type="button" '
+        'title="Close Text" aria-label="Close message" aria-controls="textWall">&times;</button>\n'
+        f'      <div class="text-wall" id="textWall" role="dialog" aria-modal="false" '
+        f'aria-label="Message text" aria-hidden="true" tabindex="-1" style="{overlay_style}">\n'
+        f'        <div class="text-wall-content" id="textWallContent">{message_html}</div>\n'
+        f'      </div>'
+    )
+
+
+def _message_button_html() -> str:
+    return (
+        '<button id="open-text" class="hud-button hud-button-icon" type="button" '
+        'title="Show Message" aria-label="Show message" aria-controls="textWall" '
+        'aria-expanded="false" aria-hidden="true">\n'
+        '      <img src="gallery/controls/showmessageicon.png" alt="" aria-hidden="true" decoding="async">\n'
+        '    </button>'
+    )
+
+
 def _require_file(path: Path, *, what: str, expected_rel_hint: Optional[str] = None) -> None:
     if path.is_file():
         return
@@ -440,12 +311,28 @@ def _validate_template_placeholders() -> None:
     """
     Fail fast if Template.py changes and placeholders drift.
     """
-    required = ("{{TITLE}}", "{{MESSAGE_HTML}}", "{{INITIAL_VOLUME}}")
+    required = (
+        "{{TITLE}}",
+        "{{BUILD_ID}}",
+        "{{INITIAL_VOLUME}}",
+        "{{HAS_MESSAGE}}",
+        "{{MESSAGE_OVERLAY_HTML}}",
+        "{{MESSAGE_BUTTON_HTML}}",
+        "{{MESSAGE_OVERLAY_PRESET}}",
+    )
     missing = [k for k in required if k not in TEMPLATE_HTML]
     if missing:
         raise TemplateDriftError(
             "Template drift detected: TEMPLATE_HTML is missing placeholder(s): "
             + ", ".join(missing)
+        )
+
+    required_js = ("{{BUILD_ID}}",)
+    missing_js = [k for k in required_js if k not in TEMPLATE_JS]
+    if missing_js:
+        raise TemplateDriftError(
+            "Template drift detected: TEMPLATE_JS is missing placeholder(s): "
+            + ", ".join(missing_js)
         )
 
     # Optional sanity checks (non-fatal, but good to catch major layout change)
@@ -503,7 +390,10 @@ def _seed_sfx_into_build(
             missing.append(name)
             continue
 
-        _atomic_copy_file(src, sounds_dst / name)
+        try:
+            _export_apple_safe_mp3(src, sounds_dst / name)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to prepare app SFX for Play build ({name}): {exc}") from exc
 
     if missing:
         # Produce a concrete, actionable error message
@@ -568,19 +458,18 @@ def generate_play_bundle(
             f"Expected files: {CONTROL_FILES}"
         )
 
-    # Validate user music exists
+    # User music is optional. Image-only letters should still build.
     user_sounds = pr / USER_SOUNDS_DIR
-    _require_file(
-        user_sounds / MUSIC_FILE,
-        what="user music (music.mp3)",
-        expected_rel_hint=f"{Path(USER_SOUNDS_DIR) / MUSIC_FILE}",
-    )
+    user_music = user_sounds / MUSIC_FILE
+    has_user_music = user_music.is_file()
+    build_id = str(int(time.time()))
 
     # Settings drive deterministic output path
     settings = _load_settings(pr)
     recipient = _recipient_from_settings(settings)
     title = _title_from_settings(settings, recipient)
     starting_vol = _starting_volume_from_settings(settings)
+    curtain_style, curtain_rgb = _curtain_rgb_for_style(pr, settings)
 
     # Deterministic Play folder (NO timestamp; overwrites same location)
     bp = plan_build(pr, recipient=recipient, title=title)
@@ -590,7 +479,6 @@ def generate_play_bundle(
     controls_dst = bp.play_controls_dir
     message_dst = bp.play_message_dir
     sounds_dst = bp.play_sounds_dir
-    fonts_dst = bp.play_fonts_dir
 
     # Source dirs (user)
     pages_src = pr / USER_PAGES_DIR
@@ -600,7 +488,7 @@ def generate_play_bundle(
 
     # Copy pages/controls (required)
     _copy_required_files(pages_src, pages_dst, REQUIRED_SLIDES)
-    _copy_required_files(controls_src, controls_dst, CONTROL_FILES)
+    _copy_control_files(controls_src, controls_dst, CONTROL_FILES, curtain_rgb=curtain_rgb)
 
     # Copy message files (optional)
     if msg_html_src.is_file():
@@ -608,11 +496,15 @@ def generate_play_bundle(
     if msg_png_src.is_file():
         _atomic_copy_file(msg_png_src, message_dst / "message.png")
 
-    # Copy sounds:
-    # - music from user
-    _atomic_copy_file(user_sounds / MUSIC_FILE, sounds_dst / MUSIC_FILE)
+    # Export sounds:
+    # - optional user music
+    if has_user_music:
+        try:
+            _export_apple_safe_mp3(user_music, sounds_dst / MUSIC_FILE)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to prepare user music for Play build: {exc}") from exc
 
-    # - seed/copy SFX into the build (app preferred, optional user fallback)
+    # - seed/export SFX into the build (app preferred, optional user fallback)
     _seed_sfx_into_build(
         project_root=pr,
         sounds_dst=sounds_dst,
@@ -620,25 +512,42 @@ def generate_play_bundle(
         allow_user_sfx_fallback=allow_user_sfx_fallback,
     )
 
+    # Write CSS/JS
+    _atomic_write_text(bp.play_dir / "styles.css", TEMPLATE_CSS)
+    _atomic_write_text(bp.play_dir / "script.js", TEMPLATE_JS.replace("{{BUILD_ID}}", build_id))
+
     # Message HTML injection (prefer passed string, else disk)
     if message_html is None:
         message_html = _read_text_safe(msg_html_src)
-    message_html = normalize_message_fragment(message_html)
-    message_html, embedded_font_css = _build_embedded_font_payload(message_html, fonts_dst)
-    safe_title = html_lib.escape(title, quote=False)
 
-    # Write CSS/JS
-    styles_css = TEMPLATE_CSS if not embedded_font_css else f"{embedded_font_css}\n\n{TEMPLATE_CSS}"
-    _atomic_write_text(bp.play_dir / "styles.css", styles_css)
-    _atomic_write_text(bp.play_dir / "script.js", TEMPLATE_JS)
+    has_message_html = message_html_has_content(message_html or "")
+    message_html = normalize_message_fragment(message_html or "") if has_message_html else ""
+    overlay_style = _message_overlay_style_from_settings(settings)
+    has_message_js = "true" if has_message_html else "false"
 
-    built_html = (
+    html = (
         TEMPLATE_HTML
-        .replace("{{TITLE}}", safe_title)
-        .replace("{{MESSAGE_HTML}}", message_html)
+        .replace("{{TITLE}}", html_lib.escape(title, quote=False))
+        .replace("{{BUILD_ID}}", build_id)
+        .replace("{{HAS_MESSAGE}}", has_message_js)
+        .replace("{{MESSAGE_OVERLAY_HTML}}", _message_overlay_html(message_html, overlay_style) if has_message_html else "")
+        .replace("{{MESSAGE_BUTTON_HTML}}", _message_button_html() if has_message_html else "")
         .replace("{{INITIAL_VOLUME}}", str(starting_vol))
+        .replace("{{MESSAGE_OVERLAY_PRESET}}", _message_overlay_preset_from_settings(settings))
     )
-    _atomic_write_text(bp.play_dir / "index.html", built_html)
+
+    if not has_user_music:
+        html = html.replace('data-has-user-music="true"', 'data-has-user-music="false"')
+
+    _atomic_write_text(bp.play_dir / "index.html", html)
+    _write_play_metadata(
+        bp.play_dir,
+        settings=settings,
+        recipient=recipient,
+        title=title,
+        curtain_style=curtain_style,
+        curtain_rgb=curtain_rgb,
+    )
 
     if open_in_browser:
         try:
