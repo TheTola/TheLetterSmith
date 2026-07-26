@@ -21,19 +21,14 @@ except Exception:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Try to import the premium visualizer.
-# Prefer the unified sound_visualizer module; fall back to legacy audio_visualizer.
-# If both fail, use the built-in minimal visualizer.
+# Try to import the full visualizer. If it fails, use the built-in minimal visualizer.
 # ─────────────────────────────────────────────────────────────────────────────
 _AudioVisualizerUltra = None  # type: ignore[var-annotated]
 
 try:
     from sound_visualizer import AudioVisualizerUltra as _AudioVisualizerUltra  # type: ignore
 except Exception:
-    try:
-        from audio_visualizer import AudioVisualizerUltra as _AudioVisualizerUltra  # type: ignore  # legacy
-    except Exception:
-        _AudioVisualizerUltra = None
+    _AudioVisualizerUltra = None
 
 
 def _b64z_unpack_u8(s: str) -> bytes:

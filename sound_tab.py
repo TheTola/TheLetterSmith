@@ -1263,7 +1263,6 @@ class WaveHandler(QtCore.QObject):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SoundTab(QtWidgets.QWidget):
-    preview_movie = QtCore.Signal(QtGui.QMovie)        # legacy signal (kept)
     preview_widget = QtCore.Signal(QtWidgets.QWidget)  # visualizer widget
 
     def __init__(self, project_root):

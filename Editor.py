@@ -567,52 +567,6 @@ class RichTextEdit(QTextEdit):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Preview Widget
-# ─────────────────────────────────────────────────────────────────────────────
-
-class PreviewWidget(QtWidgets.QWidget):
-    def __init__(
-        self,
-        background_path: Optional[Path],
-        editor: QTextEdit,
-        preview_pixmap: Optional[QPixmap] = None,
-        parent=None
-    ) -> None:
-        super().__init__(parent)
-        self._bg_path = Path(background_path) if background_path else None
-        self._bg_pm: Optional[QPixmap] = preview_pixmap if (preview_pixmap and not preview_pixmap.isNull()) else None
-        self._editor = editor
-        self.setMinimumWidth(320)
-
-    def paintEvent(self, _event) -> None:
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
-        w, h = self.width(), self.height()
-
-        pm = self._bg_pm
-        if pm is None and self._bg_path and self._bg_path.exists():
-            pm = QPixmap(str(self._bg_path))
-
-        if pm and not pm.isNull():
-            bg = pm.scaled(w, h, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-            painter.drawPixmap(0, 0, bg)
-        else:
-            painter.fillRect(self.rect(), Qt.black)
-
-        doc = QtGui.QTextDocument()
-        doc.setHtml(self._editor.toHtml())
-
-        margin = 16
-        doc.setTextWidth(max(1, w - margin * 2))
-
-        painter.save()
-        painter.translate(margin, margin)
-        doc.drawContents(painter, QtCore.QRectF(0, 0, w - margin * 2, h - margin * 2))
-        painter.restore()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Editor Dialog
 # ─────────────────────────────────────────────────────────────────────────────
 

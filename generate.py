@@ -300,13 +300,6 @@ def _message_button_html() -> str:
     )
 
 
-def _require_file(path: Path, *, what: str, expected_rel_hint: Optional[str] = None) -> None:
-    if path.is_file():
-        return
-    hint = f"\nExpected: {expected_rel_hint}" if expected_rel_hint else ""
-    raise FileNotFoundError(f"Missing {what}: {path}{hint}")
-
-
 def _validate_template_placeholders() -> None:
     """
     Fail fast if Template.py changes and placeholders drift.

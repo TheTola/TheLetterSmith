@@ -12,7 +12,6 @@ DOC_GUID_RE = re.compile(
     re.IGNORECASE,
 )
 STYLE_ATTR_RE = re.compile(r"\sstyle=(['\"])(.*?)\1", re.IGNORECASE | re.DOTALL)
-FONT_FAMILY_DECL_RE = re.compile(r"(font-family\s*:\s*)([^;]+)", re.IGNORECASE)
 CSS_LENGTH_RE = re.compile(r"^(-?\d+(?:\.\d+)?)(pt|px|em|rem|%)$", re.IGNORECASE)
 CSS_LINE_HEIGHT_RE = re.compile(r"^(-?\d+(?:\.\d+)?)%?$", re.IGNORECASE)
 FRAGMENT_NOISE_TAG_RE = re.compile(
@@ -20,22 +19,6 @@ FRAGMENT_NOISE_TAG_RE = re.compile(
     re.IGNORECASE,
 )
 INVISIBLE_TEXT_RE = re.compile(r"[\s\u00a0\u200b\u200c\u200d\u2060\ufeff]+")
-
-GENERIC_FONT_FAMILIES = {
-    "serif",
-    "sans-serif",
-    "monospace",
-    "cursive",
-    "fantasy",
-    "system-ui",
-    "ui-serif",
-    "ui-sans-serif",
-    "ui-monospace",
-    "ui-rounded",
-    "emoji",
-    "math",
-    "fangsong",
-}
 
 MOJIBAKE_MARKERS = (
     "â€™",
@@ -74,49 +57,6 @@ def _normalize_newlines(text: str) -> str:
 def _format_decimal(value: float) -> str:
     text = f"{value:.3f}".rstrip("0").rstrip(".")
     return text or "0"
-
-
-def _font_key(value: str) -> str:
-    return re.sub(r"\s+", " ", (value or "").strip().strip("\"'")).casefold()
-
-
-def _split_css_font_family_list(value: str) -> list[str]:
-    parts: list[str] = []
-    buf: list[str] = []
-    quote = ""
-
-    for ch in value or "":
-        if quote:
-            buf.append(ch)
-            if ch == quote:
-                quote = ""
-            continue
-
-        if ch in ("'", '"'):
-            quote = ch
-            buf.append(ch)
-            continue
-
-        if ch == ",":
-            part = "".join(buf).strip()
-            if part:
-                parts.append(part)
-            buf = []
-            continue
-
-        buf.append(ch)
-
-    part = "".join(buf).strip()
-    if part:
-        parts.append(part)
-    return parts
-
-
-def _unquote_css_font_family(value: str) -> str:
-    text = (value or "").strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
-        text = text[1:-1]
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def _mojibake_score(text: str) -> int:
@@ -269,63 +209,6 @@ def _clean_style_attrs(html: str) -> str:
     return STYLE_ATTR_RE.sub(repl, html)
 
 
-def extract_font_families(raw: str) -> list[str]:
-    text = normalize_message_document_html(raw)
-    if not text:
-        return []
-
-    seen: set[str] = set()
-    families: list[str] = []
-
-    for match in FONT_FAMILY_DECL_RE.finditer(text):
-        for part in _split_css_font_family_list(match.group(2)):
-            family = _unquote_css_font_family(part)
-            key = _font_key(family)
-            if not family or key in GENERIC_FONT_FAMILIES or key in seen:
-                continue
-            seen.add(key)
-            families.append(family)
-
-    return families
-
-
-def rewrite_font_families(
-    raw: str,
-    family_aliases: dict[str, str],
-    *,
-    raw_css: bool = False,
-    prepend: bool = True,
-) -> str:
-    if not raw or not family_aliases:
-        return raw
-
-    alias_by_key = {_font_key(name): alias for name, alias in family_aliases.items() if alias}
-    if not alias_by_key:
-        return raw
-
-    def repl(match: re.Match[str]) -> str:
-        prefix = match.group(1)
-        value = match.group(2)
-        rebuilt: list[str] = []
-        inserted: set[str] = set()
-
-        for part in _split_css_font_family_list(value):
-            family = _unquote_css_font_family(part)
-            alias = alias_by_key.get(_font_key(family))
-            alias_value = alias if raw_css else (f"'{alias}'" if alias else "")
-            if alias and alias not in inserted and prepend:
-                rebuilt.append(alias_value)
-                inserted.add(alias)
-            rebuilt.append(part.strip())
-            if alias and alias not in inserted and not prepend:
-                rebuilt.append(alias_value)
-                inserted.add(alias)
-
-        return prefix + ", ".join(rebuilt)
-
-    return FONT_FAMILY_DECL_RE.sub(repl, raw)
-
-
 def normalize_message_fragment(raw: str) -> str:
     text = normalize_message_document_html(raw)
     if not text:
@@ -414,16 +297,6 @@ def message_html_has_content(html: str) -> bool:
     except Exception:
         return _visible_text(re.sub(r"<[^>]*>", "", fragment))
     return parser.has_content
-
-
-def message_file_has_content(path: str | Path) -> bool:
-    source = Path(path)
-    if not source.is_file():
-        return False
-    try:
-        return message_html_has_content(read_text_normalized(source))
-    except Exception:
-        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

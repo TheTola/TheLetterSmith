@@ -577,7 +577,6 @@ class Nexus(QtWidgets.QMainWindow):
         self.message_tab.preview_image.connect(self._show_image)
         self.message_tab.text_selected.connect(self._show_html)
 
-        self.sound_tab.preview_movie.connect(self._show_movie)
         self.sound_tab.preview_widget.connect(self._mount_sound_preview)
 
         try:
@@ -664,17 +663,6 @@ class Nexus(QtWidgets.QMainWindow):
                 self.preview_stack.setCurrentIndex(self._sound_preview_index)
         except Exception as ex:
             self.status(f"⚠️ Sound preview mount failed: {ex}")
-
-    def _show_movie(self, movie: QMovie):
-        if movie is None:
-            return
-        try:
-            self._clear_preview()
-            self.image_preview.setMovie(movie)
-            self.preview_stack.setCurrentWidget(self.image_preview)
-            movie.start()
-        except Exception:
-            pass
 
     def _on_message_double_click(self):
         try:

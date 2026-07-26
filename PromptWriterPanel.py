@@ -9,7 +9,7 @@ import json
 import random
 import re
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Callable
@@ -2252,17 +2252,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def _show_reference_message(self, message: str) -> None:
-        try:
-            self.lbl_reference_status.setText(message)
-            self.reference_strip.setVisible(True)
-        except Exception:
-            pass
-        try:
-            QtWidgets.QMessageBox.information(self, "Reference Image", message)
-        except Exception:
-            pass
-
     def _clear_reference_cards(self) -> None:
         try:
             while self.reference_cards_layout.count():
@@ -2358,26 +2347,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self.btn_toggle_references.setText("Hide" if self._references_visible else "Show")
         except Exception:
             pass
-
-    def _set_reference_image_role(self, reference_id: str, role: str) -> bool:
-        normalized_role = _normalize_reference_role(role)
-        for index, ref in enumerate(self._reference_images):
-            if ref.id == reference_id:
-                self._reference_images[index] = replace(ref, role=normalized_role)
-                self._schedule_persist_state()
-                return True
-        return False
-
-    def _reference_image_paths(self) -> List[Path]:
-        paths: List[Path] = []
-        for ref in self._reference_images[:REFERENCE_IMAGE_MAX_COUNT]:
-            try:
-                image_path = Path(ref.path)
-            except Exception:
-                continue
-            if image_path.exists() and image_path.is_file():
-                paths.append(image_path)
-        return paths
 
     def _copy_reference_image_to_clipboard(self, path: object) -> bool:
         try:
@@ -2610,9 +2579,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     text = w.toPlainText().strip()
             parts.append(f"--- {key} ---\n\n{text}" if text else f"--- {key} ---\n\n")
         return "\n\n".join(parts).strip()
-
-    def _build_all_prompts_copy_text(self) -> str:
-        return self._build_copy_all_text()
 
     def copy_all_with_references(self) -> str:
         return self._build_copy_all_text()

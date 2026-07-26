@@ -703,9 +703,6 @@ class AudioAnalysisManager(QtCore.QObject):
         p = Path(path).resolve()
         return self.analysis_dir / f"{p.name}.analysis.json"
 
-    def _candidate_analysis_files_for(self, path: Path) -> List[Path]:
-        return [self._analysis_file_for(path)]
-
     def _needs_analysis(self, path: Path) -> bool:
         return self.load_cached(path) is None
 
