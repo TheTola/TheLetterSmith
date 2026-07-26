@@ -653,10 +653,14 @@ class ForgeTab(QtWidgets.QWidget):
             return ""
 
         report = reporter()
+        embedded = tuple(report.get("embedded", ())) if isinstance(report, dict) else ()
         fallback = tuple(report.get("fallback", ())) if isinstance(report, dict) else ()
-        if not fallback:
-            return ""
-        return "\n- Font fallback used: " + ", ".join(fallback)
+        notes: list[str] = []
+        if embedded:
+            notes.append("\n- Embedded fonts: " + ", ".join(embedded))
+        if fallback:
+            notes.append("\n- Font files not found: " + ", ".join(fallback))
+        return "".join(notes)
 
     def _log(self, text: str) -> None:
         self.status.setPlainText(text)

@@ -1081,6 +1081,49 @@ class _PressGoLabel(QtWidgets.QLabel):
 
         super().leaveEvent(event)
 
+
+class _CommandRevealOverlay(QtWidgets.QWidget):
+    """Dark-to-cyan sweep drawn over the fully laid-out Command page."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self._progress = 1.0
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+
+    def _get_progress(self) -> float:
+        return self._progress
+
+    def _set_progress(self, value: float) -> None:
+        self._progress = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    revealProgress = QtCore.Property(float, _get_progress, _set_progress)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        progress = self._progress
+
+        veil_alpha = int(round(190 * (1.0 - progress)))
+        if veil_alpha:
+            painter.fillRect(self.rect(), QtGui.QColor(7, 10, 16, veil_alpha))
+
+        if progress < 1.0:
+            sweep_x = int(round(self.width() * progress))
+            sweep_width = max(72, self.width() // 7)
+            gradient = QtGui.QLinearGradient(
+                sweep_x - sweep_width,
+                0,
+                sweep_x + sweep_width,
+                0,
+            )
+            gradient.setColorAt(0.0, QtGui.QColor(0, 210, 230, 0))
+            gradient.setColorAt(0.5, QtGui.QColor(0, 210, 230, 105))
+            gradient.setColorAt(1.0, QtGui.QColor(0, 210, 230, 0))
+            painter.fillRect(self.rect(), gradient)
+
+
 class CommandTab(QtWidgets.QWidget):
     """Command page containing the image-backed reset control."""
     wiped = QtCore.Signal()
@@ -1109,6 +1152,19 @@ class CommandTab(QtWidgets.QWidget):
         self.go_btn.setToolTip("Wipe the letter")
         self.go_btn.clicked.connect(lambda: self._do_reset())
 
+        self._reveal_overlay = _CommandRevealOverlay(self)
+        self._reveal_overlay.hide()
+        self._reveal_anim = QtCore.QPropertyAnimation(
+            self._reveal_overlay,
+            b"revealProgress",
+            self,
+        )
+        self._reveal_anim.setDuration(480)
+        self._reveal_anim.setStartValue(0.0)
+        self._reveal_anim.setEndValue(1.0)
+        self._reveal_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self._reveal_anim.finished.connect(self._reveal_overlay.hide)
+
         self._relayout()
 
     def _do_reset(self) -> None:
@@ -1123,11 +1179,26 @@ class CommandTab(QtWidgets.QWidget):
         super().resizeEvent(event)
         self._relayout()
 
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        self._relayout()
+        self._reveal_anim.stop()
+        self._reveal_overlay.setProperty("revealProgress", 0.0)
+        self._reveal_overlay.show()
+        self._reveal_overlay.raise_()
+        self._reveal_anim.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        self._reveal_anim.stop()
+        self._reveal_overlay.hide()
+        super().hideEvent(event)
+
     def _relayout(self) -> None:
         w = max(1, self.width())
         h = max(1, self.height())
 
         self.bg_label.setGeometry(0, 0, w, h)
+        self._reveal_overlay.setGeometry(0, 0, w, h)
 
         if not self._bg_pix.isNull():
             bg_scaled = self._bg_pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -1149,6 +1220,8 @@ class CommandTab(QtWidgets.QWidget):
 
         self.go_btn.set_base(base_rect, go_base)
         self.go_btn.raise_()
+        if self._reveal_overlay.isVisible():
+            self._reveal_overlay.raise_()
 
 def main() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)

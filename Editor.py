@@ -95,6 +95,8 @@ from config import (
 )
 
 from message_html import ensure_message_html_from_emessage
+from editor_diagnostics import record_editor_failure
+from font_export import inspect_font_family
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants & Helpers
@@ -123,47 +125,6 @@ MESSAGE_OVERLAY_PRESETS: dict[str, tuple[str, tuple[int, int, int], str]] = {
 
 ASSET_SUBDIR = "message_assets"  # under gallery/
 
-FONT_FILE_SUFFIXES = (".ttf", ".otf", ".woff", ".woff2")
-BUNDLED_FONT_DIR_CANDIDATES = (
-    "gallery/app/fonts",
-    "gallery/user/fonts",
-    "gallery/fonts",
-    "fonts",
-    "assets/fonts",
-)
-COMMON_SYSTEM_FONT_FAMILIES = {
-    "arial",
-    "calibri",
-    "cambria",
-    "candara",
-    "consolas",
-    "courier new",
-    "georgia",
-    "lucida handwriting",
-    "segoe ui",
-    "tahoma",
-    "times new roman",
-    "trebuchet ms",
-    "verdana",
-}
-FONT_STYLE_NAME_TOKENS = {
-    "black",
-    "bold",
-    "book",
-    "condensed",
-    "demi",
-    "extrabold",
-    "hairline",
-    "heavy",
-    "italic",
-    "light",
-    "medium",
-    "regular",
-    "semibold",
-    "thin",
-}
-
-
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
@@ -173,21 +134,6 @@ def _safe_name(filename: str) -> str:
     out = "".join(("_" if ch in bad else ch) for ch in filename)
     out = out.strip().strip(".")
     return out or "asset"
-
-
-def _font_match_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", (value or "").casefold())
-
-
-def _font_file_match_keys(path: Path) -> set[str]:
-    stem = path.stem
-    raw_parts = [part for part in re.split(r"[\s_\-.]+", stem) if part]
-    filtered_parts = [part for part in raw_parts if part.casefold() not in FONT_STYLE_NAME_TOKENS]
-
-    keys = {_font_match_key(stem)}
-    if filtered_parts:
-        keys.add(_font_match_key(" ".join(filtered_parts)))
-    return {key for key in keys if key}
 
 
 def _hypernote_href(note: str) -> str:
@@ -230,24 +176,26 @@ def _coerce_message_overlay_settings(data: dict) -> tuple[str, int]:
 
 def _atomic_write(path: Path, data: str, *, encoding: str = "utf-8") -> None:
     _ensure_dir(path.parent)
-    tmp = path.with_suffix(path.suffix + f".tmp.{int(time.time() * 1000)}")
-    tmp.write_text(data, encoding=encoding)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        with tmp.open("w", encoding=encoding) as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
 
-    tries = 4
-    for _ in range(tries):
-        try:
-            if path.exists():
-                tmp.replace(path)
-            else:
-                tmp.rename(path)
-            return
-        except Exception:
-            time.sleep(0.05)
+        last_error: Optional[OSError] = None
+        for _ in range(4):
+            try:
+                os.replace(tmp, path)
+                return
+            except OSError as error:
+                last_error = error
+                time.sleep(0.05)
 
-    if path.exists():
-        tmp.replace(path)
-    else:
-        tmp.rename(path)
+        if last_error is not None:
+            raise last_error
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -596,6 +544,8 @@ class Editor(QDialog):
 
         # Tracks the most recent spacing selection (used to force identical browser output)
         self._export_line_spacing: Optional[float] = None
+        self._save_in_progress = False
+        self._saved_html: Optional[str] = None
 
         self.setWindowTitle("Letter Smith — Editor")
         self.setModal(True)
@@ -604,6 +554,7 @@ class Editor(QDialog):
         self._apply_styles()
         self._restore_geometry()
         self._build_ui(preview_pixmap)
+        self.editor.document().setModified(False)
 
 
     def _apply_default_center_alignment_if_plain(self) -> None:
@@ -696,14 +647,14 @@ class Editor(QDialog):
         self.font_info_button.clicked.connect(self.show_font_export_info)
         hb.addWidget(self.font_info_button)
 
-        btn_save = QPushButton("Save")
-        btn_save.setShortcut(QKeySequence.Save)
-        btn_save.clicked.connect(self.apply_changes)
+        self.btn_save = QPushButton("Save")
+        self.btn_save.setShortcut(QKeySequence.Save)
+        self.btn_save.clicked.connect(self.apply_changes)
 
         btn_cancel = QPushButton("Cancel")
         btn_cancel.clicked.connect(self.reject)
 
-        hb.addWidget(btn_save)
+        hb.addWidget(self.btn_save)
         hb.addWidget(btn_cancel)
         main_layout.addLayout(hb)
 
@@ -1037,80 +988,42 @@ class Editor(QDialog):
             point_size = DEFAULT_FONT_SIZE
         return f"{int(round(point_size))} pt"
 
-    def _bundled_font_index(self) -> dict[str, list[Path]]:
-        """Build a filename-based index of project-bundled font files."""
-        cached = getattr(self, "_bundled_font_cache", None)
-        if isinstance(cached, dict):
-            return cached
-
-        index: dict[str, list[Path]] = {}
-        seen: set[Path] = set()
-        for relative_dir in BUNDLED_FONT_DIR_CANDIDATES:
-            folder = (self.project_root / relative_dir).resolve()
-            if not folder.is_dir():
-                continue
-            try:
-                font_files = [p for p in folder.rglob("*") if p.is_file() and p.suffix.casefold() in FONT_FILE_SUFFIXES]
-            except Exception:
-                font_files = []
-            for font_path in font_files:
-                if font_path in seen:
-                    continue
-                seen.add(font_path)
-                for key in _font_file_match_keys(font_path):
-                    index.setdefault(key, []).append(font_path)
-
-        self._bundled_font_cache = index
-        return index
-
-    def _font_export_status(self, family: str) -> tuple[str, list[Path]]:
-        """Return a readable export status and matching bundled font files."""
-        key = _font_match_key(family)
-        bundled = self._bundled_font_index().get(key, [])
-        if bundled:
-            return "Bundled", bundled
-
-        if (family or "").strip().casefold() in COMMON_SYSTEM_FONT_FAMILIES:
-            return "Not bundled — common system font", []
-
-        return "Not bundled", []
-
     def _font_export_info_text(self) -> str:
         """Build the text shown by the bottom info button."""
         family = self._selected_font_family_for_export()
         size_text = self._selected_font_size_text()
-        status, matches = self._font_export_status(family)
+        inspection = inspect_font_family(self.project_root, family)
+        paths = [face.source_path for face in inspection.faces]
 
-        if matches:
-            match_lines = "\n".join(f"- {path}" for path in matches[:8])
-            if len(matches) > 8:
-                match_lines += f"\n- ...and {len(matches) - 8} more"
+        if paths:
+            match_lines = "\n".join(f"- {path}" for path in paths[:8])
+            if len(paths) > 8:
+                match_lines += f"\n- ...and {len(paths) - 8} more"
         else:
-            searched = "\n".join(f"- {self.project_root / item}" for item in BUNDLED_FONT_DIR_CANDIDATES)
-            match_lines = "No matching bundled font file found.\n\nSearched folders:\n" + searched
+            match_lines = "No matching installed or project font file was found."
 
-        if status == "Bundled":
+        if inspection.status == "Ready to embed":
             meaning = (
-                "This font has a matching font file inside the Letter Smith project font folders. "
-                "It is treated as bundled project material rather than depending only on the recipient's computer."
+                "Generate will copy this font into the letter viewer and load it only inside that viewer. "
+                "The recipient does not need the font installed."
             )
-        elif status == "Not bundled — common system font":
+        elif inspection.status == "Embedding restricted":
             meaning = (
-                "This font is common on many Windows systems, but there is no matching bundled font file in the project. "
-                "The viewer may still display it correctly on your machine, but recipient devices can fall back if they do not have it."
+                "The font file marks embedding as restricted, so Generate will stop instead of redistributing it. "
+                "Choose an embeddable font."
             )
         else:
             meaning = (
-                "This font is not bundled in the project font folders. The saved HTML can name the font, "
-                "but the final viewer depends on the recipient/browser having that font or choosing a fallback."
+                "Generate cannot guarantee this font yet. Install it or place a licensed TTF, OTF, WOFF, "
+                "or WOFF2 file in gallery/user/fonts."
             )
 
         return (
             f"Selected font: {family}\n"
             f"Selected size: {size_text}\n"
-            f"Bundled status: {status}\n\n"
+            f"Export status: {inspection.status}\n\n"
             f"{meaning}\n\n"
-            f"Matching bundled file(s):\n{match_lines}"
+            f"Matching font file(s):\n{match_lines}"
         )
 
     def show_font_export_info(self) -> None:
@@ -1176,18 +1089,43 @@ class Editor(QDialog):
     def get_edited_html(self) -> str:
         return self.editor.toHtml()
 
+    def get_saved_html(self) -> Optional[str]:
+        """Return the exact HTML committed by the successful Save action."""
+        return self._saved_html
+
     def apply_changes(self) -> None:
         """
         Save to message.html, but force browser to match spacing chosen in editor by
         injecting a wrapper with inline line-height.
         """
-        content = self.get_edited_html()
-        content = self._inject_export_line_spacing_wrapper(content)
+        if self._save_in_progress:
+            return
+
+        self._save_in_progress = True
+        self.btn_save.setEnabled(False)
         try:
+            content = self.get_edited_html()
+            content = self._inject_export_line_spacing_wrapper(content)
             _atomic_write(self.message_path, content, encoding="utf-8")
+            if self.message_path.read_text(encoding="utf-8") != content:
+                raise OSError("The saved letter could not be verified.")
+            self._saved_html = content
+            self.editor.document().setModified(False)
             self.accept()
         except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"Could not save:\n{type(e).__name__}: {e}")
+            try:
+                log_path = record_editor_failure(self.project_root, "save letter", e)
+                log_note = f"\n\nDetails were written to:\n{log_path}"
+            except Exception:
+                log_note = ""
+            QMessageBox.critical(
+                self,
+                "Save Error",
+                f"Could not save:\n{type(e).__name__}: {e}{log_note}",
+            )
+        finally:
+            self._save_in_progress = False
+            self.btn_save.setEnabled(True)
 
     def _inject_export_line_spacing_wrapper(self, html: str) -> str:
         if not html:

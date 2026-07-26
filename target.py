@@ -39,6 +39,8 @@ from typing import Callable, Iterable, Optional
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
+from app_icon import canonical_icon_paths, configure_windows_app_identity
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Small color helpers (UI accents)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -451,12 +453,13 @@ def open_in_file_explorer_select(path: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def find_app_icon(base_dir: Path) -> Optional[Path]:
+    _, canonical_ico = canonical_icon_paths(base_dir)
     candidates = (
+        canonical_ico,
         base_dir / "gallery" / "icon" / "ls-icon.ico",
         base_dir / "gallery" / "icon" / "LSmith.ico",
         base_dir / "gallery" / "icons" / "LSmith.ico",
         base_dir / "gallery" / "icons" / "ls-icon.ico",
-        base_dir / "gallery" / "app" / "icons" / "folder" / "LSmith.ico",
     )
     for p in candidates:
         if p.exists():
@@ -467,9 +470,22 @@ def find_app_icon(base_dir: Path) -> Optional[Path]:
 def apply_window_icon(win: tk.Tk | tk.Toplevel, icon_path: Optional[Path]) -> None:
     if not icon_path:
         return
+
+    icon_path = Path(icon_path)
+    png_path = icon_path if icon_path.suffix.lower() == ".png" else icon_path.with_suffix(".png")
+    ico_path = icon_path if icon_path.suffix.lower() == ".ico" else icon_path.with_suffix(".ico")
+
+    if png_path.is_file():
+        try:
+            photo = tk.PhotoImage(file=str(png_path))
+            win.iconphoto(True, photo)
+            setattr(win, "_letter_smith_icon_photo", photo)
+        except Exception:
+            pass
+
     try:
-        if os.name == "nt":
-            win.iconbitmap(str(icon_path))
+        if os.name == "nt" and ico_path.is_file():
+            win.iconbitmap(str(ico_path))
     except Exception:
         pass
 
@@ -1242,7 +1258,7 @@ def main() -> None:
     parser.add_argument("--preset", type=str, default="chatgpt", help="chatgpt | flatabs | (empty)")
     parser.add_argument("--stdout", action="store_true", help="Headless: print to stdout and exit.")
     parser.add_argument("--folder", type=str, default=None, help="Headless: folder to scan.")
-    parser.add_argument("--icon", type=str, default=None, help="Optional .ico path (absolute or relative).")
+    parser.add_argument("--icon", type=str, default=None, help="Optional .ico or .png path (absolute or relative).")
     args = parser.parse_args()
 
     base_dir = Path(__file__).resolve().parent
@@ -1274,6 +1290,7 @@ def main() -> None:
         sys.stdout.write(format_output(result, opts))
         return
 
+    configure_windows_app_identity()
     app = TargetApp(preset=(args.preset or None), icon_path=icon_path)
     app.update_idletasks()
 

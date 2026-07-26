@@ -39,6 +39,15 @@ class StandardTitleBar(QtWidgets.QFrame):
         self._layout.setContentsMargins(6, 0, 6, 0)
         self._layout.setSpacing(8)
 
+        self.icon_label = QtWidgets.QLabel(self)
+        self.icon_label.setObjectName("windowIconLabel")
+        self.icon_label.setFixedSize(30, 30)
+        self.icon_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        icon = window.windowIcon()
+        if not icon.isNull():
+            self.icon_label.setPixmap(icon.pixmap(28, 28))
+            self._layout.addWidget(self.icon_label)
+
         self.title_label = QtWidgets.QLabel(title, self)
         self.title_label.setObjectName("windowTitleLabel")
         self.title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)

@@ -40,6 +40,8 @@ except Exception as e:
         f"Original error:\n{e}"
     )
 
+from app_icon import apply_qt_window_icon, canonical_icon_paths
+
 # Visual effects are centralized in anima.py; the shell can run without them.
 try:
     from anima import ParticleBurst, TabSwitcher, install_click_fx
@@ -130,6 +132,18 @@ class TitleBar(QtWidgets.QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 0, 8, 0)
         layout.setSpacing(6)
+
+        app_icon = QtWidgets.QLabel(self)
+        app_icon.setObjectName("AppIcon")
+        app_icon.setFixedSize(30, 30)
+        app_icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        png_path, _ = canonical_icon_paths(self.parent.project_root)
+        pixmap = QPixmap(str(png_path))
+        if not pixmap.isNull():
+            app_icon.setPixmap(
+                pixmap.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+            layout.addWidget(app_icon)
 
         title = QtWidgets.QLabel("The Silver-Tongued Lettersmith", self)
         title.setStyleSheet("color:#00ffff; font:16px 'Segoe UI Semibold'; letter-spacing:1px;")
@@ -356,6 +370,8 @@ class Nexus(QtWidgets.QMainWindow):
     def __init__(self, project_root: str | Path):
         super().__init__()
         self.project_root = str(project_root)
+        self.setWindowTitle("Letter Smith")
+        apply_qt_window_icon(self, self.project_root)
 
         # Frameless + QSS
         self.setWindowFlag(QtCore.Qt.FramelessWindowHint)

@@ -19,6 +19,7 @@ from PySide6.QtCore import Qt, QEasingCurve, QUrl
 from PySide6.QtGui import QDesktopServices, QColor
 from PySide6.QtWidgets import QGraphicsDropShadowEffect
 
+from app_icon import apply_qt_window_icon, configure_windows_app_identity
 from window_chrome import StandardTitleBar
 
 
@@ -1224,6 +1225,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
         self.project_root = Path(project_root).resolve() if project_root else self._discover_project_root()
+        self.setWindowTitle("Letter Smith — Prompt Writer")
+        apply_qt_window_icon(self, self.project_root)
 
         # Prompt Writer persistence (separate file so other modules can\'t overwrite it)
         self._state_path = self.project_root / "prompt_writer_state.json"
@@ -2860,6 +2863,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
 
 if __name__ == "__main__":
+    configure_windows_app_identity()
     app = QtWidgets.QApplication(sys.argv)
     w = PromptWriterPanel()
     w.popup(); w.show()

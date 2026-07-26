@@ -645,24 +645,56 @@ class TabSwitcher(QtCore.QObject):
         super().__init__(parent or stack)
         self.stack = stack
         self._active: Optional[QtCore.QParallelAnimationGroup] = None
+        self._active_target: Optional[QtWidgets.QWidget] = None
+        self._active_cleanup = None
+
+    def _stop_active(self) -> None:
+        grp = self._active
+        cleanup = self._active_cleanup
+        self._active = None
+        self._active_target = None
+        self._active_cleanup = None
+
+        if grp is not None:
+            try:
+                grp.stop()
+            except RuntimeError:
+                pass
+
+        if cleanup is not None:
+            cleanup()
+
+        if grp is not None:
+            try:
+                grp.deleteLater()
+            except RuntimeError:
+                pass
 
     def go_to(self, index: int) -> None:
+        if index < 0 or index >= self.stack.count():
+            return
+
+        requested_w = self.stack.widget(index)
+        if self._active is not None:
+            if requested_w is self._active_target:
+                return
+            self._stop_active()
+
         if index == self.stack.currentIndex():
             return
 
-        # Stop any active transition
-        if self._active and self._active.state() == QtCore.QAbstractAnimation.Running:
-            self._active.stop()
-            self._active = None
-
         old_w = self.stack.currentWidget()
-        new_w = self.stack.widget(index)
+        new_w = requested_w
         if not old_w or not new_w:
             self.stack.setCurrentIndex(index)
             return
 
-        # Snapshot geometry
-        new_geo: QRect = new_w.geometry()
+        # Hidden stack pages can retain Qt's default 640x480 geometry. Size the
+        # incoming page to the live viewport before its first visible paint.
+        new_geo: QRect = old_w.geometry()
+        if new_geo.isEmpty():
+            new_geo = self.stack.contentsRect()
+        new_w.setGeometry(new_geo)
 
         # Always ensure new widget is visible and on top during animation
         new_w.setVisible(True)
@@ -713,29 +745,47 @@ class TabSwitcher(QtCore.QObject):
         slide_in.setEasingCurve(QEasingCurve.OutCubic)
         grp.addAnimation(slide_in)
 
-        def _finish() -> None:
+        def _cleanup() -> None:
+            for widget, effect in ((old_w, old_eff), (new_w, new_eff)):
+                if effect is None:
+                    continue
+                try:
+                    if widget.graphicsEffect() is effect:
+                        widget.setGraphicsEffect(None)
+                except RuntimeError:
+                    pass
+
             try:
-                self.stack.setCurrentIndex(index)
                 new_w.move(end_pos)
-            except Exception:
+                current_w = self.stack.currentWidget()
+                if current_w is not new_w:
+                    new_w.setVisible(False)
+                if current_w is not None:
+                    current_w.setVisible(True)
+                    current_w.raise_()
+            except RuntimeError:
                 pass
 
-            # Only clear opacity effects we applied
-            if can_fade:
-                try:
-                    old_w.setGraphicsEffect(None)
-                except Exception:
-                    pass
-                try:
-                    new_w.setGraphicsEffect(None)
-                except Exception:
-                    pass
+        def _finish() -> None:
+            if self._active is not grp:
+                return
 
             self._active = None
+            self._active_target = None
+            self._active_cleanup = None
+            try:
+                if self.stack.indexOf(new_w) >= 0:
+                    self.stack.setCurrentWidget(new_w)
+            except RuntimeError:
+                pass
+            _cleanup()
+            grp.deleteLater()
 
         grp.finished.connect(_finish)
         self._active = grp
-        grp.start(QtCore.QAbstractAnimation.DeleteWhenStopped)
+        self._active_target = new_w
+        self._active_cleanup = _cleanup
+        grp.start()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

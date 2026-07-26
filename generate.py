@@ -50,6 +50,7 @@ from curtain_color import (
     extract_deep_dominant_color_from_images,
     write_tinted_curtain_image,
 )
+from font_export import FontExportError, build_embedded_font_payload
 from message_html import (
     message_html_has_content,
     normalize_message_fragment,
@@ -89,6 +90,12 @@ from config import (
 APP_SOUNDS_DIR = Path("gallery") / "app" / "sounds"
 CURTAIN_FILES = {"cleft.png", "cright.png"}
 CURTAIN_ANALYSIS_PAGE_ORDER = ("wall.png", "cover.png", "letter.png", "back.png")
+_LAST_FONT_EXPORT_REPORT: dict[str, tuple[str, ...]] = {
+    "embedded": (),
+    "files": (),
+    "fallback": (),
+    "restricted": (),
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -409,6 +416,10 @@ def _seed_sfx_into_build(
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
+def get_last_font_export_report() -> dict[str, tuple[str, ...]]:
+    return dict(_LAST_FONT_EXPORT_REPORT)
+
+
 def generate_play_bundle(
     project_root: str,
     *,
@@ -430,6 +441,8 @@ def generate_play_bundle(
 
     Returns the play folder path.
     """
+    global _LAST_FONT_EXPORT_REPORT
+
     pr = Path(project_root)
     ensure_output_dirs(pr)
 
@@ -505,8 +518,7 @@ def generate_play_bundle(
         allow_user_sfx_fallback=allow_user_sfx_fallback,
     )
 
-    # Write CSS/JS
-    _atomic_write_text(bp.play_dir / "styles.css", TEMPLATE_CSS)
+    # Write JS
     _atomic_write_text(bp.play_dir / "script.js", TEMPLATE_JS.replace("{{BUILD_ID}}", build_id))
 
     # Message HTML injection (prefer passed string, else disk)
@@ -515,6 +527,16 @@ def generate_play_bundle(
 
     has_message_html = message_html_has_content(message_html or "")
     message_html = normalize_message_fragment(message_html or "") if has_message_html else ""
+    try:
+        font_result = build_embedded_font_payload(pr, message_html, bp.play_fonts_dir)
+    except FontExportError as error:
+        _LAST_FONT_EXPORT_REPORT = error.report
+        raise
+    _LAST_FONT_EXPORT_REPORT = font_result.report
+    message_html = font_result.html
+    styles_css = TEMPLATE_CSS if not font_result.css else f"{font_result.css}\n\n{TEMPLATE_CSS}"
+    _atomic_write_text(bp.play_dir / "styles.css", styles_css)
+
     overlay_style = _message_overlay_style_from_settings(settings)
     has_message_js = "true" if has_message_html else "false"
 

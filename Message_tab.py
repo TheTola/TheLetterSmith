@@ -41,6 +41,7 @@ from PySide6.QtGui import (
 )
 
 from Editor import Editor
+from editor_diagnostics import record_editor_failure
 from config import (
     SETTINGS_FILE,
     USER_PAGES_DIR,
@@ -821,39 +822,36 @@ class MessageTab(QtWidgets.QWidget):
                 full_pix = candidate
 
         dlg = Editor(html_for_editor, full_pix, parent=self)
-        dlg.accepted.connect(lambda: self._handle_editor_accepted(dlg))
-        dlg.exec()
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            self._handle_editor_accepted(dlg)
 
     def _handle_editor_accepted(self, dlg: QtWidgets.QDialog) -> None:
         new_html: Optional[str] = None
         try:
-            new_html = dlg.get_edited_html()  # type: ignore[attr-defined]
+            new_html = dlg.get_saved_html()  # type: ignore[attr-defined]
         except Exception:
-            try:
-                new_html = dlg.editor.toHtml()  # type: ignore[attr-defined]
-            except Exception:
-                new_html = None
+            new_html = None
 
         if not new_html:
-            self.status.setText("ℹ️ Editor accepted, but HTML not Found.")
+            self.status.setText("ℹ️ Editor closed without verified saved HTML.")
             return
 
-        html_path = self._html_path()
+        self.current_html = new_html
+        self.status.setText("💾 message.html saved.")
+        self.edit_btn.setEnabled(True)
+
         try:
-            _atomic_write_text(html_path, new_html)
-            self.current_html = new_html
-            self.status.setText("💾 message.html saved.")
-            self.edit_btn.setEnabled(True)
+            # Run preview work only after the modal editor has fully closed.
+            self._ensure_wall_exists()
+            self.text_selected.emit(new_html)
+            self._generate_image(new_html)
+            self._emit_best_preview()
         except Exception as e:
-            self.status.setText(f"❌ Error saving HTML: {e}")
-            return
-
-        # Always guarantee wall before rendering
-        self._ensure_wall_exists()
-
-        self.text_selected.emit(new_html)
-        self._generate_image(new_html)
-        self._emit_best_preview()
+            try:
+                log_path = record_editor_failure(self.project_root, "refresh saved letter preview", e)
+                self.status.setText(f"⚠️ Saved; preview refresh failed. See {log_path.name}.")
+            except Exception:
+                self.status.setText(f"⚠️ Saved; preview refresh failed: {e}")
 
     # ──────────────────────────────────────────────────────────────────
     # Preview button

@@ -25,9 +25,17 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtWidgets
+
+from app_icon import (
+    apply_qt_window_icon,
+    build_qt_icon,
+    configure_windows_app_identity,
+    resolve_app_icon,
+)
+from editor_diagnostics import record_editor_failure
 
 
 # =============================================================================
@@ -200,13 +208,11 @@ def pick_icon(root: Path, settings: dict) -> Optional[Path]:
     Returns the best icon file path, or None.
 
     Supports an explicit override:
-      settings.json: { "app_icon": "relative/or/absolute/path/to.ico" }
+      settings.json: { "app_icon": "relative/or/absolute/path/to.png" }
 
     If override is missing/invalid, use conventional project fallbacks.
-
-    Notes:
-      - Windows expects .ico for application icons.
-      - The selection order should match your canonical convention.
+    PNG is preferred for Qt rendering; the matching ICO remains available for
+    native Windows surfaces and packaging.
     """
     override = settings.get("app_icon")
     if isinstance(override, str) and override.strip():
@@ -218,21 +224,10 @@ def pick_icon(root: Path, settings: dict) -> Optional[Path]:
             return p
         logging.info(f"[Icon] Override not found: {p}")
 
-    candidates: Tuple[Path, ...] = (
-        # preferred canonical path
-        root / "gallery" / "icon" / "ls-icon.ico",
-        # compatibility fallbacks
-        root / "gallery" / "icon" / "LSmith.ico",
-        root / "gallery" / "icons" / "LSmith.ico",
-        root / "gallery" / "icons" / "ls-icon.ico",
-        root / "gallery" / "app" / "icons" / "folder" / "LSmith.ico",
-        root / "gallery" / "app" / "icons" / "folder" / "LSmith.png",
-    )
-
-    for p in candidates:
-        if p.exists():
-            logging.info(f"[Icon] Using: {p}")
-            return p
+    icon = resolve_app_icon(root, prefer_png=True)
+    if icon is not None:
+        logging.info(f"[Icon] Using: {icon}")
+        return icon
 
     logging.info("[Icon] No icon found (default will be used).")
     return None
@@ -263,7 +258,9 @@ def bootstrap_qt(icon: Optional[Path]) -> QtWidgets.QApplication:
     app.setOrganizationDomain(ORG_DOMAIN)
 
     if icon and icon.exists():
-        app.setWindowIcon(QtGui.QIcon(str(icon)))
+        app_icon = build_qt_icon(icon)
+        if not app_icon.isNull():
+            app.setWindowIcon(app_icon)
 
     return app
 
@@ -283,7 +280,7 @@ def _show_critical(title: str, message: str) -> None:
         pass
 
 
-def install_exception_hook(app_name: str) -> None:
+def install_exception_hook(app_name: str, project_root: Path) -> None:
     """
     Makes exceptions visible.
 
@@ -315,11 +312,20 @@ def install_exception_hook(app_name: str) -> None:
         logging.error("[Crash] Unhandled exception:")
         logging.error(trace.rstrip())
 
+        log_note = "A traceback was printed to the console."
+        try:
+            active_widget = QtWidgets.QApplication.activeModalWidget()
+            if active_widget is not None and active_widget.__class__.__name__ == "Editor":
+                log_path = record_editor_failure(project_root, "unhandled editor action", exc)
+                log_note = f"Details were written to:\n{log_path}"
+        except Exception:
+            pass
+
         _show_critical(
             f"{app_name} — Crash",
             "An unexpected error occurred:\n\n"
             f"{exc}\n\n"
-            "A traceback was printed to the console."
+            f"{log_note}"
         )
 
     sys.excepthook = _hook
@@ -362,8 +368,9 @@ def main() -> None:
     icon = pick_icon(root, settings)
     log_startup(root, icon, settings)
 
+    configure_windows_app_identity()
     app = bootstrap_qt(icon)
-    install_exception_hook(APP_NAME)
+    install_exception_hook(APP_NAME, root)
 
 
     # Late import:
@@ -378,6 +385,7 @@ def main() -> None:
         raise
 
     win = Nexus(root)
+    apply_qt_window_icon(win, root, fallback_path=icon)
     win.show()
 
     try:
