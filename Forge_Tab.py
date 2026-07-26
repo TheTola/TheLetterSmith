@@ -44,6 +44,7 @@ from PySide6.QtCore import Qt, QUrl
 
 import generate  # <-- IMPORTANT: module import only
 from message_html import read_text_normalized
+from message_history import MessageHistory
 from project_store import ProjectStore
 from project_readiness import assess_project_readiness, project_is_ready
 from portable_export import (
@@ -895,6 +896,10 @@ class ForgeTab(QtWidgets.QWidget):
             if staged_missing:
                 raise RuntimeError("Staged load is missing pages: " + ", ".join(staged_missing))
 
+            history = MessageHistory(self.project_root)
+            current_revision = history.snapshot_current_if_changed()
+            if current_revision is not None:
+                history.copy_revision_to_message_directory(current_revision, staged_message)
             window = self.window()
             sound_tab = getattr(window, "sound_tab", None)
             wave = getattr(sound_tab, "wave", None)

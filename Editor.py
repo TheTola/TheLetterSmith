@@ -73,7 +73,6 @@ from PySide6.QtWidgets import (
     QToolBar,
     QFontComboBox,
     QSpinBox,
-    QSlider,
     QLabel,
     QColorDialog,
     QPushButton,
@@ -82,7 +81,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QToolButton,
     QMenu,
-    QSplitter,
     QCheckBox,
 )
 
@@ -92,11 +90,19 @@ from config import (
     MESSAGE_HTML_FILE,
 )
 
+from message_format import (
+    DEFAULT_MESSAGE_FONT,
+    DEFAULT_MESSAGE_LINE_SPACING,
+    apply_blank_editor_defaults,
+    message_plain_text,
+)
+from message_history import MessageHistory
 from message_html import ensure_message_html_from_emessage
 from editor_diagnostics import record_editor_failure
 from font_export import inspect_font_family
 from settings_store import SettingsStore
 from project_store import ProjectStore
+from transactional_io import atomic_write_text
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants & Helpers
@@ -112,17 +118,6 @@ SETTINGS_ORG = "LetterSmith"
 SETTINGS_APP = "Editor"
 SETTINGS_KEY_COLOR = "textColor"
 SETTINGS_KEY_GEOMETRY = "windowGeometry"
-MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
-MESSAGE_OVERLAY_OPACITY_KEY = "message_overlay_opacity"
-DEFAULT_MESSAGE_OVERLAY_PRESET = "paper"
-DEFAULT_MESSAGE_OVERLAY_OPACITY = 68
-MESSAGE_OVERLAY_PRESETS: dict[str, tuple[str, tuple[int, int, int], str]] = {
-    "black": ("Black", (0, 0, 0), "#ffffff"),
-    "white": ("White", (255, 255, 255), "#221710"),
-    "paper": ("Paper", (245, 235, 210), "#221710"),
-    "clear": ("Clear", (255, 255, 255), "#221710"),
-}
-
 ASSET_SUBDIR = "message_assets"  # under gallery/
 
 def _ensure_dir(p: Path) -> None:
@@ -148,47 +143,6 @@ def _hypernote_note_from_href(href: str) -> Optional[str]:
         return unquote(raw)
     except Exception:
         return raw
-
-
-def _coerce_message_overlay_settings(data: dict) -> tuple[str, int]:
-    preset = str(data.get(MESSAGE_OVERLAY_PRESET_KEY, DEFAULT_MESSAGE_OVERLAY_PRESET)).strip().lower()
-    if preset not in MESSAGE_OVERLAY_PRESETS:
-        preset = DEFAULT_MESSAGE_OVERLAY_PRESET
-
-    try:
-        opacity = int(data.get(MESSAGE_OVERLAY_OPACITY_KEY, DEFAULT_MESSAGE_OVERLAY_OPACITY))
-    except Exception:
-        opacity = DEFAULT_MESSAGE_OVERLAY_OPACITY
-    opacity = max(0, min(100, opacity))
-
-    if preset == "clear":
-        opacity = 0
-
-    return preset, opacity
-
-
-def _atomic_write(path: Path, data: str, *, encoding: str = "utf-8") -> None:
-    _ensure_dir(path.parent)
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{time.time_ns()}")
-    try:
-        with tmp.open("w", encoding=encoding) as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-
-        last_error: Optional[OSError] = None
-        for _ in range(4):
-            try:
-                os.replace(tmp, path)
-                return
-            except OSError as error:
-                last_error = error
-                time.sleep(0.05)
-
-        if last_error is not None:
-            raise last_error
-    finally:
-        tmp.unlink(missing_ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -512,6 +466,8 @@ class RichTextEdit(QTextEdit):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Editor(QDialog):
+    autosaved = QtCore.Signal(str)
+
     def __init__(self, message_html: str, preview_pixmap: Optional[QPixmap] = None, parent=None) -> None:
         super().__init__(parent)
 
@@ -523,13 +479,12 @@ class Editor(QDialog):
         self.message_path.parent.mkdir(parents=True, exist_ok=True)
         self.project_settings = SettingsStore(self.project_root)
         self.project_store = ProjectStore(self.project_root)
+        self.message_history = MessageHistory(self.project_root)
 
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
         s = self.project_settings.as_dict()
         self.recipient_name = (s.get("recipient_name") or "Friend").strip() or "Friend"
-        self.overlay_preset, self.overlay_opacity = _coerce_message_overlay_settings(s)
-        self.overlay_buttons: dict[str, QPushButton] = {}
 
         saved = self.settings.value(SETTINGS_KEY_COLOR, QColor("#eeeeee"))
         self.last_color = saved if isinstance(saved, QColor) else QColor("#eeeeee")
@@ -551,30 +506,22 @@ class Editor(QDialog):
         self._build_ui(preview_pixmap)
         self.editor.document().setModified(False)
         self._recover_autosave_if_available()
+        if not message_plain_text(self.editor.toHtml()):
+            self._initialize_blank_message_defaults()
+        self.message_history.snapshot_current_if_changed()
 
         self._autosave_timer = QtCore.QTimer(self)
-        self._autosave_timer.setInterval(5000)
-        self._autosave_timer.timeout.connect(self._autosave_draft)
-        self._autosave_timer.start()
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(1500)
+        self._autosave_timer.timeout.connect(self._autosave_message)
 
-
-    def _apply_default_center_alignment_if_plain(self) -> None:
-        """Center plain/default messages without overwriting explicit saved alignment."""
-        raw = (self.message_html or "").lower()
-        if "text-align" in raw or "align=" in raw:
-            return
-        cursor = QTextCursor(self.editor.document())
-        cursor.beginEditBlock()
-        try:
-            block = self.editor.document().firstBlock()
-            while block.isValid():
-                bc = QTextCursor(block)
-                bf = bc.blockFormat()
-                bf.setAlignment(Qt.AlignCenter)
-                bc.setBlockFormat(bf)
-                block = block.next()
-        finally:
-            cursor.endEditBlock()
+    def _initialize_blank_message_defaults(self) -> None:
+        apply_blank_editor_defaults(self.editor)
+        self._export_line_spacing = DEFAULT_MESSAGE_LINE_SPACING
+        self.font_combo.setCurrentFont(QFont(DEFAULT_MESSAGE_FONT))
+        self.btn_align.setText("Align: Center")
+        self.btn_spacing.setText("Spacing: Double")
+        self.editor.document().setModified(False)
 
     def _resolve_initial_message_html(self, message_html: str) -> str:
         """
@@ -609,29 +556,17 @@ class Editor(QDialog):
         self.toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         main_layout.addWidget(self.toolbar)
 
-        splitter = QSplitter(Qt.Horizontal)
-
         self.editor = RichTextEdit(self.project_root)
         self.editor.document().setDefaultStyleSheet("a { text-decoration: none; }")
         self.editor.setHtml(self.message_html)
-        self._apply_default_center_alignment_if_plain()
-        splitter.addWidget(self.editor)
-
-        # The old second-screen preview was intentionally removed.
-        # The right side now holds compact export controls only.
         self.preview = self.editor
-        self.overlay_panel = self._build_overlay_panel()
-        splitter.addWidget(self.overlay_panel)
-
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-        splitter.setSizes([860, 240])
-        main_layout.addWidget(splitter, 1)
+        main_layout.addWidget(self.editor, 1)
 
         self._build_toolbar_actions()
 
         self.editor.textChanged.connect(self.preview.update)
         self.editor.textChanged.connect(self.update_word_count)
+        self.editor.textChanged.connect(self._schedule_autosave)
         self.editor.currentCharFormatChanged.connect(self.preview.update)
         self.editor.currentCharFormatChanged.connect(self._sync_format)
         self.editor.document().modificationChanged.connect(self._set_dirty_state)
@@ -743,17 +678,17 @@ class Editor(QDialog):
 
         self.toolbar.addSeparator()
 
-        btn_align = QToolButton(self)
-        btn_align.setText("Align")
-        btn_align.setPopupMode(QToolButton.InstantPopup)
-        btn_align.setAutoRaise(True)
+        self.btn_align = QToolButton(self)
+        self.btn_align.setText("Align")
+        self.btn_align.setPopupMode(QToolButton.InstantPopup)
+        self.btn_align.setAutoRaise(True)
 
         menu_align = QMenu(self)
-        menu_align.addAction("Left",   lambda: self.editor.setAlignment(Qt.AlignLeft))
-        menu_align.addAction("Center", lambda: self.editor.setAlignment(Qt.AlignCenter))
-        menu_align.addAction("Right",  lambda: self.editor.setAlignment(Qt.AlignRight))
-        btn_align.setMenu(menu_align)
-        self.toolbar.addWidget(btn_align)
+        menu_align.addAction("Left", lambda: self._set_alignment(Qt.AlignLeft, "Left"))
+        menu_align.addAction("Center", lambda: self._set_alignment(Qt.AlignCenter, "Center"))
+        menu_align.addAction("Right", lambda: self._set_alignment(Qt.AlignRight, "Right"))
+        self.btn_align.setMenu(menu_align)
+        self.toolbar.addWidget(self.btn_align)
 
         act_col = QAction("Color", self)
         act_col.triggered.connect(self.choose_color)
@@ -800,139 +735,7 @@ class Editor(QDialog):
 
 
     # ──────────────────────────────────────────────────────────────────────
-    # Message overlay controls
     # ──────────────────────────────────────────────────────────────────────
-
-    def _overlay_rgb(self) -> tuple[int, int, int]:
-        _label, rgb, _ink = MESSAGE_OVERLAY_PRESETS.get(
-            self.overlay_preset,
-            MESSAGE_OVERLAY_PRESETS[DEFAULT_MESSAGE_OVERLAY_PRESET],
-        )
-        return rgb
-
-    def _build_overlay_panel(self) -> QtWidgets.QFrame:
-        panel = QtWidgets.QFrame(self)
-        panel.setObjectName("overlayControlPanel")
-        panel.setMinimumWidth(220)
-        panel.setMaximumWidth(280)
-
-        root = QVBoxLayout(panel)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
-
-        title = QLabel("Text Background", panel)
-        title.setObjectName("overlayPanelTitle")
-        root.addWidget(title)
-
-        note = QLabel("Controls the layer behind the message in the final letter.", panel)
-        note.setObjectName("overlayPanelNote")
-        note.setWordWrap(True)
-        root.addWidget(note)
-
-        row1 = QHBoxLayout()
-        row1.setSpacing(6)
-        row2 = QHBoxLayout()
-        row2.setSpacing(6)
-
-        for key in ("black", "white", "paper", "clear"):
-            label, _rgb, _ink = MESSAGE_OVERLAY_PRESETS[key]
-            btn = QPushButton(label, panel)
-            btn.setObjectName("overlayPresetButton")
-            btn.setCheckable(True)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _checked=False, preset=key: self._set_message_overlay_preset(preset))
-            self.overlay_buttons[key] = btn
-            if key in ("black", "white"):
-                row1.addWidget(btn)
-            else:
-                row2.addWidget(btn)
-
-        root.addLayout(row1)
-        root.addLayout(row2)
-
-        self.overlay_opacity_label = QLabel(panel)
-        self.overlay_opacity_label.setObjectName("overlayOpacityLabel")
-        root.addWidget(self.overlay_opacity_label)
-
-        self.overlay_opacity_slider = QSlider(Qt.Horizontal, panel)
-        self.overlay_opacity_slider.setObjectName("overlayOpacitySlider")
-        self.overlay_opacity_slider.setRange(0, 100)
-        self.overlay_opacity_slider.setValue(int(self.overlay_opacity))
-        self.overlay_opacity_slider.valueChanged.connect(self._set_message_overlay_opacity)
-        root.addWidget(self.overlay_opacity_slider)
-
-        preview = QtWidgets.QFrame(panel)
-        preview.setObjectName("overlayColorPreview")
-        preview.setFixedHeight(34)
-        root.addWidget(preview)
-        self.overlay_color_preview = preview
-
-        root.addStretch(1)
-        self._sync_overlay_controls()
-        return panel
-
-    def _set_message_overlay_preset(self, preset: str) -> None:
-        preset = str(preset or "").strip().lower()
-        if preset not in MESSAGE_OVERLAY_PRESETS:
-            return
-
-        self.overlay_preset = preset
-        if preset == "clear":
-            self.overlay_opacity = 0
-            if hasattr(self, "overlay_opacity_slider"):
-                self.overlay_opacity_slider.blockSignals(True)
-                self.overlay_opacity_slider.setValue(0)
-                self.overlay_opacity_slider.blockSignals(False)
-
-        self._save_overlay_settings()
-        self._sync_overlay_controls()
-
-    def _set_message_overlay_opacity(self, value: int) -> None:
-        opacity = max(0, min(100, int(value)))
-        if self.overlay_preset == "clear" and opacity > 0:
-            self.overlay_preset = DEFAULT_MESSAGE_OVERLAY_PRESET
-        self.overlay_opacity = opacity
-        self._save_overlay_settings()
-        self._sync_overlay_controls()
-
-    def _sync_overlay_controls(self) -> None:
-        for key, btn in getattr(self, "overlay_buttons", {}).items():
-            btn.blockSignals(True)
-            btn.setChecked(key == self.overlay_preset)
-            btn.blockSignals(False)
-
-        if hasattr(self, "overlay_opacity_slider"):
-            self.overlay_opacity_slider.blockSignals(True)
-            self.overlay_opacity_slider.setValue(int(self.overlay_opacity))
-            self.overlay_opacity_slider.blockSignals(False)
-
-        if hasattr(self, "overlay_opacity_label"):
-            label, _rgb, _ink = MESSAGE_OVERLAY_PRESETS.get(
-                self.overlay_preset,
-                MESSAGE_OVERLAY_PRESETS[DEFAULT_MESSAGE_OVERLAY_PRESET],
-            )
-            self.overlay_opacity_label.setText(f"Opacity: {int(self.overlay_opacity)}%  •  {label}")
-
-        if hasattr(self, "overlay_color_preview"):
-            r, g, b = self._overlay_rgb()
-            alpha = max(0.0, min(1.0, self.overlay_opacity / 100.0))
-            self.overlay_color_preview.setStyleSheet(
-                "QFrame#overlayColorPreview {"
-                f"background: rgba({r}, {g}, {b}, {alpha:.3f});"
-                "border: 1px solid #596273;"
-                "border-radius: 8px;"
-                "}"
-            )
-
-    def _save_overlay_settings(self) -> None:
-        try:
-            self.project_settings.update_fields(
-                message_overlay_preset=self.overlay_preset,
-                message_overlay_opacity=int(self.overlay_opacity),
-            )
-        except Exception:
-            pass
-
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
@@ -940,7 +743,6 @@ class Editor(QDialog):
             "QToolBar{background:#161616;border:1px solid #242424;border-radius:6px;margin:2px;padding:2px;}"
             "QTextEdit,QPlainTextEdit{background:#0f0f0f;color:#eee;border:1px solid #222;border-radius:6px;padding:8px;}"
             "QLabel{color:#bbb;}"
-            "QSplitter::handle{background:#1e1e1e;}"
             "QPushButton{background:#1d1d1d;color:#fff;border:1px solid #00d0ff;border-radius:6px;padding:6px 12px;}"
             "QPushButton:hover{background:#00d0ff;color:#111;}"
             "QSpinBox{background:#181818;color:#eee;border:1px solid #333;border-radius:4px;padding:2px;}"
@@ -950,15 +752,6 @@ class Editor(QDialog):
             "QToolButton:hover{border-color:#00d0ff;}"
             "QToolButton#hypernoteButton{min-width:46px;min-height:36px;padding:0 8px;color:#8fc7ff;border-color:#1f5b92;background:#111820;font-size:24px;}"
             "QToolButton#hypernoteButton:hover{color:#ffffff;border-color:#69b7ff;background:#17304a;}"
-            "QFrame#overlayControlPanel{background:#2b2f36;border:1px solid #414852;border-radius:10px;}"
-            "QLabel#overlayPanelTitle{color:#edf1f7;font-size:14px;font-weight:800;}"
-            "QLabel#overlayPanelNote{color:#aab4c0;font-size:11px;font-weight:500;}"
-            "QLabel#overlayOpacityLabel{color:#dce4ef;font-size:12px;font-weight:700;padding-top:4px;}"
-            "QPushButton#overlayPresetButton{background:#1f242c;color:#edf1f7;border:1px solid #4b5563;border-radius:7px;padding:6px 8px;min-height:28px;}"
-            "QPushButton#overlayPresetButton:hover{background:#303846;border-color:#748194;color:#fff;}"
-            "QPushButton#overlayPresetButton:checked{background:#435061;border-color:#9aa8bb;color:#ffffff;}"
-            "QSlider#overlayOpacitySlider::groove:horizontal{height:6px;background:#1b2028;border-radius:3px;}"
-            "QSlider#overlayOpacitySlider::handle:horizontal{width:16px;height:16px;margin:-5px 0;background:#d5dde8;border:1px solid #ffffff;border-radius:8px;}"
             "QToolButton#fontInfoButton{min-width:18px;max-width:18px;min-height:18px;max-height:18px;border-radius:9px;padding:0;color:#8290a3;border:1px solid #2f3744;background:#161a20;font-size:10px;font-weight:700;}"
             "QToolButton#fontInfoButton:hover{color:#e6edf6;border-color:#536477;background:#202833;}"
             "QCheckBox{color:#ddd;}"
@@ -1087,14 +880,29 @@ class Editor(QDialog):
         self.dirty_label.setStyleSheet("color:#ffbd70;" if dirty else "color:#79e092;")
         self.setWindowTitle("Letter Smith — Editor" + (" *" if dirty else ""))
 
-    def _autosave_draft(self) -> None:
+    def _schedule_autosave(self) -> None:
+        if self._save_in_progress or not hasattr(self, "_autosave_timer"):
+            return
+        self._autosave_timer.start()
+
+    def _autosave_message(self) -> None:
         if not self.editor.document().isModified() or self._save_in_progress:
             return
         try:
-            self.project_store.autosave_message(self.get_edited_html())
-            self.dirty_label.setText("Unsaved changes · draft saved")
+            content = self._inject_export_line_spacing_wrapper(self.get_edited_html())
+            if self.message_path.is_file():
+                previous = self.message_path.read_text(encoding="utf-8")
+                if previous != content:
+                    self.message_history.maybe_create_timed_revision(previous)
+            atomic_write_text(self.message_path, content)
+            self.project_store.autosave_message(content)
+            self.editor.document().setModified(False)
+            self.dirty_label.setText("Autosaved")
+            self.dirty_label.setStyleSheet("color:#79e092;")
+            self.autosaved.emit(content)
         except Exception:
-            self.dirty_label.setText("Unsaved changes · draft failed")
+            self.dirty_label.setText("Autosave failed")
+            self.dirty_label.setStyleSheet("color:#ff8a8a;")
 
     def _recover_autosave_if_available(self) -> None:
         recovery = self.project_store.recoverable_message_autosave()
@@ -1181,9 +989,10 @@ class Editor(QDialog):
         try:
             content = self.get_edited_html()
             content = self._inject_export_line_spacing_wrapper(content)
-            _atomic_write(self.message_path, content, encoding="utf-8")
+            atomic_write_text(self.message_path, content)
             if self.message_path.read_text(encoding="utf-8") != content:
                 raise OSError("The saved letter could not be verified.")
+            self.message_history.create_revision(content, force=True)
             try:
                 self.project_store.clear_message_autosave()
                 self.project_store.save_active()
@@ -1399,7 +1208,7 @@ class Editor(QDialog):
     def set_font_family(self, font: QFont) -> None:
         family = font.family()
         def transform(fmt: QTextCharFormat) -> None:
-            fmt.setFontFamily(family)
+            fmt.setFontFamilies([family])
         self._apply_to_selected_fragments(transform)
 
     def _effective_font_size(self, fmt: QTextCharFormat) -> float:
@@ -1494,8 +1303,22 @@ class Editor(QDialog):
         c.createList(lf)
         c.endEditBlock()
 
+    def _set_alignment(self, alignment: Qt.AlignmentFlag, label: str) -> None:
+        self.editor.setAlignment(alignment)
+        self.btn_align.setText(f"Align: {label}")
+
     def set_line_spacing(self, multiplier: float) -> None:
         self._export_line_spacing = float(multiplier)
+        labels = {
+            1.0: "Single",
+            1.15: "1.15",
+            1.5: "1.5",
+            2.0: "Double",
+            2.5: "2.5",
+            3.0: "3.0",
+        }
+        label = labels.get(round(float(multiplier), 2), f"{float(multiplier):g}")
+        self.btn_spacing.setText(f"Spacing: {label}")
 
         pct = float(max(0.5, float(multiplier)) * 100.0)
         pct = max(50.0, min(400.0, pct))

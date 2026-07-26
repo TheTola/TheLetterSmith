@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from config import MESSAGE_HTML_FILE, MUSIC_FILE, USER_MESSAGE_DIR, USER_PAGES_DIR, USER_SOUNDS_DIR
+from message_history import MessageHistory
 from playlist import PLAYLIST_PATH
 from settings_store import SettingsStore
 from transactional_io import PathTransaction
@@ -198,6 +199,13 @@ class ProjectStore:
                 playlist_staging.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_playlist, playlist_staging)
 
+            history = MessageHistory(self.project_root)
+            current_revision = history.snapshot_current_if_changed()
+            if current_revision is not None:
+                history.copy_revision_to_message_directory(
+                    current_revision,
+                    message_tx.staging_path,
+                )
             pages_tx.commit(keep_backup=True)
             committed.append(pages_tx)
             message_tx.commit(keep_backup=True)
