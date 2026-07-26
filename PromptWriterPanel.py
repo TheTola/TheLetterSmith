@@ -32,7 +32,7 @@ VISIONARY_URL = "https://chatgpt.com/g/g-68ce5925196c8191a222e24d29323813-the-vi
 
 _FILE_CACHE: Dict[str, Tuple[List[str], Optional[Path], Optional[Tuple[int, int]]]] = {}
 PROMPTER_ROOT = Path(__file__).resolve().parent
-PROMPT_WRITER_STATE_VERSION = 2
+PROMPT_WRITER_STATE_VERSION = 3
 MAX_STATE_TEXT_LENGTH = 24000
 REFERENCE_IMAGE_MAX_COUNT = 3
 REFERENCE_IMAGE_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
@@ -155,7 +155,35 @@ BUILT_IN_CHECK_KEYS: Tuple[str, ...] = (
     "real",
     "paint",
     "minimal",
-) + tuple(key for key, _, _ in POLICY_DETAIL_OPTION_SPECS)
+    "neutral_style",
+) + tuple(key for key, _, _ in POLICY_DETAIL_OPTION_SPECS) + (
+    "unspecified_framing",
+)
+
+EXCLUSIVE_CHECK_GROUPS: Tuple[Tuple[str, ...], ...] = (
+    ("black", "white"),
+    ("real", "paint", "minimal", "neutral_style"),
+    ("close_up_focus", "full_body_view", "wide_scene", "unspecified_framing"),
+)
+
+EXCLUSIVE_CHECK_DEFAULTS: Dict[Tuple[str, ...], str] = {
+    EXCLUSIVE_CHECK_GROUPS[1]: "neutral_style",
+    EXCLUSIVE_CHECK_GROUPS[2]: "unspecified_framing",
+}
+
+
+def _normalize_exclusive_check_states(checks_raw: object) -> Dict[str, bool]:
+    raw = checks_raw if isinstance(checks_raw, dict) else {}
+    checks = {key: bool(raw.get(key, False)) for key in BUILT_IN_CHECK_KEYS}
+
+    for group in EXCLUSIVE_CHECK_GROUPS:
+        selected = next((key for key in group if checks[key]), None)
+        if selected is None:
+            selected = EXCLUSIVE_CHECK_DEFAULTS.get(group)
+        for key in group:
+            checks[key] = key == selected
+
+    return checks
 
 
 @dataclass(frozen=True)
@@ -1550,8 +1578,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             return {}
 
         checks_raw = state.get("checks", {})
-        if not isinstance(checks_raw, dict):
-            checks_raw = {}
 
         generated_raw = state.get("generated_prompts", {})
         if not isinstance(generated_raw, dict):
@@ -1569,7 +1595,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "letter": _normalize_text(state.get("letter", "")),
             "wall": _normalize_text(state.get("wall", "")),
             "back": _normalize_text(state.get("back", "")),
-            "checks": {key: bool(checks_raw.get(key, False)) for key in BUILT_IN_CHECK_KEYS},
+            "checks": _normalize_exclusive_check_states(checks_raw),
             "generated_prompts": {
                 image_name: _normalize_text(generated_raw.get(image_name, ""))
                 for image_name in self._images
@@ -1599,6 +1625,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             (self.cb_real, "real"),
             (self.cb_paint, "paint"),
             (self.cb_minimal, "minimal"),
+            (self.cb_neutral_style, "neutral_style"),
             (self.cb_forbid, "forbid_text"),
             (self.cb_clean_composition, "clean_composition"),
             (self.cb_strong_focal_point, "strong_focal_point"),
@@ -1608,6 +1635,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             (self.cb_full_body_view, "full_body_view"),
             (self.cb_wide_scene, "wide_scene"),
             (self.cb_simplified_details, "simplified_details"),
+            (self.cb_unspecified_framing, "unspecified_framing"),
         )
 
     def _guidance_checkbox_specs(self) -> Tuple[Tuple[QtWidgets.QCheckBox, str], ...]:
@@ -1950,19 +1978,26 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.cb_real = GoldenCheckBox("Bias Toward Photorealism")
         self.cb_paint = GoldenCheckBox("Bias Toward Painterly Style")
         self.cb_minimal = GoldenCheckBox("Bias Toward Minimalistic Composition")
+        self.cb_neutral_style = GoldenCheckBox("Neutral / No Extra Style Bias")
         self.cb_simplified_details = GoldenCheckBox("Simplified Details")
+        _set_help(
+            self.cb_neutral_style,
+            "Add no extra style bias beyond the selected Graphics and Illustration choice.",
+        )
         gb_layout.addWidget(self.cb_real, 6, 0)
         gb_layout.addWidget(self.cb_paint, 6, 1)
         gb_layout.addWidget(self.cb_minimal, 7, 0)
-        gb_layout.addWidget(self.cb_simplified_details, 7, 1)
+        gb_layout.addWidget(self.cb_neutral_style, 7, 1)
+        gb_layout.addWidget(self.cb_simplified_details, 8, 0, 1, 2)
+        self.cb_neutral_style.setChecked(True)
 
-        add_helpful_header(8, "Image Safety / Clean Output")
+        add_helpful_header(9, "Image Safety / Clean Output")
         self.cb_forbid = GoldenCheckBox("No Text in the Image")
         self.cb_clean_composition = GoldenCheckBox("Clean Composition")
-        gb_layout.addWidget(self.cb_forbid, 9, 0, 1, 2)
-        gb_layout.addWidget(self.cb_clean_composition, 10, 0, 1, 2)
+        gb_layout.addWidget(self.cb_forbid, 10, 0, 1, 2)
+        gb_layout.addWidget(self.cb_clean_composition, 11, 0, 1, 2)
 
-        add_helpful_header(11, "Camera / Framing")
+        add_helpful_header(12, "Camera / Framing")
         self.cb_strong_focal_point = GoldenCheckBox("Strong Focal Point")
         _set_help(
             self.cb_strong_focal_point,
@@ -1973,16 +2008,23 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.cb_close_up_focus = GoldenCheckBox("Close-Up Focus")
         self.cb_full_body_view = GoldenCheckBox("Full Body View")
         self.cb_wide_scene = GoldenCheckBox("Wide Scene")
+        self.cb_unspecified_framing = GoldenCheckBox("Unspecified Framing")
+        _set_help(
+            self.cb_unspecified_framing,
+            "Add no extra close-up, full-body, or wide-scene framing instruction.",
+        )
         _set_help(
             self.cb_wide_scene,
             "Wide Scene means showing more environment inside the same portrait 2048×3072 frame. It does not change the aspect ratio.",
         )
-        gb_layout.addWidget(self.cb_strong_focal_point, 12, 0, 1, 2)
-        gb_layout.addWidget(self.cb_dynamic_angle, 13, 0)
-        gb_layout.addWidget(self.cb_cinematic_framing, 13, 1)
-        gb_layout.addWidget(self.cb_close_up_focus, 14, 0)
-        gb_layout.addWidget(self.cb_full_body_view, 14, 1)
-        gb_layout.addWidget(self.cb_wide_scene, 15, 0, 1, 2)
+        gb_layout.addWidget(self.cb_strong_focal_point, 13, 0, 1, 2)
+        gb_layout.addWidget(self.cb_dynamic_angle, 14, 0)
+        gb_layout.addWidget(self.cb_cinematic_framing, 14, 1)
+        gb_layout.addWidget(self.cb_close_up_focus, 15, 0)
+        gb_layout.addWidget(self.cb_full_body_view, 15, 1)
+        gb_layout.addWidget(self.cb_wide_scene, 16, 0)
+        gb_layout.addWidget(self.cb_unspecified_framing, 16, 1)
+        self.cb_unspecified_framing.setChecked(True)
 
         left_v.addWidget(self.gb_helpful)
 
@@ -2214,8 +2256,35 @@ class PromptWriterPanel(QtWidgets.QWidget):
         )
 
 
-    def _enforce_exclusive_group(self, checked_box: QtWidgets.QCheckBox, group: Tuple[QtWidgets.QCheckBox, ...]) -> None:
+    def _exclusive_checkbox_groups(
+        self,
+    ) -> Tuple[Tuple[Tuple[QtWidgets.QCheckBox, ...], Optional[QtWidgets.QCheckBox]], ...]:
+        return (
+            ((self.cb_black, self.cb_white), None),
+            (
+                (self.cb_real, self.cb_paint, self.cb_minimal, self.cb_neutral_style),
+                self.cb_neutral_style,
+            ),
+            (
+                (
+                    self.cb_close_up_focus,
+                    self.cb_full_body_view,
+                    self.cb_wide_scene,
+                    self.cb_unspecified_framing,
+                ),
+                self.cb_unspecified_framing,
+            ),
+        )
+
+    def _enforce_exclusive_group(
+        self,
+        checked_box: QtWidgets.QCheckBox,
+        group: Tuple[QtWidgets.QCheckBox, ...],
+        fallback: Optional[QtWidgets.QCheckBox] = None,
+    ) -> None:
         if not checked_box.isChecked():
+            if fallback is not None and not any(checkbox.isChecked() for checkbox in group):
+                fallback.setChecked(True)
             return
         for other in group:
             if other is checked_box:
@@ -2225,11 +2294,29 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 other.setChecked(False)
                 other.blockSignals(False)
 
-    def _wire_exclusive_group(self, group: Tuple[QtWidgets.QCheckBox, ...]) -> None:
+    def _wire_exclusive_group(
+        self,
+        group: Tuple[QtWidgets.QCheckBox, ...],
+        fallback: Optional[QtWidgets.QCheckBox] = None,
+    ) -> None:
         for checkbox in group:
             checkbox.stateChanged.connect(
-                lambda *_args, cb=checkbox, grp=group: self._enforce_exclusive_group(cb, grp)
+                lambda *_args, cb=checkbox, grp=group, default=fallback: self._enforce_exclusive_group(
+                    cb, grp, default
+                )
             )
+
+    def _normalize_exclusive_controls(self) -> None:
+        for group, fallback in self._exclusive_checkbox_groups():
+            selected = next((checkbox for checkbox in group if checkbox.isChecked()), fallback)
+            if selected is None:
+                continue
+            for checkbox in group:
+                should_check = checkbox is selected
+                if checkbox.isChecked() != should_check:
+                    checkbox.blockSignals(True)
+                    checkbox.setChecked(should_check)
+                    checkbox.blockSignals(False)
 
     def _connect_signals(self):
         self.btn_generate.clicked.connect(self._on_generate)
@@ -2248,9 +2335,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self.txt_letter.textChanged.connect(lambda: self._schedule_persist_state())
             self.txt_wall.textChanged.connect(lambda: self._schedule_persist_state())
             self.txt_back.textChanged.connect(lambda: self._schedule_persist_state())
-            self._wire_exclusive_group((self.cb_black, self.cb_white, self.cb_frame, self.cb_polaroid, self.cb_cardshadow))
-            self._wire_exclusive_group((self.cb_close_up_focus, self.cb_full_body_view, self.cb_wide_scene))
-            self._wire_exclusive_group((self.cb_real, self.cb_paint, self.cb_minimal, self.cb_simplified_details))
+            for group, fallback in self._exclusive_checkbox_groups():
+                self._wire_exclusive_group(group, fallback)
             for checkbox, _ in self._checkbox_state_specs():
                 checkbox.stateChanged.connect(lambda *_: self._schedule_persist_state())
         except Exception:
@@ -2602,6 +2688,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._reload_managed_list("color")
 
     def _collect_guidance(self) -> List[str]:
+        self._normalize_exclusive_controls()
         return [
             phrase
             for checkbox, phrase in self._guidance_checkbox_specs()
@@ -2711,6 +2798,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.cmb_color.setCurrentIndex(0)
         for checkbox, _ in self._checkbox_state_specs():
             checkbox.setChecked(False)
+        self.cb_neutral_style.setChecked(True)
+        self.cb_unspecified_framing.setChecked(True)
 
         self._generated_prompts = {}
         self._reference_images = []
