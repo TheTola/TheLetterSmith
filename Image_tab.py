@@ -1,557 +1,912 @@
-# File: Image_tab.py
-"""
-Image tab UI and logic.
-
-SOURCE OF TRUTH (pages):
-  gallery/user/pages/
-    cover.png
-    letter.png
-    wall.png
-    back.png
-
-Notes:
-- Slot mapping:
-    1 → cover.png
-    2 → letter.png
-    3 → wall.png   (Letter Background)
-    4 → back.png
-- We emit scaled previews (200 px width, aspect-preserved) for all 4 as they are set.
-- Hover preview works for all 4.
-- Reset clears preview instantly (signals).
-
-This file writes ONLY into gallery/user/pages/*.png for the viewer pipeline.
-
-Prompt Writer FAB:
-- NOT draggable.
-- Hard-locked placement mode (FAB_LOCKED) to pin it where you want.
-"""
-
 from __future__ import annotations
 
+import io
 import os
+import time
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 
 from PIL import Image, ImageOps
-
-from PySide6 import QtWidgets, QtGui, QtCore
-from PySide6.QtCore import Signal, QUrl, QSize, QPoint
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import QPoint, QSize, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon
 
+from transactional_io import atomic_write_bytes, atomic_write_json
+from ui_status import StatusBanner, StatusController, StatusLevel
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Drag-and-drop aware selection button
-# ─────────────────────────────────────────────────────────────────────────────
-class DropButton(QtWidgets.QPushButton):
+
+class ImageState(Enum):
+    READY = "ready"
+    MISSING = "missing"
+    WARNING = "warning"
+
+
+@dataclass(frozen=True)
+class ImageAssessment:
+    state: ImageState
+    reason: str
+    width: int = 0
+    height: int = 0
+
+
+RECOMMENDED_WIDTH = 1200
+RECOMMENDED_HEIGHT = 1800
+TARGET_ASPECT_RATIO = 2 / 3
+EXTREME_ASPECT_MIN = 0.35
+EXTREME_ASPECT_MAX = 1.8
+SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+RING_COLORS = {
+    ImageState.READY: "#75b88a",
+    ImageState.MISSING: "#c75858",
+    ImageState.WARNING: "#d5ad48",
+}
+
+
+def _load_image_exif(path: str | Path) -> Image.Image:
+    with Image.open(path) as opened:
+        image = ImageOps.exif_transpose(opened)
+        image.load()
+    if image.mode not in ("RGB", "RGBA"):
+        image = image.convert("RGBA")
+    return image
+
+
+def _png_bytes(image: Image.Image) -> bytes:
+    stream = io.BytesIO()
+    mode = "RGBA" if image.mode == "RGBA" else "RGB"
+    image.convert(mode).save(stream, format="PNG", optimize=True)
+    return stream.getvalue()
+
+
+def assess_image(
+    canonical_path: str | Path,
+    crop_metadata: Optional[dict] = None,
+) -> ImageAssessment:
+    path = Path(canonical_path)
+    if not path.is_file():
+        return ImageAssessment(ImageState.MISSING, "The image has not been selected.")
+    try:
+        if path.stat().st_size <= 0:
+            return ImageAssessment(ImageState.MISSING, "The image file is empty.")
+        with Image.open(path) as image:
+            image.verify()
+        with Image.open(path) as image:
+            width, height = image.size
+    except (OSError, ValueError, SyntaxError) as exc:
+        return ImageAssessment(ImageState.MISSING, f"The image cannot be read: {exc}")
+
+    if width <= 0 or height <= 0:
+        return ImageAssessment(ImageState.MISSING, "The image dimensions are invalid.")
+
+    metadata = crop_metadata if isinstance(crop_metadata, dict) else {}
+    source_value = str(metadata.get("source", "")).strip()
+    if source_value:
+        source = Path(source_value)
+        if not source.is_absolute():
+            source = path.parent / source
+        if not source.is_file():
+            return ImageAssessment(
+                ImageState.WARNING,
+                "Crop information references an original image that is missing.",
+                width,
+                height,
+            )
+
+    if width < RECOMMENDED_WIDTH or height < RECOMMENDED_HEIGHT:
+        return ImageAssessment(
+            ImageState.WARNING,
+            (
+                f"Resolution is {width} × {height}; "
+                f"{RECOMMENDED_WIDTH} × {RECOMMENDED_HEIGHT} or larger is recommended."
+            ),
+            width,
+            height,
+        )
+
+    aspect = width / height
+    if not metadata and (aspect < EXTREME_ASPECT_MIN or aspect > EXTREME_ASPECT_MAX):
+        return ImageAssessment(
+            ImageState.WARNING,
+            "The image has an unusually extreme aspect ratio and has not been cropped.",
+            width,
+            height,
+        )
+    return ImageAssessment(ImageState.READY, "", width, height)
+
+
+def calculate_crop_box(
+    width: int,
+    height: int,
+    *,
+    zoom: float = 1.0,
+    center_x: float = 0.5,
+    center_y: float = 0.5,
+) -> tuple[int, int, int, int]:
+    if width <= 0 or height <= 0:
+        raise ValueError("Crop source dimensions must be positive.")
+    zoom = max(1.0, min(3.0, float(zoom)))
+    source_aspect = width / height
+    if source_aspect > TARGET_ASPECT_RATIO:
+        base_height = float(height)
+        base_width = base_height * TARGET_ASPECT_RATIO
+    else:
+        base_width = float(width)
+        base_height = base_width / TARGET_ASPECT_RATIO
+
+    crop_width = max(1.0, base_width / zoom)
+    crop_height = max(1.0, base_height / zoom)
+    half_width = crop_width / 2
+    half_height = crop_height / 2
+    center_px_x = max(half_width, min(width - half_width, float(center_x) * width))
+    center_px_y = max(half_height, min(height - half_height, float(center_y) * height))
+
+    left = int(round(center_px_x - half_width))
+    top = int(round(center_px_y - half_height))
+    right = int(round(center_px_x + half_width))
+    bottom = int(round(center_px_y + half_height))
+    left = max(0, min(left, width - 1))
+    top = max(0, min(top, height - 1))
+    right = max(left + 1, min(right, width))
+    bottom = max(top + 1, min(bottom, height))
+    return left, top, right, bottom
+
+
+class ImageArea(QtWidgets.QLabel):
+    clicked = Signal()
     file_dropped = Signal(str)
-    hovered = Signal(int)
+    hovered = Signal()
 
-    def __init__(self, label: str, index: int) -> None:
-        super().__init__(label)
-        self.index = index
-        self.setFont(QtGui.QFont("Segoe UI", 11))
-        self.setFixedHeight(40)
+    def __init__(self, title: str) -> None:
+        super().__init__()
+        self._source_pixmap = QtGui.QPixmap()
+        self.image_state = ImageState.MISSING
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(150, 225)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
         self.setAcceptDrops(True)
-        self.setToolTip("Click or drag-and-drop an image (PNG, JPG, BMP)")
-        self.setStyleSheet(self._style_default())
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setAccessibleName(f"Select {title}")
+        self.setText("＋")
+        self.setToolTip("The image has not been selected. Click or drop an image here.")
+        self._apply_ring()
 
-    def enterEvent(self, event) -> None:
-        self.hovered.emit(self.index)
+    def set_image(self, path: Path, assessment: ImageAssessment) -> None:
+        pixmap = QtGui.QPixmap(str(path)) if path.is_file() else QtGui.QPixmap()
+        self._source_pixmap = pixmap
+        self.image_state = assessment.state
+        self.setToolTip(
+            assessment.reason
+            or "Click or drop an image here to replace the current image."
+        )
+        self._render_pixmap()
+        self._apply_ring()
+
+    def _render_pixmap(self) -> None:
+        if self._source_pixmap.isNull():
+            self.setPixmap(QtGui.QPixmap())
+            self.setText("＋")
+            return
+        self.setText("")
+        available = self.size() - QSize(16, 16)
+        self.setPixmap(
+            self._source_pixmap.scaled(
+                available,
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _apply_ring(self, *, drop_active: bool = False) -> None:
+        color = "#8ce7ee" if drop_active else RING_COLORS[self.image_state]
+        self.setStyleSheet(
+            "QLabel {"
+            f"border: 4px solid {color};"
+            "border-radius: 18px;"
+            "background: rgba(20, 24, 29, 0.78);"
+            "color: #77828d;"
+            "font: 42px 'Segoe UI Light';"
+            "padding: 4px;"
+            "}"
+            f"QLabel:focus {{ border-color: #b9f4f6; outline: none; }}"
+        )
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() in (
+            QtCore.Qt.Key.Key_Return,
+            QtCore.Qt.Key.Key_Enter,
+            QtCore.Qt.Key.Key_Space,
+        ):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def enterEvent(self, event: QtCore.QEvent) -> None:
+        self.hovered.emit()
         super().enterEvent(event)
 
-    def _style_default(self) -> str:
-        return (
-            "QPushButton { background-color: #222; border: 1px solid #00d0ff; "
-            "border-radius: 6px; padding: 8px; color: #eee; text-align: left; } "
-            "QPushButton:hover { background-color: #00d0ff; color: #111; }"
-        )
-
-    def _style_glow(self) -> str:
-        return (
-            "QPushButton { background-color: #222; border: 2px solid #00ffff; "
-            "border-radius: 6px; padding: 8px; color: #fff; }"
-        )
-
-    def dragEnterEvent(self, event) -> None:
-        if event.mimeData().hasUrls():
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        if self._first_supported_path(event.mimeData()) is not None:
+            self._apply_ring(drop_active=True)
             event.acceptProposedAction()
-            self.setStyleSheet(self._style_glow())
+            return
+        event.ignore()
 
-    def dragMoveEvent(self, event) -> None:
+    def dragLeaveEvent(self, event: QtGui.QDragLeaveEvent) -> None:
+        self._apply_ring()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        self._apply_ring()
+        path = self._first_supported_path(event.mimeData())
+        if path is None:
+            event.ignore()
+            return
+        self.file_dropped.emit(str(path))
         event.acceptProposedAction()
 
-    def dragLeaveEvent(self, event) -> None:
-        self.setStyleSheet(self._style_default())
+    @staticmethod
+    def _first_supported_path(mime_data: QtCore.QMimeData) -> Optional[Path]:
+        if not mime_data.hasUrls():
+            return None
+        for url in mime_data.urls():
+            path = Path(url.toLocalFile())
+            if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES:
+                return path
+        return None
 
-    def dropEvent(self, event) -> None:
-        self.setStyleSheet(self._style_default())
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if path.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
-                self.file_dropped.emit(path)
-                break
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._render_pixmap()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Static Floating Action Button (Prompt Writer)
-# ─────────────────────────────────────────────────────────────────────────────
+class ImageCard(QtWidgets.QFrame):
+    def __init__(self, title: str) -> None:
+        super().__init__()
+        self.setObjectName("imageCard")
+        self.setStyleSheet(
+            "QFrame#imageCard {"
+            "background: rgba(31, 35, 40, 0.72);"
+            "border: 1px solid rgba(100, 155, 165, 0.25);"
+            "border-radius: 12px;"
+            "}"
+        )
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        title_label = QtWidgets.QLabel(title)
+        title_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        title_label.setStyleSheet("color:#cce7ea; font:600 11px 'Segoe UI'; border:none;")
+        layout.addWidget(title_label)
+
+        self.image_area = ImageArea(title)
+        layout.addWidget(self.image_area, 1)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.setSpacing(8)
+        self.crop_button = QtWidgets.QPushButton("Crop")
+        self.clear_button = QtWidgets.QPushButton("Clear")
+        for button in (self.crop_button, self.clear_button):
+            button.setMinimumHeight(28)
+            button.setStyleSheet(
+                "QPushButton {"
+                "background:#22282d; color:#dce9ea; border:1px solid #52646a;"
+                "border-radius:5px; padding:4px 12px;"
+                "}"
+                "QPushButton:hover { border-color:#7fc7cd; color:white; }"
+                "QPushButton:disabled { color:#687378; border-color:#343c40; }"
+            )
+            controls.addWidget(button)
+        layout.addLayout(controls)
+
+    def emphasize(self) -> None:
+        effect = QtWidgets.QGraphicsDropShadowEffect(self)
+        effect.setBlurRadius(28)
+        effect.setOffset(0, 0)
+        effect.setColor(QtGui.QColor("#8ce7ee"))
+        self.setGraphicsEffect(effect)
+        QtCore.QTimer.singleShot(900, lambda: self.setGraphicsEffect(None))
+        self.image_area.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+
+
+class CropCanvas(QtWidgets.QWidget):
+    position_changed = Signal(float, float)
+
+    def __init__(
+        self,
+        source: Path,
+        *,
+        zoom: float,
+        center_x: float,
+        center_y: float,
+    ) -> None:
+        super().__init__()
+        self._pixmap = QtGui.QPixmap(str(source))
+        if self._pixmap.isNull():
+            raise ValueError("The original image cannot be displayed.")
+        self.zoom = zoom
+        self.center_x = center_x
+        self.center_y = center_y
+        self._last_position: Optional[QtCore.QPointF] = None
+        self.setFixedSize(360, 540)
+        self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+
+    def sizeHint(self) -> QSize:
+        return QSize(360, 540)
+
+    def set_zoom(self, zoom: float) -> None:
+        self.zoom = max(1.0, min(3.0, zoom))
+        self._constrain_center()
+        self.update()
+
+    def reset_crop(self) -> None:
+        self.zoom = 1.0
+        self.center_x = 0.5
+        self.center_y = 0.5
+        self.position_changed.emit(self.center_x, self.center_y)
+        self.update()
+
+    def crop_box(self) -> tuple[int, int, int, int]:
+        return calculate_crop_box(
+            self._pixmap.width(),
+            self._pixmap.height(),
+            zoom=self.zoom,
+            center_x=self.center_x,
+            center_y=self.center_y,
+        )
+
+    def _constrain_center(self) -> None:
+        left, top, right, bottom = self.crop_box()
+        crop_width = right - left
+        crop_height = bottom - top
+        half_x = crop_width / (2 * self._pixmap.width())
+        half_y = crop_height / (2 * self._pixmap.height())
+        self.center_x = max(half_x, min(1.0 - half_x, self.center_x))
+        self.center_y = max(half_y, min(1.0 - half_y, self.center_y))
+        self.position_changed.emit(self.center_x, self.center_y)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform)
+        painter.fillRect(self.rect(), QtGui.QColor("#101316"))
+        left, top, right, bottom = self.crop_box()
+        source = QtCore.QRectF(left, top, right - left, bottom - top)
+        painter.drawPixmap(QtCore.QRectF(self.rect()), self._pixmap, source)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#8ce7ee"), 2))
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -2, -2), 10, 10)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._last_position = event.position()
+            self.setCursor(QtCore.Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._last_position is None:
+            return
+        delta = event.position() - self._last_position
+        self._last_position = event.position()
+        left, top, right, bottom = self.crop_box()
+        crop_fraction_x = (right - left) / self._pixmap.width()
+        crop_fraction_y = (bottom - top) / self._pixmap.height()
+        self.center_x -= (delta.x() / max(1, self.width())) * crop_fraction_x
+        self.center_y -= (delta.y() / max(1, self.height())) * crop_fraction_y
+        self._constrain_center()
+        self.update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        self._last_position = None
+        self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+        super().mouseReleaseEvent(event)
+
+
+class CropDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        source: Path,
+        *,
+        zoom: float = 1.0,
+        center_x: float = 0.5,
+        center_y: float = 0.5,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Crop image")
+        self.setModal(True)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.canvas = CropCanvas(
+            source,
+            zoom=zoom,
+            center_x=center_x,
+            center_y=center_y,
+        )
+        layout.addWidget(self.canvas, 1)
+
+        zoom_row = QtWidgets.QHBoxLayout()
+        zoom_row.addWidget(QtWidgets.QLabel("Zoom"))
+        self.zoom_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.zoom_slider.setRange(100, 300)
+        self.zoom_slider.setValue(round(zoom * 100))
+        self.zoom_slider.valueChanged.connect(
+            lambda value: self.canvas.set_zoom(value / 100)
+        )
+        zoom_row.addWidget(self.zoom_slider, 1)
+        layout.addLayout(zoom_row)
+
+        button_row = QtWidgets.QHBoxLayout()
+        reset_button = QtWidgets.QPushButton("Reset crop")
+        reset_button.clicked.connect(self._reset)
+        button_row.addWidget(reset_button)
+        button_row.addStretch(1)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Save
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        button_row.addWidget(buttons)
+        layout.addLayout(button_row)
+
+    def _reset(self) -> None:
+        self.canvas.reset_crop()
+        self.zoom_slider.setValue(100)
+
+    def values(self) -> tuple[float, float, float]:
+        return self.canvas.zoom, self.canvas.center_x, self.canvas.center_y
+
+
 class StaticFab(QtWidgets.QToolButton):
-    SETTINGS_ORG = "LetterSmith"
-    SETTINGS_APP = "LettersmithApp"
-    KEY_GLOBAL_POS = "pwrite_fab_global_pos"  # stored as "x,y"
-
     def __init__(self, parent_widget: QtWidgets.QWidget, surface: QtWidgets.QWidget):
         super().__init__(parent_widget)
         self._surface = surface
-
         self.setObjectName("PWriteFab")
-        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.setAutoRaise(True)
-        self.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+        self.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.setFixedSize(200, 200)
         self.setStyleSheet("#PWriteFab{background:transparent; border:none; padding:0;}")
 
-    def set_surface(self, surf: QtWidgets.QWidget) -> None:
-        self._surface = surf
-
-    def _settings(self) -> QtCore.QSettings:
-        return QtCore.QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
-
-    def save_global_position(self) -> None:
-        gp = self.mapToGlobal(QPoint(0, 0))
-        self._settings().setValue(self.KEY_GLOBAL_POS, f"{gp.x()},{gp.y()}")
-
-    def restore_global_position(self, surface: Optional[QtWidgets.QWidget] = None) -> bool:
-        surf = surface or self._surface
-        raw = self._settings().value(self.KEY_GLOBAL_POS, "")
-        if not isinstance(raw, str) or "," not in raw:
-            return False
-        try:
-            xs, ys = raw.split(",", 1)
-            gp = QPoint(int(xs), int(ys))
-        except Exception:
-            return False
-        if not surf:
-            return False
-        self.move(surf.mapFromGlobal(gp))
-        return True
+    def set_surface(self, surface: QtWidgets.QWidget) -> None:
+        self._surface = surface
 
     def clamp_to_surface(self) -> None:
-        if not self._surface:
+        if self._surface is None:
             return
-        pad = 0
-        max_x = max(pad, self._surface.width() - self.width() - pad)
-        max_y = max(pad, self._surface.height() - self.height() - pad)
-        x = max(pad, min(self.x(), max_x))
-        y = max(pad, min(self.y(), max_y))
-        self.move(QPoint(x, y))
+        self.move(
+            max(0, min(self.x(), self._surface.width() - self.width())),
+            max(0, min(self.y(), self._surface.height() - self.height())),
+        )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Image utilities
-# ─────────────────────────────────────────────────────────────────────────────
-def _load_image_exif(path: str) -> Image.Image:
-    im = Image.open(path)
-    im = ImageOps.exif_transpose(im)
-    if im.mode not in ("RGB", "RGBA"):
-        try:
-            im = im.convert("RGBA")
-        except Exception:
-            im = im.convert("RGB")
-    return im
-
-
-def _save_png(img: Image.Image, dest_png_path: str) -> None:
-    Path(dest_png_path).parent.mkdir(parents=True, exist_ok=True)
-    mode = "RGBA" if img.mode == "RGBA" else "RGB"
-    img.convert(mode).save(dest_png_path, format="PNG", optimize=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Image tab proper
-# ─────────────────────────────────────────────────────────────────────────────
 class ImageTab(QtWidgets.QWidget):
     image_selected = Signal(QtGui.QPixmap)
     hover_preview_image = Signal(QtGui.QPixmap)
-
-    # NEW: explicit clear signal for Nexus
     clear_preview = Signal()
 
-    FAB_LOCKED = True
+    SLOT_MAP = {
+        1: ("Cover Page Image", "cover.png"),
+        2: ("Main Letter Image", "letter.png"),
+        3: ("Letter Background Image", "wall.png"),
+        4: ("Final Backdrop Image", "back.png"),
+    }
     FAB_FIXED_X = 55
     FAB_FIXED_Y_PAD = 28
 
-    FAB_NUDGE_X = 0
-    FAB_NUDGE_Y = 0
-
-    FAB_TOP_PAD = 16
-    FAB_RIGHT_PAD = 16
-
-    def __init__(self) -> None:
+    def __init__(self, project_root: str | Path | None = None) -> None:
         super().__init__()
-
-        # Correct order: cover, letter, wall, back
-        self.labels = {
-            1: ("Cover Page Image", "cover.png"),
-            2: ("Main Letter Image", "letter.png"),
-            3: ("Letter Background Image", "wall.png"),
-            4: ("Final Backdrop Image", "back.png"),
-        }
-        self.image_paths: dict[int, Optional[str]] = {i: None for i in self.labels.keys()}
+        self.project_root = Path(project_root or Path(__file__).resolve().parent).resolve()
+        self.labels = dict(self.SLOT_MAP)
+        self.image_paths: dict[int, Optional[str]] = {index: None for index in self.labels}
+        self.cards: dict[int, ImageCard] = {}
+        self.buttons: dict[int, ImageArea] = {}
+        self.status_controller = StatusController()
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(10)
 
         header = QtWidgets.QLabel("Select images for your letter")
         header.setFont(QtGui.QFont("Segoe UI Semibold", 16))
         header.setStyleSheet("color:#00d0ff;")
-        header.setAlignment(QtCore.Qt.AlignCenter)
-        glow = QtWidgets.QGraphicsDropShadowEffect(self)
-        glow.setBlurRadius(8)
-        glow.setOffset(0, 1)
-        glow.setColor(QtGui.QColor(0, 255, 255, 90))
-        header.setGraphicsEffect(glow)
+        header.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
 
-        self.buttons: dict[int, QtWidgets.QWidget] = {}
-        for idx in (1, 2, 3, 4):
-            label_text, _ = self.labels[idx]
-            btn = DropButton(f"  {label_text}", idx)
-            btn.clicked.connect(lambda _=False, i=idx: self._pick_image_dialog(i))
-            btn.file_dropped.connect(lambda p, i=idx: self._set_image_from_drop(p, i))
-            btn.hovered.connect(self.preview_from_gallery)
-            self.buttons[idx] = btn
-            layout.addWidget(btn)
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(12)
+        for index, (title, _filename) in self.labels.items():
+            card = ImageCard(title)
+            card.image_area.clicked.connect(
+                lambda index=index: self._pick_image_dialog(index)
+            )
+            card.image_area.file_dropped.connect(
+                lambda path, index=index: self._set_image_from_drop(path, index)
+            )
+            card.image_area.hovered.connect(
+                lambda index=index: self.preview_from_gallery(index)
+            )
+            card.crop_button.clicked.connect(
+                lambda _checked=False, index=index: self.open_crop_dialog(index)
+            )
+            card.clear_button.clicked.connect(
+                lambda _checked=False, index=index: self.clear_image(index)
+            )
+            self.cards[index] = card
+            self.buttons[index] = card.image_area
+            grid.addWidget(card, (index - 1) // 2, (index - 1) % 2)
+        layout.addLayout(grid, 1)
 
-        btn_row = QtWidgets.QHBoxLayout()
-
-        self.reset_btn = QtWidgets.QPushButton("🔄 Reset Images")
-        self.reset_btn.setFont(QtGui.QFont("Segoe UI Semibold", 11))
-        self.reset_btn.setStyleSheet(
-            "QPushButton { background-color:#222; color:#eee; border:1px solid #00d0ff; }"
-            "QPushButton:hover { background-color:#00d0ff; color:#111; }"
-        )
+        utility_row = QtWidgets.QHBoxLayout()
+        self.reset_btn = QtWidgets.QPushButton("Reset Images")
         self.reset_btn.clicked.connect(self.reset_images)
-        btn_row.addWidget(self.reset_btn)
-
+        utility_row.addWidget(self.reset_btn)
         self.open_btn = QtWidgets.QPushButton("Gallery")
-        self.open_btn.setFont(QtGui.QFont("Segoe UI Semibold", 11))
-        self.open_btn.setStyleSheet(
-            "QPushButton { background-color:#222; color:#eee; border:1px solid #00d0ff; }"
-            "QPushButton:hover { background-color:#00d0ff; color:#111; }"
-        )
         self.open_btn.clicked.connect(self.open_gallery_folder)
-        btn_row.addWidget(self.open_btn)
+        utility_row.addWidget(self.open_btn)
+        utility_row.addStretch(1)
+        layout.addLayout(utility_row)
 
-        layout.addLayout(btn_row)
+        self.status_banner = StatusBanner(controller=self.status_controller)
+        self.status = self.status_banner._label
+        layout.addWidget(self.status_banner)
 
-        self.status = QtWidgets.QLabel()
-        self.status.setFont(QtGui.QFont("Segoe UI", 10))
-        self.status.setStyleSheet("color:#bbb;")
-        layout.addWidget(self.status)
-
-        # Create FAB with safe temporary parent; attach on showEvent.
         self._fab_surface: QtWidgets.QWidget = self
         self.pwrite_fab = StaticFab(self, self)
-
-        # Icon
-        project_dir = os.path.dirname(os.path.abspath(__file__))
-        pwrite_paths = [
-            os.path.join(project_dir, "gallery", "app", "icons", "Pwrite.png"),
-            os.path.join(project_dir, "gallery", "app", "icons", "pwrite.png"),
-        ]
-        icon = None
-        for p in pwrite_paths:
-            if os.path.exists(p):
-                icon = QIcon(p)
-                break
-
-        if icon:
-            self.pwrite_fab.setIcon(icon)
+        icon_path = self.project_root / "gallery/app/icons/Pwrite.png"
+        if icon_path.is_file():
+            self.pwrite_fab.setIcon(QIcon(str(icon_path)))
             self.pwrite_fab.setIconSize(QSize(200, 200))
         else:
             self.pwrite_fab.setText("PROMPT\nWRITER")
-            self.pwrite_fab.setStyleSheet(
-                self.pwrite_fab.styleSheet() + " #PWriteFab{color:#00e5e5; font:700 18px 'Segoe UI';}"
-            )
-
         self.pwrite_fab.clicked.connect(self._open_prompt_writer_bridge)
         self.pwrite_fab.show()
         self.pwrite_fab.raise_()
 
-    # ────────────────────────────────────────────────────────────
-    # Canonical paths
-    # ────────────────────────────────────────────────────────────
+        self.refresh_from_workspace()
+
     def _project_dir(self) -> str:
-        return os.path.dirname(os.path.abspath(__file__))
+        return str(self.project_root)
 
     def _user_pages_dir(self) -> str:
-        return os.path.join(self._project_dir(), "gallery", "user", "pages")
+        return str(self.project_root / "gallery/user/pages")
 
-    # ────────────────────────────────────────────────────────────
-    # Preview surface discovery (legacy)
-    # ────────────────────────────────────────────────────────────
-    def _find_preview_surface(self) -> Optional[QtWidgets.QWidget]:
-        win = self.window()
-        if not isinstance(win, QtWidgets.QWidget):
-            return None
+    @property
+    def pages_dir(self) -> Path:
+        return self.project_root / "gallery/user/pages"
 
-        candidates: List[QtWidgets.QWidget] = []
+    @property
+    def originals_dir(self) -> Path:
+        return self.pages_dir / "originals"
 
-        for w in win.findChildren(QtWidgets.QWidget):
-            name = (w.objectName() or "").lower()
-            if "preview" in name:
-                candidates.append(w)
+    @property
+    def crops_path(self) -> Path:
+        return self.pages_dir / "crops.json"
 
-        for lab in win.findChildren(QtWidgets.QLabel):
-            try:
-                pm = lab.pixmap()
-            except Exception:
-                pm = None
-            if pm is not None and not pm.isNull():
-                candidates.append(lab)
+    def canonical_path(self, index: int) -> Path:
+        return self.pages_dir / self.labels[index][1]
 
-        biggest = None
-        biggest_area = 0
-        for w in win.findChildren(QtWidgets.QWidget):
-            if w is self or self.isAncestorOf(w):
-                continue
-            if not w.isVisible():
-                continue
-            r = w.rect()
-            area = max(0, r.width()) * max(0, r.height())
-            if area > biggest_area:
-                biggest_area = area
-                biggest = w
+    def original_path(self, index: int) -> Path:
+        return self.originals_dir / self.labels[index][1]
 
-        if biggest is not None:
-            candidates.append(biggest)
+    def _load_crop_metadata(self) -> dict:
+        try:
+            data = __import__("json").loads(self.crops_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, UnicodeError, ValueError):
+            return {}
 
-        best = None
-        best_area = 0
-        for w in candidates:
-            if not w.isVisible():
-                continue
-            r = w.rect()
-            area = max(0, r.width()) * max(0, r.height())
-            if area >= best_area and area >= 200 * 200:
-                best = w
-                best_area = area
+    def _write_crop_metadata(self, metadata: dict) -> None:
+        atomic_write_json(self.crops_path, metadata)
 
-        return best
+    def _assessment(self, index: int) -> ImageAssessment:
+        metadata = self._load_crop_metadata().get(self.labels[index][1])
+        return assess_image(
+            self.canonical_path(index),
+            metadata if isinstance(metadata, dict) else None,
+        )
 
-    # ────────────────────────────────────────────────────────────
-    # FAB positioning
-    # ────────────────────────────────────────────────────────────
-    def _place_fab_default_top_right(self) -> None:
-        surf = self._fab_surface
-        x = surf.width() - self.pwrite_fab.width() - self.FAB_RIGHT_PAD
-        y = self.FAB_TOP_PAD
-        self.pwrite_fab.move(QPoint(max(0, x), max(0, y)))
-        self.pwrite_fab.clamp_to_surface()
+    def _refresh_card(self, index: int) -> ImageAssessment:
+        assessment = self._assessment(index)
+        path = self.canonical_path(index)
+        self.image_paths[index] = str(path) if path.is_file() else None
+        card = self.cards[index]
+        card.image_area.set_image(path, assessment)
+        card.crop_button.setEnabled(
+            path.is_file() and assessment.state is not ImageState.MISSING
+        )
+        metadata = self._load_crop_metadata()
+        card.clear_button.setEnabled(
+            path.exists()
+            or self.original_path(index).exists()
+            or self.labels[index][1] in metadata
+        )
+        return assessment
 
-    def _apply_nudge(self) -> None:
-        if self.FAB_NUDGE_X != 0 or self.FAB_NUDGE_Y != 0:
-            self.pwrite_fab.move(self.pwrite_fab.pos() + QPoint(self.FAB_NUDGE_X, self.FAB_NUDGE_Y))
-            self.pwrite_fab.clamp_to_surface()
-
-    def _place_fab_locked(self, win: QtWidgets.QWidget) -> None:
-        tabbar = win.findChild(QtWidgets.QTabBar)
-        if tabbar is not None:
-            y = tabbar.geometry().bottom() + int(self.FAB_FIXED_Y_PAD)
-        else:
-            y = int(self.FAB_FIXED_Y_PAD)
-
-        x = int(self.FAB_FIXED_X)
-
-        self.pwrite_fab.move(QPoint(max(0, x), max(0, y)))
-        self.pwrite_fab.clamp_to_surface()
-        self.pwrite_fab.raise_()
-
-    def _ensure_fab_on_preview(self) -> None:
-        if bool(self.FAB_LOCKED):
-            win = self.window()
-            if not isinstance(win, QtWidgets.QWidget):
-                win = self
-
-            if self.pwrite_fab.parent() is not win:
-                self._fab_surface = win
-                self.pwrite_fab.setParent(win)
-                self.pwrite_fab.set_surface(win)
-                self.pwrite_fab.show()
-                self.pwrite_fab.raise_()
-
-            self._place_fab_locked(win)
-            return
-
-        surf = self._find_preview_surface() or self
-        global_pos = self.pwrite_fab.mapToGlobal(QPoint(0, 0))
-
-        if self.pwrite_fab.parent() is not surf:
-            self._fab_surface = surf
-            self.pwrite_fab.setParent(surf)
-            self.pwrite_fab.set_surface(surf)
-            self.pwrite_fab.show()
-            self.pwrite_fab.raise_()
-            self.pwrite_fab.move(surf.mapFromGlobal(global_pos))
-
-        restored = self.pwrite_fab.restore_global_position(surface=surf)
-
-        if not restored:
-            self._place_fab_default_top_right()
-            self.pwrite_fab.save_global_position()
-        else:
-            self.pwrite_fab.clamp_to_surface()
-
-        self._apply_nudge()
-        self.pwrite_fab.save_global_position()
-
-        self.pwrite_fab.show()
-        self.pwrite_fab.raise_()
-
-    # ────────────────────────────────────────────────────────────
-    # Qt events
-    # ────────────────────────────────────────────────────────────
-    def showEvent(self, event: QtGui.QShowEvent) -> None:
-        super().showEvent(event)
-        QtCore.QTimer.singleShot(0, self._ensure_fab_on_preview)
-
-    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
-        super().resizeEvent(event)
-        if hasattr(self, "pwrite_fab") and self.pwrite_fab and self.pwrite_fab.isVisible():
-            if bool(self.FAB_LOCKED):
-                win = self.window()
-                if not isinstance(win, QtWidgets.QWidget):
-                    win = self
-                self._fab_surface = win
-                self.pwrite_fab.set_surface(win)
-                self._place_fab_locked(win)
-            else:
-                self.pwrite_fab.clamp_to_surface()
-                self.pwrite_fab.save_global_position()
-
-    # ────────────────────────────────────────────────────────────
-    # Selection
-    # ────────────────────────────────────────────────────────────
-    def _pick_image_dialog(self, idx: int) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+    def _pick_image_dialog(self, index: int) -> None:
+        path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
             self,
-            f"Select {self.labels[idx][0]}",
+            f"Select {self.labels[index][0]}",
             "",
-            "Images (*.png *.jpg *.jpeg *.bmp)",
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp)",
         )
         if path:
-            self.set_image_path(idx, path)
+            self.set_image_path(index, path)
 
-    def _set_image_from_drop(self, path: str, idx: int) -> None:
-        if os.path.exists(path):
-            self.set_image_path(idx, path)
+    def _set_image_from_drop(self, path: str, index: int) -> None:
+        if Path(path).is_file():
+            self.set_image_path(index, path)
 
-    def set_image_path(self, idx: int, source_path: str) -> None:
-        label_text, filename = self.labels[idx]
-        self.image_paths[idx] = source_path
-
-        pages_dir = self._user_pages_dir()
-        os.makedirs(pages_dir, exist_ok=True)
-
-        dest_png = os.path.join(pages_dir, filename)
-
+    def set_image_path(self, index: int, source_path: str) -> None:
+        if index not in self.labels:
+            raise KeyError(f"Unknown image slot: {index}")
+        filename = self.labels[index][1]
         try:
-            img = _load_image_exif(source_path)
-            _save_png(img, dest_png)
-        except Exception as e:
-            self.status.setText(f"❌ Failed to process {filename}: {e}")
+            image = _load_image_exif(source_path)
+            payload = _png_bytes(image)
+            atomic_write_bytes(self.original_path(index), payload)
+            atomic_write_bytes(self.canonical_path(index), payload)
+            metadata = self._load_crop_metadata()
+            if filename in metadata:
+                metadata.pop(filename, None)
+                self._write_crop_metadata(metadata)
+        except Exception as exc:
+            self.status_controller.publish(
+                f"Could not import {filename}: {exc}",
+                StatusLevel.ERROR,
+                persistent=True,
+                key=f"image-{index}",
+            )
+            self._refresh_card(index)
             return
 
-        btn = self.buttons.get(idx)
-        if isinstance(btn, QtWidgets.QPushButton):
-            btn.setText(f"  ✔️  {label_text}")
-
-        pix = QtGui.QPixmap(dest_png)
-        if pix.isNull():
-            self.status.setText("❌ Invalid image file after save")
+        assessment = self._refresh_card(index)
+        pixmap = QtGui.QPixmap(str(self.canonical_path(index)))
+        if pixmap.isNull():
+            self.status_controller.publish(
+                f"Could not read the saved {filename}.",
+                StatusLevel.ERROR,
+                persistent=True,
+                key=f"image-{index}",
+            )
             return
+        self.status_controller.clear(f"image-{index}")
+        self.status_controller.publish(f"{filename} saved.", StatusLevel.SUCCESS)
+        self.image_selected.emit(
+            pixmap.scaledToWidth(
+                200,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        if assessment.state is ImageState.WARNING:
+            self.cards[index].image_area.setToolTip(assessment.reason)
 
-        preview = pix.scaledToWidth(200, QtCore.Qt.SmoothTransformation)
-        self.image_selected.emit(preview)
-        self.status.setText(f"✅ {filename} saved; preview ready.")
+    def _ensure_original(self, index: int) -> Path:
+        original = self.original_path(index)
+        if original.is_file():
+            return original
+        canonical = self.canonical_path(index)
+        image = _load_image_exif(canonical)
+        atomic_write_bytes(original, _png_bytes(image))
+        return original
 
-    def refresh_from_workspace(self) -> None:
-        pages_dir = Path(self._user_pages_dir())
-        first_pixmap: Optional[QtGui.QPixmap] = None
-        for idx, (label_text, filename) in self.labels.items():
-            path = pages_dir / filename
-            self.image_paths[idx] = str(path) if path.is_file() else None
-            button = self.buttons.get(idx)
-            if isinstance(button, QtWidgets.QPushButton):
-                button.setText(
-                    f"  ✔  {label_text}" if path.is_file() else f"  {label_text}"
-                )
-            if first_pixmap is None and path.is_file():
-                candidate = QtGui.QPixmap(str(path))
-                if not candidate.isNull():
-                    first_pixmap = candidate
-        if first_pixmap is not None:
-            self.image_selected.emit(
-                first_pixmap.scaledToWidth(200, QtCore.Qt.SmoothTransformation)
+    def open_crop_dialog(self, index: int) -> None:
+        if self._assessment(index).state is ImageState.MISSING:
+            self.status_controller.publish(
+                "Select a readable image before cropping.",
+                StatusLevel.WARNING,
+            )
+            return
+        try:
+            original = self._ensure_original(index)
+            saved = self._load_crop_metadata().get(self.labels[index][1], {})
+            dialog = CropDialog(
+                original,
+                zoom=float(saved.get("zoom", 1.0)) if isinstance(saved, dict) else 1.0,
+                center_x=float(saved.get("center_x", 0.5)) if isinstance(saved, dict) else 0.5,
+                center_y=float(saved.get("center_y", 0.5)) if isinstance(saved, dict) else 0.5,
+                parent=self,
+            )
+        except Exception as exc:
+            self.status_controller.publish(
+                f"Could not open crop: {exc}",
+                StatusLevel.ERROR,
+                persistent=True,
+                key=f"image-{index}",
+            )
+            return
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            zoom, center_x, center_y = dialog.values()
+            self.apply_crop(
+                index,
+                zoom=zoom,
+                center_x=center_x,
+                center_y=center_y,
             )
 
-    # ────────────────────────────────────────────────────────────
-    # Hover preview
-    # ────────────────────────────────────────────────────────────
-    def preview_from_gallery(self, idx: int) -> None:
-        _, filename = self.labels[idx]
-        full_path = os.path.join(self._user_pages_dir(), filename)
-        if os.path.exists(full_path):
-            pix = QtGui.QPixmap(full_path)
-            if not pix.isNull():
-                prev = pix.scaledToWidth(200, QtCore.Qt.SmoothTransformation)
-                self.hover_preview_image.emit(prev)
+    def apply_crop(
+        self,
+        index: int,
+        *,
+        zoom: float,
+        center_x: float,
+        center_y: float,
+    ) -> None:
+        filename = self.labels[index][1]
+        try:
+            original = self._ensure_original(index)
+            image = _load_image_exif(original)
+            box = calculate_crop_box(
+                image.width,
+                image.height,
+                zoom=zoom,
+                center_x=center_x,
+                center_y=center_y,
+            )
+            cropped = image.crop(box)
+            atomic_write_bytes(self.canonical_path(index), _png_bytes(cropped))
+            metadata = self._load_crop_metadata()
+            metadata[filename] = {
+                "source": f"originals/{filename}",
+                "zoom": round(max(1.0, min(3.0, float(zoom))), 3),
+                "center_x": round(max(0.0, min(1.0, float(center_x))), 4),
+                "center_y": round(max(0.0, min(1.0, float(center_y))), 4),
+                "crop_box": list(box),
+                "target_ratio": "2:3",
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            }
+            self._write_crop_metadata(metadata)
+        except Exception as exc:
+            self.status_controller.publish(
+                f"Could not save crop for {filename}: {exc}",
+                StatusLevel.ERROR,
+                persistent=True,
+                key=f"image-{index}",
+            )
+            self._refresh_card(index)
+            return
 
-    # ────────────────────────────────────────────────────────────
-    # Utilities
-    # ────────────────────────────────────────────────────────────
-    def reset_images(self) -> None:
-        pages_dir = self._user_pages_dir()
+        self.status_controller.clear(f"image-{index}")
+        self.status_controller.publish(f"{filename} crop saved.", StatusLevel.SUCCESS)
+        self._refresh_card(index)
+        self.preview_from_gallery(index, selected=True)
 
-        for i in (1, 2, 3, 4):
-            self.image_paths[i] = None
-            label_text, filename = self.labels[i]
-            btn = self.buttons.get(i)
-            if isinstance(btn, QtWidgets.QPushButton):
-                btn.setText(f"  {label_text}")
-
-            file_path = os.path.join(pages_dir, filename)
+    def clear_image(self, index: int, *, announce: bool = True) -> None:
+        filename = self.labels[index][1]
+        errors: list[str] = []
+        for path in (self.canonical_path(index), self.original_path(index)):
             try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-            except Exception:
-                pass
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                errors.append(str(exc))
+        try:
+            metadata = self._load_crop_metadata()
+            metadata.pop(filename, None)
+            self._write_crop_metadata(metadata)
+        except OSError as exc:
+            errors.append(str(exc))
 
-        # Clear preview instantly (works even if Nexus isn't wired yet)
+        assessment = self._refresh_card(index)
         self.image_selected.emit(QtGui.QPixmap())
         self.hover_preview_image.emit(QtGui.QPixmap())
         self.clear_preview.emit()
+        if errors:
+            self.status_controller.publish(
+                f"Could not fully clear {filename}: {'; '.join(errors)}",
+                StatusLevel.ERROR,
+                persistent=True,
+                key=f"image-{index}",
+            )
+        else:
+            self.status_controller.clear(f"image-{index}")
+            if announce:
+                self.status_controller.publish(f"{filename} cleared.", StatusLevel.INFO)
+        self.cards[index].image_area.setToolTip(assessment.reason)
 
-        self.status.setText("🧹 Cleared All Images.")
+    def reset_images(self) -> None:
+        for index in self.labels:
+            self.clear_image(index, announce=False)
+        self.status_controller.publish("All images cleared.", StatusLevel.INFO)
+
+    def refresh_from_workspace(self) -> None:
+        first_pixmap: Optional[QtGui.QPixmap] = None
+        for index in self.labels:
+            assessment = self._refresh_card(index)
+            if first_pixmap is None and assessment.state is not ImageState.MISSING:
+                candidate = QtGui.QPixmap(str(self.canonical_path(index)))
+                if not candidate.isNull():
+                    first_pixmap = candidate
+        if first_pixmap is None:
+            self.clear_preview.emit()
+            return
+        self.image_selected.emit(
+            first_pixmap.scaledToWidth(
+                200,
+                QtCore.Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def preview_from_gallery(self, index: int, *, selected: bool = False) -> None:
+        pixmap = QtGui.QPixmap(str(self.canonical_path(index)))
+        if pixmap.isNull():
+            return
+        preview = pixmap.scaledToWidth(
+            200,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        if selected:
+            self.image_selected.emit(preview)
+        else:
+            self.hover_preview_image.emit(preview)
+
+    def focus_card(self, index: int) -> None:
+        card = self.cards.get(index)
+        if card is not None:
+            card.emphasize()
 
     def open_gallery_folder(self) -> None:
-        user_root = os.path.join(self._project_dir(), "gallery", "user", "pages")
-        os.makedirs(user_root, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(user_root))
+        self.pages_dir.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.pages_dir)))
 
-    # ────────────────────────────────────────────────────────────
-    # Prompt Writer bridge
-    # ────────────────────────────────────────────────────────────
-    def _open_prompt_writer_bridge(self):
-        try:
-            win = self.window()
-            opener = getattr(win, "open_prompt_writer", None)
-            if callable(opener):
-                opener()
-                self.status.setText("Prompt Writer opened.")
-                return
-        except Exception:
-            pass
-        self.status.setText("⚠️ Prompt Writer opener not found on main window.")
+    def _place_fab_locked(self) -> None:
+        window = self.window()
+        surface = window if isinstance(window, QtWidgets.QWidget) else self
+        if self.pwrite_fab.parent() is not surface:
+            self.pwrite_fab.setParent(surface)
+        self._fab_surface = surface
+        self.pwrite_fab.set_surface(surface)
+        tabbar = surface.findChild(QtWidgets.QTabBar)
+        y = (
+            tabbar.geometry().bottom() + self.FAB_FIXED_Y_PAD
+            if tabbar is not None
+            else self.FAB_FIXED_Y_PAD
+        )
+        self.pwrite_fab.move(QPoint(self.FAB_FIXED_X, y))
+        self.pwrite_fab.clamp_to_surface()
+        self.pwrite_fab.show()
+        self.pwrite_fab.raise_()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        QtCore.QTimer.singleShot(0, self._place_fab_locked)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "pwrite_fab"):
+            self._place_fab_locked()
+
+    def _open_prompt_writer_bridge(self) -> None:
+        opener = getattr(self.window(), "open_prompt_writer", None)
+        if callable(opener):
+            opener()
+            self.status_controller.publish("Prompt Writer opened.", StatusLevel.INFO)
+            return
+        self.status_controller.publish(
+            "Prompt Writer is unavailable.",
+            StatusLevel.WARNING,
+        )
+
+
+__all__ = [
+    "CropDialog",
+    "ImageAssessment",
+    "ImageCard",
+    "ImageState",
+    "ImageTab",
+    "assess_image",
+    "calculate_crop_box",
+]

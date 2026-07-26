@@ -537,7 +537,7 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception as ex:
             raise ImportError(f"Failed to import feature tabs: {ex}")
 
-        self.image_tab   = ImageTab()
+        self.image_tab   = ImageTab(self.project_root)
         self.sound_tab   = SoundTab(self.project_root)
         self.message_tab = MessageTab(self.project_root)
         self.forge_tab   = ForgeTab(self.project_root)
