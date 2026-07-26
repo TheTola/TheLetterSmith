@@ -551,6 +551,7 @@ class Nexus(QtWidgets.QMainWindow):
         self.forge_tab.fix_requested.connect(self._fix_readiness_item)
         self.forge_tab.preview_requested.connect(self._load_forge_preview)
         self.forge_tab.preview_restart_requested.connect(self._restart_forge_preview)
+        self.forge_tab.preview_fullscreen_requested.connect(self._toggle_forge_preview_fullscreen)
         self.forge_tab.preview_mute_requested.connect(self._mute_forge_preview)
         self.forge_tab.preview_report_requested.connect(self._report_forge_preview_assets)
         self.forge_tab.project_will_open.connect(self._prepare_workspace_audio_change)
@@ -719,17 +720,18 @@ class Nexus(QtWidgets.QMainWindow):
         if key in image_slots:
             self.tabbar.setCurrentIndex(0)
             QtCore.QTimer.singleShot(
-                0, lambda slot=image_slots[key]: self.image_tab._pick_image_dialog(slot)
+                0, lambda slot=image_slots[key]: self.image_tab.focus_card(slot)
             )
             return
         if key == "music":
             self.tabbar.setCurrentIndex(1)
-            QtCore.QTimer.singleShot(0, self.sound_tab.select_music)
+            playlist_widget = getattr(self.sound_tab, "playlist_view", self.sound_tab)
+            QtCore.QTimer.singleShot(0, playlist_widget.setFocus)
             return
         if key in {"message", "recipient", "title"}:
             self.tabbar.setCurrentIndex(2)
             if key == "message":
-                QtCore.QTimer.singleShot(0, self.message_tab.select_file)
+                QtCore.QTimer.singleShot(0, self.message_tab.edit_btn.setFocus)
             elif key == "recipient":
                 QtCore.QTimer.singleShot(0, self.message_tab.name_input.setFocus)
             else:
@@ -961,6 +963,12 @@ class Nexus(QtWidgets.QMainWindow):
     def _restart_forge_preview(self) -> None:
         if self.preview_stack.currentWidget() is self.html_preview:
             self.html_preview.reload()
+
+    def _toggle_forge_preview_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
 
     def _mute_forge_preview(self, muted: bool) -> None:
         self.html_preview.page().setAudioMuted(bool(muted))

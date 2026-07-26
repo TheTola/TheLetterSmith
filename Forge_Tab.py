@@ -1,28 +1,6 @@
 # ===============================
 # File: Forge_Tab.py
-# Purpose: Forge tab - deterministic Play build + Load (Recipient -> Title)
-#
-# FINAL BUTTON BEHAVIOR:
-# - Generate:
-#     Builds Play bundle, opens browser (index.html). Does NOT open folders.
-# - Seal the Letter:
-#     Builds Play bundle, opens the Play folder (GitHub Pages target).
-#
-# LOAD (FINAL SPEC):
-# - Clicking Load opens a drop-down menu (QMenu)
-# - Menu lists ALL recipient folders under: output/Play/<recipient>/
-# - Hovering a recipient expands a submenu listing ALL titles (from <title> in index.html)
-# - Clicking a title loads that build back into canonical SOURCE:
-#     gallery/user/pages/*
-#     gallery/user/message/*
-#     gallery/user/sounds/music.mp3   (ONLY music.mp3)
-# - Does NOT touch flips/gliss/appssong/controls
-# - Updates settings.json:
-#     recipient_name, recipient_title
-#
-# NEW:
-# - When a saved letter is loaded, ForgeTab emits a signal so Nexus can immediately
-#   refresh the Forge preview (cover.png) + caption (project title).
+# Purpose: Forge readiness, transactional preview, publishing, and saved-letter loading.
 # ===============================
 
 from __future__ import annotations
@@ -46,23 +24,15 @@ import generate  # <-- IMPORTANT: module import only
 from message_html import read_text_normalized
 from message_history import MessageHistory
 from project_store import ProjectStore
-from project_readiness import assess_project_readiness, project_is_ready
-from portable_export import (
-    create_publish_package,
-    create_single_html,
-    create_zip_package,
-)
-from playlist import PLAYLIST_PATH, PlaylistStore
+from readiness import evaluate_readiness
+from saved_letters import SavedLetter, SavedLetterCatalog, update_saved_metadata
+from playlist import CROSSFADE_MS, PLAYLIST_PATH, PROCESSED_ARCHIVE_PATH
 from settings_store import SettingsStore
-from transactional_io import PathTransaction
+from transactional_io import PathTransaction, atomic_write_json
 
 from config import (
     PUBLISHED_PAGE_URL_KEY,
     PLAY_METADATA_FILE,
-    OUTPUT_PLAY_DIR,
-    OUTPUT_FILE_DIR,
-    OUTPUT_PACKAGES_DIR,
-    OUTPUT_PUBLISH_DIR,
     CURTAIN_STYLE_KEY,
     CURTAIN_STYLE_LABELS,
     CURTAIN_STYLE_WHITE,
@@ -72,7 +42,6 @@ from config import (
     VALID_CURTAIN_STYLES,
     ensure_output_dirs,
     play_bundle_path,
-    validate_required_images,
     MESSAGE_HTML_FILE,
     USER_PAGES_DIR,
     USER_MESSAGE_DIR,
@@ -84,22 +53,6 @@ from config import (
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
-def _read_text(path: Path) -> str:
-    try:
-        return read_text_normalized(path)
-    except Exception:
-        return ""
-
-
-def _extract_html_title(index_html: Path) -> str:
-    txt = _read_text(index_html)
-    m = re.search(r"<title>\s*(.*?)\s*</title>", txt, flags=re.IGNORECASE | re.DOTALL)
-    if not m:
-        return index_html.parent.name
-    t = re.sub(r"\s+", " ", m.group(1)).strip()
-    return t or index_html.parent.name
-
-
 def _load_settings(root: Path) -> dict:
     return SettingsStore(root).as_dict()
 
@@ -195,10 +148,7 @@ def _forge_menu_style() -> str:
 
 
 def _get_generate_fn():
-    """
-    Robust resolver for the Generate function.
-    We do NOT hard-import a symbol because your file has shifted names before.
-    """
+    """Resolve the installed Play-bundle generator."""
     fn = getattr(generate, "generate_play_bundle", None)
     if callable(fn):
         return fn
@@ -210,28 +160,75 @@ def _get_generate_fn():
     return None
 
 
-def _open_folder(path: Path) -> None:
-    QtGui.QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+# ---------------------------------------------------------------------
+# Saved-letter browser
+# ---------------------------------------------------------------------
+class SavedLetterBrowser(QtWidgets.QDialog):
+    def __init__(self, project_root: str | Path, parent=None) -> None:
+        super().__init__(parent)
+        self.catalog = SavedLetterCatalog(project_root)
+        self.setWindowTitle("Load Letter")
+        self.resize(620, 460)
+
+        layout = QVBoxLayout(self)
+        self.search_input = QtWidgets.QLineEdit()
+        self.search_input.setPlaceholderText("Search recipient or title")
+        self.search_input.textChanged.connect(self._refresh)
+        layout.addWidget(self.search_input)
+
+        self.list_widget = QtWidgets.QListWidget()
+        self.list_widget.setIconSize(QtCore.QSize(72, 54))
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self.accept())
+        layout.addWidget(self.list_widget, 1)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Open | QtWidgets.QDialogButtonBox.Cancel
+        )
+        self.load_button = buttons.button(QtWidgets.QDialogButtonBox.Open)
+        self.load_button.setText("Load")
+        self.load_button.setEnabled(False)
+        self.list_widget.currentItemChanged.connect(
+            lambda current, _previous: self.load_button.setEnabled(current is not None)
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        self.list_widget.clear()
+        for entry in self.catalog.search(self.search_input.text()):
+            modified = entry.modified_at.strftime("%Y-%m-%d %H:%M")
+            state = "Published" if entry.published else "Not published"
+            prefix = "Recovery — " if entry.recovery else ""
+            item = QtWidgets.QListWidgetItem(
+                f"{prefix}{entry.recipient} — {entry.title}\n{modified} · {state}"
+            )
+            if entry.cover_path is not None:
+                item.setIcon(QtGui.QIcon(str(entry.cover_path)))
+            item.setData(Qt.UserRole, entry)
+            self.list_widget.addItem(item)
+        if self.list_widget.count():
+            self.list_widget.setCurrentRow(0)
+
+    def selected_entry(self) -> Optional[SavedLetter]:
+        item = self.list_widget.currentItem()
+        value = item.data(Qt.UserRole) if item is not None else None
+        return value if isinstance(value, SavedLetter) else None
 
 
 # ---------------------------------------------------------------------
 # ForgeTab
 # ---------------------------------------------------------------------
 class ForgeTab(QtWidgets.QWidget):
-    """
-    - Generate:
-        Builds Play bundle, opens browser
-    - Seal the Letter:
-        Builds Play bundle, opens Play folder (GitHub Pages target)
-    - Load:
-        Dropdown menu: Recipient -> Title -> Load build into gallery/user/*
-    """
+    """Readiness, preview, publishing, and transactional saved-letter loading."""
 
     # Nexus should connect to this to refresh preview/caption immediately after load.
     letter_loaded = QtCore.Signal(dict)  # payload includes recipient_name, recipient_title, play_dir
     fix_requested = QtCore.Signal(str)
     preview_requested = QtCore.Signal(str, str)
     preview_restart_requested = QtCore.Signal()
+    preview_fullscreen_requested = QtCore.Signal()
     preview_mute_requested = QtCore.Signal(bool)
     preview_report_requested = QtCore.Signal()
     project_will_open = QtCore.Signal()
@@ -256,7 +253,7 @@ class ForgeTab(QtWidgets.QWidget):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
 
-        title = QLabel("Generate Animated Letter")
+        title = QLabel("Forge")
         title.setFont(QFont("Segoe UI Semibold", 18))
         title.setStyleSheet("color: #00d0ff;")
         title.setAlignment(Qt.AlignCenter)
@@ -279,8 +276,8 @@ class ForgeTab(QtWidgets.QWidget):
         top_row.addWidget(self.settings_btn, 0, Qt.AlignRight)
 
         self.load_btn = self._tiny_button("Load")
-        self.load_btn.setToolTip("Load a saved letter from output/Play (Recipient -> Title)")
-        self.load_btn.clicked.connect(self._open_load_menu)
+        self.load_btn.setToolTip("Browse saved letters and recovery snapshots")
+        self.load_btn.clicked.connect(self._open_load_browser)
         top_row.addWidget(self.load_btn, 0, Qt.AlignRight)
 
         layout.addLayout(top_row)
@@ -292,24 +289,17 @@ class ForgeTab(QtWidgets.QWidget):
         btns = QHBoxLayout()
         btns.setSpacing(12)
 
-        self.generate_btn = self._styled_button("Generate", "#ff8800", "#ffaa00", "yellow")
-        self.generate_btn.setToolTip("Build the Play bundle and preview in your browser")
-        self.generate_btn.clicked.connect(self.generate)
-        btns.addWidget(self.generate_btn)
+        self.preview_btn = self._styled_button("Preview Letter", "#ff8800", "#ffaa00", "yellow")
+        self.preview_btn.clicked.connect(self.preview_letter)
+        btns.addWidget(self.preview_btn)
 
-        self.seal_btn = self._styled_button(" Seal the Letter", "#6a5acd", "#836fff", "white")
-        self.seal_btn.setToolTip("Build the Play bundle and open the Play folder (GitHub Pages target)")
-        self.seal_btn.clicked.connect(self.seal_the_letter)
-        btns.addWidget(self.seal_btn)
+        self.publish_btn = self._styled_button("Publish Letter", "#6a5acd", "#836fff", "white")
+        self.publish_btn.clicked.connect(self.publish_letter)
+        btns.addWidget(self.publish_btn)
 
-        self.export_btn = self._styled_button("Export", "#147a68", "#20a78d", "white")
-        self.export_btn.setToolTip("Export a Web Folder, ZIP, Single HTML, or Publish Package")
-        self.export_btn.clicked.connect(self._open_export_menu)
-        btns.addWidget(self.export_btn)
-
-        self.go_to_page_btn = self._page_button("Go to Page")
-        self.go_to_page_btn.clicked.connect(self.go_to_page)
-        btns.addWidget(self.go_to_page_btn)
+        self.open_published_btn = self._page_button("Open Published Letter")
+        self.open_published_btn.clicked.connect(self.go_to_page)
+        btns.addWidget(self.open_published_btn)
 
         layout.addLayout(btns)
 
@@ -321,11 +311,6 @@ class ForgeTab(QtWidgets.QWidget):
             " border-radius:4px; color:#ddd;"
         )
         layout.addWidget(self.status)
-
-        # Quick open output folder
-        self.open_output_btn = self._utility_button(" Open Output Folder")
-        self.open_output_btn.clicked.connect(self.open_output_folder)
-        layout.addWidget(self.open_output_btn)
 
         self._log("Ready.")
         self.refresh_readiness()
@@ -370,67 +355,6 @@ class ForgeTab(QtWidgets.QWidget):
 
         gp = self.project_btn.mapToGlobal(QtCore.QPoint(0, self.project_btn.height()))
         menu.popup(gp)
-
-    def _open_export_menu(self) -> None:
-        menu = QtWidgets.QMenu(self)
-        menu.setStyleSheet(_forge_menu_style())
-        for label, kind in (
-            ("Web Folder", "web"),
-            ("ZIP Package", "zip"),
-            ("Single HTML", "single"),
-            ("Publish Package", "publish"),
-        ):
-            action = menu.addAction(label)
-            action.triggered.connect(
-                lambda _checked=False, export_kind=kind: self._perform_portable_export(export_kind)
-            )
-        gp = self.export_btn.mapToGlobal(QtCore.QPoint(0, self.export_btn.height()))
-        menu.popup(gp)
-
-    def _perform_portable_export(self, kind: str) -> None:
-        items = assess_project_readiness(self.project_root)
-        missing = [item.label for item in items if item.required and not item.ready]
-        if missing:
-            self._log("[ERROR] Complete these required items first:\n- " + "\n- ".join(missing))
-            return
-        gen_fn = _get_generate_fn()
-        if gen_fn is None:
-            self._log("[ERROR] The Play generator is unavailable.")
-            return
-        message_html = self._read_message_html(self.project_root / MESSAGE_HTML_FILE)
-        try:
-            self.autosave_project()
-            play_dir = Path(
-                gen_fn(
-                    str(self.project_root),
-                    message_html=message_html,
-                    open_in_browser=False,
-                )
-            )
-            self._last_play_dir = play_dir
-            if kind == "web":
-                exported = play_dir
-            elif kind == "zip":
-                exported = create_zip_package(
-                    play_dir, self.project_root / OUTPUT_PACKAGES_DIR
-                )
-            elif kind == "single":
-                exported = create_single_html(
-                    play_dir, self.project_root / OUTPUT_FILE_DIR
-                )
-            elif kind == "publish":
-                exported = create_publish_package(
-                    play_dir, self.project_root / OUTPUT_PUBLISH_DIR
-                )
-            else:
-                raise ValueError(f"Unknown export format: {kind}")
-
-            self.refresh_readiness()
-            self.request_preview()
-            self._log(f"[OK] Export created:\n{exported}")
-            _open_folder(exported if exported.is_dir() else exported.parent)
-        except Exception as error:
-            self._log(f"[ERROR] Export failed: {type(error).__name__}: {error}")
 
     def _prompt_project_name(self, title: str, initial: str = "") -> str:
         name, accepted = QtWidgets.QInputDialog.getText(
@@ -548,50 +472,18 @@ class ForgeTab(QtWidgets.QWidget):
         label.setStyleSheet("color:#b9c9d2;")
         row.addWidget(label)
 
-        self._device_buttons: dict[str, QPushButton] = {}
-        for mode, text in (
-            ("desktop", "Desktop"),
-            ("phone-portrait", "Phone portrait"),
-            ("phone-landscape", "Phone landscape"),
-        ):
-            button = self._tiny_button(text)
-            button.setCheckable(True)
-            button.clicked.connect(
-                lambda _checked=False, selected=mode: self.request_preview(selected)
-            )
-            row.addWidget(button)
-            self._device_buttons[mode] = button
-
         row.addStretch(1)
-        self.restart_preview_btn = self._tiny_button("Restart")
+        self.restart_preview_btn = self._tiny_button("Refresh")
         self.restart_preview_btn.clicked.connect(self.preview_restart_requested.emit)
         row.addWidget(self.restart_preview_btn)
-
-        self.mute_preview_btn = self._tiny_button("Mute")
-        self.mute_preview_btn.setCheckable(True)
-        self.mute_preview_btn.toggled.connect(self._set_preview_muted)
-        row.addWidget(self.mute_preview_btn)
-
-        self.open_preview_btn = self._tiny_button("Open externally")
-        self.open_preview_btn.clicked.connect(self.open_preview_externally)
-        row.addWidget(self.open_preview_btn)
-
-        self.report_preview_btn = self._tiny_button("Report missing asset")
-        self.report_preview_btn.clicked.connect(self.preview_report_requested.emit)
-        row.addWidget(self.report_preview_btn)
+        self.fullscreen_preview_btn = self._tiny_button("Fullscreen")
+        self.fullscreen_preview_btn.clicked.connect(self.preview_fullscreen_requested.emit)
+        row.addWidget(self.fullscreen_preview_btn)
         parent_layout.addLayout(row)
         self._sync_preview_controls(False)
 
     def _sync_preview_controls(self, available: bool) -> None:
-        for mode, button in self._device_buttons.items():
-            button.setEnabled(available)
-            button.setChecked(mode == self._preview_mode)
-        for button in (
-            self.restart_preview_btn,
-            self.mute_preview_btn,
-            self.open_preview_btn,
-            self.report_preview_btn,
-        ):
+        for button in (self.restart_preview_btn, self.fullscreen_preview_btn):
             button.setEnabled(available)
 
     def _current_play_index(self) -> Optional[Path]:
@@ -608,7 +500,7 @@ class ForgeTab(QtWidgets.QWidget):
         return index if index.is_file() else None
 
     def request_preview(self, mode: Optional[str] = None) -> None:
-        if mode in self._device_buttons:
+        if mode in {"desktop", "phone-portrait", "phone-landscape"}:
             self._preview_mode = str(mode)
         index = self._current_play_index()
         self._sync_preview_controls(index is not None)
@@ -624,7 +516,7 @@ class ForgeTab(QtWidgets.QWidget):
     def open_preview_externally(self) -> None:
         index = self._current_play_index()
         if index is None:
-            self._log("Generate the letter before opening its finished viewer.")
+            self._log("Preview the letter before opening its finished viewer.")
             return
         QtGui.QDesktopServices.openUrl(QUrl.fromLocalFile(str(index.resolve())))
 
@@ -638,83 +530,59 @@ class ForgeTab(QtWidgets.QWidget):
             self._log("[OK] The finished preview reports no missing image or audio assets.")
 
     def _build_readiness_panel(self, parent_layout: QVBoxLayout) -> None:
-        panel = QtWidgets.QFrame()
-        panel.setObjectName("ReadinessPanel")
-        panel.setStyleSheet(
+        self.readiness_panel = QtWidgets.QFrame()
+        self.readiness_panel.setObjectName("ReadinessPanel")
+        self.readiness_panel.setStyleSheet(
             "#ReadinessPanel { background:#15191d; border:1px solid #2b5963; border-radius:7px; }"
             "QLabel { border:none; }"
         )
-        outer = QVBoxLayout(panel)
-        outer.setContentsMargins(10, 8, 10, 8)
-        outer.setSpacing(5)
+        outer = QVBoxLayout(self.readiness_panel)
+        outer.setContentsMargins(12, 10, 12, 10)
+        outer.setSpacing(6)
 
-        header = QHBoxLayout()
-        caption = QLabel("Project readiness")
-        caption.setFont(QFont("Segoe UI Semibold", 11))
-        caption.setStyleSheet("color:#dffcff;")
-        header.addWidget(caption)
-        header.addStretch(1)
-        self.readiness_summary = QLabel()
-        self.readiness_summary.setStyleSheet("color:#aab7c4;")
-        header.addWidget(self.readiness_summary)
-        outer.addLayout(header)
+        self.readiness_percentage = QLabel()
+        self.readiness_percentage.setFont(QFont("Segoe UI Semibold", 13))
+        self.readiness_percentage.setStyleSheet("color:#dffcff;")
+        outer.addWidget(self.readiness_percentage)
+        self.readiness_status = QLabel()
+        self.readiness_status.setFont(QFont("Segoe UI Semibold", 11))
+        outer.addWidget(self.readiness_status)
 
-        grid = QtWidgets.QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(3)
-        self._readiness_rows: dict[str, tuple[QLabel, QPushButton]] = {}
-        for index, item in enumerate(assess_project_readiness(self.project_root)):
-            cell = QtWidgets.QWidget()
-            row = QHBoxLayout(cell)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(5)
-            state = QLabel()
-            state.setMinimumWidth(145)
-            row.addWidget(state, 1)
-            fix = QPushButton("Fix")
-            fix.setFixedSize(38, 22)
-            fix.setStyleSheet(
-                "QPushButton { padding:1px 5px; color:#8cecff; border:1px solid #39717c; }"
-                "QPushButton:hover { background:#17343a; }"
-            )
-            fix.clicked.connect(
+        self._missing_buttons: dict[str, QPushButton] = {}
+        for item in evaluate_readiness(self.project_root).items:
+            button = QPushButton()
+            button.setFlat(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(
                 lambda _checked=False, key=item.key: self.fix_requested.emit(key)
             )
-            row.addWidget(fix)
-            grid.addWidget(cell, index % 5, index // 5)
-            self._readiness_rows[item.key] = (state, fix)
-        outer.addLayout(grid)
-        parent_layout.addWidget(panel)
+            outer.addWidget(button)
+            self._missing_buttons[item.key] = button
+        parent_layout.addWidget(self.readiness_panel)
 
     def refresh_readiness(self) -> None:
-        items = assess_project_readiness(self.project_root)
-        missing_required = sum(1 for item in items if item.required and not item.ready)
-        for item in items:
-            row = self._readiness_rows.get(item.key)
-            if row is None:
+        result = evaluate_readiness(self.project_root)
+        self.readiness_percentage.setText(f"{result.completion_percentage}% Complete")
+        status_color = "#ff8080" if result.status == "Not Ready" else "#79e092"
+        self.readiness_status.setText(result.status)
+        self.readiness_status.setStyleSheet(f"color:{status_color};")
+        missing = {item.key: item for item in result.missing_items}
+        for key, button in self._missing_buttons.items():
+            item = missing.get(key)
+            button.setVisible(item is not None)
+            if item is None:
                 continue
-            state, fix = row
-            if item.ready:
-                prefix, color = "✓", "#79e092"
-            elif item.required:
-                prefix, color = "✕", "#ff8080"
-            else:
-                prefix, color = "○", "#bdc7d0"
-            optional = " (optional)" if not item.required else ""
-            state.setText(f"{prefix} {item.label}{optional}")
-            state.setStyleSheet(f"color:{color};")
-            state.setToolTip(item.detail)
-            fix.setVisible(not item.ready)
-            fix.setToolTip(f"Fix {item.label.lower()}")
-
-        if project_is_ready(items):
-            self.readiness_summary.setText("Ready to generate")
-            self.readiness_summary.setStyleSheet("color:#79e092;")
-        else:
-            suffix = "item" if missing_required == 1 else "items"
-            self.readiness_summary.setText(f"{missing_required} required {suffix} missing")
-            self.readiness_summary.setStyleSheet("color:#ff9a9a;")
+            prefix = "✕" if item.required else "⚠"
+            color = "#ff8080" if item.required else "#e4c96d"
+            button.setText(f"{prefix} {item.label}")
+            button.setStyleSheet(
+                "QPushButton { text-align:left; padding:3px 2px; border:none;"
+                f" background:transparent; color:{color}; }}"
+                "QPushButton:hover { text-decoration:underline; }"
+            )
+            button.setToolTip(item.detail)
+        self.preview_btn.setEnabled(result.can_preview)
+        self.publish_btn.setEnabled(result.can_preview)
 
     # ---------------------------------------------------------------------
     # Forge settings
@@ -746,80 +614,25 @@ class ForgeTab(QtWidgets.QWidget):
         self._log(
             "Curtain style set to: "
             f"{_curtain_style_label(style)}\n\n"
-            "This will be applied the next time you Generate or Seal the Letter."
+            "This will be applied the next time you preview or publish the letter."
         )
 
     # ---------------------------------------------------------------------
-    # Load menu (Recipient -> Title)
+    # Saved-letter browser
     # ---------------------------------------------------------------------
-    def _open_load_menu(self) -> None:
-        menu = self._build_load_menu()
-        if menu is None:
+    def _open_load_browser(self) -> None:
+        dialog = SavedLetterBrowser(self.project_root, self)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
             return
+        entry = dialog.selected_entry()
+        if entry is not None:
+            self._load_saved_letter(entry)
 
-        gp = self.load_btn.mapToGlobal(QtCore.QPoint(0, self.load_btn.height()))
-        menu.popup(gp)
-
-    def _build_load_menu(self) -> Optional[QtWidgets.QMenu]:
-        ensure_output_dirs(self.project_root)
-        base = (self.project_root / OUTPUT_PLAY_DIR).resolve()
-        base.mkdir(parents=True, exist_ok=True)
-
-        menu = QtWidgets.QMenu(self)
-        menu.setStyleSheet(_forge_menu_style())
-
-        recipients = [p for p in base.iterdir() if p.is_dir()]
-        recipients.sort(key=lambda p: p.name.lower())
-
-        if not recipients:
-            act = menu.addAction("No saved letters found")
-            act.setEnabled(False)
-            return menu
-
-        for recip_dir in recipients:
-            recip_slug = recip_dir.name
-            recip_display = _humanize_slug(recip_slug)
-
-            title_dirs = [p for p in recip_dir.iterdir() if p.is_dir()]
-            valid_titles: list[tuple[str, Path]] = []
-            for td in sorted(title_dirs, key=lambda p: p.name.lower()):
-                idx = td / "index.html"
-                gal = td / "gallery"
-                if idx.is_file() and gal.is_dir():
-                    valid_titles.append((_extract_html_title(idx), td))
-
-            if not valid_titles:
-                continue
-
-            sub = QtWidgets.QMenu(recip_display, menu)
-            sub.setStyleSheet(menu.styleSheet())
-            menu.addMenu(sub)
-
-            for display_title, play_dir in valid_titles:
-                action = sub.addAction(display_title)
-                action.setData({
-                    "recipient_slug": recip_slug,
-                    "recipient_display": recip_display,
-                    "title_display": display_title,
-                    "play_dir": str(play_dir),
-                })
-                action.triggered.connect(lambda _=False, a=action: self._load_from_action(a))
-
-        if not menu.actions():
-            act = menu.addAction("No valid letters found")
-            act.setEnabled(False)
-
-        return menu
-
-    def _load_from_action(self, action: QtGui.QAction) -> None:
-        data = action.data()
-        if not isinstance(data, dict):
-            return
-
-        play_dir = Path(str(data.get("play_dir", ""))).resolve()
-        recip_display = str(data.get("recipient_display", "")).strip()
-        title_display = str(data.get("title_display", "")).strip()
-        recip_slug = str(data.get("recipient_slug", "")).strip()
+    def _load_saved_letter(self, entry: SavedLetter) -> None:
+        play_dir = entry.path.resolve()
+        recip_display = entry.recipient.strip()
+        title_display = entry.title.strip()
+        recip_slug = play_dir.parent.name
 
         if not play_dir.exists():
             self._log("[ERROR] Selected folder is missing.")
@@ -852,6 +665,21 @@ class ForgeTab(QtWidgets.QWidget):
         dst_sounds.mkdir(parents=True, exist_ok=True)
 
         metadata = _read_play_metadata(play_dir)
+        raw_playlist = metadata.get("playlist")
+        playlist_tracks = raw_playlist.get("tracks", []) if isinstance(raw_playlist, dict) else []
+        if not isinstance(playlist_tracks, list):
+            self._log("[ERROR] Invalid build: playlist metadata is malformed.")
+            return
+        repeat_playlist = bool(raw_playlist.get("repeat", True)) if isinstance(raw_playlist, dict) else True
+        normalized_tracks: list[dict[str, str]] = []
+        for track in playlist_tracks:
+            if not isinstance(track, dict):
+                continue
+            archive_name = Path(str(track.get("archive_name", ""))).name
+            if archive_name:
+                normalized_tracks.append({"archive_name": archive_name})
+        if not normalized_tracks and src_music.is_file():
+            normalized_tracks = [{"archive_name": "music.mp3"}]
         updates = {}
         updates["recipient_name"] = str(
             metadata.get("recipient_name")
@@ -877,18 +705,46 @@ class ForgeTab(QtWidgets.QWidget):
             staging_suffix=".load-staging",
             backup_suffix=".load-backup",
         )
-        transactions = (pages_tx, message_tx, music_tx, playlist_tx)
+        archive_tx = PathTransaction(
+            self.project_root / PROCESSED_ARCHIVE_PATH,
+            staging_suffix=".load-staging",
+            backup_suffix=".load-backup",
+        )
+        transactions = (pages_tx, message_tx, music_tx, playlist_tx, archive_tx)
         committed: list[PathTransaction] = []
 
         try:
             staged_pages = pages_tx.prepare()
             staged_message = message_tx.prepare()
             staged_music = music_tx.prepare()
-            playlist_tx.prepare()
+            staged_playlist = playlist_tx.prepare()
+            staged_archive = archive_tx.prepare()
             shutil.copytree(src_pages, staged_pages)
             shutil.copytree(src_message, staged_message)
+            if archive_tx.final_path.is_dir():
+                shutil.copytree(archive_tx.final_path, staged_archive)
+            else:
+                staged_archive.mkdir(parents=True)
             if src_music.is_file():
                 shutil.copy2(src_music, staged_music)
+            runtime_playlist = src_sounds / "playlist"
+            for index, track in enumerate(normalized_tracks, start=1):
+                source = runtime_playlist / f"track-{index:03d}.mp3"
+                if not source.is_file():
+                    if len(normalized_tracks) == 1 and src_music.is_file():
+                        source = src_music
+                    else:
+                        raise RuntimeError(f"Saved playlist track {index} is missing.")
+                shutil.copy2(source, staged_archive / track["archive_name"])
+            atomic_write_json(
+                staged_playlist,
+                {
+                    "version": 1,
+                    "tracks": normalized_tracks,
+                    "repeat": repeat_playlist,
+                    "crossfade_ms": CROSSFADE_MS,
+                },
+            )
 
             staged_missing = [
                 name for name in REQUIRED_SLIDES if not (staged_pages / name).is_file()
@@ -912,10 +768,10 @@ class ForgeTab(QtWidgets.QWidget):
             committed.append(message_tx)
             music_tx.commit(replace=src_music.is_file(), keep_backup=True)
             committed.append(music_tx)
-            playlist_tx.commit(replace=False, keep_backup=True)
+            playlist_tx.commit(keep_backup=True)
             committed.append(playlist_tx)
-            if src_music.is_file():
-                PlaylistStore(self.project_root).migrate_legacy_music(src_music)
+            archive_tx.commit(keep_backup=True)
+            committed.append(archive_tx)
 
             settings = SettingsStore(self.project_root).update_fields(updates)
         except Exception as error:
@@ -967,11 +823,6 @@ class ForgeTab(QtWidgets.QWidget):
     # ---------------------------------------------------------------------
     # Utility actions
     # ---------------------------------------------------------------------
-    def open_output_folder(self) -> None:
-        ensure_output_dirs(self.project_root)
-        out_parent = (self.project_root / OUTPUT_PLAY_DIR).parent
-        _open_folder(out_parent)
-
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
         super().showEvent(event)
         self.refresh_saved_page_url()
@@ -990,11 +841,11 @@ class ForgeTab(QtWidgets.QWidget):
 
     def _sync_go_to_page_button(self) -> None:
         has_url = bool(self.saved_page_url)
-        self.go_to_page_btn.setEnabled(has_url)
+        self.open_published_btn.setEnabled(has_url)
         if has_url:
-            self.go_to_page_btn.setToolTip(self.saved_page_url)
+            self.open_published_btn.setToolTip(self.saved_page_url)
         else:
-            self.go_to_page_btn.setToolTip("No published page URL has been saved yet.")
+            self.open_published_btn.setToolTip("No published page URL has been saved yet.")
 
     def go_to_page(self) -> None:
         url = self.refresh_saved_page_url()
@@ -1011,84 +862,50 @@ class ForgeTab(QtWidgets.QWidget):
     # ---------------------------------------------------------------------
     # Actions
     # ---------------------------------------------------------------------
-    def generate(self) -> None:
-        self._run_pipeline(mode="generate")
+    def preview_letter(self) -> None:
+        self._build_letter(for_publish=False)
 
-    def seal_the_letter(self) -> None:
-        self._run_pipeline(mode="seal")
+    def publish_letter(self) -> None:
+        self._build_letter(for_publish=True)
 
-    def _run_pipeline(self, *, mode: str) -> None:
+    def _build_letter(self, *, for_publish: bool) -> None:
         ensure_output_dirs(self.project_root)
-
+        readiness = evaluate_readiness(self.project_root)
+        if not readiness.can_preview:
+            missing = [item.label for item in readiness.missing_items if item.required]
+            self._log("[ERROR] Complete these required items first:\n- " + "\n- ".join(missing))
+            self.refresh_readiness()
+            return
         gen_fn = _get_generate_fn()
         if gen_fn is None:
             self._log("[ERROR] generate.py is missing generate_play_bundle/generate_gallery.")
             return
-
-        missing = validate_required_images(self.project_root)
-        if missing:
-            self._log(
-                f"[ERROR] Cannot proceed: missing {', '.join(missing)}\n"
-                f"Expected in: {self.project_root / 'gallery/user/pages'}"
-            )
-            return
-
         msg_path = (self.project_root / MESSAGE_HTML_FILE).resolve()
         message_html = self._read_message_html(msg_path)
-
-        if not message_html.strip():
-            self._log(
-                "[ERROR] Cannot proceed: message is empty or missing.\n"
-                f"Expected: {msg_path}\n"
-                "Open the editor and Save your message."
-            )
-            return
-
         try:
-            if mode == "generate":
-                play_dir = gen_fn(
-                    str(self.project_root),
-                    message_html=message_html,
-                    open_in_browser=True,
-                )
-                self.refresh_saved_page_url()
-                self.refresh_readiness()
-                self._last_play_dir = Path(play_dir)
-                self.request_preview()
-                self._log(
-                    "[OK] Play bundle updated and opened in browser.\n"
-                    f"- Play: {play_dir}\n"
-                    f"- Message: {msg_path}"
-                    f"{self._font_export_note()}"
-                )
-                return
-
-            if mode == "seal":
-                play_dir = gen_fn(
+            self.autosave_project()
+            play_dir = Path(
+                gen_fn(
                     str(self.project_root),
                     message_html=message_html,
                     open_in_browser=False,
                 )
-                self.refresh_saved_page_url()
-                self.refresh_readiness()
-                self._last_play_dir = Path(play_dir)
-                self.request_preview()
-
+            )
+            self._last_play_dir = play_dir
+            update_saved_metadata(play_dir, self.project_root, readiness)
+            self.refresh_saved_page_url()
+            self.refresh_readiness()
+            self.request_preview()
+            if for_publish:
                 self._log(
-                    "[OK] Play bundle updated.\n"
-                    f"- Play (GitHub target): {play_dir}"
-                    f"{self._font_export_note()}\n\n"
-                    "Opening Play folder now."
+                    "[OK] Letter build is ready for publishing."
+                    f"{self._font_export_note()}"
                 )
-
-                _open_folder(Path(play_dir))
-                return
-
-            self._log(f"[ERROR] Internal error: unknown mode '{mode}'")
-
+            else:
+                self._log("[OK] Letter preview refreshed.")
         except Exception as e:
             tb = traceback.format_exc(limit=30)
-            self._log(f"[ERROR] Pipeline error: {type(e).__name__}: {e}\n\n{tb}")
+            self._log(f"[ERROR] Build failed: {type(e).__name__}: {e}\n\n{tb}")
 
     # ---------------------------------------------------------------------
     # Helpers
@@ -1152,18 +969,6 @@ class ForgeTab(QtWidgets.QWidget):
             "QPushButton:disabled { background:#161b22; color:#6e7681; border-color:#30363d; }"
         )
         btn.setGraphicsEffect(self._shadow_effect(16))
-        return btn
-
-    def _utility_button(self, text: str) -> QPushButton:
-        btn = QPushButton(text)
-        btn.setFont(QFont("Segoe UI Semibold", 12))
-        btn.setMinimumHeight(44)
-        btn.setStyleSheet(
-            "QPushButton { background:#0f0f12; color:#e6e6e6;"
-            "border:1px solid #00d0ff; border-radius:8px; padding:10px 14px; }"
-            "QPushButton:hover { background:#113945; }"
-        )
-        btn.setGraphicsEffect(self._shadow_effect(12))
         return btn
 
     def _tiny_button(self, text: str) -> QPushButton:
