@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from config import MESSAGE_HTML_FILE, MUSIC_FILE, USER_MESSAGE_DIR, USER_PAGES_DIR, USER_SOUNDS_DIR
+from playlist import PLAYLIST_PATH
 from settings_store import SettingsStore
 from transactional_io import PathTransaction
 
@@ -177,7 +178,11 @@ class ProjectStore:
             self.project_root / USER_SOUNDS_DIR / MUSIC_FILE,
             staging_suffix=".project-staging",
         )
-        transactions = (pages_tx, message_tx, music_tx)
+        playlist_tx = PathTransaction(
+            self.project_root / PLAYLIST_PATH,
+            staging_suffix=".project-staging",
+        )
+        transactions = (pages_tx, message_tx, music_tx, playlist_tx)
         committed: list[PathTransaction] = []
         try:
             _copy_directory(source / "pages", pages_tx.prepare())
@@ -187,6 +192,11 @@ class ProjectStore:
             if source_music.is_file():
                 music_staging.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_music, music_staging)
+            playlist_staging = playlist_tx.prepare()
+            source_playlist = source / "sounds" / "playlist.json"
+            if source_playlist.is_file():
+                playlist_staging.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_playlist, playlist_staging)
 
             pages_tx.commit(keep_backup=True)
             committed.append(pages_tx)
@@ -194,6 +204,8 @@ class ProjectStore:
             committed.append(message_tx)
             music_tx.commit(replace=source_music.is_file(), keep_backup=True)
             committed.append(music_tx)
+            playlist_tx.commit(replace=source_playlist.is_file(), keep_backup=True)
+            committed.append(playlist_tx)
 
             project_settings = manifest.get("settings", {})
             updates = dict(project_settings) if isinstance(project_settings, dict) else {}
@@ -301,6 +313,12 @@ class ProjectStore:
                 shutil.copy2(active_music, project_music)
             else:
                 project_music.unlink(missing_ok=True)
+            project_playlist = sounds / "playlist.json"
+            active_playlist = self.project_root / PLAYLIST_PATH
+            if active_playlist.is_file():
+                shutil.copy2(active_playlist, project_playlist)
+            else:
+                project_playlist.unlink(missing_ok=True)
 
             previous = self._read_manifest(staging)
             settings = self.settings.as_dict()

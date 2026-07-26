@@ -330,6 +330,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let musicEnableButton = null;
 
   const BUILD_ID = "{{BUILD_ID}}";
+  const playlistConfig = {{PLAYLIST_JSON}};
   const VOLUME_STORAGE_KEY = 'lettersmith-viewer-volume';
   const flipPool = Array.from({length: 10}, (_, i) => `gallery/sounds/flip${i+1}.mp3`);
   const glissSrc = 'gallery/sounds/glissando.mp3';
@@ -362,7 +363,115 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  const music = hasMusic ? makeAudio('gallery/sounds/music.mp3', { loop: true, volume: 0 }) : null;
+  const playlistSources = Array.isArray(playlistConfig.tracks)
+    ? playlistConfig.tracks.map((track) => String(track.src || '')).filter(Boolean)
+    : [];
+  const playlistRepeat = playlistConfig.repeat !== false;
+  const playlistCrossfadeMs = 1000;
+  const musicPlayers = (hasMusic && playlistSources.length)
+    ? Array.from({length: 2}, () => makeAudio(playlistSources[0], { loop: false, volume: 0 }))
+    : [];
+  let musicActiveSlot = 0;
+  let musicIndex = 0;
+  let music = musicPlayers[0] || null;
+  let musicTargetVolume = 0;
+  let playlistFade = null;
+
+  function nextMusicIndex(){
+    if (!playlistSources.length) return null;
+    if (musicIndex + 1 < playlistSources.length) return musicIndex + 1;
+    return playlistRepeat ? 0 : null;
+  }
+  function applyPlaylistVolumes(progress=null){
+    if (!musicPlayers.length) return;
+    if (playlistFade && progress !== null){
+      const t = clamp(progress, 0, 1);
+      musicPlayers[playlistFade.fromSlot].volume = musicTargetVolume * (1 - t);
+      musicPlayers[playlistFade.toSlot].volume = musicTargetVolume * t;
+      return;
+    }
+    musicPlayers.forEach((player, slot) => {
+      player.volume = slot === musicActiveSlot ? musicTargetVolume : 0;
+    });
+  }
+  function configureMusicSlot(slot, index){
+    const player = musicPlayers[slot];
+    if (!player || !playlistSources[index]) return null;
+    try{
+      player.pause();
+      player.src = withBuildId(playlistSources[index]);
+      player.currentTime = 0;
+      player.loop = false;
+      player.muted = musicTargetVolume === 0;
+      player.load();
+    }catch(err){
+      console.warn('Playlist track setup failed', err);
+      return null;
+    }
+    return player;
+  }
+  async function beginPlaylistCrossfade(){
+    if (playlistFade || musicPlayers.length < 2) return;
+    const nextIndex = nextMusicIndex();
+    if (nextIndex === null || nextIndex === musicIndex) return;
+    const fromSlot = musicActiveSlot;
+    const toSlot = 1 - fromSlot;
+    const incoming = configureMusicSlot(toSlot, nextIndex);
+    if (!incoming) return;
+    incoming.volume = 0;
+    playlistFade = { fromSlot, toSlot, nextIndex, startedAt: 0, pending: true };
+    const ok = await safePlay(incoming, `playlist-${nextIndex + 1}`);
+    if (!ok){
+      playlistFade = null;
+      return;
+    }
+    playlistFade.startedAt = performance.now();
+    playlistFade.pending = false;
+    function crossfadeStep(now){
+      if (!playlistFade || playlistFade.pending) return;
+      const progress = clamp((now - playlistFade.startedAt) / playlistCrossfadeMs, 0, 1);
+      applyPlaylistVolumes(progress);
+      if (progress < 1){
+        requestAnimationFrame(crossfadeStep);
+        return;
+      }
+      const completed = playlistFade;
+      const outgoing = musicPlayers[completed.fromSlot];
+      try{ outgoing.pause(); outgoing.currentTime = 0; }catch(_err){ }
+      musicActiveSlot = completed.toSlot;
+      musicIndex = completed.nextIndex;
+      music = musicPlayers[musicActiveSlot];
+      playlistFade = null;
+      applyPlaylistVolumes();
+    }
+    requestAnimationFrame(crossfadeStep);
+  }
+  function handleMusicTimeUpdate(player, slot){
+    if (slot !== musicActiveSlot || playlistFade || playlistSources.length < 2) return;
+    if (!Number.isFinite(player.duration) || player.duration <= 1) return;
+    const remainingMs = (player.duration - player.currentTime) * 1000;
+    if (remainingMs <= playlistCrossfadeMs) beginPlaylistCrossfade();
+  }
+  function handleMusicEnded(slot){
+    if (slot !== musicActiveSlot || playlistFade) return;
+    const nextIndex = nextMusicIndex();
+    if (nextIndex === null) return;
+    if (nextIndex === musicIndex){
+      try{ music.currentTime = 0; }catch(_err){ }
+      safePlay(music, 'playlist-repeat');
+      return;
+    }
+    musicIndex = nextIndex;
+    configureMusicSlot(musicActiveSlot, musicIndex);
+    music = musicPlayers[musicActiveSlot];
+    applyPlaylistVolumes();
+    safePlay(music, `playlist-${musicIndex + 1}`);
+  }
+  musicPlayers.forEach((player, slot) => {
+    player.addEventListener('timeupdate', () => handleMusicTimeUpdate(player, slot));
+    player.addEventListener('ended', () => handleMusicEnded(slot));
+  });
+
   const gliss = makeAudio(glissSrc, { volume: 0.10 });
   const flipSounds = flipPool.map((href) => makeAudio(href, { volume: 0.5 }));
   const deferredAssets = [
@@ -374,7 +483,7 @@ document.addEventListener('DOMContentLoaded', () => {
     { as: 'image', href: 'gallery/controls/volon.png' },
     { as: 'image', href: 'gallery/controls/voloff.png' },
     ...(hasMessage ? [{ as: 'image', href: 'gallery/controls/showmessageicon.png' }] : []),
-    ...(hasMusic ? [{ as: 'audio', href: 'gallery/sounds/music.mp3', type: 'audio/mpeg' }] : []),
+    ...playlistSources.map((href) => ({ as: 'audio', href, type: 'audio/mpeg' })),
     ...flipPool.map((href) => ({ as: 'audio', href, type: 'audio/mpeg' })),
   ];
 
@@ -665,7 +774,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function playFlip(){
     if (!flipSounds.length) return;
     const pick = flipSounds[Math.floor(Math.random() * flipSounds.length)];
-    const vol = music ? clamp(music.volume, 0, 1) : 0.5;
+    const vol = music ? clamp(musicTargetVolume || music.volume, 0, 1) : 0.5;
     try{
       pick.pause();
       pick.currentTime = 0;
@@ -869,8 +978,13 @@ document.addEventListener('DOMContentLoaded', () => {
     const muted = vv === 0;
 
     if (music && hasMusic){
-      music.volume = vol01;
-      music.muted = muted;
+      musicTargetVolume = vol01;
+      musicPlayers.forEach((player) => { player.muted = muted; });
+      applyPlaylistVolumes(
+        playlistFade && !playlistFade.pending
+          ? clamp((performance.now() - playlistFade.startedAt) / playlistCrossfadeMs, 0, 1)
+          : null
+      );
     }
 
     volIconImg.src = muted ? 'gallery/controls/voloff.png' : 'gallery/controls/volon.png';
@@ -905,6 +1019,7 @@ document.addEventListener('DOMContentLoaded', () => {
       musicEnableButton.addEventListener('click', async () => {
         const v = loadVolume0to100();
         const target = clamp(v / 100, 0, 1);
+        musicTargetVolume = target;
         music.volume = 0;
         music.muted = target === 0;
         const ok = await startMusicPlayback('music-enable');
@@ -930,6 +1045,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function fadeMusicToVolume(target){
     if (!music || !hasMusic) return;
     target = clamp(target, 0, 1);
+    musicTargetVolume = target;
     const startVolume = clamp(music.volume || 0, 0, 1);
     const start = performance.now();
     music.muted = target === 0;
@@ -938,6 +1054,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const e = t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t + 2, 2)/2;
       music.volume = startVolume + ((target - startVolume) * e);
       if (t < 1) requestAnimationFrame(fadeStep);
+      else applyPlaylistVolumes();
     }
     requestAnimationFrame(fadeStep);
   }

@@ -165,7 +165,12 @@ class AudioHardeningTests(unittest.TestCase):
             exported = [dst for _, dst in calls]
             self.assertEqual(
                 exported,
-                ["music.mp3", "glissando.mp3", *[f"flip{i}.mp3" for i in range(1, 11)]],
+                [
+                    "track-001.mp3",
+                    "music.mp3",
+                    "glissando.mp3",
+                    *[f"flip{i}.mp3" for i in range(1, 11)],
+                ],
             )
 
             html = (play_dir / "index.html").read_text(encoding="utf-8")

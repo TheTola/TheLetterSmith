@@ -684,14 +684,9 @@ class Nexus(QtWidgets.QMainWindow):
     def _on_letter_loaded(self, _payload=None) -> None:
         """Refresh live audio after a transactional saved-letter load."""
         try:
-            music_path = Path(self.project_root) / USER_SOUNDS_DIR / MUSIC_FILE
             self.sound_tab.wave.release_current_file_handle()
             self.sound_tab._current_processed = ""
-            if music_path.is_file():
-                self.sound_tab.wave.load_audio(str(music_path))
-                self.sound_tab._preview.set_audio_file(str(music_path))
-            else:
-                self.sound_tab._preview.set_audio_file("")
+            self.sound_tab.refresh_from_workspace()
         except Exception:
             pass
 

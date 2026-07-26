@@ -133,6 +133,24 @@ class StatusBanner(QtWidgets.QFrame):
         self.controller.connect(self._show_message)
         self.hide()
 
+    def setText(self, text: str) -> None:
+        stripped = str(text).lstrip()
+        if stripped.startswith(("❌", "✕")):
+            level = StatusLevel.ERROR
+        elif stripped.startswith(("⚠", "Warning")):
+            level = StatusLevel.WARNING
+        elif stripped.startswith(("✅", "Saved", "Autosaved")):
+            level = StatusLevel.SUCCESS
+        else:
+            level = StatusLevel.INFO
+        self.controller.publish(str(text), level)
+
+    def text(self) -> str:
+        return self._label.text()
+
+    def clear(self) -> None:
+        self.controller.clear_all()
+
     def _show_message(self, message: Optional[StatusMessage]) -> None:
         if message is None or not message.text:
             self._label.clear()

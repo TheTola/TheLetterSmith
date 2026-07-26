@@ -51,6 +51,7 @@ from portable_export import (
     create_single_html,
     create_zip_package,
 )
+from playlist import PLAYLIST_PATH, PlaylistStore
 from settings_store import SettingsStore
 from transactional_io import PathTransaction
 
@@ -870,13 +871,19 @@ class ForgeTab(QtWidgets.QWidget):
         pages_tx = PathTransaction(dst_pages, staging_suffix=".load-staging", backup_suffix=".load-backup")
         message_tx = PathTransaction(dst_message, staging_suffix=".load-staging", backup_suffix=".load-backup")
         music_tx = PathTransaction(dst_music, staging_suffix=".load-staging", backup_suffix=".load-backup")
-        transactions = (pages_tx, message_tx, music_tx)
+        playlist_tx = PathTransaction(
+            self.project_root / PLAYLIST_PATH,
+            staging_suffix=".load-staging",
+            backup_suffix=".load-backup",
+        )
+        transactions = (pages_tx, message_tx, music_tx, playlist_tx)
         committed: list[PathTransaction] = []
 
         try:
             staged_pages = pages_tx.prepare()
             staged_message = message_tx.prepare()
             staged_music = music_tx.prepare()
+            playlist_tx.prepare()
             shutil.copytree(src_pages, staged_pages)
             shutil.copytree(src_message, staged_message)
             if src_music.is_file():
@@ -900,6 +907,10 @@ class ForgeTab(QtWidgets.QWidget):
             committed.append(message_tx)
             music_tx.commit(replace=src_music.is_file(), keep_backup=True)
             committed.append(music_tx)
+            playlist_tx.commit(replace=False, keep_backup=True)
+            committed.append(playlist_tx)
+            if src_music.is_file():
+                PlaylistStore(self.project_root).migrate_legacy_music(src_music)
 
             settings = SettingsStore(self.project_root).update_fields(updates)
         except Exception as error:

@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 import os
+import importlib.util
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
+
+from transactional_io import atomic_write_bytes
+
+
+@dataclass(frozen=True)
+class AudioDependencies:
+    pydub: bool
+    ffmpeg: str
+    ffprobe: str
 
 
 def _find_audio_tool(env_name: str, exe_name: str) -> str:
@@ -43,6 +54,16 @@ def _load_pydub_tools():
         pydub.AudioSegment.ffprobe = ffprobe  # type: ignore[attr-defined]
 
     return AudioSegment, effects
+
+
+def detect_audio_dependencies() -> AudioDependencies:
+    executable = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    probe = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+    return AudioDependencies(
+        pydub=importlib.util.find_spec("pydub") is not None,
+        ffmpeg=_find_audio_tool("FFMPEG_BIN", executable),
+        ffprobe=_find_audio_tool("FFPROBE_BIN", probe),
+    )
 
 
 def _export_with_pydub(src: Path, tmp: Path) -> None:
@@ -106,13 +127,22 @@ def _export_apple_safe_mp3(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(dst.suffix + ".tmp")
     pydub_error: Exception | None = None
+    ffmpeg_error: Exception | None = None
 
     try:
         try:
             _export_with_pydub(src, tmp)
         except Exception as exc:
             pydub_error = exc
-            _export_with_ffmpeg(src, tmp)
+            try:
+                _export_with_ffmpeg(src, tmp)
+            except Exception as fallback_exc:
+                ffmpeg_error = fallback_exc
+                if src.suffix.casefold() == ".mp3":
+                    tmp.unlink(missing_ok=True)
+                    atomic_write_bytes(dst, src.read_bytes())
+                    return
+                raise
         os.replace(tmp, dst)
     except Exception as exc:
         try:
@@ -120,9 +150,9 @@ def _export_apple_safe_mp3(src: Path, dst: Path) -> None:
                 tmp.unlink()
         except Exception:
             pass
-        if pydub_error is not None and exc is not pydub_error:
+        if pydub_error is not None and ffmpeg_error is not None:
             raise RuntimeError(
                 f"Failed to export Apple-safe MP3 from {src} to {dst}: "
-                f"pydub failed ({pydub_error}); ffmpeg fallback failed ({exc})"
+                f"pydub failed ({pydub_error}); ffmpeg fallback failed ({ffmpeg_error})"
             ) from exc
         raise RuntimeError(f"Failed to export Apple-safe MP3 from {src} to {dst}: {exc}") from exc

@@ -14,6 +14,7 @@ from config import (
     USER_SOUNDS_DIR,
 )
 from message_html import message_html_has_content, read_text_normalized
+from playlist import PlaylistStore
 from settings_store import SettingsStore
 
 
@@ -61,6 +62,8 @@ def assess_project_readiness(project_root: str | Path) -> tuple[ReadinessItem, .
 
     recipient = str(settings.get("recipient_name", "")).strip()
     title = str(settings.get("recipient_title", "")).strip()
+    playlist_store = PlaylistStore(root)
+    playlist = playlist_store.load()
     items.extend(
         (
             ReadinessItem("recipient", "Recipient", bool(recipient), True, recipient or "Not set"),
@@ -68,9 +71,9 @@ def assess_project_readiness(project_root: str | Path) -> tuple[ReadinessItem, .
             ReadinessItem(
                 "music",
                 "Music",
-                (sounds / MUSIC_FILE).is_file(),
+                bool(playlist.tracks),
                 False,
-                str(sounds / MUSIC_FILE),
+                str(playlist_store.path),
             ),
         )
     )

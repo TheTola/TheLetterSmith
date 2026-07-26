@@ -52,8 +52,9 @@ from curtain_color import (
     write_tinted_curtain_image,
 )
 from font_export import FontExportError, build_embedded_font_payload
+from playlist import CROSSFADE_MS, PlaylistStore, playlist_payload
 from settings_store import SettingsStore
-from transactions import PathTransaction
+from transactional_io import PathTransaction
 from message_html import (
     message_html_has_content,
     normalize_message_fragment,
@@ -239,6 +240,7 @@ def _write_play_metadata(
     title: str,
     curtain_style: str,
     curtain_rgb: tuple[int, int, int],
+    playlist: dict,
 ) -> None:
     metadata = {
         "recipient_name": recipient,
@@ -246,6 +248,7 @@ def _write_play_metadata(
         PUBLISHED_PAGE_URL_KEY: str(settings.get(PUBLISHED_PAGE_URL_KEY, "")).strip(),
         CURTAIN_STYLE_KEY: curtain_style,
         "curtain_rgb": list(curtain_rgb),
+        "playlist": playlist,
     }
     _atomic_write_text(play_dir / PLAY_METADATA_FILE, json.dumps(metadata, indent=2))
 
@@ -329,7 +332,7 @@ def _validate_template_placeholders() -> None:
             + ", ".join(missing)
         )
 
-    required_js = ("{{BUILD_ID}}",)
+    required_js = ("{{BUILD_ID}}", "{{PLAYLIST_JSON}}")
     missing_js = [k for k in required_js if k not in TEMPLATE_JS]
     if missing_js:
         raise TemplateDriftError(
@@ -466,10 +469,11 @@ def _generate_play_bundle_contents(
             f"Expected files: {CONTROL_FILES}"
         )
 
-    # User music is optional. Image-only letters should still build.
-    user_sounds = pr / USER_SOUNDS_DIR
-    user_music = user_sounds / MUSIC_FILE
-    has_user_music = user_music.is_file()
+    # User music is optional. A legacy music.mp3 is migrated to one playlist entry.
+    playlist_store = PlaylistStore(pr)
+    playlist = playlist_store.load()
+    playlist_sources = playlist_store.resolve_all(playlist)
+    has_user_music = bool(playlist_sources)
     build_id = str(int(time.time()))
 
     # Settings drive deterministic output path
@@ -510,13 +514,24 @@ def _generate_play_bundle_contents(
     if msg_png_src.is_file():
         _atomic_copy_file(msg_png_src, message_dst / "message.png")
 
-    # Export sounds:
-    # - optional user music
+    # Export the active playlist to deterministic runtime names.
     if has_user_music:
+        runtime_playlist = sounds_dst / "playlist"
+        runtime_playlist.mkdir(parents=True, exist_ok=True)
+        for index, source in enumerate(playlist_sources, start=1):
+            destination = runtime_playlist / f"track-{index:03d}.mp3"
+            try:
+                _export_apple_safe_mp3(source, destination)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to prepare playlist track {index} ({source.name}): {exc}"
+                ) from exc
+
+        # Keep the established compatibility asset for older saved viewers.
         try:
-            _export_apple_safe_mp3(user_music, sounds_dst / MUSIC_FILE)
+            _export_apple_safe_mp3(playlist_sources[0], sounds_dst / MUSIC_FILE)
         except Exception as exc:
-            raise RuntimeError(f"Failed to prepare user music for Play build: {exc}") from exc
+            raise RuntimeError(f"Failed to prepare compatibility music.mp3: {exc}") from exc
 
     # - seed/export SFX into the build (app preferred, optional user fallback)
     _seed_sfx_into_build(
@@ -526,8 +541,24 @@ def _generate_play_bundle_contents(
         allow_user_sfx_fallback=allow_user_sfx_fallback,
     )
 
-    # Write JS
-    _atomic_write_text(bp.play_dir / "script.js", TEMPLATE_JS.replace("{{BUILD_ID}}", build_id))
+    viewer_playlist = {
+        "version": 1,
+        "tracks": [
+            {
+                "archive_name": track.archive_name,
+                "src": f"gallery/sounds/playlist/track-{index:03d}.mp3",
+            }
+            for index, track in enumerate(playlist.tracks, start=1)
+        ],
+        "repeat": playlist.repeat,
+        "crossfade_ms": CROSSFADE_MS,
+    }
+    viewer_script = (
+        TEMPLATE_JS
+        .replace("{{BUILD_ID}}", build_id)
+        .replace("{{PLAYLIST_JSON}}", json.dumps(viewer_playlist, indent=2))
+    )
+    _atomic_write_text(bp.play_dir / "script.js", viewer_script)
 
     # Message HTML injection (prefer passed string, else disk)
     if message_html is None:
@@ -570,6 +601,7 @@ def _generate_play_bundle_contents(
         title=title,
         curtain_style=curtain_style,
         curtain_rgb=curtain_rgb,
+        playlist=playlist_payload(playlist),
     )
 
     return bp.play_dir
@@ -591,6 +623,11 @@ def _validate_staged_play_bundle(
     ]
     if has_user_music:
         expected.append(play_dir / GALLERY_DIR / SOUNDS_DIR / MUSIC_FILE)
+        playlist_assets = tuple(
+            (play_dir / GALLERY_DIR / SOUNDS_DIR / "playlist").glob("track-*.mp3")
+        )
+        if not playlist_assets:
+            raise RuntimeError("Staged Play build has no playlist track assets.")
     if seed_sfx:
         expected.extend(
             play_dir / GALLERY_DIR / SOUNDS_DIR / name
@@ -635,7 +672,7 @@ def generate_play_bundle(
         )
         _validate_staged_play_bundle(
             staging_dir,
-            has_user_music=(pr / USER_SOUNDS_DIR / MUSIC_FILE).is_file(),
+            has_user_music=bool(PlaylistStore(pr).load().tracks),
             seed_sfx=seed_sfx,
         )
         transaction.commit()

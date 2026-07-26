@@ -26,7 +26,10 @@ from PySide6.QtWidgets import (
 )
 
 from audio_export import _export_apple_safe_mp3
+from playlist import Playlist, PlaylistStore
+from playlist_player import PlaylistPlayer
 from settings_store import SettingsStore
+from ui_status import StatusBanner, StatusController, StatusLevel
 
 # --- Visualizer (shared preview widget) ---
 from sound_preview import SoundPreviewWidget
@@ -1112,6 +1115,9 @@ class ArchiveDropdown(QtWidgets.QFrame):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class WaveHandler(QtCore.QObject):
+    active_player_changed = QtCore.Signal(object)
+    track_changed = QtCore.Signal(int, str)
+
     def __init__(
         self,
         project_root,
@@ -1122,21 +1128,32 @@ class WaveHandler(QtCore.QObject):
         self.project_root = Path(project_root).resolve()
         self.settings_store = SettingsStore(self.project_root)
 
-        # Music player (persistent)
-        self.audio_output = QAudioOutput(self)
-        self.player = QMediaPlayer(self)
-        self.player.setAudioOutput(self.audio_output)
+        self.playlist_player = PlaylistPlayer(self)
+        self.player = self.playlist_player.active_player
+        self.audio_output = self.playlist_player.active_output
+        self.playlist_player.active_player_changed.connect(self._on_active_player_changed)
+        self.playlist_player.track_changed.connect(self.track_changed.emit)
 
         # One-shot SFX pool for gliss plays
         self._sfx_pool: List[Tuple[QMediaPlayer, QAudioOutput]] = []
 
         # Volume: load saved; else use STARTING_VOLUME from config
         self._music_volume = self._load_music_volume()  # 0.0..1.0
-        self.audio_output.setVolume(self._music_volume)
+        self.playlist_player.set_volume(self._music_volume)
 
         self._archive = archive_mgr
         self._muted = False
         self._shutdown = False
+
+    def _on_active_player_changed(self, player: QMediaPlayer) -> None:
+        self.player = player
+        self.audio_output = self.playlist_player.active_output
+        self.active_player_changed.emit(player)
+
+    def set_playlist(self, paths: List[Path] | Tuple[Path, ...], *, repeat: bool) -> None:
+        self.playlist_player.set_tracks(paths, repeat=repeat)
+        self.player = self.playlist_player.active_player
+        self.audio_output = self.playlist_player.active_output
 
     def _load_music_volume(self) -> float:
         settings = self.settings_store.as_dict()
@@ -1157,7 +1174,11 @@ class WaveHandler(QtCore.QObject):
         self.settings_store.update_fields(music_volume=v, starting_volume=v)
 
         self._music_volume = v / 100.0
-        self.audio_output.setVolume(self._music_volume)
+        self.playlist_player.set_volume(self._music_volume)
+
+    def set_music_volume_live(self, volume_percent: int) -> None:
+        self._music_volume = max(0, min(100, int(volume_percent))) / 100.0
+        self.playlist_player.set_volume(self._music_volume)
 
     def validate_audio(self, path: str) -> Tuple[bool, str]:
         if not os.path.exists(path):
@@ -1177,25 +1198,26 @@ class WaveHandler(QtCore.QObject):
     def load_audio(self, path: str) -> None:
         if self._shutdown:
             return
-        self.player.setSource(QUrl.fromLocalFile(path))
+        self.playlist_player.set_tracks((Path(path),), repeat=True)
+        self.player = self.playlist_player.active_player
+        self.audio_output = self.playlist_player.active_output
 
     def play_audio(self) -> None:
         if self._shutdown:
             return
-        self.audio_output.setVolume(self._music_volume)
-        self.player.play()
+        self.playlist_player.set_volume(self._music_volume)
+        self.playlist_player.play()
 
     def pause_audio(self) -> None:
-        self.player.pause()
+        self.playlist_player.pause()
 
     def start_over_audio(self) -> None:
-        self.player.setPosition(0)
-        self.audio_output.setVolume(self._music_volume)
-        self.player.play()
+        self.playlist_player.set_volume(self._music_volume)
+        self.playlist_player.start_over()
 
     def toggle_mute(self) -> bool:
         self._muted = not self._muted
-        self.audio_output.setMuted(self._muted)
+        self.playlist_player.set_muted(self._muted)
         try:
             for _p, out in list(self._sfx_pool):
                 out.setMuted(self._muted)
@@ -1204,13 +1226,12 @@ class WaveHandler(QtCore.QObject):
         return self._muted
 
     def is_playing(self) -> bool:
-        return self.player.playbackState() == QMediaPlayer.PlayingState
+        return self.playlist_player.is_playing()
 
     def release_current_file_handle(self) -> None:
         """Stop playback and detach source to release OS file handle."""
         try:
-            self.player.stop()
-            self.player.setSource(QUrl())  # detach
+            self.playlist_player.release_file_handles()
         except Exception:
             pass
 
@@ -1219,6 +1240,7 @@ class WaveHandler(QtCore.QObject):
             return
         self._shutdown = True
         self.release_current_file_handle()
+        self.playlist_player.shutdown()
 
         for player, output in list(self._sfx_pool):
             try:
@@ -1230,11 +1252,6 @@ class WaveHandler(QtCore.QObject):
             player.deleteLater()
             output.deleteLater()
         self._sfx_pool.clear()
-
-        try:
-            self.player.setAudioOutput(None)
-        except Exception:
-            pass
 
     def play_gliss(self) -> bool:
         if self._shutdown:
@@ -1290,16 +1307,29 @@ class SoundTab(QtWidgets.QWidget):
         self._shutdown = False
 
         self._archive_mgr = SoundArchiveManager(self.project_root)
+        self._playlist_store = PlaylistStore(self.project_root)
+        self._playlist = self._playlist_store.load()
+        self.status_controller = StatusController()
+        self._rebuilding_playlist = False
+        self._resolved_playlist_tracks: list[tuple[str, Path]] = []
         self.wave = WaveHandler(project_root, archive_mgr=self._archive_mgr, parent=self)
 
         # Visualizer for Nexus preview
         self._preview = SoundPreviewWidget(self.wave.player, parent=self)
+        self.wave.active_player_changed.connect(self._preview.set_media_player)
+        self.wave.track_changed.connect(self._on_playlist_track_changed)
         self._archive_mgr.current_changed.connect(self._on_current_changed)
 
-        # Analysis manager. The project archive lives under:
-        #   gallery/user/sounds/appssong/{processed,analysis}
-        # Keep this explicit so analysis never drifts back to the old archive path.
-        self._analysis = AudioAnalysisManager(self.project_root, parent=self) if AudioAnalysisManager is not None else None
+        settings = SettingsStore(self.project_root).snapshot()
+        self._analysis_enabled = bool(
+            settings.get("debug", False)
+            and settings.get("enable_audio_analysis", False)
+        )
+        self._analysis = (
+            AudioAnalysisManager(self.project_root, parent=self)
+            if self._analysis_enabled and AudioAnalysisManager is not None
+            else None
+        )
         self._analysis_bootstrapped = False
         self._current_processed = ""
         self._current_analysis_key = ""
@@ -1312,20 +1342,13 @@ class SoundTab(QtWidgets.QWidget):
 
         self._init_ui()
         self._init_shortcuts()
+        self._sync_playlist_player()
 
-        # Prime current track if present
-        current_track = _user_current_music(self.project_root)
-        if current_track.exists():
-            self.wave.load_audio(str(current_track))
-            self._current_processed = self._read_current_processed_from_manifest()
-
+        if self._playlist.tracks:
+            self._current_processed = self._playlist.tracks[0].archive_name
             stable_path = self._stable_audio_path_for_preview()
             if stable_path is not None:
-                try:
-                    self._preview.set_audio_file(str(stable_path))
-                except Exception:
-                    pass
-
+                self._preview.set_audio_file(str(stable_path))
             self._prime_analysis_for_current()
 
         # Hand to Nexus
@@ -1344,7 +1367,12 @@ class SoundTab(QtWidgets.QWidget):
                 misses.append(str(p))
         if misses:
             try:
-                self.status.setText("⚠ Missing sound assets:\n" + "\n".join(misses))
+                self.status_controller.publish(
+                    "Missing sound assets:\n" + "\n".join(misses),
+                    StatusLevel.WARNING,
+                    persistent=True,
+                    key="sound-assets",
+                )
             except Exception:
                 pass
 
@@ -1386,12 +1414,8 @@ class SoundTab(QtWidgets.QWidget):
 
         if (self._analysis is not None) and (not self._analysis_bootstrapped):
             self._analysis_bootstrapped = True
-            # Do not sweep/analyze every archived song just because the tab opened.
-            # The current track is primed on demand, and cached tracks load instantly.
             try:
                 self._prime_analysis_for_current()
-                if not self._analysis.is_busy():
-                    self.status.setText("Audio cache ready.")
             except Exception:
                 pass
 
@@ -1484,6 +1508,47 @@ class SoundTab(QtWidgets.QWidget):
         self.btn_archive.clicked.connect(self._open_archive_dropdown)
         self._dropdown.request_release.connect(self.wave.release_current_file_handle)
 
+        self.playlist_view = QtWidgets.QTreeWidget()
+        self.playlist_view.setHeaderHidden(True)
+        self.playlist_view.setColumnCount(3)
+        self.playlist_view.setRootIsDecorated(False)
+        self.playlist_view.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.playlist_view.setDragEnabled(True)
+        self.playlist_view.setAcceptDrops(True)
+        self.playlist_view.setDragDropMode(
+            QtWidgets.QAbstractItemView.DragDropMode.InternalMove
+        )
+        self.playlist_view.setDefaultDropAction(QtCore.Qt.DropAction.MoveAction)
+        self.playlist_view.setFixedHeight(150)
+        self.playlist_view.setColumnWidth(0, 32)
+        self.playlist_view.setColumnWidth(1, 430)
+        self.playlist_view.setStyleSheet(
+            "QTreeWidget {"
+            "background:#10131a; border:1px solid #2b3344; border-radius:8px;"
+            "color:#dce8ec; outline:none;"
+            "}"
+            "QTreeWidget::item { min-height:30px; }"
+            "QTreeWidget::item:selected { background:#263442; }"
+        )
+        self.playlist_view.model().rowsMoved.connect(self._on_playlist_rows_moved)
+        card.addWidget(self.playlist_view)
+
+        completion_row = QHBoxLayout()
+        completion_row.addStretch(1)
+        self.repeat_playlist = QtWidgets.QRadioButton("Repeat playlist")
+        self.stop_after_final = QtWidgets.QRadioButton("Stop after final song")
+        completion_group = QtWidgets.QButtonGroup(self)
+        completion_group.addButton(self.repeat_playlist)
+        completion_group.addButton(self.stop_after_final)
+        self.repeat_playlist.toggled.connect(self._on_repeat_toggled)
+        self.stop_after_final.toggled.connect(self._on_stop_toggled)
+        completion_row.addWidget(self.repeat_playlist)
+        completion_row.addWidget(self.stop_after_final)
+        completion_row.addStretch(1)
+        card.addLayout(completion_row)
+
         volume_label = QLabel("Volume")
         volume_label.setObjectName("soundVolumeLabel")
         volume_label.setAlignment(Qt.AlignCenter)
@@ -1543,17 +1608,9 @@ class SoundTab(QtWidgets.QWidget):
             "QProgressBar::chunk { background:#00c8ff; border-radius:6px; }"
         )
         self.analysis_progress.hide()
-        card.addWidget(self.analysis_progress)
-
-        self.status = QLabel()
-        self.status.setWordWrap(True)
-        self.status.setAlignment(Qt.AlignCenter)
-        self.status.setFont(QtGui.QFont("Consolas", 10))
-        self.status.setStyleSheet(
-            "QLabel { background-color:#10131a; color:#bbb; border:1px solid #242c3a; "
-            "border-radius:8px; padding:8px; }"
-        )
-        card.addWidget(self.status)
+        self.status_banner = StatusBanner(controller=self.status_controller)
+        self.status = self.status_banner
+        card.addWidget(self.status_banner)
 
         center_row.addWidget(self.sound_card, 0, Qt.AlignTop | Qt.AlignHCenter)
         center_row.addStretch(1)
@@ -1570,6 +1627,7 @@ class SoundTab(QtWidgets.QWidget):
         self.vol_slider.sliderReleased.connect(self._on_volume_released)
 
         self.setAcceptDrops(True)
+        self._refresh_playlist_view()
         self.update_status()
 
     def _open_archive_dropdown(self):
@@ -1580,6 +1638,112 @@ class SoundTab(QtWidgets.QWidget):
         QtGui.QShortcut(QtGui.QKeySequence(Qt.Key_Space), self, activated=self.play_pause_audio)
         QtGui.QShortcut(QtGui.QKeySequence(Qt.Key_M), self, activated=self.toggle_mute)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+L"), self, activated=self.select_music)
+
+    def _refresh_playlist_view(self) -> None:
+        if not hasattr(self, "playlist_view"):
+            return
+        self._rebuilding_playlist = True
+        try:
+            self.playlist_view.clear()
+            for index, track in enumerate(self._playlist.tracks):
+                item = QtWidgets.QTreeWidgetItem(["≡", track.archive_name, ""])
+                item.setData(1, QtCore.Qt.ItemDataRole.UserRole, track.archive_name)
+                item.setTextAlignment(0, QtCore.Qt.AlignmentFlag.AlignCenter)
+                self.playlist_view.addTopLevelItem(item)
+                remove_button = QtWidgets.QToolButton()
+                remove_button.setText("Remove")
+                remove_button.setAccessibleName(f"Remove {track.archive_name}")
+                remove_button.clicked.connect(
+                    lambda _checked=False, index=index: self._remove_playlist_track(index)
+                )
+                self.playlist_view.setItemWidget(item, 2, remove_button)
+            self.playlist_view.resizeColumnToContents(0)
+            self.playlist_view.resizeColumnToContents(2)
+            self.repeat_playlist.setChecked(self._playlist.repeat)
+            self.stop_after_final.setChecked(not self._playlist.repeat)
+        finally:
+            self._rebuilding_playlist = False
+
+    def _on_playlist_rows_moved(self, *_args) -> None:
+        if self._rebuilding_playlist:
+            return
+        QtCore.QTimer.singleShot(0, self._persist_playlist_order)
+
+    def _persist_playlist_order(self) -> None:
+        names = []
+        for index in range(self.playlist_view.topLevelItemCount()):
+            item = self.playlist_view.topLevelItem(index)
+            names.append(str(item.data(1, QtCore.Qt.ItemDataRole.UserRole) or item.text(1)))
+        self._playlist = self._playlist_store.replace_tracks(names)
+        self._sync_playlist_player(refresh_view=False)
+        self.status_controller.publish("Playlist order saved.", StatusLevel.SUCCESS)
+
+    def _on_repeat_toggled(self, checked: bool) -> None:
+        if self._rebuilding_playlist or not checked:
+            return
+        self._playlist = self._playlist_store.set_repeat(True)
+        self.wave.playlist_player.set_repeat(True)
+
+    def _on_stop_toggled(self, checked: bool) -> None:
+        if self._rebuilding_playlist or not checked:
+            return
+        self._playlist = self._playlist_store.set_repeat(False)
+        self.wave.playlist_player.set_repeat(False)
+
+    def _remove_playlist_track(self, index: int) -> None:
+        try:
+            self._playlist = self._playlist_store.remove(index)
+        except (IndexError, OSError, ValueError) as exc:
+            self.status_controller.publish(
+                f"Could not remove playlist track: {exc}",
+                StatusLevel.ERROR,
+            )
+            return
+        self._sync_playlist_player()
+        self.status_controller.publish("Track removed from playlist.", StatusLevel.INFO)
+
+    def _append_playlist_track(self, archive_name: str) -> None:
+        self._playlist = self._playlist_store.add(archive_name)
+        self._sync_playlist_player()
+
+    def _sync_playlist_player(self, *, refresh_view: bool = True) -> None:
+        resolved: list[Path] = []
+        self._resolved_playlist_tracks = []
+        missing: list[str] = []
+        for track in self._playlist.tracks:
+            path = self._playlist_store.resolve_track(track)
+            if path is None:
+                missing.append(track.archive_name)
+            else:
+                resolved.append(path)
+                self._resolved_playlist_tracks.append((track.archive_name, path))
+        self.wave.set_playlist(resolved, repeat=self._playlist.repeat)
+        if refresh_view:
+            self._refresh_playlist_view()
+        if missing:
+            self.status_controller.publish(
+                "Playlist tracks are missing: " + ", ".join(missing),
+                StatusLevel.WARNING,
+                persistent=True,
+                key="playlist-missing",
+            )
+        else:
+            self.status_controller.clear("playlist-missing")
+
+    def _on_playlist_track_changed(self, index: int, path: str) -> None:
+        try:
+            self._preview.set_media_player(self.wave.player)
+            self._preview.set_audio_file(path)
+        except Exception:
+            pass
+        if 0 <= index < len(self._resolved_playlist_tracks):
+            self._current_processed = self._resolved_playlist_tracks[index][0]
+        self._prime_analysis_for_current()
+
+    def refresh_from_workspace(self) -> None:
+        self._playlist = self._playlist_store.load()
+        self._sync_playlist_player()
+        self.update_status()
 
     # ─────────────────────────────────────────────────────────────────────
     # Stable path policy (preview + analysis use same stable path)
@@ -1676,10 +1840,15 @@ class SoundTab(QtWidgets.QWidget):
     def _stable_audio_path_for_preview(self) -> Optional[Path]:
         """
         Priority:
-          1. gallery/user/sounds/appssong/originals/<current song>.mp3
-          2. gallery/user/sounds/appssong/processed/<current song>.mp3
-          3. gallery/user/sounds/music.mp3
+          1. Current playlist track.
+          2. gallery/user/sounds/appssong/originals/<current song>.mp3
+          3. gallery/user/sounds/appssong/processed/<current song>.mp3
+          4. gallery/user/sounds/music.mp3
         """
+        playlist_path = self.wave.playlist_player.current_path
+        if playlist_path is not None and playlist_path.is_file():
+            return playlist_path.resolve()
+
         p0 = self._current_original_path_for_preview()
         if p0 is not None and p0.exists():
             return p0
@@ -1753,65 +1922,32 @@ class SoundTab(QtWidgets.QWidget):
         try:
             self._analysis.ensure_analyzed(stable, priority=True)
         except Exception as e:
-            print(f"[Sound] Analysis failed: {stable} | {e!r}")
+            print(f"[Sound] Optional analyzer unavailable: {stable} | {e!r}")
 
     # ─────────────────────────────────────────────────────────────────────
     # Analysis callbacks
     # ─────────────────────────────────────────────────────────────────────
     def _on_analysis_busy(self, busy: bool) -> None:
-        try:
-            if busy:
-                try:
-                    self.status.setText("⏳ Building audio analysis cache…")
-                except Exception:
-                    pass
-                self.analysis_progress.show()
-                self.analysis_progress.setValue(0)
-            else:
-                self.analysis_progress.hide()
-                try:
-                    t = self.status.text()
-                except Exception:
-                    t = ""
-                if "Analysis failed" not in t:
-                    self.status.setText("Audio cache ready.")
-        except Exception:
-            pass
+        self.analysis_progress.hide()
 
     def _on_analysis_progress(self, done: int, total: int, current_name: str, current_pct: int) -> None:
-        try:
-            t = max(1, int(total))
-            d = max(0, int(done))
-            cp = max(0, min(100, int(current_pct)))
-            overall = int(round(((d + (cp / 100.0)) / t) * 100.0))
-            overall = max(0, min(100, overall))
-            self.analysis_progress.setValue(overall)
-            if current_name:
-                self.analysis_progress.setFormat(f"Analyzing {current_name}… {overall}%")
-            else:
-                self.analysis_progress.setFormat(f"Analyzing audio… {overall}%")
-        except Exception:
-            pass
+        self.analysis_progress.hide()
 
     def _on_analysis_ready(self, path_key: str, payload: dict) -> None:
         try:
             print(f"[Sound] Analysis ready: {path_key}")
             if self._current_analysis_key and str(path_key) == self._current_analysis_key:
                 self._push_analysis_payload(payload)
-                self.status.setText("Audio analysis ready.")
             else:
                 print(f"[Sound] Ignored analysis payload. Current key: {self._current_analysis_key}")
         except Exception as e:
             print(f"[Sound] Analysis ready handler failed: {e!r}")
 
     def _on_analysis_failed(self, path_key: str, msg: str) -> None:
-        print(f"[Sound] Analysis failed: {path_key} | {msg}")
+        print(f"[Sound] Optional analyzer unavailable: {path_key} | {msg}")
         try:
             if self._current_analysis_key and (str(path_key) == self._current_analysis_key):
                 self._push_analysis_payload(None)
-            # Playback and analysis are separate systems. Qt may play a file even
-            # when the offline analyzer cannot decode it. Do not stop playback.
-            self.status.setText(f"⚠️ Analysis failed: {msg}\nPlayback can still continue.")
         except Exception:
             pass
 
@@ -1821,12 +1957,6 @@ class SoundTab(QtWidgets.QWidget):
     def _on_current_changed(self, processed_filename: str) -> None:
         self._current_processed = processed_filename or ""
 
-        # Live playback is always music.mp3 (copy-mode)
-        music_path = _user_current_music(self.project_root)
-        if music_path.exists():
-            self.wave.load_audio(str(music_path))
-
-        # Preview must use stable path (processed if possible)
         stable = self._stable_audio_path_for_preview()
         if stable is not None:
             try:
@@ -1834,26 +1964,29 @@ class SoundTab(QtWidgets.QWidget):
             except Exception:
                 pass
 
-        # Prime analysis and keep keys aligned
         self._prime_analysis_for_current()
 
         self.playpause_btn.setText("▶️ Play")
-        self.status.setText(f"✅ Current set: {processed_filename or '(cleared)'}")
 
     def _on_use_from_archive(self, processed_filename: str) -> None:
         self.wave.release_current_file_handle()
         try:
             self._archive_mgr.set_current(processed_filename)
+            self._append_playlist_track(processed_filename)
         except Exception as e:
             QMessageBox.critical(self, "Archive Error", str(e))
             return
+        self.status_controller.publish(
+            f"{processed_filename} added to the playlist.",
+            StatusLevel.SUCCESS,
+        )
 
     # ─────────────────────────────────────────────────────────────────────
     # Volume
     # ─────────────────────────────────────────────────────────────────────
     def _on_volume_changed(self, val: int) -> None:
         self.vol_value.setText(f"{val}%")
-        self.wave.audio_output.setVolume(max(0, min(100, val)) / 100.0)
+        self.wave.set_music_volume_live(val)
 
     def _on_volume_released(self) -> None:
         v = self.vol_slider.value()
@@ -1863,9 +1996,10 @@ class SoundTab(QtWidgets.QWidget):
     # UI actions
     # ─────────────────────────────────────────────────────────────────────
     def update_status(self):
-        music_path = _user_current_music(self.project_root)
-        if music_path.exists():
-            self.status.setText(f"✅ Music loaded: {MUSIC_FILE}")
+        count = len(self._playlist.tracks)
+        if count:
+            noun = "track" if count == 1 else "tracks"
+            self.status.setText(f"✅ Playlist ready: {count} {noun}.")
         else:
             self.status.setText("No audio loaded.")
 
@@ -1883,10 +2017,8 @@ class SoundTab(QtWidgets.QWidget):
             self.status.setText("⏸️ Paused.")
             return
 
-        if self.wave.player.source().isEmpty():
-            music_path = _user_current_music(self.project_root)
-            if music_path.exists():
-                self.wave.load_audio(str(music_path))
+        if not self.wave.playlist_player.tracks:
+            self._sync_playlist_player()
 
         stable = self._stable_audio_path_for_preview()
         if stable is not None:
@@ -1901,10 +2033,6 @@ class SoundTab(QtWidgets.QWidget):
         self.status.setText("🎧 Playing")
 
     def startover_audio(self):
-        music_path = _user_current_music(self.project_root)
-        if music_path.exists():
-            self.wave.load_audio(str(music_path))
-
         stable = self._stable_audio_path_for_preview()
         if stable is not None:
             try:
@@ -1979,14 +2107,10 @@ class SoundTab(QtWidgets.QWidget):
             self.status.setText("Import canceled.")
             return
 
-        # Playback always points to live music.mp3
-        music_path = _user_current_music(self.project_root)
-        if music_path.exists():
-            self.wave.load_audio(str(music_path))
-
-        # Preview/analyzer should use stable processed path when possible
         self._current_processed = res.archive_processed or self._read_current_processed_from_manifest()
-        stable = self._stable_audio_path_for_preview()
+        archive_name = self._current_processed or Path(path).name
+        self._append_playlist_track(archive_name)
+        stable = self._playlist_store.resolve_track(self._playlist.tracks[-1])
         if stable is not None:
             try:
                 self._preview.set_audio_file(str(stable))
@@ -1998,6 +2122,6 @@ class SoundTab(QtWidgets.QWidget):
         try:
             self.status.setText(f"✅ {res.message}")
         except Exception:
-            self.status.setText(f"✅ Music added: {music_path.name}")
+            self.status.setText(f"✅ Music added: {archive_name}")
 
         self.playpause_btn.setText("▶️ Play")
