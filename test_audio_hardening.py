@@ -174,6 +174,37 @@ class AudioHardeningTests(unittest.TestCase):
             self.assertIn("const BUILD_ID =", script)
             self.assertNotIn("{{BUILD_ID}}", html + script)
 
+    def test_failed_generate_preserves_previous_valid_build(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_project_assets(root)
+
+            def successful_export(_src: Path, dst: Path) -> None:
+                Path(dst).parent.mkdir(parents=True, exist_ok=True)
+                Path(dst).write_bytes(b"valid")
+
+            with mock.patch.object(generate, "_export_apple_safe_mp3", successful_export):
+                play_dir = generate.generate_play_bundle(str(root), message_html="<p>Saved</p>")
+
+            marker = play_dir / "previous-build.marker"
+            marker.write_text("keep", encoding="utf-8")
+
+            def failing_export(src: Path, dst: Path) -> None:
+                if Path(src).name == "flip3.mp3":
+                    raise RuntimeError("simulated export failure")
+                successful_export(src, dst)
+
+            with (
+                mock.patch.object(generate, "_export_apple_safe_mp3", failing_export),
+                self.assertRaisesRegex(RuntimeError, "simulated export failure"),
+            ):
+                generate.generate_play_bundle(str(root), message_html="<p>Replacement</p>")
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+            self.assertTrue((play_dir / "index.html").is_file())
+            self.assertFalse(play_dir.with_name(play_dir.name + ".staging").exists())
+            self.assertFalse(play_dir.with_name(play_dir.name + ".backup").exists())
+
     def test_template_centralizes_audio_creation_and_safe_playback(self) -> None:
         self.assertIn("function makeAudio", TEMPLATE_JS)
         self.assertIn("function safePlay", TEMPLATE_JS)
@@ -202,6 +233,51 @@ class AudioHardeningTests(unittest.TestCase):
             self.assertNotEqual(result.action, "error", result.message)
             self.assertEqual(calls, [("song.mp3", "song.mp3"), ("song.mp3", "music.mp3")])
             self.assertEqual((root / "gallery" / "user" / "sounds" / "music.mp3").read_bytes(), b"apple safe")
+
+    def test_archive_and_analysis_share_configured_paths(self) -> None:
+        from config import (
+            USER_AUDIO_ANALYSIS_DIR,
+            USER_AUDIO_MANIFEST_FILE,
+            USER_AUDIO_ORIGINALS_DIR,
+            USER_AUDIO_PROCESSED_DIR,
+        )
+        from sound_analyzer import AudioAnalysisManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = sound_tab.SoundArchiveManager(root)
+            analysis = AudioAnalysisManager(root)
+
+            self.assertEqual(archive.dir_originals, (root / USER_AUDIO_ORIGINALS_DIR).resolve())
+            self.assertEqual(archive.dir_processed, (root / USER_AUDIO_PROCESSED_DIR).resolve())
+            self.assertEqual(archive.current_manifest, (root / USER_AUDIO_MANIFEST_FILE).resolve())
+            self.assertEqual(analysis.processed_dir, (root / USER_AUDIO_PROCESSED_DIR).resolve())
+            self.assertEqual(analysis.analysis_dir, (root / USER_AUDIO_ANALYSIS_DIR).resolve())
+            analysis.shutdown()
+            analysis.shutdown()
+
+    def test_wave_handler_shutdown_releases_all_players(self) -> None:
+        import os
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6 import QtWidgets
+        from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as tmp:
+            handler = sound_tab.WaveHandler(Path(tmp))
+            one_shot_output = QAudioOutput(handler)
+            one_shot_player = QMediaPlayer(handler)
+            one_shot_player.setAudioOutput(one_shot_output)
+            handler._sfx_pool.append((one_shot_player, one_shot_output))
+
+            handler.shutdown()
+            handler.shutdown()
+
+            self.assertTrue(handler._shutdown)
+            self.assertEqual(handler._sfx_pool, [])
+            self.assertTrue(handler.player.source().isEmpty())
+        self.assertIsNotNone(app)
 
 
 if __name__ == "__main__":

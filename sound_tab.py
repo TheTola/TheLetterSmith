@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from audio_export import _export_apple_safe_mp3
+from settings_store import SettingsStore
 
 # --- Visualizer (shared preview widget) ---
 from sound_preview import SoundPreviewWidget
@@ -41,14 +42,16 @@ from mutagen import File as MutagenFile
 
 # --- Project config ---
 from config import (
-    SETTINGS_FILE,
     MAX_AUDIO_MB,
-    STARTING_VOLUME,
     MUSIC_FILE,
     GLISS_FILE,
     FLIP_PREFIX,
     FLIP_COUNT,
     USER_SOUNDS_DIR,
+    USER_AUDIO_ORIGINALS_DIR,
+    USER_AUDIO_PROCESSED_DIR,
+    USER_AUDIO_ANALYSIS_DIR,
+    USER_AUDIO_MANIFEST_FILE,
 )
 
 
@@ -66,32 +69,27 @@ GLISS_VOLUME_PERCENT = 10
 
 def _user_sounds_dir(project_root: Path) -> Path:
     # gallery/user/sounds
-        return project_root / USER_SOUNDS_DIR
-
-
-def _user_archive_root(project_root: Path) -> Path:
-    # gallery/user/sounds/appssong
-    return _user_sounds_dir(project_root) / "appssong"
+    return project_root / USER_SOUNDS_DIR
 
 
 def _user_archive_originals(project_root: Path) -> Path:
     # gallery/user/sounds/appssong/originals
-    return _user_archive_root(project_root) / "originals"
+    return project_root / USER_AUDIO_ORIGINALS_DIR
 
 
 def _user_archive_processed(project_root: Path) -> Path:
     # gallery/user/sounds/appssong/processed
-    return _user_archive_root(project_root) / "processed"
+    return project_root / USER_AUDIO_PROCESSED_DIR
 
 
 def _user_archive_analysis(project_root: Path) -> Path:
     # gallery/user/sounds/appssong/analysis
-    return _user_archive_root(project_root) / "analysis"
+    return project_root / USER_AUDIO_ANALYSIS_DIR
 
 
 def _user_current_manifest(project_root: Path) -> Path:
     # gallery/user/sounds/appssong/current.json
-    return _user_archive_root(project_root) / "current.json"
+    return project_root / USER_AUDIO_MANIFEST_FILE
 
 
 def _user_current_music(project_root: Path) -> Path:
@@ -299,7 +297,7 @@ class SoundArchiveManager(QtCore.QObject):
         try:
             data = json.loads(self.current_manifest.read_text(encoding="utf-8"))
             current_rel = data.get("current_processed_rel") or data.get("current_rel", "")
-            expected_rel = f"{USER_SOUNDS_DIR}/appssong/processed/{processed_filename}"
+            expected_rel = f"{USER_AUDIO_PROCESSED_DIR}/{processed_filename}"
             is_current = (current_rel == expected_rel)
         except Exception:
             pass
@@ -394,10 +392,10 @@ class SoundArchiveManager(QtCore.QObject):
     def _write_manifest(self, processed_name: str, size: int, original_name: Optional[str] = None) -> None:
         original_name = original_name or self._original_name_for_processed(processed_name)
         data = {
-            "current_original_rel": f"gallery/user/sounds/appssong/originals/{original_name}",
-            "current_processed_rel": f"gallery/user/sounds/appssong/processed/{processed_name}",
-            "current_live_rel": "gallery/user/sounds/music.mp3",
-            "current_rel": f"gallery/user/sounds/appssong/processed/{processed_name}",
+            "current_original_rel": f"{USER_AUDIO_ORIGINALS_DIR}/{original_name}",
+            "current_processed_rel": f"{USER_AUDIO_PROCESSED_DIR}/{processed_name}",
+            "current_live_rel": f"{USER_SOUNDS_DIR}/{MUSIC_FILE}",
+            "current_rel": f"{USER_AUDIO_PROCESSED_DIR}/{processed_name}",
             "link_mode": "copy",
             "size": size,
             "set_at": datetime.now().isoformat(timespec="seconds"),
@@ -1114,14 +1112,19 @@ class ArchiveDropdown(QtWidgets.QFrame):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class WaveHandler(QtCore.QObject):
-    def __init__(self, project_root, archive_mgr: Optional[SoundArchiveManager] = None):
-        super().__init__()
+    def __init__(
+        self,
+        project_root,
+        archive_mgr: Optional[SoundArchiveManager] = None,
+        parent: Optional[QtCore.QObject] = None,
+    ):
+        super().__init__(parent)
         self.project_root = Path(project_root).resolve()
-        self.settings_path = self.project_root / SETTINGS_FILE
+        self.settings_store = SettingsStore(self.project_root)
 
         # Music player (persistent)
-        self.audio_output = QAudioOutput()
-        self.player = QMediaPlayer()
+        self.audio_output = QAudioOutput(self)
+        self.player = QMediaPlayer(self)
         self.player.setAudioOutput(self.audio_output)
 
         # One-shot SFX pool for gliss plays
@@ -1133,21 +1136,10 @@ class WaveHandler(QtCore.QObject):
 
         self._archive = archive_mgr
         self._muted = False
-
-    def _read_settings(self) -> Dict:
-        try:
-            return json.loads(self.settings_path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-
-    def _write_settings(self, settings: Dict) -> None:
-        try:
-            self.settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        self._shutdown = False
 
     def _load_music_volume(self) -> float:
-        settings = self._read_settings()
+        settings = self.settings_store.as_dict()
         if "music_volume" in settings:
             try:
                 v = max(0, min(100, int(settings["music_volume"])))
@@ -1155,17 +1147,14 @@ class WaveHandler(QtCore.QObject):
             except Exception:
                 pass
         try:
-            v = max(0, min(100, int(STARTING_VOLUME)))
+            v = max(0, min(100, int(settings.get("starting_volume", 31))))
         except Exception:
-            v = 100
+            v = 31
         return v / 100.0
 
     def save_music_volume(self, volume_percent: int) -> None:
         v = max(0, min(100, int(volume_percent)))
-        settings = self._read_settings()
-        settings["music_volume"] = v
-        settings["starting_volume"] = v
-        self._write_settings(settings)
+        self.settings_store.update_fields(music_volume=v, starting_volume=v)
 
         self._music_volume = v / 100.0
         self.audio_output.setVolume(self._music_volume)
@@ -1186,9 +1175,13 @@ class WaveHandler(QtCore.QObject):
             return False, f"Metadata error: {e}"
 
     def load_audio(self, path: str) -> None:
+        if self._shutdown:
+            return
         self.player.setSource(QUrl.fromLocalFile(path))
 
     def play_audio(self) -> None:
+        if self._shutdown:
+            return
         self.audio_output.setVolume(self._music_volume)
         self.player.play()
 
@@ -1221,12 +1214,36 @@ class WaveHandler(QtCore.QObject):
         except Exception:
             pass
 
+    def shutdown(self) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+        self.release_current_file_handle()
+
+        for player, output in list(self._sfx_pool):
+            try:
+                player.stop()
+                player.setSource(QUrl())
+                player.setAudioOutput(None)
+            except Exception:
+                pass
+            player.deleteLater()
+            output.deleteLater()
+        self._sfx_pool.clear()
+
+        try:
+            self.player.setAudioOutput(None)
+        except Exception:
+            pass
+
     def play_gliss(self) -> bool:
+        if self._shutdown:
+            return False
         gliss_raw = _user_gliss_path(self.project_root)
         if not gliss_raw.exists():
             return False
         try:
-            out = QAudioOutput()
+            out = QAudioOutput(self)
             try:
                 out.setDevice(self.audio_output.device())
             except Exception:
@@ -1234,7 +1251,7 @@ class WaveHandler(QtCore.QObject):
             out.setVolume(GLISS_VOLUME_PERCENT / 100.0)
             out.setMuted(self._muted)
 
-            p = QMediaPlayer()
+            p = QMediaPlayer(self)
             p.setAudioOutput(out)
             p.setSource(QUrl.fromLocalFile(str(gliss_raw)))
 
@@ -1250,6 +1267,8 @@ class WaveHandler(QtCore.QObject):
                         self._sfx_pool.remove((p, out))
                     except Exception:
                         self._sfx_pool[:] = [(pp, oo) for (pp, oo) in self._sfx_pool if pp is not p]
+                    p.deleteLater()
+                    out.deleteLater()
 
             p.mediaStatusChanged.connect(_cleanup_when_done)
             p.play()
@@ -1268,9 +1287,10 @@ class SoundTab(QtWidgets.QWidget):
     def __init__(self, project_root):
         super().__init__()
         self.project_root = Path(project_root).resolve()
+        self._shutdown = False
 
         self._archive_mgr = SoundArchiveManager(self.project_root)
-        self.wave = WaveHandler(project_root, archive_mgr=self._archive_mgr)
+        self.wave = WaveHandler(project_root, archive_mgr=self._archive_mgr, parent=self)
 
         # Visualizer for Nexus preview
         self._preview = SoundPreviewWidget(self.wave.player, parent=self)
@@ -1285,14 +1305,6 @@ class SoundTab(QtWidgets.QWidget):
         self._current_analysis_key = ""
 
         if self._analysis is not None:
-            try:
-                self._analysis.processed_dir = _user_archive_processed(self.project_root)
-                self._analysis.analysis_dir = _user_archive_analysis(self.project_root)
-                self._analysis.processed_dir.mkdir(parents=True, exist_ok=True)
-                self._analysis.analysis_dir.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
-
             self._analysis.busyChanged.connect(self._on_analysis_busy)
             self._analysis.batchProgress.connect(self._on_analysis_progress)
             self._analysis.analysisReady.connect(self._on_analysis_ready)
@@ -1336,11 +1348,40 @@ class SoundTab(QtWidgets.QWidget):
             except Exception:
                 pass
 
+    def shutdown(self) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+
+        if self._analysis is not None:
+            try:
+                self._analysis.shutdown()
+            except Exception:
+                pass
+        try:
+            self._preview.shutdown()
+        except Exception:
+            pass
+        try:
+            self.wave.shutdown()
+        except Exception:
+            pass
+        try:
+            self._dropdown.close()
+        except Exception:
+            pass
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.shutdown()
+        super().closeEvent(event)
+
     # ─────────────────────────────────────────────────────────────────────
     # UI
     # ─────────────────────────────────────────────────────────────────────
     def showEvent(self, e: QtGui.QShowEvent) -> None:
         super().showEvent(e)
+        if self._shutdown:
+            return
         self.preview_widget.emit(self._preview)
 
         if (self._analysis is not None) and (not self._analysis_bootstrapped):

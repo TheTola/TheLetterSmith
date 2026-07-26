@@ -20,13 +20,14 @@ TEMPLATE_HTML = r"""
   <link rel="preload" as="audio" href="gallery/sounds/glissando.mp3?v={{BUILD_ID}}" type="audio/mpeg">
 </head>
 
-<body data-has-message="{{HAS_MESSAGE}}" data-has-user-music="true" data-message-preset="{{MESSAGE_OVERLAY_PRESET}}">
+<body data-has-message="{{HAS_MESSAGE}}" data-has-user-music="true" data-message-preset="{{MESSAGE_OVERLAY_PRESET}}" data-tap-navigation="true">
   <div id="curtain-overlay" aria-hidden="false" role="dialog" aria-modal="true" aria-labelledby="begin-button">
     <img id="curtain-left"  src="gallery/controls/cleft.png"  alt="" aria-hidden="true" decoding="async" fetchpriority="high">
     <img id="curtain-right" src="gallery/controls/cright.png" alt="" aria-hidden="true" decoding="async" fetchpriority="high">
     <img id="curtain-left-detail"  src="gallery/controls/R_cleft.png"  alt="" aria-hidden="true" decoding="async" fetchpriority="high">
     <img id="curtain-right-detail" src="gallery/controls/R_cright.png" alt="" aria-hidden="true" decoding="async" fetchpriority="high">
     <button id="begin-button" type="button">Tap to Begin</button>
+    <p id="mobile-sound-hint">Sound starts after you tap Begin.</p>
   </div>
 
   <div id="slideshow" aria-hidden="true">
@@ -65,6 +66,10 @@ TEMPLATE_HTML = r"""
     </button>
 
     <div id="progress" aria-live="polite">Page 1 of 4</div>
+    <div id="mobile-actions" aria-label="Viewer actions">
+      <button id="fullscreen-button" class="hud-button text-action" type="button">Fullscreen</button>
+      <button id="share-button" class="hud-button text-action" type="button" hidden>Share</button>
+    </div>
 
     {{MESSAGE_BUTTON_HTML}}
   </div>
@@ -167,6 +172,7 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 #curtain-overlay.curtain-fallback #curtain-left,#curtain-overlay.curtain-fallback #curtain-right,#curtain-overlay.curtain-fallback #curtain-left-detail,#curtain-overlay.curtain-fallback #curtain-right-detail{display:none}
 #begin-button{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);min-width:min(80vw,280px);padding:14px 30px;border:1px solid rgba(155,255,251,.42);border-radius:var(--pill-radius);background:linear-gradient(180deg,rgba(15,24,38,.88),rgba(6,10,18,.72));color:var(--text-main);font-size:clamp(22px,3.2vw,42px);font-weight:700;letter-spacing:.02em;cursor:pointer;z-index:10002;animation:pulse 2s infinite;box-shadow:var(--hud-shadow),0 0 0 1px rgba(0,255,255,.14)}
 #curtain-overlay:not(.is-visible) #begin-button{opacity:0}
+#mobile-sound-hint{display:none;position:absolute;left:50%;top:calc(50% + 66px);transform:translateX(-50%);width:min(82vw,360px);margin:0;color:var(--text-soft);font:600 14px/1.4 var(--font-ui);text-align:center;z-index:10002}
 #begin-button:hover{background:linear-gradient(180deg,rgba(20,31,48,.94),rgba(8,12,20,.84))}
 @keyframes curtainIntroFadeIn{from{opacity:0}to{opacity:1}}
 @keyframes curtainPanelFadeIn{from{opacity:0}to{opacity:1}}
@@ -206,6 +212,9 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .nav-button[disabled]:hover{transform:translateY(-50%)}
 
 #progress{position:absolute;right:var(--corner-offset);bottom:var(--corner-offset);display:inline-flex;align-items:center;min-height:40px;padding:0 14px;border:1px solid rgba(255,255,255,.10);border-radius:var(--pill-radius);background:rgba(6,9,16,.56);box-shadow:var(--hud-shadow);color:var(--text-soft);font:700 clamp(12px,1.2vw,14px)/1 var(--font-ui);letter-spacing:.08em;text-transform:uppercase;z-index:101}
+#mobile-actions{position:absolute;top:var(--corner-offset);left:var(--corner-offset);display:flex;gap:8px;z-index:102}
+.text-action{min-height:40px;padding:0 14px;border-radius:var(--pill-radius);font:700 12px/1 var(--font-ui)}
+.text-action[hidden]{display:none}
 
 .text-wall{position:absolute;top:50%;left:50%;width:min(var(--wall-max-width),calc(100% - (2 * var(--wall-gap))));max-height:calc(100% - (2 * var(--wall-gap)));overflow:auto;padding:var(--wall-frame-pad);border:1px solid var(--paper-edge);border-radius:var(--panel-radius);background:linear-gradient(180deg,rgba(var(--message-overlay-rgb),var(--message-overlay-opacity)),rgba(var(--message-overlay-rgb),var(--message-overlay-opacity)));color:var(--message-ink);box-shadow:0 30px 80px var(--paper-shadow),0 12px 28px rgba(0,0,0,.22),inset 0 1px 0 var(--paper-line);z-index:105;opacity:0;visibility:hidden;pointer-events:none;transform:translate(-50%,-48%);transition:opacity var(--wall-fade-ms) ease,transform var(--motion-medium),visibility 0s linear var(--wall-fade-ms);isolation:isolate;scrollbar-width:thin;scrollbar-color:rgba(92,67,40,.52) rgba(0,0,0,.06)}
 .text-wall.is-open{opacity:1;visibility:visible;pointer-events:auto;transform:translate(-50%,-50%);transition:opacity var(--wall-fade-ms) ease,transform var(--motion-medium),visibility 0s}
@@ -253,7 +262,7 @@ body.stage-ready #volume-control{opacity:1;visibility:visible;pointer-events:aut
 #audio-enable-button.is-visible{display:inline-flex}
 
 @media (max-width: 900px){:root{--nav-size:clamp(68px,11vw,96px);--wall-gap:clamp(18px,4vw,30px)}.text-wall-content{font-size:clamp(16px,1.8vw,18px)}}
-@media (max-width: 640px){:root{--nav-size:clamp(60px,18vw,76px);--icon-size:44px;--close-size:40px;--corner-offset:16px}#prev,#next{top:auto;bottom:calc(var(--corner-offset) + 8px + env(safe-area-inset-bottom));transform:none}#prev:hover,#next:hover{transform:scale(1.04)}.nav-button[disabled]:hover{transform:none}#volume-control{top:auto;right:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom));transform:none}body.stage-ready #volume-control{transform:none}#progress{left:50%;right:auto;bottom:calc(var(--corner-offset) + env(safe-area-inset-bottom));transform:translateX(-50%)}#open-text{left:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom))}#close-text{top:16px;right:16px}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - (2 * var(--wall-gap)) - 110px)}#volume-control.slider-open #volume-slider{width:min(34vw,128px)}}
+@media (max-width: 640px){:root{--nav-size:clamp(60px,18vw,76px);--icon-size:44px;--close-size:40px;--corner-offset:16px}#mobile-sound-hint{display:block}#mobile-actions{top:calc(var(--corner-offset) + env(safe-area-inset-top));left:50%;transform:translateX(-50%)}#prev,#next{top:auto;bottom:calc(var(--corner-offset) + 8px + env(safe-area-inset-bottom));transform:none}#prev:hover,#next:hover{transform:scale(1.04)}.nav-button[disabled]:hover{transform:none}#volume-control{top:auto;right:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom));transform:none}body.stage-ready #volume-control{transform:none}#progress{left:50%;right:auto;bottom:calc(var(--corner-offset) + env(safe-area-inset-bottom));transform:translateX(-50%)}#open-text{left:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom))}#close-text{top:16px;right:16px}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - (2 * var(--wall-gap)) - 110px)}#volume-control.slider-open #volume-slider{width:min(34vw,128px)}}
 @media (prefers-reduced-motion: reduce){*,*::before,*::after{scroll-behavior:auto !important}#slideshow,#volume-control,#open-text,#close-text,.text-wall,#volume-slider{transition:none}#begin-button{animation:none}#curtain-overlay.is-visible,#curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right,#curtain-overlay.is-visible #curtain-left-detail,#curtain-overlay.is-visible #curtain-right-detail{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
 """
 
@@ -273,6 +282,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const prevBtn   = document.getElementById('prev');
   const nextBtn   = document.getElementById('next');
   const progress  = document.getElementById('progress');
+  const fullscreenBtn = document.getElementById('fullscreen-button');
+  const shareBtn = document.getElementById('share-button');
 
   const turn       = document.getElementById('turn');
   const turnShadow = document.getElementById('turnShadow');
@@ -319,11 +330,13 @@ document.addEventListener('DOMContentLoaded', () => {
   let musicEnableButton = null;
 
   const BUILD_ID = "{{BUILD_ID}}";
+  const VOLUME_STORAGE_KEY = 'lettersmith-viewer-volume';
   const flipPool = Array.from({length: 10}, (_, i) => `gallery/sounds/flip${i+1}.mp3`);
   const glissSrc = 'gallery/sounds/glissando.mp3';
 
   function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
   function withBuildId(url){
+    if (url.startsWith('data:') || url.startsWith('blob:')) return url;
     const sep = url.includes('?') ? '&' : '?';
     return `${url}${sep}v=${encodeURIComponent(BUILD_ID)}`;
   }
@@ -844,6 +857,10 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   function loadVolume0to100(){
     const v0 = (typeof INITIAL_VOLUME === 'number') ? INITIAL_VOLUME : 50;
+    try{
+      const saved = Number.parseInt(window.localStorage.getItem(VOLUME_STORAGE_KEY) || '', 10);
+      if (Number.isFinite(saved)) return clamp(saved, 0, 100);
+    }catch(_err){ }
     return clamp(Math.round(v0), 0, 100);
   }
   function setVolume0to100(v){
@@ -862,6 +879,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (slider){
       slider.value = String(vv);
     }
+    try{ window.localStorage.setItem(VOLUME_STORAGE_KEY, String(vv)); }
+    catch(_err){ }
   }
   function setSliderOpen(open){
     const shouldOpen = !!open;
@@ -1082,6 +1101,63 @@ document.addEventListener('DOMContentLoaded', () => {
   bindPress(beginBtn, (e) => { e.preventDefault(); openCurtain(); });
   prevBtn.addEventListener('click', () => go(-1));
   nextBtn.addEventListener('click', () => go(1));
+
+  let swipeStart = null;
+  let suppressTapUntil = 0;
+  slideshowEl.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch') return;
+    if (wall && wall.classList.contains('is-open')) return;
+    const target = e.target instanceof Element ? e.target : null;
+    if (target && target.closest('button,a,input,[role="button"]')) return;
+    swipeStart = { x: e.clientX, y: e.clientY, pointerId: e.pointerId };
+  }, { passive: true });
+  slideshowEl.addEventListener('pointerup', (e) => {
+    if (!swipeStart || swipeStart.pointerId !== e.pointerId) return;
+    const start = swipeStart;
+    swipeStart = null;
+    if (wall && wall.classList.contains('is-open')) return;
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+    if (Math.abs(dx) < 48 || Math.abs(dx) <= Math.abs(dy) * 1.25) return;
+    suppressTapUntil = performance.now() + 500;
+    go(dx < 0 ? 1 : -1);
+  }, { passive: true });
+  slideshowEl.addEventListener('pointercancel', () => { swipeStart = null; }, { passive: true });
+  slideshowEl.addEventListener('click', (e) => {
+    if (document.body.dataset.tapNavigation !== 'true') return;
+    if (performance.now() < suppressTapUntil) return;
+    if (wall && wall.classList.contains('is-open')) return;
+    const target = e.target instanceof Element ? e.target : null;
+    if (target && target.closest('button,a,input,[role="button"]')) return;
+    const rect = slideshowEl.getBoundingClientRect();
+    const relativeX = e.clientX - rect.left;
+    if (relativeX < rect.width * 0.24) go(-1);
+    else if (relativeX > rect.width * 0.76) go(1);
+  });
+
+  if (fullscreenBtn){
+    if (!document.fullscreenEnabled){
+      fullscreenBtn.hidden = true;
+    }else{
+      fullscreenBtn.addEventListener('click', async () => {
+        try{
+          if (document.fullscreenElement) await document.exitFullscreen();
+          else await document.documentElement.requestFullscreen();
+        }catch(err){ console.warn('Fullscreen request failed', err); }
+      });
+      document.addEventListener('fullscreenchange', () => {
+        fullscreenBtn.textContent = document.fullscreenElement ? 'Exit fullscreen' : 'Fullscreen';
+      });
+    }
+  }
+  if (shareBtn && typeof navigator.share === 'function'){
+    shareBtn.hidden = false;
+    shareBtn.addEventListener('click', async () => {
+      try{ await navigator.share({ title: document.title, url: window.location.href }); }
+      catch(err){ if (err && err.name !== 'AbortError') console.warn('Share failed', err); }
+    });
+  }
+
   window.addEventListener('keydown', (e) => {
     if (!started || introControlsLocked) return;
     if (e.key === 'ArrowLeft'){

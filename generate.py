@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import time
 import webbrowser
@@ -51,17 +52,17 @@ from curtain_color import (
     write_tinted_curtain_image,
 )
 from font_export import FontExportError, build_embedded_font_payload
+from settings_store import SettingsStore
+from transactions import PathTransaction
 from message_html import (
     message_html_has_content,
     normalize_message_fragment,
     read_text_normalized,
 )
 from config import (
-    SETTINGS_FILE,
     PUBLISHED_PAGE_URL_KEY,
     PLAY_METADATA_FILE,
     DEFAULT_VOLUME,
-    STARTING_VOLUME,
     CURTAIN_STYLE_KEY,
     CURTAIN_STYLE_WHITE,
     CURTAIN_STYLE_AVERAGE,
@@ -70,8 +71,13 @@ from config import (
     VALID_CURTAIN_STYLES,
     ensure_output_dirs,
     plan_build,
+    play_bundle_path,
     validate_required_images,
     validate_controls,
+    GALLERY_DIR,
+    PAGES_DIR,
+    CONTROLS_DIR,
+    SOUNDS_DIR,
     USER_PAGES_DIR,
     USER_CONTROLS_DIR,
     USER_MESSAGE_DIR,
@@ -150,11 +156,7 @@ def _read_text_safe(path: Path) -> str:
 
 
 def _load_settings(project_root: Path) -> dict:
-    fp = project_root / SETTINGS_FILE
-    try:
-        return json.loads(fp.read_text(encoding="utf-8")) if fp.exists() else {}
-    except Exception:
-        return {}
+    return SettingsStore(project_root).as_dict()
 
 
 def _recipient_from_settings(settings: dict) -> str:
@@ -169,7 +171,7 @@ def _title_from_settings(settings: dict, recipient: str) -> str:
 
 def _starting_volume_from_settings(settings: dict) -> int:
     try:
-        v = int(settings.get("starting_volume", STARTING_VOLUME if isinstance(STARTING_VOLUME, int) else DEFAULT_VOLUME))
+        v = int(settings.get("starting_volume", DEFAULT_VOLUME))
     except Exception:
         v = DEFAULT_VOLUME
     return max(0, min(100, v))
@@ -420,13 +422,13 @@ def get_last_font_export_report() -> dict[str, tuple[str, ...]]:
     return dict(_LAST_FONT_EXPORT_REPORT)
 
 
-def generate_play_bundle(
+def _generate_play_bundle_contents(
     project_root: str,
     *,
     message_html: Optional[str] = None,
-    open_in_browser: bool = False,
     seed_sfx: bool = True,
     allow_user_sfx_fallback: bool = True,
+    play_dir_override: Optional[Path] = None,
 ) -> Path:
     """
     Build the Play bundle at:
@@ -478,7 +480,13 @@ def generate_play_bundle(
     curtain_style, curtain_rgb = _curtain_rgb_for_style(pr, settings)
 
     # Deterministic Play folder (NO timestamp; overwrites same location)
-    bp = plan_build(pr, recipient=recipient, title=title)
+    bp = plan_build(
+        pr,
+        recipient=recipient,
+        title=title,
+        play_dir=play_dir_override,
+        clear_existing=True,
+    )
 
     # Runtime destinations
     pages_dst = bp.play_pages_dir
@@ -564,10 +572,80 @@ def generate_play_bundle(
         curtain_rgb=curtain_rgb,
     )
 
+    return bp.play_dir
+
+
+def _validate_staged_play_bundle(
+    play_dir: Path,
+    *,
+    has_user_music: bool,
+    seed_sfx: bool,
+) -> None:
+    expected = [
+        play_dir / "index.html",
+        play_dir / "styles.css",
+        play_dir / "script.js",
+        play_dir / PLAY_METADATA_FILE,
+        *[play_dir / GALLERY_DIR / PAGES_DIR / name for name in REQUIRED_SLIDES],
+        *[play_dir / GALLERY_DIR / CONTROLS_DIR / name for name in CONTROL_FILES],
+    ]
+    if has_user_music:
+        expected.append(play_dir / GALLERY_DIR / SOUNDS_DIR / MUSIC_FILE)
+    if seed_sfx:
+        expected.extend(
+            play_dir / GALLERY_DIR / SOUNDS_DIR / name
+            for name in _sfx_names()
+        )
+
+    missing = [str(path.relative_to(play_dir)) for path in expected if not path.is_file()]
+    if missing:
+        raise RuntimeError("Staged Play build is incomplete:\n" + "\n".join(f"  - {name}" for name in missing))
+
+    index_html = (play_dir / "index.html").read_text(encoding="utf-8")
+    if "<html" not in index_html.casefold() or "</html>" not in index_html.casefold():
+        raise RuntimeError("Staged index.html is not a complete HTML document.")
+    unresolved = sorted(set(re.findall(r"\{\{[A-Z0-9_]+\}\}", index_html)))
+    if unresolved:
+        raise RuntimeError("Staged index.html contains unresolved placeholders: " + ", ".join(unresolved))
+
+
+def generate_play_bundle(
+    project_root: str,
+    *,
+    message_html: Optional[str] = None,
+    open_in_browser: bool = False,
+    seed_sfx: bool = True,
+    allow_user_sfx_fallback: bool = True,
+) -> Path:
+    pr = Path(project_root).resolve()
+    settings = _load_settings(pr)
+    recipient = _recipient_from_settings(settings)
+    title = _title_from_settings(settings, recipient)
+    final_dir = play_bundle_path(pr, recipient=recipient, title=title)
+    transaction = PathTransaction(final_dir)
+    staging_dir = transaction.prepare()
+
+    try:
+        _generate_play_bundle_contents(
+            str(pr),
+            message_html=message_html,
+            seed_sfx=seed_sfx,
+            allow_user_sfx_fallback=allow_user_sfx_fallback,
+            play_dir_override=staging_dir,
+        )
+        _validate_staged_play_bundle(
+            staging_dir,
+            has_user_music=(pr / USER_SOUNDS_DIR / MUSIC_FILE).is_file(),
+            seed_sfx=seed_sfx,
+        )
+        transaction.commit()
+    except Exception:
+        transaction.abort()
+        raise
+
     if open_in_browser:
         try:
-            webbrowser.open((bp.play_dir / "index.html").as_uri())
+            webbrowser.open((final_dir / "index.html").as_uri())
         except Exception:
             pass
-
-    return bp.play_dir
+    return final_dir

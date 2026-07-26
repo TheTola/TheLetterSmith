@@ -19,7 +19,6 @@ What does NOT belong here:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sys
@@ -36,6 +35,7 @@ from app_icon import (
     resolve_app_icon,
 )
 from editor_diagnostics import record_editor_failure
+from settings_store import SettingsStore
 
 
 # =============================================================================
@@ -126,12 +126,8 @@ def load_settings(root: Path) -> dict:
         not core behavior that could surprise users.
     """
 
-    path = root / SETTINGS_FILE
-    if not path.exists():
-        return {}
-
     try:
-        return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        return SettingsStore(root).as_dict()
     except Exception:
         return {}
 

@@ -1233,6 +1233,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._persist_timer = QtCore.QTimer(self)
         self._persist_timer.setSingleShot(True)
         self._persist_timer.timeout.connect(self._persist_state_now)
+        self._shutdown = False
 
         self._drag_pos: Optional[QtCore.QPoint] = None
         self._is_maximized: bool = False
@@ -2854,6 +2855,32 @@ class PromptWriterPanel(QtWidgets.QWidget):
         except Exception:
             pass
         super().mouseDoubleClickEvent(event)
+
+    def shutdown(self) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+
+        self._persist_timer.stop()
+        try:
+            self._persist_state_now()
+        except Exception:
+            pass
+        visionary_timer = getattr(self, "_visionary_timer", None)
+        if visionary_timer is not None:
+            visionary_timer.stop()
+        self._geom_anim.stop()
+        self._fade_anim.stop()
+
+        for dialog in self.findChildren(QtWidgets.QDialog):
+            try:
+                dialog.close()
+            except Exception:
+                pass
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.shutdown()
+        super().closeEvent(event)
 
     def hide(self):
         try:

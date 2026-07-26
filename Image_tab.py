@@ -477,6 +477,26 @@ class ImageTab(QtWidgets.QWidget):
         self.image_selected.emit(preview)
         self.status.setText(f"✅ {filename} saved; preview ready.")
 
+    def refresh_from_workspace(self) -> None:
+        pages_dir = Path(self._user_pages_dir())
+        first_pixmap: Optional[QtGui.QPixmap] = None
+        for idx, (label_text, filename) in self.labels.items():
+            path = pages_dir / filename
+            self.image_paths[idx] = str(path) if path.is_file() else None
+            button = self.buttons.get(idx)
+            if isinstance(button, QtWidgets.QPushButton):
+                button.setText(
+                    f"  ✔  {label_text}" if path.is_file() else f"  {label_text}"
+                )
+            if first_pixmap is None and path.is_file():
+                candidate = QtGui.QPixmap(str(path))
+                if not candidate.isNull():
+                    first_pixmap = candidate
+        if first_pixmap is not None:
+            self.image_selected.emit(
+                first_pixmap.scaledToWidth(200, QtCore.Qt.SmoothTransformation)
+            )
+
     # ────────────────────────────────────────────────────────────
     # Hover preview
     # ────────────────────────────────────────────────────────────

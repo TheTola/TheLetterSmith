@@ -41,7 +41,6 @@ into the saved HTML body.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
@@ -88,7 +87,6 @@ from PySide6.QtWidgets import (
 )
 
 from config import (
-    SETTINGS_FILE,
     GALLERY_DIR,
     USER_PAGES_DIR,
     MESSAGE_HTML_FILE,
@@ -97,6 +95,8 @@ from config import (
 from message_html import ensure_message_html_from_emessage
 from editor_diagnostics import record_editor_failure
 from font_export import inspect_font_family
+from settings_store import SettingsStore
+from project_store import ProjectStore
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants & Helpers
@@ -148,13 +148,6 @@ def _hypernote_note_from_href(href: str) -> Optional[str]:
         return unquote(raw)
     except Exception:
         return raw
-
-
-def _read_json(fp: Path) -> dict:
-    try:
-        return json.loads(fp.read_text(encoding="utf-8")) if fp.exists() else {}
-    except Exception:
-        return {}
 
 
 def _coerce_message_overlay_settings(data: dict) -> tuple[str, int]:
@@ -528,11 +521,12 @@ class Editor(QDialog):
         # Canonical message location (SOURCE OF TRUTH)
         self.message_path = (self.project_root / MESSAGE_HTML_FILE).resolve()
         self.message_path.parent.mkdir(parents=True, exist_ok=True)
-        self.settings_path = (self.project_root / SETTINGS_FILE).resolve()
+        self.project_settings = SettingsStore(self.project_root)
+        self.project_store = ProjectStore(self.project_root)
 
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
-        s = _read_json(self.settings_path)
+        s = self.project_settings.as_dict()
         self.recipient_name = (s.get("recipient_name") or "Friend").strip() or "Friend"
         self.overlay_preset, self.overlay_opacity = _coerce_message_overlay_settings(s)
         self.overlay_buttons: dict[str, QPushButton] = {}
@@ -546,6 +540,7 @@ class Editor(QDialog):
         self._export_line_spacing: Optional[float] = None
         self._save_in_progress = False
         self._saved_html: Optional[str] = None
+        self._allow_close = False
 
         self.setWindowTitle("Letter Smith — Editor")
         self.setModal(True)
@@ -555,6 +550,12 @@ class Editor(QDialog):
         self._restore_geometry()
         self._build_ui(preview_pixmap)
         self.editor.document().setModified(False)
+        self._recover_autosave_if_available()
+
+        self._autosave_timer = QtCore.QTimer(self)
+        self._autosave_timer.setInterval(5000)
+        self._autosave_timer.timeout.connect(self._autosave_draft)
+        self._autosave_timer.start()
 
 
     def _apply_default_center_alignment_if_plain(self) -> None:
@@ -633,10 +634,14 @@ class Editor(QDialog):
         self.editor.textChanged.connect(self.update_word_count)
         self.editor.currentCharFormatChanged.connect(self.preview.update)
         self.editor.currentCharFormatChanged.connect(self._sync_format)
+        self.editor.document().modificationChanged.connect(self._set_dirty_state)
 
         hb = QHBoxLayout()
         self.word_label = QLabel()
         hb.addWidget(self.word_label)
+        self.dirty_label = QLabel("Saved")
+        self.dirty_label.setStyleSheet("color:#79e092;")
+        hb.addWidget(self.dirty_label)
         hb.addStretch()
 
         self.font_info_button = QToolButton(self)
@@ -920,11 +925,11 @@ class Editor(QDialog):
             )
 
     def _save_overlay_settings(self) -> None:
-        data = _read_json(self.settings_path)
-        data[MESSAGE_OVERLAY_PRESET_KEY] = self.overlay_preset
-        data[MESSAGE_OVERLAY_OPACITY_KEY] = int(self.overlay_opacity)
         try:
-            _atomic_write(self.settings_path, json.dumps(data, indent=2), encoding="utf-8")
+            self.project_settings.update_fields(
+                message_overlay_preset=self.overlay_preset,
+                message_overlay_opacity=int(self.overlay_opacity),
+            )
         except Exception:
             pass
 
@@ -1075,7 +1080,77 @@ class Editor(QDialog):
         if isinstance(geom, QtCore.QByteArray):
             self.restoreGeometry(geom)
 
+    def _set_dirty_state(self, dirty: bool) -> None:
+        if not hasattr(self, "dirty_label"):
+            return
+        self.dirty_label.setText("Unsaved changes" if dirty else "Saved")
+        self.dirty_label.setStyleSheet("color:#ffbd70;" if dirty else "color:#79e092;")
+        self.setWindowTitle("Letter Smith — Editor" + (" *" if dirty else ""))
+
+    def _autosave_draft(self) -> None:
+        if not self.editor.document().isModified() or self._save_in_progress:
+            return
+        try:
+            self.project_store.autosave_message(self.get_edited_html())
+            self.dirty_label.setText("Unsaved changes · draft saved")
+        except Exception:
+            self.dirty_label.setText("Unsaved changes · draft failed")
+
+    def _recover_autosave_if_available(self) -> None:
+        recovery = self.project_store.recoverable_message_autosave()
+        if recovery is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Restore Autosave",
+            "A newer autosaved message was found. Restore it?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            self.project_store.clear_message_autosave()
+            return
+        try:
+            self.editor.setHtml(recovery.read_text(encoding="utf-8"))
+            self.editor.document().setModified(True)
+        except Exception:
+            pass
+
+    def _unsaved_close_choice(self) -> QMessageBox.StandardButton:
+        if not self.editor.document().isModified():
+            return QMessageBox.Discard
+        box = QMessageBox(self)
+        box.setWindowTitle("Unsaved Message")
+        box.setText("Save your message before closing the editor?")
+        box.setStandardButtons(QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+        box.setDefaultButton(QMessageBox.Save)
+        return QMessageBox.StandardButton(box.exec())
+
+    def reject(self) -> None:
+        if self._allow_close:
+            super().reject()
+            return
+        choice = self._unsaved_close_choice()
+        if choice == QMessageBox.Save:
+            self.apply_changes()
+            return
+        if choice == QMessageBox.Discard:
+            self.project_store.clear_message_autosave()
+            self._allow_close = True
+            super().reject()
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if not self._allow_close:
+            choice = self._unsaved_close_choice()
+            if choice == QMessageBox.Save:
+                self.apply_changes()
+                event.ignore()
+                return
+            if choice == QMessageBox.Cancel:
+                event.ignore()
+                return
+            self.project_store.clear_message_autosave()
+            self._allow_close = True
         try:
             self.settings.setValue(SETTINGS_KEY_GEOMETRY, self.saveGeometry())
         except Exception:
@@ -1109,8 +1184,21 @@ class Editor(QDialog):
             _atomic_write(self.message_path, content, encoding="utf-8")
             if self.message_path.read_text(encoding="utf-8") != content:
                 raise OSError("The saved letter could not be verified.")
+            try:
+                self.project_store.clear_message_autosave()
+                self.project_store.save_active()
+            except Exception as project_error:
+                try:
+                    record_editor_failure(
+                        self.project_root, "save active project after saving letter", project_error
+                    )
+                except Exception:
+                    pass
             self._saved_html = content
             self.editor.document().setModified(False)
+            if hasattr(self, "_autosave_timer"):
+                self._autosave_timer.stop()
+            self._allow_close = True
             self.accept()
         except Exception as e:
             try:

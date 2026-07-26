@@ -24,6 +24,7 @@ FRAGMENT_NOISE_TAG_RE = re.compile(
     re.IGNORECASE,
 )
 INVISIBLE_TEXT_RE = re.compile(r"[\s\u00a0\u200b\u200c\u200d\u2060\ufeff]+")
+WORD_RE = re.compile(r"\b\w+\b", re.UNICODE)
 
 GENERIC_FONT_FAMILIES = {
     "serif",
@@ -320,6 +321,140 @@ def normalize_message_fragment(raw: str) -> str:
     fragment = FRAGMENT_NOISE_TAG_RE.sub("", fragment)
     fragment = _clean_style_attrs(fragment)
     return fragment.strip()
+
+
+class _VisibleWordCounter(HTMLParser):
+    IGNORED_CONTAINER_TAGS = {"script", "style", "template", "title", "head"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.word_count = 0
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() in self.IGNORED_CONTAINER_TAGS:
+            self._ignored_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() in self.IGNORED_CONTAINER_TAGS and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_depth:
+            self.word_count += len(WORD_RE.findall(data))
+
+
+class _FormattingPreservingWordLimiter(HTMLParser):
+    IGNORED_CONTAINER_TAGS = _VisibleWordCounter.IGNORED_CONTAINER_TAGS
+    VOID_TAGS = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(convert_charrefs=False)
+        self.limit = max(0, int(limit))
+        self.word_count = 0
+        self.truncated = False
+        self._ignored_depth = 0
+        self._stopped = False
+        self._open_tags: list[str] = []
+        self._output: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self._stopped:
+            return
+        normalized = tag.casefold()
+        self._output.append(self.get_starttag_text() or f"<{tag}>")
+        if normalized not in self.VOID_TAGS:
+            self._open_tags.append(tag)
+        if normalized in self.IGNORED_CONTAINER_TAGS:
+            self._ignored_depth += 1
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if not self._stopped:
+            self._output.append(self.get_starttag_text() or f"<{tag}/>")
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._stopped:
+            return
+        normalized = tag.casefold()
+        self._output.append(f"</{tag}>")
+        for index in range(len(self._open_tags) - 1, -1, -1):
+            if self._open_tags[index].casefold() == normalized:
+                del self._open_tags[index]
+                break
+        if normalized in self.IGNORED_CONTAINER_TAGS and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._stopped:
+            return
+        if self._ignored_depth:
+            self._output.append(data)
+            return
+
+        matches = list(WORD_RE.finditer(data))
+        remaining = self.limit - self.word_count
+        if len(matches) <= remaining:
+            self._output.append(data)
+            self.word_count += len(matches)
+            return
+
+        cutoff = matches[max(0, remaining)].start()
+        self._output.append(data[:cutoff])
+        self.word_count += max(0, remaining)
+        self.truncated = True
+        self._stopped = True
+
+    def handle_entityref(self, name: str) -> None:
+        self._append_entity(f"&{name};", _html.unescape(f"&{name};"))
+
+    def handle_charref(self, name: str) -> None:
+        self._append_entity(f"&#{name};", _html.unescape(f"&#{name};"))
+
+    def handle_comment(self, data: str) -> None:
+        if not self._stopped:
+            self._output.append(f"<!--{data}-->")
+
+    def handle_decl(self, decl: str) -> None:
+        if not self._stopped:
+            self._output.append(f"<!{decl}>")
+
+    def handle_pi(self, data: str) -> None:
+        if not self._stopped:
+            self._output.append(f"<?{data}>")
+
+    def _append_entity(self, encoded: str, decoded: str) -> None:
+        if self._stopped:
+            return
+        entity_words = 0 if self._ignored_depth else len(WORD_RE.findall(decoded))
+        if self.word_count + entity_words > self.limit:
+            self.truncated = True
+            self._stopped = True
+            return
+        self._output.append(encoded)
+        self.word_count += entity_words
+
+    def result(self) -> str:
+        if self._stopped:
+            self._output.extend(f"</{tag}>" for tag in reversed(self._open_tags))
+            self._open_tags.clear()
+        return "".join(self._output)
+
+
+def count_message_html_words(raw: str) -> int:
+    parser = _VisibleWordCounter()
+    parser.feed(raw or "")
+    parser.close()
+    return parser.word_count
+
+
+def truncate_message_html_words(raw: str, limit: int) -> str:
+    parser = _FormattingPreservingWordLimiter(limit)
+    parser.feed(raw or "")
+    parser.close()
+    return parser.result()
 
 
 class _MessageContentParser(HTMLParser):

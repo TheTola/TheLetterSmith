@@ -33,7 +33,6 @@ __all__ = [
 from config import (
     SETTINGS_FILE,
     PUBLISHED_PAGE_URL_KEY,
-    CURTAIN_STYLE_KEY,
     CURTAIN_STYLE_WHITE,
     USER_PAGES_DIR,
     USER_MESSAGE_DIR,
@@ -42,6 +41,7 @@ from config import (
     MUSIC_FILE,
 )
 from message_html import ensure_message_html_from_emessage
+from settings_store import SettingsStore
 
 def app_root() -> Path:
     base = getattr(sys, "_MEIPASS", None)
@@ -84,20 +84,6 @@ def _safe_delete_file(path: Path) -> int:
     except Exception:
         pass
     return 0
-
-def _read_settings(path: Path) -> dict:
-    try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
-
-def _write_settings(path: Path, data: dict) -> None:
-    try:
-        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    except Exception:
-        pass
 
 def _get_nexus_window(parent: Optional[QtWidgets.QWidget]) -> Optional[QtWidgets.QWidget]:
     if parent is None:
@@ -711,21 +697,16 @@ def _clear_editor(win: Optional[QtWidgets.QWidget], root: Path) -> int:
     return _delete_editor_dock_files(root)
 
 def _reset_settings_on_disk(root: Path) -> None:
-    settings_path = (root / SETTINGS_FILE).resolve()
-    data = _read_settings(settings_path)
-
-    data["recipient_name"] = ""
-    data["recipient_title"] = ""
-    data[PUBLISHED_PAGE_URL_KEY] = ""
-
-    data["starting_volume"] = 50
-    data["music_volume"] = 50
-
-    data["music_file"] = ""
-    data["last_audio"] = "none"
-    data[CURTAIN_STYLE_KEY] = CURTAIN_STYLE_WHITE
-
-    _write_settings(settings_path, data)
+    SettingsStore(root).update_fields(
+        recipient_name="",
+        recipient_title="",
+        published_page_url="",
+        starting_volume=50,
+        music_volume=50,
+        music_file="",
+        last_audio="none",
+        curtain_style=CURTAIN_STYLE_WHITE,
+    )
 
 def _delete_music_and_manifest(root: Path) -> int:
     """
@@ -1052,8 +1033,17 @@ class _PressGoLabel(QtWidgets.QLabel):
         self._scale_anim.setEndValue(float(target))
         self._scale_anim.start()
 
+    def _contains_visible_pixel(self, pos: QtCore.QPoint) -> bool:
+        pixmap = self.pixmap()
+        if pixmap is None or pixmap.isNull() or not self.rect().contains(pos):
+            return False
+        return pixmap.toImage().pixelColor(pos).alpha() > 16
+
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton:
+        if (
+            event.button() == Qt.LeftButton
+            and self._contains_visible_pixel(event.position().toPoint())
+        ):
             self._pressed = True
             self._animate_to(0.92, 85)
             event.accept()
@@ -1066,7 +1056,7 @@ class _PressGoLabel(QtWidgets.QLabel):
             self._pressed = False
             self._animate_to(1.0, 110)
 
-            if self.rect().contains(event.position().toPoint()):
+            if self._contains_visible_pixel(event.position().toPoint()):
                 QtCore.QTimer.singleShot(0, self.clicked.emit)
 
             event.accept()
@@ -1083,7 +1073,7 @@ class _PressGoLabel(QtWidgets.QLabel):
 
 
 class _CommandRevealOverlay(QtWidgets.QWidget):
-    """Dark-to-cyan sweep drawn over the fully laid-out Command page."""
+    """Dark blood-red sweep drawn over the fully laid-out Command page."""
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
@@ -1107,7 +1097,7 @@ class _CommandRevealOverlay(QtWidgets.QWidget):
 
         veil_alpha = int(round(190 * (1.0 - progress)))
         if veil_alpha:
-            painter.fillRect(self.rect(), QtGui.QColor(7, 10, 16, veil_alpha))
+            painter.fillRect(self.rect(), QtGui.QColor(18, 2, 5, veil_alpha))
 
         if progress < 1.0:
             sweep_x = int(round(self.width() * progress))
@@ -1118,10 +1108,78 @@ class _CommandRevealOverlay(QtWidgets.QWidget):
                 sweep_x + sweep_width,
                 0,
             )
-            gradient.setColorAt(0.0, QtGui.QColor(0, 210, 230, 0))
-            gradient.setColorAt(0.5, QtGui.QColor(0, 210, 230, 105))
-            gradient.setColorAt(1.0, QtGui.QColor(0, 210, 230, 0))
+            gradient.setColorAt(0.0, QtGui.QColor(120, 0, 12, 0))
+            gradient.setColorAt(0.5, QtGui.QColor(120, 0, 12, 165))
+            gradient.setColorAt(1.0, QtGui.QColor(120, 0, 12, 0))
             painter.fillRect(self.rect(), gradient)
+
+
+class _GravityPulseOverlay(QtWidgets.QWidget):
+    """Concentric blood-red waves expanding from the GO control."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self._progress = 1.0
+        self._origin = QtCore.QPointF()
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+
+    def set_origin(self, origin: QtCore.QPoint) -> None:
+        self._origin = QtCore.QPointF(origin)
+
+    def _get_progress(self) -> float:
+        return self._progress
+
+    def _set_progress(self, value: float) -> None:
+        self._progress = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    pulseProgress = QtCore.Property(float, _get_progress, _set_progress)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        corners = (
+            QtCore.QPointF(0, 0),
+            QtCore.QPointF(self.width(), 0),
+            QtCore.QPointF(0, self.height()),
+            QtCore.QPointF(self.width(), self.height()),
+        )
+        max_radius = max(QtCore.QLineF(self._origin, corner).length() for corner in corners)
+
+        for delay, strength in ((0.0, 1.0), (0.10, 0.72), (0.20, 0.46)):
+            if self._progress < delay:
+                continue
+
+            wave = min(1.0, (self._progress - delay) / (1.0 - delay))
+            radius = max_radius * wave
+            alpha = int(round(210 * strength * ((1.0 - wave) ** 0.72)))
+            if alpha <= 0:
+                continue
+
+            shadow_pen = QtGui.QPen(QtGui.QColor(26, 0, 4, alpha))
+            shadow_pen.setWidthF(max(2.0, 18.0 * (1.0 - wave)))
+            painter.setPen(shadow_pen)
+            painter.drawEllipse(self._origin, radius, radius)
+
+            edge_pen = QtGui.QPen(QtGui.QColor(135, 0, 16, alpha))
+            edge_pen.setWidthF(max(1.0, 5.0 * (1.0 - wave)))
+            painter.setPen(edge_pen)
+            painter.drawEllipse(self._origin, radius, radius)
+
+        core_progress = min(1.0, self._progress / 0.42)
+        core_alpha = int(round(115 * (1.0 - core_progress)))
+        if core_alpha > 0:
+            core_radius = max(24.0, max_radius * 0.16 * core_progress)
+            core = QtGui.QRadialGradient(self._origin, core_radius)
+            core.setColorAt(0.0, QtGui.QColor(170, 0, 18, core_alpha))
+            core.setColorAt(0.55, QtGui.QColor(90, 0, 10, core_alpha // 2))
+            core.setColorAt(1.0, QtGui.QColor(30, 0, 4, 0))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(core)
+            painter.drawEllipse(self._origin, core_radius, core_radius)
 
 
 class CommandTab(QtWidgets.QWidget):
@@ -1150,7 +1208,7 @@ class CommandTab(QtWidgets.QWidget):
 
         self.go_btn = _PressGoLabel(self)
         self.go_btn.setToolTip("Wipe the letter")
-        self.go_btn.clicked.connect(lambda: self._do_reset())
+        self.go_btn.clicked.connect(self._start_gravity_pulse)
 
         self._reveal_overlay = _CommandRevealOverlay(self)
         self._reveal_overlay.hide()
@@ -1165,7 +1223,48 @@ class CommandTab(QtWidgets.QWidget):
         self._reveal_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
         self._reveal_anim.finished.connect(self._reveal_overlay.hide)
 
+        self._pulse_overlay = _GravityPulseOverlay(self)
+        self._pulse_overlay.hide()
+        self._pulse_anim = QtCore.QPropertyAnimation(
+            self._pulse_overlay,
+            b"pulseProgress",
+            self,
+        )
+        self._pulse_anim.setDuration(620)
+        self._pulse_anim.setStartValue(0.0)
+        self._pulse_anim.setEndValue(1.0)
+        self._pulse_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self._pulse_anim.finished.connect(self._finish_gravity_pulse)
+        self._pulse_pending = False
+
+        self._reset_timer = QtCore.QTimer(self)
+        self._reset_timer.setSingleShot(True)
+        self._reset_timer.timeout.connect(self._do_reset)
+
         self._relayout()
+
+    def _start_gravity_pulse(self) -> None:
+        if self._pulse_pending:
+            return
+
+        self._pulse_pending = True
+        self._reveal_anim.stop()
+        self._reveal_overlay.hide()
+        self._pulse_anim.stop()
+        self._pulse_overlay.set_origin(self.go_btn.geometry().center())
+        self._pulse_overlay.setProperty("pulseProgress", 0.0)
+        self._pulse_overlay.show()
+        self._pulse_overlay.raise_()
+        self._pulse_anim.start()
+
+    def _finish_gravity_pulse(self) -> None:
+        self._pulse_overlay.hide()
+        if not self._pulse_pending:
+            return
+
+        self._pulse_pending = False
+        if self.isVisible():
+            self._reset_timer.start(0)
 
     def _do_reset(self) -> None:
         confirm_and_reset(self)
@@ -1191,6 +1290,10 @@ class CommandTab(QtWidgets.QWidget):
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
         self._reveal_anim.stop()
         self._reveal_overlay.hide()
+        self._pulse_anim.stop()
+        self._pulse_overlay.hide()
+        self._pulse_pending = False
+        self._reset_timer.stop()
         super().hideEvent(event)
 
     def _relayout(self) -> None:
@@ -1199,29 +1302,30 @@ class CommandTab(QtWidgets.QWidget):
 
         self.bg_label.setGeometry(0, 0, w, h)
         self._reveal_overlay.setGeometry(0, 0, w, h)
+        self._pulse_overlay.setGeometry(0, 0, w, h)
 
         if not self._bg_pix.isNull():
-            bg_scaled = self._bg_pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            bg_scaled = self._bg_pix.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
             self.bg_label.setPixmap(bg_scaled)
 
         if self._go_pix.isNull():
             self.go_btn.set_base(QtCore.QRect(0, 0, 0, 0), self._go_pix)
             return
 
-        target = int(min(w, h) * 0.28)
-        target = max(140, min(460, target))
-
-        go_base = self._go_pix.scaled(target, target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-        bw = go_base.width()
-        bh = go_base.height()
-
-        base_rect = QtCore.QRect((w - bw) // 2, (h - bh) // 2, bw, bh)
+        go_base = self._go_pix.scaled(
+            w,
+            h,
+            Qt.IgnoreAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        base_rect = QtCore.QRect(0, 0, w, h)
 
         self.go_btn.set_base(base_rect, go_base)
         self.go_btn.raise_()
         if self._reveal_overlay.isVisible():
             self._reveal_overlay.raise_()
+        if self._pulse_overlay.isVisible():
+            self._pulse_overlay.raise_()
 
 def main() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)

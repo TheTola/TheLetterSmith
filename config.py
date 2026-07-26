@@ -15,13 +15,14 @@ They do not point to old source locations.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from settings_store import SettingsStore
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Project + settings
@@ -85,6 +86,11 @@ USER_PAGES_DIR = f"{GALLERY_USER_DIR}/pages"
 USER_CONTROLS_DIR = f"{GALLERY_USER_DIR}/card/controls"
 USER_MESSAGE_DIR = f"{GALLERY_USER_DIR}/message"
 USER_SOUNDS_DIR = f"{GALLERY_USER_DIR}/sounds"
+USER_AUDIO_ARCHIVE_DIR = f"{USER_SOUNDS_DIR}/appssong"
+USER_AUDIO_ORIGINALS_DIR = f"{USER_AUDIO_ARCHIVE_DIR}/originals"
+USER_AUDIO_PROCESSED_DIR = f"{USER_AUDIO_ARCHIVE_DIR}/processed"
+USER_AUDIO_ANALYSIS_DIR = f"{USER_AUDIO_ARCHIVE_DIR}/analysis"
+USER_AUDIO_MANIFEST_FILE = f"{USER_AUDIO_ARCHIVE_DIR}/current.json"
 
 # Message (SOURCE)
 MESSAGE_HTML_FILE = f"{USER_MESSAGE_DIR}/message.html"
@@ -120,76 +126,14 @@ MAX_AUDIO_MB = 15
 OUTPUT_DIR = "output"
 OUTPUT_PLAY_DIR = os.path.join(OUTPUT_DIR, "Play")  # browsable bundle
 OUTPUT_FILE_DIR = os.path.join(OUTPUT_DIR, "File")  # single-file HTML (inlined)
+OUTPUT_PACKAGES_DIR = os.path.join(OUTPUT_DIR, "Packages")
+OUTPUT_PUBLISH_DIR = os.path.join(OUTPUT_DIR, "Publish")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Settings
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_settings(project_root: str | Path) -> Dict:
-    pr = Path(project_root)
-    path = pr / SETTINGS_FILE
-
-    try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except Exception:
-        data = {}
-
-    updated = False
-
-    # starting_volume (0–100)
-    try:
-        v = int(data.get("starting_volume", DEFAULT_VOLUME))
-        v = max(0, min(100, v))
-    except Exception:
-        v = DEFAULT_VOLUME
-
-    if data.get("starting_volume") != v:
-        data["starting_volume"] = v
-        updated = True
-
-    # last_audio (store filename only)
-    last_audio = data.get("last_audio", DEFAULT_AUDIO)
-    try:
-        last_audio = Path(str(last_audio)).name
-    except Exception:
-        last_audio = DEFAULT_AUDIO
-
-    if data.get("last_audio") != last_audio:
-        data["last_audio"] = last_audio
-        updated = True
-
-    # curtain_style
-    style = str(data.get(CURTAIN_STYLE_KEY, DEFAULT_CURTAIN_STYLE)).strip().lower()
-    aliases = {
-        "white": CURTAIN_STYLE_WHITE,
-        "pure white": CURTAIN_STYLE_WHITE,
-        "pure_white": CURTAIN_STYLE_WHITE,
-        "blank": CURTAIN_STYLE_WHITE,
-        "original": CURTAIN_STYLE_WHITE,
-        "average": CURTAIN_STYLE_AVERAGE,
-        "average color": CURTAIN_STYLE_AVERAGE,
-        "average_color": CURTAIN_STYLE_AVERAGE,
-        "common": CURTAIN_STYLE_AVERAGE,
-        "common color": CURTAIN_STYLE_AVERAGE,
-        "complementary": CURTAIN_STYLE_COMPLEMENTARY,
-        "complementary average": CURTAIN_STYLE_COMPLEMENTARY,
-        "complementary average color": CURTAIN_STYLE_COMPLEMENTARY,
-        "complementary_average_color": CURTAIN_STYLE_COMPLEMENTARY,
-    }
-    style = aliases.get(style, style)
-    if style not in VALID_CURTAIN_STYLES:
-        style = DEFAULT_CURTAIN_STYLE
-
-    if data.get(CURTAIN_STYLE_KEY) != style:
-        data[CURTAIN_STYLE_KEY] = style
-        updated = True
-
-    if updated:
-        try:
-            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-
-    return data
+    return SettingsStore(project_root).as_dict()
 
 
 _SETTINGS = _load_settings(_PROJECT_ROOT)
@@ -203,7 +147,7 @@ CONFIG_DICT = dict(_SETTINGS)
 # ─────────────────────────────────────────────────────────────────────────────
 def ensure_output_dirs(project_root: str | Path) -> None:
     pr = Path(project_root)
-    for sub in (OUTPUT_PLAY_DIR, OUTPUT_FILE_DIR):
+    for sub in (OUTPUT_PLAY_DIR, OUTPUT_FILE_DIR, OUTPUT_PACKAGES_DIR, OUTPUT_PUBLISH_DIR):
         (pr / sub).mkdir(parents=True, exist_ok=True)
 
 
@@ -266,7 +210,21 @@ class BuildPaths:
     play_fonts_dir: Path
 
 
-def plan_build(project_root: str | Path, *, recipient: str, title: str) -> BuildPaths:
+def play_bundle_path(project_root: str | Path, *, recipient: str, title: str) -> Path:
+    pr = Path(project_root)
+    rec_slug = safe_slug(recipient, fallback="friend")
+    ttl_slug = safe_slug(title, fallback="letter")
+    return (pr / OUTPUT_PLAY_DIR / rec_slug / ttl_slug).resolve()
+
+
+def plan_build(
+    project_root: str | Path,
+    *,
+    recipient: str,
+    title: str,
+    play_dir: Optional[Path] = None,
+    clear_existing: bool = True,
+) -> BuildPaths:
     """
     Deterministic output path (NO timestamp):
       output/Play/<recipient_slug>/<title_slug>/
@@ -287,16 +245,17 @@ def plan_build(project_root: str | Path, *, recipient: str, title: str) -> Build
     pr = Path(project_root)
     ensure_output_dirs(pr)
 
-    rec_slug = safe_slug(recipient, fallback="friend")
-    ttl_slug = safe_slug(title, fallback="letter")
+    target_dir = Path(play_dir).resolve() if play_dir is not None else play_bundle_path(
+        pr,
+        recipient=recipient,
+        title=title,
+    )
+    target_dir.mkdir(parents=True, exist_ok=True)
 
-    play_dir = pr / OUTPUT_PLAY_DIR / rec_slug / ttl_slug
-    play_dir.mkdir(parents=True, exist_ok=True)
+    if clear_existing:
+        _safe_clear_dir_contents(target_dir)
 
-    # Overwrite behavior: clear previous build contents
-    _safe_clear_dir_contents(play_dir)
-
-    play_gallery = play_dir / GALLERY_DIR
+    play_gallery = target_dir / GALLERY_DIR
     play_pages = play_gallery / PAGES_DIR
     play_controls = play_gallery / CONTROLS_DIR
     play_message = play_gallery / MESSAGE_DIR
@@ -310,7 +269,7 @@ def plan_build(project_root: str | Path, *, recipient: str, title: str) -> Build
     play_fonts.mkdir(parents=True, exist_ok=True)
 
     return BuildPaths(
-        play_dir=play_dir,
+        play_dir=target_dir,
         play_gallery_dir=play_gallery,
         play_pages_dir=play_pages,
         play_controls_dir=play_controls,
@@ -354,7 +313,8 @@ def validate_audio_assets(project_root: str | Path) -> List[str]:
 class Config:
     def __init__(self, project_root: str | Path = _PROJECT_ROOT, **_ignored):
         self.project_root = Path(project_root)
-        self._settings = _load_settings(self.project_root)
+        self.store = SettingsStore(self.project_root)
+        self._settings = self.store.as_dict()
 
     def __getattr__(self, key):
         if key in self._settings:
@@ -365,6 +325,14 @@ class Config:
         return self._settings.get(key)
 
     def as_dict(self) -> Dict:
+        self._settings = self.store.as_dict()
+        return dict(self._settings)
+
+    def reload(self) -> Dict:
+        return self.as_dict()
+
+    def update_fields(self, **fields) -> Dict:
+        self._settings = self.store.update_fields(fields)
         return dict(self._settings)
 
 
@@ -399,6 +367,11 @@ __all__ = [
     "USER_CONTROLS_DIR",
     "USER_MESSAGE_DIR",
     "USER_SOUNDS_DIR",
+    "USER_AUDIO_ARCHIVE_DIR",
+    "USER_AUDIO_ORIGINALS_DIR",
+    "USER_AUDIO_PROCESSED_DIR",
+    "USER_AUDIO_ANALYSIS_DIR",
+    "USER_AUDIO_MANIFEST_FILE",
     "REQUIRED_SLIDES",
     "CONTROL_FILES",
     "MESSAGE_HTML_FILE",
@@ -413,12 +386,15 @@ __all__ = [
     "OUTPUT_DIR",
     "OUTPUT_PLAY_DIR",
     "OUTPUT_FILE_DIR",
+    "OUTPUT_PACKAGES_DIR",
+    "OUTPUT_PUBLISH_DIR",
     # helpers
     "ensure_output_dirs",
     "ensure_gallery_dirs",
     "safe_slug",
     "display_name",
     "plan_build",
+    "play_bundle_path",
     "BuildPaths",
     # validation
     "validate_required_images",

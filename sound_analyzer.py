@@ -10,7 +10,7 @@ import os
 import shutil
 import tempfile
 
-from config import USER_SOUNDS_DIR
+from config import USER_AUDIO_ANALYSIS_DIR, USER_AUDIO_PROCESSED_DIR
 
 import zlib
 from dataclasses import dataclass
@@ -577,12 +577,8 @@ class AudioAnalysisManager(QtCore.QObject):
         super().__init__(parent)
         self.project_root = Path(project_root).resolve()
 
-        # Current Letter Smith archive path. Older builds used "archive"; the
-        # active Sound tab archive uses "appssong". Keeping the manager aligned
-        # prevents analysis jobs from searching a dead folder.
-        base = self.project_root / USER_SOUNDS_DIR / "appssong"
-        self.processed_dir = base / "processed"
-        self.analysis_dir = base / "analysis"
+        self.processed_dir = self.project_root / USER_AUDIO_PROCESSED_DIR
+        self.analysis_dir = self.project_root / USER_AUDIO_ANALYSIS_DIR
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         self.analysis_dir.mkdir(parents=True, exist_ok=True)
 
@@ -599,12 +595,16 @@ class AudioAnalysisManager(QtCore.QObject):
         self._hop_ms = 20
         self._nbands = 32
         self._decoder_missing_notified: set[str] = set()
+        self._shutting_down = False
 
     # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ public â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def is_busy(self) -> bool:
         return self._busy
 
     def shutdown(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
         self._queue.clear()
         self._pending.clear()
         self._cleanup_thread()
@@ -618,7 +618,7 @@ class AudioAnalysisManager(QtCore.QObject):
         are loaded on demand, and playback still works through Qt. This prevents
         repeated failed analyzer jobs every time the Sound tab opens.
         """
-        if not self.processed_dir.exists():
+        if self._shutting_down or not self.processed_dir.exists():
             return
         if not _has_ffmpeg_pair():
             return
@@ -629,6 +629,8 @@ class AudioAnalysisManager(QtCore.QObject):
                 self.ensure_analyzed(p, priority=False)
 
     def ensure_analyzed(self, path: Path, priority: bool = True) -> None:
+        if self._shutting_down:
+            return
         p = Path(path).resolve()
         key = str(p)
 
@@ -724,6 +726,12 @@ class AudioAnalysisManager(QtCore.QObject):
         # cleanup old thread
         self._cleanup_thread()
 
+        if self._shutting_down:
+            self._queue.clear()
+            self._pending.clear()
+            self._set_busy(False)
+            return
+
         if not self._queue:
             self._pending.clear()
             self._set_busy(False)
@@ -770,8 +778,11 @@ class AudioAnalysisManager(QtCore.QObject):
 
         if self._thread is not None:
             try:
+                self._thread.requestInterruption()
                 self._thread.quit()
-                self._thread.wait(50)
+                if not self._thread.wait(5000):
+                    self._thread.terminate()
+                    self._thread.wait(1000)
             except Exception:
                 pass
 
@@ -789,7 +800,8 @@ class AudioAnalysisManager(QtCore.QObject):
         self.batchProgress.emit(self._done, max(self._total, 1), Path(path_str).name, 100)
         self.analysisReady.emit(path_str, payload)
 
-        QtCore.QTimer.singleShot(0, self._start_next)
+        if not self._shutting_down:
+            QtCore.QTimer.singleShot(0, self._start_next)
 
     def _on_failed(self, path_str: str, msg: str) -> None:
         self._pending.discard(path_str)
@@ -798,5 +810,6 @@ class AudioAnalysisManager(QtCore.QObject):
         self.batchProgress.emit(self._done, max(self._total, 1), Path(path_str).name, 100)
         self.analysisFailed.emit(path_str, msg)
 
-        QtCore.QTimer.singleShot(0, self._start_next)
+        if not self._shutting_down:
+            QtCore.QTimer.singleShot(0, self._start_next)
 

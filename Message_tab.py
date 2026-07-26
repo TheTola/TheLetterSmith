@@ -8,7 +8,6 @@ from __future__ import annotations
 import html as _html
 import os
 import re
-import json
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -42,6 +41,7 @@ from PySide6.QtGui import (
 
 from Editor import Editor
 from editor_diagnostics import record_editor_failure
+from settings_store import SettingsStore
 from config import (
     SETTINGS_FILE,
     USER_PAGES_DIR,
@@ -49,7 +49,11 @@ from config import (
     MESSAGE_IMAGE_FILE,
 )
 
-from message_html import ensure_message_html_from_emessage
+from message_html import (
+    count_message_html_words,
+    ensure_message_html_from_emessage,
+    truncate_message_html_words,
+)
 
 PUBLISHED_PAGE_URL_KEY = "published_page_url"
 
@@ -138,15 +142,6 @@ def _atomic_save_image(img: QImage, path: str) -> bool:
     return False
 
 
-def _strip_html_for_word_count(html: str) -> str:
-    no_tags = re.sub(r"<[^>]+>", " ", html)
-    return _html.unescape(no_tags)
-
-
-def _word_count(text_like: str) -> int:
-    return len(re.findall(r"\w+", text_like))
-
-
 MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
 MESSAGE_OVERLAY_OPACITY_KEY = "message_overlay_opacity"
 DEFAULT_MESSAGE_OVERLAY_PRESET = "paper"
@@ -160,10 +155,7 @@ MESSAGE_OVERLAY_PRESETS: dict[str, tuple[tuple[int, int, int], str]] = {
 
 
 def _message_overlay_settings(settings_path: str | os.PathLike) -> tuple[str, int, tuple[int, int, int], str]:
-    try:
-        data = json.loads(Path(settings_path).read_text(encoding="utf-8")) if Path(settings_path).exists() else {}
-    except Exception:
-        data = {}
+    data = SettingsStore(Path(settings_path).resolve().parent).as_dict()
 
     preset = str(data.get(MESSAGE_OVERLAY_PRESET_KEY, DEFAULT_MESSAGE_OVERLAY_PRESET)).strip().lower()
     if preset not in MESSAGE_OVERLAY_PRESETS:
@@ -380,6 +372,7 @@ class MessageTab(QtWidgets.QWidget):
         super().__init__()
         self.project_root = project_root
         self.settings_path = os.path.join(project_root, SETTINGS_FILE)
+        self.settings_store = SettingsStore(project_root)
 
         # Compatibility cache (disk is authoritative)
         self.current_html: str = ""
@@ -484,13 +477,7 @@ class MessageTab(QtWidgets.QWidget):
     # Settings
     # ──────────────────────────────────────────────────────────────────
     def _load_settings(self) -> None:
-        try:
-            with open(self.settings_path, "r", encoding="utf-8") as f:
-                self.settings = json.load(f)
-        except Exception:
-            self.settings = {}
-        if not isinstance(self.settings, dict):
-            self.settings = {}
+        self.settings = self.settings_store.as_dict()
 
     def _sync_inputs_from_settings(self) -> None:
         """Refresh visible fields from settings.json without emitting changes."""
@@ -508,21 +495,9 @@ class MessageTab(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def _write_settings(self) -> None:
-        Path(self.settings_path).parent.mkdir(parents=True, exist_ok=True)
-        try:
-            disk_settings = json.loads(Path(self.settings_path).read_text(encoding="utf-8"))
-        except Exception:
-            disk_settings = {}
-        if not isinstance(disk_settings, dict):
-            disk_settings = {}
-
-        for key in (MESSAGE_OVERLAY_PRESET_KEY, MESSAGE_OVERLAY_OPACITY_KEY):
-            if key in disk_settings:
-                self.settings[key] = disk_settings[key]
-
-        with open(self.settings_path, "w", encoding="utf-8") as f:
-            json.dump(self.settings, f, indent=2)
+    def _write_settings(self, *keys: str) -> None:
+        updates = {key: self.settings[key] for key in keys if key in self.settings}
+        self.settings = self.settings_store.update_fields(updates)
 
     def _set_name_locked(self, locked: bool) -> None:
         try:
@@ -539,7 +514,7 @@ class MessageTab(QtWidgets.QWidget):
     def _save_title_settings(self) -> None:
         self.settings["recipient_title"] = self.title_input.text().strip()
         try:
-            self._write_settings()
+            self._write_settings("recipient_title")
             self.status.setText("💾 Letter title saved.")
         except Exception as e:
             self.status.setText(f"❌ Error saving title: {e}")
@@ -554,7 +529,7 @@ class MessageTab(QtWidgets.QWidget):
         self.settings["recipient_name_locked"] = bool(name)
 
         try:
-            self._write_settings()
+            self._write_settings("recipient_title", "recipient_name", "recipient_name_locked")
             self._set_name_locked(bool(name))
             self.status.setText("💾 Sister set. Double-click to edit." if name else "Sister cleared.")
         except Exception as e:
@@ -574,7 +549,11 @@ class MessageTab(QtWidgets.QWidget):
 
         try:
             self.url_input.setText(normalized_url)
-            self._write_settings()
+            self._write_settings(
+                "recipient_title",
+                PUBLISHED_PAGE_URL_KEY,
+                "published_page_url_locked",
+            )
             self._set_url_locked(bool(normalized_url))
             self.published_page_url_changed.emit(normalized_url)
             self.status.setText("💾 Page URL set. Double-click to edit." if normalized_url else "Page URL cleared.")
@@ -604,7 +583,11 @@ class MessageTab(QtWidgets.QWidget):
 
         if persist:
             try:
-                self._write_settings()
+                self._write_settings(
+                    "recipient_title",
+                    PUBLISHED_PAGE_URL_KEY,
+                    "published_page_url_locked",
+                )
             except Exception as e:
                 if announce:
                     self.status.setText(f"❌ Error saving URL: {e}")
@@ -944,14 +927,13 @@ class MessageTab(QtWidgets.QWidget):
             self.status.setText("⚠️ That file had no extractable text.")
             return
 
-        wc = _word_count(_strip_html_for_word_count(html))
+        wc = count_message_html_words(html)
         if wc > 1000:
             dlg = ConfirmTruncateDialog(wc)
             if dlg.exec() == QtWidgets.QDialog.Rejected:
                 self.status.setText("✋ Import canceled.")
                 return
-            words = re.findall(r"\b\w+\b", _strip_html_for_word_count(html))[:1000]
-            html = _html.escape(" ".join(words)).replace("\n", "<br>")
+            html = truncate_message_html_words(html, 1000)
             self.status.setText("✂️ Truncated to 1000 words and saved.")
 
         html_path = self._html_path()

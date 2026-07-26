@@ -15,8 +15,8 @@ during destructive reset actions.
 
 from __future__ import annotations
 
-import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -41,6 +41,8 @@ except Exception as e:
     )
 
 from app_icon import apply_qt_window_icon, canonical_icon_paths
+from config import MUSIC_FILE, USER_CONTROLS_DIR, USER_SOUNDS_DIR
+from settings_store import SettingsStore
 
 # Visual effects are centralized in anima.py; the shell can run without them.
 try:
@@ -370,6 +372,8 @@ class Nexus(QtWidgets.QMainWindow):
     def __init__(self, project_root: str | Path):
         super().__init__()
         self.project_root = str(project_root)
+        self._shutdown = False
+        self._child_processes: list[subprocess.Popen] = []
         self.setWindowTitle("Letter Smith")
         apply_qt_window_icon(self, self.project_root)
 
@@ -543,6 +547,14 @@ class Nexus(QtWidgets.QMainWindow):
         body_layout.addWidget(self.page_stack)
 
         self.forge_tab.letter_loaded.connect(lambda _payload=None: self._show_forge_preview())
+        self.forge_tab.letter_loaded.connect(self._on_letter_loaded)
+        self.forge_tab.fix_requested.connect(self._fix_readiness_item)
+        self.forge_tab.preview_requested.connect(self._load_forge_preview)
+        self.forge_tab.preview_restart_requested.connect(self._restart_forge_preview)
+        self.forge_tab.preview_mute_requested.connect(self._mute_forge_preview)
+        self.forge_tab.preview_report_requested.connect(self._report_forge_preview_assets)
+        self.forge_tab.project_will_open.connect(self._prepare_workspace_audio_change)
+        self.forge_tab.project_opened.connect(self._on_project_opened)
         try:
             self.forge_tab.letter_loaded.connect(lambda _payload=None: self.message_tab._sync_inputs_from_settings())
         except Exception:
@@ -566,6 +578,11 @@ class Nexus(QtWidgets.QMainWindow):
         self._toast_timer = QtCore.QTimer(self)
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(lambda: self._toast.setVisible(False))
+
+        self._project_autosave_timer = QtCore.QTimer(self)
+        self._project_autosave_timer.setInterval(60000)
+        self._project_autosave_timer.timeout.connect(self.forge_tab.autosave_project)
+        self._project_autosave_timer.start()
 
         self._fade_timer: Optional[QtCore.QTimer] = None
         self._fade_anim: Optional[QtCore.QPropertyAnimation] = None
@@ -664,6 +681,75 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _on_letter_loaded(self, _payload=None) -> None:
+        """Refresh live audio after a transactional saved-letter load."""
+        try:
+            music_path = Path(self.project_root) / USER_SOUNDS_DIR / MUSIC_FILE
+            self.sound_tab.wave.release_current_file_handle()
+            self.sound_tab._current_processed = ""
+            if music_path.is_file():
+                self.sound_tab.wave.load_audio(str(music_path))
+                self.sound_tab._preview.set_audio_file(str(music_path))
+            else:
+                self.sound_tab._preview.set_audio_file("")
+        except Exception:
+            pass
+
+    def _prepare_workspace_audio_change(self) -> None:
+        try:
+            self.sound_tab.wave.release_current_file_handle()
+            self.sound_tab._preview.set_audio_file("")
+        except Exception:
+            pass
+
+    def _on_project_opened(self, _payload=None) -> None:
+        try:
+            self.image_tab.refresh_from_workspace()
+        except Exception:
+            pass
+        try:
+            self.message_tab._sync_inputs_from_settings()
+            self.message_tab._check_existing()
+        except Exception:
+            pass
+        self._on_letter_loaded(_payload)
+        try:
+            self.forge_tab.refresh_saved_page_url()
+            self.forge_tab.refresh_readiness()
+        except Exception:
+            pass
+
+    def _fix_readiness_item(self, key: str) -> None:
+        image_slots = {"cover": 1, "letter": 2, "wall": 3, "back": 4}
+        if key in image_slots:
+            self.tabbar.setCurrentIndex(0)
+            QtCore.QTimer.singleShot(
+                0, lambda slot=image_slots[key]: self.image_tab._pick_image_dialog(slot)
+            )
+            return
+        if key == "music":
+            self.tabbar.setCurrentIndex(1)
+            QtCore.QTimer.singleShot(0, self.sound_tab.select_music)
+            return
+        if key in {"message", "recipient", "title"}:
+            self.tabbar.setCurrentIndex(2)
+            if key == "message":
+                QtCore.QTimer.singleShot(0, self.message_tab.select_file)
+            elif key == "recipient":
+                QtCore.QTimer.singleShot(0, self.message_tab.name_input.setFocus)
+            else:
+                QtCore.QTimer.singleShot(0, self.message_tab.title_input.setFocus)
+            return
+        if key == "sfx":
+            self.tabbar.setCurrentIndex(1)
+            self.status("Add the missing app sound effects, then return to Forge.")
+            return
+        if key == "controls":
+            controls = Path(self.project_root) / USER_CONTROLS_DIR
+            controls.mkdir(parents=True, exist_ok=True)
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(controls.resolve())))
+            self.status("Add the missing viewer controls to the opened folder.")
+
     def _mount_sound_preview(self, widget: QtWidgets.QWidget) -> None:
         """Mount SoundTab's visualizer widget into the shared preview stack."""
         if widget is None:
@@ -710,7 +796,17 @@ class Nexus(QtWidgets.QMainWindow):
         self.preview_stack.setCurrentIndex(0)
         self.preview_caption.setVisible(False)
 
-        self.preview_frame.setVisible(idx != 4)
+        is_command = idx == 4
+        self.preview_frame.setVisible(not is_command)
+        self.help_icon.setVisible(not is_command)
+        self._status.setVisible(not is_command)
+
+        body_layout = self.body.layout()
+        if body_layout is not None:
+            margin = 0 if is_command else 12
+            body_layout.setContentsMargins(margin, margin, margin, margin)
+            body_layout.setSpacing(0 if is_command else 10)
+            body_layout.activate()
 
         # The Prompt Writer FAB is window-parented, so visibility is controlled by tab.
         try:
@@ -749,7 +845,6 @@ class Nexus(QtWidgets.QMainWindow):
         else:
             self.preview_stack.setCurrentIndex(0)
 
-        self.help_icon.setVisible(idx != 4)
         if self.help_pop.isVisible():
             self._refresh_help_text(idx)
             self._reposition_help_popover()
@@ -832,7 +927,12 @@ class Nexus(QtWidgets.QMainWindow):
             pass
 
     def _show_forge_preview(self) -> None:
-        """Forge tab: show cover.png and the project title underneath."""
+        """Forge tab: show the finished viewer, or the cover before the first build."""
+        index = self.forge_tab._current_play_index()
+        if index is not None:
+            self._load_forge_preview(str(index), self.forge_tab._preview_mode)
+            return
+
         cover_path = os.path.join(self.project_root, "gallery", "user", "pages", "cover.png")
         pm = QPixmap(cover_path)
         if not pm.isNull():
@@ -849,23 +949,104 @@ class Nexus(QtWidgets.QMainWindow):
         else:
             self.preview_caption.setVisible(False)
 
+    def _load_forge_preview(self, index_path: str, mode: str) -> None:
+        index = Path(index_path)
+        if not index.is_file():
+            self.status("Finished viewer is missing. Generate the letter again.")
+            return
+        self._forge_preview_mode = mode
+        self._resize_preview_frame()
+        self._clear_preview()
+        self.preview_caption.setVisible(False)
+        self.html_preview.setUrl(QUrl.fromLocalFile(str(index.resolve())))
+        self.html_preview.page().setAudioMuted(bool(self.forge_tab._preview_muted))
+        self.preview_stack.setCurrentWidget(self.html_preview)
+        self.status(f"Finished viewer preview: {mode.replace('-', ' ')}")
+
+    def _restart_forge_preview(self) -> None:
+        if self.preview_stack.currentWidget() is self.html_preview:
+            self.html_preview.reload()
+
+    def _mute_forge_preview(self, muted: bool) -> None:
+        self.html_preview.page().setAudioMuted(bool(muted))
+
+    def _report_forge_preview_assets(self) -> None:
+        if self.preview_stack.currentWidget() is not self.html_preview:
+            self.forge_tab.show_preview_report(["No finished viewer is loaded."])
+            return
+        missing_on_disk: list[str] = []
+        index_path = Path(self.html_preview.url().toLocalFile())
+        if index_path.is_file():
+            try:
+                sources = "\n".join(
+                    path.read_text(encoding="utf-8")
+                    for path in (
+                        index_path,
+                        index_path.with_name("styles.css"),
+                        index_path.with_name("script.js"),
+                    )
+                    if path.is_file()
+                )
+                referenced = {
+                    match.split("?", 1)[0]
+                    for match in re.findall(r"gallery/[A-Za-z0-9_./-]+", sources)
+                    if Path(match.split("?", 1)[0]).suffix
+                }
+                missing_on_disk = sorted(
+                    relative
+                    for relative in referenced
+                    if not (index_path.parent / Path(relative)).is_file()
+                )
+            except Exception:
+                pass
+        script = """
+            (() => {
+              const missing = [];
+              document.querySelectorAll('img').forEach((asset) => {
+                if (asset.complete && asset.naturalWidth === 0) {
+                  missing.push(asset.getAttribute('src') || '[image without source]');
+                }
+              });
+              document.querySelectorAll('audio').forEach((asset) => {
+                if (asset.error) {
+                  missing.push(asset.currentSrc || asset.getAttribute('src') || '[audio without source]');
+                }
+              });
+              return [...new Set(missing)];
+            })();
+        """
+        self.html_preview.page().runJavaScript(
+            script,
+            lambda browser_missing: self.forge_tab.show_preview_report(
+                sorted(set(missing_on_disk + list(browser_missing or [])))
+            ),
+        )
+
+    def _resize_preview_frame(self) -> None:
+        mode = getattr(self, "_forge_preview_mode", "")
+        available_h = max(180, int(self.height() * 0.35))
+        if self.tabbar.currentIndex() == 3 and mode == "phone-portrait":
+            h = available_h
+            w = int(h * 9 / 16)
+        elif self.tabbar.currentIndex() == 3 and mode in {"desktop", "phone-landscape"}:
+            h = available_h
+            w = int(h * 16 / 9)
+        else:
+            h = available_h
+            w = int(h * _PREVIEW_AR)
+        self.preview_frame.setFixedSize(max(160, w + 12), max(120, h + 12))
+
     def _read_project_title(self) -> str:
         """Read recipient_title from settings.json (best available 'project title' signal)."""
         try:
-            settings_path = os.path.join(self.project_root, "settings.json")
-            if os.path.exists(settings_path):
-                data = json.loads(Path(settings_path).read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    t = str(data.get("recipient_title", "")).strip()
-                    return t
+            data = SettingsStore(self.project_root).as_dict()
+            return str(data.get("recipient_title", "")).strip()
         except Exception:
             pass
         return ""
 
     def resizeEvent(self, event):
-        h = int(self.height() * 0.35)
-        w = int(h * _PREVIEW_AR)
-        self.preview_frame.setFixedSize(max(160, w + 12), max(120, h + 12))
+        self._resize_preview_frame()
 
         if self._toast.isVisible():
             self.toast(self._toast.text(), ms=(self._toast_timer.remainingTime() or 800))
@@ -904,10 +1085,11 @@ class Nexus(QtWidgets.QMainWindow):
                 self.toast("target.py missing")
                 return
             pos = QtGui.QCursor.pos()
-            subprocess.Popen(
+            process = subprocess.Popen(
                 [sys.executable, script, "--x", str(pos.x()), "--y", str(pos.y())],
                 close_fds=True
             )
+            self._child_processes.append(process)
             self.status("Target Browser opened.")
             self.toast("Target Browser launched")
         except Exception as ex:
@@ -980,7 +1162,8 @@ class Nexus(QtWidgets.QMainWindow):
         try:
             prompter = Path(self.project_root) / "Prompter" / "prompter.py"
             if prompter.exists():
-                subprocess.Popen([sys.executable, str(prompter)], close_fds=True)
+                process = subprocess.Popen([sys.executable, str(prompter)], close_fds=True)
+                self._child_processes.append(process)
                 self.status("Prompt Writer launched (Prompter).")
                 self.toast("Prompter launched")
                 return
@@ -1051,6 +1234,75 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _hide_help_popover(self):
         self.help_pop.popdown()
+
+    def shutdown(self) -> None:
+        """Stop owned background work and release resources exactly once."""
+        if self._shutdown:
+            return
+        self._shutdown = True
+
+        prompt_writer = self._prompt_writer_win
+        if isinstance(prompt_writer, QtWidgets.QWidget):
+            try:
+                if hasattr(prompt_writer, "shutdown"):
+                    prompt_writer.shutdown()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                prompt_writer.close()
+            except Exception:
+                pass
+        self._prompt_writer_win = None
+
+        if hasattr(self, "sound_tab") and hasattr(self.sound_tab, "shutdown"):
+            try:
+                self.sound_tab.shutdown()
+            except Exception:
+                pass
+
+        try:
+            self.forge_tab.autosave_project()
+        except Exception:
+            pass
+
+        for timer in self.findChildren(QtCore.QTimer):
+            timer.stop()
+        for animation in self.findChildren(QtCore.QAbstractAnimation):
+            animation.stop()
+
+        for movie in (self._help_movie_idle, self._help_movie_hover):
+            if movie is not None:
+                movie.stop()
+        try:
+            self.help_icon.setMovie(None)
+        except Exception:
+            pass
+        try:
+            self.help_pop.close()
+        except Exception:
+            pass
+
+        try:
+            self.html_preview.stop()
+            self.html_preview.setUrl(QUrl("about:blank"))
+        except Exception:
+            pass
+
+        for process in self._child_processes:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+            except Exception:
+                pass
+        self._child_processes.clear()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.shutdown()
+        super().closeEvent(event)
 
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
         icon = getattr(self, "help_icon", None)
