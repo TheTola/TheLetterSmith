@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 from config import MESSAGE_HTML_FILE, MUSIC_FILE, USER_MESSAGE_DIR, USER_PAGES_DIR, USER_SOUNDS_DIR
 from settings_store import SettingsStore
-from transactions import PathTransaction
+from transactional_io import PathTransaction
 
 
 PROJECTS_DIR = "projects"

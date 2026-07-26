@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
+
+from transactional_io import atomic_write_text
 
 
 SETTINGS_FILENAME = "settings.json"
@@ -75,6 +76,10 @@ class SettingsStore:
         return self.reload().get(key, default)
 
     def as_dict(self) -> dict[str, Any]:
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return an independent snapshot of the latest settings on disk."""
         return self.reload()
 
     def reload(self) -> dict[str, Any]:
@@ -142,19 +147,8 @@ class SettingsStore:
             pass
 
     def _write_unlocked(self, settings: Mapping[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(dict(settings), indent=2, ensure_ascii=False) + "\n"
-        temporary = self.path.with_name(
-            f".{self.path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}"
-        )
-        try:
-            with temporary.open("w", encoding="utf-8", newline="\n") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        atomic_write_text(self.path, payload)
 
     @staticmethod
     def _normalize(settings: Mapping[str, Any]) -> dict[str, Any]:

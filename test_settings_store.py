@@ -47,3 +47,14 @@ def test_changed_event_reports_only_updated_fields(tmp_path: Path) -> None:
     store.update_fields(recipient_name="Ada", recipient_title="Hello")
 
     assert events == [("recipient_name", "recipient_title")]
+
+
+def test_snapshot_returns_an_independent_current_copy(tmp_path: Path) -> None:
+    store = SettingsStore(tmp_path)
+    store.update_fields(recipient_name="Ada", unknown_future_field={"kept": True})
+
+    snapshot = store.snapshot()
+    snapshot["recipient_name"] = "Changed locally"
+
+    assert store.get("recipient_name") == "Ada"
+    assert store.snapshot()["unknown_future_field"] == {"kept": True}

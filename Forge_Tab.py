@@ -52,7 +52,7 @@ from portable_export import (
     create_zip_package,
 )
 from settings_store import SettingsStore
-from transactions import PathTransaction
+from transactional_io import PathTransaction
 
 from config import (
     PUBLISHED_PAGE_URL_KEY,
