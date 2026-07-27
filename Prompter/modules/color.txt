@@ -1,5 +1,5 @@
 -Strange / Interpretive Color Schemes
-Natural Colors
+Ruby Star Child
 Star-Bound Prismatic Explosion
 Sapphire Prismatic Storm
 Violet Prismatic Dream
@@ -50,3 +50,4 @@ Teal, Orange, & Royal Purple
 -User Added
 Turquoise, Gold, Deep Violet, Kintsugi
 Turquoise, Black, Gold, Kintsugi
+Pink & Lavender

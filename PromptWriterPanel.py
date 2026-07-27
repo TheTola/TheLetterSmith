@@ -2731,9 +2731,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
         prompts: Dict[str, str] = {}
         debug_map: Dict[str, dict] = {}
         per_data_map: Dict[str, dict] = {}
+        shared_prompt_data = self._roll_shared_prompt_data()
 
         for img in self._images:
-            per_image_data = self._roll_data_for_image()
+            per_image_data = dict(shared_prompt_data)
             per_data_map[img] = per_image_data
             prompt, payload, dbg = assemble_prompt_for_image(
                 subject,
@@ -2765,6 +2766,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._persist_state_now()
 
     def _roll_data_for_image(self) -> dict:
+        return self._roll_shared_prompt_data()
+
+    def _roll_shared_prompt_data(self) -> dict:
         data = dict(self._data)
         role_pick, _ = _pick_random_nonempty_line("role.txt")
         if role_pick:

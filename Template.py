@@ -9,6 +9,7 @@ TEMPLATE_HTML = r"""
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow, noarchive">
   <title>{{TITLE}}</title>
   <link rel="stylesheet" href="styles.css">
 
@@ -67,7 +68,7 @@ TEMPLATE_HTML = r"""
 
     <div id="progress" aria-live="polite">Page 1 of 4</div>
     <div id="mobile-actions" aria-label="Viewer actions">
-      <button id="fullscreen-button" class="hud-button text-action" type="button">Fullscreen</button>
+      <button id="fullscreen-button" class="hud-button text-action" type="button" title="Enter fullscreen" aria-label="Enter fullscreen">Fullscreen</button>
       <button id="share-button" class="hud-button text-action" type="button" hidden>Share</button>
     </div>
 
@@ -1263,7 +1264,10 @@ document.addEventListener('DOMContentLoaded', () => {
         }catch(err){ console.warn('Fullscreen request failed', err); }
       });
       document.addEventListener('fullscreenchange', () => {
-        fullscreenBtn.textContent = document.fullscreenElement ? 'Exit fullscreen' : 'Fullscreen';
+        const active = Boolean(document.fullscreenElement);
+        fullscreenBtn.textContent = active ? 'Exit fullscreen' : 'Fullscreen';
+        fullscreenBtn.title = active ? 'Exit fullscreen' : 'Enter fullscreen';
+        fullscreenBtn.setAttribute('aria-label', fullscreenBtn.title);
       });
     }
   }
