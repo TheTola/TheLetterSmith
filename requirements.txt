@@ -3,3 +3,7 @@ Pillow>=10.0.0
 pygame>=2.5.2
 mutagen>=1.47.0
 PySide6>=6.11.0,<7
+
+mammoth
+python-docx
+pypdf2

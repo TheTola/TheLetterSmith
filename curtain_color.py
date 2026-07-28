@@ -37,6 +37,42 @@ def extract_deep_dominant_color_from_images(
     return FALLBACK_CURTAIN_RGB
 
 
+def extract_light_dominant_color_from_images(image_paths: Iterable[Path]) -> RGB:
+    hue = _extract_hue_from_images(image_paths)
+    return _light_rgb_for_hue(hue) if hue is not None else (250, 248, 249)
+
+
+def extract_dark_dominant_color_from_images(image_paths: Iterable[Path]) -> RGB:
+    hue = _extract_hue_from_images(image_paths)
+    return _dark_rgb_for_hue(hue) if hue is not None else (24, 8, 12)
+
+
+def curtain_rgb_for_style(image_paths: Iterable[Path], style: str) -> RGB:
+    """Resolve a curtain tint while preserving the letter's dominant hue family."""
+    paths = tuple(Path(path) for path in image_paths)
+    normalized = (style or "").strip().casefold().replace(" ", "_")
+    if normalized in {"light", "light_curtain", "light_average_color"}:
+        return extract_light_dominant_color_from_images(paths)
+    if normalized in {"dark", "dark_curtain", "dark_average_color"}:
+        return extract_dark_dominant_color_from_images(paths)
+    if normalized in {"complementary", "complementary_average_color"}:
+        return extract_deep_dominant_color_from_images(paths, hue_shift=0.5)
+    return extract_deep_dominant_color_from_images(paths)
+
+
+def _extract_hue_from_images(image_paths: Iterable[Path]) -> Optional[float]:
+    for image_path in image_paths:
+        try:
+            with Image.open(Path(image_path)) as opened:
+                image = ImageOps.exif_transpose(opened).convert("RGBA")
+        except Exception:
+            continue
+        hue = _dominant_meaningful_hue(_downsample_for_analysis(image))
+        if hue is not None:
+            return hue
+    return None
+
+
 def write_tinted_curtain_image(source_path: Path, target_path: Path, rgb: RGB) -> None:
     rgb = _clamp_rgb(rgb)
     target = Path(target_path)
@@ -166,6 +202,27 @@ def _deep_rgb_for_hue(hue: float) -> RGB:
         value = 0.56
 
     return _clamp_rgb(tuple(round(channel * 255) for channel in colorsys.hsv_to_rgb(hue, saturation, value)))
+
+
+def _light_rgb_for_hue(hue: float) -> RGB:
+    """Very pale, clearly tinted curtain based on the original hue."""
+    h, s, l = hue % 1.0, 0.72, 0.92
+    r, g, b = colorsys.hls_to_rgb(h, l, s)
+    return _clamp_rgb(tuple(round(channel * 255) for channel in (r, g, b)))
+
+
+def _dark_rgb_for_hue(hue: float) -> RGB:
+    """Near-black, richly saturated curtain based on the original hue."""
+    degrees = (hue % 1.0) * 360.0
+    # Pink/magenta moves slightly toward crimson so dark pink becomes wine or
+    # blood red rather than muddy purple.
+    if degrees >= 320.0 or degrees <= 18.0:
+        hue = 352.0 / 360.0
+    elif 285.0 <= degrees < 320.0:
+        hue = 335.0 / 360.0
+    h, s, l = hue % 1.0, 0.88, 0.14
+    r, g, b = colorsys.hls_to_rgb(h, l, s)
+    return _clamp_rgb(tuple(round(channel * 255) for channel in (r, g, b)))
 
 
 def _clamp_rgb(rgb: tuple[int, int, int]) -> RGB:

@@ -41,6 +41,9 @@ from PySide6 import QtWidgets, QtGui, QtCore
 from PySide6.QtCore import Signal, QUrl, QSize, QPoint
 from PySide6.QtGui import QDesktopServices, QIcon
 
+from project_sync import image_fingerprint
+from image_button import ArtworkButton
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Static Floating Action Button
@@ -529,12 +532,15 @@ class ImageTab(QtWidgets.QWidget):
     image_selected = Signal(QtGui.QPixmap)
     hover_preview_image = Signal(QtGui.QPixmap)
     clear_preview = Signal()
+    images_changed = Signal(str)
 
     FAB_FIXED_X = 55
     FAB_CARD_GAP = 12
 
     def __init__(self) -> None:
         super().__init__()
+        self._disk_fingerprint = image_fingerprint(self._project_dir())
+        self._tab_active = False
 
         self.labels = {
             1: (
@@ -650,41 +656,58 @@ class ImageTab(QtWidgets.QWidget):
         utility_row = QtWidgets.QHBoxLayout()
         utility_row.setSpacing(8)
 
-        self.reset_btn = QtWidgets.QPushButton(
-            "Reset Images"
+        self.reset_btn = ArtworkButton(
+            "Reset Images",
+            self._project_dir(),
+            "BButton.png",
+            self,
         )
 
-        self.open_btn = QtWidgets.QPushButton(
-            "Gallery"
+        self.open_btn = ArtworkButton(
+            "Gallery",
+            self._project_dir(),
+            "CButton.png",
+            self,
         )
 
         for button in (
                 self.reset_btn,
                 self.open_btn,
         ):
+            # The supplied artwork contains substantial transparent breathing
+            # room. A 354 x 138 widget is exactly three times the original
+            # 118 x 46 artwork-button footprint and keeps the labels readable.
+            button.setFixedSize(354, 138)
+            button.setSizePolicy(
+                QtWidgets.QSizePolicy.Fixed,
+                QtWidgets.QSizePolicy.Fixed,
+            )
             button.setFont(
                 QtGui.QFont(
                     "Segoe UI Semibold",
-                    10,
+                    14,
+                    QtGui.QFont.Weight.Bold,
                 )
             )
 
-            button.setStyleSheet(
-                "QPushButton {"
-                "background: #171a1f;"
-                "color: #dfe6ee;"
-                "border: 1px solid #3b434e;"
-                "border-radius: 5px;"
-                "padding: 6px 12px;"
-                "}"
-                "QPushButton:hover {"
-                "border-color: #00b8cf;"
-                "color: #ffffff;"
-                "}"
-                "QPushButton:pressed {"
-                "background: #101318;"
-                "}"
-            )
+            if not button.has_artwork:
+                button.setStyleSheet(
+                    "QPushButton {"
+                    "background: #171a1f;"
+                    "color: #dfe6ee;"
+                    "border: 1px solid #3b434e;"
+                    "border-radius: 5px;"
+                    "padding: 6px 12px;"
+                    "font-weight: bold;"
+                    "}"
+                    "QPushButton:hover {"
+                    "border-color: #00b8cf;"
+                    "color: #ffffff;"
+                    "}"
+                    "QPushButton:pressed {"
+                    "background: #101318;"
+                    "}"
+                )
 
         self.reset_btn.clicked.connect(
             self.reset_images
@@ -825,102 +848,65 @@ class ImageTab(QtWidgets.QWidget):
             "pages",
         )
 
-    def _load_fresh_pixmap(
-            self,
-            path: str,
-    ) -> QtGui.QPixmap:
-        """
-        Load an image directly from disk without relying on QPixmap's
-        filename cache. This matters when another part of the app replaces
-        cover.png, letter.png, wall.png, or back.png while the Images tab is
-        already open.
-        """
-        reader = QtGui.QImageReader(path)
-        reader.setAutoTransform(True)
+    def refresh_cards(self) -> None:
+        for index, (
+                _title,
+                filename,
+        ) in self.labels.items():
+            path = os.path.join(
+                self._user_pages_dir(),
+                filename,
+            )
 
-        image = reader.read()
+            if os.path.isfile(path):
+                pixmap = QtGui.QPixmap(path)
 
-        if image.isNull():
-            return QtGui.QPixmap()
+                if not pixmap.isNull():
+                    self.image_paths[index] = path
 
-        return QtGui.QPixmap.fromImage(image)
+                    self.cards[index].set_pixmap(
+                        pixmap
+                    )
 
-    def _refresh_card_from_disk(
-            self,
-            index: int,
-            *,
-            show_in_preview: bool = False,
-    ) -> bool:
-        """
-        Refresh one image card from its gallery file.
+                    continue
 
-        Hovering a card calls this method, so only the hovered card is
-        rescanned. The thumbnail and shared preview receive the exact same
-        freshly loaded pixmap.
-        """
-        if index not in self.labels:
-            return False
-
-        path = os.path.join(
-            self._user_pages_dir(),
-            self.labels[index][1],
-        )
-
-        if not os.path.isfile(path):
             self.image_paths[index] = None
             self.cards[index].clear_pixmap()
 
-            if show_in_preview:
-                self.clear_preview.emit()
+    def sync_from_disk(self, *, force: bool = False) -> bool:
+        """Refresh all image cards and report direct file-system changes."""
+        before = self._disk_fingerprint
+        after = image_fingerprint(self._project_dir())
+        changed = force or before != after
+        self.refresh_cards()
+        self._disk_fingerprint = image_fingerprint(self._project_dir())
+        if changed:
+            self.images_changed.emit("disk")
+        return changed
 
-            return False
-
-        pixmap = self._load_fresh_pixmap(path)
-
-        if pixmap.isNull():
-            self.cards[index].set_asset_state(
-                "warning"
-            )
-            return False
-
-        self.image_paths[index] = path
-        self.cards[index].set_pixmap(pixmap)
-
-        if show_in_preview:
-            self.hover_preview_image.emit(
-                pixmap
-            )
-
-        return True
-
-    def refresh_cards(self) -> None:
-        for index in self.labels:
-            self._refresh_card_from_disk(index)
-
-    def refresh_from_disk(self) -> None:
-        """Refresh Image-owned card state after a project restoration."""
+    def sync_to_disk(self) -> None:
+        """Finalize the image fingerprint before another tab opens."""
+        current = image_fingerprint(self._project_dir())
+        if current != self._disk_fingerprint:
+            self._disk_fingerprint = current
+            self.images_changed.emit("saved")
         self.refresh_cards()
 
-    def focus_asset_slot(
-            self,
-            target: str,
-            *,
-            open_picker: bool = True,
-    ) -> None:
-        """Focus the named image slot and optionally open its picker."""
+    def refresh_from_disk(self) -> None:
+        self.sync_from_disk(force=True)
+
+    def focus_asset_slot(self, target: str) -> None:
         index = {
             "cover": 1,
             "letter": 2,
             "wall": 3,
             "back": 4,
-        }.get(str(target))
-        if index is None:
+        }.get(str(target).strip().casefold())
+        card = self.cards.get(index) if index is not None else None
+        if card is None:
             return
-        card = self.cards.get(index)
-        if card is not None:
-            card.setFocus(Qt.OtherFocusReason)
-        if open_picker:
-            self._pick_image_dialog(index)
+        card.setFocus(QtCore.Qt.OtherFocusReason)
+        card.raise_()
 
     # ─────────────────────────────────────────────────────────────────────
     # Prompt Writer positioning
@@ -1069,25 +1055,33 @@ class ImageTab(QtWidgets.QWidget):
             self._position_prompt_writer_button,
         )
 
+    def activate_for_tab_change(self) -> None:
+        if self._tab_active:
+            return
+        self._tab_active = True
+        self.sync_from_disk()
+        self._schedule_prompt_writer_position()
+
+    def deactivate_for_tab_change(self) -> None:
+        if not self._tab_active:
+            return
+        self.sync_to_disk()
+        self._tab_active = False
+        if hasattr(self, "pwrite_fab"):
+            self.pwrite_fab.hide()
+
     def showEvent(
             self,
             event: QtGui.QShowEvent,
     ) -> None:
         super().showEvent(event)
-
-        self.refresh_cards()
-        self._schedule_prompt_writer_position()
+        self.activate_for_tab_change()
 
     def hideEvent(
             self,
             event: QtGui.QHideEvent,
     ) -> None:
-        if hasattr(
-                self,
-                "pwrite_fab",
-        ):
-            self.pwrite_fab.hide()
-
+        self.deactivate_for_tab_change()
         super().hideEvent(event)
 
     def resizeEvent(
@@ -1256,12 +1250,20 @@ class ImageTab(QtWidgets.QWidget):
             self,
             index: int,
     ) -> None:
-        # Hovering scans only this slot. If another part of the app replaced
-        # its gallery image, both the card thumbnail and preview update now.
-        self._refresh_card_from_disk(
-            index,
-            show_in_preview=True,
+        if index not in self.labels:
+            return
+
+        path = os.path.join(
+            self._user_pages_dir(),
+            self.labels[index][1],
         )
+
+        pixmap = QtGui.QPixmap(path)
+
+        if not pixmap.isNull():
+            self.hover_preview_image.emit(
+                pixmap
+            )
 
     def reset_images(self) -> None:
         for index in self.labels:

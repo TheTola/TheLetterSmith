@@ -70,5 +70,6 @@
   "required_features": {
     "music": false
   },
-  "github_pages_public_warning_acknowledged": true
+  "github_pages_public_warning_acknowledged": true,
+  "music_muted": false
 }

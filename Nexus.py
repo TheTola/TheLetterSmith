@@ -231,8 +231,12 @@ class TitleBar(QtWidgets.QWidget):
             f"Curtain style set to {CURTAIN_STYLE_LABELS[style]}."
         )
         forge = getattr(self.parent, "forge_tab", None)
-        if forge is not None and forge.isVisible():
-            forge.ensure_preview_current()
+        if forge is not None:
+            schedule = getattr(forge, "schedule_refresh", None)
+            if callable(schedule):
+                schedule()
+            if forge.isVisible():
+                forge.ensure_preview_current()
 
     def _toggle_max_restore(self):
         if self.parent.isMaximized():
@@ -378,6 +382,8 @@ class Nexus(QtWidgets.QMainWindow):
         self._forge_fullscreen_visibility: dict[QtWidgets.QWidget, bool] = {}
         self._shutdown_in_progress = False
         self._shutdown_complete = False
+        self._active_tab_index = -1
+        self._tab_sync_in_progress = False
         self.setObjectName("NexusWindow")
 
         # Frameless + QSS
@@ -542,6 +548,9 @@ class Nexus(QtWidgets.QMainWindow):
         )
         self.html_preview.page().fullScreenRequested.connect(
             self._on_web_fullscreen_requested
+        )
+        self.html_preview.loadFinished.connect(
+            self._on_forge_preview_loaded
         )
         self._forge_fullscreen_escape = QtGui.QShortcut(
             QtGui.QKeySequence(Qt.Key_Escape),
@@ -734,8 +743,17 @@ class Nexus(QtWidgets.QMainWindow):
             lambda _pixmap: self.forge_tab.schedule_refresh()
         )
         self.image_tab.clear_preview.connect(self.forge_tab.schedule_refresh)
+        self.image_tab.images_changed.connect(
+            lambda _reason: self.forge_tab.schedule_refresh()
+        )
         self.sound_tab.project_sound.changed.connect(
             self.forge_tab.schedule_refresh
+        )
+        self.sound_tab.volume_changed.connect(
+            self._on_sound_volume_changed
+        )
+        self.sound_tab.sound_state_changed.connect(
+            self._on_sound_state_changed
         )
         self.message_tab.project_changed.connect(
             self.forge_tab.schedule_refresh
@@ -1014,21 +1032,179 @@ class Nexus(QtWidgets.QMainWindow):
     # ─────────────────────────────────────────────────────────
     # Tabs — show correct preview per tab + update help visibility/content
     # ─────────────────────────────────────────────────────────
-    def _tab_changed(self, idx: int) -> None:
-        """
-        Route the requested tab transition.
+    def _tab_owner(self, idx: int):
+        return {
+            0: getattr(self, "image_tab", None),
+            1: getattr(self, "sound_tab", None),
+            2: getattr(self, "message_tab", None),
+            3: getattr(self, "forge_tab", None),
+        }.get(idx)
 
-        Ordinary tabs keep the shared slide animation. Any transition entering
-        or leaving Command bypasses TabSwitcher and uses a fixed body-snapshot
-        fade so no page, preview, or help movement leaks through.
-        """
+    @staticmethod
+    def _call_lifecycle(owner, method_name: str) -> bool:
+        callback = getattr(owner, method_name, None)
+        if not callable(callback):
+            return False
+        callback()
+        return True
+
+    def _sync_tab_departure(self, old_idx: int, new_idx: int) -> None:
+        if old_idx < 0 or old_idx == new_idx:
+            return
+        owner = self._tab_owner(old_idx)
+        try:
+            if not self._call_lifecycle(owner, "deactivate_for_tab_change"):
+                self._call_lifecycle(owner, "sync_to_disk")
+        except Exception as error:
+            self.status(f"Could not finish {self.tabbar.tabText(old_idx)} synchronization: {error}")
+
+
+    def _sync_tab_arrival(self, new_idx: int, old_idx: int) -> None:
+        if new_idx < 0:
+            return
+        owner = self._tab_owner(new_idx)
+        try:
+            if not self._call_lifecycle(owner, "activate_for_tab_change"):
+                self._call_lifecycle(owner, "sync_from_disk")
+        except Exception as error:
+            self.status(f"Could not refresh {self.tabbar.tabText(new_idx)}: {error}")
+
+        if new_idx == 3:
+            self.sync_all_project_state()
+            self._apply_sound_volume_to_forge_preview()
+
+    def sync_all_project_state(self, *, force: bool = False) -> bool:
+        """Refresh every content owner and invalidate Forge only when needed."""
+        if self._tab_sync_in_progress:
+            return False
+        self._tab_sync_in_progress = True
+        changed = False
+        try:
+            for owner, method_name in (
+                (self.image_tab, "sync_from_disk"),
+                (self.message_tab, "sync_from_disk"),
+                (self.sound_tab, "sync_from_disk"),
+            ):
+                callback = getattr(owner, method_name, None)
+                if not callable(callback):
+                    callback = getattr(owner, "refresh_from_disk", None)
+                if not callable(callback):
+                    continue
+                try:
+                    result = callback(force=force)
+                except TypeError:
+                    result = callback()
+                changed = bool(result) or changed
+
+            forge_sync = getattr(self.forge_tab, "sync_all_from_disk", None)
+            if callable(forge_sync):
+                try:
+                    changed = bool(forge_sync(force=force, notify_host=False)) or changed
+                except TypeError:
+                    changed = bool(forge_sync(force=force)) or changed
+
+            if changed or force:
+                self.forge_tab.schedule_refresh()
+            self._apply_sound_volume_to_forge_preview()
+            return changed
+        finally:
+            self._tab_sync_in_progress = False
+
+    def refresh_all_project_state(self) -> bool:
+        return self.sync_all_project_state(force=True)
+
+    def refresh_forge_preview(self) -> None:
+        self.forge_tab.schedule_refresh()
+        if self.tabbar.currentIndex() == 3:
+            QtCore.QTimer.singleShot(0, self._show_forge_preview)
+
+    def restart_forge_preview(self, reason: str = "manual") -> None:
+        """Stop playback and reload the current letter at the curtain screen."""
+        if self._forge_fullscreen_active:
+            self._restore_forge_preview_from_fullscreen()
+        try:
+            self.html_preview.page().runJavaScript(
+                "document.querySelectorAll('audio,video').forEach(media => {"
+                "try { media.pause(); media.currentTime = 0; } catch (_) {}"
+                "});"
+            )
+        except RuntimeError:
+            pass
+
+        index = self.forge_tab.current_play_index()
+        if index is None or not Path(index).is_file():
+            return
+        mode = getattr(self.forge_tab, "preview_mode_value", "portrait")
+        self.html_preview.stop()
+        self.html_preview.setUrl(QUrl("about:blank"))
+        QtCore.QTimer.singleShot(
+            0,
+            lambda path=str(index), preview_mode=mode: self._load_forge_preview(path, preview_mode),
+        )
+        self.status(f"Forge preview restarted from the beginning ({reason}).")
+
+    def reset_forge_preview(self) -> None:
+        self.restart_forge_preview("reset")
+
+    def restart_preview(self) -> None:
+        self.restart_forge_preview("request")
+
+    def _sound_volume_state(self) -> tuple[int, bool]:
+        try:
+            volume = int(self.sound_tab.volume.value())
+        except Exception:
+            volume = 50
+        try:
+            muted = bool(self.sound_tab.player.is_muted())
+        except Exception:
+            muted = False
+        return max(0, min(100, volume)), muted
+
+    def _apply_sound_volume_to_forge_preview(self) -> None:
+        volume, muted = self._sound_volume_state()
+        script = (
+            "(() => {"
+            f"const value={volume}; const muted={str(muted).lower()};"
+            "document.querySelectorAll('audio,video').forEach(media => {"
+            "try { media.volume=value/100; media.muted=muted || value===0; } catch (_) {}"
+            "});"
+            "const slider=document.getElementById('volume-slider');"
+            "if(slider) slider.value=String(value);"
+            "const icon=document.getElementById('volume-icon-img');"
+            "if(icon) icon.src=(muted||value===0)?'gallery/controls/voloff.png':'gallery/controls/volon.png';"
+            "})();"
+        )
+        try:
+            self.html_preview.page().runJavaScript(script)
+        except RuntimeError:
+            pass
+
+    def _on_sound_volume_changed(self, _value: int) -> None:
+        self.forge_tab.schedule_refresh()
+        self._apply_sound_volume_to_forge_preview()
+
+    def _on_sound_state_changed(self, _reason: str) -> None:
+        self.forge_tab.schedule_refresh()
+        self._apply_sound_volume_to_forge_preview()
+
+    def _on_forge_preview_loaded(self, ok: bool) -> None:
+        if ok and self.tabbar.currentIndex() == 3:
+            self._apply_sound_volume_to_forge_preview()
+
+    def _tab_changed(self, idx: int) -> None:
+        """Synchronize the departing and arriving owners around one transition."""
         if idx < 0 or idx >= self.page_stack.count():
             return
 
-        # A new request supersedes an in-progress Command fade. Its target page
-        # was already committed underneath the snapshots.
         self._cancel_command_fade()
-        old_idx = self.page_stack.currentIndex()
+        old_idx = self._active_tab_index
+        if old_idx < 0:
+            old_idx = self.page_stack.currentIndex()
+
+        if old_idx != idx:
+            self._sync_tab_departure(old_idx, idx)
+        self._sync_tab_arrival(idx, old_idx)
+        self._active_tab_index = idx
 
         if old_idx != idx and (old_idx == 4 or idx == 4):
             self._run_command_transition(idx)
@@ -1039,10 +1215,6 @@ class Nexus(QtWidgets.QMainWindow):
     def _apply_tab_state(self, idx: int, *, animate_page: bool) -> None:
         """Apply the complete settled UI state for one tab."""
         if idx != 1:
-            try:
-                self.sound_tab.deactivate_for_tab_change()
-            except Exception:
-                pass
             self._detach_sound_preview()
 
         self._last_pixmap = None
@@ -1068,7 +1240,6 @@ class Nexus(QtWidgets.QMainWindow):
             self.preview_stack.setCurrentIndex(0)
         elif idx == 1:
             try:
-                self.sound_tab.activate_for_tab_change()
                 self._mount_sound_preview(
                     self.sound_tab.shared_preview_widget()
                 )
@@ -1082,6 +1253,7 @@ class Nexus(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(0, self._request_message_preview)
         elif idx == 3:
             QtCore.QTimer.singleShot(0, self._show_forge_preview)
+            QtCore.QTimer.singleShot(80, self._apply_sound_volume_to_forge_preview)
         else:
             self.preview_stack.setCurrentIndex(0)
 
@@ -1866,7 +2038,7 @@ class Nexus(QtWidgets.QMainWindow):
             body = (
                 "Check readiness, load a saved letter, and select Preview Letter "
                 "to test the complete interactive viewer. Publish Letter creates "
-                "the hosted result, and Open Published Letter opens its saved link."
+                "the hosted result, and Open Letter opens the published link or the current local build."
             )
         else:
             header, body = "", ""

@@ -41,6 +41,8 @@ from PySide6.QtGui import (
 )
 
 from Editor import Editor
+from image_button import ArtworkButton
+from project_sync import file_fingerprint
 from message_history import (
     delete_revision,
     list_revisions,
@@ -48,13 +50,10 @@ from message_history import (
     write_message_with_revision,
 )
 from message_html import is_lettersmith_message_html
-from settings_store import (
-    PUBLISHED_PAGE_URL_KEY,
-    SettingsStore,
-    normalize_published_page_url,
-)
+from settings_store import SettingsStore
 from config import (
     SETTINGS_FILE,
+    PUBLISHED_PAGE_URL_KEY,
     USER_PAGES_DIR,
     MESSAGE_HTML_FILE,
     MESSAGE_IMAGE_FILE,
@@ -148,7 +147,20 @@ def _reading_time_label(word_count: int) -> str:
     return f"~{math.ceil(word_count / 200)} min read"
 
 
-_normalize_published_page_url = normalize_published_page_url
+def _normalize_published_page_url(value: str) -> str:
+    """Return a canonical HTTP(S) URL, or an empty string when invalid."""
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+
+    parsed = QtCore.QUrl.fromUserInput(candidate)
+    if not parsed.isValid():
+        return ""
+    if parsed.scheme().lower() not in {"http", "https"}:
+        return ""
+    if not parsed.host():
+        return ""
+    return parsed.toString()
 
 
 MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
@@ -197,19 +209,21 @@ def _message_overlay_settings(settings_path: str | os.PathLike) -> tuple[str, in
 # Drag-drop button
 # ─────────────────────────────────────────────────────────────────────────────
 
-class DropMessageButton(QtWidgets.QPushButton):
+class DropMessageButton(ArtworkButton):
     file_dropped = Signal(str)
 
-    def __init__(self, label: str = "Import Message…") -> None:
-        super().__init__(label)
-        self.setFont(QFont("Segoe UI Semibold", 10))
-        self.setFixedSize(210, 38)
+    def __init__(self, project_root: str | Path, label: str = "Import") -> None:
+        super().__init__(label, project_root, "LButton.png")
+        self.setFont(QFont("Segoe UI Semibold", 12, QFont.Bold))
+        self.setFixedSize(198, 69)
         self.setAcceptDrops(True)
+        self.setAccessibleName("Import")
         self.setToolTip(
             "Import a .txt, .docx, .pdf, .odt, or saved Letter Smith .html message. "
             "You may also drag a supported file onto this button."
         )
-        self.setStyleSheet(self._default_style())
+        if not self.has_artwork:
+            self.setStyleSheet(self._default_style())
 
     def _default_style(self) -> str:
         return (
@@ -233,7 +247,9 @@ class DropMessageButton(QtWidgets.QPushButton):
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:  # type: ignore[override]
         if event.mimeData().hasUrls() and any(self._is_supported_url(u) for u in event.mimeData().urls()):
             event.acceptProposedAction()
-            self.setStyleSheet(self._glow_style())
+            if not self.has_artwork:
+                self.setStyleSheet(self._glow_style())
+            self.update()
         else:
             event.ignore()
 
@@ -241,10 +257,14 @@ class DropMessageButton(QtWidgets.QPushButton):
         event.acceptProposedAction()
 
     def dragLeaveEvent(self, event: QtGui.QDragLeaveEvent) -> None:  # type: ignore[override]
-        self.setStyleSheet(self._default_style())
+        if not self.has_artwork:
+            self.setStyleSheet(self._default_style())
+        self.update()
 
     def dropEvent(self, event: QtGui.QDropEvent) -> None:  # type: ignore[override]
-        self.setStyleSheet(self._default_style())
+        if not self.has_artwork:
+            self.setStyleSheet(self._default_style())
+        self.update()
         for url in event.mimeData().urls():
             if self._is_supported_url(url):
                 self.file_dropped.emit(url.toLocalFile())
@@ -388,6 +408,8 @@ class MessageTab(QtWidgets.QWidget):
         self._overlay_render_timer.setSingleShot(True)
         self._overlay_render_timer.setInterval(180)
         self._overlay_render_timer.timeout.connect(self._render_overlay_preview)
+        self._sync_state = self._capture_sync_state()
+        self._tab_active = False
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(20, 12, 20, 14)
@@ -432,7 +454,7 @@ class MessageTab(QtWidgets.QWidget):
         self.url_input.setPlaceholderText("https://your-published-letter-page")
         self.url_input.setToolTip(
             "Save the public page address for this letter. "
-            "Forge uses this address for Open Published Letter and sharing."
+            "Forge uses this address for Open Letter and sharing."
         )
 
         title_recipient_layout.addRow("Letter Title:", self.title_input)
@@ -446,40 +468,45 @@ class MessageTab(QtWidgets.QWidget):
 
         shell.addWidget(self._build_message_overlay_controls())
 
-        actions = QtWidgets.QHBoxLayout()
+        actions = QtWidgets.QGridLayout()
         actions.setContentsMargins(0, 0, 0, 0)
-        actions.setSpacing(8)
-        actions.addStretch(1)
-
-        self.btn = DropMessageButton()
-        self.btn.clicked.connect(self.select_file)
-        self.btn.file_dropped.connect(self.handle_drop)
-        actions.addWidget(self.btn)
+        actions.setHorizontalSpacing(10)
+        actions.setVerticalSpacing(8)
+        actions.setColumnStretch(0, 1)
+        actions.setColumnStretch(4, 1)
 
         compact_button_style = (
-            "QPushButton{min-height:36px;padding:0 16px;background:#171b20;color:#e4ebf4;"
-            "border:1px solid #38424f;border-radius:7px;}"
+            "QPushButton{min-height:40px;padding:0 16px;background:#171b20;color:#e4ebf4;"
+            "border:1px solid #38424f;border-radius:7px;font-weight:700;}"
             "QPushButton:hover{border-color:#00d0ff;background:#1c252e;}"
             "QPushButton:disabled{color:#69727e;border-color:#2b3139;background:#15181c;}"
         )
 
-        self.edit_btn = QtWidgets.QPushButton("Edit Message")
-        self.edit_btn.setFixedWidth(135)
-        self.edit_btn.setFont(QFont("Segoe UI", 10))
-        self.edit_btn.setStyleSheet(compact_button_style)
+        self.btn = DropMessageButton(self.project_root, "Import")
+        self.btn.clicked.connect(self.select_file)
+        self.btn.file_dropped.connect(self.handle_drop)
+        actions.addWidget(self.btn, 0, 1)
+
+        self.edit_btn = ArtworkButton("Edit", self.project_root, "PButton.png", self)
+        self.edit_btn.setFixedSize(198, 69)
+        self.edit_btn.setFont(QFont("Segoe UI Semibold", 12, QFont.Bold))
+        if not self.edit_btn.has_artwork:
+            self.edit_btn.setStyleSheet(compact_button_style)
         self.edit_btn.setToolTip("Open the rich-text editor for the current message.")
+        self.edit_btn.setAccessibleName("Edit")
         self.edit_btn.setEnabled(True)
         self.edit_btn.clicked.connect(self.open_editor)
-        actions.addWidget(self.edit_btn)
+        actions.addWidget(self.edit_btn, 0, 2)
 
-        self.revisions_btn = QtWidgets.QPushButton("Revisions")
-        self.revisions_btn.setFixedWidth(110)
-        self.revisions_btn.setFont(QFont("Segoe UI", 10))
-        self.revisions_btn.setStyleSheet(compact_button_style)
+        self.revisions_btn = ArtworkButton("Revisions", self.project_root, "RButton.png", self)
+        self.revisions_btn.setFixedSize(198, 69)
+        self.revisions_btn.setFont(QFont("Segoe UI Semibold", 12, QFont.Bold))
+        if not self.revisions_btn.has_artwork:
+            self.revisions_btn.setStyleSheet(compact_button_style)
         self.revisions_btn.setToolTip("Open autosaved message versions and restore an earlier version.")
+        self.revisions_btn.setAccessibleName("Revisions")
         self.revisions_btn.clicked.connect(self.open_revision_history)
-        actions.addWidget(self.revisions_btn)
-        actions.addStretch(1)
+        actions.addWidget(self.revisions_btn, 0, 3)
         shell.addLayout(actions)
 
         self.status = QtWidgets.QLabel()
@@ -505,12 +532,34 @@ class MessageTab(QtWidgets.QWidget):
     # ──────────────────────────────────────────────────────────────────
     # Show hook: every time user clicks into Message tab
     # ──────────────────────────────────────────────────────────────────
-    def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
-        super().showEvent(event)
-        self.refresh_from_disk()
+    def _message_settings_signature(self) -> str:
+        settings = self.settings_store.snapshot()
+        relevant = {
+            key: settings.get(key)
+            for key in (
+                "recipient_title",
+                "recipient_name",
+                PUBLISHED_PAGE_URL_KEY,
+                MESSAGE_OVERLAY_PRESET_KEY,
+                MESSAGE_OVERLAY_OPACITY_KEY,
+            )
+        }
+        return json.dumps(relevant, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
-    def refresh_from_disk(self) -> None:
-        """Refresh Message-owned settings, editor state, and preview."""
+    def _capture_sync_state(self) -> dict[str, str]:
+        return {
+            "html": file_fingerprint(self._html_path()),
+            "png": file_fingerprint(self._png_path()),
+            "wall": file_fingerprint(self._wall_path()),
+            "settings": self._message_settings_signature(),
+        }
+
+    def sync_from_disk(self, *, force: bool = False) -> bool:
+        """Reconcile Message content, metadata, rendering, and direct disk edits."""
+        before = dict(getattr(self, "_sync_state", {}))
+        after = self._capture_sync_state()
+        changed_keys = {key for key, value in after.items() if force or before.get(key) != value}
+
         self._load_settings()
         self.title_input.setText(str(self.settings.get("recipient_title", "")))
         self.name_input.setText(str(self.settings.get("recipient_name", "")))
@@ -524,9 +573,57 @@ class MessageTab(QtWidgets.QWidget):
         self._sync_overlay_controls()
         self._refresh_message_from_disk()
         self._ensure_wall_exists()
-        self._ensure_message_exists()
+
+        render_changed = bool(changed_keys.intersection({"html", "wall", "settings"}))
+        if render_changed and self.current_html.strip():
+            self._generate_image(self.current_html)
+        else:
+            self._ensure_message_exists()
+
         self._emit_best_preview()
         self._update_message_summary()
+        self._sync_state = self._capture_sync_state()
+        if changed_keys:
+            self.project_changed.emit()
+        return bool(changed_keys)
+
+    def sync_to_disk(self) -> bool:
+        """Persist Message metadata and finish render state before tab exit."""
+        before = self._capture_sync_state()
+        self._save_settings()
+        self._refresh_message_from_disk()
+        self._ensure_wall_exists()
+        if self.current_html.strip() and not self._png_path().is_file():
+            self._generate_image(self.current_html)
+        self._ensure_message_exists()
+        self._sync_state = self._capture_sync_state()
+        changed = before != self._sync_state
+        if changed:
+            self.project_changed.emit()
+        return changed
+
+    def activate_for_tab_change(self) -> None:
+        if self._tab_active:
+            return
+        self._tab_active = True
+        self.sync_from_disk()
+
+    def deactivate_for_tab_change(self) -> None:
+        if not self._tab_active:
+            return
+        self.sync_to_disk()
+        self._tab_active = False
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self.activate_for_tab_change()
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:  # type: ignore[override]
+        self.deactivate_for_tab_change()
+        super().hideEvent(event)
+
+    def refresh_from_disk(self) -> None:
+        self.sync_from_disk(force=True)
 
     def focus_field(self, target: str) -> None:
         """Focus the Message correction requested by Project Readiness."""
@@ -703,6 +800,8 @@ class MessageTab(QtWidgets.QWidget):
         self._generate_image(restored)
         self._emit_best_preview()
         self.status.setText("Revision restored.")
+        self._sync_state = self._capture_sync_state()
+        self.project_changed.emit()
         return True
 
     # ──────────────────────────────────────────────────────────────────
@@ -972,6 +1071,8 @@ class MessageTab(QtWidgets.QWidget):
         self._content_has_intentional_formatting = True
         self._update_message_summary(html)
         self.text_selected.emit(html)
+        self._sync_state = self._capture_sync_state()
+        self.project_changed.emit()
 
     def _handle_editor_finished(self, dlg: QtWidgets.QDialog) -> None:
         try:
@@ -1197,3 +1298,10 @@ class MessageTab(QtWidgets.QWidget):
             # Force existence (wall->message) if generation fails
             self.status.setText(f"❌ Error generating message.png: {e}")
             self._ensure_message_exists()
+    def shutdown(self) -> None:
+        self._overlay_render_timer.stop()
+        try:
+            self.sync_to_disk()
+        except Exception:
+            pass
+

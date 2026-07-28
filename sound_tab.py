@@ -45,6 +45,8 @@ from sound_model import (
     utc_now_text,
 )
 from sound_preview import SoundPreviewWidget
+from project_sync import sound_fingerprint
+from image_button import ArtworkButton
 
 try:
     from sound_analyzer import AudioAnalysisManager, analysis_runtime_status
@@ -633,6 +635,9 @@ class PlaylistPlayer(QtCore.QObject):
         self._muted = bool(muted)
         self._apply_output_state()
 
+    def is_muted(self) -> bool:
+        return self._muted
+
     def toggle_mute(self) -> bool:
         self.set_muted(not self._muted)
         return self._muted
@@ -1017,6 +1022,8 @@ class PlaylistItemWidget(QtWidgets.QFrame):
 
 class SoundTab(QtWidgets.QWidget):
     preview_widget = QtCore.Signal(QtWidgets.QWidget)
+    sound_state_changed = QtCore.Signal(str)
+    volume_changed = QtCore.Signal(int)
 
     def __init__(self, project_root: str | Path) -> None:
         super().__init__()
@@ -1026,6 +1033,11 @@ class SoundTab(QtWidgets.QWidget):
         self.player = PlaylistPlayer(self.library.path_for, self)
         self.wave = self.player  # compatibility for command.py and existing Nexus hooks
         self._tab_active = False
+        self._disk_fingerprint = sound_fingerprint(self.project_root)
+        self._volume_save_timer = QtCore.QTimer(self)
+        self._volume_save_timer.setSingleShot(True)
+        self._volume_save_timer.setInterval(140)
+        self._volume_save_timer.timeout.connect(self._save_volume)
         self._import_thread: Optional[QtCore.QThread] = None
         self._import_worker: Optional[_ImportWorker] = None
         self._repair_thread: Optional[QtCore.QThread] = None
@@ -1044,6 +1056,7 @@ class SoundTab(QtWidgets.QWidget):
         self._init_ui()
         self._connect_signals()
         self._reload_player_queue()
+        self._apply_saved_mute_state()
         self._refresh_ui()
         self.preview_widget.emit(self._preview)
 
@@ -1066,24 +1079,42 @@ class SoundTab(QtWidgets.QWidget):
 
     def _init_ui(self) -> None:
         root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(20, 18, 20, 20)
-        # The Sound tab receives a little more vertical breathing room when the
-        # Nexus preview is reduced in normal-window mode.
-        root.setSpacing(16)
+        root.setContentsMargins(20, 16, 20, 18)
+        root.setSpacing(12)
 
         header = QtWidgets.QHBoxLayout()
+        header.setSpacing(0)
         title = QtWidgets.QLabel("Sound")
         title.setStyleSheet("color:#dff8ff;font-size:18px;font-weight:700;")
-        self.archive_btn = QtWidgets.QPushButton("Archive")
+        self.archive_btn = ArtworkButton("Archive", self.project_root, "DButton.png", self)
         self.archive_btn.setToolTip("Choose music from the archive")
-        self.archive_btn.setMinimumHeight(40)
-        self.clear_btn = QtWidgets.QPushButton("Clear")
+        self.clear_btn = ArtworkButton("Clear", self.project_root, "GButton.png", self)
         self.clear_btn.setToolTip("Clear music assigned to this letter")
-        self.clear_btn.setMinimumHeight(40)
+
+        # Twenty percent larger than the base 118 x 46 artwork footprint.
+        for button in (self.archive_btn, self.clear_btn):
+            button.setFixedSize(142, 56)
+            button.setFont(
+    QtGui.QFont(
+        "Segoe UI Semibold",
+        11,
+        QtGui.QFont.Bold,
+    )
+)
+            button.setSizePolicy(
+                QtWidgets.QSizePolicy.Fixed,
+                QtWidgets.QSizePolicy.Fixed,
+            )
+
+        button_cluster = QtWidgets.QHBoxLayout()
+        button_cluster.setContentsMargins(0, 0, 0, 0)
+        button_cluster.setSpacing(2)
+        button_cluster.addWidget(self.archive_btn)
+        button_cluster.addWidget(self.clear_btn)
+
         header.addWidget(title)
         header.addStretch(1)
-        header.addWidget(self.archive_btn)
-        header.addWidget(self.clear_btn)
+        header.addLayout(button_cluster)
         root.addLayout(header)
 
         self.mode_stack = QtWidgets.QStackedWidget()
@@ -1094,12 +1125,10 @@ class SoundTab(QtWidgets.QWidget):
         root.addWidget(self.mode_stack, 1)
 
         self.now_playing = QtWidgets.QLabel("No music selected")
-        self.now_playing.setStyleSheet("color:#b7c9dc;padding:6px 4px;")
+        self.now_playing.setStyleSheet("color:#b7c9dc;padding:2px 4px;")
         root.addWidget(self.now_playing)
 
         transport = QtWidgets.QHBoxLayout()
-        transport.setContentsMargins(0, 4, 0, 4)
-        transport.setSpacing(10)
         self.prev_btn = QtWidgets.QToolButton()
         self.prev_btn.setText("⏮")
         self.prev_btn.setToolTip("Previous track or restart current track")
@@ -1113,21 +1142,10 @@ class SoundTab(QtWidgets.QWidget):
         self.timeline = CleanSlider()
         self.timeline.setRange(0, 0)
         self.total = QtWidgets.QLabel("0:00")
-        # QPushButton is used here instead of QToolButton because QToolButton
-        # elides the Windows emoji glyph to "..." when its global padding is
-        # applied. This button has its own zero-padding style, so the Unicode
-        # speaker symbols remain centered and fully visible.
-        self.mute_btn = QtWidgets.QPushButton("\U0001F50A")
-        self.mute_btn.setObjectName("soundVolumeButton")
+        self.mute_btn = QtWidgets.QToolButton()
+        self.mute_btn.setText("🔊")
         self.mute_btn.setToolTip("Mute music")
-        self.mute_btn.setAccessibleName("Mute or restore music")
         self.mute_btn.setFont(QtGui.QFont("Segoe UI Emoji", 18))
-        self.mute_btn.setStyleSheet(
-            "QPushButton#soundVolumeButton{padding:0;margin:0;min-height:0;"
-            "background:#1b2430;border:1px solid #33475f;border-radius:8px;"
-            "font-family:'Segoe UI Emoji';font-size:20px;}"
-            "QPushButton#soundVolumeButton:hover{border-color:#00c8ff;background:#233447;}"
-        )
         self.volume = CleanSlider()
         self.volume.setRange(0, 100)
         self.volume.setValue(self._load_volume())
@@ -1135,7 +1153,7 @@ class SoundTab(QtWidgets.QWidget):
         for button in (self.prev_btn, self.play_btn, self.next_btn):
             button.setFixedSize(48, 42)
             button.setFont(QtGui.QFont("Segoe UI Symbol", 18))
-        self.mute_btn.setFixedSize(52, 42)
+        self.mute_btn.setFixedSize(48, 42)
         transport.addWidget(self.prev_btn)
         transport.addWidget(self.play_btn)
         transport.addWidget(self.next_btn)
@@ -1148,7 +1166,7 @@ class SoundTab(QtWidgets.QWidget):
 
         status_row = QtWidgets.QHBoxLayout()
         self.status = QtWidgets.QLabel("")
-        self.status.setStyleSheet("color:#91a8bd;min-height:24px;padding-top:2px;")
+        self.status.setStyleSheet("color:#91a8bd;min-height:22px;")
         self.cancel_job_btn = QtWidgets.QPushButton("Cancel")
         self.cancel_job_btn.hide()
         status_row.addWidget(self.status, 1)
@@ -1200,8 +1218,8 @@ class SoundTab(QtWidgets.QWidget):
         panel = QtWidgets.QFrame()
         panel.setObjectName("playlistPanel")
         layout = QtWidgets.QVBoxLayout(panel)
-        layout.setContentsMargins(12, 14, 12, 14)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
         summary = QtWidgets.QHBoxLayout()
         self.playlist_summary = QtWidgets.QLabel("Playlist")
         self.expand_btn = QtWidgets.QPushButton("Collapse")
@@ -1218,7 +1236,7 @@ class SoundTab(QtWidgets.QWidget):
         self.playlist_list.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
         self.playlist_list.setDefaultDropAction(Qt.MoveAction)
         self.playlist_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.playlist_list.setSpacing(6)
+        self.playlist_list.setSpacing(4)
         self.playlist_list.model().rowsMoved.connect(self._playlist_rows_moved)
         layout.addWidget(self.playlist_list, 1)
         panel.setStyleSheet("QFrame#playlistPanel{background:#111820;border:1px solid #2b3a4d;border-radius:12px;}")
@@ -1260,17 +1278,31 @@ class SoundTab(QtWidgets.QWidget):
 
     def _save_volume(self) -> None:
         settings = _read_settings(self.project_root)
-        settings["music_volume"] = self.volume.value()
-        settings["starting_volume"] = self.volume.value()
+        value = self.volume.value()
+        settings["music_volume"] = value
+        settings["starting_volume"] = value
+        settings["music_muted"] = self.player.is_muted()
         _write_settings(self.project_root, settings)
+        self._disk_fingerprint = sound_fingerprint(self.project_root)
 
     def _volume_changed(self, value: int) -> None:
         self.player.set_volume(value)
+        self.volume_changed.emit(int(value))
+        self._volume_save_timer.start()
+
+    def _apply_saved_mute_state(self) -> None:
+        settings = _read_settings(self.project_root)
+        muted = bool(settings.get("music_muted", False))
+        self.player.set_muted(muted)
+        self.mute_btn.setText("🔇" if muted else "🔊")
+        self.mute_btn.setToolTip("Restore music" if muted else "Mute music")
 
     def _toggle_mute(self) -> None:
         muted = self.player.toggle_mute()
-        self.mute_btn.setText("\U0001F507" if muted else "\U0001F50A")
+        self.mute_btn.setText("🔇" if muted else "🔊")
         self.mute_btn.setToolTip("Restore music" if muted else "Mute music")
+        self._save_volume()
+        self.sound_state_changed.emit("mute")
 
     def _project_state_changed(self) -> None:
         self._reload_player_queue()
@@ -1658,11 +1690,53 @@ class SoundTab(QtWidgets.QWidget):
     def shared_preview_widget(self) -> QtWidgets.QWidget:
         return self._preview
 
+    def sync_from_disk(self, *, force: bool = False) -> bool:
+        """Reload current project sound and authoritative volume from disk."""
+        before = self._disk_fingerprint
+        after = sound_fingerprint(self.project_root)
+        changed = force or before != after
+        if changed:
+            self.reload_project_from_disk()
+        saved_volume = self._load_volume()
+        if self.volume.value() != saved_volume:
+            blocker = QtCore.QSignalBlocker(self.volume)
+            self.volume.setValue(saved_volume)
+            del blocker
+        self.player.set_volume(saved_volume)
+        self._apply_saved_mute_state()
+        self._disk_fingerprint = sound_fingerprint(self.project_root)
+        if changed:
+            self.sound_state_changed.emit("disk")
+        self.volume_changed.emit(saved_volume)
+        return changed
+
+    def sync_to_disk(self) -> None:
+        """Persist the Sound tab state before another tab consumes it."""
+        self._volume_save_timer.stop()
+        self._save_volume()
+        self.project_sound.save()
+        self._disk_fingerprint = sound_fingerprint(self.project_root)
+        self.sound_state_changed.emit("saved")
+
+    def refresh_from_disk(self) -> None:
+        self.sync_from_disk(force=True)
+
+    def focus_music_editor(self) -> None:
+        target = self.add_track_btn if self.project_sound.state.mode == "playlist" else self.single_action_btn
+        target.setFocus(QtCore.Qt.OtherFocusReason)
+        target.raise_()
+
     def activate_for_tab_change(self) -> None:
+        if self._tab_active:
+            return
+        self.sync_from_disk()
         self._tab_active = True
         self._preview.set_tab_active(True)
 
     def deactivate_for_tab_change(self) -> None:
+        if not self._tab_active:
+            return
+        self.sync_to_disk()
         self._tab_active = False
         self.player.stop(reset_position=True)
         self._preview.set_tab_active(False)
@@ -1688,19 +1762,6 @@ class SoundTab(QtWidgets.QWidget):
         self._reload_player_queue()
         self._refresh_ui()
 
-    def refresh_from_disk(self) -> None:
-        """Refresh Sound-owned assignment, playlist, and preview state."""
-        self.reload_project_from_disk()
-
-    def focus_music_editor(self) -> None:
-        """Focus the primary Sound action requested by Project Readiness."""
-        target = (
-            self.add_track_btn
-            if self.project_sound.state.mode == "playlist"
-            else self.single_action_btn
-        )
-        target.setFocus(Qt.OtherFocusReason)
-
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
         self.activate_for_tab_change()
@@ -1717,10 +1778,7 @@ class SoundTab(QtWidgets.QWidget):
             thread.quit()
             thread.wait(3500)
 
-    def shutdown(self) -> None:
-        """Stop Sound-owned workers and native multimedia resources once."""
-        if getattr(self, "_shutdown_complete", False):
-            return
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._stop_background_threads()
         self.player.shutdown()
         self._preview.shutdown()
@@ -1729,10 +1787,6 @@ class SoundTab(QtWidgets.QWidget):
                 self._analysis.shutdown()
             except Exception:
                 pass
-        self._shutdown_complete = True
-
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self.shutdown()
         super().closeEvent(event)
 
 
