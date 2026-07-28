@@ -14,6 +14,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6 import QtWidgets
+from PySide6.QtCore import Qt
 
 import Forge_Tab
 import generate
@@ -246,6 +247,13 @@ class ForgeWorkflowTests(unittest.TestCase):
         )
         self.assertFalse(hasattr(tab, "generate_btn"))
         self.assertFalse(hasattr(tab, "seal_btn"))
+        self.assertEqual(tab.saved_panel.maximumWidth(), 820)
+        self.assertIs(
+            tab.published_url.parentWidget(),
+            tab.identity_panel,
+        )
+        self.assertEqual(tab.heading_title.alignment(), Qt.AlignCenter)
+        self.assertIsNotNone(tab.preview_format_panel)
         visible = {
             key
             for key, button in tab.readiness_window._missing_buttons.items()

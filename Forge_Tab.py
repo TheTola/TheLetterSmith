@@ -257,31 +257,45 @@ class ForgeTab(QtWidgets.QWidget):
             "QComboBox:focus,QLineEdit:focus{border-color:#00d2ef;}"
         )
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(28, 14, 28, 16)
-        layout.setSpacing(10)
+        self._main_layout = QtWidgets.QVBoxLayout(self)
+        self._main_layout.setContentsMargins(72, 20, 72, 12)
+        self._main_layout.setSpacing(8)
 
         heading_row = QtWidgets.QHBoxLayout()
+        heading_row.setContentsMargins(0, 0, 0, 6)
         heading_row.setSpacing(10)
-        title = QtWidgets.QLabel("Forge")
-        title.setStyleSheet("color:#00d4f4;font:700 18pt 'Segoe UI';")
-        heading_row.addWidget(title)
+        self._heading_balance = QtWidgets.QWidget()
+        heading_row.addWidget(self._heading_balance)
         heading_row.addStretch(1)
+        self.heading_title = QtWidgets.QLabel("Forge")
+        self.heading_title.setAlignment(Qt.AlignCenter)
+        self.heading_title.setStyleSheet(
+            "color:#00d4f4;font:700 18pt 'Segoe UI';"
+        )
+        heading_row.addWidget(self.heading_title)
+        heading_row.addStretch(1)
+
+        self._readiness_controls = QtWidgets.QWidget()
+        readiness_row = QtWidgets.QHBoxLayout(self._readiness_controls)
+        readiness_row.setContentsMargins(0, 0, 0, 0)
+        readiness_row.setSpacing(10)
         self.readiness_summary = QtWidgets.QLabel()
         self.readiness_summary.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        heading_row.addWidget(self.readiness_summary)
+        readiness_row.addWidget(self.readiness_summary)
         self.readiness_btn = self._small_button("Review Readiness")
         self.readiness_btn.clicked.connect(self.show_readiness_window)
-        heading_row.addWidget(self.readiness_btn)
-        layout.addLayout(heading_row)
+        readiness_row.addWidget(self.readiness_btn)
+        heading_row.addWidget(self._readiness_controls)
+        self._main_layout.addLayout(heading_row)
 
-        saved_panel = QtWidgets.QFrame()
-        saved_panel.setObjectName("ForgeSavedPanel")
-        saved_panel.setStyleSheet(
+        self.saved_panel = QtWidgets.QFrame()
+        self.saved_panel.setObjectName("ForgeSavedPanel")
+        self.saved_panel.setMaximumWidth(820)
+        self.saved_panel.setStyleSheet(
             "QFrame#ForgeSavedPanel{background:#101820;"
             "border:1px solid #284554;border-radius:7px;}"
         )
-        saved_row = QtWidgets.QHBoxLayout(saved_panel)
+        saved_row = QtWidgets.QHBoxLayout(self.saved_panel)
         saved_row.setContentsMargins(10, 8, 10, 8)
         saved_row.setSpacing(8)
         saved_row.addWidget(QtWidgets.QLabel("Saved letter"))
@@ -303,15 +317,22 @@ class ForgeTab(QtWidgets.QWidget):
         self.refresh_saved_btn = self._small_button("Refresh")
         self.refresh_saved_btn.clicked.connect(self.refresh_saved_letters)
         saved_row.addWidget(self.refresh_saved_btn)
-        layout.addWidget(saved_panel)
 
-        identity = QtWidgets.QFrame()
-        identity.setObjectName("ForgeIdentity")
-        identity.setStyleSheet(
+        saved_holder = QtWidgets.QHBoxLayout()
+        saved_holder.setContentsMargins(0, 0, 0, 0)
+        saved_holder.addStretch(1)
+        saved_holder.addWidget(self.saved_panel, 1)
+        saved_holder.addStretch(1)
+        self._main_layout.addLayout(saved_holder)
+
+        self.identity_panel = QtWidgets.QFrame()
+        self.identity_panel.setObjectName("ForgeIdentity")
+        self.identity_panel.setMaximumWidth(1510)
+        self.identity_panel.setStyleSheet(
             "QFrame#ForgeIdentity{background:#111921;"
             "border:1px solid #253d49;border-radius:7px;}"
         )
-        identity_row = QtWidgets.QHBoxLayout(identity)
+        identity_row = QtWidgets.QHBoxLayout(self.identity_panel)
         identity_row.setContentsMargins(10, 7, 10, 7)
         identity_row.setSpacing(10)
         identity_row.addWidget(self._muted_label("Title"))
@@ -324,11 +345,40 @@ class ForgeTab(QtWidgets.QWidget):
             "color:#f2fbff;font:600 10pt 'Segoe UI';"
         )
         identity_row.addWidget(self.identity_recipient, 1)
-        layout.addWidget(identity)
+        identity_row.addWidget(self._muted_label("Published URL"))
+        self.published_url = QtWidgets.QLineEdit()
+        self.published_url.setReadOnly(True)
+        self.published_url.setMaximumWidth(380)
+        self.published_url.setPlaceholderText(
+            "Save the deployed URL in Message after publishing"
+        )
+        identity_row.addWidget(self.published_url, 1)
+        self.copy_link_btn = self._small_button("Copy Published Link")
+        self.copy_link_btn.clicked.connect(self.copy_published_link)
+        identity_row.addWidget(self.copy_link_btn)
 
-        format_row = QtWidgets.QHBoxLayout()
+        identity_holder = QtWidgets.QHBoxLayout()
+        identity_holder.setContentsMargins(0, 0, 0, 0)
+        identity_holder.addStretch(1)
+        identity_holder.addWidget(self.identity_panel, 1)
+        identity_holder.addStretch(1)
+        self._main_layout.addLayout(identity_holder)
+
+        self.preview_format_panel = QtWidgets.QWidget(self)
+        self.preview_format_panel.setObjectName("ForgePreviewFormat")
+        self.preview_format_panel.setFixedWidth(232)
+        self.preview_format_panel.setStyleSheet(
+            "QWidget#ForgePreviewFormat{background:transparent;}"
+            "QComboBox{background:#121b23;color:#e8f9ff;"
+            "border:1px solid #00d2ef;border-radius:6px;padding:6px 8px;}"
+            "QComboBox:focus{border-color:#8defff;}"
+        )
+        format_row = QtWidgets.QHBoxLayout(self.preview_format_panel)
+        format_row.setContentsMargins(0, 0, 0, 0)
+        format_row.setSpacing(8)
         format_row.addWidget(self._muted_label("Preview format"))
         self.preview_mode = QtWidgets.QComboBox()
+        self.preview_mode.setMinimumWidth(132)
         for label, mode in PREVIEW_MODES:
             self.preview_mode.addItem(label, mode)
         current = self.preview_mode.findData(self._preview_mode)
@@ -337,8 +387,6 @@ class ForgeTab(QtWidgets.QWidget):
             self._preview_mode_changed
         )
         format_row.addWidget(self.preview_mode)
-        format_row.addStretch(1)
-        layout.addLayout(format_row)
 
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(10)
@@ -346,41 +394,18 @@ class ForgeTab(QtWidgets.QWidget):
             "Preview Letter", "#b86600", "#f09b18"
         )
         self.preview_btn.clicked.connect(self.preview_letter)
-        actions.addWidget(self.preview_btn)
+        actions.addWidget(self.preview_btn, 4)
         self.publish_btn = self._action_button(
             "Publish Letter", "#5a45bb", "#7c67de"
         )
         self.publish_btn.clicked.connect(self.publish_letter)
-        actions.addWidget(self.publish_btn)
+        actions.addWidget(self.publish_btn, 4)
         self.open_published_btn = self._action_button(
             "Open Published Letter", "#17232d", "#426070"
         )
         self.open_published_btn.clicked.connect(self.open_published_letter)
-        actions.addWidget(self.open_published_btn)
-        layout.addLayout(actions)
-
-        share = QtWidgets.QFrame()
-        share.setObjectName("ForgeShare")
-        share.setStyleSheet(
-            "QFrame#ForgeShare{background:#101820;border:1px solid #284554;"
-            "border-radius:7px;}"
-        )
-        share_layout = QtWidgets.QHBoxLayout(share)
-        share_layout.setContentsMargins(10, 8, 10, 8)
-        share_layout.setSpacing(8)
-        share_layout.addWidget(self._muted_label("Published URL"))
-        self.published_url = QtWidgets.QLineEdit()
-        self.published_url.setReadOnly(True)
-        self.published_url.setMaximumWidth(620)
-        self.published_url.setPlaceholderText(
-            "Save the deployed URL in Message after publishing"
-        )
-        share_layout.addWidget(self.published_url, 1)
-        self.copy_link_btn = self._small_button("Copy Published Link")
-        self.copy_link_btn.clicked.connect(self.copy_published_link)
-        share_layout.addWidget(self.copy_link_btn)
-        share_layout.addStretch(1)
-        layout.addWidget(share)
+        actions.addWidget(self.open_published_btn, 3)
+        self._main_layout.addLayout(actions)
 
         self.status = _StatusLabel()
         self.status.setObjectName("ForgeStatus")
@@ -391,8 +416,30 @@ class ForgeTab(QtWidgets.QWidget):
         self.status.setStyleSheet(
             "QLabel#ForgeStatus{color:#a9c4cf;padding:3px 2px;}"
         )
-        layout.addWidget(self.status)
-        layout.addStretch(1)
+        self._main_layout.addWidget(self.status)
+        self._main_layout.addStretch(1)
+
+    def _sync_heading_balance(self) -> None:
+        self._heading_balance.setFixedWidth(
+            self._readiness_controls.sizeHint().width()
+        )
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        side_margin = min(104, max(24, int(self.width() * 0.055)))
+        self._main_layout.setContentsMargins(
+            side_margin,
+            20,
+            side_margin,
+            12,
+        )
+        identity_width = max(
+            0,
+            min(1510, self.width() - (side_margin * 2)),
+        )
+        if identity_width:
+            self.identity_panel.setFixedWidth(identity_width)
+        self._sync_heading_balance()
+        super().resizeEvent(event)
 
     @staticmethod
     def _muted_label(text: str) -> QtWidgets.QLabel:
@@ -477,6 +524,7 @@ class ForgeTab(QtWidgets.QWidget):
         self.readiness_summary.setStyleSheet(
             f"color:{color};font:600 10pt 'Segoe UI';"
         )
+        self._sync_heading_balance()
         self.preview_btn.setEnabled(not self._busy and result.can_preview)
         self.publish_btn.setEnabled(not self._busy and result.can_publish)
         return result

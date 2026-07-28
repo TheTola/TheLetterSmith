@@ -486,6 +486,7 @@ class Nexus(QtWidgets.QMainWindow):
         help_row.setContentsMargins(0, 0, 0, 0)
         help_row.setSpacing(0)
         help_row.addStretch(1)
+        self.preview_tools_layout = help_row
 
         self.help_icon = QLabel()
         self.help_icon.setObjectName("HelpIcon")
@@ -577,6 +578,13 @@ class Nexus(QtWidgets.QMainWindow):
         self.message_tab = MessageTab(self.project_root)
         self.forge_tab   = ForgeTab(self.project_root)
         self.command_tab = CommandTab(self.project_root)
+        self.preview_tools_layout.insertWidget(
+            0,
+            self.forge_tab.preview_format_panel,
+            0,
+            Qt.AlignLeft | Qt.AlignVCenter,
+        )
+        self.forge_tab.preview_format_panel.setVisible(False)
 
         # Feature pages are wrapped in explicit surfaces. This prevents Nexus's
         # outer gray from bleeding through transparent child widgets. Sound gets
@@ -953,6 +961,8 @@ class Nexus(QtWidgets.QMainWindow):
         self.preview_stack.setCurrentIndex(0)
         self.preview_caption.setVisible(False)
         self.preview_frame.setVisible(idx != 4)
+        self.forge_tab.preview_format_panel.setVisible(idx == 3)
+        self._update_preview_tools_geometry()
 
         if animate_page and self._tabswitch is not None:
             self._tabswitch.go_to(idx)
@@ -995,6 +1005,15 @@ class Nexus(QtWidgets.QMainWindow):
                 self._reposition_help_popover()
 
         QtCore.QTimer.singleShot(0, self._update_preview_geometry)
+
+    def _update_preview_tools_geometry(self) -> None:
+        forge_visible = self.tabbar.currentIndex() == 3
+        left_margin = (
+            max(0, int(self.width() * 0.085))
+            if forge_visible
+            else 0
+        )
+        self.preview_tools_layout.setContentsMargins(left_margin, 0, 0, 0)
 
     def _stop_shared_tab_animation(self) -> None:
         """Stop and clean the ordinary TabSwitcher without starting another."""
@@ -1402,6 +1421,7 @@ class Nexus(QtWidgets.QMainWindow):
 
     def resizeEvent(self, event):
         self._update_preview_geometry()
+        self._update_preview_tools_geometry()
 
         # Reposition any visible toast
         if self._toast.isVisible():
