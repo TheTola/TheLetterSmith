@@ -1020,12 +1020,12 @@ class ForgeTab(QtWidgets.QWidget):
             if not publisher.is_configured():
                 configured = publisher.configure(None)
                 if not configured.configured:
-                    message = (
+                    configuration_message = (
                         "Publishing requires GitHub CLI or a configured Git "
                         "remote. The local letter was generated successfully."
                     )
                     if configured.message:
-                        message = (
+                        configuration_message = (
                             f"{configured.message} "
                             "The local letter was generated successfully."
                         )
@@ -1033,7 +1033,10 @@ class ForgeTab(QtWidgets.QWidget):
                         play_path,
                         readiness,
                         metadata,
-                        PublishResult(False, message=message),
+                        PublishResult(
+                            False,
+                            message=configuration_message,
+                        ),
                     )
             publish_result = publisher.publish(play_path, metadata)
             return play_path, readiness, metadata, publish_result
