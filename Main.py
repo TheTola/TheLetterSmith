@@ -4,7 +4,8 @@
 """
 Letter Smith — Application Entry Point (Clean, Non-Legacy)
 
-This file exists to:
+This file is intentionally boring.
+It exists to:
   1) Put the process in a known-good execution state (root, sys.path).
   2) Bring up Qt safely (one QApplication, proper app identity, icon).
   3) Make crashes impossible to miss (console traceback + modal dialog).
@@ -15,27 +16,22 @@ What does NOT belong here:
   - Asset processing / base64 packing / build automation
   - Any filesystem mutation beyond "set CWD" and reading settings
 
+If you ever feel tempted to add "just one more helper" here:
+  - Put it in the module that owns the feature.
+  - Keep this entrypoint as pure orchestration.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
-from PySide6 import QtCore, QtWidgets
-
-from app_icon import (
-    apply_qt_window_icon,
-    build_qt_icon,
-    configure_windows_app_identity,
-    resolve_app_icon,
-)
-from editor_diagnostics import record_editor_failure
-from settings_store import SettingsStore
+from PySide6 import QtCore, QtGui, QtWidgets
 
 
 # =============================================================================
@@ -126,8 +122,12 @@ def load_settings(root: Path) -> dict:
         not core behavior that could surprise users.
     """
 
+    path = root / SETTINGS_FILE
+    if not path.exists():
+        return {}
+
     try:
-        return SettingsStore(root).as_dict()
+        return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
     except Exception:
         return {}
 
@@ -204,11 +204,13 @@ def pick_icon(root: Path, settings: dict) -> Optional[Path]:
     Returns the best icon file path, or None.
 
     Supports an explicit override:
-      settings.json: { "app_icon": "relative/or/absolute/path/to.png" }
+      settings.json: { "app_icon": "relative/or/absolute/path/to.ico" }
 
     If override is missing/invalid, use conventional project fallbacks.
-    PNG is preferred for Qt rendering; the matching ICO remains available for
-    native Windows surfaces and packaging.
+
+    Notes:
+      - Windows expects .ico for application icons.
+      - The selection order should match your canonical convention.
     """
     override = settings.get("app_icon")
     if isinstance(override, str) and override.strip():
@@ -220,10 +222,21 @@ def pick_icon(root: Path, settings: dict) -> Optional[Path]:
             return p
         logging.info(f"[Icon] Override not found: {p}")
 
-    icon = resolve_app_icon(root, prefer_png=True)
-    if icon is not None:
-        logging.info(f"[Icon] Using: {icon}")
-        return icon
+    candidates: Tuple[Path, ...] = (
+        # preferred canonical path
+        root / "gallery" / "icon" / "ls-icon.ico",
+        # compatibility fallbacks
+        root / "gallery" / "icon" / "LSmith.ico",
+        root / "gallery" / "icons" / "LSmith.ico",
+        root / "gallery" / "icons" / "ls-icon.ico",
+        root / "gallery" / "app" / "icons" / "folder" / "LSmith.ico",
+        root / "gallery" / "app" / "icons" / "folder" / "LSmith.png",
+    )
+
+    for p in candidates:
+        if p.exists():
+            logging.info(f"[Icon] Using: {p}")
+            return p
 
     logging.info("[Icon] No icon found (default will be used).")
     return None
@@ -254,9 +267,7 @@ def bootstrap_qt(icon: Optional[Path]) -> QtWidgets.QApplication:
     app.setOrganizationDomain(ORG_DOMAIN)
 
     if icon and icon.exists():
-        app_icon = build_qt_icon(icon)
-        if not app_icon.isNull():
-            app.setWindowIcon(app_icon)
+        app.setWindowIcon(QtGui.QIcon(str(icon)))
 
     return app
 
@@ -276,7 +287,7 @@ def _show_critical(title: str, message: str) -> None:
         pass
 
 
-def install_exception_hook(app_name: str, project_root: Path) -> None:
+def install_exception_hook(app_name: str) -> None:
     """
     Makes exceptions visible.
 
@@ -308,20 +319,11 @@ def install_exception_hook(app_name: str, project_root: Path) -> None:
         logging.error("[Crash] Unhandled exception:")
         logging.error(trace.rstrip())
 
-        log_note = "A traceback was printed to the console."
-        try:
-            active_widget = QtWidgets.QApplication.activeModalWidget()
-            if active_widget is not None and active_widget.__class__.__name__ == "Editor":
-                log_path = record_editor_failure(project_root, "unhandled editor action", exc)
-                log_note = f"Details were written to:\n{log_path}"
-        except Exception:
-            pass
-
         _show_critical(
             f"{app_name} — Crash",
             "An unexpected error occurred:\n\n"
             f"{exc}\n\n"
-            f"{log_note}"
+            "A traceback was printed to the console."
         )
 
     sys.excepthook = _hook
@@ -364,9 +366,8 @@ def main() -> None:
     icon = pick_icon(root, settings)
     log_startup(root, icon, settings)
 
-    configure_windows_app_identity()
     app = bootstrap_qt(icon)
-    install_exception_hook(APP_NAME, root)
+    install_exception_hook(APP_NAME)
 
 
     # Late import:
@@ -381,7 +382,6 @@ def main() -> None:
         raise
 
     win = Nexus(root)
-    apply_qt_window_icon(win, root, fallback_path=icon)
     win.show()
 
     try:

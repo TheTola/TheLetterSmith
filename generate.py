@@ -7,22 +7,22 @@
 #       index.html, styles.css, script.js
 #       gallery/
 #         pages/      (cover/letter/wall/back)
-#         controls/   (npage/ppage/cleft/cright/R_cleft/R_cright/volon/voloff/showmessageicon)
+#         controls/   (npage/ppage/cleft/cright/volon/voloff/showmessageicon)
 #         message/    (message.html, message.png optional)
-#         sounds/     (music, glissando, flip1..flip10)
+#         sounds/     (single track or playlist, glissando, flip1..flip10)
 #
 # Source-of-truth on disk:
 #   User content:
 #     gallery/user/pages
 #     gallery/user/card/controls
 #     gallery/user/message
-#     gallery/user/sounds/music.mp3        (user-selected music)
+#     gallery/user/sounds/appssong/        (archive + project sound manifest)
 #   App-owned SFX (immutable):
 #     gallery/app/sounds/glissando.mp3
 #     gallery/app/sounds/flip1..flip10.mp3
 #
 # Improvements applied:
-#   1) Auto-seed SFX into the build (app path preferred; fallback to user sounds if enabled)
+#   1) Seed required SFX exclusively from the app-owned sound directory
 #   2) Atomic copy on Windows (copy -> tmp -> os.replace) for robustness
 #   3) Strict template placeholder validation (fail fast if Template drift occurs)
 #
@@ -33,56 +33,32 @@
 
 from __future__ import annotations
 
+import html as _html
 import json
 import os
-import re
 import shutil
-import time
+import tempfile
 import webbrowser
-import html as html_lib
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Iterable
+from typing import Optional
 
-from audio_export import _export_apple_safe_mp3
 from Template import TEMPLATE_HTML, TEMPLATE_CSS, TEMPLATE_JS
-from curtain_color import (
-    FALLBACK_CURTAIN_RGB,
-    extract_deep_dominant_color_from_images,
-    write_tinted_curtain_image,
-)
-from font_export import FontExportError, build_embedded_font_payload
-from playlist import CROSSFADE_MS, PlaylistStore, playlist_payload
-from settings_store import SettingsStore
-from transactional_io import PathTransaction
-from message_html import (
-    message_html_has_content,
-    normalize_message_fragment,
-    read_text_normalized,
+from sound_model import (
+    BUILD_SOUND_MANIFEST_NAME,
+    build_sound_manifest,
+    resolve_project_tracks,
+    resolve_track_path,
 )
 from config import (
-    PUBLISHED_PAGE_URL_KEY,
-    PLAY_METADATA_FILE,
+    SETTINGS_FILE,
     DEFAULT_VOLUME,
-    CURTAIN_STYLE_KEY,
-    CURTAIN_STYLE_WHITE,
-    CURTAIN_STYLE_AVERAGE,
-    CURTAIN_STYLE_COMPLEMENTARY,
-    DEFAULT_CURTAIN_STYLE,
-    VALID_CURTAIN_STYLES,
+    STARTING_VOLUME,
     ensure_output_dirs,
     plan_build,
-    play_bundle_path,
     validate_required_images,
     validate_controls,
-    GALLERY_DIR,
-    PAGES_DIR,
-    CONTROLS_DIR,
-    SOUNDS_DIR,
     USER_PAGES_DIR,
     USER_CONTROLS_DIR,
-    USER_MESSAGE_DIR,
-    USER_SOUNDS_DIR,
     REQUIRED_SLIDES,
     CONTROL_FILES,
     MESSAGE_HTML_FILE,
@@ -95,14 +71,6 @@ from config import (
 
 # App-owned SFX live here (relative to project root)
 APP_SOUNDS_DIR = Path("gallery") / "app" / "sounds"
-CURTAIN_FILES = {"cleft.png", "cright.png"}
-CURTAIN_ANALYSIS_PAGE_ORDER = ("wall.png", "cover.png", "letter.png", "back.png")
-_LAST_FONT_EXPORT_REPORT: dict[str, tuple[str, ...]] = {
-    "embedded": (),
-    "files": (),
-    "fallback": (),
-    "restricted": (),
-}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,30 +83,37 @@ class TemplateDriftError(RuntimeError):
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+def _unique_temp_path(destination: Path, suffix: str = ".tmp") -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=suffix, dir=str(destination.parent)
+    )
+    os.close(fd)
+    return Path(name)
+
+
 def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding=encoding)
-    os.replace(tmp, path)
+    destination = Path(path).resolve()
+    tmp = _unique_temp_path(destination)
+    try:
+        tmp.write_text(text, encoding=encoding)
+        os.replace(tmp, destination)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _atomic_copy_file(src: Path, dst: Path) -> None:
-    """
-    Windows-safe atomic copy:
-      - copy to dst.tmp
-      - os.replace(tmp, dst)
-    """
-    src = Path(src)
-    dst = Path(dst)
-    if not src.is_file():
-        raise FileNotFoundError(f"Missing required asset: {src}")
+    source = Path(src).resolve()
+    destination = Path(dst).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Missing required asset: {source}")
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(dst.suffix + ".tmp")
-
-    # copy2 preserves mtime/metadata; good for deterministic debugging
-    shutil.copy2(src, tmp)
-    os.replace(tmp, dst)
+    tmp = _unique_temp_path(destination)
+    try:
+        shutil.copy2(source, tmp)
+        os.replace(tmp, destination)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _copy_required_files(src_dir: Path, dst_dir: Path, names: list[str]) -> None:
@@ -151,106 +126,38 @@ def _copy_required_files(src_dir: Path, dst_dir: Path, names: list[str]) -> None
 
 def _read_text_safe(path: Path) -> str:
     try:
-        return read_text_normalized(path)
-    except Exception:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
         return ""
 
 
 def _load_settings(project_root: Path) -> dict:
-    return SettingsStore(project_root).as_dict()
+    path = project_root / SETTINGS_FILE
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _recipient_from_settings(settings: dict) -> str:
-    v = (settings.get("recipient_name") or "Friend").strip()
-    return v or "Friend"
+    value = str(settings.get("recipient_name") or "Friend").strip()
+    return value or "Friend"
 
 
 def _title_from_settings(settings: dict, recipient: str) -> str:
-    v = (settings.get("recipient_title") or f"Letter for {recipient}").strip()
-    return v or f"Letter for {recipient}"
+    value = str(settings.get("recipient_title") or f"Letter for {recipient}").strip()
+    return value or f"Letter for {recipient}"
 
 
 def _starting_volume_from_settings(settings: dict) -> int:
     try:
-        v = int(settings.get("starting_volume", DEFAULT_VOLUME))
+        v = int(settings.get("starting_volume", STARTING_VOLUME if isinstance(STARTING_VOLUME, int) else DEFAULT_VOLUME))
     except Exception:
         v = DEFAULT_VOLUME
     return max(0, min(100, v))
-
-
-def _curtain_style_from_settings(settings: dict) -> str:
-    style = str(settings.get(CURTAIN_STYLE_KEY, DEFAULT_CURTAIN_STYLE)).strip().lower()
-    aliases = {
-        "white": CURTAIN_STYLE_WHITE,
-        "pure white": CURTAIN_STYLE_WHITE,
-        "pure_white": CURTAIN_STYLE_WHITE,
-        "blank": CURTAIN_STYLE_WHITE,
-        "original": CURTAIN_STYLE_WHITE,
-        "average": CURTAIN_STYLE_AVERAGE,
-        "average color": CURTAIN_STYLE_AVERAGE,
-        "average_color": CURTAIN_STYLE_AVERAGE,
-        "common": CURTAIN_STYLE_AVERAGE,
-        "common color": CURTAIN_STYLE_AVERAGE,
-        "complementary": CURTAIN_STYLE_COMPLEMENTARY,
-        "complementary average": CURTAIN_STYLE_COMPLEMENTARY,
-        "complementary average color": CURTAIN_STYLE_COMPLEMENTARY,
-        "complementary_average_color": CURTAIN_STYLE_COMPLEMENTARY,
-    }
-    style = aliases.get(style, style)
-    return style if style in VALID_CURTAIN_STYLES else DEFAULT_CURTAIN_STYLE
-
-
-def _curtain_analysis_paths(project_root: Path) -> list[Path]:
-    pages_dir = project_root / USER_PAGES_DIR
-    return [pages_dir / name for name in CURTAIN_ANALYSIS_PAGE_ORDER]
-
-
-def _curtain_rgb_for_style(project_root: Path, settings: dict) -> tuple[str, tuple[int, int, int]]:
-    style = _curtain_style_from_settings(settings)
-    if style == CURTAIN_STYLE_WHITE:
-        return style, FALLBACK_CURTAIN_RGB
-
-    hue_shift = 0.5 if style == CURTAIN_STYLE_COMPLEMENTARY else 0.0
-    rgb = extract_deep_dominant_color_from_images(_curtain_analysis_paths(project_root), hue_shift=hue_shift)
-    return style, rgb
-
-
-def _copy_control_files(
-    src_dir: Path,
-    dst_dir: Path,
-    names: list[str],
-    *,
-    curtain_rgb: tuple[int, int, int],
-) -> None:
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    for name in names:
-        src = src_dir / name
-        dst = dst_dir / name
-        if name in CURTAIN_FILES:
-            write_tinted_curtain_image(src, dst, curtain_rgb)
-        else:
-            _atomic_copy_file(src, dst)
-
-
-def _write_play_metadata(
-    play_dir: Path,
-    *,
-    settings: dict,
-    recipient: str,
-    title: str,
-    curtain_style: str,
-    curtain_rgb: tuple[int, int, int],
-    playlist: dict,
-) -> None:
-    metadata = {
-        "recipient_name": recipient,
-        "recipient_title": title,
-        PUBLISHED_PAGE_URL_KEY: str(settings.get(PUBLISHED_PAGE_URL_KEY, "")).strip(),
-        CURTAIN_STYLE_KEY: curtain_style,
-        "curtain_rgb": list(curtain_rgb),
-        "playlist": playlist,
-    }
-    _atomic_write_text(play_dir / PLAY_METADATA_FILE, json.dumps(metadata, indent=2))
 
 
 MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
@@ -265,13 +172,10 @@ MESSAGE_OVERLAY_PRESETS: dict[str, tuple[tuple[int, int, int], str]] = {
 }
 
 
-def _message_overlay_preset_from_settings(settings: dict) -> str:
-    preset = str(settings.get(MESSAGE_OVERLAY_PRESET_KEY, DEFAULT_MESSAGE_OVERLAY_PRESET)).strip().lower()
-    return preset if preset in MESSAGE_OVERLAY_PRESETS else DEFAULT_MESSAGE_OVERLAY_PRESET
-
-
 def _message_overlay_style_from_settings(settings: dict) -> str:
-    preset = _message_overlay_preset_from_settings(settings)
+    preset = str(settings.get(MESSAGE_OVERLAY_PRESET_KEY, DEFAULT_MESSAGE_OVERLAY_PRESET)).strip().lower()
+    if preset not in MESSAGE_OVERLAY_PRESETS:
+        preset = DEFAULT_MESSAGE_OVERLAY_PRESET
 
     try:
         opacity = int(settings.get(MESSAGE_OVERLAY_OPACITY_KEY, DEFAULT_MESSAGE_OVERLAY_OPACITY))
@@ -291,53 +195,23 @@ def _message_overlay_style_from_settings(settings: dict) -> str:
     )
 
 
-def _message_overlay_html(message_html: str, overlay_style: str) -> str:
-    return (
-        '<button id="close-text" class="hud-button hud-button-close" type="button" '
-        'title="Close Text" aria-label="Close message" aria-controls="textWall">&times;</button>\n'
-        f'      <div class="text-wall" id="textWall" role="dialog" aria-modal="false" '
-        f'aria-label="Message text" aria-hidden="true" tabindex="-1" style="{overlay_style}">\n'
-        f'        <div class="text-wall-content" id="textWallContent">{message_html}</div>\n'
-        f'      </div>'
-    )
-
-
-def _message_button_html() -> str:
-    return (
-        '<button id="open-text" class="hud-button hud-button-icon" type="button" '
-        'title="Show Message" aria-label="Show message" aria-controls="textWall" '
-        'aria-expanded="false" aria-hidden="true">\n'
-        '      <img src="gallery/controls/showmessageicon.png" alt="" aria-hidden="true" decoding="async">\n'
-        '    </button>'
-    )
+def _require_file(path: Path, *, what: str, expected_rel_hint: Optional[str] = None) -> None:
+    if path.is_file():
+        return
+    hint = f"\nExpected: {expected_rel_hint}" if expected_rel_hint else ""
+    raise FileNotFoundError(f"Missing {what}: {path}{hint}")
 
 
 def _validate_template_placeholders() -> None:
     """
     Fail fast if Template.py changes and placeholders drift.
     """
-    required = (
-        "{{TITLE}}",
-        "{{BUILD_ID}}",
-        "{{INITIAL_VOLUME}}",
-        "{{HAS_MESSAGE}}",
-        "{{MESSAGE_OVERLAY_HTML}}",
-        "{{MESSAGE_BUTTON_HTML}}",
-        "{{MESSAGE_OVERLAY_PRESET}}",
-    )
+    required = ("{{TITLE}}", "{{MESSAGE_HTML}}", "{{INITIAL_VOLUME}}", "{{MESSAGE_OVERLAY_STYLE}}", "{{MUSIC_PLAYLIST_JSON}}", "{{MUSIC_CROSSFADE_MS}}", "{{MUSIC_PRELOAD_HTML}}")
     missing = [k for k in required if k not in TEMPLATE_HTML]
     if missing:
         raise TemplateDriftError(
             "Template drift detected: TEMPLATE_HTML is missing placeholder(s): "
             + ", ".join(missing)
-        )
-
-    required_js = ("{{BUILD_ID}}", "{{PLAYLIST_JSON}}")
-    missing_js = [k for k in required_js if k not in TEMPLATE_JS]
-    if missing_js:
-        raise TemplateDriftError(
-            "Template drift detected: TEMPLATE_JS is missing placeholder(s): "
-            + ", ".join(missing_js)
         )
 
     # Optional sanity checks (non-fatal, but good to catch major layout change)
@@ -353,85 +227,35 @@ def _sfx_names() -> list[str]:
     return names
 
 
-def _pick_first_existing(candidates: Iterable[Path]) -> Optional[Path]:
-    for p in candidates:
-        if p.is_file():
-            return p
-    return None
-
-
-def _seed_sfx_into_build(
-    *,
-    project_root: Path,
-    sounds_dst: Path,
-    seed_sfx: bool,
-    allow_user_sfx_fallback: bool,
-) -> None:
-    """
-    Always writes SFX into the Play bundle's gallery/sounds/.
-
-    Priority:
-      1) gallery/app/sounds/<sfx>
-      2) (optional fallback) gallery/user/sounds/<sfx>   [legacy location]
-
-    This NEVER writes back into gallery/app/sounds.
-    """
+def _seed_sfx_into_build(*, project_root: Path, sounds_dst: Path, seed_sfx: bool) -> None:
+    """Copy required sound effects from the app-owned source directory."""
     if not seed_sfx:
         return
 
     app_sounds = project_root / APP_SOUNDS_DIR
-    user_sounds = project_root / USER_SOUNDS_DIR
-
-    missing: list[str] = []
+    missing = [name for name in _sfx_names() if not (app_sounds / name).is_file()]
+    if missing:
+        lines = [
+            "Missing required app sound effects:",
+            *[f"  - {name}" for name in missing],
+            "",
+            f"Expected directory: {app_sounds}",
+        ]
+        raise FileNotFoundError("\n".join(lines))
 
     for name in _sfx_names():
-        src = _pick_first_existing(
-            [
-                app_sounds / name,
-                (user_sounds / name) if allow_user_sfx_fallback else Path("__disabled__"),
-            ]
-        )
-        if src is None:
-            missing.append(name)
-            continue
-
-        try:
-            _export_apple_safe_mp3(src, sounds_dst / name)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to prepare app SFX for Play build ({name}): {exc}") from exc
-
-    if missing:
-        # Produce a concrete, actionable error message
-        lines = [
-            "Missing required SFX for Play build:",
-            *[f"  - {m}" for m in missing],
-            "",
-            "Provide them here (preferred):",
-            f"  - {APP_SOUNDS_DIR.as_posix()}/",
-        ]
-        if allow_user_sfx_fallback:
-            lines += [
-                "",
-                "Fallback (legacy) path was also checked:",
-                f"  - {Path(USER_SOUNDS_DIR).as_posix()}/",
-            ]
-        raise FileNotFoundError("\n".join(lines))
+        _atomic_copy_file(app_sounds / name, sounds_dst / name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
-def get_last_font_export_report() -> dict[str, tuple[str, ...]]:
-    return dict(_LAST_FONT_EXPORT_REPORT)
-
-
-def _generate_play_bundle_contents(
+def generate_play_bundle(
     project_root: str,
     *,
     message_html: Optional[str] = None,
+    open_in_browser: bool = False,
     seed_sfx: bool = True,
-    allow_user_sfx_fallback: bool = True,
-    play_dir_override: Optional[Path] = None,
 ) -> Path:
     """
     Build the Play bundle at:
@@ -446,8 +270,6 @@ def _generate_play_bundle_contents(
 
     Returns the play folder path.
     """
-    global _LAST_FONT_EXPORT_REPORT
-
     pr = Path(project_root)
     ensure_output_dirs(pr)
 
@@ -469,28 +291,18 @@ def _generate_play_bundle_contents(
             f"Expected files: {CONTROL_FILES}"
         )
 
-    # User music is optional. A legacy music.mp3 is migrated to one playlist entry.
-    playlist_store = PlaylistStore(pr)
-    playlist = playlist_store.load()
-    playlist_sources = playlist_store.resolve_all(playlist)
-    has_user_music = bool(playlist_sources)
-    build_id = str(int(time.time()))
+    # Resolve the current project's explicit sound mode. Music is optional;
+    # a project with no selected track exports silently instead of failing.
+    sound_state, sound_tracks = resolve_project_tracks(pr)
 
     # Settings drive deterministic output path
     settings = _load_settings(pr)
     recipient = _recipient_from_settings(settings)
     title = _title_from_settings(settings, recipient)
     starting_vol = _starting_volume_from_settings(settings)
-    curtain_style, curtain_rgb = _curtain_rgb_for_style(pr, settings)
 
     # Deterministic Play folder (NO timestamp; overwrites same location)
-    bp = plan_build(
-        pr,
-        recipient=recipient,
-        title=title,
-        play_dir=play_dir_override,
-        clear_existing=True,
-    )
+    bp = plan_build(pr, recipient=recipient, title=title)
 
     # Runtime destinations
     pages_dst = bp.play_pages_dir
@@ -506,7 +318,7 @@ def _generate_play_bundle_contents(
 
     # Copy pages/controls (required)
     _copy_required_files(pages_src, pages_dst, REQUIRED_SLIDES)
-    _copy_control_files(controls_src, controls_dst, CONTROL_FILES, curtain_rgb=curtain_rgb)
+    _copy_required_files(controls_src, controls_dst, CONTROL_FILES)
 
     # Copy message files (optional)
     if msg_html_src.is_file():
@@ -514,175 +326,55 @@ def _generate_play_bundle_contents(
     if msg_png_src.is_file():
         _atomic_copy_file(msg_png_src, message_dst / "message.png")
 
-    # Export the active playlist to deterministic runtime names.
-    if has_user_music:
-        runtime_playlist = sounds_dst / "playlist"
-        runtime_playlist.mkdir(parents=True, exist_ok=True)
-        for index, source in enumerate(playlist_sources, start=1):
-            destination = runtime_playlist / f"track-{index:03d}.mp3"
-            try:
-                _export_apple_safe_mp3(source, destination)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to prepare playlist track {index} ({source.name}): {exc}"
-                ) from exc
+    # Copy only the tracks assigned to this letter. The first runtime name
+    # remains music.mp3 for compatibility; additional playlist entries receive
+    # stable numbered names.
+    runtime_music_files: list[str] = []
+    for index, record in enumerate(sound_tracks):
+        runtime_name = MUSIC_FILE if index == 0 else f"music-{index + 1:03d}.mp3"
+        source = resolve_track_path(pr, record)
+        _require_file(source, what=f"processed music for {record.display_title}")
+        _atomic_copy_file(source, sounds_dst / runtime_name)
+        runtime_music_files.append(runtime_name)
 
-        # Keep the established compatibility asset for older saved viewers.
-        try:
-            _export_apple_safe_mp3(playlist_sources[0], sounds_dst / MUSIC_FILE)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to prepare compatibility music.mp3: {exc}") from exc
-
-    # - seed/export SFX into the build (app preferred, optional user fallback)
-    _seed_sfx_into_build(
-        project_root=pr,
-        sounds_dst=sounds_dst,
-        seed_sfx=seed_sfx,
-        allow_user_sfx_fallback=allow_user_sfx_fallback,
+    sound_manifest = build_sound_manifest(sound_state, sound_tracks, runtime_music_files)
+    _atomic_write_text(
+        sounds_dst / BUILD_SOUND_MANIFEST_NAME,
+        json.dumps(sound_manifest, indent=2, ensure_ascii=False),
     )
 
-    viewer_playlist = {
-        "version": 1,
-        "tracks": [
-            {
-                "archive_name": track.archive_name,
-                "src": f"gallery/sounds/playlist/track-{index:03d}.mp3",
-            }
-            for index, track in enumerate(playlist.tracks, start=1)
-        ],
-        "repeat": playlist.repeat,
-        "crossfade_ms": CROSSFADE_MS,
-    }
-    viewer_script = (
-        TEMPLATE_JS
-        .replace("{{BUILD_ID}}", build_id)
-        .replace("{{PLAYLIST_JSON}}", json.dumps(viewer_playlist, indent=2))
-    )
-    _atomic_write_text(bp.play_dir / "script.js", viewer_script)
+    # Copy required app-owned SFX into the build.
+    _seed_sfx_into_build(project_root=pr, sounds_dst=sounds_dst, seed_sfx=seed_sfx)
+
+    # Write CSS/JS
+    _atomic_write_text(bp.play_dir / "styles.css", TEMPLATE_CSS)
+    _atomic_write_text(bp.play_dir / "script.js", TEMPLATE_JS)
 
     # Message HTML injection (prefer passed string, else disk)
     if message_html is None:
         message_html = _read_text_safe(msg_html_src)
 
-    has_message_html = message_html_has_content(message_html or "")
-    message_html = normalize_message_fragment(message_html or "") if has_message_html else ""
-    try:
-        font_result = build_embedded_font_payload(pr, message_html, bp.play_fonts_dir)
-    except FontExportError as error:
-        _LAST_FONT_EXPORT_REPORT = error.report
-        raise
-    _LAST_FONT_EXPORT_REPORT = font_result.report
-    message_html = font_result.html
-    styles_css = TEMPLATE_CSS if not font_result.css else f"{font_result.css}\n\n{TEMPLATE_CSS}"
-    _atomic_write_text(bp.play_dir / "styles.css", styles_css)
-
-    overlay_style = _message_overlay_style_from_settings(settings)
-    has_message_js = "true" if has_message_html else "false"
-
+    playlist_sources = [f"gallery/sounds/{name}" for name in runtime_music_files]
+    preload_html = (
+        f'<link rel="preload" as="audio" href="{playlist_sources[0]}" type="audio/mpeg">'
+        if playlist_sources else ""
+    )
     html = (
         TEMPLATE_HTML
-        .replace("{{TITLE}}", html_lib.escape(title, quote=False))
-        .replace("{{BUILD_ID}}", build_id)
-        .replace("{{HAS_MESSAGE}}", has_message_js)
-        .replace("{{MESSAGE_OVERLAY_HTML}}", _message_overlay_html(message_html, overlay_style) if has_message_html else "")
-        .replace("{{MESSAGE_BUTTON_HTML}}", _message_button_html() if has_message_html else "")
+        .replace("{{TITLE}}", _html.escape(title, quote=True))
+        .replace("{{MESSAGE_HTML}}", message_html or "")
         .replace("{{INITIAL_VOLUME}}", str(starting_vol))
-        .replace("{{MESSAGE_OVERLAY_PRESET}}", _message_overlay_preset_from_settings(settings))
+        .replace("{{MESSAGE_OVERLAY_STYLE}}", _message_overlay_style_from_settings(settings))
+        .replace("{{MUSIC_PLAYLIST_JSON}}", json.dumps(playlist_sources))
+        .replace("{{MUSIC_CROSSFADE_MS}}", str(int(sound_manifest.get("crossfade_ms", 0))))
+        .replace("{{MUSIC_PRELOAD_HTML}}", preload_html)
     )
-
-    if not has_user_music:
-        html = html.replace('data-has-user-music="true"', 'data-has-user-music="false"')
-
     _atomic_write_text(bp.play_dir / "index.html", html)
-    _write_play_metadata(
-        bp.play_dir,
-        settings=settings,
-        recipient=recipient,
-        title=title,
-        curtain_style=curtain_style,
-        curtain_rgb=curtain_rgb,
-        playlist=playlist_payload(playlist),
-    )
-
-    return bp.play_dir
-
-
-def _validate_staged_play_bundle(
-    play_dir: Path,
-    *,
-    has_user_music: bool,
-    seed_sfx: bool,
-) -> None:
-    expected = [
-        play_dir / "index.html",
-        play_dir / "styles.css",
-        play_dir / "script.js",
-        play_dir / PLAY_METADATA_FILE,
-        *[play_dir / GALLERY_DIR / PAGES_DIR / name for name in REQUIRED_SLIDES],
-        *[play_dir / GALLERY_DIR / CONTROLS_DIR / name for name in CONTROL_FILES],
-    ]
-    if has_user_music:
-        expected.append(play_dir / GALLERY_DIR / SOUNDS_DIR / MUSIC_FILE)
-        playlist_assets = tuple(
-            (play_dir / GALLERY_DIR / SOUNDS_DIR / "playlist").glob("track-*.mp3")
-        )
-        if not playlist_assets:
-            raise RuntimeError("Staged Play build has no playlist track assets.")
-    if seed_sfx:
-        expected.extend(
-            play_dir / GALLERY_DIR / SOUNDS_DIR / name
-            for name in _sfx_names()
-        )
-
-    missing = [str(path.relative_to(play_dir)) for path in expected if not path.is_file()]
-    if missing:
-        raise RuntimeError("Staged Play build is incomplete:\n" + "\n".join(f"  - {name}" for name in missing))
-
-    index_html = (play_dir / "index.html").read_text(encoding="utf-8")
-    if "<html" not in index_html.casefold() or "</html>" not in index_html.casefold():
-        raise RuntimeError("Staged index.html is not a complete HTML document.")
-    unresolved = sorted(set(re.findall(r"\{\{[A-Z0-9_]+\}\}", index_html)))
-    if unresolved:
-        raise RuntimeError("Staged index.html contains unresolved placeholders: " + ", ".join(unresolved))
-
-
-def generate_play_bundle(
-    project_root: str,
-    *,
-    message_html: Optional[str] = None,
-    open_in_browser: bool = False,
-    seed_sfx: bool = True,
-    allow_user_sfx_fallback: bool = True,
-) -> Path:
-    pr = Path(project_root).resolve()
-    settings = _load_settings(pr)
-    recipient = _recipient_from_settings(settings)
-    title = _title_from_settings(settings, recipient)
-    final_dir = play_bundle_path(pr, recipient=recipient, title=title)
-    transaction = PathTransaction(final_dir)
-    staging_dir = transaction.prepare()
-
-    try:
-        _generate_play_bundle_contents(
-            str(pr),
-            message_html=message_html,
-            seed_sfx=seed_sfx,
-            allow_user_sfx_fallback=allow_user_sfx_fallback,
-            play_dir_override=staging_dir,
-        )
-        _validate_staged_play_bundle(
-            staging_dir,
-            has_user_music=bool(PlaylistStore(pr).load().tracks),
-            seed_sfx=seed_sfx,
-        )
-        transaction.commit()
-    except Exception:
-        transaction.abort()
-        raise
 
     if open_in_browser:
         try:
-            webbrowser.open((final_dir / "index.html").as_uri())
+            webbrowser.open((bp.play_dir / "index.html").as_uri())
         except Exception:
             pass
-    return final_dir
+
+    return bp.play_dir

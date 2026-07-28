@@ -1,128 +1,157 @@
 from __future__ import annotations
 
-import hashlib
+import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from config import MESSAGE_HTML_FILE, USER_MESSAGE_DIR
-from message_format import message_plain_text
-from transactional_io import atomic_write_text
 
-
-MAX_MESSAGE_REVISIONS = 20
-EXTENDED_EDIT_INTERVAL_SECONDS = 5 * 60
-HISTORY_RELATIVE_PATH = Path(USER_MESSAGE_DIR) / "history"
+REVISION_FOLDER_NAME = "revisions"
+MAX_REVISIONS = 60
 
 
 @dataclass(frozen=True)
 class MessageRevision:
     path: Path
-    timestamp: datetime
-    preview: str
+    created_at: datetime
+    reason: str
+    size_bytes: int
+
+    @property
+    def display_name(self) -> str:
+        stamp = self.created_at.strftime("%b %d, %Y  %I:%M:%S %p")
+        reason = self.reason.replace("_", " ").strip().title()
+        return f"{stamp}  —  {reason}" if reason else stamp
 
 
-class MessageHistory:
-    def __init__(self, project_root: str | Path) -> None:
-        self.project_root = Path(project_root).resolve()
-        self.message_path = self.project_root / MESSAGE_HTML_FILE
-        self.history_dir = self.project_root / HISTORY_RELATIVE_PATH
+def revision_directory(message_path: str | Path) -> Path:
+    return Path(message_path).resolve().parent / REVISION_FOLDER_NAME
 
-    def list_revisions(self) -> tuple[MessageRevision, ...]:
-        if not self.history_dir.is_dir():
-            return ()
-        revisions: list[MessageRevision] = []
-        for path in self.history_dir.glob("*.html"):
-            try:
-                html = path.read_text(encoding="utf-8")
-                timestamp = datetime.fromtimestamp(path.stat().st_mtime)
-            except OSError:
-                continue
-            plain = " ".join(message_plain_text(html).split())
-            preview = plain[:120] + ("…" if len(plain) > 120 else "")
-            revisions.append(MessageRevision(path.resolve(), timestamp, preview or "(Blank message)"))
-        revisions.sort(key=lambda revision: (revision.timestamp, revision.path.name), reverse=True)
-        return tuple(revisions)
 
-    def create_revision(self, html: str, *, force: bool = False) -> Optional[Path]:
-        value = html or ""
-        revisions = self.list_revisions()
-        if not force and revisions:
-            try:
-                if revisions[0].path.read_text(encoding="utf-8") == value:
-                    return None
-            except OSError:
-                pass
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
 
-        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = self.history_dir / f"{stamp}-{time.time_ns()}-{digest}.html"
-        atomic_write_text(path, value)
-        self._prune()
-        return path.resolve()
-
-    def snapshot_current_if_changed(self) -> Optional[Path]:
-        if not self.message_path.is_file():
-            return None
+    last_error: Optional[OSError] = None
+    for _ in range(6):
         try:
-            html = self.message_path.read_text(encoding="utf-8")
-        except OSError:
-            return None
-        return self.create_revision(html)
-
-    def maybe_create_timed_revision(
-        self,
-        html: str,
-        *,
-        now: Optional[float] = None,
-    ) -> Optional[Path]:
-        timestamp = time.time() if now is None else float(now)
-        revisions = self.list_revisions()
-        if revisions and timestamp - revisions[0].timestamp.timestamp() < EXTENDED_EDIT_INTERVAL_SECONDS:
-            return None
-        return self.create_revision(html)
-
-    def restore(self, revision_path: str | Path) -> str:
-        requested = Path(revision_path).resolve()
-        allowed = {revision.path for revision in self.list_revisions()}
-        if requested not in allowed:
-            raise ValueError("Revision is outside the active message history.")
-
-        replacement = requested.read_text(encoding="utf-8")
-        if self.message_path.is_file():
-            current = self.message_path.read_text(encoding="utf-8")
-            self.create_revision(current, force=True)
-        atomic_write_text(self.message_path, replacement)
-        return replacement
-
-    def copy_revision_to_message_directory(
-        self,
-        revision_path: str | Path,
-        message_directory: str | Path,
-    ) -> Path:
-        source = Path(revision_path).resolve()
-        allowed = {revision.path for revision in self.list_revisions()}
-        if source not in allowed:
-            raise ValueError("Revision is outside the active message history.")
-        destination_dir = Path(message_directory) / "history"
-        destination = destination_dir / source.name
-        atomic_write_text(destination, source.read_text(encoding="utf-8"))
-        self._prune_directory(destination_dir)
-        return destination
-
-    def _prune(self) -> None:
-        self._prune_directory(self.history_dir)
-
-    @staticmethod
-    def _prune_directory(directory: Path) -> None:
-        if not directory.is_dir():
+            os.replace(tmp, path)
             return
-        paths = sorted(
-            directory.glob("*.html"),
-            key=lambda path: (path.stat().st_mtime, path.name),
-            reverse=True,
-        )
-        for stale in paths[MAX_MESSAGE_REVISIONS:]:
-            stale.unlink(missing_ok=True)
+        except OSError as error:
+            last_error = error
+            time.sleep(0.05)
+
+    if last_error is not None:
+        raise last_error
+
+
+def _revision_filename(reason: str) -> str:
+    safe_reason = re.sub(r"[^a-z0-9_-]+", "-", (reason or "revision").strip().lower()).strip("-")
+    safe_reason = safe_reason or "revision"
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return f"{stamp}__{safe_reason}.html"
+
+
+def _parse_revision(path: Path) -> MessageRevision:
+    stem = path.stem
+    stamp_text, _, reason = stem.partition("__")
+    try:
+        created = datetime.strptime(stamp_text, "%Y%m%d-%H%M%S-%f")
+    except ValueError:
+        created = datetime.fromtimestamp(path.stat().st_mtime)
+    try:
+        size = int(path.stat().st_size)
+    except OSError:
+        size = 0
+    return MessageRevision(path=path, created_at=created, reason=reason or "revision", size_bytes=size)
+
+
+def list_revisions(message_path: str | Path) -> list[MessageRevision]:
+    folder = revision_directory(message_path)
+    if not folder.is_dir():
+        return []
+    revisions = [_parse_revision(path) for path in folder.glob("*.html") if path.is_file()]
+    revisions.sort(key=lambda item: item.created_at, reverse=True)
+    return revisions
+
+
+def prune_revisions(message_path: str | Path, *, keep: int = MAX_REVISIONS) -> None:
+    keep = max(1, int(keep))
+    for revision in list_revisions(message_path)[keep:]:
+        try:
+            revision.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def snapshot_current(
+    message_path: str | Path,
+    *,
+    reason: str = "revision",
+    skip_if_content: Optional[str] = None,
+) -> Optional[Path]:
+    path = Path(message_path).resolve()
+    if not path.is_file():
+        return None
+
+    try:
+        current = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    if skip_if_content is not None and current == skip_if_content:
+        return None
+
+    folder = revision_directory(path)
+    folder.mkdir(parents=True, exist_ok=True)
+    revision_path = folder / _revision_filename(reason)
+    _atomic_write(revision_path, current)
+    prune_revisions(path)
+    return revision_path
+
+
+def write_message_with_revision(
+    message_path: str | Path,
+    content: str,
+    *,
+    reason: str = "autosave",
+) -> bool:
+    path = Path(message_path).resolve()
+    previous = ""
+    if path.is_file():
+        try:
+            previous = path.read_text(encoding="utf-8")
+        except OSError:
+            previous = ""
+
+    if previous == content:
+        return False
+
+    if previous:
+        snapshot_current(path, reason=reason, skip_if_content=content)
+
+    _atomic_write(path, content)
+    return True
+
+
+def restore_revision(message_path: str | Path, revision_path: str | Path) -> str:
+    message = Path(message_path).resolve()
+    revision = Path(revision_path).resolve()
+    folder = revision_directory(message).resolve()
+
+    if not revision.is_file() or revision.parent != folder:
+        raise FileNotFoundError("The selected revision is not available.")
+
+    content = revision.read_text(encoding="utf-8")
+    snapshot_current(message, reason="before-restore", skip_if_content=content)
+    _atomic_write(message, content)
+    prune_revisions(message)
+    return content
+
+
+def delete_revision(revision_path: str | Path) -> None:
+    Path(revision_path).unlink(missing_ok=True)

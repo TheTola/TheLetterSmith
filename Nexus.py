@@ -1,27 +1,35 @@
-# Nexus.py
+# ===============================
+# File: Nexus.py
+# ===============================
 """
-Main application shell for Letter Smith.
+Nexus — main shell for Letter Smith
+Clean placement • Robust overlay • Sound visualizer • Prompt Writer FAB owned by Image_tab
++ Help.gif (idle, plays constantly) swaps to HHelp.gif on hover
++ Per-tab Help popover header: ✨The Image tab✨ / ✨The sound tab✨ / ✨The message tab✨ / ✨The forge tab✨
 
-Nexus owns the frameless main window, tab navigation, preview surface,
-help popover, Prompt Writer launcher, and cross-tab
-signal wiring. Feature-specific work remains inside the individual tab modules:
-Image_tab, sound_tab, Message_tab, Forge_Tab, and command.
-
-The shell keeps the user-facing preview synchronized across tabs: images show
-selected page art, Sound mounts its visualizer, Message displays message
-previews, Forge shows the current cover/title, and Command hides the preview
-during destructive reset actions.
+Notes
+- If Qt WebEngine is missing, we exit with a clear tip: pip install PySide6-Addons
+- Animation helpers come from anima.py; we fall back safely if not found
 """
 
 from __future__ import annotations
 
-import os
-import re
-import subprocess
-import sys
+import os, sys, subprocess, json
 from pathlib import Path
 from typing import Optional
 
+# ─────────────────────────────────────────────────────────────
+# Overlay integration (robust, guarded)
+# ─────────────────────────────────────────────────────────────
+try:
+    from Over_Nexus import install_over_nexus, Config as OverConfig
+except Exception:
+    install_over_nexus = None  # type: ignore
+    OverConfig = None          # type: ignore
+
+# ─────────────────────────────────────────────────────────────
+# Qt
+# ─────────────────────────────────────────────────────────────
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl, QEvent, QSize, QPoint
 from PySide6.QtGui import QColor, QPixmap, QIcon, QMouseEvent, QMovie, QFont
@@ -30,7 +38,7 @@ from PySide6.QtWidgets import (
     QFrame
 )
 
-# The Message preview uses Qt WebEngine to render authored HTML.
+# WebEngine (used for HTML preview)
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
 except Exception as e:
@@ -40,11 +48,7 @@ except Exception as e:
         f"Original error:\n{e}"
     )
 
-from app_icon import apply_qt_window_icon, canonical_icon_paths
-from config import MUSIC_FILE, USER_CONTROLS_DIR, USER_SOUNDS_DIR
-from settings_store import SettingsStore
-
-# Visual effects are centralized in anima.py; the shell can run without them.
+# Animations / FX (from anima.py)
 try:
     from anima import ParticleBurst, TabSwitcher, install_click_fx
 except Exception:
@@ -53,18 +57,27 @@ except Exception:
     def install_click_fx(_):  # type: ignore
         pass
 
-# Shell-owned asset paths and viewport sizing.
-REL_RETICLE_ICON = "gallery/app/icons/reticle.png"
-REL_HELP_GIF = "gallery/app/icons/Help.gif"
-REL_HELP_HOVER = "gallery/app/icons/HHelp.gif"
-REL_HELP_PNG = "gallery/app/icons/Help.png"
+# ─────────────────────────────────────────────────────────────
+# Relative asset hints & sizing
+# ─────────────────────────────────────────────────────────────
+
+REL_RETICLE_ICON = "gallery/app/icons/reticle.png"   # optional (title bar icon)
+REL_HELP_GIF     = "gallery/app/icons/Help.gif"      # idle (plays constantly)
+REL_HELP_HOVER   = "gallery/app/icons/HHelp.gif"     # hover variant (plays on hover)
+REL_HELP_PNG     = "gallery/app/icons/Help.png"      # final static fallback
 
 WIN_W, WIN_H = 1400, 900
-_PREVIEW_AR = 169 / 253
-HELP_ICON_PX = 125
+_PREVIEW_AR = 169 / 253  # preview frame aspect (matches your 169×253 scaling)
 
+# Help icon display size
+HELP_ICON_PX = 125
+HELP_ICON_HALF = HELP_ICON_PX // 2
+
+
+# ─────────────────────────────────────────────────────────────
+# Event filter for message double-click on QWebEngineView
+# ─────────────────────────────────────────────────────────────
 class _DoubleClickFilter(QtCore.QObject):
-    """Routes double-clicks on the message preview into the full preview dialog."""
     def __init__(self, nexus: "Nexus"):
         super().__init__(nexus)
         self.nexus = nexus
@@ -76,56 +89,11 @@ class _DoubleClickFilter(QtCore.QObject):
                 return True
         return False
 
-class _HoverTabSwitchFilter(QtCore.QObject):
-    """Activates a tab after the cursor rests on it briefly."""
-    def __init__(self, tabbar: QtWidgets.QTabBar, delay_ms: int = 333):
-        super().__init__(tabbar)
-        self.tabbar = tabbar
-        self._pending_index = -1
-        self._timer = QtCore.QTimer(self)
-        self._timer.setSingleShot(True)
-        self._timer.setInterval(delay_ms)
-        self._timer.timeout.connect(self._activate_pending_tab)
 
-    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
-        if watched is self.tabbar:
-            t = event.type()
-            if t in (QEvent.MouseMove, QEvent.HoverMove, QEvent.Enter, QEvent.HoverEnter):
-                pos = self._event_pos(event)
-                if pos is not None:
-                    self._schedule_index(self.tabbar.tabAt(pos))
-            elif t in (QEvent.Leave, QEvent.HoverLeave):
-                self._cancel()
-        return super().eventFilter(watched, event)
-
-    def _event_pos(self, event: QtCore.QEvent) -> Optional[QtCore.QPoint]:
-        if hasattr(event, "position"):
-            return event.position().toPoint()
-        if hasattr(event, "pos"):
-            return event.pos()
-        return self.tabbar.mapFromGlobal(QtGui.QCursor.pos())
-
-    def _schedule_index(self, index: int) -> None:
-        if index < 0 or index == self.tabbar.currentIndex():
-            self._cancel()
-            return
-        if index != self._pending_index:
-            self._pending_index = index
-            self._timer.start()
-
-    def _cancel(self) -> None:
-        self._pending_index = -1
-        self._timer.stop()
-
-    def _activate_pending_tab(self) -> None:
-        index = self._pending_index
-        cursor_index = self.tabbar.tabAt(self.tabbar.mapFromGlobal(QtGui.QCursor.pos()))
-        self._cancel()
-        if index >= 0 and index == cursor_index and index != self.tabbar.currentIndex():
-            self.tabbar.setCurrentIndex(index)
-
+# ─────────────────────────────────────────────────────────────
+# Custom Title Bar (frameless) — Target button opens target.py
+# ─────────────────────────────────────────────────────────────
 class TitleBar(QtWidgets.QWidget):
-    """Frameless title bar with app title, target launcher, and window controls."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent = parent
@@ -135,23 +103,12 @@ class TitleBar(QtWidgets.QWidget):
         layout.setContentsMargins(8, 0, 8, 0)
         layout.setSpacing(6)
 
-        app_icon = QtWidgets.QLabel(self)
-        app_icon.setObjectName("AppIcon")
-        app_icon.setFixedSize(30, 30)
-        app_icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        png_path, _ = canonical_icon_paths(self.parent.project_root)
-        pixmap = QPixmap(str(png_path))
-        if not pixmap.isNull():
-            app_icon.setPixmap(
-                pixmap.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
-            layout.addWidget(app_icon)
-
         title = QtWidgets.QLabel("The Silver-Tongued Lettersmith", self)
         title.setStyleSheet("color:#00ffff; font:16px 'Segoe UI Semibold'; letter-spacing:1px;")
         layout.addWidget(title)
         layout.addStretch()
 
+        # Target (reticle) button
         btn_target = QtWidgets.QPushButton()
         btn_target.setFixedSize(32, 32)
         btn_target.setToolTip("Open Target Browser")
@@ -168,6 +125,7 @@ class TitleBar(QtWidgets.QWidget):
         btn_target.clicked.connect(self.parent.open_target_browser)
         layout.addWidget(btn_target)
 
+        # Minimize
         btn_min = QtWidgets.QPushButton("–")
         btn_min.setFixedSize(32, 32)
         btn_min.setStyleSheet(
@@ -177,6 +135,7 @@ class TitleBar(QtWidgets.QWidget):
         btn_min.clicked.connect(self.parent.showMinimized)
         layout.addWidget(btn_min)
 
+        # Max/Restore
         self.btn_max = QtWidgets.QPushButton("□")
         self.btn_max.setFixedSize(32, 32)
         self.btn_max.setStyleSheet(
@@ -186,6 +145,7 @@ class TitleBar(QtWidgets.QWidget):
         self.btn_max.clicked.connect(self._toggle_max_restore)
         layout.addWidget(self.btn_max)
 
+        # Close
         btn_close = QtWidgets.QPushButton("✕")
         btn_close.setFixedSize(32, 32)
         btn_close.setStyleSheet(
@@ -213,118 +173,77 @@ class TitleBar(QtWidgets.QWidget):
             self.parent.move(self.parent.pos() + delta)
             self._drag_start = event.globalPosition().toPoint()
 
+
+# ─────────────────────────────────────────────────────────────
+# Small hover-help popover (top-level tooltip window)
+# ─────────────────────────────────────────────────────────────
 class HelpPopover(QFrame):
-    """Floating help card positioned beside the active tab help icon."""
     def __init__(self, parent: QtWidgets.QWidget):
         super().__init__(parent)
         self.setObjectName("HelpPopover")
         self.setVisible(False)
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setAttribute(Qt.WA_NoSystemBackground, False)
-        self.setWindowFlag(Qt.ToolTip, True)
-
-        self._fixed_width = 420
-
-        self.setMinimumWidth(self._fixed_width)
-        self.setMaximumWidth(self._fixed_width)
-        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Minimum)
+        self.setWindowFlag(Qt.ToolTip, True)  # native tooltip stacking behavior
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(14, 12, 14, 14)
-        lay.setSpacing(8)
-        lay.setSizeConstraint(QtWidgets.QLayout.SetFixedSize)
+        lay.setContentsMargins(10, 8, 10, 10)
+        lay.setSpacing(6)
 
-        self.header = QLabel("")
-        self.header.setObjectName("HelpHeader")
-        self.header.setTextFormat(Qt.PlainText)
-        self.header.setAlignment(Qt.AlignCenter)
-        self.header.setWordWrap(True)
-        self.header.setAutoFillBackground(False)
-        self.header.setAttribute(Qt.WA_NoSystemBackground, True)
-        self.header.setTextInteractionFlags(Qt.NoTextInteraction)
-        self.header.setFixedWidth(self._fixed_width - 28)
-
-        hf = QFont("Segoe UI Semibold", 14)
+        self.header = QLabel("")  # dynamic per-tab header
+        self.header.setTextFormat(Qt.RichText)
+        hf = QFont("Segoe UI Semibold", 13)
         hf.setBold(True)
         self.header.setFont(hf)
+        self.header.setWordWrap(True)
+        self.header.setStyleSheet("font-weight:800; color:#e0ffff; background:transparent;")
 
         self.body = QLabel("")
-        self.body.setObjectName("HelpBody")
-        self.body.setTextFormat(Qt.PlainText)
-        self.body.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.body.setWordWrap(True)
-        self.body.setAutoFillBackground(False)
-        self.body.setAttribute(Qt.WA_NoSystemBackground, True)
-        self.body.setTextInteractionFlags(Qt.NoTextInteraction)
-        self.body.setFixedWidth(self._fixed_width - 28)
-
         bf = QFont("Segoe UI", 10)
-        bf.setBold(False)
         self.body.setFont(bf)
+        self.body.setWordWrap(True)
+        self.body.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
         lay.addWidget(self.header)
         lay.addWidget(self.body)
 
         self.setStyleSheet("""
             QFrame#HelpPopover {
-                background: #2b2b2b;
+                background: #101317;
                 border: 2px solid #2f7474;
                 border-radius: 8px;
             }
-
-            QLabel#HelpHeader {
-                background: transparent;
-                border: none;
+            QFrame#HelpPopover QLabel {
                 color: #e0ffff;
-                font-size: 14px;
-                font-weight: 800;
-                padding: 0;
-                margin: 0;
-            }
-
-            QLabel#HelpBody {
-                background: transparent;
-                border: none;
-                color: #e0ffff;
-                font-size: 10px;
-                font-weight: 400;
-                padding: 0;
-                margin: 0;
             }
         """)
 
     def set_header_text(self, text: str) -> None:
-        self.header.setText(str(text or ""))
-        self._stabilize_size()
+        self.header.setText(text or "")
+        self.header.adjustSize()
+        self.adjustSize()
 
     def set_help_text(self, body_text: str) -> None:
-        self.body.setText(str(body_text or ""))
-        self._stabilize_size()
-
-    def _stabilize_size(self) -> None:
-        """
-        Keep the popover width stable so hover events, movie-frame swaps,
-        and label repaints cannot make the body text reflow sideways.
-        """
-        self.header.setFixedWidth(self._fixed_width - 28)
-        self.body.setFixedWidth(self._fixed_width - 28)
+        self.body.setText(body_text or "")
+        self.body.adjustSize()
         self.adjustSize()
-        self.resize(self._fixed_width, self.sizeHint().height())
 
     def popup_at(self, anchor_global: QPoint, prefer_left: bool, parent: QtWidgets.QWidget, icon_px: int = HELP_ICON_PX):
         """
         Place the popover adjacent to the help icon.
 
         anchor_global: icon center in GLOBAL coords.
-        If this widget is a top-level (Qt.ToolTip), move in GLOBAL coords.
-        If it is a child widget, move in PARENT-LOCAL coords.
+        If this widget is a top-level (Qt.ToolTip), we must move in GLOBAL coords.
+        If it's a child widget, we move in PARENT-LOCAL coords.
         """
-        self._stabilize_size()
+        self.adjustSize()
+        width = min(420, max(320, self.sizeHint().width()))
+        self.resize(width, self.sizeHint().height())
 
         margin = 8
         is_tooltip = bool(self.windowFlags() & Qt.ToolTip)
 
         if is_tooltip:
+            # Top-level tooltip: use GLOBAL coords; clamp to the window's screen
             try:
                 win = parent.window().windowHandle()
                 screen = win.screen() if win else QtGui.QGuiApplication.primaryScreen()
@@ -333,7 +252,7 @@ class HelpPopover(QFrame):
             sgeo = screen.availableGeometry() if screen else QtGui.QGuiApplication.primaryScreen().availableGeometry()
 
             x_right_g = anchor_global.x() + (icon_px // 2) + margin
-            x_left_g = anchor_global.x() - (icon_px // 2) - margin - self.width()
+            x_left_g  = anchor_global.x() - (icon_px // 2) - margin - self.width()
 
             xg = x_right_g
             if prefer_left or (x_right_g + self.width() > sgeo.right() - margin):
@@ -345,10 +264,11 @@ class HelpPopover(QFrame):
 
             self.move(xg, yg)
         else:
+            # Child widget: position in PARENT-LOCAL coords
             anchor_local = parent.mapFromGlobal(anchor_global)
 
             x_right = anchor_local.x() + (icon_px // 2) + margin
-            x_left = anchor_local.x() - (icon_px // 2) - margin - self.width()
+            x_left  = anchor_local.x() - (icon_px // 2) - margin - self.width()
             parent_rect = parent.rect()
 
             x = x_right
@@ -367,70 +287,160 @@ class HelpPopover(QFrame):
     def popdown(self):
         self.setVisible(False)
 
+
+# ─────────────────────────────────────────────────────────────
+# Nexus Main Window
+# ─────────────────────────────────────────────────────────────
 class Nexus(QtWidgets.QMainWindow):
-    """Top-level window that coordinates Letter Smith tabs and shared preview state."""
     def __init__(self, project_root: str | Path):
         super().__init__()
         self.project_root = str(project_root)
-        self._shutdown = False
-        self._child_processes: list[subprocess.Popen] = []
-        self.setWindowTitle("Letter Smith")
-        apply_qt_window_icon(self, self.project_root)
+        self.setObjectName("NexusWindow")
 
         # Frameless + QSS
         self.setWindowFlag(QtCore.Qt.FramelessWindowHint)
         self.setStyleSheet("""
-            QMainWindow, QWidget, QStackedWidget, QTabBar {
-                background:#1e1e1e; color:#d0d0d0; font-family:'Segoe UI'; font-size:11px;
+            /*
+             * Background ownership is deliberately scoped.
+             *
+             * Do not assign a background to every QWidget or QStackedWidget.
+             * Doing so paints Nexus gray through transparent child margins and
+             * creates the rectangular "holes" that were visible in Sound.
+             */
+            QMainWindow#NexusWindow,
+            QWidget#NexusRoot,
+            QWidget#NexusBody {
+                background:#1e1e1e;
+                color:#d0d0d0;
+                font-family:'Segoe UI';
+                font-size:11px;
             }
-            QLabel { color:#b0e0e6; font-weight:600; }
+
+            QStackedWidget#FeatureStack,
+            QStackedWidget#PreviewStack,
+            QWidget#PreviewBlank {
+                background:transparent;
+                border:none;
+            }
+
+            /*
+             * Each feature page owns its own surface. Sound uses the dark-blue
+             * surface expected by its interface, so transparent areas reveal
+             * blue rather than Nexus gray.
+             */
+            QWidget#ImagePageSurface,
+            QWidget#MessagePageSurface,
+            QWidget#ForgePageSurface,
+            QWidget#CommandPageSurface {
+                background:#1e1e1e;
+                border:none;
+            }
+
+            QWidget#SoundPageSurface {
+                background:#101820;
+                border:none;
+            }
+
+            QTabBar#MainTabBar {
+                background:#1e1e1e;
+                color:#d0d0d0;
+                font-family:'Segoe UI';
+                font-size:11px;
+            }
+
+            QLabel {
+                color:#b0e0e6;
+                font-weight:600;
+            }
+
             QPushButton {
-                background-color:transparent; color:#d0d0d0; border:1px solid #444;
-                border-radius:4px; padding:6px 12px; font:11px 'Segoe UI';
+                background-color:transparent;
+                color:#d0d0d0;
+                border:1px solid #444;
+                border-radius:4px;
+                padding:6px 12px;
+                font:11px 'Segoe UI';
             }
-            QPushButton:hover { background:#2a2a2a; border-color:#00b2b2; color:#e0f7f7; }
-            QPushButton:pressed{ background:#353535; border-color:#00a0a0; color:#c0f0f0; }
-
-            QTabBar::tab {
-                background:transparent; border:none; padding:8px 14px; margin-right:2px; color:#a0a0a0;
+            QPushButton:hover {
+                background:#2a2a2a;
+                border-color:#00b2b2;
+                color:#e0f7f7;
             }
-            QTabBar::tab:selected { color:#e0fdfd; border-bottom:2px solid #00b2b2; }
-            QTabBar::tab:hover    { color:#e0f7f7; }
+            QPushButton:pressed {
+                background:#353535;
+                border-color:#00a0a0;
+                color:#c0f0f0;
+            }
 
-            #PreviewFrame  { background:#2b2b2b; border:2px solid #444; border-radius:6px; }
+            QTabBar#MainTabBar::tab {
+                background:transparent;
+                border:none;
+                padding:8px 14px;
+                margin-right:2px;
+                color:#a0a0a0;
+            }
+            QTabBar#MainTabBar::tab:selected {
+                color:#e0fdfd;
+                border-bottom:2px solid #00b2b2;
+            }
+            QTabBar#MainTabBar::tab:hover {
+                color:#e0f7f7;
+            }
+
+            QStatusBar {
+                background:#1e1e1e;
+                color:#d0d0d0;
+            }
+
+            QWidget#PreviewFrame {
+                background:#101317;
+                border:2px solid #444;
+                border-radius:6px;
+            }
         """)
 
+        # Central layout
         main_widget = QtWidgets.QWidget(self)
+        main_widget.setObjectName("NexusRoot")
+        main_widget.setAttribute(Qt.WA_StyledBackground, True)
         main_layout = QtWidgets.QVBoxLayout(main_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
+        # Title bar
         self.title_bar = TitleBar(self)
         main_layout.addWidget(self.title_bar)
 
+        # Tab bar
         self.tabbar = QtWidgets.QTabBar()
+        self.tabbar.setObjectName("MainTabBar")
         for name in ("Images", "Sound", "Message", "Forge", "Command"):
             self.tabbar.addTab(name)
         self.tabbar.setDrawBase(False)
         self.tabbar.currentChanged.connect(self._tab_changed)
-        self.tabbar.setMouseTracking(True)
-        self.tabbar.setAttribute(Qt.WA_Hover, True)
-        self._hover_tab_switch = _HoverTabSwitchFilter(self.tabbar)
-        self.tabbar.installEventFilter(self._hover_tab_switch)
         main_layout.addWidget(self.tabbar)
 
+        # Body
         self.body = QtWidgets.QWidget()
+        self.body.setObjectName("NexusBody")
+        self.body.setAttribute(Qt.WA_StyledBackground, True)
         body_layout = QtWidgets.QVBoxLayout(self.body)
         body_layout.setContentsMargins(12, 12, 12, 12)
         body_layout.setSpacing(10)
 
+        # Preview frame (centered)
         self.preview_frame = QtWidgets.QWidget()
         self.preview_frame.setObjectName("PreviewFrame")
         pf_layout = QVBoxLayout(self.preview_frame)
         pf_layout.setContentsMargins(6, 6, 6, 6)
 
         self.preview_stack = QtWidgets.QStackedWidget(self.preview_frame)
-        self.preview_stack.addWidget(QtWidgets.QWidget())
+        self.preview_stack.setObjectName("PreviewStack")
+
+        self.preview_blank = QtWidgets.QWidget()
+        self.preview_blank.setObjectName("PreviewBlank")
+        self.preview_blank.setAttribute(Qt.WA_StyledBackground, True)
+        self.preview_stack.addWidget(self.preview_blank)
 
         self.image_preview = QtWidgets.QLabel(alignment=Qt.AlignCenter)
         self.image_preview.setStyleSheet("background:transparent;")
@@ -444,6 +454,7 @@ class Nexus(QtWidgets.QMainWindow):
         pf_layout.addWidget(self.preview_stack)
         body_layout.addWidget(self.preview_frame, alignment=Qt.AlignHCenter)
 
+        # Caption under preview (Forge tab: project title)
         self.preview_caption = QLabel("", alignment=Qt.AlignCenter)
         self.preview_caption.setVisible(False)
         self.preview_caption.setStyleSheet(
@@ -451,7 +462,10 @@ class Nexus(QtWidgets.QMainWindow):
         )
         body_layout.addWidget(self.preview_caption, alignment=Qt.AlignHCenter)
 
-        # Help icon and hover popover for the active feature tab.
+        # ─────────────────────────────────────────────────────────
+        # Help (top-right above the feature panel) — dual-GIF swap
+        # Idle = Help.gif (plays constantly), Hover = HHelp.gif
+        # ─────────────────────────────────────────────────────────
         help_row = QHBoxLayout()
         help_row.setContentsMargins(0, 0, 0, 0)
         help_row.setSpacing(0)
@@ -477,6 +491,7 @@ class Nexus(QtWidgets.QMainWindow):
         self.help_icon.setMouseTracking(True)
         self.help_icon.setAttribute(Qt.WA_Hover, True)
 
+        # Movies: idle + hover
         self._help_movie_idle: Optional[QMovie] = None
         self._help_movie_hover: Optional[QMovie] = None
 
@@ -490,20 +505,23 @@ class Nexus(QtWidgets.QMainWindow):
                     mv.setCacheMode(QMovie.CacheAll)
                     mv.setSpeed(100)
                     mv.setScaledSize(QSize(HELP_ICON_PX, HELP_ICON_PX))
-                    mv.start()
+                    mv.start()  # play constantly
                     return mv
             return None
 
         self._help_movie_idle  = _load_movie(_abs(REL_HELP_GIF))
         self._help_movie_hover = _load_movie(_abs(REL_HELP_HOVER))
 
-        # Prefer animated help assets; use the static PNG or text only if needed.
+        # Initial visual: prefer idle movie → hover movie → PNG fallback → text
         if self._help_movie_idle:
             self.help_icon.setMovie(self._help_movie_idle)
         elif self._help_movie_hover:
             self.help_icon.setMovie(self._help_movie_hover)
         else:
-            self._set_static_help_icon(_abs(REL_HELP_PNG))
+            self._set_help_fallback_icon(_abs(REL_HELP_PNG))
+
+        # Legacy-compat shim (prevents AttributeError in any old slots)
+        self._help_movie = None
 
         help_row.addWidget(self.help_icon, 0, Qt.AlignRight)
         body_layout.addLayout(help_row)
@@ -528,6 +546,7 @@ class Nexus(QtWidgets.QMainWindow):
 
         # Feature tabs
         self.page_stack = QtWidgets.QStackedWidget()
+        self.page_stack.setObjectName("FeatureStack")
         try:
             from Image_tab import ImageTab
             from sound_tab import SoundTab
@@ -537,40 +556,57 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception as ex:
             raise ImportError(f"Failed to import feature tabs: {ex}")
 
-        self.image_tab   = ImageTab(self.project_root)
+        self.image_tab   = ImageTab()
         self.sound_tab   = SoundTab(self.project_root)
         self.message_tab = MessageTab(self.project_root)
         self.forge_tab   = ForgeTab(self.project_root)
         self.command_tab = CommandTab(self.project_root)
-        for w in (self.image_tab, self.sound_tab, self.message_tab, self.forge_tab, self.command_tab):
-            self.page_stack.addWidget(w)
+
+        # Feature pages are wrapped in explicit surfaces. This prevents Nexus's
+        # outer gray from bleeding through transparent child widgets. Sound gets
+        # a dark-blue surface; the other tabs retain the normal Nexus surface.
+        self.image_page = self._make_page_surface(
+            "ImagePageSurface",
+            self.image_tab,
+        )
+        self.sound_page = self._make_page_surface(
+            "SoundPageSurface",
+            self.sound_tab,
+        )
+        self.message_page = self._make_page_surface(
+            "MessagePageSurface",
+            self.message_tab,
+        )
+        self.forge_page = self._make_page_surface(
+            "ForgePageSurface",
+            self.forge_tab,
+        )
+        self.command_page = self._make_page_surface(
+            "CommandPageSurface",
+            self.command_tab,
+        )
+
+        for page in (
+            self.image_page,
+            self.sound_page,
+            self.message_page,
+            self.forge_page,
+            self.command_page,
+        ):
+            self.page_stack.addWidget(page)
+
         body_layout.addWidget(self.page_stack)
 
-        self.forge_tab.letter_loaded.connect(lambda _payload=None: self._show_forge_preview())
         self.forge_tab.letter_loaded.connect(self._on_letter_loaded)
-        self.forge_tab.fix_requested.connect(self._fix_readiness_item)
-        self.forge_tab.preview_requested.connect(self._load_forge_preview)
-        self.forge_tab.preview_restart_requested.connect(self._restart_forge_preview)
-        self.forge_tab.preview_fullscreen_requested.connect(self._toggle_forge_preview_fullscreen)
-        self.forge_tab.preview_mute_requested.connect(self._mute_forge_preview)
-        self.forge_tab.preview_report_requested.connect(self._report_forge_preview_assets)
-        self.forge_tab.project_will_open.connect(self._prepare_workspace_audio_change)
-        self.forge_tab.project_opened.connect(self._on_project_opened)
-        try:
-            self.forge_tab.letter_loaded.connect(lambda _payload=None: self.message_tab._sync_inputs_from_settings())
-        except Exception:
-            pass
-        try:
-            self.message_tab.published_page_url_changed.connect(self.forge_tab.set_saved_page_url)
-        except Exception:
-            pass
 
         main_layout.addWidget(self.body)
         self.setCentralWidget(main_widget)
 
+        # Status bar
         self._status = QStatusBar()
         self.setStatusBar(self._status)
 
+        # Toast overlay
         self._toast = QLabel(self)
         self._toast.setStyleSheet(
             "QLabel{background:rgba(0,0,0,0.7); color:#e0ffff; border-radius:6px; padding:8px 12px;}"
@@ -580,71 +616,124 @@ class Nexus(QtWidgets.QMainWindow):
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(lambda: self._toast.setVisible(False))
 
-        self._project_autosave_timer = QtCore.QTimer(self)
-        self._project_autosave_timer.setInterval(60000)
-        self._project_autosave_timer.timeout.connect(self.forge_tab.autosave_project)
-        self._project_autosave_timer.start()
-
+        # Preview fade state
         self._fade_timer: Optional[QtCore.QTimer] = None
         self._fade_anim: Optional[QtCore.QPropertyAnimation] = None
 
+        # Overlay installer — disables the Over_Nexus Prompt Writer launcher.
+        # The visible Prompt Writer FAB is owned by Image_tab.py.
+        self._over = None
+        if callable(install_over_nexus) and OverConfig is not None:
+            try:
+                self._over = install_over_nexus(
+                    nexus=self,
+                    project_root=self.project_root,
+                    config=OverConfig(show_prompter_launcher=False),
+                )
+            except Exception as ex:
+                self._over = None
+                print(f"[Overlay] WARNING: install_over_nexus failed: {ex}")
+
+
+        # Optional spark overlay
         self._spark = ParticleBurst(self.body) if ParticleBurst else None
         if self._spark:
             self._spark.setGeometry(self.body.rect())
             self._spark.hide()
 
+        # Optional tab switcher animations
         self._tabswitch = TabSwitcher(self.page_stack) if TabSwitcher else None
 
+        # === Mounted Sound visualizer state ===
         self._sound_preview_widget: Optional[QtWidgets.QWidget] = None
         self._sound_preview_index: Optional[int] = None
 
+        # Remember last image pixmap for proper re-scaling on resize
         self._last_pixmap: Optional[QPixmap] = None
 
+        # Cross-tab preview wiring
         self.image_tab.image_selected.connect(self._show_image)
         self.image_tab.hover_preview_image.connect(self._show_image)
 
+        # ImageTab reset -> clear preview immediately
         try:
             self.image_tab.clear_preview.connect(self._on_image_tab_clear_preview)
         except Exception:
             pass
 
         self.message_tab.preview_image.connect(self._show_image)
+        self.message_tab.wall_preview.connect(self._show_image)
         self.message_tab.text_selected.connect(self._show_html)
 
-        self.sound_tab.preview_widget.connect(self._mount_sound_preview)
 
+        # Command: after wipe, hard-clear preview state (redundancy)
         try:
             self.command_tab.wiped.connect(self._on_command_wiped)
         except Exception:
             pass
 
-        try:
-            self.message_tab.wall_file_selected.connect(self._on_wall_selected)
-        except Exception:
-            pass
-
+        # Keep a reference to Prompt Writer window if opened via shortcut
         self._prompt_writer_win: Optional[QtWidgets.QWidget] = None
 
+        # Initial sizing & tab
         self.setMinimumSize(1180, 820)
         self.resize(WIN_W, WIN_H)
         self.tabbar.setCurrentIndex(0)
         self._tab_changed(0)
 
+        # Shortcuts + click effects
         self._install_shortcuts()
         try:
             install_click_fx(self)
         except Exception:
             pass
 
+        # Double-click filter for full message view
         self._dbl_filter = _DoubleClickFilter(self)
         self.html_preview.installEventFilter(self._dbl_filter)
 
+        # Initial feedback
         self.status("Ready.")
         self.toast("Welcome to Letter Smith")
 
+        # Diagnostics after event loop starts
+        QtCore.QTimer.singleShot(0, self._post_init_diagnostics)
+
+    def _make_page_surface(
+        self,
+        object_name: str,
+        content: QtWidgets.QWidget,
+    ) -> QtWidgets.QWidget:
+        """Wrap a feature tab in a page-owned background surface."""
+        surface = QtWidgets.QWidget(self.page_stack)
+        surface.setObjectName(object_name)
+        surface.setAttribute(Qt.WA_StyledBackground, True)
+
+        layout = QtWidgets.QVBoxLayout(surface)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(content)
+
+        # The feature widget itself remains transparent unless it deliberately
+        # paints one of its own panels. Its unused regions therefore reveal the
+        # correct page surface instead of the Nexus shell.
+        content.setAutoFillBackground(False)
+        return surface
+
+    # ─────────────────────────────────────────────────────────
+    # Diagnostics: show key state once live
+    # ─────────────────────────────────────────────────────────
+    def _post_init_diagnostics(self) -> None:
+        over = getattr(self, "_over", None)
+        panel = getattr(over, "panel", None) if over is not None else None
+        print(f"[Boot] Nexus visible={self.isVisible()} minimized={self.isMinimized()} "
+              f"over_panel={'yes' if panel else 'no'}")
+
+    # ─────────────────────────────────────────────────────────
+    # Shortcuts
+    # ─────────────────────────────────────────────────────────
     def _install_shortcuts(self) -> None:
-        """Register shell-level keyboard shortcuts."""
-        # Ctrl+Alt+P opens Prompt Writer
+        # Ctrl+Alt+P opens prompt writer (no button)
         sc = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Alt+P"), self)
         sc.activated.connect(self.open_prompt_writer)
 
@@ -652,6 +741,9 @@ class Nexus(QtWidgets.QMainWindow):
         sc2 = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+H"), self)
         sc2.activated.connect(lambda: (self._show_help_from_icon() if not self.help_pop.isVisible() else self._hide_help_popover()))
 
+    # ─────────────────────────────────────────────────────────
+    # Status / Toast utilities
+    # ─────────────────────────────────────────────────────────
     def status(self, msg: str) -> None:
         try:
             self._status.showMessage(msg, 5000)
@@ -674,95 +766,51 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    def _on_wall_selected(self, path: str) -> None:
-        """Store Message-tab wall selections in ImageTab slot 4."""
-        try:
-            # ImageTab has set_image_path(slot, path)
-            self.image_tab.set_image_path(4, path)
-        except Exception:
-            pass
-
-    def _on_letter_loaded(self, _payload=None) -> None:
-        """Refresh live audio after a transactional saved-letter load."""
-        try:
-            self.sound_tab.wave.release_current_file_handle()
-            self.sound_tab._current_processed = ""
-            self.sound_tab.refresh_from_workspace()
-        except Exception:
-            pass
-
-    def _prepare_workspace_audio_change(self) -> None:
-        try:
-            self.sound_tab.wave.release_current_file_handle()
-            self.sound_tab._preview.set_audio_file("")
-        except Exception:
-            pass
-
-    def _on_project_opened(self, _payload=None) -> None:
-        try:
-            self.image_tab.refresh_from_workspace()
-        except Exception:
-            pass
-        try:
-            self.message_tab._sync_inputs_from_settings()
-            self.message_tab._check_existing()
-        except Exception:
-            pass
-        self._on_letter_loaded(_payload)
-        try:
-            self.forge_tab.refresh_saved_page_url()
-            self.forge_tab.refresh_readiness()
-        except Exception:
-            pass
-
-    def _fix_readiness_item(self, key: str) -> None:
-        image_slots = {"cover": 1, "letter": 2, "wall": 3, "back": 4}
-        if key in image_slots:
-            self.tabbar.setCurrentIndex(0)
-            QtCore.QTimer.singleShot(
-                0, lambda slot=image_slots[key]: self.image_tab.focus_card(slot)
-            )
-            return
-        if key == "music":
-            self.tabbar.setCurrentIndex(1)
-            playlist_widget = getattr(self.sound_tab, "playlist_view", self.sound_tab)
-            QtCore.QTimer.singleShot(0, playlist_widget.setFocus)
-            return
-        if key in {"message", "recipient", "title"}:
-            self.tabbar.setCurrentIndex(2)
-            if key == "message":
-                QtCore.QTimer.singleShot(0, self.message_tab.edit_btn.setFocus)
-            elif key == "recipient":
-                QtCore.QTimer.singleShot(0, self.message_tab.name_input.setFocus)
-            else:
-                QtCore.QTimer.singleShot(0, self.message_tab.title_input.setFocus)
-            return
-        if key == "sfx":
-            self.tabbar.setCurrentIndex(1)
-            self.status("Add the missing app sound effects, then return to Forge.")
-            return
-        if key == "controls":
-            controls = Path(self.project_root) / USER_CONTROLS_DIR
-            controls.mkdir(parents=True, exist_ok=True)
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(controls.resolve())))
-            self.status("Add the missing viewer controls to the opened folder.")
-
+    # ─────────────────────────────────────────────────────────
+    # Sound preview mounting (widget-based visualizer)
+    # ─────────────────────────────────────────────────────────
     def _mount_sound_preview(self, widget: QtWidgets.QWidget) -> None:
-        """Mount SoundTab's visualizer widget into the shared preview stack."""
-        if widget is None:
+        if not isinstance(widget, QtWidgets.QWidget):
             return
+
+        if self._sound_preview_widget is not None and self._sound_preview_widget is not widget:
+            self._detach_sound_preview()
+
+        self._sound_preview_widget = widget
+        index = self.preview_stack.indexOf(widget)
+        if index < 0:
+            index = self.preview_stack.addWidget(widget)
+        self._sound_preview_index = index
+
+        if self.tabbar.currentIndex() == 1:
+            widget.show()
+            self.preview_stack.setCurrentIndex(index)
+
+    def _detach_sound_preview(self) -> None:
+        """Remove the Sound-owned widget from the shared preview surface."""
+        widget = self._sound_preview_widget
+        if widget is None:
+            self._sound_preview_index = None
+            return
+
+        if self.preview_stack.currentWidget() is widget:
+            self.preview_stack.setCurrentIndex(0)
+        if self.preview_stack.indexOf(widget) >= 0:
+            self.preview_stack.removeWidget(widget)
+        widget.hide()
+        widget.setParent(self.sound_tab)
+        self._sound_preview_index = None
+
+    def _on_letter_loaded(self, _payload: Optional[dict] = None) -> None:
         try:
-            if self._sound_preview_widget is widget and self._sound_preview_index is not None:
-                return
+            self.sound_tab.reload_project_from_disk()
+        except Exception as exc:
+            self.status(f"⚠️ Sound state refresh failed: {exc}")
+        self._show_forge_preview()
 
-            self._sound_preview_widget = widget
-            self._sound_preview_index = self.preview_stack.addWidget(widget)
-
-            if self.tabbar.currentIndex() == 1:
-                self.preview_stack.setCurrentIndex(self._sound_preview_index)
-        except Exception as ex:
-            self.status(f"⚠️ Sound preview mount failed: {ex}")
-
+    # ─────────────────────────────────────────────────────────
+    # Message double-click → full dialog preview
+    # ─────────────────────────────────────────────────────────
     def _on_message_double_click(self):
         try:
             dlg = QDialog(self)
@@ -773,6 +821,7 @@ class Nexus(QtWidgets.QMainWindow):
             view = QWebEngineView(dlg)
             lay.addWidget(view)
 
+            # Clone current html from main view
             url = getattr(self.message_tab, "last_preview_url", None)
             if isinstance(url, QUrl):
                 view.setUrl(url)
@@ -785,35 +834,33 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception as ex:
             self.status(f"❌ Message preview failed: {ex}")
 
+    # ─────────────────────────────────────────────────────────
+    # Tabs — show correct preview per tab + update help visibility/content
+    # ─────────────────────────────────────────────────────────
     def _tab_changed(self, idx: int):
-        """Switch the active feature page and rebuild the shared preview state."""
-        # Switching tabs resets the shared preview before the active tab repopulates it.
+        # Sound owns playback and its visualizer only while tab index 1 is active.
+        # Forge/readiness windows are intentionally not touched here. Their
+        # visibility and manual-close state remain owned by Forge; entering Sound
+        # must never show or recreate them.
+        if idx != 1:
+            try:
+                self.sound_tab.deactivate_for_tab_change()
+            except Exception:
+                pass
+            self._detach_sound_preview()
+
         self._last_pixmap = None
         self._clear_preview()
-        self.preview_stack.setCurrentIndex(0)
+        self.preview_stack.setCurrentIndex(0)  # blank
         self.preview_caption.setVisible(False)
 
-        is_command = idx == 4
-        self.preview_frame.setVisible(not is_command)
-        self.help_icon.setVisible(not is_command)
-        self._status.setVisible(not is_command)
+        # Recalculate the preview immediately when the active tab changes.
+        # The Sound tab uses a shorter preview in a normal window so its full
+        # control panel remains visible without requiring maximized mode.
+        QtCore.QTimer.singleShot(0, self._update_preview_geometry)
 
-        body_layout = self.body.layout()
-        if body_layout is not None:
-            margin = 0 if is_command else 12
-            body_layout.setContentsMargins(margin, margin, margin, margin)
-            body_layout.setSpacing(0 if is_command else 10)
-            body_layout.activate()
-
-        # The Prompt Writer FAB is window-parented, so visibility is controlled by tab.
-        try:
-            if hasattr(self, "image_tab") and hasattr(self.image_tab, "pwrite_fab"):
-                show_fab = idx == 0
-                self.image_tab.pwrite_fab.setVisible(show_fab)
-                if show_fab:
-                    self.image_tab.pwrite_fab.raise_()
-        except Exception:
-            pass
+        # Hide preview only on "Command" tab (index 4)
+        self.preview_frame.setVisible(idx != 4)
 
         if self._tabswitch:
             self._tabswitch.go_to(idx)
@@ -823,29 +870,46 @@ class Nexus(QtWidgets.QMainWindow):
         tab_name = self.tabbar.tabText(idx)
         self.status(f"Switched to: {tab_name}")
 
-        # Each feature tab owns content generation; Nexus owns the shared preview surface.
+        # Per-tab preview rules:
+        # - Images: start blank; ImageTab will emit preview on hover/selection.
+        # - Sound: show the mounted visualizer widget.
+        # - Message: show current message state (message.png if present; else wall fallback).
+        # - Forge: show cover.png + project title underneath.
+        # - Command: preview hidden; still hard-cleared.
         if idx == 0:
-            self.preview_stack.setCurrentIndex(0)
+            self.preview_stack.setCurrentIndex(0)  # blank
 
         elif idx == 1:
+            try:
+                self.sound_tab.activate_for_tab_change()
+                self._mount_sound_preview(self.sound_tab.shared_preview_widget())
+            except Exception as ex:
+                self.status(f"⚠️ Sound preview unavailable: {ex}")
             if self._sound_preview_index is not None:
                 self.preview_stack.setCurrentIndex(self._sound_preview_index)
             else:
                 self.preview_stack.setCurrentIndex(0)
 
         elif idx == 2:
+            # Let MessageTab decide what to show; it will emit preview_image.
             QtCore.QTimer.singleShot(0, self._request_message_preview)
 
         elif idx == 3:
+            # Forge: show cover + title
             QtCore.QTimer.singleShot(0, self._show_forge_preview)
 
         else:
             self.preview_stack.setCurrentIndex(0)
 
+        # Help: show on all tabs except Command
+        self.help_icon.setVisible(idx != 4)
         if self.help_pop.isVisible():
             self._refresh_help_text(idx)
             self._reposition_help_popover()
 
+    # ─────────────────────────────────────────────────────────
+    # Preview rendering (image/html) + fade behavior
+    # ─────────────────────────────────────────────────────────
     def _show_image(self, pixmap: QPixmap):
         if not isinstance(pixmap, QPixmap) or pixmap.isNull():
             return
@@ -858,6 +922,7 @@ class Nexus(QtWidgets.QMainWindow):
         )
         self.image_preview.setPixmap(scaled)
         self.preview_stack.setCurrentWidget(self.image_preview)
+        # gentle fade after 30s idle
         self._fade_timer = QtCore.QTimer(self)
         self._fade_timer.setSingleShot(True)
         self._fade_timer.timeout.connect(self._fade_preview)
@@ -880,6 +945,7 @@ class Nexus(QtWidgets.QMainWindow):
         self._fade_anim.start()
 
     def _on_image_tab_clear_preview(self) -> None:
+        # Hard-clear: also drop last pixmap so resize can't resurrect it
         self._last_pixmap = None
         self._clear_preview()
 
@@ -924,12 +990,7 @@ class Nexus(QtWidgets.QMainWindow):
             pass
 
     def _show_forge_preview(self) -> None:
-        """Forge tab: show the finished viewer, or the cover before the first build."""
-        index = self.forge_tab._current_play_index()
-        if index is not None:
-            self._load_forge_preview(str(index), self.forge_tab._preview_mode)
-            return
-
+        """Forge tab: show cover.png and the project title underneath."""
         cover_path = os.path.join(self.project_root, "gallery", "user", "pages", "cover.png")
         pm = QPixmap(cover_path)
         if not pm.isNull():
@@ -946,117 +1007,60 @@ class Nexus(QtWidgets.QMainWindow):
         else:
             self.preview_caption.setVisible(False)
 
-    def _load_forge_preview(self, index_path: str, mode: str) -> None:
-        index = Path(index_path)
-        if not index.is_file():
-            self.status("Finished viewer is missing. Generate the letter again.")
-            return
-        self._forge_preview_mode = mode
-        self._resize_preview_frame()
-        self._clear_preview()
-        self.preview_caption.setVisible(False)
-        self.html_preview.setUrl(QUrl.fromLocalFile(str(index.resolve())))
-        self.html_preview.page().setAudioMuted(bool(self.forge_tab._preview_muted))
-        self.preview_stack.setCurrentWidget(self.html_preview)
-        self.status(f"Finished viewer preview: {mode.replace('-', ' ')}")
-
-    def _restart_forge_preview(self) -> None:
-        if self.preview_stack.currentWidget() is self.html_preview:
-            self.html_preview.reload()
-
-    def _toggle_forge_preview_fullscreen(self) -> None:
-        if self.isFullScreen():
-            self.showNormal()
-        else:
-            self.showFullScreen()
-
-    def _mute_forge_preview(self, muted: bool) -> None:
-        self.html_preview.page().setAudioMuted(bool(muted))
-
-    def _report_forge_preview_assets(self) -> None:
-        if self.preview_stack.currentWidget() is not self.html_preview:
-            self.forge_tab.show_preview_report(["No finished viewer is loaded."])
-            return
-        missing_on_disk: list[str] = []
-        index_path = Path(self.html_preview.url().toLocalFile())
-        if index_path.is_file():
-            try:
-                sources = "\n".join(
-                    path.read_text(encoding="utf-8")
-                    for path in (
-                        index_path,
-                        index_path.with_name("styles.css"),
-                        index_path.with_name("script.js"),
-                    )
-                    if path.is_file()
-                )
-                referenced = {
-                    match.split("?", 1)[0]
-                    for match in re.findall(r"gallery/[A-Za-z0-9_./-]+", sources)
-                    if Path(match.split("?", 1)[0]).suffix
-                }
-                missing_on_disk = sorted(
-                    relative
-                    for relative in referenced
-                    if not (index_path.parent / Path(relative)).is_file()
-                )
-            except Exception:
-                pass
-        script = """
-            (() => {
-              const missing = [];
-              document.querySelectorAll('img').forEach((asset) => {
-                if (asset.complete && asset.naturalWidth === 0) {
-                  missing.push(asset.getAttribute('src') || '[image without source]');
-                }
-              });
-              document.querySelectorAll('audio').forEach((asset) => {
-                if (asset.error) {
-                  missing.push(asset.currentSrc || asset.getAttribute('src') || '[audio without source]');
-                }
-              });
-              return [...new Set(missing)];
-            })();
-        """
-        self.html_preview.page().runJavaScript(
-            script,
-            lambda browser_missing: self.forge_tab.show_preview_report(
-                sorted(set(missing_on_disk + list(browser_missing or [])))
-            ),
-        )
-
-    def _resize_preview_frame(self) -> None:
-        mode = getattr(self, "_forge_preview_mode", "")
-        available_h = max(180, int(self.height() * 0.35))
-        if self.tabbar.currentIndex() == 3 and mode == "phone-portrait":
-            h = available_h
-            w = int(h * 9 / 16)
-        elif self.tabbar.currentIndex() == 3 and mode in {"desktop", "phone-landscape"}:
-            h = available_h
-            w = int(h * 16 / 9)
-        else:
-            h = available_h
-            w = int(h * _PREVIEW_AR)
-        self.preview_frame.setFixedSize(max(160, w + 12), max(120, h + 12))
-
     def _read_project_title(self) -> str:
         """Read recipient_title from settings.json (best available 'project title' signal)."""
         try:
-            data = SettingsStore(self.project_root).as_dict()
-            return str(data.get("recipient_title", "")).strip()
+            settings_path = os.path.join(self.project_root, "settings.json")
+            if os.path.exists(settings_path):
+                data = json.loads(Path(settings_path).read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    t = str(data.get("recipient_title", "")).strip()
+                    return t
         except Exception:
             pass
         return ""
 
-    def resizeEvent(self, event):
-        self._resize_preview_frame()
+    # ─────────────────────────────────────────────────────────
+    # Resize/Move: keep preview aspect; keep popover aligned
+    # ─────────────────────────────────────────────────────────
+    def _update_preview_geometry(self) -> None:
+        """Keep Sound usable in normal windows without changing full-screen layout."""
+        window_height = max(1, self.height())
+        try:
+            current_tab = self.tabbar.currentIndex()
+        except Exception:
+            current_tab = -1
 
+        sound_in_normal_window = (
+            current_tab == 1
+            and not self.isMaximized()
+            and not self.isFullScreen()
+        )
+
+        if sound_in_normal_window:
+            # The preview content is naturally 169 x 253. Capping it near that
+            # native height returns roughly 60-75 px to the Sound controls.
+            h = max(220, min(253, int(window_height * 0.30)))
+        else:
+            # Preserve the existing appearance in maximized/full-screen mode
+            # and on every other tab.
+            h = int(window_height * 0.35)
+
+        w = int(h * _PREVIEW_AR)
+        self.preview_frame.setFixedSize(max(160, w + 12), max(120, h + 12))
+
+    def resizeEvent(self, event):
+        self._update_preview_geometry()
+
+        # Reposition any visible toast
         if self._toast.isVisible():
             self.toast(self._toast.text(), ms=(self._toast_timer.remainingTime() or 800))
 
+        # Cover the body with spark overlay if present
         if self._spark:
             self._spark.setGeometry(self.body.rect())
 
+        # Rescale current image preview cleanly
         try:
             if self.preview_stack.currentWidget() is self.image_preview and self._last_pixmap and not self._last_pixmap.isNull():
                 scaled = self._last_pixmap.scaled(
@@ -1068,6 +1072,7 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+        # Keep help popover adjacent to the icon if visible
         if self.help_pop.isVisible():
             self._reposition_help_popover()
 
@@ -1079,8 +1084,10 @@ class Nexus(QtWidgets.QMainWindow):
             self._reposition_help_popover()
         super().moveEvent(event)
 
+    # ─────────────────────────────────────────────────────────
+    # Target Browser (title-bar button)
+    # ─────────────────────────────────────────────────────────
     def open_target_browser(self):
-        """Launch target.py from the title bar reticle button."""
         try:
             script = os.path.join(self.project_root, "target.py")
             if not os.path.exists(script):
@@ -1088,17 +1095,19 @@ class Nexus(QtWidgets.QMainWindow):
                 self.toast("target.py missing")
                 return
             pos = QtGui.QCursor.pos()
-            process = subprocess.Popen(
+            subprocess.Popen(
                 [sys.executable, script, "--x", str(pos.x()), "--y", str(pos.y())],
                 close_fds=True
             )
-            self._child_processes.append(process)
             self.status("Target Browser opened.")
             self.toast("Target Browser launched")
         except Exception as ex:
             self.status(f"❌ Could not open Target Browser: {ex}")
             self.toast("Target launch failed")
 
+    # ─────────────────────────────────────────────────────────
+    # Prompt Writer opener (used by Image_tab FAB and Ctrl+Alt+P shortcut)
+    # ─────────────────────────────────────────────────────────
     def open_prompt_writer(self):
         """
         Open Prompt Writer inline as an overlay panel (if available).
@@ -1119,11 +1128,13 @@ class Nexus(QtWidgets.QMainWindow):
             except Exception:
                 self._prompt_writer_win = None
 
+        # In-process overlay panel
         try:
-            from PromptWriterPanel import PromptWriterPanel
-            w = PromptWriterPanel(self)
+            from PromptWriterPanel import PromptWriterPanel  # local module in project root
+            w = PromptWriterPanel(self)                      # parent=self so it overlays inside the main window
             self._prompt_writer_win = w
 
+            # Attempt to preload lists from Prompter/modules/ if present
             try:
                 mods = Path(self.project_root) / "Prompter" / "modules"
                 topic = mods / "topic.txt"
@@ -1161,12 +1172,11 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception as ex:
             print(f"[PromptWriter] In-process load failed: {ex}")
 
-        # External Prompter process is used only when the inline panel cannot be created.
+        # Last resort: launch Prompter app
         try:
             prompter = Path(self.project_root) / "Prompter" / "prompter.py"
             if prompter.exists():
-                process = subprocess.Popen([sys.executable, str(prompter)], close_fds=True)
-                self._child_processes.append(process)
+                subprocess.Popen([sys.executable, str(prompter)], close_fds=True)
                 self.status("Prompt Writer launched (Prompter).")
                 self.toast("Prompter launched")
                 return
@@ -1176,13 +1186,17 @@ class Nexus(QtWidgets.QMainWindow):
         self.status("❌ Prompt Writer could not be opened.")
         self.toast("Prompt Writer unavailable")
 
-    def _set_static_help_icon(self, png_path: str):
+    # ─────────────────────────────────────────────────────────
+    # Help icon support
+    # ─────────────────────────────────────────────────────────
+    def _set_help_fallback_icon(self, png_path: str):
         if os.path.exists(png_path):
             pm = QPixmap(png_path)
             if not pm.isNull():
                 pm = pm.scaled(HELP_ICON_PX, HELP_ICON_PX, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.help_icon.setPixmap(pm)
                 return
+        # Final fallback: small text
         self.help_icon.setText("Help")
         self.help_icon.setStyleSheet("""
             QLabel#HelpIcon {
@@ -1196,23 +1210,24 @@ class Nexus(QtWidgets.QMainWindow):
         """)
 
     def _refresh_help_text(self, idx: int):
+        # Header (per tab)
         if idx == 0:
-            header = "The Image Tab"
+            header = "<b>✨The Image tab✨</b>"
             body = ("Here you choose the three pictures that make up your letter. "
                     "The cover is the front image, the letter is the main picture inside, and the back is the closing image at the end. "
                     "Each time you select one, it appears in the preview so you can see exactly how it will look in the final letter.")
         elif idx == 1:
-            header = "The Sound Tab"
+            header = "<b>✨The Sound tab✨</b>"
             body = ("This tab lets you add background music to your letter. "
                     "Pick an MP3 file, and it will play while someone reads. "
                     "If you don’t want music, you can leave it empty and the letter will stay silent.")
         elif idx == 2:
-            header = "The Message Tab"
+            header = "<b>✨The Message tab✨</b>"
             body = ("Here is where you load your words. Click Load Message File and select your note — "
                     "it can be a text file, a Word document, or a PDF. "
                     "The program will bring in up to a thousand words and display them in the preview so you can review the message before finishing.")
         elif idx == 3:
-            header = "The Forge Tab"
+            header = "<b>✨The Forge tab✨</b>"
             body = ("This is where you build the finished letter. "
                     "Click Generate to build the Play bundle and open it in your browser. "
                     "Click Seal the Letter to build the Play bundle and open the Play folder. "
@@ -1224,13 +1239,14 @@ class Nexus(QtWidgets.QMainWindow):
         self.help_pop.set_help_text(body)
 
     def _reposition_help_popover(self):
+        # Place adjacent to the help icon; flip to left if near right edge
         global_center = self.help_icon.mapToGlobal(self.help_icon.rect().center())
-        prefer_left = True
+        prefer_left = True  # prefer left so it doesn’t collide with right edge
         self.help_pop.popup_at(global_center, prefer_left, self.body, icon_px=HELP_ICON_PX)
 
     def _show_help_from_icon(self):
         idx = self.tabbar.currentIndex()
-        if idx == 4:
+        if idx == 4:  # Command — hide help
             return
         self._refresh_help_text(idx)
         self._reposition_help_popover()
@@ -1238,76 +1254,11 @@ class Nexus(QtWidgets.QMainWindow):
     def _hide_help_popover(self):
         self.help_pop.popdown()
 
-    def shutdown(self) -> None:
-        """Stop owned background work and release resources exactly once."""
-        if self._shutdown:
-            return
-        self._shutdown = True
-
-        prompt_writer = self._prompt_writer_win
-        if isinstance(prompt_writer, QtWidgets.QWidget):
-            try:
-                if hasattr(prompt_writer, "shutdown"):
-                    prompt_writer.shutdown()  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            try:
-                prompt_writer.close()
-            except Exception:
-                pass
-        self._prompt_writer_win = None
-
-        if hasattr(self, "sound_tab") and hasattr(self.sound_tab, "shutdown"):
-            try:
-                self.sound_tab.shutdown()
-            except Exception:
-                pass
-
-        try:
-            self.forge_tab.autosave_project()
-        except Exception:
-            pass
-
-        for timer in self.findChildren(QtCore.QTimer):
-            timer.stop()
-        for animation in self.findChildren(QtCore.QAbstractAnimation):
-            animation.stop()
-
-        for movie in (self._help_movie_idle, self._help_movie_hover):
-            if movie is not None:
-                movie.stop()
-        try:
-            self.help_icon.setMovie(None)
-        except Exception:
-            pass
-        try:
-            self.help_pop.close()
-        except Exception:
-            pass
-
-        try:
-            self.html_preview.stop()
-            self.html_preview.setUrl(QUrl("about:blank"))
-        except Exception:
-            pass
-
-        for process in self._child_processes:
-            try:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-            except Exception:
-                pass
-        self._child_processes.clear()
-
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self.shutdown()
-        super().closeEvent(event)
-
+    # ─────────────────────────────────────────────────────────
+    # Global event filter for help hover (robust)
+    # ─────────────────────────────────────────────────────────
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        # Safe object lookups (avoid AttributeError if Qt routes to a different QObject)
         icon = getattr(self, "help_icon", None)
         pop  = getattr(self, "help_pop", None)
 
@@ -1316,11 +1267,14 @@ class Nexus(QtWidgets.QMainWindow):
             if t in (QEvent.Enter, QEvent.HoverEnter):
                 self._help_hide_timer.stop()
                 self._help_show_timer.start()
+                # Swap to hover movie while over the icon
                 if self._help_movie_hover:
                     self.help_icon.setMovie(self._help_movie_hover)
             elif t in (QEvent.Leave, QEvent.HoverLeave):
                 self._help_show_timer.stop()
+                # If we immediately entered the popover, it will cancel this timer
                 self._help_hide_timer.start()
+                # Swap back to idle movie when leaving icon
                 if self._help_movie_idle:
                     self.help_icon.setMovie(self._help_movie_idle)
 

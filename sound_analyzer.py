@@ -7,219 +7,118 @@ import base64
 import json
 import math
 import os
-import shutil
 import tempfile
 
-from config import USER_AUDIO_ANALYSIS_DIR, USER_AUDIO_PROCESSED_DIR
+from config import USER_SOUNDS_DIR
+from audio_tools import AudioToolError, decode_mono_pcm16
 
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Deque
+from typing import Optional, List, Tuple, Deque
 from collections import deque
 
 from PySide6 import QtCore
 
+try:
+    import numpy as np  # type: ignore
+except ImportError:
+    np = None  # type: ignore[assignment]
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Analysis format
 # - We store quantized uint8 arrays packed as bytes -> zlib -> base64
 # - This keeps files small and load fast.
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _b64z_pack_u8(raw_u8: bytes, level: int = 6) -> str:
     comp = zlib.compress(raw_u8, level)
     return base64.b64encode(comp).decode("ascii")
 
 
-def _b64z_unpack_u8(s: str) -> bytes:
-    comp = base64.b64decode(s.encode("ascii"))
-    return zlib.decompress(comp)
-
-
 def _safe_mtime_size(path: Path) -> Tuple[float, int]:
     try:
         st = path.stat()
         return float(st.st_mtime), int(st.st_size)
-    except Exception:
+    except OSError:
         return 0.0, -1
 
 
-def _same_audio_identity(cached_mtime: float, cached_size: int, current_mtime: float, current_size: int) -> bool:
-    """
-    Decide whether an analysis cache still belongs to the current audio file.
-
-    Exact mtime matching is too brittle on Windows because copying/normalizing a
-    file can preserve size while shifting timestamp precision. Size mismatch is
-    a real invalidation. Same size with only timestamp drift is accepted so the
-    app can keep using an existing cache instead of forcing ffmpeg/ffprobe to
-    re-analyze a song that is already cached.
-    """
-    if int(cached_size) != int(current_size):
-        return False
-    if current_size < 0:
-        return False
-    if abs(float(current_mtime) - float(cached_mtime)) <= 1e-3:
-        return True
-    return True
+def analysis_runtime_status() -> tuple[bool, str]:
+    """Return whether the optional analysis runtime can operate."""
+    if np is None:
+        return False, "NumPy is not installed."
+    return True, ""
 
 
-def _find_audio_tool(env_name: str, exe_name: str) -> str:
-    """Locate ffmpeg/ffprobe without importing pydub."""
-    env_path = os.environ.get(env_name, "").strip().strip('"')
-    if env_path and os.path.isfile(env_path):
-        return env_path
-
-    found = shutil.which(exe_name)
-    if found:
-        return found
-
-    root = Path(__file__).resolve().parent
-    candidates = [
-        root / "ffmpeg" / "bin" / exe_name,
-        root / "tools" / "ffmpeg" / "bin" / exe_name,
-        root / "gallery" / "app" / "ffmpeg" / "bin" / exe_name,
-    ]
-    for cand in candidates:
-        if cand.is_file():
-            return str(cand)
-    return ""
+def _require_numpy():
+    available, reason = analysis_runtime_status()
+    if not available:
+        raise RuntimeError(reason)
+    return np
 
 
-def _ffmpeg_pair() -> Tuple[str, str]:
-    exe_ffmpeg = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-    exe_ffprobe = "ffprobe.exe" if os.name == "nt" else "ffprobe"
-    return (
-        _find_audio_tool("FFMPEG_BIN", exe_ffmpeg),
-        _find_audio_tool("FFPROBE_BIN", exe_ffprobe),
-    )
-
-
-def _has_ffmpeg_pair() -> bool:
-    ffmpeg, ffprobe = _ffmpeg_pair()
-    return bool(ffmpeg and ffprobe)
-
-
-def _missing_ffmpeg_message(path: Path) -> str:
-    return (
-        "Offline audio analysis is disabled because ffmpeg/ffprobe was not found. "
-        "Qt playback can still play the MP3. Existing .analysis.json cache files will still be used. "
-        "Install ffmpeg later if you want new songs analyzed automatically. "
-        f"Skipped: {path}"
-    )
-
-
-def _percentile_fallback(vals: List[float], pct: float) -> float:
-    if not vals:
-        return 0.0
-    x = sorted(vals)
-    k = (len(x) - 1) * (pct / 100.0)
-    i = int(k)
-    j = min(len(x) - 1, i + 1)
-    t = k - i
-    return (1.0 - t) * x[i] + t * x[j]
-
-
-def _norm_by_percentiles(x, p_lo=5.0, p_hi=95.0):
-    """Normalize values to 0..1 using percentiles.
-
-    Supports numpy arrays or Python sequences. If numpy is available, always
-    normalizes in numpy-space (converting sequences to np.ndarray). Falls back
-    to a pure-Python percentile estimate otherwise.
-    """
-    try:
-        import numpy as np  # type: ignore
-
-        x_arr = np.asarray(x, dtype=np.float32)
-        lo = float(np.percentile(x_arr, p_lo))
-        hi = float(np.percentile(x_arr, p_hi))
-        if hi <= lo + 1e-12:
-            return np.zeros_like(x_arr, dtype=np.float32)
-
-        y = (x_arr - lo) / (hi - lo)
-        y = np.clip(y, 0.0, 1.0).astype(np.float32)
-        return y
-    except Exception:
-        lo = _percentile_fallback(list(x), p_lo)
-        hi = _percentile_fallback(list(x), p_hi)
-        if hi <= lo + 1e-12:
-            return [0.0 for _ in x]
-        out = []
-        inv = 1.0 / (hi - lo)
-        for v in x:
-            y = (float(v) - lo) * inv
-            if y < 0.0:
-                y = 0.0
-            elif y > 1.0:
-                y = 1.0
-            out.append(float(y))
-        return out
+def _norm_by_percentiles(values, p_lo: float = 5.0, p_hi: float = 95.0):
+    numpy = _require_numpy()
+    array = numpy.asarray(values, dtype=numpy.float32)
+    lo = float(numpy.percentile(array, p_lo))
+    hi = float(numpy.percentile(array, p_hi))
+    if hi <= lo + 1e-12:
+        return numpy.zeros_like(array, dtype=numpy.float32)
+    return numpy.clip((array - lo) / (hi - lo), 0.0, 1.0).astype(numpy.float32)
 
 
 def _beat_from_bass(bass_norm, hop_ms: int) -> List[float]:
-    """
-    Simple onset/beat cue:
-    - Use positive derivative of bass energy
-    - Adaptive threshold via median + MAD
-    - Peaks spaced by >= 220ms
-    Returns beat pulse array in 0..1.
-    """
-    n = len(bass_norm)
-    if n <= 2:
-        return [0.0] * n
+    numpy = _require_numpy()
+    bass = numpy.asarray(bass_norm, dtype=numpy.float32)
+    count = len(bass)
+    if count <= 2:
+        return [0.0] * count
 
+    derivative = numpy.maximum(numpy.diff(bass, prepend=bass[0]), 0.0)
+    median = float(numpy.median(derivative))
+    mad = float(numpy.median(numpy.abs(derivative - median))) + 1e-6
+    threshold = median + 3.0 * mad
+    minimum_separation = max(1, int(round(220.0 / max(1, hop_ms))))
+    beats = numpy.zeros(count, dtype=numpy.float32)
+
+    last = -10_000
+    for index in range(1, count - 1):
+        if index - last < minimum_separation:
+            continue
+        if (
+            derivative[index] > threshold
+            and derivative[index] >= derivative[index - 1]
+            and derivative[index] >= derivative[index + 1]
+        ):
+            beats[index] = 1.0
+            last = index
+
+    for index in range(count):
+        if beats[index] <= 0.5:
+            continue
+        for offset, value in ((1, 0.55), (2, 0.25), (3, 0.12)):
+            if index + offset < count:
+                beats[index + offset] = max(beats[index + offset], value)
+            if index - offset >= 0:
+                beats[index - offset] = max(beats[index - offset], value)
+    return beats.tolist()
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    destination = Path(path).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
     try:
-        import numpy as np  # type: ignore
-        b = np.asarray(bass_norm, dtype=np.float32)
-        d = np.diff(b, prepend=b[0])
-        d = np.maximum(d, 0.0)
-
-        med = float(np.median(d))
-        mad = float(np.median(np.abs(d - med))) + 1e-6
-        thr = med + 3.0 * mad
-
-        min_sep = max(1, int(round(220.0 / max(1, hop_ms))))
-        beats = np.zeros(n, dtype=np.float32)
-
-        last = -10_000
-        for i in range(1, n - 1):
-            if i - last < min_sep:
-                continue
-            if d[i] > thr and d[i] >= d[i - 1] and d[i] >= d[i + 1]:
-                beats[i] = 1.0
-                last = i
-
-        # soften pulse: small decay around the beat
-        for i in range(n):
-            if beats[i] > 0.5:
-                for k, v in ((1, 0.55), (2, 0.25), (3, 0.12)):
-                    if i + k < n:
-                        beats[i + k] = max(beats[i + k], v)
-                    if i - k >= 0:
-                        beats[i - k] = max(beats[i - k], v)
-
-        return beats.tolist()
-    except Exception:
-        # fallback: very simple peak marking
-        d = [0.0] * n
-        for i in range(1, n):
-            dv = bass_norm[i] - bass_norm[i - 1]
-            d[i] = dv if dv > 0.0 else 0.0
-
-        med = _percentile_fallback(d, 50.0)
-        mad = _percentile_fallback([abs(v - med) for v in d], 50.0) + 1e-6
-        thr = med + 3.0 * mad
-
-        min_sep = max(1, int(round(220.0 / max(1, hop_ms))))
-        beats = [0.0] * n
-        last = -10_000
-        for i in range(1, n - 1):
-            if i - last < min_sep:
-                continue
-            if d[i] > thr and d[i] >= d[i - 1] and d[i] >= d[i + 1]:
-                beats[i] = 1.0
-                last = i
-        return beats
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, destination)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 @dataclass
@@ -252,93 +151,27 @@ class AudioAnalysisWorker(QtCore.QObject):
             payload = self._analyze_mp3(self._path, hop_ms=self._hop_ms, nbands=self._nbands)
             if self._abort:
                 return
-            self._out_file.parent.mkdir(parents=True, exist_ok=True)
-            self._out_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            _atomic_write_json(self._out_file, payload)
             self.finished.emit(str(self._path), payload)
         except Exception as e:
+            if self._abort:
+                return
             self.failed.emit(str(self._path), f"{type(e).__name__}: {e}")
 
     # --- analysis core ---
-    def _decode_audio_segment(self, path: Path):
-        """
-        Decode audio through pydub/ffmpeg.
-
-        Qt playback can succeed even when the offline analyzer fails, because they
-        use different backends. For stubborn filenames or paths, retry by copying
-        the file to a short ASCII temp path before giving up.
-        """
-        path = Path(path).resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"Audio file not found: {path}")
-
-        ffmpeg, ffprobe = _ffmpeg_pair()
-        if not ffmpeg or not ffprobe:
-            raise RuntimeError(_missing_ffmpeg_message(path))
-
-        try:
-            from pydub import AudioSegment  # type: ignore
-            import pydub  # type: ignore
-            pydub.AudioSegment.converter = ffmpeg  # type: ignore[attr-defined]
-            pydub.AudioSegment.ffprobe = ffprobe  # type: ignore[attr-defined]
-        except Exception as e:
-            raise RuntimeError(f"pydub missing: {e!r}")
-
-        try:
-            return AudioSegment.from_file(str(path))
-        except Exception as first_error:
-            tmp_dir: Optional[Path] = None
-            try:
-                tmp_dir = Path(tempfile.mkdtemp(prefix="lettersmith_audio_"))
-                suffix = path.suffix.lower() or ".mp3"
-                tmp_path = tmp_dir / f"input{suffix}"
-                shutil.copy2(path, tmp_path)
-                return AudioSegment.from_file(str(tmp_path))
-            except Exception as second_error:
-                raise RuntimeError(
-                    "Audio decode failed. The file exists and can still play through Qt, "
-                    "but the offline analyzer could not decode it. If the message includes "
-                    "WinError 2, Windows is usually missing ffmpeg/ffprobe - not the MP3. "
-                    "Install ffmpeg or keep using the cached analysis when available. "
-                    f"File: {path} | First error: {type(first_error).__name__}: {first_error} | "
-                    f"Retry error: {type(second_error).__name__}: {second_error}"
-                ) from second_error
-            finally:
-                if tmp_dir is not None:
-                    try:
-                        shutil.rmtree(tmp_dir, ignore_errors=True)
-                    except Exception:
-                        pass
-
     def _analyze_mp3(self, path: Path, hop_ms: int, nbands: int) -> dict:
         mtime, size = _safe_mtime_size(path)
 
-        seg = self._decode_audio_segment(path)
-        seg = seg.set_channels(1)
-
-        # Target SR for analysis (keep light, still believable)
+        numpy = _require_numpy()
         sr = 22050
-        seg = seg.set_frame_rate(sr)
-
-        sw = int(seg.sample_width)
-        if sw <= 0:
-            sw = 2
-
-        # Samples -> float32 [-1, 1]
         try:
-            import numpy as np  # type: ignore
-        except Exception:
-            np = None  # type: ignore
+            pcm = decode_mono_pcm16(path, sample_rate=sr, cancel_check=lambda: self._abort)
+        except AudioToolError as exc:
+            raise RuntimeError(str(exc)) from exc
 
-        if np is None:
-            # fallback: no numpy means no FFT bands; still return envelope-ish analysis
-            samples_i = seg.get_array_of_samples()
-            denom = float(2 ** (8 * sw - 1))
-            samples = [float(v) / denom for v in samples_i]
-            return self._fallback_envelope_only(path, mtime, size, sr, hop_ms, samples)
-
-        samples_i = np.array(seg.get_array_of_samples(), dtype=np.float32)
-        denom = float(2 ** (8 * sw - 1))
-        samples = samples_i / denom
+        samples = numpy.frombuffer(pcm, dtype=numpy.int16).astype(numpy.float32) / 32768.0
+        if samples.size <= 0:
+            raise RuntimeError("Empty audio")
 
         hop = int(round(sr * (hop_ms / 1000.0)))
         hop = max(64, hop)
@@ -506,52 +339,6 @@ class AudioAnalysisWorker(QtCore.QObject):
         }
         return payload
 
-    def _fallback_envelope_only(self, path: Path, mtime: float, size: int, sr: int, hop_ms: int, samples: List[float]) -> dict:
-        hop = int(round(sr * (hop_ms / 1000.0)))
-        hop = max(64, hop)
-        win = max(hop * 2, 1024)
-
-        n = len(samples)
-        if n <= 0:
-            raise RuntimeError("Empty audio")
-
-        frames = 1 + max(0, (n - 1) // hop)
-
-        lvl = [0.0] * frames
-        for i in range(frames):
-            start = i * hop
-            end = min(n, start + win)
-            if start >= n:
-                break
-            acc = 0.0
-            cnt = 0
-            for v in samples[start:end]:
-                acc += v * v
-                cnt += 1
-            rms = math.sqrt(acc / max(1, cnt))
-            lvl[i] = 20.0 * math.log10(rms + 1e-9)
-            if i % 200 == 0:
-                self.progress.emit(str(path), int(round(100.0 * (i / max(1, frames)))))
-
-        lvl_n = _norm_by_percentiles(lvl, 5.0, 95.0)
-        # in fallback mode, reuse lvl as all bands; beat is 0
-        lvl_u8 = bytes([int(max(0, min(255, round(v * 255.0)))) for v in lvl_n])
-        z = _b64z_pack_u8(lvl_u8)
-
-        payload = {
-            "version": 1,
-            "codec": "b64z_u8",
-            "src": {"path": str(path), "mtime": mtime, "size": size},
-            "sr": sr,
-            "hop_ms": hop_ms,
-            "frames": int(frames),
-            "nbands": 0,
-            "edges_hz": [],
-            "q": {"lvl": z, "bass": z, "mid": z, "high": z, "beat": _b64z_pack_u8(bytes([0] * frames)), "spec": ""},
-            "profile": {"lvl_mean": float(sum(lvl_n) / max(1, len(lvl_n))), "bass_mean": 0.0, "bright_mean": 0.0, "bass_ratio": 0.0},
-        }
-        self.progress.emit(str(path), 100)
-        return payload
 
 
 class AudioAnalysisManager(QtCore.QObject):
@@ -559,7 +346,7 @@ class AudioAnalysisManager(QtCore.QObject):
     One-at-a-time queue manager (keeps UI responsive, avoids CPU spikes).
 
     - ensure_analyzed(path, priority=True/False): enqueue if missing/stale
-    - enqueue_missing(processed_dir): enqueue any mp3 lacking analysis
+    - enqueue_missing(): optional maintenance sweep explicitly requested by a caller
     - load_cached(path): read analysis now (fast) if present/valid
 
     Signals:
@@ -577,9 +364,9 @@ class AudioAnalysisManager(QtCore.QObject):
         super().__init__(parent)
         self.project_root = Path(project_root).resolve()
 
-        self.processed_dir = self.project_root / USER_AUDIO_PROCESSED_DIR
-        self.analysis_dir = self.project_root / USER_AUDIO_ANALYSIS_DIR
-        self.processed_dir.mkdir(parents=True, exist_ok=True)
+        base = self.project_root / USER_SOUNDS_DIR / "appssong"
+        self.processed_dir = base / "processed"
+        self.analysis_dir = base / "analysis"
         self.analysis_dir.mkdir(parents=True, exist_ok=True)
 
         self._queue: Deque[_Job] = deque()
@@ -594,33 +381,19 @@ class AudioAnalysisManager(QtCore.QObject):
 
         self._hop_ms = 20
         self._nbands = 32
-        self._decoder_missing_notified: set[str] = set()
-        self._shutting_down = False
 
-    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ public â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ───────────────────── public ─────────────────────
     def is_busy(self) -> bool:
         return self._busy
 
     def shutdown(self) -> None:
-        if self._shutting_down:
-            return
-        self._shutting_down = True
         self._queue.clear()
         self._pending.clear()
         self._cleanup_thread()
         self._set_busy(False)
 
     def enqueue_missing(self) -> None:
-        """
-        Archive-wide analysis is intentionally conservative.
-
-        If ffmpeg/ffprobe is unavailable, do not enqueue anything. Cached files
-        are loaded on demand, and playback still works through Qt. This prevents
-        repeated failed analyzer jobs every time the Sound tab opens.
-        """
-        if self._shutting_down or not self.processed_dir.exists():
-            return
-        if not _has_ffmpeg_pair():
+        if not self.processed_dir.exists():
             return
 
         mp3s = sorted(self.processed_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -629,8 +402,6 @@ class AudioAnalysisManager(QtCore.QObject):
                 self.ensure_analyzed(p, priority=False)
 
     def ensure_analyzed(self, path: Path, priority: bool = True) -> None:
-        if self._shutting_down:
-            return
         p = Path(path).resolve()
         key = str(p)
 
@@ -638,12 +409,6 @@ class AudioAnalysisManager(QtCore.QObject):
         cached = self.load_cached(p)
         if cached is not None:
             self.analysisReady.emit(key, cached)
-            return
-
-        if not _has_ffmpeg_pair():
-            if key not in self._decoder_missing_notified:
-                self._decoder_missing_notified.add(key)
-                self.analysisFailed.emit(key, _missing_ffmpeg_message(p))
             return
 
         if key in self._pending:
@@ -665,7 +430,6 @@ class AudioAnalysisManager(QtCore.QObject):
     def load_cached(self, path: Path) -> Optional[dict]:
         p = Path(path).resolve()
         out = self._analysis_file_for(p)
-
         if not out.exists():
             return None
 
@@ -676,34 +440,20 @@ class AudioAnalysisManager(QtCore.QObject):
 
         try:
             src = payload.get("src", {})
-            cached_mtime = float(src.get("mtime", -1.0))
-            cached_size = int(src.get("size", -1))
+            mtime = float(src.get("mtime", -1.0))
+            size = int(src.get("size", -1))
             cur_mtime, cur_size = _safe_mtime_size(p)
-
-            if not _same_audio_identity(cached_mtime, cached_size, cur_mtime, cur_size):
+            if abs(cur_mtime - mtime) > 1e-6 or cur_size != size:
                 return None
-
-            src["path"] = str(p)
-            src["mtime"] = cur_mtime
-            src["size"] = cur_size
-            payload["src"] = src
-
-            try:
-                out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            except Exception:
-                pass
-
-            return payload
         except Exception:
             return None
 
-    # internals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    def analysis_file_for_debug(self, path: Path) -> Path:
-        return self._analysis_file_for(path)
+        return payload
 
+    # ───────────────────── internals ─────────────────────
     def _analysis_file_for(self, path: Path) -> Path:
-        p = Path(path).resolve()
-        return self.analysis_dir / f"{p.name}.analysis.json"
+        # name-based, but also invalidated by mtime/size check in payload
+        return self.analysis_dir / (path.name + ".analysis.json")
 
     def _needs_analysis(self, path: Path) -> bool:
         return self.load_cached(path) is None
@@ -725,12 +475,6 @@ class AudioAnalysisManager(QtCore.QObject):
     def _start_next(self) -> None:
         # cleanup old thread
         self._cleanup_thread()
-
-        if self._shutting_down:
-            self._queue.clear()
-            self._pending.clear()
-            self._set_busy(False)
-            return
 
         if not self._queue:
             self._pending.clear()
@@ -778,11 +522,8 @@ class AudioAnalysisManager(QtCore.QObject):
 
         if self._thread is not None:
             try:
-                self._thread.requestInterruption()
                 self._thread.quit()
-                if not self._thread.wait(5000):
-                    self._thread.terminate()
-                    self._thread.wait(1000)
+                self._thread.wait(2000)
             except Exception:
                 pass
 
@@ -800,8 +541,7 @@ class AudioAnalysisManager(QtCore.QObject):
         self.batchProgress.emit(self._done, max(self._total, 1), Path(path_str).name, 100)
         self.analysisReady.emit(path_str, payload)
 
-        if not self._shutting_down:
-            QtCore.QTimer.singleShot(0, self._start_next)
+        QtCore.QTimer.singleShot(0, self._start_next)
 
     def _on_failed(self, path_str: str, msg: str) -> None:
         self._pending.discard(path_str)
@@ -810,6 +550,7 @@ class AudioAnalysisManager(QtCore.QObject):
         self.batchProgress.emit(self._done, max(self._total, 1), Path(path_str).name, 100)
         self.analysisFailed.emit(path_str, msg)
 
-        if not self._shutting_down:
-            QtCore.QTimer.singleShot(0, self._start_next)
+        QtCore.QTimer.singleShot(0, self._start_next)
 
+
+__all__ = ["AudioAnalysisManager", "analysis_runtime_status"]

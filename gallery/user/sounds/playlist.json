@@ -2,10 +2,13 @@
   "version": 1,
   "tracks": [
     {
-      "archive_name": "Chris Tomlin - How Great Is Our God.mp3"
+      "archive_name": "Test 1.mp3"
     },
     {
-      "archive_name": "whistler.mp3"
+      "archive_name": "Test 2.mp3"
+    },
+    {
+      "archive_name": "Test 3.mp3"
     }
   ],
   "repeat": true,

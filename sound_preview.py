@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 from typing import Optional, Any, Dict
-from pathlib import Path
 import base64
 import zlib
 import math
@@ -21,14 +20,13 @@ except Exception:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Try to import the full visualizer. If it fails, use the built-in minimal visualizer.
+# Load the current visualizer implementation. The built-in minimal visualizer
+# remains as a startup-safe substitute if the optional visualizer cannot load.
 # ─────────────────────────────────────────────────────────────────────────────
-_AudioVisualizerUltra = None  # type: ignore[var-annotated]
-
 try:
     from sound_visualizer import AudioVisualizerUltra as _AudioVisualizerUltra  # type: ignore
-except Exception:
-    _AudioVisualizerUltra = None
+except ImportError:
+    _AudioVisualizerUltra = None  # type: ignore[assignment]
 
 
 def _b64z_unpack_u8(s: str) -> bytes:
@@ -192,20 +190,35 @@ class _VisualizerGate(QtCore.QObject):
         self._muted = False
 
         # Gate thresholds
-        self._silence_threshold = 0.003
+        self._silence_threshold = 0.01
 
         self._visible = False
 
         self._poll = QtCore.QTimer(self)
         self._poll.setInterval(120)
         self._poll.timeout.connect(self._poll_tick)
+        self._enabled = False
         self._shutting_down = False
 
     def is_visible(self) -> bool:
         return self._visible
 
+    def set_enabled(self, enabled: bool) -> None:
+        """Suspend gate polling while Sound does not own the preview."""
+        if self._shutting_down:
+            return
+        self._enabled = bool(enabled)
+        if not self._enabled or self._player is None:
+            self._poll.stop()
+            self._stale_pos_ticks = 0
+            self._set_visible(False)
+            return
+        self._poll.start()
+        self._poll_tick()
+
     def shutdown(self) -> None:
         self._shutting_down = True
+        self._enabled = False
         try:
             self._poll.stop()
         except Exception:
@@ -265,8 +278,12 @@ class _VisualizerGate(QtCore.QObject):
 
         self._wire_audio_out()
 
-        self._poll.start()
-        self._poll_tick()
+        if self._enabled:
+            self._poll.start()
+            self._poll_tick()
+        else:
+            self._poll.stop()
+            self._set_visible(False)
 
     def set_audio_file(self, path: str) -> None:
         self._audio_path = path or ""
@@ -461,7 +478,8 @@ class _VisualizerGate(QtCore.QObject):
         return None
 
     def _poll_tick(self) -> None:
-        if self._shutting_down:
+        if self._shutting_down or not self._enabled:
+            self._set_visible(False)
             return
         if self._player is None:
             self._set_visible(False)
@@ -484,14 +502,15 @@ class _VisualizerGate(QtCore.QObject):
 
         pos = self._read_position()
         if pos is not None:
-            # Do not mark playback as paused just because position stalls briefly.
-            # Some Qt backends update position in coarse bursts, especially on MP3s.
-            # QMediaPlayer's playback state is the authority here.
+            # position-stall inference: if "playing" but position doesn't move,
+            # treat as paused within ~360ms (3 ticks @ 120ms).
             if self._playing:
                 if pos == self._last_pos_ms:
                     self._stale_pos_ticks += 1
                 else:
                     self._stale_pos_ticks = 0
+                if self._stale_pos_ticks >= 3:
+                    self._playing = False
             else:
                 self._stale_pos_ticks = 0
 
@@ -506,14 +525,8 @@ class _VisualizerGate(QtCore.QObject):
         return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
 
     def _effective_volume(self) -> float:
-        """
-        Visualizer volume gate.
-
-        Important: muted audio should not make the preview look dead.
-        Muting only silences QAudioOutput; playback still continues, so the
-        visualizer should keep responding while muted. A real 0% volume still
-        hides the visualizer.
-        """
+        if self._muted:
+            return 0.0
         return self._clamp01(self._volume)
 
     def _analysis_level(self) -> Optional[float]:
@@ -524,19 +537,16 @@ class _VisualizerGate(QtCore.QObject):
             idx = 0
         elif idx >= self._frames:
             idx = self._frames - 1
-
-        # Use a tiny neighborhood so the preview does not blink off between
-        # adjacent low-energy frames. This keeps silence detection useful while
-        # avoiding the dead-preview look during quiet musical passages.
         try:
-            lo = max(0, idx - 2)
-            hi = min(self._frames - 1, idx + 2)
-            vals = [float(self._lvl[i]) / 255.0 for i in range(lo, hi + 1)]
-            return max(vals) if vals else None
+            return float(self._lvl[idx]) / 255.0
         except Exception:
             return None
 
     def _recompute(self) -> None:
+        if not self._enabled:
+            self._set_visible(False)
+            return
+
         # pause/stop or no track: hide
         if not self._playing or not self._audio_path:
             self._set_visible(False)
@@ -575,20 +585,14 @@ class SoundPreviewWidget(QtWidgets.QFrame):
     - set_media_player(player) -> None
     - set_audio_file(path) -> None
     - set_analysis_payload(payload) -> None
+    - set_tab_active(active) -> None
     - shutdown() -> None
-
-    Behavior:
-    - Uses the analyzer-driven visualizer when analysis payload exists.
-    - Falls back to a lightweight live-motion visualizer when analysis is missing.
-    - Keeps the preview alive while muted, because muted playback still advances.
     """
 
     def __init__(self, media_player, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self._shutdown = False
-        self._has_analysis_payload = False
-        self._current_audio_path = ""
-
+        self._tab_active = False
         self.setObjectName("sound_preview_frame")
         self.setStyleSheet(
             "#sound_preview_frame {"
@@ -600,143 +604,86 @@ class SoundPreviewWidget(QtWidgets.QFrame):
         self.setAccessibleName("Sound Preview Frame")
         self.setToolTip("Music visualizer")
 
+        # Build both stages: blank (vanished) and visualizer (active)
         self._blank = _BlankStage(self)
-        self._mini_visualizer = _MiniBarVisualizer(self)
 
-        self._premium_available = _AudioVisualizerUltra is not None
-        if self._premium_available:
+        if _AudioVisualizerUltra is not None:
             self._visualizer = _AudioVisualizerUltra(self)
         else:
-            self._visualizer = self._mini_visualizer
+            self._visualizer = _MiniBarVisualizer(self)
 
         self._blank.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self._visualizer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self._mini_visualizer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
+        # Stacked layout to keep size stable while "vanishing"
         stack = QtWidgets.QStackedLayout()
         stack.setContentsMargins(8, 8, 8, 8)
-        stack.addWidget(self._blank)
-        self._blank_index = 0
-
-        if self._premium_available:
-            stack.addWidget(self._visualizer)
-            self._premium_index = 1
-            stack.addWidget(self._mini_visualizer)
-            self._mini_index = 2
-        else:
-            stack.addWidget(self._mini_visualizer)
-            self._premium_index = -1
-            self._mini_index = 1
-
-        stack.setCurrentIndex(self._blank_index)
+        stack.addWidget(self._blank)       # index 0
+        stack.addWidget(self._visualizer)  # index 1
+        stack.setCurrentIndex(0)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.addLayout(stack, 1)
         self._stack = stack
 
+        # Gate decides whether to show visualizer or blank
         self._gate = _VisualizerGate(self)
         self._gate.visibleChanged.connect(self._on_gate_visible)
 
         if media_player is not None:
             self.set_media_player(media_player)
 
-    def _all_visualizers(self):
-        seen = set()
-        for widget in (self._visualizer, self._mini_visualizer):
-            if widget is None:
-                continue
-            key = id(widget)
-            if key in seen:
-                continue
-            seen.add(key)
-            yield widget
-
-    def _selected_visualizer(self):
-        # Prefer the analyzer-driven visualizer only after a valid cache payload
-        # has actually been applied. If the cache is missing or still loading,
-        # use the lightweight fallback so the preview remains alive instead of
-        # displaying "Analysis cache unavailable" forever.
-        if self._premium_available and self._has_analysis_payload:
-            return self._visualizer, self._premium_index
-        return self._mini_visualizer, self._mini_index
-
     def _on_gate_visible(self, show: bool) -> None:
-        if self._shutdown:
-            show = False
+        show = bool(show and self._tab_active and not self._shutdown)
 
-        if not show:
-            self._stack.setCurrentIndex(self._blank_index)
-            for widget in self._all_visualizers():
-                try:
-                    if hasattr(widget, "set_active"):
-                        widget.set_active(False)  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-            return
+        # Switch stage
+        self._stack.setCurrentIndex(1 if show else 0)
 
-        active_widget, active_index = self._selected_visualizer()
-        self._stack.setCurrentIndex(active_index)
+        # Make the visualizer actually run/stop (critical).
+        try:
+            if hasattr(self._visualizer, "set_active"):
+                self._visualizer.set_active(bool(show))  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
-        for widget in self._all_visualizers():
-            try:
-                if hasattr(widget, "set_active"):
-                    widget.set_active(widget is active_widget)  # type: ignore[attr-defined]
-            except Exception:
-                pass
-
+    # ── Public API ──────────────────────────────────────────────────────────
     def set_media_player(self, player) -> None:
         if self._shutdown:
             return
 
+        # Wire gate FIRST (controls visibility)
         try:
             self._gate.set_media_player(player)
         except Exception as e:
             logging.debug(f"[SoundPreview] gate set_media_player warning: {e!r}")
 
-        for widget in self._all_visualizers():
-            try:
-                if hasattr(widget, "set_media_player"):
-                    widget.set_media_player(player)  # type: ignore[call-arg]
-            except Exception as e:
-                logging.debug(f"[SoundPreview] visualizer set_media_player warning: {e!r}")
+        # Then pass through to visualizer if it supports it
+        try:
+            if hasattr(self._visualizer, "set_media_player"):
+                self._visualizer.set_media_player(player)  # type: ignore[call-arg]
+        except Exception as e:
+            logging.debug(f"[SoundPreview] visualizer set_media_player warning: {e!r}")
 
+        # Sync current visible state into visualizer active flag
         self._on_gate_visible(self._gate.is_visible())
 
     def set_audio_file(self, path: str) -> None:
         if self._shutdown:
             return
 
-        path = path or ""
-        changed = path != self._current_audio_path
-        self._current_audio_path = path
-
-        if changed:
-            # A new song must not inherit the previous song's cached analysis.
-            # The correct cache will be applied immediately afterward if it exists.
-            self._has_analysis_payload = False
-            try:
-                self._gate.set_analysis_payload(None)
-            except Exception:
-                pass
-            for widget in self._all_visualizers():
-                try:
-                    if hasattr(widget, "set_analysis_payload"):
-                        widget.set_analysis_payload(None)  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-
+        # Update gate so it can silence-detect
         try:
             self._gate.set_audio_file(path)
         except Exception as e:
             logging.debug(f"[SoundPreview] gate set_audio_file warning: {e!r}")
 
-        for widget in self._all_visualizers():
-            try:
-                if hasattr(widget, "set_audio_file"):
-                    widget.set_audio_file(path)  # type: ignore[call-arg]
-            except Exception as e:
-                logging.debug(f"[SoundPreview] visualizer set_audio_file warning: {e!r}")
+        # Pass through to visualizer
+        try:
+            if hasattr(self._visualizer, "set_audio_file"):
+                self._visualizer.set_audio_file(path)  # type: ignore[call-arg]
+        except Exception as e:
+            logging.debug(f"[SoundPreview] visualizer set_audio_file warning: {e!r}")
 
         self._on_gate_visible(self._gate.is_visible())
 
@@ -744,28 +691,28 @@ class SoundPreviewWidget(QtWidgets.QFrame):
         if self._shutdown:
             return
 
-        self._has_analysis_payload = False
-        try:
-            if payload:
-                q = payload.get("q", {}) or {}
-                frames = int(payload.get("frames", 0) or 0)
-                self._has_analysis_payload = bool(frames > 0 and q.get("lvl"))
-        except Exception:
-            self._has_analysis_payload = False
-
+        # Gate uses this for silence collapse
         try:
             self._gate.set_analysis_payload(payload)
         except Exception as e:
             logging.debug(f"[SoundPreview] gate set_analysis_payload warning: {e!r}")
 
-        for widget in self._all_visualizers():
-            try:
-                if hasattr(widget, "set_analysis_payload"):
-                    widget.set_analysis_payload(payload)  # type: ignore[attr-defined]
-            except Exception as e:
-                logging.debug(f"[SoundPreview] visualizer set_analysis_payload warning: {e!r}")
+        # Visualizer uses this for drawing
+        try:
+            if hasattr(self._visualizer, "set_analysis_payload"):
+                self._visualizer.set_analysis_payload(payload)  # type: ignore[attr-defined]
+        except Exception as e:
+            logging.debug(f"[SoundPreview] visualizer set_analysis_payload warning: {e!r}")
 
         self._on_gate_visible(self._gate.is_visible())
+
+    def set_tab_active(self, active: bool) -> None:
+        """Enable gate polling and drawing only while Sound owns the preview."""
+        if self._shutdown:
+            return
+        self._tab_active = bool(active)
+        self._gate.set_enabled(self._tab_active)
+        self._on_gate_visible(self._gate.is_visible() if self._tab_active else False)
 
     def visualizer(self) -> QtWidgets.QWidget:
         return self._visualizer
@@ -774,6 +721,7 @@ class SoundPreviewWidget(QtWidgets.QFrame):
         if self._shutdown:
             return
         self._shutdown = True
+        self._tab_active = False
 
         try:
             self._gate.shutdown()
@@ -783,18 +731,16 @@ class SoundPreviewWidget(QtWidgets.QFrame):
             self._on_gate_visible(False)
         except Exception:
             pass
-
-        for widget in self._all_visualizers():
-            try:
-                if hasattr(widget, "set_media_player"):
-                    widget.set_media_player(None)  # type: ignore[call-arg]
-            except Exception:
-                pass
-            try:
-                if hasattr(widget, "shutdown"):
-                    widget.shutdown()  # type: ignore[attr-defined]
-            except Exception:
-                pass
+        try:
+            if hasattr(self._visualizer, "set_media_player"):
+                self._visualizer.set_media_player(None)  # type: ignore[call-arg]
+        except Exception:
+            pass
+        try:
+            if hasattr(self._visualizer, "shutdown"):
+                self._visualizer.shutdown()  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.shutdown()

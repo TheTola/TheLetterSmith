@@ -1,2127 +1,1719 @@
 # ===============================
 # File: sound_tab.py
-# Purpose: Sound tab (archive + playback + analysis + visualizer)
-
+# Purpose: Single-track-first Sound tab with optional playlists and archive
+# ===============================
 
 from __future__ import annotations
 
-import errno
 import json
+import logging
 import os
 import shutil
-import sys
-import time
-from dataclasses import dataclass
-from datetime import datetime
+import tempfile
 from pathlib import Path
-from typing import Optional, List, Tuple, Dict
+from typing import Callable, Optional
 
-# --- Qt ---
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PySide6.QtWidgets import (
-    QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSlider,
-    QFileDialog, QMessageBox
-)
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 
-from audio_export import _export_apple_safe_mp3
-from playlist import Playlist, PlaylistStore
-from playlist_player import PlaylistPlayer
-from settings_store import SettingsStore
-from ui_status import StatusBanner, StatusController, StatusLevel
-
-# --- Visualizer (shared preview widget) ---
-from sound_preview import SoundPreviewWidget
-
-# --- Analysis (offline MP3 -> cached) ---
-try:
-    from sound_analyzer import AudioAnalysisManager
-except Exception:
-    AudioAnalysisManager = None  # type: ignore
-
-# --- Audio utils ---
-from mutagen import File as MutagenFile
-
-# --- Project config ---
+from audio_tools import AudioToolError, convert_to_mp3, probe_audio, toolchain_available
 from config import (
     MAX_AUDIO_MB,
-    MUSIC_FILE,
-    GLISS_FILE,
-    FLIP_PREFIX,
-    FLIP_COUNT,
+    SETTINGS_FILE,
+    STARTING_VOLUME,
     USER_SOUNDS_DIR,
-    USER_AUDIO_ORIGINALS_DIR,
-    USER_AUDIO_PROCESSED_DIR,
-    USER_AUDIO_ANALYSIS_DIR,
-    USER_AUDIO_MANIFEST_FILE,
 )
+from sound_model import (
+    ProjectSoundState,
+    TrackRecord,
+    analysis_dir,
+    atomic_write_json,
+    current_manifest_path,
+    current_music_path,
+    display_title_from_name,
+    ensure_sound_dirs,
+    hash_file,
+    load_library,
+    load_project_state,
+    originals_dir,
+    processed_dir,
+    resolve_track_path,
+    safe_filename,
+    save_library,
+    save_project_state,
+    utc_now_text,
+)
+from sound_preview import SoundPreviewWidget
+
+try:
+    from sound_analyzer import AudioAnalysisManager, analysis_runtime_status
+except Exception as exc:
+    logging.getLogger(__name__).warning("Sound analysis unavailable: %s", exc)
+    AudioAnalysisManager = None  # type: ignore[assignment]
+
+    def analysis_runtime_status() -> tuple[bool, str]:
+        return False, "Sound analysis module could not be imported."
 
 
-# Supported formats
-VALID_AUDIO_EXTS = [".mp3", ".wav", ".ogg", ".aac", ".m4a", ".flac"]
+VALID_AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".aac", ".m4a", ".flac"}
+ANALYSIS_SETTINGS_KEY = "enable_sound_analysis"
+LAST_MUSIC_FOLDER_KEY = "last_music_folder"
+CROSSFADE_MS = 1000
 
 
-# Gliss always at 10% (independent of music volume)
-GLISS_VOLUME_PERCENT = 10
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    return f"{total // 60}:{total % 60:02d}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# NEW PATH MODEL (single source of truth)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _user_sounds_dir(project_root: Path) -> Path:
-    # gallery/user/sounds
-    return project_root / USER_SOUNDS_DIR
+def _format_ms(milliseconds: int) -> str:
+    return _format_duration(max(0, int(milliseconds)) / 1000.0)
 
 
-def _user_archive_originals(project_root: Path) -> Path:
-    # gallery/user/sounds/appssong/originals
-    return project_root / USER_AUDIO_ORIGINALS_DIR
-
-
-def _user_archive_processed(project_root: Path) -> Path:
-    # gallery/user/sounds/appssong/processed
-    return project_root / USER_AUDIO_PROCESSED_DIR
-
-
-def _user_archive_analysis(project_root: Path) -> Path:
-    # gallery/user/sounds/appssong/analysis
-    return project_root / USER_AUDIO_ANALYSIS_DIR
-
-
-def _user_current_manifest(project_root: Path) -> Path:
-    # gallery/user/sounds/appssong/current.json
-    return project_root / USER_AUDIO_MANIFEST_FILE
-
-
-def _user_current_music(project_root: Path) -> Path:
-    # gallery/user/sounds/music.mp3
-    return _user_sounds_dir(project_root) / MUSIC_FILE
-
-
-def _user_gliss_path(project_root: Path) -> Path:
-    return _user_sounds_dir(project_root) / GLISS_FILE
-
-
-def _user_flip_path(project_root: Path, i: int) -> Path:
-    return _user_sounds_dir(project_root) / f"{FLIP_PREFIX}{i}.mp3"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _atomic_copy(src: Path, dst: Path) -> None:
-    """Atomic write via *.tmp then os.replace."""
+def _atomic_copy(source: Path, destination: Path) -> None:
+    src = Path(source).resolve()
+    dst = Path(destination).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"Audio file does not exist: {src}")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(dst.suffix + ".tmp")
-    with src.open("rb") as rf, tmp.open("wb") as wf:
-        shutil.copyfileobj(rf, wf, length=1024 * 1024)
-        wf.flush()
-        os.fsync(wf.fileno())
-    os.replace(tmp, dst)
-
-
-def _file_size(p: Path) -> int:
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent))
+    os.close(fd)
+    tmp = Path(tmp_name)
     try:
-        return p.stat().st_size
-    except Exception:
-        return -1
+        with src.open("rb") as read_handle, tmp.open("wb") as write_handle:
+            shutil.copyfileobj(read_handle, write_handle, 1024 * 1024)
+            write_handle.flush()
+            os.fsync(write_handle.fileno())
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
-def _open_folder(path: Path) -> None:
-    path = path.resolve()
-    path.mkdir(parents=True, exist_ok=True)
+def _read_settings(project_root: Path) -> dict:
+    path = project_root / SETTINGS_FILE
     try:
-        if sys.platform.startswith("win"):
-            os.startfile(str(path))  # type: ignore[attr-defined]
-        elif sys.platform.startswith("darwin"):
-            import subprocess
-            subprocess.run(["open", str(path)], check=False)
-        else:
-            import subprocess
-            subprocess.run(["xdg-open", str(path)], check=False)
-    except Exception:
-        QtGui.QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Archive manager (CURRENT target: gallery/user/sounds/music.mp3)
-# Archive: gallery/user/sounds/appssong/{originals,processed}
-# Manifest: gallery/user/sounds/appssong/current.json
-# ─────────────────────────────────────────────────────────────────────────────
+def _write_settings(project_root: Path, settings: dict) -> None:
+    atomic_write_json(project_root / SETTINGS_FILE, settings)
 
-@dataclass
-class AddResult:
-    action: str
-    archive_original: Optional[str]
-    archive_processed: Optional[str]
-    size: int
-    message: str
 
+def _analysis_requested(project_root: Path) -> bool:
+    return _read_settings(project_root).get(ANALYSIS_SETTINGS_KEY) is True
 
-class SoundArchiveManager(QtCore.QObject):
-    archive_changed = QtCore.Signal()
-    current_changed = QtCore.Signal(str)  # processed filename
 
-    def __init__(self, project_root: Path):
-        super().__init__()
-        self.project_root = Path(project_root).resolve()
+class CleanSlider(QtWidgets.QSlider):
+    """Horizontal slider with no inactive/native groove.
 
-        self.sounds_root = _user_sounds_dir(self.project_root)
-        self.dir_originals = _user_archive_originals(self.project_root)
-        self.dir_processed = _user_archive_processed(self.project_root)
-        self.current_manifest = _user_current_manifest(self.project_root)
-
-        self.sounds_root.mkdir(parents=True, exist_ok=True)
-        self.dir_originals.mkdir(parents=True, exist_ok=True)
-        self.dir_processed.mkdir(parents=True, exist_ok=True)
-
-        # Single source of truth for live audio used by viewer
-        self.current_target = _user_current_music(self.project_root)
-
-
-
-    # Names-only listing (newest first by normal archive/file order)
-    def list_archive(self) -> List[str]:
-        names: List[str] = []
-        if not self.dir_processed.exists():
-            return names
-        items = sorted(self.dir_processed.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-        for p in items:
-            if p.is_file() and p.suffix.lower() == ".mp3":
-                names.append(p.name)
-        return names
-
-    def current_processed_name(self) -> str:
-        """Return the current processed archive filename from current.json, if valid."""
-        try:
-            if not self.current_manifest.exists():
-                return ""
-            data = json.loads(self.current_manifest.read_text(encoding="utf-8"))
-            rel = str(data.get("current_processed_rel") or data.get("current_rel") or "")
-            name = Path(rel).name if rel else ""
-            if name and (self.dir_processed / name).is_file():
-                return name
-        except Exception:
-            pass
-        return ""
-
-    def list_archive_for_display(self) -> List[str]:
-        """Current song first; all other songs remain in normal archive order."""
-        names = self.list_archive()
-        current = self.current_processed_name()
-        if current and current in names:
-            return [current] + [name for name in names if name != current]
-        return names
-
-    def add_song_from_path(self, source: Path) -> AddResult:
-        """
-        Two-copy flow:
-          • appssong/originals/<originalname.ext>
-          • appssong/processed/<originalname>.mp3  (normalize→mp3; fallback copy if mp3)
-        Then set current by copying to gallery/user/sounds/music.mp3 and write manifest.
-        """
-        source = Path(source)
-        if not source.exists() or not source.is_file():
-            return AddResult("error", None, None, -1, "Source file does not exist or is not a file.")
-
-        incoming_size = _file_size(source)
-        if incoming_size > MAX_AUDIO_MB * 1024 * 1024:
-            return AddResult("error", None, None, incoming_size, f"File exceeds {MAX_AUDIO_MB} MB limit.")
-
-        final_original_name, action = self._decide_original_name(source.name, incoming_size)
-        if action == "cancel":
-            return AddResult("canceled", None, None, incoming_size, "User canceled rename due to conflict.")
-
-        orig_path = self.dir_originals / final_original_name
-        if action != "skipped":
-            try:
-                _atomic_copy(source, orig_path)
-            except Exception as e:
-                return AddResult("error", None, None, incoming_size, f"Failed to archive original: {e!r}")
-
-        processed_name = Path(final_original_name).stem + ".mp3"
-        processed_path = self.dir_processed / processed_name
-
-        try:
-            _export_apple_safe_mp3(source, processed_path)
-        except Exception as e:
-            return AddResult(
-                "error",
-                final_original_name,
-                None,
-                incoming_size,
-                f"Failed to export Apple-safe MP3: {e}",
-            )
-
-        # Set current (Windows-safe with short retries)
-        try:
-            self._set_current_by_copy(processed_path)
-        except Exception as e:
-            return AddResult(
-                "error",
-                final_original_name,
-                processed_name,
-                incoming_size,
-                f"Failed to set current Apple-safe music: {e}",
-            )
-        self._write_manifest(processed_name, _file_size(processed_path), final_original_name)
-
-        self.archive_changed.emit()
-        self.current_changed.emit(processed_name)
-
-        msg = {
-            "skipped": "Duplicate by name and size; original not copied. Processed & set current.",
-            "renamed": f"Original renamed to {final_original_name}. Processed & set current.",
-            "added":   f"Archived original as {final_original_name}. Processed & set current.",
-        }.get(action, "Processed & set current.")
-        return AddResult(action, final_original_name, processed_name, incoming_size, msg)
-
-    def set_current(self, processed_filename: str) -> None:
-        src = self.dir_processed / processed_filename
-        if not src.exists():
-            raise FileNotFoundError(f"Not in processed archive: {processed_filename}")
-        self._set_current_by_copy(src)
-        self._write_manifest(processed_filename, _file_size(src), self._original_name_for_processed(processed_filename))
-        self.current_changed.emit(processed_filename)
-
-    def delete_processed(self, processed_filename: str) -> bool:
-        """
-        Delete one processed item by name. If it was current, fall back to newest remaining,
-        else clear music.mp3 + manifest.
-        """
-        target = self.dir_processed / processed_filename
-        if not target.exists():
-            return False
-
-        is_current = False
-        try:
-            data = json.loads(self.current_manifest.read_text(encoding="utf-8"))
-            current_rel = data.get("current_processed_rel") or data.get("current_rel", "")
-            expected_rel = f"{USER_AUDIO_PROCESSED_DIR}/{processed_filename}"
-            is_current = (current_rel == expected_rel)
-        except Exception:
-            pass
-
-        try:
-            target.unlink()
-        except Exception:
-            return False
-
-        if is_current:
-            remaining = self.list_archive()
-            if remaining:
-                self.set_current(remaining[0])  # newest
-            else:
-                try:
-                    if self.current_target.exists():
-                        self.current_target.unlink()
-                except Exception:
-                    pass
-                try:
-                    if self.current_manifest.exists():
-                        self.current_manifest.unlink()
-                except Exception:
-                    pass
-                self.current_changed.emit("")
-
-        self.archive_changed.emit()
-        return True
-
-    # ── internals ────────────────────────────────────────────
-    def _decide_original_name(self, desired_name: str, size: int) -> Tuple[str, str]:
-        desired = self.dir_originals / desired_name
-        if desired.exists():
-            existing_size = _file_size(desired)
-            if existing_size == size:
-                return desired_name, "skipped"
-            new_name = self._prompt_rename(desired_name)
-            if not new_name:
-                return desired_name, "cancel"
-            return new_name, "renamed"
-        return desired_name, "added"
-
-    def _prompt_rename(self, current_name: str) -> Optional[str]:
-        dlg = RenameDialog(current_name)
-        return dlg.run_and_get_name()
-
-    def _set_current_by_copy(self, src: Path) -> None:
-        src = src.resolve()
-        dst = self.current_target.resolve()
-        if src == dst:
-            return
-
-        tries = 5
-        delay = 0.15
-        for _ in range(tries):
-            try:
-                _export_apple_safe_mp3(src, dst)
-                return
-            except PermissionError:
-                if os.name == "nt":
-                    time.sleep(delay)
-                    continue
-                raise
-            except OSError as e:
-                if os.name == "nt" and e.errno in (errno.EACCES, errno.EPERM):
-                    time.sleep(delay)
-                    continue
-                raise
-        raise PermissionError(
-            f"Unable to replace {dst} after {tries} attempts. "
-            "Is it open in another app or being previewed/synced?"
-        )
-
-    def _original_name_for_processed(self, processed_name: str) -> str:
-        exact = self.dir_originals / processed_name
-        if exact.is_file():
-            return processed_name
-
-        stem = Path(processed_name).stem
-        try:
-            matches = [p for p in self.dir_originals.iterdir() if p.is_file() and p.stem == stem]
-        except Exception:
-            matches = []
-
-        for p in matches:
-            if p.suffix.lower() == ".mp3":
-                return p.name
-        if matches:
-            return sorted(matches, key=lambda p: p.name.lower())[0].name
-        return processed_name
-
-    def _write_manifest(self, processed_name: str, size: int, original_name: Optional[str] = None) -> None:
-        original_name = original_name or self._original_name_for_processed(processed_name)
-        data = {
-            "current_original_rel": f"{USER_AUDIO_ORIGINALS_DIR}/{original_name}",
-            "current_processed_rel": f"{USER_AUDIO_PROCESSED_DIR}/{processed_name}",
-            "current_live_rel": f"{USER_SOUNDS_DIR}/{MUSIC_FILE}",
-            "current_rel": f"{USER_AUDIO_PROCESSED_DIR}/{processed_name}",
-            "link_mode": "copy",
-            "size": size,
-            "set_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        self.current_manifest.parent.mkdir(parents=True, exist_ok=True)
-        self.current_manifest.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Minimal frameless rename dialog (keeps ext)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class RenameDialog(QtWidgets.QDialog):
-    def __init__(self, current_name: str, parent: Optional[QtWidgets.QWidget] = None):
-        super().__init__(parent)
-        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self._current_name = current_name
-        self._final = current_name
-
-        outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(12, 12, 12, 12)
-
-        panel = QtWidgets.QFrame(self)
-        panel.setObjectName("panel")
-        panel.setStyleSheet(
-            "#panel { background: rgba(18,18,24,240); border-radius: 14px; border: 1px solid #2b3344; }"
-            "QLabel { color: #e6e6e6; }"
-            "QLineEdit { background: #1e2230; border: 1px solid #2b3344; border-radius: 8px; padding: 6px 8px; color: #e6e6e6; }"
-            "QPushButton { background: #222530; border: 1px solid #2b3344; border-radius: 8px; padding: 6px 10px; color: #e6e6e6; }"
-            "QPushButton:hover { border-color: #00c8ff; }"
-        )
-        inner = QtWidgets.QVBoxLayout(panel)
-        inner.setContentsMargins(16, 16, 16, 16)
-        inner.setSpacing(10)
-
-        lbl = QtWidgets.QLabel(
-            f"A file named <b>{current_name}</b> already exists with a different size.<br>"
-            "Please enter a new name for the incoming song:"
-        )
-        self._edit = QtWidgets.QLineEdit(current_name)
-        self._edit.selectAll()
-
-        btns = QtWidgets.QHBoxLayout()
-        btns.addStretch(1)
-        btn_cancel = QtWidgets.QPushButton("Cancel")
-        btn_save = QtWidgets.QPushButton("Save")
-        btns.addWidget(btn_cancel)
-        btns.addWidget(btn_save)
-
-        inner.addWidget(lbl)
-        inner.addWidget(self._edit)
-        inner.addLayout(btns)
-        outer.addWidget(panel)
-
-        btn_cancel.clicked.connect(self.reject)
-        btn_save.clicked.connect(self._on_save)
-
-        self.resize(460, 160)
-
-    def _on_save(self) -> None:
-        name = self._edit.text().strip()
-        if not name:
-            return
-
-        ext = Path(self._current_name).suffix
-        if not name.endswith(ext):
-            name += ext
-
-        if any(ch in name for ch in '<>:"/\\|?*'):
-            return
-
-        base = Path(name).stem.upper()
-        if base in {
-            "CON", "PRN", "AUX", "NUL",
-            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
-        }:
-            return
-
-        self._final = name
-        self.accept()
-
-    def run_and_get_name(self) -> Optional[str]:
-        return self._final if (self.exec() == QtWidgets.QDialog.Accepted) else None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Frameless confirm (“Are you sure?”) used by delete
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ConfirmDialog(QtWidgets.QDialog):
-    def __init__(self, message: str, parent=None):
-        super().__init__(parent or None)
-        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.setModal(True)
-        self.setWindowModality(Qt.ApplicationModal)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setFocusPolicy(Qt.StrongFocus)
-
-        outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(10, 10, 10, 10)
-
-        panel = QtWidgets.QFrame(self)
-        panel.setObjectName("panel")
-        panel.setStyleSheet(
-            "#panel { background: rgba(15,17,22,240); border-radius: 12px; border: 1px solid #2b3344; }"
-            "QLabel { color: #e6e6e6; }"
-            "QPushButton { background: #1b1f2a; border: 1px solid #2a2f3e; border-radius: 8px; padding: 5px 10px; color:#e6e6e6; }"
-            "QPushButton:hover { border-color:#00c8ff; }"
-        )
-        inner = QtWidgets.QVBoxLayout(panel)
-        inner.setContentsMargins(14, 14, 14, 14)
-        inner.setSpacing(10)
-
-        lbl = QtWidgets.QLabel(message)
-        row = QtWidgets.QHBoxLayout()
-        row.addStretch(1)
-        btn_no = QtWidgets.QPushButton("No")
-        btn_yes = QtWidgets.QPushButton("Yes")
-        row.addWidget(btn_no)
-        row.addWidget(btn_yes)
-
-        inner.addWidget(lbl)
-        inner.addLayout(row)
-        outer.addWidget(panel)
-
-        btn_no.clicked.connect(self.reject)
-        btn_yes.clicked.connect(self.accept)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Archive dropdown (movable + clamped + clickable song names + delete mode)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class _ArchivePaintButton(QtWidgets.QWidget):
-    """
-    Custom-painted clickable control for the archive popup.
-
-    This intentionally does NOT inherit QPushButton.
-    Reason: global/app QPushButton:hover styles were overriding the archive text
-    paint state and making labels appear to vanish on hover/highlight.
+    Qt's platform style can redraw a gray rail even when a stylesheet marks the
+    add-page transparent. This widget paints the progress line and handle
+    directly, so no gray bar can appear.
     """
 
-    clicked = QtCore.Signal()
-
-    def __init__(
-        self,
-        text: str,
-        *,
-        kind: str = "normal",
-        elide: bool = False,
-        parent: Optional[QtWidgets.QWidget] = None,
-    ) -> None:
-        super().__init__(parent)
-        self._text = text
-        self._kind = kind
-        self._elide = elide
-        self._hover = False
-        self._pressed = False
-        self._active = False
-
-        self.setCursor(Qt.PointingHandCursor)
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(Qt.Horizontal, parent)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setMinimumHeight(28)
         self.setMouseTracking(True)
-        self.setAttribute(Qt.WA_Hover, True)
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.setToolTip(text)
-        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
-        font = QtGui.QFont("Segoe UI", 9)
-        if kind in {"danger", "delete"}:
-            font.setWeight(QtGui.QFont.DemiBold)
-        self.setFont(font)
-
-        if kind == "danger":
-            self.setFixedSize(26, 26)
-        elif kind == "delete":
-            self.setFixedSize(74, 28)
-        elif kind == "song":
-            self.setFixedHeight(30)
-        else:
-            self.setFixedHeight(28)
-
-    def set_active(self, active: bool) -> None:
-        self._active = bool(active)
-        self.update()
-
-    def is_active(self) -> bool:
-        return self._active
-
-    def enterEvent(self, event: QtCore.QEvent) -> None:  # type: ignore[override]
-        self._hover = True
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event: QtCore.QEvent) -> None:  # type: ignore[override]
-        self._hover = False
-        self._pressed = False
-        self.update()
-        super().leaveEvent(event)
-
-    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
-        if event.button() == Qt.LeftButton:
-            self._pressed = True
-            self.update()
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
-        if event.button() == Qt.LeftButton:
-            was_pressed = self._pressed
-            self._pressed = False
-            self.update()
-            if was_pressed and self.rect().contains(event.position().toPoint()):
-                self.clicked.emit()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:  # type: ignore[override]
-        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
-            self.clicked.emit()
-            event.accept()
-            return
-        super().keyPressEvent(event)
+    def sizeHint(self) -> QtCore.QSize:  # type: ignore[override]
+        hint = super().sizeHint()
+        return QtCore.QSize(max(120, hint.width()), 28)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # type: ignore[override]
         del event
-
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
 
-        rect = self.rect().adjusted(0, 0, -1, -1)
-        radius = 8 if self._kind != "song" else 6
+        radius = 8.0
+        left = radius + 1.0
+        right = max(left, float(self.width()) - radius - 1.0)
+        span = max(0.0, right - left)
+        minimum = self.minimum()
+        maximum = self.maximum()
+        ratio = 0.0 if maximum <= minimum else (self.value() - minimum) / float(maximum - minimum)
+        ratio = max(0.0, min(1.0, ratio))
+        center_x = left + (span * ratio)
+        center_y = self.height() / 2.0
 
-        bg, border, fg = self._colors()
+        active = QtGui.QColor(0, 200, 255, 210 if self.isEnabled() else 90)
+        handle = QtGui.QColor(0, 229, 244, 255 if self.isEnabled() else 120)
+        outline = QtGui.QColor(7, 91, 104, 255 if self.isEnabled() else 110)
 
-        if bg.alpha() > 0:
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(bg)
-            painter.drawRoundedRect(rect, radius, radius)
-
-        if border.alpha() > 0:
-            pen = QtGui.QPen(border)
-            pen.setWidth(1)
+        if center_x > left:
+            pen = QtGui.QPen(active, 3.0, Qt.SolidLine, Qt.RoundCap)
             painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRoundedRect(rect, radius, radius)
+            painter.drawLine(QtCore.QPointF(left, center_y), QtCore.QPointF(center_x, center_y))
 
-        painter.setPen(fg)
-        painter.setFont(self.font())
-
-        if self._kind == "danger":
-            text = self._text
-            align = Qt.AlignCenter
-            text_rect = rect
-        elif self._kind == "delete":
-            text = self._text
-            align = Qt.AlignCenter
-            text_rect = rect
-        else:
-            metrics = QtGui.QFontMetrics(self.font())
-            usable = max(20, rect.width() - 16)
-            text = metrics.elidedText(self._text, Qt.ElideRight, usable) if self._elide else self._text
-            align = Qt.AlignVCenter | Qt.AlignLeft
-            text_rect = rect.adjusted(8, 0, -8, 0)
-
-        painter.drawText(text_rect, align, text)
-
-    def _colors(self) -> Tuple[QtGui.QColor, QtGui.QColor, QtGui.QColor]:
-        if self._kind == "song":
-            bg = QtGui.QColor(0, 0, 0, 0)
-            border = QtGui.QColor(0, 0, 0, 0)
-            fg = QtGui.QColor("#e6e6e6")
-
-            if self._active:
-                # Current song: subtle, visible distinction without making the row loud.
-                bg = QtGui.QColor(0, 200, 255, 28)
-                border = QtGui.QColor(0, 200, 255, 92)
-                fg = QtGui.QColor("#dffaff")
-
-            if self._hover or self.hasFocus():
-                bg = QtGui.QColor(0, 200, 255, 54 if self._active else 46)
-                border = QtGui.QColor(0, 200, 255, 130 if self._active else 0)
-                fg = QtGui.QColor("#ffffff")
-
-            if self._pressed:
-                bg = QtGui.QColor(0, 200, 255, 82 if self._active else 72)
-                border = QtGui.QColor(0, 229, 255, 170 if self._active else 0)
-                fg = QtGui.QColor("#ffffff")
-
-            return bg, border, fg
-
-        if self._kind == "delete":
-            bg = QtGui.QColor("#1b1f2a")
-            border = QtGui.QColor(255, 77, 79, 140)
-            fg = QtGui.QColor("#ffd7d9")
-            if self._hover or self.hasFocus():
-                bg = QtGui.QColor("#3a1b20")
-                border = QtGui.QColor("#ff6b6d")
-                fg = QtGui.QColor("#ffffff")
-            if self._pressed:
-                bg = QtGui.QColor("#451e25")
-                border = QtGui.QColor("#ff7c7e")
-                fg = QtGui.QColor("#ffffff")
-            return bg, border, fg
-
-        if self._kind == "danger":
-            if self._active:
-                bg = QtGui.QColor("#2a171b")
-                border = QtGui.QColor("#ff4d4f")
-                fg = QtGui.QColor("#ffb8bd")
-                if self._hover or self.hasFocus():
-                    bg = QtGui.QColor("#3a1b20")
-                    border = QtGui.QColor("#ff6b6d")
-                    fg = QtGui.QColor("#ffffff")
-                if self._pressed:
-                    bg = QtGui.QColor("#451e25")
-                    border = QtGui.QColor("#ff7c7e")
-                    fg = QtGui.QColor("#ffffff")
-                return bg, border, fg
-
-            bg = QtGui.QColor("#1b1f2a")
-            border = QtGui.QColor("#2a2f3e")
-            fg = QtGui.QColor("#e6e6e6")
-            if self._hover or self.hasFocus():
-                bg = QtGui.QColor("#223040")
-                border = QtGui.QColor("#00c8ff")
-                fg = QtGui.QColor("#ffffff")
-            if self._pressed:
-                bg = QtGui.QColor("#182536")
-                border = QtGui.QColor("#00e5ff")
-                fg = QtGui.QColor("#ffffff")
-            return bg, border, fg
-
-        bg = QtGui.QColor("#1b1f2a")
-        border = QtGui.QColor("#2a2f3e")
-        fg = QtGui.QColor("#e6e6e6")
-        if self._hover or self.hasFocus():
-            bg = QtGui.QColor("#223040")
-            border = QtGui.QColor("#00c8ff")
-            fg = QtGui.QColor("#ffffff")
-        if self._pressed:
-            bg = QtGui.QColor("#182536")
-            border = QtGui.QColor("#00e5ff")
-            fg = QtGui.QColor("#ffffff")
-        return bg, border, fg
+        painter.setPen(QtGui.QPen(outline, 1.0))
+        painter.setBrush(handle)
+        painter.drawEllipse(QtCore.QPointF(center_x, center_y), radius, radius)
 
 
-class ArchiveDropdown(QtWidgets.QFrame):
-    use_requested = QtCore.Signal(str)
-    request_release = QtCore.Signal()  # ask parent to release player handle before file ops
+class SoundLibrary(QtCore.QObject):
+    changed = QtCore.Signal()
 
-    _STYLE = """
-        QFrame#panel {
-            background: rgba(15,17,22,242);
-            border-radius: 12px;
-            border: 1px solid #2b3344;
-        }
-        QFrame#row {
-            background: #121520;
-            border: 1px solid #2b3344;
-            border-radius: 8px;
-        }
-        QLabel {
-            color: #dcdfe4;
-            background: transparent;
-        }
-        QScrollArea {
-            border: none;
-            background: transparent;
-        }
-        QScrollArea QWidget {
-            background: transparent;
-        }
-        QScrollBar:vertical {
-            background: transparent;
-            width: 5px;
-            margin: 2px 0 2px 0;
-        }
-        QScrollBar::handle:vertical {
-            background: rgba(255,255,255,42);
-            border-radius: 2px;
-            min-height: 24px;
-        }
-        QScrollBar::handle:vertical:hover {
-            background: rgba(0,200,255,90);
-        }
-        QScrollBar::add-line:vertical,
-        QScrollBar::sub-line:vertical {
-            height: 0px;
-            background: transparent;
-            border: none;
-        }
-        QScrollBar::add-page:vertical,
-        QScrollBar::sub-page:vertical {
-            background: transparent;
-        }
-        QScrollBar:horizontal {
-            height: 0px;
-            background: transparent;
-        }
-        QScrollBar::handle:horizontal,
-        QScrollBar::add-line:horizontal,
-        QScrollBar::sub-line:horizontal,
-        QScrollBar::add-page:horizontal,
-        QScrollBar::sub-page:horizontal {
-            height: 0px;
-            width: 0px;
-            background: transparent;
-            border: none;
-        }
-    """
-
-    def __init__(self, mgr: SoundArchiveManager, parent: Optional[QtWidgets.QWidget] = None):
+    def __init__(self, project_root: Path, parent: Optional[QtCore.QObject] = None) -> None:
         super().__init__(parent)
-        self._mgr = mgr
-        self.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setMouseTracking(True)
-        self.setMinimumSize(520, 260)
-        self.resize(600, 360)
+        self.project_root = Path(project_root).resolve()
+        ensure_sound_dirs(self.project_root)
+        self.records: dict[str, TrackRecord] = load_library(self.project_root)
+        self._migrate_legacy_processed_files()
 
-        self._delete_mode = False
-        self._drag_offset = QtCore.QPoint(0, 0)
-        self._outside_filter_installed = False
-
-        # Auto-refresh sources:
-        # - manager signals after add/delete/current changes
-        # - QFileSystemWatcher catches direct filesystem changes while the app is open
-        # - show_at() still refreshes immediately before display
-        self._refresh_pending = False
-        self._watcher = QtCore.QFileSystemWatcher(self)
-        self._watcher.directoryChanged.connect(self._schedule_refresh)
-        self._watcher.fileChanged.connect(self._schedule_refresh)
-
-        outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(8, 8, 8, 8)
-
-        self._panel = QtWidgets.QFrame(self)
-        self._panel.setObjectName("panel")
-        self._panel.setStyleSheet(self._STYLE)
-
-        inner = QtWidgets.QVBoxLayout(self._panel)
-        inner.setContentsMargins(10, 10, 10, 10)
-        inner.setSpacing(8)
-
-        header = QtWidgets.QHBoxLayout()
-        title = QtWidgets.QLabel("Archive")
-        title.setStyleSheet("font-weight:600; font-size:14px;")
-
-        self.btn_delete_mode = _ArchivePaintButton("–", kind="danger", parent=self._panel)
-        self.btn_delete_mode.setToolTip("Toggle delete mode")
-        self.btn_delete_mode.clicked.connect(self._toggle_delete_mode)
-
-        header.addWidget(title)
-        header.addStretch(1)
-        header.addWidget(self.btn_delete_mode)
-
-        self._scroll = QtWidgets.QScrollArea()
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._scroll.viewport().setAutoFillBackground(False)
-
-        self._list_holder = QtWidgets.QWidget()
-        self._list_holder.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Minimum)
-        self._list_layout = QtWidgets.QVBoxLayout(self._list_holder)
-        self._list_layout.setContentsMargins(0, 0, 0, 0)
-        self._list_layout.setSpacing(6)
-        self._scroll.setWidget(self._list_holder)
-
-        inner.addLayout(header)
-        inner.addWidget(self._scroll, 1)
-        outer.addWidget(self._panel)
-
-        self._opacity = QtWidgets.QGraphicsOpacityEffect(self)
-        self.setGraphicsEffect(self._opacity)
-        self._anim = QtCore.QPropertyAnimation(self._opacity, b"opacity", self)
-        self._anim.setDuration(180)
-        self._anim.setStartValue(0.0)
-        self._anim.setEndValue(1.0)
-
-        self._mgr.archive_changed.connect(self._schedule_refresh)
-        self._mgr.current_changed.connect(self._schedule_refresh)
-        self._setup_auto_refresh()
-        self.refresh()
-
-    def _setup_auto_refresh(self) -> None:
-        self._ensure_watched_paths()
-
-    def _ensure_watched_paths(self) -> None:
-        paths: list[str] = []
-        for p in (
-            self._mgr.dir_processed,
-            self._mgr.dir_originals,
-            self._mgr.current_manifest.parent,
-            self._mgr.current_manifest,
-        ):
+    def _migrate_legacy_processed_files(self) -> None:
+        known_files = {Path(record.processed_file).name for record in self.records.values()}
+        changed = False
+        for path in processed_dir(self.project_root).glob("*.mp3"):
+            if path.name in known_files:
+                continue
             try:
-                if p.exists():
-                    paths.append(str(p.resolve()))
-            except Exception:
+                content_hash = hash_file(path)
+            except OSError:
+                continue
+            existing = self.find_by_hash(content_hash)
+            if existing is not None:
+                continue
+            track_id = content_hash[:16]
+            while track_id in self.records:
+                track_id = content_hash[: min(64, len(track_id) + 4)]
+            duration = 0.0
+            try:
+                duration = probe_audio(path).duration_seconds
+            except AudioToolError:
                 pass
-
-        current = set(self._watcher.files()) | set(self._watcher.directories())
-        wanted = set(paths)
-
-        # Drop dead watches; QFileSystemWatcher can silently lose file watches
-        # after atomic replace/delete, so rebuild the set conservatively.
-        stale = [p for p in current if p not in wanted]
-        if stale:
-            try:
-                self._watcher.removePaths(stale)
-            except Exception:
-                pass
-
-        missing = [p for p in paths if p not in current]
-        if missing:
-            try:
-                self._watcher.addPaths(missing)
-            except Exception:
-                for p in missing:
-                    try:
-                        self._watcher.addPath(p)
-                    except Exception:
-                        pass
-
-    def _schedule_refresh(self, *_args) -> None:
-        if self._refresh_pending:
-            return
-        self._refresh_pending = True
-        QtCore.QTimer.singleShot(60, self._run_scheduled_refresh)
-
-    def _run_scheduled_refresh(self) -> None:
-        self._refresh_pending = False
-        self._ensure_watched_paths()
-        self.refresh()
-
-    def sizeHint(self) -> QtCore.QSize:  # type: ignore[override]
-        return QtCore.QSize(600, 360)
-
-    def _available_geom_at(self, global_pos: QtCore.QPoint) -> QtCore.QRect:
-        screen = QtGui.QGuiApplication.screenAt(global_pos)
-        if not screen:
-            screen = QtGui.QGuiApplication.primaryScreen()
-        return screen.availableGeometry()
-
-    def _clamp_to_screen(self, pos: QtCore.QPoint) -> QtCore.QPoint:
-        geom = self._available_geom_at(pos)
-        hint = self.sizeHint()
-        w = max(self.width(), hint.width())
-        h = max(self.height(), hint.height())
-        x = max(geom.left(), min(pos.x(), geom.right() - w))
-        y = max(geom.top(),  min(pos.y(), geom.bottom() - h))
-        return QtCore.QPoint(x, y)
-
-    def _install_outside_filter(self) -> None:
-        if self._outside_filter_installed:
-            return
-        app = QtWidgets.QApplication.instance()
-        if app is not None:
-            app.installEventFilter(self)
-            self._outside_filter_installed = True
-
-    def _remove_outside_filter(self) -> None:
-        if not self._outside_filter_installed:
-            return
-        app = QtWidgets.QApplication.instance()
-        if app is not None:
-            try:
-                app.removeEventFilter(self)
-            except Exception:
-                pass
-        self._outside_filter_installed = False
-
-    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:  # type: ignore[override]
-        if not self.isVisible():
-            return False
-
-        et = event.type()
-        if et == QtCore.QEvent.KeyPress:
-            try:
-                if event.key() == Qt.Key_Escape:  # type: ignore[attr-defined]
-                    self.hide()
-                    return True
-            except Exception:
-                return False
-
-        if et in (QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseButtonDblClick):
-            try:
-                global_pos = event.globalPosition().toPoint()  # type: ignore[attr-defined]
-            except Exception:
-                try:
-                    global_pos = QtGui.QCursor.pos()
-                except Exception:
-                    return False
-
-            if not self.frameGeometry().contains(global_pos):
-                self.hide()
-                return False
-
-        return False
-
-    def show_at(self, global_pos: QtCore.QPoint) -> None:
-        self.refresh()
-        p = self._clamp_to_screen(global_pos)
-        self.move(p)
-        self._opacity.setOpacity(0.0)
-        super().show()
-        self._install_outside_filter()
-        self._anim.start()
-
-    def hideEvent(self, event: QtGui.QHideEvent) -> None:  # type: ignore[override]
-        self._remove_outside_filter()
-        super().hideEvent(event)
-
-    def mousePressEvent(self, e: QtGui.QMouseEvent) -> None:
-        if e.button() == Qt.LeftButton:
-            self._drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            e.accept()
-        else:
-            super().mousePressEvent(e)
-
-    def mouseMoveEvent(self, e: QtGui.QMouseEvent) -> None:
-        if e.buttons() & Qt.LeftButton:
-            new_pos = e.globalPosition().toPoint() - self._drag_offset
-            self.move(self._clamp_to_screen(new_pos))
-            e.accept()
-        else:
-            super().mouseMoveEvent(e)
-
-    def refresh(self) -> None:
-        self._ensure_watched_paths()
-
-        while self._list_layout.count():
-            item = self._list_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-
-        names = self._mgr.list_archive_for_display()
-        current = self._mgr.current_processed_name()
-        if not names:
-            empty = QtWidgets.QLabel("No archived music yet.")
-            empty.setAlignment(Qt.AlignCenter)
-            empty.setStyleSheet("color:#8f98a8; padding:18px;")
-            self._list_layout.addWidget(empty)
-        else:
-            for name in names:
-                self._list_layout.addWidget(self._make_row(name, is_current=(name == current)))
-
-        self._list_layout.addStretch(1)
-
-    def _toggle_delete_mode(self) -> None:
-        self._delete_mode = not self._delete_mode
-        self.btn_delete_mode.set_active(self._delete_mode)
-        self.refresh()
-
-    def _make_row(self, name: str, *, is_current: bool = False) -> QtWidgets.QWidget:
-        row = QtWidgets.QFrame()
-        row.setObjectName("row")
-        row.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-
-        if is_current:
-            row.setStyleSheet(
-                "QFrame#row { "
-                "background: rgba(0, 200, 255, 18); "
-                "border: 1px solid rgba(0, 200, 255, 82); "
-                "border-radius: 8px; "
-                "}"
+            record = TrackRecord(
+                track_id=track_id,
+                content_hash=content_hash,
+                display_title=display_title_from_name(path.name),
+                original_name=path.name,
+                original_file="",
+                processed_file=path.name,
+                duration_seconds=duration,
+                added_at=utc_now_text(),
             )
+            self.records[record.track_id] = record
+            changed = True
+        if changed:
+            save_library(self.project_root, self.records)
 
-        h = QtWidgets.QHBoxLayout(row)
-        h.setContentsMargins(6, 5, 6, 5)
-        h.setSpacing(6)
+    def all_records(self, sort_mode: str = "recent") -> list[TrackRecord]:
+        records = list(self.records.values())
+        if sort_mode == "name":
+            return sorted(records, key=lambda item: item.display_title.casefold())
+        if sort_mode == "duration":
+            return sorted(records, key=lambda item: (item.duration_seconds, item.display_title.casefold()))
+        return sorted(records, key=lambda item: item.added_at, reverse=True)
 
-        btn_name = _ArchivePaintButton(name, kind="song", elide=True, parent=row)
-        btn_name.set_active(is_current)
-        if is_current:
-            btn_name.setToolTip(f"Current song: {name}")
-        btn_name.clicked.connect(lambda n=name: self._select_song(n))
-        h.addWidget(btn_name, 1)
+    def get(self, track_id: str) -> Optional[TrackRecord]:
+        return self.records.get(str(track_id))
 
-        if self._delete_mode:
-            btn_del = _ArchivePaintButton("Delete", kind="delete", parent=row)
-            btn_del.clicked.connect(lambda n=name: self._confirm_delete(n))
-            h.addWidget(btn_del, 0)
+    def path_for(self, track_id: str) -> Optional[Path]:
+        record = self.get(track_id)
+        if record is None:
+            return None
+        path = resolve_track_path(self.project_root, record)
+        return path if path.is_file() else None
 
-        return row
+    def find_by_hash(self, content_hash: str) -> Optional[TrackRecord]:
+        for record in self.records.values():
+            if record.content_hash == content_hash:
+                return record
+        return None
 
-    def _select_song(self, name: str) -> None:
-        self.use_requested.emit(name)
-        self.hide()
+    def register_imports(self, payloads: list[dict]) -> list[str]:
+        selected: list[str] = []
+        changed = False
+        for payload in payloads:
+            existing_id = str(payload.get("existing_track_id", ""))
+            if existing_id and existing_id in self.records:
+                selected.append(existing_id)
+                continue
+            record_payload = payload.get("record")
+            if not isinstance(record_payload, dict):
+                continue
+            record = TrackRecord.from_dict(record_payload)
+            self.records[record.track_id] = record
+            selected.append(record.track_id)
+            changed = True
+        if changed:
+            save_library(self.project_root, self.records)
+            self.changed.emit()
+        return selected
 
-    def _confirm_delete(self, name: str) -> None:
-        dlg = ConfirmDialog(f"Are you sure you want to remove “{name}” from archive?", self)
-        if dlg.exec() == QtWidgets.QDialog.Accepted:
-            self.request_release.emit()
-            ok = self._mgr.delete_processed(name)
-            if not ok:
-                QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Delete failed.")
-            else:
-                self._schedule_refresh()
+    def rename_display_title(self, track_id: str, title: str) -> None:
+        record = self.get(track_id)
+        clean = " ".join(str(title).split()).strip()
+        if record is None or not clean:
+            return
+        record.display_title = clean
+        save_library(self.project_root, self.records)
+        self.changed.emit()
+
+    def delete_track(self, track_id: str) -> bool:
+        record = self.records.get(track_id)
+        if record is None:
+            return False
+        processed = resolve_track_path(self.project_root, record)
+        try:
+            processed.unlink(missing_ok=True)
+        except OSError as exc:
+            logging.getLogger(__name__).warning("Could not delete processed track %s: %s", processed, exc)
+            return False
+        self.records.pop(track_id, None)
+        for path in (
+            originals_dir(self.project_root) / Path(record.original_file).name if record.original_file else None,
+            analysis_dir(self.project_root) / f"{Path(record.processed_file).stem}.json",
+        ):
+            if path is None:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        save_library(self.project_root, self.records)
+        self.changed.emit()
+        return True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# WaveHandler (player + persisted volume)
-# Gliss policy: ALWAYS play the ORIGINAL file at fixed 10% volume.
-# Supports overlapping one-shot SFX so a new play never cuts a previous one.
-# ─────────────────────────────────────────────────────────────────────────────
 
-class WaveHandler(QtCore.QObject):
-    active_player_changed = QtCore.Signal(object)
-    track_changed = QtCore.Signal(int, str)
+class ProjectSound(QtCore.QObject):
+    changed = QtCore.Signal()
+
+    def __init__(self, project_root: Path, library: SoundLibrary, parent: Optional[QtCore.QObject] = None) -> None:
+        super().__init__(parent)
+        self.project_root = Path(project_root).resolve()
+        self.library = library
+        self.state = load_project_state(self.project_root, valid_ids=set(self.library.records))
+        self._migrate_legacy_current_track()
+        self.save()
+
+    def _migrate_legacy_current_track(self) -> None:
+        if self.state.ordered_track_ids():
+            return
+        music = current_music_path(self.project_root)
+        if not music.is_file():
+            return
+        try:
+            digest = hash_file(music)
+        except OSError:
+            return
+        record = self.library.find_by_hash(digest)
+        if record is None:
+            return
+        self.state.single_track_id = record.track_id
+        self.state.selected_track_id = record.track_id
+
+    def save(self) -> None:
+        self.state.normalize(set(self.library.records))
+        save_project_state(self.project_root, self.state)
+        self._sync_compatibility_files()
+        self.changed.emit()
+
+    def _sync_compatibility_files(self) -> None:
+        track_id = self.state.selected_track_id
+        if track_id not in self.state.ordered_track_ids():
+            ordered = self.state.ordered_track_ids()
+            track_id = ordered[0] if ordered else ""
+            self.state.selected_track_id = track_id
+        music_path = current_music_path(self.project_root)
+        manifest = current_manifest_path(self.project_root)
+        source = self.library.path_for(track_id) if track_id else None
+        if source is None:
+            music_path.unlink(missing_ok=True)
+            manifest.unlink(missing_ok=True)
+            return
+        record = self.library.get(track_id)
+        if record is None:
+            return
+        try:
+            current = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            current = {}
+        try:
+            music_matches = (
+                music_path.is_file()
+                and current.get("track_id") == track_id
+                and music_path.stat().st_size == source.stat().st_size
+            )
+            if not music_matches:
+                _atomic_copy(source, music_path)
+            atomic_write_json(
+                manifest,
+                {
+                    "current_rel": f"{USER_SOUNDS_DIR}/appssong/processed/{record.processed_file}",
+                    "track_id": track_id,
+                    "link_mode": "copy",
+                },
+            )
+        except OSError as exc:
+            logging.getLogger(__name__).warning("Could not update compatibility music.mp3: %s", exc)
+
+    def set_single(self, track_id: str) -> None:
+        self.state.mode = "single"
+        self.state.single_track_id = track_id if track_id in self.library.records else ""
+        self.state.playlist = []
+        self.state.selected_track_id = self.state.single_track_id
+        self.save()
+
+    def create_playlist(self) -> None:
+        first = self.state.single_track_id if self.state.single_track_id in self.library.records else ""
+        self.state.mode = "playlist"
+        self.state.playlist = [first] if first else []
+        self.state.single_track_id = ""
+        self.state.selected_track_id = first
+        self.state.playlist_expanded = True
+        self.save()
+
+    def add_to_playlist(self, track_ids: list[str]) -> None:
+        if self.state.mode != "playlist":
+            self.create_playlist()
+        for track_id in track_ids:
+            if track_id in self.library.records and track_id not in self.state.playlist:
+                self.state.playlist.append(track_id)
+        if not self.state.selected_track_id and self.state.playlist:
+            self.state.selected_track_id = self.state.playlist[0]
+        self.save()
+
+    def reorder_playlist(self, track_ids: list[str]) -> None:
+        self.state.playlist = [track_id for track_id in track_ids if track_id in self.library.records]
+        self.save()
+
+    def remove_from_playlist(self, track_id: str) -> None:
+        self.state.playlist = [item for item in self.state.playlist if item != track_id]
+        if self.state.selected_track_id == track_id:
+            self.state.selected_track_id = self.state.playlist[0] if self.state.playlist else ""
+        self.save()
+
+    def select_track(self, track_id: str) -> None:
+        if track_id in self.state.ordered_track_ids():
+            self.state.selected_track_id = track_id
+            self.save()
+
+    def convert_to_single(self, track_id: str = "") -> None:
+        chosen = track_id if track_id in self.state.playlist else self.state.selected_track_id
+        if chosen not in self.library.records:
+            chosen = self.state.playlist[0] if self.state.playlist else ""
+        self.set_single(chosen)
+
+    def clear(self) -> None:
+        self.state = ProjectSoundState()
+        self.save()
+
+    def remove_usage(self, track_id: str) -> None:
+        self.state.remove_usage(track_id)
+        self.save()
+
+    def ordered_ids(self) -> list[str]:
+        return self.state.ordered_track_ids()
+
+
+class _ImportWorker(QtCore.QObject):
+    finished = QtCore.Signal(list)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, project_root: Path, paths: list[str], known_hashes: dict[str, str]) -> None:
+        super().__init__()
+        self.project_root = project_root
+        self.paths = [Path(path).resolve() for path in paths]
+        self.known_hashes = dict(known_hashes)
+        self._cancelled = False
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        results: list[dict] = []
+        created_artifacts: list[Path] = []
+        try:
+            for source in self.paths:
+                if self._cancelled:
+                    raise RuntimeError("Audio import canceled.")
+                if not source.is_file():
+                    raise FileNotFoundError(f"Audio file does not exist: {source}")
+                if source.suffix.casefold() not in VALID_AUDIO_EXTS:
+                    raise ValueError(f"Unsupported audio format: {source.suffix}")
+                if source.stat().st_size > MAX_AUDIO_MB * 1024 * 1024:
+                    raise ValueError(f"{source.name} exceeds the {MAX_AUDIO_MB} MB limit.")
+                content_hash = hash_file(source)
+                existing_id = self.known_hashes.get(content_hash)
+                if existing_id:
+                    results.append({"existing_track_id": existing_id})
+                    continue
+                track_id = content_hash[:24]
+                safe_name = safe_filename(source.name)
+                original_name = f"{track_id}__{safe_name}"
+                processed_name = f"{track_id}.mp3"
+                original_destination = originals_dir(self.project_root) / original_name
+                processed_destination = processed_dir(self.project_root) / processed_name
+                created_original = not original_destination.is_file()
+                created_processed = not processed_destination.is_file()
+                if created_original:
+                    created_artifacts.append(original_destination)
+                if created_processed:
+                    created_artifacts.append(processed_destination)
+                try:
+                    if created_original:
+                        _atomic_copy(source, original_destination)
+                    if source.suffix.casefold() == ".mp3":
+                        _atomic_copy(source, processed_destination)
+                    else:
+                        if not toolchain_available():
+                            raise AudioToolError(
+                                "This file needs conversion, but tools/ffmpeg.exe and tools/ffprobe.exe are missing."
+                            )
+                        convert_to_mp3(
+                            source,
+                            processed_destination,
+                            cancel_check=lambda: self._cancelled,
+                        )
+                    duration = 0.0
+                    try:
+                        duration = probe_audio(processed_destination).duration_seconds
+                    except AudioToolError:
+                        pass
+                    record = TrackRecord(
+                        track_id=track_id,
+                        content_hash=content_hash,
+                        display_title=display_title_from_name(source.name),
+                        original_name=source.name,
+                        original_file=original_name,
+                        processed_file=processed_name,
+                        duration_seconds=duration,
+                        added_at=utc_now_text(),
+                    )
+                    results.append({"record": record.to_dict()})
+                    self.known_hashes[content_hash] = track_id
+                except Exception:
+                    if created_original:
+                        original_destination.unlink(missing_ok=True)
+                    if created_processed:
+                        processed_destination.unlink(missing_ok=True)
+                    raise
+            self.finished.emit(results)
+        except Exception as exc:
+            for artifact in created_artifacts:
+                try:
+                    artifact.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self.failed.emit(str(exc))
+
+    @QtCore.Slot()
+    def cancel(self) -> None:
+        self._cancelled = True
+
+
+class _RepairWorker(QtCore.QObject):
+    finished = QtCore.Signal(int, list)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, project_root: Path) -> None:
+        super().__init__()
+        self.project_root = Path(project_root).resolve()
+        self._cancelled = False
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        repaired = 0
+        issues: list[str] = []
+        records = load_library(self.project_root)
+        try:
+            for folder in (originals_dir(self.project_root), processed_dir(self.project_root), analysis_dir(self.project_root)):
+                for tmp in folder.glob(".*.tmp*"):
+                    if self._cancelled:
+                        raise RuntimeError("Archive repair canceled.")
+                    try:
+                        tmp.unlink()
+                        repaired += 1
+                    except OSError:
+                        issues.append(f"Could not remove temporary file: {tmp.name}")
+            for record in records.values():
+                if self._cancelled:
+                    raise RuntimeError("Archive repair canceled.")
+                processed = resolve_track_path(self.project_root, record)
+                if processed.is_file():
+                    continue
+                original = originals_dir(self.project_root) / Path(record.original_file).name if record.original_file else None
+                if original is None or not original.is_file():
+                    issues.append(f"Missing audio files for {record.display_title}")
+                    continue
+                try:
+                    if original.suffix.casefold() == ".mp3":
+                        _atomic_copy(original, processed)
+                    else:
+                        convert_to_mp3(original, processed, cancel_check=lambda: self._cancelled)
+                    record.duration_seconds = probe_audio(processed).duration_seconds
+                    repaired += 1
+                except (AudioToolError, OSError) as exc:
+                    issues.append(f"{record.display_title}: {exc}")
+            save_library(self.project_root, records)
+            self.finished.emit(repaired, issues)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    @QtCore.Slot()
+    def cancel(self) -> None:
+        self._cancelled = True
+
+
+class PlaylistPlayer(QtCore.QObject):
+    trackChanged = QtCore.Signal(str)
+    playbackChanged = QtCore.Signal(bool)
+    positionChanged = QtCore.Signal(int, int)
+    activePlayerChanged = QtCore.Signal(object)
+    error = QtCore.Signal(str)
+    finished = QtCore.Signal()
+
+    def __init__(self, path_resolver: Callable[[str], Optional[Path]], parent: Optional[QtCore.QObject] = None) -> None:
+        super().__init__(parent)
+        self.path_resolver = path_resolver
+        self.players = [QMediaPlayer(self), QMediaPlayer(self)]
+        self.outputs = [QAudioOutput(self), QAudioOutput(self)]
+        for index, player in enumerate(self.players):
+            player.setAudioOutput(self.outputs[index])
+            player.positionChanged.connect(lambda position, i=index: self._on_position(i, position))
+            player.durationChanged.connect(lambda duration, i=index: self._on_duration(i, duration))
+            player.mediaStatusChanged.connect(lambda status, i=index: self._on_status(i, status))
+            player.errorOccurred.connect(lambda _error, text, i=index: self._on_error(i, text))
+        self.queue: list[str] = []
+        self.current_index = -1
+        self.active_slot = 0
+        self._durations = [0, 0]
+        self._volume = max(0.0, min(1.0, float(STARTING_VOLUME) / 100.0))
+        self._muted = False
+        self._crossfade_timer = QtCore.QTimer(self)
+        self._crossfade_timer.setInterval(40)
+        self._crossfade_timer.timeout.connect(self._crossfade_step)
+        self._crossfade_elapsed = 0
+        self._crossfade_from = -1
+        self._crossfade_to = -1
+        self._transitioning = False
+        self._apply_output_state()
+
+    @property
+    def player(self) -> QMediaPlayer:
+        return self.players[self.active_slot]
+
+    @property
+    def current_track_id(self) -> str:
+        if 0 <= self.current_index < len(self.queue):
+            return self.queue[self.current_index]
+        return ""
+
+    def set_queue(self, track_ids: list[str], selected_track_id: str = "") -> None:
+        was_playing = self.is_playing()
+        self.stop(reset_position=True)
+        self.queue = [track_id for track_id in track_ids if self.path_resolver(track_id) is not None]
+        if selected_track_id in self.queue:
+            self.current_index = self.queue.index(selected_track_id)
+        else:
+            self.current_index = 0 if self.queue else -1
+        self._load_active_source()
+        if was_playing and self.queue:
+            self.play()
+
+    def _load_active_source(self) -> None:
+        player = self.players[self.active_slot]
+        path = self.path_resolver(self.current_track_id) if self.current_track_id else None
+        player.stop()
+        player.setPosition(0)
+        player.setSource(QUrl.fromLocalFile(str(path))) if path else player.setSource(QUrl())
+        self.activePlayerChanged.emit(player)
+        self.trackChanged.emit(self.current_track_id)
+        self.positionChanged.emit(0, 0)
+
+    def set_volume(self, percent: int) -> None:
+        self._volume = max(0.0, min(1.0, int(percent) / 100.0))
+        self._apply_output_state()
+
+    def set_muted(self, muted: bool) -> None:
+        self._muted = bool(muted)
+        self._apply_output_state()
+
+    def toggle_mute(self) -> bool:
+        self.set_muted(not self._muted)
+        return self._muted
+
+    def _apply_output_state(self) -> None:
+        for output in self.outputs:
+            output.setMuted(self._muted)
+            if not self._transitioning:
+                output.setVolume(self._volume)
+
+    def is_playing(self) -> bool:
+        return any(player.playbackState() == QMediaPlayer.PlayingState for player in self.players)
+
+    def play(self) -> None:
+        if not self.queue or self.current_index < 0:
+            return
+        if self.player.source().isEmpty():
+            self._load_active_source()
+        self.outputs[self.active_slot].setVolume(self._volume)
+        self.player.play()
+        self.playbackChanged.emit(True)
+
+    def pause(self) -> None:
+        self._cancel_crossfade(keep_active=True)
+        self.player.pause()
+        self.playbackChanged.emit(False)
+
+    def stop(self, reset_position: bool = True) -> None:
+        self._cancel_crossfade(keep_active=True)
+        for player in self.players:
+            player.stop()
+            if reset_position:
+                player.setPosition(0)
+        self.playbackChanged.emit(False)
+        self.positionChanged.emit(0, self._durations[self.active_slot])
+
+    def seek(self, position: int) -> None:
+        self.player.setPosition(max(0, int(position)))
+
+    def select_track(self, track_id: str, autoplay: bool = False) -> None:
+        if track_id not in self.queue:
+            return
+        self.stop(reset_position=True)
+        self.current_index = self.queue.index(track_id)
+        self._load_active_source()
+        if autoplay:
+            self.play()
+
+    def next(self, autoplay: bool = True) -> None:
+        if self.current_index + 1 >= len(self.queue):
+            self.stop(reset_position=True)
+            return
+        self.stop(reset_position=True)
+        self.current_index += 1
+        self._load_active_source()
+        if autoplay:
+            self.play()
+
+    def previous(self) -> None:
+        if self.player.position() > 3000 or self.current_index <= 0:
+            self.seek(0)
+            return
+        self.stop(reset_position=True)
+        self.current_index -= 1
+        self._load_active_source()
+        self.play()
+
+    def _on_position(self, slot: int, position: int) -> None:
+        if slot != self.active_slot:
+            return
+        duration = self._durations[slot]
+        self.positionChanged.emit(position, duration)
+        if (
+            not self._transitioning
+            and len(self.queue) > 1
+            and self.current_index + 1 < len(self.queue)
+            and duration > CROSSFADE_MS + 500
+            and 0 < duration - position <= CROSSFADE_MS
+        ):
+            self._begin_crossfade()
+
+    def _on_duration(self, slot: int, duration: int) -> None:
+        self._durations[slot] = max(0, int(duration))
+        if slot == self.active_slot:
+            self.positionChanged.emit(self.players[slot].position(), self._durations[slot])
+
+    def _on_status(self, slot: int, status: QMediaPlayer.MediaStatus) -> None:
+        if status != QMediaPlayer.EndOfMedia or slot != self.active_slot or self._transitioning:
+            return
+        if self.current_index + 1 < len(self.queue):
+            self.next(autoplay=True)
+            return
+        self.stop(reset_position=True)
+        self.finished.emit()
+
+    def _on_error(self, slot: int, text: str) -> None:
+        if slot == self.active_slot and text:
+            self.error.emit(text)
+
+    def _begin_crossfade(self) -> None:
+        next_index = self.current_index + 1
+        if next_index >= len(self.queue):
+            return
+        next_slot = 1 - self.active_slot
+        path = self.path_resolver(self.queue[next_index])
+        if path is None:
+            return
+        standby = self.players[next_slot]
+        standby.stop()
+        standby.setSource(QUrl.fromLocalFile(str(path)))
+        standby.setPosition(0)
+        self.outputs[next_slot].setMuted(self._muted)
+        self.outputs[next_slot].setVolume(0.0)
+        standby.play()
+        self._transitioning = True
+        self._crossfade_elapsed = 0
+        self._crossfade_from = self.active_slot
+        self._crossfade_to = next_slot
+        self._crossfade_timer.start()
+
+    def _crossfade_step(self) -> None:
+        self._crossfade_elapsed += self._crossfade_timer.interval()
+        progress = min(1.0, self._crossfade_elapsed / float(CROSSFADE_MS))
+        self.outputs[self._crossfade_from].setVolume(self._volume * (1.0 - progress))
+        self.outputs[self._crossfade_to].setVolume(self._volume * progress)
+        if progress < 1.0:
+            return
+        old_slot = self._crossfade_from
+        new_slot = self._crossfade_to
+        self._crossfade_timer.stop()
+        self.players[old_slot].stop()
+        self.players[old_slot].setPosition(0)
+        self.outputs[old_slot].setVolume(self._volume)
+        self.active_slot = new_slot
+        self.current_index += 1
+        self._transitioning = False
+        self._crossfade_from = -1
+        self._crossfade_to = -1
+        self.activePlayerChanged.emit(self.player)
+        self.trackChanged.emit(self.current_track_id)
+        self.playbackChanged.emit(True)
+
+    def _cancel_crossfade(self, keep_active: bool) -> None:
+        if not self._transitioning:
+            return
+        self._crossfade_timer.stop()
+        standby = self._crossfade_to
+        if standby >= 0:
+            self.players[standby].stop()
+            self.players[standby].setPosition(0)
+            self.outputs[standby].setVolume(self._volume)
+        if keep_active and self._crossfade_from >= 0:
+            self.outputs[self._crossfade_from].setVolume(self._volume)
+        self._transitioning = False
+        self._crossfade_from = -1
+        self._crossfade_to = -1
+
+    def release_current_file_handle(self) -> None:
+        self.stop(reset_position=True)
+        for player in self.players:
+            player.setSource(QUrl())
+
+    def shutdown(self) -> None:
+        self.release_current_file_handle()
+
+
+class ArchiveDialog(QtWidgets.QDialog):
+    tracksChosen = QtCore.Signal(list)
 
     def __init__(
         self,
-        project_root,
-        archive_mgr: Optional[SoundArchiveManager] = None,
-        parent: Optional[QtCore.QObject] = None,
-    ):
+        library: SoundLibrary,
+        used_ids: Callable[[], set[str]],
+        delete_callback: Callable[[str], bool],
+        repair_callback: Callable[[], None],
+        *,
+        multi_select: bool,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
         super().__init__(parent)
-        self.project_root = Path(project_root).resolve()
-        self.settings_store = SettingsStore(self.project_root)
+        self.library = library
+        self.used_ids = used_ids
+        self.delete_callback = delete_callback
+        self.repair_callback = repair_callback
+        self.setWindowTitle("Music Archive")
+        self.resize(760, 500)
+        self.setModal(True)
 
-        self.playlist_player = PlaylistPlayer(self)
-        self.player = self.playlist_player.active_player
-        self.audio_output = self.playlist_player.active_output
-        self.playlist_player.active_player_changed.connect(self._on_active_player_changed)
-        self.playlist_player.track_changed.connect(self.track_changed.emit)
+        root = QtWidgets.QVBoxLayout(self)
+        top = QtWidgets.QHBoxLayout()
+        self.search = QtWidgets.QLineEdit()
+        self.search.setPlaceholderText("Search archive…")
+        self.sort = QtWidgets.QComboBox()
+        self.sort.addItem("Recently added", "recent")
+        self.sort.addItem("Name", "name")
+        self.sort.addItem("Duration", "duration")
+        top.addWidget(self.search, 1)
+        top.addWidget(self.sort)
+        root.addLayout(top)
 
-        # One-shot SFX pool for gliss plays
-        self._sfx_pool: List[Tuple[QMediaPlayer, QAudioOutput]] = []
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Title", "Duration", "Added", "Used"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(
+            QtWidgets.QAbstractItemView.ExtendedSelection if multi_select else QtWidgets.QAbstractItemView.SingleSelection
+        )
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.doubleClicked.connect(lambda _index: self._choose())
+        root.addWidget(self.table, 1)
 
-        # Volume: load saved; else use STARTING_VOLUME from config
-        self._music_volume = self._load_music_volume()  # 0.0..1.0
-        self.playlist_player.set_volume(self._music_volume)
+        buttons = QtWidgets.QHBoxLayout()
+        self.preview_btn = QtWidgets.QPushButton("Preview")
+        self.rename_btn = QtWidgets.QPushButton("Rename Title")
+        self.delete_btn = QtWidgets.QPushButton("Delete")
+        self.original_btn = QtWidgets.QPushButton("Show Original")
+        self.repair_btn = QtWidgets.QPushButton("Repair Archive")
+        self.choose_btn = QtWidgets.QPushButton("Add Selected" if multi_select else "Use Selected")
+        close_btn = QtWidgets.QPushButton("Close")
+        buttons.addWidget(self.preview_btn)
+        buttons.addWidget(self.rename_btn)
+        buttons.addWidget(self.delete_btn)
+        buttons.addWidget(self.original_btn)
+        buttons.addWidget(self.repair_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(self.choose_btn)
+        buttons.addWidget(close_btn)
+        root.addLayout(buttons)
 
-        self._archive = archive_mgr
-        self._muted = False
-        self._shutdown = False
+        self.preview_output = QAudioOutput(self)
+        self.preview_output.setVolume(0.35)
+        self.preview_player = QMediaPlayer(self)
+        self.preview_player.setAudioOutput(self.preview_output)
+        self._previewing_id = ""
 
-    def _on_active_player_changed(self, player: QMediaPlayer) -> None:
-        self.player = player
-        self.audio_output = self.playlist_player.active_output
-        self.active_player_changed.emit(player)
+        self.search.textChanged.connect(self.refresh)
+        self.sort.currentIndexChanged.connect(self.refresh)
+        self.preview_btn.clicked.connect(self._preview)
+        self.rename_btn.clicked.connect(self._rename)
+        self.delete_btn.clicked.connect(self._delete)
+        self.original_btn.clicked.connect(self._show_original)
+        self.repair_btn.clicked.connect(self._repair)
+        self.choose_btn.clicked.connect(self._choose)
+        close_btn.clicked.connect(self.reject)
+        self.library.changed.connect(self.refresh)
+        self.refresh()
+        self.setStyleSheet(
+            "QDialog{background:#11151c;color:#e7eef8;}"
+            "QLineEdit,QComboBox,QTableWidget{background:#0b0f15;color:#e7eef8;border:1px solid #293445;}"
+            "QPushButton{background:#1c2430;color:#eef6ff;border:1px solid #38506b;border-radius:7px;padding:9px 13px;min-height:22px;}"
+            "QPushButton:hover{border-color:#00c8ff;background:#233447;}"
+        )
 
-    def set_playlist(self, paths: List[Path] | Tuple[Path, ...], *, repeat: bool) -> None:
-        self.playlist_player.set_tracks(paths, repeat=repeat)
-        self.player = self.playlist_player.active_player
-        self.audio_output = self.playlist_player.active_output
+    def refresh(self) -> None:
+        query = self.search.text().strip().casefold()
+        records = self.library.all_records(str(self.sort.currentData() or "recent"))
+        if query:
+            records = [record for record in records if query in record.display_title.casefold() or query in record.original_name.casefold()]
+        self.table.setRowCount(len(records))
+        used = self.used_ids()
+        for row, record in enumerate(records):
+            title = QtWidgets.QTableWidgetItem(record.display_title)
+            title.setData(Qt.UserRole, record.track_id)
+            self.table.setItem(row, 0, title)
+            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(_format_duration(record.duration_seconds)))
+            self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(record.added_at[:10]))
+            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem("Current project" if record.track_id in used else ""))
+        self.table.resizeRowsToContents()
 
-    def _load_music_volume(self) -> float:
-        settings = self.settings_store.as_dict()
-        if "music_volume" in settings:
-            try:
-                v = max(0, min(100, int(settings["music_volume"])))
-                return v / 100.0
-            except Exception:
-                pass
-        try:
-            v = max(0, min(100, int(settings.get("starting_volume", 31))))
-        except Exception:
-            v = 31
-        return v / 100.0
+    def selected_ids(self) -> list[str]:
+        rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
+        result: list[str] = []
+        for row in rows:
+            item = self.table.item(row, 0)
+            if item is not None:
+                result.append(str(item.data(Qt.UserRole) or ""))
+        return [track_id for track_id in result if track_id]
 
-    def save_music_volume(self, volume_percent: int) -> None:
-        v = max(0, min(100, int(volume_percent)))
-        self.settings_store.update_fields(music_volume=v, starting_volume=v)
+    def _choose(self) -> None:
+        ids = self.selected_ids()
+        if ids:
+            self.tracksChosen.emit(ids)
+            self.accept()
 
-        self._music_volume = v / 100.0
-        self.playlist_player.set_volume(self._music_volume)
-
-    def set_music_volume_live(self, volume_percent: int) -> None:
-        self._music_volume = max(0, min(100, int(volume_percent))) / 100.0
-        self.playlist_player.set_volume(self._music_volume)
-
-    def validate_audio(self, path: str) -> Tuple[bool, str]:
-        if not os.path.exists(path):
-            return False, "File does not exist."
-        ext = os.path.splitext(path)[1].lower()
-        if ext not in VALID_AUDIO_EXTS:
-            return False, "Unsupported format."
-        if os.path.getsize(path) > MAX_AUDIO_MB * 1024 * 1024:
-            return False, f"File exceeds {MAX_AUDIO_MB}MB limit."
-        try:
-            audio = MutagenFile(path)
-            duration = round(audio.info.length, 2) if audio and audio.info else "Unknown"
-            return True, f"Valid audio file ({duration} seconds)"
-        except Exception as e:
-            return False, f"Metadata error: {e}"
-
-    def load_audio(self, path: str) -> None:
-        if self._shutdown:
+    def _preview(self) -> None:
+        ids = self.selected_ids()
+        if not ids:
             return
-        self.playlist_player.set_tracks((Path(path),), repeat=True)
-        self.player = self.playlist_player.active_player
-        self.audio_output = self.playlist_player.active_output
-
-    def play_audio(self) -> None:
-        if self._shutdown:
+        track_id = ids[0]
+        if self._previewing_id == track_id and self.preview_player.playbackState() == QMediaPlayer.PlayingState:
+            self.preview_player.stop()
+            self.preview_btn.setText("Preview")
             return
-        self.playlist_player.set_volume(self._music_volume)
-        self.playlist_player.play()
-
-    def pause_audio(self) -> None:
-        self.playlist_player.pause()
-
-    def start_over_audio(self) -> None:
-        self.playlist_player.set_volume(self._music_volume)
-        self.playlist_player.start_over()
-
-    def toggle_mute(self) -> bool:
-        self._muted = not self._muted
-        self.playlist_player.set_muted(self._muted)
-        try:
-            for _p, out in list(self._sfx_pool):
-                out.setMuted(self._muted)
-        except Exception:
-            pass
-        return self._muted
-
-    def is_playing(self) -> bool:
-        return self.playlist_player.is_playing()
-
-    def release_current_file_handle(self) -> None:
-        """Stop playback and detach source to release OS file handle."""
-        try:
-            self.playlist_player.release_file_handles()
-        except Exception:
-            pass
-
-    def shutdown(self) -> None:
-        if self._shutdown:
+        path = self.library.path_for(track_id)
+        if path is None:
             return
-        self._shutdown = True
-        self.release_current_file_handle()
-        self.playlist_player.shutdown()
+        self.preview_player.stop()
+        self.preview_player.setSource(QUrl.fromLocalFile(str(path)))
+        self.preview_player.play()
+        self._previewing_id = track_id
+        self.preview_btn.setText("Stop Preview")
 
-        for player, output in list(self._sfx_pool):
-            try:
-                player.stop()
-                player.setSource(QUrl())
-                player.setAudioOutput(None)
-            except Exception:
-                pass
-            player.deleteLater()
-            output.deleteLater()
-        self._sfx_pool.clear()
+    def _rename(self) -> None:
+        ids = self.selected_ids()
+        if not ids:
+            return
+        record = self.library.get(ids[0])
+        if record is None:
+            return
+        title, ok = QtWidgets.QInputDialog.getText(self, "Rename Display Title", "Display title:", text=record.display_title)
+        if ok and title.strip():
+            self.library.rename_display_title(record.track_id, title)
 
-    def play_gliss(self) -> bool:
-        if self._shutdown:
-            return False
-        gliss_raw = _user_gliss_path(self.project_root)
-        if not gliss_raw.exists():
-            return False
-        try:
-            out = QAudioOutput(self)
-            try:
-                out.setDevice(self.audio_output.device())
-            except Exception:
-                pass
-            out.setVolume(GLISS_VOLUME_PERCENT / 100.0)
-            out.setMuted(self._muted)
+    def _show_original(self) -> None:
+        ids = self.selected_ids()
+        if not ids:
+            return
+        record = self.library.get(ids[0])
+        if record is None or not record.original_file:
+            return
+        original = originals_dir(self.library.project_root) / Path(record.original_file).name
+        if original.is_file():
+            QtGui.QDesktopServices.openUrl(QUrl.fromLocalFile(str(original.parent)))
 
-            p = QMediaPlayer(self)
-            p.setAudioOutput(out)
-            p.setSource(QUrl.fromLocalFile(str(gliss_raw)))
+    def _repair(self) -> None:
+        self.accept()
+        self.repair_callback()
 
-            self._sfx_pool.append((p, out))
+    def _delete(self) -> None:
+        ids = self.selected_ids()
+        if not ids:
+            return
+        self.preview_player.stop()
+        self.preview_player.setSource(QUrl())
+        self._previewing_id = ""
+        self.preview_btn.setText("Preview")
+        for track_id in ids:
+            self.delete_callback(track_id)
+        self.refresh()
 
-            def _cleanup_when_done(_status: QMediaPlayer.MediaStatus) -> None:
-                if _status in (QMediaPlayer.EndOfMedia, QMediaPlayer.InvalidMedia, QMediaPlayer.NoMedia):
-                    try:
-                        p.stop()
-                    except Exception:
-                        pass
-                    try:
-                        self._sfx_pool.remove((p, out))
-                    except Exception:
-                        self._sfx_pool[:] = [(pp, oo) for (pp, oo) in self._sfx_pool if pp is not p]
-                    p.deleteLater()
-                    out.deleteLater()
-
-            p.mediaStatusChanged.connect(_cleanup_when_done)
-            p.play()
-            return True
-        except Exception:
-            return False
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.preview_player.stop()
+        self.preview_player.setSource(QUrl())
+        super().closeEvent(event)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SoundTab
-# ─────────────────────────────────────────────────────────────────────────────
+class PlaylistItemWidget(QtWidgets.QFrame):
+    removeRequested = QtCore.Signal(str)
+
+    def __init__(self, record: TrackRecord, active: bool, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.track_id = record.track_id
+        self.setObjectName("playlistRow")
+        row = QtWidgets.QHBoxLayout(self)
+        row.setContentsMargins(9, 6, 7, 6)
+        row.setSpacing(8)
+        drag = QtWidgets.QLabel("≡")
+        title = QtWidgets.QLabel(record.display_title)
+        title.setToolTip(record.original_name)
+        duration = QtWidgets.QLabel(_format_duration(record.duration_seconds))
+        remove = QtWidgets.QToolButton()
+        remove.setText("×")
+        remove.setToolTip("Remove from playlist")
+        remove.setFixedSize(30, 30)
+        remove.clicked.connect(lambda: self.removeRequested.emit(self.track_id))
+        row.addWidget(drag)
+        row.addWidget(title, 1)
+        row.addWidget(duration)
+        row.addWidget(remove)
+        border = "#00c8ff" if active else "#2b3344"
+        background = "rgba(0,200,255,28)" if active else "#151a22"
+        self.setStyleSheet(
+            f"QFrame#playlistRow{{background:{background};border:1px solid {border};border-radius:8px;}}"
+            "QLabel{color:#e8eff8;}QToolButton{color:#cfd8e5;border:none;font-size:18px;}"
+            "QToolButton:hover{color:#ff7777;}"
+        )
+
 
 class SoundTab(QtWidgets.QWidget):
-    preview_widget = QtCore.Signal(QtWidgets.QWidget)  # visualizer widget
+    preview_widget = QtCore.Signal(QtWidgets.QWidget)
 
-    def __init__(self, project_root):
+    def __init__(self, project_root: str | Path) -> None:
         super().__init__()
         self.project_root = Path(project_root).resolve()
-        self._shutdown = False
+        self.library = SoundLibrary(self.project_root, self)
+        self.project_sound = ProjectSound(self.project_root, self.library, self)
+        self.player = PlaylistPlayer(self.library.path_for, self)
+        self.wave = self.player  # compatibility for command.py and existing Nexus hooks
+        self._tab_active = False
+        self._import_thread: Optional[QtCore.QThread] = None
+        self._import_worker: Optional[_ImportWorker] = None
+        self._repair_thread: Optional[QtCore.QThread] = None
+        self._repair_worker: Optional[_RepairWorker] = None
+        self._pending_import_mode = "single"
+        self._analysis = None
+        self._analysis_key = ""
+        self._analysis_disabled = False
+        self._preview = SoundPreviewWidget(self.player.player, parent=self)
+        self._preview.set_tab_active(False)
+        self._status_timer = QtCore.QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(lambda: self.status.setText(""))
 
-        self._archive_mgr = SoundArchiveManager(self.project_root)
-        self._playlist_store = PlaylistStore(self.project_root)
-        self._playlist = self._playlist_store.load()
-        self.status_controller = StatusController()
-        self._rebuilding_playlist = False
-        self._resolved_playlist_tracks: list[tuple[str, Path]] = []
-        self.wave = WaveHandler(project_root, archive_mgr=self._archive_mgr, parent=self)
-
-        # Visualizer for Nexus preview
-        self._preview = SoundPreviewWidget(self.wave.player, parent=self)
-        self.wave.active_player_changed.connect(self._preview.set_media_player)
-        self.wave.track_changed.connect(self._on_playlist_track_changed)
-        self._archive_mgr.current_changed.connect(self._on_current_changed)
-
-        settings = SettingsStore(self.project_root).snapshot()
-        self._analysis_enabled = bool(
-            settings.get("debug", False)
-            and settings.get("enable_audio_analysis", False)
-        )
-        self._analysis = (
-            AudioAnalysisManager(self.project_root, parent=self)
-            if self._analysis_enabled and AudioAnalysisManager is not None
-            else None
-        )
-        self._analysis_bootstrapped = False
-        self._current_processed = ""
-        self._current_analysis_key = ""
-
-        if self._analysis is not None:
-            self._analysis.busyChanged.connect(self._on_analysis_busy)
-            self._analysis.batchProgress.connect(self._on_analysis_progress)
-            self._analysis.analysisReady.connect(self._on_analysis_ready)
-            self._analysis.analysisFailed.connect(self._on_analysis_failed)
-
+        self._init_analysis()
         self._init_ui()
-        self._init_shortcuts()
-        self._sync_playlist_player()
-
-        if self._playlist.tracks:
-            self._current_processed = self._playlist.tracks[0].archive_name
-            stable_path = self._stable_audio_path_for_preview()
-            if stable_path is not None:
-                self._preview.set_audio_file(str(stable_path))
-            self._prime_analysis_for_current()
-
-        # Hand to Nexus
+        self._connect_signals()
+        self._reload_player_queue()
+        self._refresh_ui()
         self.preview_widget.emit(self._preview)
 
-        # Warn if SFX missing
-        self._warn_if_missing_sfx()
-
-    def _warn_if_missing_sfx(self) -> None:
-        misses = []
-        if not _user_gliss_path(self.project_root).exists():
-            misses.append(str(_user_gliss_path(self.project_root)))
-        for i in range(1, 11):
-            p = _user_flip_path(self.project_root, i)
-            if not p.exists():
-                misses.append(str(p))
-        if misses:
-            try:
-                self.status_controller.publish(
-                    "Missing sound assets:\n" + "\n".join(misses),
-                    StatusLevel.WARNING,
-                    persistent=True,
-                    key="sound-assets",
-                )
-            except Exception:
-                pass
-
-    def shutdown(self) -> None:
-        if self._shutdown:
+    def _init_analysis(self) -> None:
+        if not _analysis_requested(self.project_root) or AudioAnalysisManager is None:
             return
-        self._shutdown = True
+        ready, reason = analysis_runtime_status()
+        if not ready:
+            logging.getLogger(__name__).warning("Sound analysis disabled: %s", reason)
+            return
+        try:
+            manager = AudioAnalysisManager(self.project_root, parent=self)
+            manager.processed_dir = processed_dir(self.project_root)
+            manager.analysis_dir = analysis_dir(self.project_root)
+            manager.analysisReady.connect(self._on_analysis_ready)
+            manager.analysisFailed.connect(self._on_analysis_failed)
+            self._analysis = manager
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Sound analysis disabled: %s", exc)
 
+    def _init_ui(self) -> None:
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 20)
+        # The Sound tab receives a little more vertical breathing room when the
+        # Nexus preview is reduced in normal-window mode.
+        root.setSpacing(16)
+
+        header = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Sound")
+        title.setStyleSheet("color:#dff8ff;font-size:18px;font-weight:700;")
+        self.archive_btn = QtWidgets.QPushButton("Archive")
+        self.archive_btn.setToolTip("Choose music from the archive")
+        self.archive_btn.setMinimumHeight(40)
+        self.clear_btn = QtWidgets.QPushButton("Clear")
+        self.clear_btn.setToolTip("Clear music assigned to this letter")
+        self.clear_btn.setMinimumHeight(40)
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(self.archive_btn)
+        header.addWidget(self.clear_btn)
+        root.addLayout(header)
+
+        self.mode_stack = QtWidgets.QStackedWidget()
+        self.single_panel = self._build_single_panel()
+        self.playlist_panel = self._build_playlist_panel()
+        self.mode_stack.addWidget(self.single_panel)
+        self.mode_stack.addWidget(self.playlist_panel)
+        root.addWidget(self.mode_stack, 1)
+
+        self.now_playing = QtWidgets.QLabel("No music selected")
+        self.now_playing.setStyleSheet("color:#b7c9dc;padding:6px 4px;")
+        root.addWidget(self.now_playing)
+
+        transport = QtWidgets.QHBoxLayout()
+        transport.setContentsMargins(0, 4, 0, 4)
+        transport.setSpacing(10)
+        self.prev_btn = QtWidgets.QToolButton()
+        self.prev_btn.setText("⏮")
+        self.prev_btn.setToolTip("Previous track or restart current track")
+        self.play_btn = QtWidgets.QToolButton()
+        self.play_btn.setText("▶")
+        self.play_btn.setToolTip("Play or pause")
+        self.next_btn = QtWidgets.QToolButton()
+        self.next_btn.setText("⏭")
+        self.next_btn.setToolTip("Next track")
+        self.elapsed = QtWidgets.QLabel("0:00")
+        self.timeline = CleanSlider()
+        self.timeline.setRange(0, 0)
+        self.total = QtWidgets.QLabel("0:00")
+        # QPushButton is used here instead of QToolButton because QToolButton
+        # elides the Windows emoji glyph to "..." when its global padding is
+        # applied. This button has its own zero-padding style, so the Unicode
+        # speaker symbols remain centered and fully visible.
+        self.mute_btn = QtWidgets.QPushButton("\U0001F50A")
+        self.mute_btn.setObjectName("soundVolumeButton")
+        self.mute_btn.setToolTip("Mute music")
+        self.mute_btn.setAccessibleName("Mute or restore music")
+        self.mute_btn.setFont(QtGui.QFont("Segoe UI Emoji", 18))
+        self.mute_btn.setStyleSheet(
+            "QPushButton#soundVolumeButton{padding:0;margin:0;min-height:0;"
+            "background:#1b2430;border:1px solid #33475f;border-radius:8px;"
+            "font-family:'Segoe UI Emoji';font-size:20px;}"
+            "QPushButton#soundVolumeButton:hover{border-color:#00c8ff;background:#233447;}"
+        )
+        self.volume = CleanSlider()
+        self.volume.setRange(0, 100)
+        self.volume.setValue(self._load_volume())
+        self.volume.setFixedWidth(156)
+        for button in (self.prev_btn, self.play_btn, self.next_btn):
+            button.setFixedSize(48, 42)
+            button.setFont(QtGui.QFont("Segoe UI Symbol", 18))
+        self.mute_btn.setFixedSize(52, 42)
+        transport.addWidget(self.prev_btn)
+        transport.addWidget(self.play_btn)
+        transport.addWidget(self.next_btn)
+        transport.addWidget(self.elapsed)
+        transport.addWidget(self.timeline, 1)
+        transport.addWidget(self.total)
+        transport.addWidget(self.mute_btn)
+        transport.addWidget(self.volume)
+        root.addLayout(transport)
+
+        status_row = QtWidgets.QHBoxLayout()
+        self.status = QtWidgets.QLabel("")
+        self.status.setStyleSheet("color:#91a8bd;min-height:24px;padding-top:2px;")
+        self.cancel_job_btn = QtWidgets.QPushButton("Cancel")
+        self.cancel_job_btn.hide()
+        status_row.addWidget(self.status, 1)
+        status_row.addWidget(self.cancel_job_btn)
+        root.addLayout(status_row)
+
+        self.setAcceptDrops(True)
+        self.setStyleSheet(
+            "QWidget{color:#e7eef8;}"
+            "QPushButton,QToolButton{background:#1b2430;border:1px solid #33475f;border-radius:8px;padding:8px 12px;min-height:22px;}"
+            "QPushButton:hover,QToolButton:hover{border-color:#00c8ff;background:#233447;}"
+            "QStackedWidget,QListWidget{background:transparent;border:none;}"
+        )
+
+    def _build_single_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QFrame()
+        panel.setObjectName("singleCard")
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(18, 20, 18, 20)
+        layout.setSpacing(12)
+        self.single_title = QtWidgets.QLabel("No music selected")
+        self.single_title.setAlignment(Qt.AlignCenter)
+        self.single_title.setStyleSheet("font-size:17px;font-weight:650;color:#eaf7ff;")
+        self.single_detail = QtWidgets.QLabel("Add one song for this letter.")
+        self.single_detail.setAlignment(Qt.AlignCenter)
+        self.single_detail.setWordWrap(True)
+        self.single_detail.setStyleSheet("color:#93a8bd;")
+        button_row = QtWidgets.QHBoxLayout()
+        self.single_action_btn = QtWidgets.QPushButton("Add Music")
+        self.single_action_btn.setMinimumSize(132, 40)
+        self.create_playlist_btn = QtWidgets.QPushButton("Create Playlist")
+        self.create_playlist_btn.setMinimumSize(156, 40)
+        self.create_playlist_btn.hide()
+        button_row.addStretch(1)
+        button_row.addWidget(self.single_action_btn)
+        button_row.addWidget(self.create_playlist_btn)
+        button_row.addStretch(1)
+        layout.addStretch(1)
+        layout.addWidget(self.single_title)
+        layout.addWidget(self.single_detail)
+        layout.addLayout(button_row)
+        layout.addStretch(1)
+        panel.setStyleSheet(
+            "QFrame#singleCard{background:#121820;border:1px solid #2b3a4d;border-radius:12px;}"
+        )
+        return panel
+
+    def _build_playlist_panel(self) -> QtWidgets.QWidget:
+        panel = QtWidgets.QFrame()
+        panel.setObjectName("playlistPanel")
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(12, 14, 12, 14)
+        layout.setSpacing(12)
+        summary = QtWidgets.QHBoxLayout()
+        self.playlist_summary = QtWidgets.QLabel("Playlist")
+        self.expand_btn = QtWidgets.QPushButton("Collapse")
+        self.add_track_btn = QtWidgets.QPushButton("Add Track")
+        self.convert_single_btn = QtWidgets.QPushButton("Convert to Single Track")
+        for button in (self.expand_btn, self.add_track_btn, self.convert_single_btn):
+            button.setMinimumHeight(40)
+        summary.addWidget(self.playlist_summary, 1)
+        summary.addWidget(self.expand_btn)
+        summary.addWidget(self.add_track_btn)
+        summary.addWidget(self.convert_single_btn)
+        layout.addLayout(summary)
+        self.playlist_list = QtWidgets.QListWidget()
+        self.playlist_list.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
+        self.playlist_list.setDefaultDropAction(Qt.MoveAction)
+        self.playlist_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.playlist_list.setSpacing(6)
+        self.playlist_list.model().rowsMoved.connect(self._playlist_rows_moved)
+        layout.addWidget(self.playlist_list, 1)
+        panel.setStyleSheet("QFrame#playlistPanel{background:#111820;border:1px solid #2b3a4d;border-radius:12px;}")
+        return panel
+
+    def _connect_signals(self) -> None:
+        self.single_action_btn.clicked.connect(self._choose_new_files)
+        self.create_playlist_btn.clicked.connect(self._create_playlist)
+        self.add_track_btn.clicked.connect(self._choose_new_files)
+        self.archive_btn.clicked.connect(self._open_archive_for_current_mode)
+        self.expand_btn.clicked.connect(self._toggle_playlist_expanded)
+        self.convert_single_btn.clicked.connect(self._convert_to_single)
+        self.clear_btn.clicked.connect(self._clear_project_sound)
+        self.prev_btn.clicked.connect(self.player.previous)
+        self.play_btn.clicked.connect(self._toggle_play)
+        self.next_btn.clicked.connect(lambda: self.player.next(autoplay=True))
+        self.mute_btn.clicked.connect(self._toggle_mute)
+        self.volume.valueChanged.connect(self._volume_changed)
+        self.volume.sliderReleased.connect(self._save_volume)
+        self.timeline.sliderMoved.connect(self.player.seek)
+        self.playlist_list.itemClicked.connect(self._playlist_item_selected)
+        self.playlist_list.itemDoubleClicked.connect(self._playlist_item_activated)
+        self.cancel_job_btn.clicked.connect(self._cancel_background_job)
+        self.player.trackChanged.connect(self._on_track_changed)
+        self.player.playbackChanged.connect(lambda playing: self.play_btn.setText("⏸" if playing else "▶"))
+        self.player.positionChanged.connect(self._on_position_changed)
+        self.player.activePlayerChanged.connect(self._on_active_player_changed)
+        self.player.error.connect(lambda message: self._show_status(f"Playback error: {message}", persistent=True))
+        self.player.finished.connect(lambda: self._show_status("Playback finished."))
+        self.library.changed.connect(self._refresh_ui)
+        self.project_sound.changed.connect(self._project_state_changed)
+
+    def _load_volume(self) -> int:
+        settings = _read_settings(self.project_root)
+        try:
+            return max(0, min(100, int(settings.get("music_volume", STARTING_VOLUME))))
+        except (TypeError, ValueError):
+            return int(STARTING_VOLUME)
+
+    def _save_volume(self) -> None:
+        settings = _read_settings(self.project_root)
+        settings["music_volume"] = self.volume.value()
+        settings["starting_volume"] = self.volume.value()
+        _write_settings(self.project_root, settings)
+
+    def _volume_changed(self, value: int) -> None:
+        self.player.set_volume(value)
+
+    def _toggle_mute(self) -> None:
+        muted = self.player.toggle_mute()
+        self.mute_btn.setText("\U0001F507" if muted else "\U0001F50A")
+        self.mute_btn.setToolTip("Restore music" if muted else "Mute music")
+
+    def _project_state_changed(self) -> None:
+        self._reload_player_queue()
+        self._refresh_ui()
+
+    def _reload_player_queue(self) -> None:
+        self.player.set_queue(self.project_sound.ordered_ids(), self.project_sound.state.selected_track_id)
+        self.player.set_volume(self.volume.value() if hasattr(self, "volume") else self._load_volume())
+
+    def _refresh_ui(self) -> None:
+        state = self.project_sound.state
+        if state.mode == "playlist":
+            self.create_playlist_btn.hide()
+            self.mode_stack.setCurrentWidget(self.playlist_panel)
+            self._refresh_playlist()
+        else:
+            self.mode_stack.setCurrentWidget(self.single_panel)
+            record = self.library.get(state.single_track_id)
+            has_single_track = record is not None
+            self.create_playlist_btn.setVisible(has_single_track)
+            if record is None:
+                self.single_title.setText("No music selected")
+                self.single_detail.setText("Add one song for this letter.")
+                self.single_action_btn.setText("Add Music")
+            else:
+                self.single_title.setText(record.display_title)
+                self.single_detail.setText(f"{_format_duration(record.duration_seconds)}  •  {record.original_name}")
+                self.single_action_btn.setText("Replace Music")
+        self._sync_transport_enabled()
+        self._on_track_changed(self.player.current_track_id)
+
+    def _refresh_playlist(self) -> None:
+        self.playlist_list.blockSignals(True)
+        self.playlist_list.clear()
+        active = self.project_sound.state.selected_track_id
+        total_duration = 0.0
+        for track_id in self.project_sound.state.playlist:
+            record = self.library.get(track_id)
+            if record is None:
+                continue
+            total_duration += record.duration_seconds
+            item = QtWidgets.QListWidgetItem()
+            item.setData(Qt.UserRole, track_id)
+            widget = PlaylistItemWidget(record, track_id == active)
+            widget.removeRequested.connect(self.project_sound.remove_from_playlist)
+            item.setSizeHint(widget.sizeHint())
+            self.playlist_list.addItem(item)
+            self.playlist_list.setItemWidget(item, widget)
+        self.playlist_list.blockSignals(False)
+        count = self.playlist_list.count()
+        self.playlist_summary.setText(f"Playlist • {count} track{'s' if count != 1 else ''} • {_format_duration(total_duration)}")
+        expanded = self.project_sound.state.playlist_expanded
+        self.playlist_list.setVisible(expanded)
+        self.expand_btn.setText("Collapse" if expanded else "Expand")
+
+    def _playlist_item_selected(self, item: QtWidgets.QListWidgetItem) -> None:
+        track_id = str(item.data(Qt.UserRole) or "")
+        if not track_id:
+            return
+        self.project_sound.select_track(track_id)
+
+    def _playlist_item_activated(self, item: QtWidgets.QListWidgetItem) -> None:
+        track_id = str(item.data(Qt.UserRole) or "")
+        if not track_id:
+            return
+        self.project_sound.select_track(track_id)
+        self.player.select_track(track_id, autoplay=True)
+
+    def _playlist_rows_moved(self, *_args) -> None:
+        ids: list[str] = []
+        for row in range(self.playlist_list.count()):
+            item = self.playlist_list.item(row)
+            ids.append(str(item.data(Qt.UserRole) or ""))
+        self.project_sound.reorder_playlist([track_id for track_id in ids if track_id])
+
+    def _sync_transport_enabled(self) -> None:
+        has_tracks = bool(self.project_sound.ordered_ids())
+        self.play_btn.setEnabled(has_tracks)
+        self.prev_btn.setEnabled(has_tracks)
+        self.next_btn.setEnabled(self.project_sound.state.mode == "playlist" and len(self.project_sound.state.playlist) > 1)
+        self.timeline.setEnabled(has_tracks)
+        self.clear_btn.setEnabled(has_tracks)
+
+    def _choose_new_files(self) -> None:
+        settings = _read_settings(self.project_root)
+        start = str(settings.get(LAST_MUSIC_FOLDER_KEY, ""))
+        if self.project_sound.state.mode == "playlist":
+            paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+                self,
+                "Add Playlist Tracks",
+                start,
+                "Audio Files (*.mp3 *.wav *.ogg *.aac *.m4a *.flac)",
+            )
+        else:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Choose Music",
+                start,
+                "Audio Files (*.mp3 *.wav *.ogg *.aac *.m4a *.flac)",
+            )
+            paths = [path] if path else []
+        if paths:
+            self._remember_music_folder(paths[0])
+            self._start_import(paths)
+
+    def _remember_music_folder(self, path: str) -> None:
+        settings = _read_settings(self.project_root)
+        settings[LAST_MUSIC_FOLDER_KEY] = str(Path(path).resolve().parent)
+        _write_settings(self.project_root, settings)
+
+    def _start_import(self, paths: list[str]) -> None:
+        if self._import_thread is not None:
+            return
+        self.player.stop(reset_position=True)
+        known = {record.content_hash: record.track_id for record in self.library.records.values()}
+        thread = QtCore.QThread(self)
+        worker = _ImportWorker(self.project_root, paths, known)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._import_finished)
+        worker.failed.connect(self._import_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_import_handles)
+        self._import_thread = thread
+        self._import_worker = worker
+        self._set_busy(True, f"Importing {len(paths)} track{'s' if len(paths) != 1 else ''}…")
+        thread.start()
+
+    def _import_finished(self, payloads: list[dict]) -> None:
+        ids = self.library.register_imports(payloads)
+        if self.project_sound.state.mode == "playlist":
+            self.project_sound.add_to_playlist(ids)
+        elif ids:
+            self.project_sound.set_single(ids[0])
+        self._show_status(f"Added {len(ids)} track{'s' if len(ids) != 1 else ''}.")
+
+    def _import_failed(self, message: str) -> None:
+        if "canceled" in message.casefold():
+            self._show_status("Import canceled.")
+        else:
+            self._show_status(f"Import failed: {message}", persistent=True)
+            QtWidgets.QMessageBox.critical(self, "Audio Import Error", message)
+
+    def _clear_import_handles(self) -> None:
+        self._import_thread = None
+        self._import_worker = None
+        self._set_busy(False)
+
+    def _set_busy(self, busy: bool, message: str = "") -> None:
+        self.single_action_btn.setEnabled(not busy)
+        self.add_track_btn.setEnabled(not busy)
+        self.archive_btn.setEnabled(not busy)
+        self.cancel_job_btn.setVisible(busy)
+        if message:
+            self.status.setText(message)
+            self._status_timer.stop()
+
+    def _cancel_background_job(self) -> None:
+        if self._import_worker is not None:
+            self._import_worker.cancel()
+        if self._repair_worker is not None:
+            self._repair_worker.cancel()
+
+    def _open_archive_for_current_mode(self) -> None:
+        dialog = ArchiveDialog(
+            self.library,
+            lambda: set(self.project_sound.ordered_ids()),
+            self._delete_archive_track,
+            self._start_archive_repair,
+            multi_select=self.project_sound.state.mode == "playlist",
+            parent=self,
+        )
+        dialog.tracksChosen.connect(self._archive_tracks_chosen)
+        dialog.exec()
+
+    def _archive_tracks_chosen(self, track_ids: list[str]) -> None:
+        if self.project_sound.state.mode == "playlist":
+            self.project_sound.add_to_playlist(track_ids)
+        elif track_ids:
+            self.project_sound.set_single(track_ids[0])
+
+    def _delete_archive_track(self, track_id: str) -> bool:
+        record = self.library.get(track_id)
+        if record is None:
+            return False
+        state_backup = ProjectSoundState.from_dict(self.project_sound.state.to_dict())
+        used = self.project_sound.state.is_using(track_id)
+        if used:
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("Track Is In Use")
+            box.setText(f"{record.display_title} is used by this letter.")
+            remove_button = box.addButton("Remove From This Letter", QtWidgets.QMessageBox.ActionRole)
+            delete_button = box.addButton("Delete From Archive", QtWidgets.QMessageBox.DestructiveRole)
+            box.addButton(QtWidgets.QMessageBox.Cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked == remove_button:
+                self.project_sound.remove_usage(track_id)
+                return False
+            if clicked != delete_button:
+                return False
+            self.project_sound.remove_usage(track_id)
+        else:
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Delete Track",
+                f"Delete {record.display_title} from the music archive?",
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                return False
+        self.player.release_current_file_handle()
+        deleted = self.library.delete_track(track_id)
+        if not deleted:
+            self.project_sound.state = state_backup
+            self.project_sound.save()
+            self._show_status("The track could not be deleted because its file is still in use.", persistent=True)
+            return False
+        self.project_sound.save()
+        self._reload_player_queue()
+        return True
+
+    def _start_archive_repair(self) -> None:
+        if self._repair_thread is not None:
+            return
+        thread = QtCore.QThread(self)
+        worker = _RepairWorker(self.project_root)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._repair_finished)
+        worker.failed.connect(self._repair_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_repair_handles)
+        self._repair_thread = thread
+        self._repair_worker = worker
+        self._set_busy(True, "Repairing music archive…")
+        thread.start()
+
+    def _repair_finished(self, repaired: int, issues: list[str]) -> None:
+        self.library.records = load_library(self.project_root)
+        self.library.changed.emit()
+        if issues:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Archive Repair",
+                f"Repaired {repaired} item(s).\n\n" + "\n".join(issues[:12]),
+            )
+        else:
+            self._show_status(f"Archive repair completed: {repaired} item(s) repaired.")
+
+    def _repair_failed(self, message: str) -> None:
+        self._show_status(f"Archive repair failed: {message}", persistent=True)
+
+    def _clear_repair_handles(self) -> None:
+        self._repair_thread = None
+        self._repair_worker = None
+        self._set_busy(False)
+
+    def _create_playlist(self) -> None:
+        self.project_sound.create_playlist()
+        if not self.project_sound.state.playlist:
+            self._choose_new_files()
+
+    def _convert_to_single(self) -> None:
+        selected = self.project_sound.state.selected_track_id
+        row = self.playlist_list.currentRow()
+        if row >= 0:
+            selected = str(self.playlist_list.item(row).data(Qt.UserRole) or selected)
+        self.project_sound.convert_to_single(selected)
+
+    def _toggle_playlist_expanded(self) -> None:
+        self.project_sound.state.playlist_expanded = not self.project_sound.state.playlist_expanded
+        save_project_state(self.project_root, self.project_sound.state)
+        self._refresh_playlist()
+
+    def _clear_project_sound(self) -> None:
+        if not self.project_sound.ordered_ids():
+            return
+        if QtWidgets.QMessageBox.question(self, "Clear Project Sound", "Remove all music from this letter?") == QtWidgets.QMessageBox.Yes:
+            self.player.stop(reset_position=True)
+            self.project_sound.clear()
+
+    def _toggle_play(self) -> None:
+        if not self._tab_active:
+            return
+        if self.player.is_playing():
+            self.player.pause()
+        else:
+            self.player.play()
+            self._prime_analysis_for_current()
+
+    def _on_track_changed(self, track_id: str) -> None:
+        if track_id and track_id in self.project_sound.ordered_ids():
+            self.project_sound.state.selected_track_id = track_id
+            save_project_state(self.project_root, self.project_sound.state)
+        record = self.library.get(track_id)
+        self.now_playing.setText(f"Now Playing: {record.display_title}" if record else "No music selected")
+        path = self.library.path_for(track_id) if track_id else None
+        self._preview.set_audio_file(str(path) if path else "")
+        self._refresh_playlist() if self.project_sound.state.mode == "playlist" else None
+        self._prime_analysis_for_current()
+
+    def _on_position_changed(self, position: int, duration: int) -> None:
+        self.timeline.blockSignals(True)
+        self.timeline.setRange(0, max(0, duration))
+        self.timeline.setValue(max(0, min(position, duration if duration > 0 else position)))
+        self.timeline.blockSignals(False)
+        self.elapsed.setText(_format_ms(position))
+        self.total.setText(_format_ms(duration))
+
+    def _on_active_player_changed(self, player: QMediaPlayer) -> None:
+        self._preview.set_media_player(player)
+
+    def _prime_analysis_for_current(self) -> None:
+        if self._analysis is None or self._analysis_disabled:
+            return
+        path = self.library.path_for(self.player.current_track_id)
+        if path is None:
+            return
+        self._analysis_key = str(path.resolve())
+        try:
+            cached = self._analysis.load_cached(path)
+            if cached is not None:
+                self._preview.set_analysis_payload(cached)
+            else:
+                self._analysis.ensure_analyzed(path, priority=True)
+        except Exception as exc:
+            self._disable_analysis(str(exc))
+
+    def _on_analysis_ready(self, path_key: str, payload: dict) -> None:
+        if str(path_key) == self._analysis_key:
+            self._preview.set_analysis_payload(payload)
+
+    def _on_analysis_failed(self, _path_key: str, message: str) -> None:
+        self._disable_analysis(message)
+
+    def _disable_analysis(self, message: str) -> None:
+        if self._analysis_disabled:
+            return
+        self._analysis_disabled = True
+        logging.getLogger(__name__).warning("Sound analysis disabled for this session: %s", message)
+        manager = self._analysis
+        self._analysis = None
+        try:
+            if manager is not None:
+                manager.shutdown()
+        except Exception:
+            pass
+
+    def _show_status(self, message: str, persistent: bool = False) -> None:
+        self.status.setText(message)
+        self._status_timer.stop()
+        if not persistent:
+            self._status_timer.start(4200)
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        urls = event.mimeData().urls()
+        if any(Path(url.toLocalFile()).suffix.casefold() in VALID_AUDIO_EXTS for url in urls):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        paths = [
+            url.toLocalFile()
+            for url in event.mimeData().urls()
+            if Path(url.toLocalFile()).suffix.casefold() in VALID_AUDIO_EXTS
+        ]
+        if not paths:
+            event.ignore()
+            return
+        if self.project_sound.state.mode == "single":
+            paths = paths[:1]
+        self._remember_music_folder(paths[0])
+        self._start_import(paths)
+        event.acceptProposedAction()
+
+    def shared_preview_widget(self) -> QtWidgets.QWidget:
+        return self._preview
+
+    def activate_for_tab_change(self) -> None:
+        self._tab_active = True
+        self._preview.set_tab_active(True)
+
+    def deactivate_for_tab_change(self) -> None:
+        self._tab_active = False
+        self.player.stop(reset_position=True)
+        self._preview.set_tab_active(False)
+        self.play_btn.setText("▶")
+
+    def release_current_file_handle(self) -> None:
+        self.player.stop(reset_position=True)
+        for player in self.player.players:
+            player.setSource(QUrl())
+
+    def reset_project_sound(self) -> None:
+        self.player.stop(reset_position=True)
+        self.project_sound.clear()
+        self._refresh_ui()
+
+    def reload_project_from_disk(self) -> None:
+        self.player.stop(reset_position=True)
+        self.library.records = load_library(self.project_root)
+        self.project_sound.state = load_project_state(
+            self.project_root,
+            valid_ids=set(self.library.records),
+        )
+        self._reload_player_queue()
+        self._refresh_ui()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self.activate_for_tab_change()
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        self.deactivate_for_tab_change()
+        super().hideEvent(event)
+
+    def _stop_background_threads(self) -> None:
+        self._cancel_background_job()
+        for thread in (self._import_thread, self._repair_thread):
+            if thread is None or not thread.isRunning():
+                continue
+            thread.quit()
+            thread.wait(3500)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._stop_background_threads()
+        self.player.shutdown()
+        self._preview.shutdown()
         if self._analysis is not None:
             try:
                 self._analysis.shutdown()
             except Exception:
                 pass
-        try:
-            self._preview.shutdown()
-        except Exception:
-            pass
-        try:
-            self.wave.shutdown()
-        except Exception:
-            pass
-        try:
-            self._dropdown.close()
-        except Exception:
-            pass
-
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self.shutdown()
         super().closeEvent(event)
 
-    # ─────────────────────────────────────────────────────────────────────
-    # UI
-    # ─────────────────────────────────────────────────────────────────────
-    def showEvent(self, e: QtGui.QShowEvent) -> None:
-        super().showEvent(e)
-        if self._shutdown:
-            return
-        self.preview_widget.emit(self._preview)
 
-        if (self._analysis is not None) and (not self._analysis_bootstrapped):
-            self._analysis_bootstrapped = True
-            try:
-                self._prime_analysis_for_current()
-            except Exception:
-                pass
-
-    def _init_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 20)
-        root.setSpacing(10)
-
-        # Centered compact control card. The preview is owned by Nexus;
-        # this card is intentionally narrow so the Sound tab does not sprawl.
-        center_row = QHBoxLayout()
-        center_row.setContentsMargins(0, 0, 0, 0)
-        center_row.setSpacing(0)
-        center_row.addStretch(1)
-
-        self.sound_card = QtWidgets.QFrame(self)
-        self.sound_card.setObjectName("soundControlCard")
-        self.sound_card.setFixedWidth(620)
-        self.sound_card.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Maximum)
-        self.sound_card.setStyleSheet(
-            "QFrame#soundControlCard {"
-            " background:#151821;"
-            " border:1px solid #2b3344;"
-            " border-radius:14px;"
-            "}"
-            "QLabel#soundTitle {"
-            " color:#e6f7ff;"
-            " font-size:18px;"
-            " font-weight:800;"
-            " letter-spacing:0.5px;"
-            "}"
-            "QLabel#soundVolumeLabel {"
-            " color:#b0e0e6;"
-            " font-weight:700;"
-            "}"
-            "QLabel#soundVolumeValue {"
-            " background:#222936;"
-            " border:1px solid #3a4558;"
-            " border-radius:7px;"
-            " padding:3px 8px;"
-            " color:#e6e6e6;"
-            "}"
-            "QPushButton {"
-            " background:#1e2230;"
-            " border:1px solid #2f3a4d;"
-            " border-radius:9px;"
-            " color:#e6e6e6;"
-            " padding:7px 14px;"
-            " min-height:22px;"
-            "}"
-            "QPushButton:hover {"
-            " border-color:#00c8ff;"
-            " background:#232b3a;"
-            "}"
-            "QPushButton:pressed {"
-            " background:#10141d;"
-            "}"
-        )
-
-        card = QVBoxLayout(self.sound_card)
-        card.setContentsMargins(24, 18, 24, 20)
-        card.setSpacing(14)
-
-        title = QLabel("Sound")
-        title.setObjectName("soundTitle")
-        title.setAlignment(Qt.AlignCenter)
-        card.addWidget(title)
-
-        top_buttons = QHBoxLayout()
-        top_buttons.setSpacing(12)
-        top_buttons.addStretch(1)
-
-        self.btn_archive = QPushButton("Archive")
-        self.btn_archive.setObjectName("btn_sound_archive")
-        self.btn_archive.setFixedHeight(34)
-        self.btn_archive.setMinimumWidth(126)
-        self.btn_archive.setCursor(Qt.PointingHandCursor)
-
-        self.add_btn = QPushButton("🎵 Add Music")
-        self.add_btn.setFixedHeight(34)
-        self.add_btn.setMinimumWidth(144)
-        self.add_btn.setCursor(Qt.PointingHandCursor)
-
-        top_buttons.addWidget(self.btn_archive, 0)
-        top_buttons.addWidget(self.add_btn, 0)
-        top_buttons.addStretch(1)
-        card.addLayout(top_buttons)
-
-        self._dropdown = ArchiveDropdown(self._archive_mgr, parent=self)
-        self.btn_archive.clicked.connect(self._open_archive_dropdown)
-        self._dropdown.request_release.connect(self.wave.release_current_file_handle)
-
-        self.playlist_view = QtWidgets.QTreeWidget()
-        self.playlist_view.setHeaderHidden(True)
-        self.playlist_view.setColumnCount(3)
-        self.playlist_view.setRootIsDecorated(False)
-        self.playlist_view.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
-        )
-        self.playlist_view.setDragEnabled(True)
-        self.playlist_view.setAcceptDrops(True)
-        self.playlist_view.setDragDropMode(
-            QtWidgets.QAbstractItemView.DragDropMode.InternalMove
-        )
-        self.playlist_view.setDefaultDropAction(QtCore.Qt.DropAction.MoveAction)
-        self.playlist_view.setFixedHeight(150)
-        self.playlist_view.setColumnWidth(0, 32)
-        self.playlist_view.setColumnWidth(1, 430)
-        self.playlist_view.setStyleSheet(
-            "QTreeWidget {"
-            "background:#10131a; border:1px solid #2b3344; border-radius:8px;"
-            "color:#dce8ec; outline:none;"
-            "}"
-            "QTreeWidget::item { min-height:30px; }"
-            "QTreeWidget::item:selected { background:#263442; }"
-        )
-        self.playlist_view.model().rowsMoved.connect(self._on_playlist_rows_moved)
-        card.addWidget(self.playlist_view)
-
-        completion_row = QHBoxLayout()
-        completion_row.addStretch(1)
-        self.repeat_playlist = QtWidgets.QRadioButton("Repeat playlist")
-        self.stop_after_final = QtWidgets.QRadioButton("Stop after final song")
-        completion_group = QtWidgets.QButtonGroup(self)
-        completion_group.addButton(self.repeat_playlist)
-        completion_group.addButton(self.stop_after_final)
-        self.repeat_playlist.toggled.connect(self._on_repeat_toggled)
-        self.stop_after_final.toggled.connect(self._on_stop_toggled)
-        completion_row.addWidget(self.repeat_playlist)
-        completion_row.addWidget(self.stop_after_final)
-        completion_row.addStretch(1)
-        card.addLayout(completion_row)
-
-        volume_label = QLabel("Volume")
-        volume_label.setObjectName("soundVolumeLabel")
-        volume_label.setAlignment(Qt.AlignCenter)
-        card.addWidget(volume_label)
-
-        vol_row = QHBoxLayout()
-        vol_row.setSpacing(10)
-        vol_row.addStretch(1)
-
-        self.vol_slider = QSlider(Qt.Horizontal)
-        self.vol_slider.setRange(0, 100)
-        init_percent = int(round(self.wave._music_volume * 100))
-        self.vol_slider.setValue(init_percent)
-        self.vol_slider.setFixedWidth(360)
-        self.vol_slider.setStyleSheet(
-            "QSlider::groove:horizontal { height:7px; background:#303744; border-radius:3px; }"
-            "QSlider::handle:horizontal { width:16px; height:16px; margin:-5px 0; "
-            "background:#00b2b2; border:1px solid #089; border-radius:8px; }"
-            "QSlider::sub-page:horizontal { background:#0aa; border-radius:3px; }"
-        )
-
-        self.vol_value = QLabel(f"{init_percent}%")
-        self.vol_value.setObjectName("soundVolumeValue")
-        self.vol_value.setMinimumWidth(48)
-        self.vol_value.setAlignment(Qt.AlignCenter)
-
-        vol_row.addWidget(self.vol_slider, 0)
-        vol_row.addWidget(self.vol_value, 0)
-        vol_row.addStretch(1)
-        card.addLayout(vol_row)
-
-        playback_row = QHBoxLayout()
-        playback_row.setSpacing(12)
-        playback_row.addStretch(1)
-
-        self.playpause_btn = QPushButton("▶️ Play")
-        self.startover_btn = QPushButton("⏮️ Start Over")
-        self.mute_btn = QPushButton("🔇 Mute")
-
-        for btn in (self.playpause_btn, self.startover_btn, self.mute_btn):
-            btn.setFixedHeight(36)
-            btn.setMinimumWidth(124)
-            btn.setCursor(Qt.PointingHandCursor)
-            playback_row.addWidget(btn, 0)
-
-        playback_row.addStretch(1)
-        card.addLayout(playback_row)
-
-        self.analysis_progress = QtWidgets.QProgressBar()
-        self.analysis_progress.setRange(0, 100)
-        self.analysis_progress.setValue(0)
-        self.analysis_progress.setTextVisible(True)
-        self.analysis_progress.setFormat("Analyzing audio… %p%")
-        self.analysis_progress.setFixedHeight(18)
-        self.analysis_progress.setStyleSheet(
-            "QProgressBar { background:#0d0f14; border:1px solid #2b3344; border-radius:6px; color:#e6e6e6; }"
-            "QProgressBar::chunk { background:#00c8ff; border-radius:6px; }"
-        )
-        self.analysis_progress.hide()
-        self.status_banner = StatusBanner(controller=self.status_controller)
-        self.status = self.status_banner
-        card.addWidget(self.status_banner)
-
-        center_row.addWidget(self.sound_card, 0, Qt.AlignTop | Qt.AlignHCenter)
-        center_row.addStretch(1)
-        root.addLayout(center_row)
-        root.addStretch(1)
-
-        self.add_btn.clicked.connect(self.select_music)
-        self.playpause_btn.clicked.connect(self.play_pause_audio)
-        self.startover_btn.clicked.connect(self.startover_audio)
-        self.mute_btn.clicked.connect(self.toggle_mute)
-        self._dropdown.use_requested.connect(self._on_use_from_archive)
-
-        self.vol_slider.valueChanged.connect(self._on_volume_changed)
-        self.vol_slider.sliderReleased.connect(self._on_volume_released)
-
-        self.setAcceptDrops(True)
-        self._refresh_playlist_view()
-        self.update_status()
-
-    def _open_archive_dropdown(self):
-        gp = self.btn_archive.mapToGlobal(QtCore.QPoint(0, self.btn_archive.height()))
-        self._dropdown.show_at(gp)
-
-    def _init_shortcuts(self) -> None:
-        QtGui.QShortcut(QtGui.QKeySequence(Qt.Key_Space), self, activated=self.play_pause_audio)
-        QtGui.QShortcut(QtGui.QKeySequence(Qt.Key_M), self, activated=self.toggle_mute)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+L"), self, activated=self.select_music)
-
-    def _refresh_playlist_view(self) -> None:
-        if not hasattr(self, "playlist_view"):
-            return
-        self._rebuilding_playlist = True
-        try:
-            self.playlist_view.clear()
-            for index, track in enumerate(self._playlist.tracks):
-                item = QtWidgets.QTreeWidgetItem(["≡", track.archive_name, ""])
-                item.setData(1, QtCore.Qt.ItemDataRole.UserRole, track.archive_name)
-                item.setTextAlignment(0, QtCore.Qt.AlignmentFlag.AlignCenter)
-                self.playlist_view.addTopLevelItem(item)
-                remove_button = QtWidgets.QToolButton()
-                remove_button.setText("Remove")
-                remove_button.setAccessibleName(f"Remove {track.archive_name}")
-                remove_button.clicked.connect(
-                    lambda _checked=False, index=index: self._remove_playlist_track(index)
-                )
-                self.playlist_view.setItemWidget(item, 2, remove_button)
-            self.playlist_view.resizeColumnToContents(0)
-            self.playlist_view.resizeColumnToContents(2)
-            self.repeat_playlist.setChecked(self._playlist.repeat)
-            self.stop_after_final.setChecked(not self._playlist.repeat)
-        finally:
-            self._rebuilding_playlist = False
-
-    def _on_playlist_rows_moved(self, *_args) -> None:
-        if self._rebuilding_playlist:
-            return
-        QtCore.QTimer.singleShot(0, self._persist_playlist_order)
-
-    def _persist_playlist_order(self) -> None:
-        names = []
-        for index in range(self.playlist_view.topLevelItemCount()):
-            item = self.playlist_view.topLevelItem(index)
-            names.append(str(item.data(1, QtCore.Qt.ItemDataRole.UserRole) or item.text(1)))
-        self._playlist = self._playlist_store.replace_tracks(names)
-        self._sync_playlist_player(refresh_view=False)
-        self.status_controller.publish("Playlist order saved.", StatusLevel.SUCCESS)
-
-    def _on_repeat_toggled(self, checked: bool) -> None:
-        if self._rebuilding_playlist or not checked:
-            return
-        self._playlist = self._playlist_store.set_repeat(True)
-        self.wave.playlist_player.set_repeat(True)
-
-    def _on_stop_toggled(self, checked: bool) -> None:
-        if self._rebuilding_playlist or not checked:
-            return
-        self._playlist = self._playlist_store.set_repeat(False)
-        self.wave.playlist_player.set_repeat(False)
-
-    def _remove_playlist_track(self, index: int) -> None:
-        try:
-            self._playlist = self._playlist_store.remove(index)
-        except (IndexError, OSError, ValueError) as exc:
-            self.status_controller.publish(
-                f"Could not remove playlist track: {exc}",
-                StatusLevel.ERROR,
-            )
-            return
-        self._sync_playlist_player()
-        self.status_controller.publish("Track removed from playlist.", StatusLevel.INFO)
-
-    def _append_playlist_track(self, archive_name: str) -> None:
-        self._playlist = self._playlist_store.add(archive_name)
-        self._sync_playlist_player()
-
-    def _sync_playlist_player(self, *, refresh_view: bool = True) -> None:
-        resolved: list[Path] = []
-        self._resolved_playlist_tracks = []
-        missing: list[str] = []
-        for track in self._playlist.tracks:
-            path = self._playlist_store.resolve_track(track)
-            if path is None:
-                missing.append(track.archive_name)
-            else:
-                resolved.append(path)
-                self._resolved_playlist_tracks.append((track.archive_name, path))
-        self.wave.set_playlist(resolved, repeat=self._playlist.repeat)
-        if refresh_view:
-            self._refresh_playlist_view()
-        if missing:
-            self.status_controller.publish(
-                "Playlist tracks are missing: " + ", ".join(missing),
-                StatusLevel.WARNING,
-                persistent=True,
-                key="playlist-missing",
-            )
-        else:
-            self.status_controller.clear("playlist-missing")
-
-    def _on_playlist_track_changed(self, index: int, path: str) -> None:
-        try:
-            self._preview.set_media_player(self.wave.player)
-            self._preview.set_audio_file(path)
-        except Exception:
-            pass
-        if 0 <= index < len(self._resolved_playlist_tracks):
-            self._current_processed = self._resolved_playlist_tracks[index][0]
-        self._prime_analysis_for_current()
-
-    def refresh_from_workspace(self) -> None:
-        self._playlist = self._playlist_store.load()
-        self._sync_playlist_player()
-        self.update_status()
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Stable path policy (preview + analysis use same stable path)
-    # ─────────────────────────────────────────────────────────────────────
-    def _read_current_processed_from_manifest(self) -> str:
-        try:
-            manifest = _user_current_manifest(self.project_root)
-            if not manifest.exists():
-                return ""
-            data = json.loads(manifest.read_text(encoding="utf-8"))
-            rel = str(data.get("current_processed_rel") or data.get("current_rel") or "")
-            return Path(rel).name if rel else ""
-        except Exception:
-            return ""
-
-    def _processed_path_for(self, processed_filename: str) -> Path:
-        return _user_archive_processed(self.project_root) / processed_filename
-
-    def _resolve_manifest_path(self, rel_or_path: str) -> Optional[Path]:
-        rel_or_path = str(rel_or_path or "").strip()
-        if not rel_or_path:
-            return None
-        p = Path(rel_or_path)
-        if not p.is_absolute():
-            p = self.project_root / p
-        return p.resolve()
-
-    def _read_current_original_from_manifest(self) -> str:
-        """
-        Return the current original archive filename/path from current.json.
-        Prefer current_original_rel.
-        Fall back to current_processed_rel/current_rel only for old manifests.
-        """
-        try:
-            manifest = _user_current_manifest(self.project_root)
-            if not manifest.exists():
-                return ""
-            data = json.loads(manifest.read_text(encoding="utf-8"))
-            return str(
-                data.get("current_original_rel")
-                or data.get("current_processed_rel")
-                or data.get("current_rel")
-                or ""
-            )
-        except Exception:
-            return ""
-
-    def _original_path_for_processed(self, processed_filename: str) -> Optional[Path]:
-        if not processed_filename:
-            return None
-
-        originals = _user_archive_originals(self.project_root)
-        exact = originals / processed_filename
-        if exact.is_file():
-            return exact.resolve()
-
-        stem = Path(processed_filename).stem
-        try:
-            matches = [p for p in originals.iterdir() if p.is_file() and p.stem == stem]
-        except Exception:
-            matches = []
-
-        for p in matches:
-            if p.suffix.lower() == ".mp3":
-                return p.resolve()
-        if matches:
-            return sorted(matches, key=lambda p: p.name.lower())[0].resolve()
-        return None
-
-    def _current_original_path_for_preview(self) -> Optional[Path]:
-        """
-        Resolve the current original song path from the manifest.
-        Normal expected path:
-            gallery/user/sounds/appssong/originals/<song>.mp3
-        """
-        rel = self._read_current_original_from_manifest()
-        p = self._resolve_manifest_path(rel)
-        if p is not None and p.is_file() and "originals" in p.parts:
-            return p
-
-        if self._current_processed:
-            p = self._original_path_for_processed(self._current_processed)
-            if p is not None and p.is_file():
-                return p
-
-        processed_name = self._read_current_processed_from_manifest()
-        if processed_name:
-            p = self._original_path_for_processed(processed_name)
-            if p is not None and p.is_file():
-                return p
-
-        return None
-
-    def _stable_audio_path_for_preview(self) -> Optional[Path]:
-        """
-        Priority:
-          1. Current playlist track.
-          2. gallery/user/sounds/appssong/originals/<current song>.mp3
-          3. gallery/user/sounds/appssong/processed/<current song>.mp3
-          4. gallery/user/sounds/music.mp3
-        """
-        playlist_path = self.wave.playlist_player.current_path
-        if playlist_path is not None and playlist_path.is_file():
-            return playlist_path.resolve()
-
-        p0 = self._current_original_path_for_preview()
-        if p0 is not None and p0.exists():
-            return p0
-
-        if self._current_processed:
-            p = self._processed_path_for(self._current_processed)
-            if p.exists():
-                return p.resolve()
-
-        processed_name = self._read_current_processed_from_manifest()
-        if processed_name:
-            p = self._processed_path_for(processed_name)
-            if p.exists():
-                return p.resolve()
-
-        p2 = _user_current_music(self.project_root)
-        if p2.exists():
-            return p2.resolve()
-        return None
-
-    def _push_analysis_payload(self, payload: Optional[dict]) -> None:
-        try:
-            self._preview.set_analysis_payload(payload)
-        except Exception:
-            try:
-                vis = self._preview.visualizer()
-                if hasattr(vis, "set_analysis_payload"):
-                    vis.set_analysis_payload(payload)  # type: ignore[attr-defined]
-            except Exception:
-                pass
-
-    def _prime_analysis_for_current(self) -> None:
-        if self._analysis is None:
-            return
-
-        stable = self._stable_audio_path_for_preview()
-        if stable is None or not stable.exists():
-            print("[Sound] Preview source missing.")
-            return
-
-        stable = stable.resolve()
-        key = str(stable)
-        self._current_analysis_key = key
-
-        try:
-            original = self._current_original_path_for_preview()
-            if original is not None:
-                print(f"[Sound] Current original: {original.resolve()}")
-        except Exception:
-            pass
-
-        print(f"[Sound] Playback source: {_user_current_music(self.project_root).resolve()}")
-        print(f"[Sound] Preview source: {stable}")
-        print(f"[Sound] Analysis source: {stable}")
-
-        try:
-            cache_path = self._analysis.analysis_file_for_debug(stable)
-            print(f"[Sound] Analysis cache path: {cache_path}")
-        except Exception:
-            pass
-
-        cached = self._analysis.load_cached(stable)
-        print(f"[Sound] Cache loaded: {'yes' if cached is not None else 'no'}")
-
-        if cached is not None:
-            self._push_analysis_payload(cached)
-        else:
-            self._push_analysis_payload(None)
-
-        print(f"[Sound] Analysis started: {stable}")
-        try:
-            self._analysis.ensure_analyzed(stable, priority=True)
-        except Exception as e:
-            print(f"[Sound] Optional analyzer unavailable: {stable} | {e!r}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Analysis callbacks
-    # ─────────────────────────────────────────────────────────────────────
-    def _on_analysis_busy(self, busy: bool) -> None:
-        self.analysis_progress.hide()
-
-    def _on_analysis_progress(self, done: int, total: int, current_name: str, current_pct: int) -> None:
-        self.analysis_progress.hide()
-
-    def _on_analysis_ready(self, path_key: str, payload: dict) -> None:
-        try:
-            print(f"[Sound] Analysis ready: {path_key}")
-            if self._current_analysis_key and str(path_key) == self._current_analysis_key:
-                self._push_analysis_payload(payload)
-            else:
-                print(f"[Sound] Ignored analysis payload. Current key: {self._current_analysis_key}")
-        except Exception as e:
-            print(f"[Sound] Analysis ready handler failed: {e!r}")
-
-    def _on_analysis_failed(self, path_key: str, msg: str) -> None:
-        print(f"[Sound] Optional analyzer unavailable: {path_key} | {msg}")
-        try:
-            if self._current_analysis_key and (str(path_key) == self._current_analysis_key):
-                self._push_analysis_payload(None)
-        except Exception:
-            pass
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Current selection changes
-    # ─────────────────────────────────────────────────────────────────────
-    def _on_current_changed(self, processed_filename: str) -> None:
-        self._current_processed = processed_filename or ""
-
-        stable = self._stable_audio_path_for_preview()
-        if stable is not None:
-            try:
-                self._preview.set_audio_file(str(stable))
-            except Exception:
-                pass
-
-        self._prime_analysis_for_current()
-
-        self.playpause_btn.setText("▶️ Play")
-
-    def _on_use_from_archive(self, processed_filename: str) -> None:
-        self.wave.release_current_file_handle()
-        try:
-            self._archive_mgr.set_current(processed_filename)
-            self._append_playlist_track(processed_filename)
-        except Exception as e:
-            QMessageBox.critical(self, "Archive Error", str(e))
-            return
-        self.status_controller.publish(
-            f"{processed_filename} added to the playlist.",
-            StatusLevel.SUCCESS,
-        )
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Volume
-    # ─────────────────────────────────────────────────────────────────────
-    def _on_volume_changed(self, val: int) -> None:
-        self.vol_value.setText(f"{val}%")
-        self.wave.set_music_volume_live(val)
-
-    def _on_volume_released(self) -> None:
-        v = self.vol_slider.value()
-        self.wave.save_music_volume(v)
-
-    # ─────────────────────────────────────────────────────────────────────
-    # UI actions
-    # ─────────────────────────────────────────────────────────────────────
-    def update_status(self):
-        count = len(self._playlist.tracks)
-        if count:
-            noun = "track" if count == 1 else "tracks"
-            self.status.setText(f"✅ Playlist ready: {count} {noun}.")
-        else:
-            self.status.setText("No audio loaded.")
-
-    def select_music(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select Music File", "", "Audio Files (*.mp3 *.wav *.ogg *.aac *.m4a *.flac)"
-        )
-        if path:
-            self._process_file(path)
-
-    def play_pause_audio(self):
-        if self.wave.is_playing():
-            self.wave.pause_audio()
-            self.playpause_btn.setText("▶️ Play")
-            self.status.setText("⏸️ Paused.")
-            return
-
-        if not self.wave.playlist_player.tracks:
-            self._sync_playlist_player()
-
-        stable = self._stable_audio_path_for_preview()
-        if stable is not None:
-            try:
-                self._preview.set_audio_file(str(stable))
-            except Exception:
-                pass
-            self._prime_analysis_for_current()
-
-        self.wave.play_audio()
-        self.playpause_btn.setText("⏸️ Pause")
-        self.status.setText("🎧 Playing")
-
-    def startover_audio(self):
-        stable = self._stable_audio_path_for_preview()
-        if stable is not None:
-            try:
-                self._preview.set_audio_file(str(stable))
-            except Exception:
-                pass
-            self._prime_analysis_for_current()
-
-        self.wave.start_over_audio()
-        self.playpause_btn.setText("⏸️ Pause")
-        self.status.setText("⏮️ Start over.")
-
-    def toggle_mute(self):
-        """Mute/unmute audio output without pausing playback or changing position."""
-        muted = self.wave.toggle_mute()
-        self.mute_btn.setText("🔊 Unmute" if muted else "🔇 Mute")
-
-        # Mute must not alter the play/pause state. Keep the visible playback
-        # button synced to the actual QMediaPlayer state.
-        if self.wave.is_playing():
-            self.playpause_btn.setText("⏸️ Pause")
-            self.status.setText("🔇 Muted — playback continues." if muted else "🎧 Playing")
-        else:
-            self.playpause_btn.setText("▶️ Play")
-            self.status.setText("🔇 Muted." if muted else "Audio unmuted.")
-
-    def open_sounds_folder(self):
-        _open_folder(self.project_root / USER_SOUNDS_DIR)
-
-    # Drag & drop
-    def dragEnterEvent(self, event: QtGui.QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dropEvent(self, event: QtGui.QDropEvent):
-        handled = False
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if path.lower().endswith(tuple(VALID_AUDIO_EXTS)):
-                self._process_file(path)
-                handled = True
-                break
-        if handled:
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def _process_file(self, path):
-        # IMPORTANT: release current handle before writing music.mp3 (Windows)
-        self.wave.release_current_file_handle()
-
-        valid, msg = self.wave.validate_audio(path)
-        if not valid:
-            self.status.setText(f"❌ {msg}")
-            QMessageBox.warning(self, "Invalid Audio", msg)
-            return
-        try:
-            res = self._archive_mgr.add_song_from_path(Path(path))
-        except Exception as e:
-            self.status.setText(f"❌ Failed to process audio: {e}")
-            QMessageBox.critical(self, "Conversion Error", str(e))
-            return
-
-        if res.action == "error":
-            self.status.setText(f"❌ {res.message}")
-            QMessageBox.critical(self, "Audio Import Error", res.message)
-            return
-
-        if res.action == "canceled":
-            self.status.setText("Import canceled.")
-            return
-
-        self._current_processed = res.archive_processed or self._read_current_processed_from_manifest()
-        archive_name = self._current_processed or Path(path).name
-        self._append_playlist_track(archive_name)
-        stable = self._playlist_store.resolve_track(self._playlist.tracks[-1])
-        if stable is not None:
-            try:
-                self._preview.set_audio_file(str(stable))
-            except Exception:
-                pass
-
-        self._prime_analysis_for_current()
-
-        try:
-            self.status.setText(f"✅ {res.message}")
-        except Exception:
-            self.status.setText(f"✅ Music added: {archive_name}")
-
-        self.playpause_btn.setText("▶️ Play")
+__all__ = ["SoundTab", "SoundLibrary", "ProjectSound", "PlaylistPlayer"]
