@@ -55,6 +55,13 @@ TEMPLATE_HTML = r"""
     </button>
 
     <div id="progress" aria-live="polite">Page 1 of 4</div>
+    <button
+      id="fullscreen-button"
+      class="hud-button fullscreen-action"
+      type="button"
+      title="Enter fullscreen"
+      aria-label="Enter fullscreen"
+    >Fullscreen</button>
 
     <button
       id="open-text"
@@ -194,6 +201,7 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .nav-button[disabled]:hover{transform:translateY(-50%)}
 
 #progress{position:absolute;right:var(--corner-offset);bottom:var(--corner-offset);display:inline-flex;align-items:center;min-height:40px;padding:0 14px;border:1px solid rgba(255,255,255,.10);border-radius:var(--pill-radius);background:rgba(6,9,16,.56);box-shadow:var(--hud-shadow);color:var(--text-soft);font:700 clamp(12px,1.2vw,14px)/1 var(--font-ui);letter-spacing:.08em;text-transform:uppercase;z-index:101}
+#fullscreen-button{position:absolute;top:var(--corner-offset);right:var(--corner-offset);width:auto;height:40px;padding:0 14px;z-index:107;font:700 12px/1 var(--font-ui);letter-spacing:.03em}
 
 .text-wall{position:absolute;top:50%;left:50%;width:min(var(--wall-max-width),calc(100% - (2 * var(--wall-gap))));max-height:calc(100% - (2 * var(--wall-gap)));overflow:auto;padding:var(--wall-frame-pad);border:1px solid var(--paper-edge);border-radius:var(--panel-radius);background:linear-gradient(180deg,rgba(var(--message-overlay-rgb),var(--message-overlay-opacity)),rgba(var(--message-overlay-rgb),var(--message-overlay-opacity)));color:var(--message-ink);box-shadow:0 30px 80px var(--paper-shadow),0 12px 28px rgba(0,0,0,.22),inset 0 1px 0 var(--paper-line);z-index:105;opacity:0;visibility:hidden;pointer-events:none;transform:translate(-50%,-48%);transition:opacity var(--wall-fade-ms) ease,transform var(--motion-medium),visibility 0s linear var(--wall-fade-ms);isolation:isolate;scrollbar-width:thin;scrollbar-color:rgba(92,67,40,.52) rgba(0,0,0,.06)}
 .text-wall.is-open{opacity:1;visibility:visible;pointer-events:auto;transform:translate(-50%,-50%);transition:opacity var(--wall-fade-ms) ease,transform var(--motion-medium),visibility 0s}
@@ -230,7 +238,7 @@ body.stage-ready #volume-control{opacity:1;visibility:visible;pointer-events:aut
 #volume-slider::-moz-range-thumb{width:16px;height:16px;background:var(--accent-strong);border:2px solid #fff;border-radius:50%;cursor:pointer;box-shadow:0 0 0 4px rgba(0,255,255,.12)}
 
 @media (max-width: 900px){:root{--nav-size:clamp(68px,11vw,96px);--wall-gap:clamp(18px,4vw,30px)}.text-wall-content{font-size:clamp(16px,1.8vw,18px)}}
-@media (max-width: 640px){:root{--nav-size:clamp(60px,18vw,76px);--icon-size:44px;--close-size:40px;--corner-offset:16px}#prev,#next{top:auto;bottom:calc(var(--corner-offset) + 8px + env(safe-area-inset-bottom));transform:none}#prev:hover,#next:hover{transform:scale(1.04)}.nav-button[disabled]:hover{transform:none}#volume-control{top:auto;right:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom));transform:none}body.stage-ready #volume-control{transform:none}#progress{left:50%;right:auto;bottom:calc(var(--corner-offset) + env(safe-area-inset-bottom));transform:translateX(-50%)}#open-text{left:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom))}#close-text{top:16px;right:16px}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - (2 * var(--wall-gap)) - 110px)}#volume-control.slider-open #volume-slider{width:min(34vw,128px)}}
+@media (max-width: 640px){:root{--nav-size:clamp(60px,18vw,76px);--icon-size:44px;--close-size:40px;--corner-offset:16px}#prev,#next{top:auto;bottom:calc(var(--corner-offset) + 8px + env(safe-area-inset-bottom));transform:none}#prev:hover,#next:hover{transform:scale(1.04)}.nav-button[disabled]:hover{transform:none}#volume-control{top:auto;right:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom));transform:none}body.stage-ready #volume-control{transform:none}#progress{left:50%;right:auto;bottom:calc(var(--corner-offset) + env(safe-area-inset-bottom));transform:translateX(-50%)}#fullscreen-button{top:16px;right:16px}#open-text{left:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom))}#close-text{top:64px;right:16px}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - (2 * var(--wall-gap)) - 110px)}#volume-control.slider-open #volume-slider{width:min(34vw,128px)}}
 @media (prefers-reduced-motion: reduce){*,*::before,*::after{scroll-behavior:auto !important}#slideshow,#volume-control,#open-text,#close-text,.text-wall,#volume-slider{transition:none}#begin-button{animation:none}#curtain-overlay.is-visible,#curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
 """
 
@@ -245,6 +253,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const prevBtn   = document.getElementById('prev');
   const nextBtn   = document.getElementById('next');
   const progress  = document.getElementById('progress');
+  const fullscreenBtn = document.getElementById('fullscreen-button');
 
   const wall       = document.getElementById('textWall');
   const closeText  = document.getElementById('close-text');
@@ -726,6 +735,26 @@ document.addEventListener('DOMContentLoaded', () => {
   bindPress(beginBtn, (e) => { e.preventDefault(); openCurtain(); });
   prevBtn.addEventListener('click', () => go(-1));
   nextBtn.addEventListener('click', () => go(1));
+  if (fullscreenBtn){
+    fullscreenBtn.addEventListener('click', async () => {
+      try{
+        if (document.fullscreenElement){
+          await document.exitFullscreen();
+        } else {
+          await document.documentElement.requestFullscreen();
+        }
+      }catch(err){
+        console.warn('Fullscreen request failed', err);
+      }
+    });
+    document.addEventListener('fullscreenchange', () => {
+      const active = Boolean(document.fullscreenElement);
+      const label = active ? 'Exit fullscreen' : 'Fullscreen';
+      fullscreenBtn.textContent = label;
+      fullscreenBtn.title = active ? 'Exit fullscreen' : 'Enter fullscreen';
+      fullscreenBtn.setAttribute('aria-label', fullscreenBtn.title);
+    });
+  }
   window.addEventListener('keydown', (e) => {
     if (!started || introControlsLocked || wallRevealLocked) return;
     if (e.key === 'ArrowLeft'){

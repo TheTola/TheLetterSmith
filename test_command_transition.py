@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke test for Letter Smith Command-tab transitions and hover tab switching."""
+"""Smoke test for Letter Smith directional Command fades and hover tab switching."""
 
 from __future__ import annotations
 
@@ -61,6 +61,11 @@ def main() -> int:
     assert stack.currentIndex() == 2
     assert switcher._active is not None
     assert switcher._active.duration() == int(FX.TAB_MS * 2)
+    assert switcher._active.animationCount() == 1
+    enter_animation = switcher._active.animationAt(0)
+    assert enter_animation.property("anima.CommandFadeDirection") == "in"
+    assert float(enter_animation.startValue()) == 0.0
+    assert float(enter_animation.endValue()) == 1.0
     assert wait_until(lambda: switcher._active is None, FX.TAB_MS * 2 + 500)
 
     switcher.go_to(0)
@@ -68,6 +73,11 @@ def main() -> int:
     assert stack.currentIndex() == 0
     assert switcher._active is not None
     assert switcher._active.duration() == int(FX.TAB_MS * 2)
+    assert switcher._active.animationCount() == 1
+    leave_animation = switcher._active.animationAt(0)
+    assert leave_animation.property("anima.CommandFadeDirection") == "out"
+    assert float(leave_animation.startValue()) == 1.0
+    assert float(leave_animation.endValue()) == 0.0
 
     # Interrupt the Command fade. The previous group must be canceled cleanly.
     QtTest.QTest.qWait(40)
@@ -86,7 +96,7 @@ def main() -> int:
         FX.TAB_HOVER_DELAY_MS + 500,
     )
 
-    print("PASS: Command cross-fade, interruption handling, and hover switching")
+    print("PASS: directional Command fade-in/fade-out, interruption handling, and hover switching")
     window.close()
     return 0
 

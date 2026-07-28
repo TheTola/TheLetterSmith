@@ -414,6 +414,7 @@ def plan_build(
     recipient: str,
     title: str,
     project_id: str,
+    play_dir_override: Optional[str | Path] = None,
 ) -> BuildPaths:
     """
     Create a deterministic project build location.
@@ -452,11 +453,21 @@ def plan_build(
             "project_id must be a UUID string"
         )
 
-    play_dir = (
+    final_play_dir = (
         pr
         / OUTPUT_PLAY_DIR
         / stable_id
+    ).resolve()
+    play_dir = (
+        Path(play_dir_override).resolve()
+        if play_dir_override is not None
+        else final_play_dir
     )
+    if play_dir_override is not None and (
+        play_dir == final_play_dir
+        or play_dir.parent != final_play_dir.parent
+    ):
+        raise ValueError("The build staging directory must be a sibling of the final build.")
 
     play_dir.mkdir(
         parents=True,

@@ -49,10 +49,13 @@ from sound_model import (
     resolve_project_tracks,
     resolve_track_path,
 )
+from project_state import ensure_project_identity
+from transactional_io import PathTransaction
 from config import (
     SETTINGS_FILE,
     DEFAULT_VOLUME,
     STARTING_VOLUME,
+    OUTPUT_PLAY_DIR,
     ensure_output_dirs,
     plan_build,
     validate_required_images,
@@ -300,9 +303,23 @@ def generate_play_bundle(
     recipient = _recipient_from_settings(settings)
     title = _title_from_settings(settings, recipient)
     starting_vol = _starting_volume_from_settings(settings)
+    project_id = ensure_project_identity(pr)
 
-    # Deterministic Play folder (NO timestamp; overwrites same location)
-    bp = plan_build(pr, recipient=recipient, title=title)
+    # Build beside the live Play bundle and replace it only after validation.
+    final_play_dir = (pr / OUTPUT_PLAY_DIR / project_id).resolve()
+    transaction = PathTransaction(
+        final_play_dir,
+        staging_suffix=".build-staging",
+        backup_suffix=".build-backup",
+    )
+    staging = transaction.prepare()
+    bp = plan_build(
+        pr,
+        recipient=recipient,
+        title=title,
+        project_id=project_id,
+        play_dir_override=staging,
+    )
 
     # Runtime destinations
     pages_dst = bp.play_pages_dir
@@ -371,10 +388,33 @@ def generate_play_bundle(
     )
     _atomic_write_text(bp.play_dir / "index.html", html)
 
+    required_output = (
+        bp.play_dir / "index.html",
+        bp.play_dir / "styles.css",
+        bp.play_dir / "script.js",
+        *(bp.play_pages_dir / name for name in REQUIRED_SLIDES),
+        *(bp.play_controls_dir / name for name in CONTROL_FILES),
+    )
+    missing_output = [str(path.relative_to(bp.play_dir)) for path in required_output if not path.is_file()]
+    if missing_output:
+        transaction.abort()
+        raise RuntimeError(
+            "The staged Play bundle is incomplete: " + ", ".join(missing_output)
+        )
+    try:
+        transaction.commit(
+            keep_backup=True,
+            validator=lambda directory: (directory / "index.html").is_file(),
+        )
+    except Exception:
+        transaction.abort()
+        raise
+    transaction.finalize()
+
     if open_in_browser:
         try:
-            webbrowser.open((bp.play_dir / "index.html").as_uri())
+            webbrowser.open((final_play_dir / "index.html").as_uri())
         except Exception:
             pass
 
-    return bp.play_dir
+    return final_play_dir

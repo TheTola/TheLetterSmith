@@ -12,7 +12,7 @@ Design goals
 
 Public API (stable)
 - ParticleBurst            : transparent overlay for sparks + rings + flash
-- TabSwitcher              : normal slide+fade plus Command-only cross-fade
+- TabSwitcher              : normal slide+fade plus directional Command fades
 - install_click_fx         : global hover glow + press pulse installer
 - set_excitement_level     : global intensity scalar for bursts
 - get_excitement_level
@@ -30,7 +30,7 @@ import math
 import random
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QEvent, QPoint, QRect, QSize, QTimer, QEasingCurve
@@ -52,7 +52,7 @@ def _dbg(msg: str) -> None:
 # Version + exports
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION = "2.1.0-command-fade"
+VERSION = "2.2.0-command-directional-fade"
 
 __all__ = [
     "VERSION",
@@ -741,9 +741,10 @@ class TabSwitcher(QtCore.QObject):
     - fade when neither page already owns a graphics effect
 
     Command tab override:
-    - pure cross-fade, no slide
+    - entering Command: the Command page fades in over the unchanged old page
+    - leaving Command: the Command page fades out over the destination page
+    - no slide and no simultaneous two-page cross-fade
     - double the normal transition duration
-    - applies both entering and leaving Command
     - cancels any transition already in progress
     - uses snapshots, so it does not replace page graphics effects
 
@@ -862,68 +863,131 @@ class TabSwitcher(QtCore.QObject):
         new_w: QtWidgets.QWidget,
         new_geo: QRect,
     ) -> None:
-        """Run the Command-only snapshot cross-fade override."""
+        """Run the directional Command fade override.
+
+        Entering Command:
+            Keep the old page visually unchanged and fade the Command snapshot
+            from transparent to opaque above it.
+
+        Leaving Command:
+            Put the destination page underneath and fade the Command snapshot
+            from opaque to transparent above it.
+
+        This intentionally is not a cross-fade. Only the Command visual changes
+        opacity, matching the requested enter/leave behavior.
+        """
         viewport = self.stack.contentsRect()
         if viewport.isEmpty():
             self.stack.setCurrentIndex(index)
             return
 
-        old_pixmap = self._grab_page(old_w, viewport.size())
+        old_is_command = self._is_command_page(old_w)
+        new_is_command = self._is_command_page(new_w)
+        entering_command = new_is_command and not old_is_command
+        leaving_command = old_is_command and not new_is_command
 
-        # Commit the requested page before capturing it. The snapshots cover the
-        # viewport during the fade, and this makes interruption deterministic:
-        # a new hover target starts from whichever page was most recently chosen.
-        self.stack.setCurrentWidget(new_w)
-        new_w.setGeometry(new_geo)
-        new_w.show()
-        new_w.raise_()
-        new_pixmap = self._grab_page(new_w, viewport.size())
-
-        if old_pixmap.isNull() or new_pixmap.isNull():
+        # A Command-to-Command transition is not expected, but resolving it
+        # immediately is safer than accidentally falling back to a slide.
+        if not entering_command and not leaving_command:
+            self.stack.setCurrentWidget(new_w)
+            new_w.setGeometry(new_geo)
             new_w.show()
             new_w.raise_()
             return
 
-        old_layer = QtWidgets.QLabel(self.stack)
-        new_layer = QtWidgets.QLabel(self.stack)
-        for layer, pixmap in ((old_layer, old_pixmap), (new_layer, new_pixmap)):
+        duration = self._command_duration(old_w, new_w)
+        grp = QtCore.QParallelAnimationGroup(self)
+        layers: List[QtWidgets.QLabel] = []
+
+        def _make_layer(
+            pixmap: QtGui.QPixmap,
+            *,
+            opacity: float,
+        ) -> Tuple[QtWidgets.QLabel, QtWidgets.QGraphicsOpacityEffect]:
+            layer = QtWidgets.QLabel(self.stack)
             layer.setGeometry(viewport)
             layer.setPixmap(pixmap)
             layer.setScaledContents(True)
-            layer.setStyleSheet("background:transparent; border:none; padding:0; margin:0;")
+            layer.setStyleSheet(
+                "background:transparent; border:none; padding:0; margin:0;"
+            )
             layer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+            effect = QtWidgets.QGraphicsOpacityEffect(layer)
+            effect.setOpacity(opacity)
+            layer.setGraphicsEffect(effect)
             layer.show()
+            layer.raise_()
 
-        new_layer.raise_()
-        old_layer.raise_()
+            layers.append(layer)
+            return layer, effect
 
-        old_eff = QtWidgets.QGraphicsOpacityEffect(old_layer)
-        new_eff = QtWidgets.QGraphicsOpacityEffect(new_layer)
-        old_eff.setOpacity(1.0)
-        new_eff.setOpacity(0.0)
-        old_layer.setGraphicsEffect(old_eff)
-        new_layer.setGraphicsEffect(new_eff)
+        if entering_command:
+            # Capture the page we are leaving while it is still the current page.
+            old_pixmap = self._grab_page(old_w, viewport.size())
 
-        # Hide the live page until the new snapshot has fully faded in.
-        new_w.hide()
+            # Commit and capture Command. The live Command widget stays beneath
+            # the opaque old-page snapshot until the fade completes.
+            self.stack.setCurrentWidget(new_w)
+            new_w.setGeometry(new_geo)
+            new_w.show()
+            new_w.raise_()
+            command_pixmap = self._grab_page(new_w, viewport.size())
 
-        duration = self._command_duration(old_w, new_w)
-        grp = QtCore.QParallelAnimationGroup(self)
+            if old_pixmap.isNull() or command_pixmap.isNull():
+                new_w.show()
+                new_w.raise_()
+                return
 
-        fade_out = QtCore.QPropertyAnimation(old_eff, b"opacity", grp)
-        fade_out.setDuration(duration)
-        fade_out.setStartValue(1.0)
-        fade_out.setEndValue(0.0)
-        fade_out.setEasingCurve(QEasingCurve.InOutSine)
+            _old_layer, _old_effect = _make_layer(old_pixmap, opacity=1.0)
+            command_layer, command_effect = _make_layer(
+                command_pixmap,
+                opacity=0.0,
+            )
+            command_layer.raise_()
 
-        fade_in = QtCore.QPropertyAnimation(new_eff, b"opacity", grp)
-        fade_in.setDuration(duration)
-        fade_in.setStartValue(0.0)
-        fade_in.setEndValue(1.0)
-        fade_in.setEasingCurve(QEasingCurve.InOutSine)
+            # Only Command fades. The old snapshot remains fully opaque below it.
+            fade = QtCore.QPropertyAnimation(command_effect, b"opacity", grp)
+            fade.setDuration(duration)
+            fade.setStartValue(0.0)
+            fade.setEndValue(1.0)
+            fade.setEasingCurve(QEasingCurve.InOutSine)
+            fade.setProperty("anima.CommandFadeDirection", "in")
+            grp.addAnimation(fade)
 
-        grp.addAnimation(fade_out)
-        grp.addAnimation(fade_in)
+            # Keep the live Command page current beneath the snapshots. The
+            # opaque old-page snapshot prevents it from leaking through early.
+
+        else:
+            # Capture Command before changing the current stack page.
+            command_pixmap = self._grab_page(old_w, viewport.size())
+
+            # The destination is committed immediately underneath the Command
+            # snapshot. As Command becomes transparent, the destination is revealed.
+            self.stack.setCurrentWidget(new_w)
+            new_w.setGeometry(new_geo)
+            new_w.show()
+            new_w.raise_()
+
+            if command_pixmap.isNull():
+                new_w.show()
+                new_w.raise_()
+                return
+
+            command_layer, command_effect = _make_layer(
+                command_pixmap,
+                opacity=1.0,
+            )
+            command_layer.raise_()
+
+            # Only Command fades. The destination remains fully visible below it.
+            fade = QtCore.QPropertyAnimation(command_effect, b"opacity", grp)
+            fade.setDuration(duration)
+            fade.setStartValue(1.0)
+            fade.setEndValue(0.0)
+            fade.setEasingCurve(QEasingCurve.InOutSine)
+            fade.setProperty("anima.CommandFadeDirection", "out")
+            grp.addAnimation(fade)
 
         cleaned = False
 
@@ -933,7 +997,7 @@ class TabSwitcher(QtCore.QObject):
                 return
             cleaned = True
 
-            for layer in (old_layer, new_layer):
+            for layer in layers:
                 try:
                     layer.hide()
                     layer.setGraphicsEffect(None)

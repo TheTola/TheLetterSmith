@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Optional
 
 from config import PLAY_METADATA_FILE
-from playlist import PlaylistStore, playlist_payload
+from project_state import ensure_project_identity
 from readiness import ReadinessResult
 from settings_store import SettingsStore
+from sound_model import resolve_project_tracks
 from transactional_io import atomic_write_json
 
 
@@ -133,21 +134,44 @@ def update_saved_metadata(
     metadata_path = destination / PLAY_METADATA_FILE
     metadata = SavedLetterCatalog._metadata(destination)
     settings = SettingsStore(root).snapshot()
-    playlist = PlaylistStore(root).load()
+    sound_state, sound_tracks = resolve_project_tracks(root)
+    restorable_settings = {
+        key: settings[key]
+        for key in (
+            "starting_volume",
+            "music_volume",
+            "curtain_style",
+            "message_overlay_preset",
+            "message_overlay_opacity",
+        )
+        if key in settings
+    }
     metadata.update(
         {
+            "project_id": ensure_project_identity(root),
             "recipient_name": str(settings.get("recipient_name", "")).strip(),
             "recipient_title": str(settings.get("recipient_title", "")).strip(),
             "build_location": str(destination),
             "build_timestamp": datetime.now(timezone.utc).isoformat(),
             "published_page_url": str(settings.get("published_page_url", "")).strip(),
-            "playlist": playlist_payload(playlist),
+            "settings": restorable_settings,
+            "sound": {
+                "mode": sound_state.mode,
+                "track_count": len(sound_tracks),
+                "tracks": [
+                    {
+                        "display_title": track.display_title,
+                        "duration_seconds": track.duration_seconds,
+                    }
+                    for track in sound_tracks
+                ],
+            },
             "readiness": {
                 "percentage": readiness.completion_percentage,
                 "status": readiness.status,
             },
             "cover_thumbnail_path": "gallery/pages/cover.png",
-            "source_version": 1,
+            "source_version": 2,
         }
     )
     atomic_write_json(metadata_path, metadata)

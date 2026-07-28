@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 # WebEngine (used for HTML preview)
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
+    from PySide6.QtWebEngineCore import QWebEngineSettings
 except Exception as e:
     raise SystemExit(
         "Qt WebEngine is required for the HTML preview.\n"
@@ -449,6 +450,13 @@ class Nexus(QtWidgets.QMainWindow):
         self.html_preview = QWebEngineView()
         self.html_preview.setStyleSheet("background-color:#1e1e1e;")
         self.html_preview.page().setBackgroundColor(QColor("#1e1e1e"))
+        self.html_preview.settings().setAttribute(
+            QWebEngineSettings.FullScreenSupportEnabled,
+            True,
+        )
+        self.html_preview.page().fullScreenRequested.connect(
+            self._on_web_fullscreen_requested
+        )
         self.preview_stack.addWidget(self.html_preview)
 
         pf_layout.addWidget(self.preview_stack)
@@ -597,7 +605,33 @@ class Nexus(QtWidgets.QMainWindow):
 
         body_layout.addWidget(self.page_stack)
 
+        self.forge_tab.attach_readiness_window(self)
         self.forge_tab.letter_loaded.connect(self._on_letter_loaded)
+        self.forge_tab.fix_requested.connect(self._fix_readiness_item)
+        self.forge_tab.preview_requested.connect(self._load_forge_preview)
+        self.forge_tab.published_url_changed.connect(
+            lambda url: self.message_tab.set_published_page_url(
+                url,
+                persist=False,
+                announce=False,
+            )
+        )
+        self.message_tab.published_page_url_changed.connect(
+            self.forge_tab.set_saved_page_url
+        )
+        self.image_tab.image_selected.connect(
+            lambda _pixmap: self.forge_tab.refresh_readiness()
+        )
+        self.image_tab.clear_preview.connect(self.forge_tab.refresh_readiness)
+        self.sound_tab.project_sound.changed.connect(
+            self.forge_tab.refresh_readiness
+        )
+        self.message_tab.title_input.editingFinished.connect(
+            self.forge_tab.refresh_readiness
+        )
+        self.message_tab.name_input.editingFinished.connect(
+            self.forge_tab.refresh_readiness
+        )
 
         main_layout.addWidget(self.body)
         self.setCentralWidget(main_widget)
@@ -647,6 +681,8 @@ class Nexus(QtWidgets.QMainWindow):
         # === Mounted Sound visualizer state ===
         self._sound_preview_widget: Optional[QtWidgets.QWidget] = None
         self._sound_preview_index: Optional[int] = None
+        self._forge_preview_mode = "portrait"
+        self._forge_fullscreen_host: Optional[QtWidgets.QDialog] = None
 
         # Remember last image pixmap for proper re-scaling on resize
         self._last_pixmap: Optional[QPixmap] = None
@@ -698,6 +734,7 @@ class Nexus(QtWidgets.QMainWindow):
 
         # Diagnostics after event loop starts
         QtCore.QTimer.singleShot(0, self._post_init_diagnostics)
+        QtCore.QTimer.singleShot(0, self.forge_tab.show_readiness_window)
 
     def _make_page_surface(
         self,
@@ -803,10 +840,55 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _on_letter_loaded(self, _payload: Optional[dict] = None) -> None:
         try:
+            self.image_tab.refresh_cards()
+        except Exception as exc:
+            self.status(f"Image state refresh failed: {exc}")
+        try:
+            self.message_tab._load_settings()
+            self.message_tab.title_input.setText(
+                str(self.message_tab.settings.get("recipient_title", ""))
+            )
+            self.message_tab.name_input.setText(
+                str(self.message_tab.settings.get("recipient_name", ""))
+            )
+            self.message_tab.url_input.setText(
+                str(self.message_tab.settings.get("published_page_url", ""))
+            )
+            self.message_tab._check_existing()
+        except Exception as exc:
+            self.status(f"Message state refresh failed: {exc}")
+        try:
             self.sound_tab.reload_project_from_disk()
         except Exception as exc:
             self.status(f"⚠️ Sound state refresh failed: {exc}")
+        self.forge_tab.refresh_saved_page_url()
+        self.forge_tab.refresh_readiness()
         self._show_forge_preview()
+
+    def _fix_readiness_item(self, key: str) -> None:
+        image_slots = {"cover": 1, "letter": 2, "wall": 3, "back": 4}
+        if key in image_slots:
+            self.tabbar.setCurrentIndex(0)
+            QtCore.QTimer.singleShot(
+                0,
+                lambda slot=image_slots[key]: self.image_tab._pick_image_dialog(
+                    slot
+                ),
+            )
+            return
+        if key == "music":
+            self.tabbar.setCurrentIndex(1)
+            QtCore.QTimer.singleShot(0, self.sound_tab.setFocus)
+            return
+        if key in {"message", "recipient", "title", "published_url"}:
+            self.tabbar.setCurrentIndex(2)
+            target = {
+                "message": self.message_tab.edit_btn,
+                "recipient": self.message_tab.name_input,
+                "title": self.message_tab.title_input,
+                "published_url": self.message_tab.url_input,
+            }[key]
+            QtCore.QTimer.singleShot(0, target.setFocus)
 
     # ─────────────────────────────────────────────────────────
     # Message double-click → full dialog preview
@@ -869,12 +951,13 @@ class Nexus(QtWidgets.QMainWindow):
 
         tab_name = self.tabbar.tabText(idx)
         self.status(f"Switched to: {tab_name}")
+        self.forge_tab.refresh_readiness()
 
         # Per-tab preview rules:
         # - Images: start blank; ImageTab will emit preview on hover/selection.
         # - Sound: show the mounted visualizer widget.
         # - Message: show current message state (message.png if present; else wall fallback).
-        # - Forge: show cover.png + project title underneath.
+        # - Forge: show the generated interactive viewer.
         # - Command: preview hidden; still hard-cleared.
         if idx == 0:
             self.preview_stack.setCurrentIndex(0)  # blank
@@ -895,7 +978,7 @@ class Nexus(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(0, self._request_message_preview)
 
         elif idx == 3:
-            # Forge: show cover + title
+            # Forge: show the generated interactive viewer.
             QtCore.QTimer.singleShot(0, self._show_forge_preview)
 
         else:
@@ -990,22 +1073,77 @@ class Nexus(QtWidgets.QMainWindow):
             pass
 
     def _show_forge_preview(self) -> None:
-        """Forge tab: show cover.png and the project title underneath."""
-        cover_path = os.path.join(self.project_root, "gallery", "user", "pages", "cover.png")
-        pm = QPixmap(cover_path)
-        if not pm.isNull():
-            self._show_image(pm)
-        else:
-            self._last_pixmap = None
-            self._clear_preview()
-            self.preview_stack.setCurrentIndex(0)
+        """Show the actual generated viewer, never a static Forge stand-in."""
+        index = self.forge_tab._current_play_index()
+        if index is not None:
+            self._load_forge_preview(
+                str(index),
+                self.forge_tab._preview_mode,
+            )
+            return
+        self._last_pixmap = None
+        self._clear_preview()
+        self.preview_stack.setCurrentIndex(0)
+        self.preview_caption.setText(
+            "Select Preview Letter to build the interactive viewer."
+        )
+        self.preview_caption.setVisible(True)
 
-        title_text = self._read_project_title()
-        if title_text:
-            self.preview_caption.setText(title_text)
-            self.preview_caption.setVisible(True)
-        else:
-            self.preview_caption.setVisible(False)
+    def _load_forge_preview(self, index_path: str, mode: str) -> None:
+        index = Path(index_path)
+        if not index.is_file():
+            self.status("The playable letter is missing. Preview it again.")
+            return
+        self._forge_preview_mode = (
+            mode if mode in {"portrait", "landscape", "window"} else "portrait"
+        )
+        self._update_preview_geometry()
+        self._last_pixmap = None
+        self._clear_preview()
+        self.preview_caption.setVisible(False)
+        self.html_preview.setUrl(QUrl.fromLocalFile(str(index.resolve())))
+        self.preview_stack.setCurrentWidget(self.html_preview)
+        self.status(
+            f"Interactive letter preview: "
+            f"{self._forge_preview_mode.replace('-', ' ')}"
+        )
+
+    def _on_web_fullscreen_requested(self, request) -> None:
+        toggle_on = bool(request.toggleOn())
+        request.accept()
+        if toggle_on:
+            if self._forge_fullscreen_host is not None:
+                return
+            if self.preview_stack.indexOf(self.html_preview) >= 0:
+                self.preview_stack.removeWidget(self.html_preview)
+            host = QtWidgets.QDialog(self)
+            host.setWindowTitle("Letter Preview")
+            host.setWindowFlag(Qt.FramelessWindowHint, True)
+            layout = QVBoxLayout(host)
+            layout.setContentsMargins(0, 0, 0, 0)
+            self.html_preview.setParent(host)
+            layout.addWidget(self.html_preview)
+            host.finished.connect(self._restore_forge_preview_from_fullscreen)
+            self._forge_fullscreen_host = host
+            host.showFullScreen()
+            self.html_preview.setFocus()
+            return
+        self._restore_forge_preview_from_fullscreen()
+
+    def _restore_forge_preview_from_fullscreen(self, *_args) -> None:
+        host = self._forge_fullscreen_host
+        if host is None:
+            return
+        self._forge_fullscreen_host = None
+        host.layout().removeWidget(self.html_preview)
+        self.html_preview.setParent(self.preview_stack)
+        if self.preview_stack.indexOf(self.html_preview) < 0:
+            self.preview_stack.addWidget(self.html_preview)
+        if self.tabbar.currentIndex() == 3:
+            self.preview_stack.setCurrentWidget(self.html_preview)
+        if host.isVisible():
+            host.close()
+        host.deleteLater()
 
     def _read_project_title(self) -> str:
         """Read recipient_title from settings.json (best available 'project title' signal)."""
@@ -1026,6 +1164,7 @@ class Nexus(QtWidgets.QMainWindow):
     def _update_preview_geometry(self) -> None:
         """Keep Sound usable in normal windows without changing full-screen layout."""
         window_height = max(1, self.height())
+        window_width = max(1, self.width())
         try:
             current_tab = self.tabbar.currentIndex()
         except Exception:
@@ -1037,6 +1176,24 @@ class Nexus(QtWidgets.QMainWindow):
             and not self.isFullScreen()
         )
 
+        if current_tab == 3:
+            mode = getattr(self, "_forge_preview_mode", "portrait")
+            max_h = max(260, int(window_height * 0.38))
+            max_w = max(420, int(window_width * 0.82))
+            if mode == "portrait":
+                h = max_h
+                w = int(h * (9 / 16))
+            elif mode == "landscape":
+                w = min(max_w, int(max_h * (16 / 9)))
+                h = int(w * (9 / 16))
+            else:
+                w = min(max_w, int(max_h * (16 / 10)))
+                h = int(w * (10 / 16))
+            self.preview_frame.setFixedSize(
+                max(240, w + 12),
+                max(180, h + 12),
+            )
+            return
         if sound_in_normal_window:
             # The preview content is naturally 169 x 253. Capping it near that
             # native height returns roughly 60-75 px to the Sound controls.
@@ -1228,10 +1385,11 @@ class Nexus(QtWidgets.QMainWindow):
                     "The program will bring in up to a thousand words and display them in the preview so you can review the message before finishing.")
         elif idx == 3:
             header = "<b>✨The Forge tab✨</b>"
-            body = ("This is where you build the finished letter. "
-                    "Click Generate to build the Play bundle and open it in your browser. "
-                    "Click Seal the Letter to build the Play bundle and open the Play folder. "
-                    "Use Load to bring an existing saved letter back into the editor.")
+            body = (
+                "Check readiness, load a saved letter, and select Preview Letter "
+                "to test the complete interactive viewer. Publish Letter creates "
+                "the hosted result, and Open Published Letter opens its saved link."
+            )
         else:
             header, body = "", ""
 

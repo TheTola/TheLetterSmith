@@ -599,8 +599,9 @@ class CommandTab(QtWidgets.QWidget):
         super().__init__(parent)
         self.project_root = Path(project_root).resolve()
         self.setObjectName("CommandTab")
-        # TabSwitcher reads these properties. Any transition entering or
-        # leaving Command becomes a pure fade at twice normal tab speed.
+        # TabSwitcher reads these properties. Entering Command fades the
+        # Command page in; leaving Command fades it out. Both run at twice
+        # the ordinary tab-transition duration and never use the normal slide.
         self.setProperty("anima.Transition", "command-fade")
         self.setProperty("anima.TransitionDurationMultiplier", 2.0)
         self.setStyleSheet("QWidget#CommandTab { background:#0b0c10; }")

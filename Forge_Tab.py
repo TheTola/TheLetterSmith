@@ -1,50 +1,42 @@
-# ===============================
-# File: Forge_Tab.py
-# Purpose: Forge tab — deterministic Play build + Load (Recipient → Title)
-#
-# FINAL BUTTON BEHAVIOR:
-# - Generate:
-#     Builds Play bundle, opens browser (index.html). Does NOT open folders.
-# - Seal the Letter:
-#     Builds Play bundle, opens the Play folder (GitHub Pages target).
-#
-# LOAD (FINAL SPEC):
-# - Clicking Load opens a drop-down menu (QMenu)
-# - Menu lists ALL recipient folders under: output/Play/<recipient>/
-# - Hovering a recipient expands a submenu listing ALL titles (from <title> in index.html)
-# - Clicking a title loads that build back into canonical SOURCE:
-#     gallery/user/pages/*
-#     gallery/user/message/*
-#     gallery/user/sounds/appssong/*  (restored single track or playlist state)
-# - Does not touch app-owned controls or sound effects.
-# - Updates settings.json:
-#     recipient_name, recipient_title
-#
-# NEW:
-# - When a saved letter is loaded, ForgeTab emits a signal so Nexus can immediately
-#   refresh the Forge preview (cover.png) + caption (project title).
-# ===============================
-
 from __future__ import annotations
 
 import json
-import re
 import shutil
-import traceback
+import uuid
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtWidgets import (
-    QPushButton, QLabel, QVBoxLayout, QHBoxLayout,
-    QGraphicsDropShadowEffect, QTextEdit
-)
-from PySide6.QtGui import QFont, QColor
 from PySide6.QtCore import Qt, QUrl
 
-import generate  # <-- IMPORTANT: module import only
+import generate
+from config import (
+    MESSAGE_HTML_FILE,
+    MUSIC_FILE,
+    OUTPUT_PLAY_DIR,
+    PLAY_METADATA_FILE,
+    PUBLISHED_PAGE_URL_KEY,
+    REQUIRED_SLIDES,
+    USER_MESSAGE_DIR,
+    USER_PAGES_DIR,
+    USER_SOUNDS_DIR,
+    ensure_output_dirs,
+)
 from message_html import read_text_normalized
+from project_state import (
+    PROJECT_ID_KEY,
+    PROJECT_SCHEMA_KEY,
+    PROJECT_SCHEMA_VERSION,
+    atomic_write_settings,
+    ensure_project_identity,
+)
+from publishing import GitHubPagesPublisher
+from publishing.github_pages import PUBLIC_WARNING_KEY
+from readiness import ReadinessResult, evaluate_readiness
+from saved_letters import SavedLetter, SavedLetterCatalog, update_saved_metadata
+from settings_store import SettingsStore
 from sound_model import (
+    ARCHIVE_DIR_NAME,
     BUILD_SOUND_MANIFEST_NAME,
     ProjectSoundState,
     import_runtime_track,
@@ -52,75 +44,22 @@ from sound_model import (
     save_project_state,
     sync_current_compatibility,
 )
+from transactional_io import PathTransaction, create_staging_directory
 
-from config import (
-    SETTINGS_FILE,
-    PUBLISHED_PAGE_URL_KEY,
-    PLAY_METADATA_FILE,
-    OUTPUT_PLAY_DIR,
-    ensure_output_dirs,
-    validate_required_images,
-    MESSAGE_HTML_FILE,
-    USER_PAGES_DIR,
-    USER_MESSAGE_DIR,
-    USER_SOUNDS_DIR,
-    MUSIC_FILE,
+
+PREVIEW_MODE_KEY = "forge_preview_mode"
+PREVIEW_MODES = (
+    ("Portrait", "portrait"),
+    ("Landscape", "landscape"),
+    ("Window / Browser", "window"),
 )
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _read_text(path: Path) -> str:
-    try:
-        return read_text_normalized(path)
-    except Exception:
-        return ""
-
-
-def _extract_html_title(index_html: Path) -> str:
-    txt = _read_text(index_html)
-    m = re.search(r"<title>\s*(.*?)\s*</title>", txt, flags=re.IGNORECASE | re.DOTALL)
-    if not m:
-        return index_html.parent.name
-    t = re.sub(r"\s+", " ", m.group(1)).strip()
-    return t or index_html.parent.name
-
-
-def _safe_clear_dir_contents(dir_path: Path) -> Tuple[int, int]:
-    files_deleted = 0
-    dirs_deleted = 0
-    if not dir_path.exists() or not dir_path.is_dir():
-        return files_deleted, dirs_deleted
-
-    for entry in dir_path.iterdir():
-        try:
-            if entry.is_file() or entry.is_symlink():
-                entry.unlink(missing_ok=True)
-                files_deleted += 1
-            elif entry.is_dir():
-                shutil.rmtree(entry, ignore_errors=True)
-                dirs_deleted += 1
-        except Exception:
-            pass
-
-    return files_deleted, dirs_deleted
-
-
-def _load_settings(root: Path) -> dict:
-    p = root / SETTINGS_FILE
-    try:
-        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-    except Exception:
-        return {}
-
-
-def _write_settings(root: Path, data: dict) -> None:
-    p = root / SETTINGS_FILE
-    try:
-        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+RESTORABLE_SETTING_KEYS = (
+    "starting_volume",
+    "music_volume",
+    "curtain_style",
+    "message_overlay_preset",
+    "message_overlay_opacity",
+)
 
 
 def _normalize_page_url(value: str) -> str:
@@ -128,557 +67,685 @@ def _normalize_page_url(value: str) -> str:
     if not candidate:
         return ""
     parsed = QUrl.fromUserInput(candidate)
-    if not parsed.isValid():
-        return ""
-    if parsed.scheme().lower() not in {"http", "https"}:
-        return ""
-    if not parsed.host():
+    if (
+        not parsed.isValid()
+        or parsed.scheme().lower() not in {"http", "https"}
+        or not parsed.host()
+    ):
         return ""
     return parsed.toString()
 
 
-def _metadata_path(play_dir: Path) -> Path:
-    return play_dir / PLAY_METADATA_FILE
+def _read_metadata(play_dir: Path) -> dict:
+    for name in (
+        PLAY_METADATA_FILE,
+        "play_metadata.json",
+        "recovery_metadata.json",
+        "metadata.json",
+    ):
+        path = play_dir / name
+        if not path.is_file():
+            continue
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
 
 
-def _read_play_metadata(play_dir: Path) -> dict:
-    path = _metadata_path(play_dir)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except Exception:
-        data = {}
-    return data if isinstance(data, dict) else {}
+class ReadinessWindow(QtWidgets.QDialog):
+    fix_requested = QtCore.Signal(str)
 
+    def __init__(self, project_root: str | Path, parent=None) -> None:
+        super().__init__(parent)
+        self.project_root = Path(project_root).resolve()
+        self.user_closed = False
+        self._positioned = False
+        self.setWindowTitle("Project Readiness")
+        self.setWindowFlag(Qt.Tool, True)
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+        self.setMinimumWidth(270)
+        self.setMaximumWidth(340)
 
-def _humanize_slug(s: str) -> str:
-    s2 = s.replace("_", " ").replace("-", " ").strip()
-    s2 = re.sub(r"\s+", " ", s2)
-    return s2.title() if s2 else s
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
 
-
-def _get_generate_fn():
-    """Return the canonical Play-bundle generator."""
-    fn = getattr(generate, "generate_play_bundle", None)
-    return fn if callable(fn) else None
-
-
-def _open_folder(path: Path) -> None:
-    QtGui.QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ForgeTab
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ForgeTab(QtWidgets.QWidget):
-    """
-    - Generate:
-        Builds Play bundle, opens browser
-    - Seal the Letter:
-        Builds Play bundle, opens Play folder (GitHub Pages target)
-    - Load:
-        Dropdown menu: Recipient -> Title -> Load build into gallery/user/*
-    """
-
-    # Nexus should connect to this to refresh preview/caption immediately after load.
-    letter_loaded = QtCore.Signal(dict)  # payload includes recipient_name, recipient_title, play_dir
-
-    def __init__(self, project_root: str | Path):
-        super().__init__()
-        self.project_root = Path(project_root)
-        self.saved_page_url = ""
-        self._init_ui()
-        self.refresh_saved_page_url()
-
-    # ─────────────────────────────────────────────────────────────────────
-    # UI
-    # ─────────────────────────────────────────────────────────────────────
-    def _init_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
-
-        title = QLabel("🛠️ Generate Animated Letter")
-        title.setFont(QFont("Segoe UI Semibold", 18))
-        title.setStyleSheet("color: #00d0ff;")
-        title.setAlignment(Qt.AlignCenter)
-        title.setGraphicsEffect(self._shadow_effect(12))
-        layout.addWidget(title)
-
-        # Top row: Load menu button only
-        top_row = QHBoxLayout()
-        top_row.setSpacing(10)
-        top_row.addStretch(1)
-
-        self.load_btn = self._tiny_button("Load")
-        self.load_btn.setToolTip("Load a saved letter from output/Play (Recipient → Title)")
-        self.load_btn.clicked.connect(self._open_load_menu)
-        top_row.addWidget(self.load_btn, 0, Qt.AlignRight)
-
-        layout.addLayout(top_row)
-
-        # Main action buttons
-        btns = QHBoxLayout()
-        btns.setSpacing(12)
-
-        self.generate_btn = self._styled_button("Generate", "#ff8800", "#ffaa00", "yellow")
-        self.generate_btn.setToolTip("Build the Play bundle and preview in your browser")
-        self.generate_btn.clicked.connect(self.generate)
-        btns.addWidget(self.generate_btn)
-
-        self.seal_btn = self._styled_button("📜 Seal the Letter", "#6a5acd", "#836fff", "white")
-        self.seal_btn.setToolTip("Build the Play bundle and open the Play folder (GitHub Pages target)")
-        self.seal_btn.clicked.connect(self.seal_the_letter)
-        btns.addWidget(self.seal_btn)
-
-        self.go_to_page_btn = self._page_button("Go to Page")
-        self.go_to_page_btn.clicked.connect(self.go_to_page)
-        btns.addWidget(self.go_to_page_btn)
-
-        layout.addLayout(btns)
-
-        # Status console
-        self.status = QTextEdit(readOnly=True)
-        self.status.setFont(QFont("Segoe UI", 11))
-        self.status.setStyleSheet(
-            "background:#1a1a1a; border:1px solid #00d0ff;"
-            " border-radius:4px; color:#ddd;"
+        self.percentage = QtWidgets.QLabel()
+        self.percentage.setStyleSheet(
+            "color:#dffcff;font:600 13px 'Segoe UI';"
         )
+        layout.addWidget(self.percentage)
+
+        self.status = QtWidgets.QLabel()
+        self.status.setStyleSheet("font:600 11px 'Segoe UI';")
         layout.addWidget(self.status)
 
-        # Quick open output folder
-        self.open_output_btn = self._utility_button("📂 Open Output Folder")
-        self.open_output_btn.clicked.connect(self.open_output_folder)
-        layout.addWidget(self.open_output_btn)
+        self.items = QtWidgets.QWidget(self)
+        self.items_layout = QtWidgets.QVBoxLayout(self.items)
+        self.items_layout.setContentsMargins(0, 2, 0, 0)
+        self.items_layout.setSpacing(2)
+        layout.addWidget(self.items)
 
+        self._missing_buttons: dict[str, QtWidgets.QPushButton] = {}
+        for item in evaluate_readiness(self.project_root).items:
+            button = QtWidgets.QPushButton()
+            button.setFlat(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(
+                lambda _checked=False, key=item.key: self.fix_requested.emit(key)
+            )
+            self.items_layout.addWidget(button)
+            self._missing_buttons[item.key] = button
+
+    def refresh(self, result: ReadinessResult) -> None:
+        self.percentage.setText(f"{result.completion_percentage}% Complete")
+        ready = result.status != "Not Ready"
+        self.status.setText(result.status)
+        self.status.setStyleSheet(
+            f"color:{'#79e092' if ready else '#ff8080'};"
+            "font:600 11px 'Segoe UI';"
+        )
+
+        missing = {item.key: item for item in result.missing_items}
+        for key, button in self._missing_buttons.items():
+            item = missing.get(key)
+            button.setVisible(item is not None)
+            if item is None:
+                continue
+            required = item.required
+            button.setText(f"{'Missing' if required else 'Optional'}: {item.label}")
+            button.setToolTip(item.detail)
+            button.setStyleSheet(
+                "QPushButton{text-align:left;padding:3px 2px;border:none;"
+                f"background:transparent;color:{'#ff9090' if required else '#e4c96d'};}}"
+                "QPushButton:hover{text-decoration:underline;}"
+            )
+
+        if not missing:
+            self.items.setVisible(False)
+        else:
+            self.items.setVisible(True)
+        self.adjustSize()
+
+    def position_near_image_area(self) -> None:
+        if self._positioned:
+            return
+        owner = self.parentWidget()
+        if owner is None:
+            return
+        top_left = owner.mapToGlobal(QtCore.QPoint(24, 105))
+        screen = owner.screen().availableGeometry() if owner.screen() else None
+        target = QtCore.QPoint(top_left.x(), top_left.y())
+        if screen is not None:
+            target.setX(
+                max(screen.left(), min(target.x(), screen.right() - self.width()))
+            )
+            target.setY(
+                max(screen.top(), min(target.y(), screen.bottom() - self.height()))
+            )
+        self.move(target)
+        self._positioned = True
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.user_closed = True
+        super().closeEvent(event)
+
+
+class ForgeTab(QtWidgets.QWidget):
+    letter_loaded = QtCore.Signal(dict)
+    fix_requested = QtCore.Signal(str)
+    preview_requested = QtCore.Signal(str, str)
+    published_url_changed = QtCore.Signal(str)
+
+    def __init__(self, project_root: str | Path) -> None:
+        super().__init__()
+        self.project_root = Path(project_root).resolve()
+        self.settings = SettingsStore(self.project_root)
+        self.catalog = SavedLetterCatalog(self.project_root)
+        self.saved_page_url = ""
+        self._last_play_dir: Optional[Path] = None
+        self._preview_mode = self._saved_preview_mode()
+        self._readiness_result = evaluate_readiness(self.project_root)
+        self.readiness_window = ReadinessWindow(self.project_root, self.window())
+        self.readiness_window.fix_requested.connect(self.fix_requested.emit)
+        self._init_ui()
+        self.refresh_saved_letters()
+        self.refresh_saved_page_url()
+        self.refresh_readiness()
+
+    def _saved_preview_mode(self) -> str:
+        value = str(self.settings.get(PREVIEW_MODE_KEY, "portrait")).strip()
+        valid = {mode for _label, mode in PREVIEW_MODES}
+        return value if value in valid else "portrait"
+
+    def _init_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(32, 16, 32, 18)
+        layout.setSpacing(12)
+
+        heading_row = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Forge")
+        title.setStyleSheet("color:#00d0ff;font:600 20px 'Segoe UI';")
+        heading_row.addWidget(title)
+        heading_row.addStretch(1)
+        self.readiness_btn = self._small_button("Project Readiness")
+        self.readiness_btn.clicked.connect(self.show_readiness_window)
+        heading_row.addWidget(self.readiness_btn)
+        layout.addLayout(heading_row)
+
+        saved_row = QtWidgets.QHBoxLayout()
+        saved_row.addWidget(QtWidgets.QLabel("Saved letter:"))
+        self.saved_selector = QtWidgets.QComboBox()
+        self.saved_selector.setMinimumWidth(420)
+        self.saved_selector.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        saved_row.addWidget(self.saved_selector, 1)
+        self.load_saved_btn = self._small_button("Load Saved Letter")
+        self.load_saved_btn.clicked.connect(self.load_selected_letter)
+        saved_row.addWidget(self.load_saved_btn)
+        self.refresh_saved_btn = self._small_button("Refresh")
+        self.refresh_saved_btn.clicked.connect(self.refresh_saved_letters)
+        saved_row.addWidget(self.refresh_saved_btn)
+        layout.addLayout(saved_row)
+
+        preview_row = QtWidgets.QHBoxLayout()
+        preview_row.addWidget(QtWidgets.QLabel("Preview format:"))
+        self.preview_mode = QtWidgets.QComboBox()
+        for label, mode in PREVIEW_MODES:
+            self.preview_mode.addItem(label, mode)
+        current = self.preview_mode.findData(self._preview_mode)
+        self.preview_mode.setCurrentIndex(max(0, current))
+        self.preview_mode.currentIndexChanged.connect(self._preview_mode_changed)
+        preview_row.addWidget(self.preview_mode)
+        preview_row.addStretch(1)
+        layout.addLayout(preview_row)
+
+        actions = QtWidgets.QHBoxLayout()
+        self.preview_btn = self._action_button(
+            "Preview Letter", "#d77b00", "#ffad24"
+        )
+        self.preview_btn.clicked.connect(self.preview_letter)
+        actions.addWidget(self.preview_btn)
+        self.publish_btn = self._action_button(
+            "Publish Letter", "#6551c9", "#8b77ed"
+        )
+        self.publish_btn.clicked.connect(self.publish_letter)
+        actions.addWidget(self.publish_btn)
+        self.open_published_btn = self._action_button(
+            "Open Published Letter", "#17202a", "#536779"
+        )
+        self.open_published_btn.clicked.connect(self.open_published_letter)
+        actions.addWidget(self.open_published_btn)
+        layout.addLayout(actions)
+
+        share = QtWidgets.QFrame()
+        share.setObjectName("SharePanel")
+        share.setStyleSheet(
+            "QFrame#SharePanel{background:#111820;border:1px solid #2b4655;"
+            "border-radius:7px;}QLabel{border:none;}"
+        )
+        share_layout = QtWidgets.QHBoxLayout(share)
+        share_layout.setContentsMargins(10, 8, 10, 8)
+        share_layout.addWidget(QtWidgets.QLabel("Published link:"))
+        self.published_url = QtWidgets.QLineEdit()
+        self.published_url.setReadOnly(True)
+        self.published_url.setPlaceholderText("Publish the letter or save its URL in Message")
+        share_layout.addWidget(self.published_url, 1)
+        self.copy_link_btn = self._small_button("Copy Link")
+        self.copy_link_btn.clicked.connect(self.copy_published_link)
+        share_layout.addWidget(self.copy_link_btn)
+        layout.addWidget(share)
+
+        self.status = QtWidgets.QPlainTextEdit()
+        self.status.setReadOnly(True)
+        self.status.setMaximumHeight(74)
+        self.status.setStyleSheet(
+            "background:#15191d;border:1px solid #2b4655;border-radius:6px;"
+            "color:#d9e4ed;padding:6px;"
+        )
+        layout.addWidget(self.status)
+        layout.addStretch(1)
         self._log("Ready.")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Load menu (Recipient → Title)
-    # ─────────────────────────────────────────────────────────────────────
-    def _open_load_menu(self) -> None:
-        menu = self._build_load_menu()
-        if menu is None:
-            return
+    def show_readiness_window(self) -> None:
+        self.refresh_readiness()
+        self.readiness_window.user_closed = False
+        self.readiness_window.show()
+        self.readiness_window.position_near_image_area()
+        self.readiness_window.raise_()
 
-        gp = self.load_btn.mapToGlobal(QtCore.QPoint(0, self.load_btn.height()))
-        menu.popup(gp)
+    def attach_readiness_window(self, owner: QtWidgets.QWidget) -> None:
+        self.readiness_window.setParent(owner, Qt.Tool)
+        self.readiness_window._positioned = False
 
-    def _build_load_menu(self) -> Optional[QtWidgets.QMenu]:
-        ensure_output_dirs(self.project_root)
-        base = (self.project_root / OUTPUT_PLAY_DIR).resolve()
-        base.mkdir(parents=True, exist_ok=True)
+    def refresh_readiness(self) -> ReadinessResult:
+        self._readiness_result = evaluate_readiness(self.project_root)
+        self.readiness_window.refresh(self._readiness_result)
+        self.readiness_btn.setText(
+            f"Project Readiness · {self._readiness_result.completion_percentage}%"
+        )
+        self.preview_btn.setEnabled(self._readiness_result.can_preview)
+        self.publish_btn.setEnabled(self._readiness_result.can_preview)
+        return self._readiness_result
 
-        menu = QtWidgets.QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background: #0f0f12;
-                color: #e6e6e6;
-                border: 1px solid #2b3344;
-                padding: 6px;
-            }
-            QMenu::item {
-                padding: 6px 18px 6px 18px;
-                border-radius: 6px;
-            }
-            QMenu::item:selected {
-                background: #113945;
-            }
-            QMenu::separator {
-                height: 1px;
-                background: #2b3344;
-                margin: 6px 6px;
-            }
-        """)
-
-        recipients = [p for p in base.iterdir() if p.is_dir()]
-        recipients.sort(key=lambda p: p.name.lower())
-
-        if not recipients:
-            act = menu.addAction("No saved letters found")
-            act.setEnabled(False)
-            return menu
-
-        for recip_dir in recipients:
-            recip_slug = recip_dir.name
-            recip_display = _humanize_slug(recip_slug)
-
-            title_dirs = [p for p in recip_dir.iterdir() if p.is_dir()]
-            valid_titles: list[tuple[str, Path]] = []
-            for td in sorted(title_dirs, key=lambda p: p.name.lower()):
-                idx = td / "index.html"
-                gal = td / "gallery"
-                if idx.is_file() and gal.is_dir():
-                    valid_titles.append((_extract_html_title(idx), td))
-
-            if not valid_titles:
-                continue
-
-            sub = QtWidgets.QMenu(recip_display, menu)
-            sub.setStyleSheet(menu.styleSheet())
-            menu.addMenu(sub)
-
-            for display_title, play_dir in valid_titles:
-                action = sub.addAction(display_title)
-                action.setData({
-                    "recipient_slug": recip_slug,
-                    "recipient_display": recip_display,
-                    "title_display": display_title,
-                    "play_dir": str(play_dir),
-                })
-                action.triggered.connect(lambda _=False, a=action: self._load_from_action(a))
-
-        if not menu.actions():
-            act = menu.addAction("No valid letters found")
-            act.setEnabled(False)
-
-        return menu
-
-    def _load_from_action(self, action: QtGui.QAction) -> None:
-        data = action.data()
-        if not isinstance(data, dict):
-            return
-
-        play_dir = Path(str(data.get("play_dir", ""))).resolve()
-        recip_display = str(data.get("recipient_display", "")).strip()
-        title_display = str(data.get("title_display", "")).strip()
-        recip_slug = str(data.get("recipient_slug", "")).strip()
-
-        if not play_dir.exists():
-            self._log("❌ Selected folder is missing.")
-            return
-
-        # Source runtime folders
-        src_gallery = play_dir / "gallery"
-        src_pages = src_gallery / "pages"
-        src_message = src_gallery / "message"
-        src_sounds = src_gallery / "sounds"
-        src_music = src_sounds / MUSIC_FILE
-        src_sound_manifest = src_sounds / BUILD_SOUND_MANIFEST_NAME
-
-        if not src_pages.is_dir():
-            self._log("❌ Invalid build: missing gallery/pages/")
-            return
-        if not src_message.is_dir():
-            self._log("❌ Invalid build: missing gallery/message/")
-            return
-        if not src_sounds.is_dir():
-            self._log("❌ Invalid build: missing gallery/sounds/")
-            return
-
-        # Dest canonical SOURCE folders
-        dst_pages = (self.project_root / USER_PAGES_DIR).resolve()
-        dst_message = (self.project_root / USER_MESSAGE_DIR).resolve()
-        dst_sounds = (self.project_root / USER_SOUNDS_DIR).resolve()
-
-        dst_pages.mkdir(parents=True, exist_ok=True)
-        dst_message.mkdir(parents=True, exist_ok=True)
-        dst_sounds.mkdir(parents=True, exist_ok=True)
-
-        # Clear ONLY pages/ and message/ contents
-        pf, pd = _safe_clear_dir_contents(dst_pages)
-        mf, md = _safe_clear_dir_contents(dst_message)
-
-        # Copy pages
-        copied_pages = 0
-        for p in src_pages.iterdir():
-            if p.is_file():
-                shutil.copy2(p, dst_pages / p.name)
-                copied_pages += 1
-
-        # Copy message folder contents
-        copied_msg = 0
-        for p in src_message.iterdir():
-            if p.is_file():
-                shutil.copy2(p, dst_message / p.name)
-                copied_msg += 1
-            elif p.is_dir():
-                shutil.copytree(p, dst_message / p.name, dirs_exist_ok=True)
-                copied_msg += 1
-
-        # Restore the letter's explicit sound mode into the reusable archive.
-        sound_payload: dict = {}
-        if src_sound_manifest.is_file():
-            try:
-                loaded = json.loads(src_sound_manifest.read_text(encoding="utf-8"))
-                sound_payload = loaded if isinstance(loaded, dict) else {}
-            except (OSError, json.JSONDecodeError):
-                sound_payload = {}
-
-        raw_tracks = sound_payload.get("tracks", [])
-        if not isinstance(raw_tracks, list):
-            raw_tracks = []
-        if not raw_tracks and src_music.is_file():
-            raw_tracks = [{"filename": MUSIC_FILE, "display_title": "Music"}]
-
-        imported_ids: list[str] = []
-        for raw_track in raw_tracks:
-            if not isinstance(raw_track, dict):
-                continue
-            filename = Path(str(raw_track.get("filename", ""))).name
-            source = src_sounds / filename
-            if not filename or not source.is_file():
-                continue
-            record = import_runtime_track(
-                self.project_root,
-                source,
-                display_title=str(raw_track.get("display_title", "")),
-                original_name=str(raw_track.get("original_name", filename)),
-                content_hash=str(raw_track.get("content_hash", "")),
-                duration_seconds=float(raw_track.get("duration_seconds", 0.0) or 0.0),
+    def refresh_saved_letters(self) -> None:
+        selected_path = ""
+        current = self.saved_selector.currentData()
+        if isinstance(current, SavedLetter):
+            selected_path = str(current.path)
+        self.saved_selector.clear()
+        selected_index = -1
+        for index, entry in enumerate(self.catalog.list_entries()):
+            date = entry.modified_at.strftime("%Y-%m-%d %H:%M")
+            published = "Published" if entry.published else "Local"
+            recovery = "Recovery · " if entry.recovery else ""
+            self.saved_selector.addItem(
+                f"{recovery}{entry.title} — {entry.recipient} · {date} · {published}",
+                entry,
             )
-            imported_ids.append(record.track_id)
+            if str(entry.path) == selected_path:
+                selected_index = index
+        if selected_index >= 0:
+            self.saved_selector.setCurrentIndex(selected_index)
+        available = self.saved_selector.count() > 0
+        self.saved_selector.setEnabled(available)
+        self.load_saved_btn.setEnabled(available)
+        if not available:
+            self.saved_selector.addItem("No saved letters found")
 
-        mode = "playlist" if str(sound_payload.get("mode", "single")) == "playlist" else "single"
-        sound_state = ProjectSoundState(
-            mode=mode,
-            single_track_id=imported_ids[0] if mode == "single" and imported_ids else "",
-            playlist=imported_ids if mode == "playlist" else [],
-            playlist_expanded=True,
-            selected_track_id=imported_ids[0] if imported_ids else "",
+    def load_selected_letter(self) -> None:
+        entry = self.saved_selector.currentData()
+        if isinstance(entry, SavedLetter):
+            self._load_saved_letter(entry)
+
+    def _load_saved_letter(self, entry: SavedLetter) -> None:
+        play_dir = entry.path.resolve()
+        src_pages = play_dir / "gallery" / "pages"
+        src_message = play_dir / "gallery" / "message"
+        src_sounds = play_dir / "gallery" / "sounds"
+        missing_pages = [
+            name for name in REQUIRED_SLIDES if not (src_pages / name).is_file()
+        ]
+        if not (play_dir / "index.html").is_file() or missing_pages:
+            detail = ", ".join(missing_pages) or "index.html"
+            self._log(f"Could not load the saved letter. Missing: {detail}.")
+            return
+        if not src_message.is_dir() or not (src_message / "message.html").is_file():
+            self._log("Could not load the saved letter. Its message is missing.")
+            return
+
+        metadata = _read_metadata(play_dir)
+        staged_root = create_staging_directory(
+            self.project_root / "output", prefix=".letter-load-"
         )
-        save_project_state(self.project_root, sound_state)
-        sync_current_compatibility(self.project_root, sound_state, load_library(self.project_root))
+        dst_pages = self.project_root / USER_PAGES_DIR
+        dst_message = self.project_root / USER_MESSAGE_DIR
+        dst_archive = self.project_root / USER_SOUNDS_DIR / ARCHIVE_DIR_NAME
+        dst_music = self.project_root / USER_SOUNDS_DIR / MUSIC_FILE
+        pages_tx = PathTransaction(
+            dst_pages, staging_suffix=".load-staging", backup_suffix=".load-backup"
+        )
+        message_tx = PathTransaction(
+            dst_message, staging_suffix=".load-staging", backup_suffix=".load-backup"
+        )
+        archive_tx = PathTransaction(
+            dst_archive, staging_suffix=".load-staging", backup_suffix=".load-backup"
+        )
+        music_tx = PathTransaction(
+            dst_music, staging_suffix=".load-staging", backup_suffix=".load-backup"
+        )
+        transactions = (pages_tx, message_tx, archive_tx, music_tx)
+        committed: list[PathTransaction] = []
 
-        metadata = _read_play_metadata(play_dir)
+        try:
+            shutil.copytree(src_pages, pages_tx.prepare())
+            shutil.copytree(src_message, message_tx.prepare())
 
-        # Update settings.json (recipient/title/url)
-        settings = _load_settings(self.project_root)
-        settings["recipient_name"] = str(
-            metadata.get("recipient_name")
-            or recip_display
-            or _humanize_slug(recip_slug)
-        ).strip()
-        settings["recipient_title"] = str(
-            metadata.get("recipient_title")
-            or title_display
-        ).strip()
-        settings[PUBLISHED_PAGE_URL_KEY] = _normalize_page_url(str(metadata.get(PUBLISHED_PAGE_URL_KEY, "")).strip())
-        _write_settings(self.project_root, settings)
+            staged_archive = (
+                staged_root / USER_SOUNDS_DIR / ARCHIVE_DIR_NAME
+            )
+            if dst_archive.is_dir():
+                shutil.copytree(dst_archive, staged_archive)
+            else:
+                staged_archive.mkdir(parents=True, exist_ok=True)
+
+            sound_payload = {}
+            sound_manifest = src_sounds / BUILD_SOUND_MANIFEST_NAME
+            if sound_manifest.is_file():
+                value = json.loads(sound_manifest.read_text(encoding="utf-8"))
+                if isinstance(value, dict):
+                    sound_payload = value
+            raw_tracks = sound_payload.get("tracks", [])
+            if not isinstance(raw_tracks, list):
+                raise ValueError("The saved sound manifest is invalid.")
+            if not raw_tracks and (src_sounds / MUSIC_FILE).is_file():
+                raw_tracks = [{"filename": MUSIC_FILE, "display_title": "Music"}]
+
+            imported_ids: list[str] = []
+            for raw_track in raw_tracks:
+                if not isinstance(raw_track, dict):
+                    continue
+                filename = Path(str(raw_track.get("filename", ""))).name
+                source = src_sounds / filename
+                if not filename or not source.is_file():
+                    raise FileNotFoundError(
+                        f"Saved music track is missing: {filename or 'unknown'}"
+                    )
+                record = import_runtime_track(
+                    staged_root,
+                    source,
+                    display_title=str(raw_track.get("display_title", "")),
+                    original_name=str(raw_track.get("original_name", filename)),
+                    content_hash=str(raw_track.get("content_hash", "")),
+                    duration_seconds=float(
+                        raw_track.get("duration_seconds", 0.0) or 0.0
+                    ),
+                )
+                imported_ids.append(record.track_id)
+
+            mode = (
+                "playlist"
+                if str(sound_payload.get("mode", "single")) == "playlist"
+                else "single"
+            )
+            state = ProjectSoundState(
+                mode=mode,
+                single_track_id=(
+                    imported_ids[0] if mode == "single" and imported_ids else ""
+                ),
+                playlist=imported_ids if mode == "playlist" else [],
+                playlist_expanded=True,
+                selected_track_id=imported_ids[0] if imported_ids else "",
+            )
+            save_project_state(staged_root, state)
+            sync_current_compatibility(
+                staged_root, state, load_library(staged_root)
+            )
+            shutil.copytree(staged_archive, archive_tx.prepare())
+            staged_music = staged_root / USER_SOUNDS_DIR / MUSIC_FILE
+            prepared_music = music_tx.prepare()
+            if staged_music.is_file():
+                prepared_music.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(staged_music, prepared_music)
+
+            pages_tx.commit(keep_backup=True)
+            committed.append(pages_tx)
+            message_tx.commit(keep_backup=True)
+            committed.append(message_tx)
+            archive_tx.commit(keep_backup=True)
+            committed.append(archive_tx)
+            music_tx.commit(
+                replace=staged_music.is_file(), keep_backup=True
+            )
+            committed.append(music_tx)
+
+            settings_before = self.settings.snapshot()
+            restored = dict(settings_before)
+            stored_settings = metadata.get("settings", {})
+            if isinstance(stored_settings, dict):
+                for key in RESTORABLE_SETTING_KEYS:
+                    if key in stored_settings:
+                        restored[key] = stored_settings[key]
+            restored["recipient_name"] = str(
+                metadata.get("recipient_name") or entry.recipient
+            ).strip()
+            restored["recipient_title"] = str(
+                metadata.get("recipient_title") or entry.title
+            ).strip()
+            restored[PUBLISHED_PAGE_URL_KEY] = _normalize_page_url(
+                str(metadata.get(PUBLISHED_PAGE_URL_KEY, ""))
+            )
+            try:
+                restored[PROJECT_ID_KEY] = str(
+                    uuid.UUID(str(metadata.get(PROJECT_ID_KEY, "")))
+                )
+            except (ValueError, TypeError, AttributeError):
+                try:
+                    restored[PROJECT_ID_KEY] = str(
+                        uuid.UUID(str(settings_before.get(PROJECT_ID_KEY, "")))
+                    )
+                except (ValueError, TypeError, AttributeError):
+                    restored[PROJECT_ID_KEY] = str(uuid.uuid4())
+            restored[PROJECT_SCHEMA_KEY] = PROJECT_SCHEMA_VERSION
+            atomic_write_settings(self.project_root, restored)
+        except Exception as error:
+            for transaction in reversed(committed):
+                try:
+                    transaction.rollback()
+                except Exception:
+                    pass
+            for transaction in transactions:
+                try:
+                    transaction.abort()
+                except Exception:
+                    pass
+            self._log(
+                "Saved-letter loading failed. The current project was preserved. "
+                f"{type(error).__name__}: {error}"
+            )
+            return
+        finally:
+            shutil.rmtree(staged_root, ignore_errors=True)
+
+        for transaction in transactions:
+            transaction.finalize()
+        self._last_play_dir = play_dir
         self.refresh_saved_page_url()
-
-        self._log(
-            "✅ Loaded saved letter\n"
-            f"Recipient: {settings['recipient_name']}\n"
-            f"Title: {settings['recipient_title']}\n"
-            f"From: {play_dir}\n\n"
-            f"Cleared: pages ({pf} files, {pd} dirs), message ({mf} files, {md} dirs)\n"
-            f"Copied: pages ({copied_pages}), message ({copied_msg}), music.mp3 (1)\n\n"
-            "Preview will update immediately."
-        )
-
+        self.refresh_readiness()
+        self.request_preview()
         payload = {
-            "recipient_name": str(settings.get("recipient_name", "")).strip(),
-            "recipient_title": str(settings.get("recipient_title", "")).strip(),
-            "published_page_url": str(settings.get(PUBLISHED_PAGE_URL_KEY, "")).strip(),
+            "recipient_name": str(restored.get("recipient_name", "")),
+            "recipient_title": str(restored.get("recipient_title", "")),
+            "published_page_url": self.saved_page_url,
             "play_dir": str(play_dir),
         }
-        QtCore.QTimer.singleShot(0, lambda: self.letter_loaded.emit(payload))
+        self.letter_loaded.emit(payload)
+        self._log(
+            f"Loaded saved letter: {payload['recipient_title']} — "
+            f"{payload['recipient_name']}."
+        )
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Utility actions
-    # ─────────────────────────────────────────────────────────────────────
-    def open_output_folder(self) -> None:
+    def _preview_mode_changed(self) -> None:
+        mode = str(self.preview_mode.currentData() or "portrait")
+        self._preview_mode = mode
+        self.settings.update_fields({PREVIEW_MODE_KEY: mode})
+        self.request_preview()
+
+    def _current_play_index(self) -> Optional[Path]:
+        if self._last_play_dir is not None:
+            index = self._last_play_dir / "index.html"
+            if index.is_file():
+                return index
+        project_id = ensure_project_identity(self.project_root)
+        index = self.project_root / OUTPUT_PLAY_DIR / project_id / "index.html"
+        return index if index.is_file() else None
+
+    def request_preview(self) -> None:
+        index = self._current_play_index()
+        if index is not None:
+            self.preview_requested.emit(str(index.resolve()), self._preview_mode)
+
+    def preview_letter(self) -> None:
+        built = self._build_letter()
+        if built is None:
+            return
+        play_dir, readiness = built
+        self._last_play_dir = play_dir
+        self.request_preview()
+        self._log("Letter preview refreshed.")
+        QtCore.QTimer.singleShot(
+            0, lambda: self._save_build_metadata(play_dir, readiness)
+        )
+
+    def publish_letter(self) -> None:
+        built = self._build_letter()
+        if built is None:
+            return
+        play_dir, readiness = built
+        self._last_play_dir = play_dir
+        self.request_preview()
+        metadata = self._save_build_metadata(play_dir, readiness)
+        if metadata is None:
+            return
+
+        publisher = GitHubPagesPublisher(self.project_root)
+        if not publisher.is_configured():
+            if not bool(self.settings.get(PUBLIC_WARNING_KEY, False)):
+                answer = QtWidgets.QMessageBox.question(
+                    self,
+                    "Publish Letter",
+                    "Published letters are placed in a public GitHub repository. "
+                    "Continue?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+                    QtWidgets.QMessageBox.Cancel,
+                )
+                if answer != QtWidgets.QMessageBox.Yes:
+                    self._log("Publishing canceled. The local preview remains available.")
+                    return
+                self.settings.update_fields({PUBLIC_WARNING_KEY: True})
+            configuration = publisher.configure(self)
+            if not configuration.configured:
+                self._log(configuration.message or "Publishing is not configured.")
+                return
+
+        self._log("Publishing letter…")
+        QtWidgets.QApplication.processEvents(
+            QtCore.QEventLoop.ExcludeUserInputEvents
+        )
+        result = publisher.publish(play_dir, metadata)
+        if not result.success:
+            self._log(result.message or "Publishing failed. The local build was preserved.")
+            return
+
+        self.settings.update_fields({PUBLISHED_PAGE_URL_KEY: result.url})
+        self.set_saved_page_url(result.url)
+        self.published_url_changed.emit(result.url)
+        update_saved_metadata(play_dir, self.project_root, evaluate_readiness(self.project_root))
+        self.refresh_readiness()
+        self.refresh_saved_letters()
+        self._log("The letter has been sealed.")
+
+    def _build_letter(self) -> Optional[tuple[Path, ReadinessResult]]:
         ensure_output_dirs(self.project_root)
-        out_parent = (self.project_root / OUTPUT_PLAY_DIR).parent
-        _open_folder(out_parent)
+        readiness = self.refresh_readiness()
+        if not readiness.can_preview:
+            missing = [
+                item.label
+                for item in readiness.missing_items
+                if item.required
+            ]
+            self._log("Complete these required items first: " + ", ".join(missing))
+            return None
+        try:
+            message = read_text_normalized(
+                self.project_root / MESSAGE_HTML_FILE
+            )
+            play_dir = Path(
+                generate.generate_play_bundle(
+                    str(self.project_root),
+                    message_html=message,
+                    open_in_browser=False,
+                )
+            ).resolve()
+        except Exception as error:
+            self._log(
+                "Build failed. The previous playable version was preserved. "
+                f"{type(error).__name__}: {error}"
+            )
+            return None
+        return play_dir, readiness
 
-    def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
-        super().showEvent(event)
-        self.refresh_saved_page_url()
+    def _save_build_metadata(
+        self, play_dir: Path, readiness: ReadinessResult
+    ) -> Optional[dict]:
+        try:
+            return update_saved_metadata(play_dir, self.project_root, readiness)
+        except Exception as error:
+            self._log(
+                "The letter is playable, but its saved metadata could not be "
+                f"updated: {error}"
+            )
+            return None
 
     def refresh_saved_page_url(self) -> str:
-        settings = _load_settings(self.project_root)
-        self.saved_page_url = _normalize_page_url(str(settings.get(PUBLISHED_PAGE_URL_KEY, "")).strip())
-        self._sync_go_to_page_button()
+        self.saved_page_url = _normalize_page_url(
+            str(self.settings.get(PUBLISHED_PAGE_URL_KEY, ""))
+        )
+        self._sync_published_url()
         return self.saved_page_url
 
     def set_saved_page_url(self, url: str) -> None:
         self.saved_page_url = _normalize_page_url(url)
-        self._sync_go_to_page_button()
+        self._sync_published_url()
+        self.refresh_readiness()
 
-    def _sync_go_to_page_button(self) -> None:
-        has_url = bool(self.saved_page_url)
-        self.go_to_page_btn.setEnabled(has_url)
-        if has_url:
-            self.go_to_page_btn.setToolTip(self.saved_page_url)
-        else:
-            self.go_to_page_btn.setToolTip("No published page URL has been saved yet.")
+    def _sync_published_url(self) -> None:
+        available = bool(self.saved_page_url)
+        self.published_url.setText(self.saved_page_url)
+        self.open_published_btn.setEnabled(available)
+        self.copy_link_btn.setEnabled(available)
+        self.open_published_btn.setToolTip(
+            self.saved_page_url
+            if available
+            else "No published page URL has been saved."
+        )
 
-    def go_to_page(self) -> None:
+    def open_published_letter(self) -> None:
         url = self.refresh_saved_page_url()
         if not url:
-            self._log("❌ No page URL saved yet. Add it in the Message tab first.")
+            self._log("No published page URL is available.")
             return
-
         if QtGui.QDesktopServices.openUrl(QUrl(url)):
-            self._log(f"✅ Opened published page.\n• URL: {url}")
+            self._log("Opened the published letter.")
+        else:
+            self._log("The published letter could not be opened.")
+
+    def go_to_page(self) -> None:
+        self.open_published_letter()
+
+    def copy_published_link(self) -> None:
+        url = self.refresh_saved_page_url()
+        if not url:
             return
+        QtWidgets.QApplication.clipboard().setText(url)
+        self._log("Published link copied.")
 
-        self._log(f"❌ Could not open the saved page URL.\n• URL: {url}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Actions
-    # ─────────────────────────────────────────────────────────────────────
-    def generate(self) -> None:
-        self._run_pipeline(mode="generate")
-
-    def seal_the_letter(self) -> None:
-        self._run_pipeline(mode="seal")
-
-    def _run_pipeline(self, *, mode: str) -> None:
-        ensure_output_dirs(self.project_root)
-
-        gen_fn = _get_generate_fn()
-        if gen_fn is None:
-            self._log("❌ generate.py is missing generate_play_bundle.")
-            return
-
-        missing = validate_required_images(self.project_root)
-        if missing:
-            self._log(
-                f"❌ Cannot proceed: missing {', '.join(missing)}\n"
-                f"Expected in: {self.project_root / 'gallery/user/pages'}"
-            )
-            return
-
-        msg_path = (self.project_root / MESSAGE_HTML_FILE).resolve()
-        message_html = self._read_message_html(msg_path)
-
-        if not message_html.strip():
-            self._log(
-                "❌ Cannot proceed: message is empty or missing.\n"
-                f"Expected: {msg_path}\n"
-                "Open the editor and Save your message."
-            )
-            return
-
-        try:
-            if mode == "generate":
-                play_dir = gen_fn(
-                    str(self.project_root),
-                    message_html=message_html,
-                    open_in_browser=True,
-                )
-                self.refresh_saved_page_url()
-                self._log(
-                    "✅ Play bundle updated and opened in browser.\n"
-                    f"• Play: {play_dir}\n"
-                    f"• Message: {msg_path}"
-                    f"{self._font_export_note()}"
-                )
-                return
-
-            if mode == "seal":
-                play_dir = gen_fn(
-                    str(self.project_root),
-                    message_html=message_html,
-                    open_in_browser=False,
-                )
-                self.refresh_saved_page_url()
-
-                self._log(
-                    "✅ Play bundle updated.\n"
-                    f"• Play (GitHub target): {play_dir}"
-                    f"{self._font_export_note()}\n\n"
-                    "Opening Play folder now."
-                )
-
-                _open_folder(Path(play_dir))
-                return
-
-            self._log(f"❌ Internal error: unknown mode '{mode}'")
-
-        except Exception as e:
-            tb = traceback.format_exc(limit=30)
-            self._log(f"❌ Pipeline error: {type(e).__name__}: {e}\n\n{tb}")
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Helpers
-    # ─────────────────────────────────────────────────────────────────────
-    def _read_message_html(self, msg_path: Path) -> str:
-        try:
-            if not msg_path.exists():
-                return ""
-            return read_text_normalized(msg_path)
-        except Exception:
-            return ""
-
-    def _font_export_note(self) -> str:
-        reporter = getattr(generate, "get_last_font_export_report", None)
-        if not callable(reporter):
-            return ""
-
-        report = reporter()
-        fallback = tuple(report.get("fallback", ())) if isinstance(report, dict) else ()
-        if not fallback:
-            return ""
-        return "\n• Font fallback used: " + ", ".join(fallback)
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self.refresh_saved_letters()
+        self.refresh_saved_page_url()
+        self.refresh_readiness()
+        QtCore.QTimer.singleShot(0, self.request_preview)
 
     def _log(self, text: str) -> None:
         self.status.setPlainText(text)
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Button styles
-    # ─────────────────────────────────────────────────────────────────────
-    def _styled_button(self, text: str, bg_color: str, border_color: str, text_color: str) -> QPushButton:
-        btn = QPushButton(text)
-        btn.setFont(QFont("Segoe UI Semibold", 14))
-        btn.setMinimumHeight(52)
-        btn.setStyleSheet(
-            f"QPushButton {{"
-            f"background:{bg_color}; border:2px solid {border_color};"
-            f"border-radius:10px; padding:14px 20px;"
-            f"color:{text_color}; font-weight:bold; }}"
-            f"QPushButton:hover {{ background:{border_color}; }}"
+    @staticmethod
+    def _small_button(text: str) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton(text)
+        button.setMinimumHeight(30)
+        button.setStyleSheet(
+            "QPushButton{background:#121a22;color:#e6eef5;border:1px solid #3c5366;"
+            "border-radius:7px;padding:5px 10px;}"
+            "QPushButton:hover{border-color:#00cfee;background:#17303b;}"
+            "QPushButton:disabled{color:#65717d;border-color:#2a333c;}"
         )
-        btn.setGraphicsEffect(self._shadow_effect(16))
-        return btn
+        return button
 
-    def _page_button(self, text: str) -> QPushButton:
-        btn = QPushButton(text)
-        btn.setFont(QFont("Segoe UI Semibold", 13))
-        btn.setMinimumHeight(52)
-        btn.setMinimumWidth(164)
-        btn.setMaximumWidth(186)
-        btn.setStyleSheet(
-            "QPushButton {"
-            "background:#24292f; color:#f0f6fc;"
-            "border:2px solid #57606a; border-radius:10px; padding:14px 16px;"
-            "font-weight:700;"
-            "}"
-            "QPushButton:hover { background:#30363d; border-color:#8b949e; }"
-            "QPushButton:disabled { background:#161b22; color:#6e7681; border-color:#30363d; }"
+    @staticmethod
+    def _action_button(
+        text: str, background: str, border: str
+    ) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton(text)
+        button.setMinimumHeight(48)
+        button.setStyleSheet(
+            f"QPushButton{{background:{background};color:white;border:2px solid {border};"
+            "border-radius:9px;padding:10px 16px;font:600 12px 'Segoe UI';}"
+            f"QPushButton:hover{{background:{border};}}"
+            "QPushButton:disabled{background:#171c21;color:#65717d;border-color:#303840;}"
         )
-        btn.setGraphicsEffect(self._shadow_effect(16))
-        return btn
-
-    def _utility_button(self, text: str) -> QPushButton:
-        btn = QPushButton(text)
-        btn.setFont(QFont("Segoe UI Semibold", 12))
-        btn.setMinimumHeight(44)
-        btn.setStyleSheet(
-            "QPushButton { background:#0f0f12; color:#e6e6e6;"
-            "border:1px solid #00d0ff; border-radius:8px; padding:10px 14px; }"
-            "QPushButton:hover { background:#113945; }"
-        )
-        btn.setGraphicsEffect(self._shadow_effect(12))
-        return btn
-
-    def _tiny_button(self, text: str) -> QPushButton:
-        btn = QPushButton(text)
-        btn.setFont(QFont("Segoe UI", 11, QFont.DemiBold))
-        btn.setFixedHeight(30)
-        btn.setStyleSheet(
-            "QPushButton { background:#0f0f12; color:#e6e6e6;"
-            "border:1px solid #00d0ff; border-radius:8px; padding:6px 12px; }"
-            "QPushButton:hover { background:#113945; }"
-        )
-        return btn
-
-    def _shadow_effect(self, blur_radius: int) -> QGraphicsDropShadowEffect:
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(blur_radius)
-        shadow.setOffset(0, 4)
-        shadow.setColor(QColor(0, 0, 0, 160))
-        return shadow
+        return button
