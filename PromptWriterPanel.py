@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import sys
+import hashlib
 import json
 import random
 import re
@@ -32,7 +33,7 @@ VISIONARY_URL = "https://chatgpt.com/g/g-68ce5925196c8191a222e24d29323813-the-vi
 
 _FILE_CACHE: Dict[str, Tuple[List[str], Optional[Path], Optional[Tuple[int, int]]]] = {}
 PROMPTER_ROOT = Path(__file__).resolve().parent
-PROMPT_WRITER_STATE_VERSION = 3
+PROMPT_WRITER_STATE_VERSION = 4
 MAX_STATE_TEXT_LENGTH = 24000
 REFERENCE_IMAGE_MAX_COUNT = 3
 REFERENCE_IMAGE_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
@@ -1295,7 +1296,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         self._images = ["Cover Prompt", "Letter Prompt", "Wall Prompt", "Back Prompt"]
         self.preview_widgets: Dict[str, QtWidgets.QTextEdit] = {}
+        self.copy_buttons: Dict[str, QtWidgets.QPushButton] = {}
         self._generated_prompts: Dict[str, str] = {}
+        self._generated_input_signature = ""
+        self._generated_output_valid = False
         self._reference_images: List[ReferenceImage] = []
         self._references_visible = True
         self._reference_html_encode_failures: List[str] = []
@@ -1446,7 +1450,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
         config = self._managed_list_config(key)
         entries = self._read_managed_entries(key)
         combo = self._managed_combo_for_key(key)
+        previous_text = combo.currentText().strip()
         self._populate_managed_combo(combo, entries, allow_none=bool(config["allow_none"]))
+        if previous_text and combo.currentText().strip() != previous_text:
+            self._invalidate_generated_output()
         if key == "color":
             self._colors_path_used = self._resolve_managed_list_path("color")
 
@@ -1595,6 +1602,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 for image_name in self._images
                 if _normalize_text(generated_raw.get(image_name, "")).strip()
             },
+            "generated_input_signature": _normalize_text(
+                state.get("generated_input_signature", ""),
+                strip=True,
+                max_length=64,
+            ),
             "reference_images": [
                 {
                     "id": ref.id,
@@ -1654,6 +1666,32 @@ class PromptWriterPanel(QtWidgets.QWidget):
             (self.cb_simplified_details, POLICY_DETAIL_OPTION_SPECS[8][2]),
         )
 
+    def _current_prompt_input_signature(self) -> str:
+        type_text = self.cmb_type.currentText().strip()
+        if type_text == NONE_CHOICE_LABEL:
+            type_text = ""
+        input_state = {
+            "type": type_text,
+            "subject": self.cmb_subject.currentText().strip(),
+            "color": self._get_color_choice() or "",
+            "global": self.txt_global.toPlainText().strip(),
+            "cover": self.txt_cover.toPlainText().strip(),
+            "letter": self.txt_letter.toPlainText().strip(),
+            "wall": self.txt_wall.toPlainText().strip(),
+            "back": self.txt_back.toPlainText().strip(),
+            "checks": {
+                state_key: bool(checkbox.isChecked())
+                for checkbox, state_key in self._checkbox_state_specs()
+            },
+        }
+        encoded = json.dumps(
+            input_state,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     def _capture_state(self) -> dict:
         def _cb(cb: QtWidgets.QCheckBox) -> bool:
             try:
@@ -1685,8 +1723,13 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "generated_prompts": {
                 image_name: prompt
                 for image_name, prompt in self._generated_prompts.items()
-                if prompt.strip()
+                if self._generated_output_valid and prompt.strip()
             },
+            "generated_input_signature": (
+                self._generated_input_signature
+                if self._generated_output_valid
+                else ""
+            ),
             "reference_images": self._reference_images_to_state(),
         }
 
@@ -1752,13 +1795,24 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
             # Generated previews
             try:
-                self._generated_prompts = dict(state.get("generated_prompts", {}))
-                for img, txt in self._generated_prompts.items():
-                    w = self.preview_widgets.get(img)
-                    if w is not None and txt.strip():
-                        w.setPlainText(txt)
+                generated_prompts = dict(state.get("generated_prompts", {}))
+                saved_signature = str(state.get("generated_input_signature", "")).strip()
+                if (
+                    generated_prompts
+                    and saved_signature
+                    and saved_signature == self._current_prompt_input_signature()
+                ):
+                    self._generated_prompts = generated_prompts
+                    self._generated_input_signature = saved_signature
+                    for img, txt in self._generated_prompts.items():
+                        w = self.preview_widgets.get(img)
+                        if w is not None and txt.strip():
+                            w.setPlainText(txt)
+                    self._set_generated_output_valid(True)
+                else:
+                    self._invalidate_generated_output()
             except Exception:
-                pass
+                self._invalidate_generated_output()
 
             try:
                 self._reference_images = self._normalize_reference_images(state.get("reference_images", []))
@@ -1799,6 +1853,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         self.btn_generate = QtWidgets.QPushButton("Generate")
         self.btn_copy = QtWidgets.QPushButton("Copy All")
+        self.btn_copy.setEnabled(False)
         self.btn_add_reference = ReferenceDropButton("Add Reference Image")
         self.btn_erase = QtWidgets.QPushButton("Erase All")
         for b in (self.btn_generate, self.btn_copy, self.btn_add_reference, self.btn_erase):
@@ -2156,6 +2211,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             copy_btn = QtWidgets.QPushButton("Copy")
             copy_btn.setFixedSize(64, 24)
             copy_btn.setToolTip(f"Copy {img}")
+            copy_btn.setEnabled(False)
             header_row.addWidget(copy_btn)
             bl.addLayout(header_row)
 
@@ -2169,6 +2225,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
             self._preview_layout.addWidget(block)
             self.preview_widgets[img] = editor
+            self.copy_buttons[img] = copy_btn
 
             copy_btn.clicked.connect(lambda _, image_name=img: self._copy_prompt(image_name))
             editor.focused.connect(lambda ed=editor: self._set_last_focused(ed))
@@ -2321,20 +2378,40 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.btn_erase.clicked.connect(self._on_erase_all)
 
         try:
-            self.cmb_type.currentTextChanged.connect(lambda *_: self._schedule_persist_state())
-            self.cmb_subject.currentTextChanged.connect(lambda *_: self._schedule_persist_state())
-            self.cmb_color.currentIndexChanged.connect(lambda *_: self._schedule_persist_state())
-            self.txt_global.textChanged.connect(lambda: self._schedule_persist_state())
-            self.txt_cover.textChanged.connect(lambda: self._schedule_persist_state())
-            self.txt_letter.textChanged.connect(lambda: self._schedule_persist_state())
-            self.txt_wall.textChanged.connect(lambda: self._schedule_persist_state())
-            self.txt_back.textChanged.connect(lambda: self._schedule_persist_state())
+            self.cmb_type.currentTextChanged.connect(self._on_prompt_input_changed)
+            self.cmb_subject.currentTextChanged.connect(self._on_prompt_input_changed)
+            self.cmb_color.currentIndexChanged.connect(self._on_prompt_input_changed)
+            self.txt_global.textChanged.connect(self._on_prompt_input_changed)
+            self.txt_cover.textChanged.connect(self._on_prompt_input_changed)
+            self.txt_letter.textChanged.connect(self._on_prompt_input_changed)
+            self.txt_wall.textChanged.connect(self._on_prompt_input_changed)
+            self.txt_back.textChanged.connect(self._on_prompt_input_changed)
             for group, fallback in self._exclusive_checkbox_groups():
                 self._wire_exclusive_group(group, fallback)
             for checkbox, _ in self._checkbox_state_specs():
-                checkbox.stateChanged.connect(lambda *_: self._schedule_persist_state())
+                checkbox.stateChanged.connect(self._on_prompt_input_changed)
         except Exception:
             pass
+
+    def _set_generated_output_valid(self, valid: bool) -> None:
+        self._generated_output_valid = bool(valid and self._generated_prompts)
+        self.btn_copy.setEnabled(self._generated_output_valid)
+        for image_name, button in self.copy_buttons.items():
+            button.setEnabled(
+                self._generated_output_valid
+                and bool(self._generated_prompts.get(image_name, "").strip())
+            )
+
+    def _invalidate_generated_output(self) -> None:
+        self._generated_prompts = {}
+        self._generated_input_signature = ""
+        for widget in self.preview_widgets.values():
+            widget.clear()
+        self._set_generated_output_valid(False)
+
+    def _on_prompt_input_changed(self, *_args: object) -> None:
+        self._invalidate_generated_output()
+        self._schedule_persist_state()
 
     def _clear_reference_cards(self) -> None:
         try:
@@ -2654,6 +2731,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
         return "\n".join(lines)
 
     def _build_copy_all_text(self) -> str:
+        if not self._generated_output_valid:
+            return ""
         parts: List[str] = []
         for key in self._images:
             text = self._generated_prompts.get(key, "").strip()
@@ -2745,6 +2824,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
             debug_map[img] = dbg
 
         self._generated_prompts = dict(prompts)
+        self._generated_input_signature = self._current_prompt_input_signature()
+        self._set_generated_output_valid(True)
 
         for img in self._images:
             w = self.preview_widgets.get(img)
@@ -2782,6 +2863,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
         return self._copy_all_prompts_text()
 
     def _copy_prompt(self, image_name: str) -> None:
+        if not self._generated_output_valid:
+            return
         text = self._generated_prompts.get(image_name, "").strip()
         if not text:
             widget = self.preview_widgets.get(image_name)
@@ -2799,11 +2882,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.cb_neutral_style.setChecked(True)
         self.cb_unspecified_framing.setChecked(True)
 
-        self._generated_prompts = {}
         self._reference_images = []
         self.txt_global.clear(); self.txt_cover.clear(); self.txt_letter.clear(); self.txt_wall.clear(); self.txt_back.clear()
-        for w in self.preview_widgets.values():
-            w.clear()
+        self._invalidate_generated_output()
 
         self._load_colors_into_combo()
         self._refresh_reference_image_panel()

@@ -291,18 +291,20 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_panel = QtWidgets.QFrame()
         self.saved_panel.setObjectName("ForgeSavedPanel")
         self.saved_panel.setMaximumWidth(820)
+        self.saved_panel.setMinimumHeight(64)
         self.saved_panel.setStyleSheet(
             "QFrame#ForgeSavedPanel{background:#101820;"
             "border:1px solid #284554;border-radius:7px;}"
         )
         saved_row = QtWidgets.QHBoxLayout(self.saved_panel)
-        saved_row.setContentsMargins(10, 8, 10, 8)
+        saved_row.setContentsMargins(10, 12, 10, 12)
         saved_row.setSpacing(8)
-        saved_row.addWidget(QtWidgets.QLabel("Saved letter"))
+        saved_row.addWidget(QtWidgets.QLabel("Saved Letter"))
         self.saved_selector = QtWidgets.QComboBox()
         self.saved_selector.setEditable(True)
         self.saved_selector.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
-        self.saved_selector.setMinimumWidth(360)
+        self.saved_selector.setMinimumWidth(160)
+        self.saved_selector.setMinimumHeight(36)
         self.saved_selector.setSizeAdjustPolicy(
             QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
         )
@@ -312,9 +314,11 @@ class ForgeTab(QtWidgets.QWidget):
             completer.setCompletionMode(QtWidgets.QCompleter.PopupCompletion)
         saved_row.addWidget(self.saved_selector, 1)
         self.load_saved_btn = self._small_button("Load Saved Letter")
+        self.load_saved_btn.setMinimumSize(136, 36)
         self.load_saved_btn.clicked.connect(self.load_selected_letter)
         saved_row.addWidget(self.load_saved_btn)
         self.refresh_saved_btn = self._small_button("Refresh")
+        self.refresh_saved_btn.setMinimumSize(72, 36)
         self.refresh_saved_btn.clicked.connect(self.refresh_saved_letters)
         saved_row.addWidget(self.refresh_saved_btn)
 
@@ -438,6 +442,12 @@ class ForgeTab(QtWidgets.QWidget):
         )
         if identity_width:
             self.identity_panel.setFixedWidth(identity_width)
+        saved_width = max(
+            0,
+            min(820, self.width() - (side_margin * 2)),
+        )
+        if saved_width:
+            self.saved_panel.setFixedWidth(saved_width)
         self._sync_heading_balance()
         super().resizeEvent(event)
 

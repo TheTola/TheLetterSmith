@@ -300,6 +300,10 @@ class Nexus(QtWidgets.QMainWindow):
     def __init__(self, project_root: str | Path):
         super().__init__()
         self.project_root = str(project_root)
+        self._forge_fullscreen_active = False
+        self._forge_fullscreen_was_maximized = False
+        self._forge_fullscreen_geometry: Optional[QtCore.QByteArray] = None
+        self._forge_fullscreen_visibility: dict[QtWidgets.QWidget, bool] = {}
         self.setObjectName("NexusWindow")
 
         # Frameless + QSS
@@ -405,10 +409,10 @@ class Nexus(QtWidgets.QMainWindow):
         """)
 
         # Central layout
-        main_widget = QtWidgets.QWidget(self)
-        main_widget.setObjectName("NexusRoot")
-        main_widget.setAttribute(Qt.WA_StyledBackground, True)
-        main_layout = QtWidgets.QVBoxLayout(main_widget)
+        self.main_widget = QtWidgets.QWidget(self)
+        self.main_widget.setObjectName("NexusRoot")
+        self.main_widget.setAttribute(Qt.WA_StyledBackground, True)
+        main_layout = QtWidgets.QVBoxLayout(self.main_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
@@ -465,6 +469,7 @@ class Nexus(QtWidgets.QMainWindow):
         self.html_preview.page().fullScreenRequested.connect(
             self._on_web_fullscreen_requested
         )
+        self.html_preview.installEventFilter(self)
         self.preview_stack.addWidget(self.html_preview)
 
         pf_layout.addWidget(self.preview_stack)
@@ -652,7 +657,7 @@ class Nexus(QtWidgets.QMainWindow):
         )
 
         main_layout.addWidget(self.body)
-        self.setCentralWidget(main_widget)
+        self.setCentralWidget(self.main_widget)
 
         # Status bar
         self._status = QStatusBar()
@@ -709,7 +714,6 @@ class Nexus(QtWidgets.QMainWindow):
         self._sound_preview_index: Optional[int] = None
         self._forge_preview_mode = "portrait"
         self._forge_preview_generation = 0
-        self._forge_fullscreen_host: Optional[QtWidgets.QDialog] = None
 
         # Remember last image pixmap for proper re-scaling on resize
         self._last_pixmap: Optional[QPixmap] = None
@@ -1292,19 +1296,45 @@ class Nexus(QtWidgets.QMainWindow):
         )
         self._update_preview_geometry()
         self._last_pixmap = None
-        self._clear_preview()
-        self.preview_caption.setVisible(False)
-        self._forge_preview_generation += 1
-        viewer_url = QUrl.fromLocalFile(str(index.resolve()))
         try:
             modified = index.stat().st_mtime_ns
         except OSError:
-            modified = self._forge_preview_generation
+            modified = None
+
+        current_url = self.html_preview.url()
+        current_path = Path(current_url.toLocalFile()) if current_url.isLocalFile() else None
+        same_build = False
+        if current_path is not None:
+            try:
+                same_build = current_path.resolve() == index.resolve()
+            except OSError:
+                same_build = False
+        if same_build and modified is not None:
+            same_build = current_url.query().startswith(
+                f"lettersmith={modified}-"
+            )
+
+        self._clear_preview()
+        self.preview_caption.setVisible(False)
+        self.preview_stack.setCurrentWidget(self.html_preview)
+        if same_build:
+            self.status(
+                f"Interactive letter preview: "
+                f"{self._forge_preview_mode.replace('-', ' ')}"
+            )
+            return
+
+        self._forge_preview_generation += 1
+        viewer_url = QUrl.fromLocalFile(str(index.resolve()))
+        cache_token = (
+            modified
+            if modified is not None
+            else self._forge_preview_generation
+        )
         viewer_url.setQuery(
-            f"lettersmith={modified}-{self._forge_preview_generation}"
+            f"lettersmith={cache_token}-{self._forge_preview_generation}"
         )
         self.html_preview.setUrl(viewer_url)
-        self.preview_stack.setCurrentWidget(self.html_preview)
         self.status(
             f"Interactive letter preview: "
             f"{self._forge_preview_mode.replace('-', ' ')}"
@@ -1322,38 +1352,88 @@ class Nexus(QtWidgets.QMainWindow):
         toggle_on = bool(request.toggleOn())
         request.accept()
         if toggle_on:
-            if self._forge_fullscreen_host is not None:
+            if self._forge_fullscreen_active:
                 return
-            if self.preview_stack.indexOf(self.html_preview) >= 0:
-                self.preview_stack.removeWidget(self.html_preview)
-            host = QtWidgets.QDialog(self)
-            host.setWindowTitle("Letter Preview")
-            host.setWindowFlag(Qt.FramelessWindowHint, True)
-            layout = QVBoxLayout(host)
-            layout.setContentsMargins(0, 0, 0, 0)
-            self.html_preview.setParent(host)
-            layout.addWidget(self.html_preview)
-            host.finished.connect(self._restore_forge_preview_from_fullscreen)
-            self._forge_fullscreen_host = host
-            host.showFullScreen()
-            self.html_preview.setFocus()
+            self._enter_forge_fullscreen()
             return
         self._restore_forge_preview_from_fullscreen()
 
-    def _restore_forge_preview_from_fullscreen(self, *_args) -> None:
-        host = self._forge_fullscreen_host
-        if host is None:
+    def _enter_forge_fullscreen(self) -> None:
+        self._forge_fullscreen_active = True
+        self._forge_fullscreen_was_maximized = self.isMaximized()
+        self._forge_fullscreen_geometry = self.saveGeometry()
+        chrome = (
+            self.title_bar,
+            self.tabbar,
+            self.preview_caption,
+            self.forge_tab.preview_format_panel,
+            self.help_icon,
+            self.page_stack,
+            self.statusBar(),
+        )
+        self._forge_fullscreen_visibility = {
+            widget: widget.isVisible()
+            for widget in chrome
+        }
+        for widget in chrome:
+            widget.hide()
+
+        body_layout = self.body.layout()
+        if body_layout is not None:
+            body_layout.setContentsMargins(0, 0, 0, 0)
+            body_layout.setSpacing(0)
+        preview_layout = self.preview_frame.layout()
+        if preview_layout is not None:
+            preview_layout.setContentsMargins(0, 0, 0, 0)
+        self.preview_frame.setStyleSheet(
+            "background:#0b0c12;border:none;border-radius:0;"
+        )
+        self.showFullScreen()
+        QtCore.QTimer.singleShot(0, self._fit_forge_fullscreen_preview)
+        QtCore.QTimer.singleShot(
+            80,
+            self._fit_forge_fullscreen_preview,
+        )
+        self.html_preview.setFocus()
+
+    def _fit_forge_fullscreen_preview(self) -> None:
+        if not self._forge_fullscreen_active:
             return
-        self._forge_fullscreen_host = None
-        host.layout().removeWidget(self.html_preview)
-        self.html_preview.setParent(self.preview_stack)
-        if self.preview_stack.indexOf(self.html_preview) < 0:
-            self.preview_stack.addWidget(self.html_preview)
-        if self.tabbar.currentIndex() == 3:
-            self.preview_stack.setCurrentWidget(self.html_preview)
-        if host.isVisible():
-            host.close()
-        host.deleteLater()
+        self.preview_frame.setFixedSize(
+            max(1, self.body.width()),
+            max(1, self.body.height()),
+        )
+
+    def _restore_forge_preview_from_fullscreen(self, *_args) -> None:
+        if not self._forge_fullscreen_active:
+            return
+        self._forge_fullscreen_active = False
+        self.preview_frame.setStyleSheet("")
+        preview_layout = self.preview_frame.layout()
+        if preview_layout is not None:
+            preview_layout.setContentsMargins(6, 6, 6, 6)
+        body_layout = self.body.layout()
+        if body_layout is not None:
+            body_layout.setContentsMargins(12, 12, 12, 12)
+            body_layout.setSpacing(10)
+
+        if self._forge_fullscreen_was_maximized:
+            self.showMaximized()
+        else:
+            self.showNormal()
+            if self._forge_fullscreen_geometry is not None:
+                self.restoreGeometry(self._forge_fullscreen_geometry)
+
+        for widget, was_visible in self._forge_fullscreen_visibility.items():
+            widget.setVisible(was_visible)
+        self._forge_fullscreen_visibility.clear()
+        self._forge_fullscreen_geometry = None
+        QtCore.QTimer.singleShot(0, self._update_preview_geometry)
+        QtCore.QTimer.singleShot(
+            0,
+            lambda: self.preview_stack.setCurrentWidget(self.html_preview),
+        )
+        self.html_preview.setFocus()
 
     def _read_project_title(self) -> str:
         """Read recipient_title from settings.json (best available 'project title' signal)."""
@@ -1373,6 +1453,9 @@ class Nexus(QtWidgets.QMainWindow):
     # ─────────────────────────────────────────────────────────
     def _update_preview_geometry(self) -> None:
         """Keep Sound usable in normal windows without changing full-screen layout."""
+        if self._forge_fullscreen_active:
+            self._fit_forge_fullscreen_preview()
+            return
         window_height = max(1, self.height())
         window_width = max(1, self.width())
         try:
@@ -1388,14 +1471,14 @@ class Nexus(QtWidgets.QMainWindow):
 
         if current_tab == 3:
             mode = getattr(self, "_forge_preview_mode", "portrait")
-            max_h = max(260, int(window_height * 0.38))
-            max_w = max(420, int(window_width * 0.82))
+            max_h = max(220, int(window_height * 0.34))
+            max_w = max(360, int(window_width * 0.74))
             if mode == "portrait":
                 h = max_h
-                w = int(h * (2 / 3))
+                w = int(h * 0.8)
                 if w > max_w:
                     w = max_w
-                    h = int(w * (3 / 2))
+                    h = int(w / 0.8)
             elif mode == "landscape":
                 w = min(max_w, int(max_h * (16 / 9)))
                 h = int(w * (9 / 16))
@@ -1641,6 +1724,19 @@ class Nexus(QtWidgets.QMainWindow):
         # Safe object lookups (avoid AttributeError if Qt routes to a different QObject)
         icon = getattr(self, "help_icon", None)
         pop  = getattr(self, "help_pop", None)
+        web_view = getattr(self, "html_preview", None)
+
+        if (
+            web_view is not None
+            and watched is web_view
+            and self._forge_fullscreen_active
+            and event.type() == QEvent.KeyPress
+            and isinstance(event, QtGui.QKeyEvent)
+            and event.key() == Qt.Key_Escape
+        ):
+            web_view.page().runJavaScript(
+                "if (document.fullscreenElement) document.exitFullscreen();"
+            )
 
         if icon is not None and watched is icon:
             t = event.type()
