@@ -74,6 +74,10 @@ _PREVIEW_AR = 169 / 253  # preview frame aspect (matches your 169×253 scaling)
 HELP_ICON_PX = 125
 HELP_ICON_HALF = HELP_ICON_PX // 2
 
+# Command deliberately bypasses the normal TabSwitcher slide. Its body-level
+# fade covers the preview, help, and page layout as one stable snapshot.
+COMMAND_FADE_MS = 440
+
 
 # ─────────────────────────────────────────────────────────────
 # Event filter for message double-click on QWebEngineView
@@ -675,8 +679,16 @@ class Nexus(QtWidgets.QMainWindow):
             self._spark.setGeometry(self.body.rect())
             self._spark.hide()
 
-        # Optional tab switcher animations
+        # Optional tab switcher animations. This remains responsible only for
+        # ordinary tab-to-tab movement. Command transitions bypass it entirely.
         self._tabswitch = TabSwitcher(self.page_stack) if TabSwitcher else None
+
+        # Command transition state. Fixed body snapshots prevent Command from
+        # inheriting movement from page-stack resizing or preview visibility.
+        self._command_fade_animation: Optional[QtCore.QPropertyAnimation] = None
+        self._command_fade_effect: Optional[QGraphicsOpacityEffect] = None
+        self._command_fade_overlays: list[QLabel] = []
+        self._command_fade_generation = 0
 
         # === Mounted Sound visualizer state ===
         self._sound_preview_widget: Optional[QtWidgets.QWidget] = None
@@ -919,11 +931,30 @@ class Nexus(QtWidgets.QMainWindow):
     # ─────────────────────────────────────────────────────────
     # Tabs — show correct preview per tab + update help visibility/content
     # ─────────────────────────────────────────────────────────
-    def _tab_changed(self, idx: int):
-        # Sound owns playback and its visualizer only while tab index 1 is active.
-        # Forge/readiness windows are intentionally not touched here. Their
-        # visibility and manual-close state remain owned by Forge; entering Sound
-        # must never show or recreate them.
+    def _tab_changed(self, idx: int) -> None:
+        """
+        Route the requested tab transition.
+
+        Ordinary tabs keep the shared slide animation. Any transition entering
+        or leaving Command bypasses TabSwitcher and uses a fixed body-snapshot
+        fade so no page, preview, or help movement leaks through.
+        """
+        if idx < 0 or idx >= self.page_stack.count():
+            return
+
+        # A new request supersedes an in-progress Command fade. Its target page
+        # was already committed underneath the snapshots.
+        self._cancel_command_fade()
+        old_idx = self.page_stack.currentIndex()
+
+        if old_idx != idx and (old_idx == 4 or idx == 4):
+            self._run_command_transition(idx)
+            return
+
+        self._apply_tab_state(idx, animate_page=(old_idx != idx))
+
+    def _apply_tab_state(self, idx: int, *, animate_page: bool) -> None:
+        """Apply the complete settled UI state for one tab."""
         if idx != 1:
             try:
                 self.sound_tab.deactivate_for_tab_change()
@@ -933,62 +964,218 @@ class Nexus(QtWidgets.QMainWindow):
 
         self._last_pixmap = None
         self._clear_preview()
-        self.preview_stack.setCurrentIndex(0)  # blank
+        self.preview_stack.setCurrentIndex(0)
         self.preview_caption.setVisible(False)
-
-        # Recalculate the preview immediately when the active tab changes.
-        # The Sound tab uses a shorter preview in a normal window so its full
-        # control panel remains visible without requiring maximized mode.
-        QtCore.QTimer.singleShot(0, self._update_preview_geometry)
-
-        # Hide preview only on "Command" tab (index 4)
         self.preview_frame.setVisible(idx != 4)
 
-        if self._tabswitch:
+        if animate_page and self._tabswitch is not None:
             self._tabswitch.go_to(idx)
         else:
+            self._stop_shared_tab_animation()
             self.page_stack.setCurrentIndex(idx)
 
         tab_name = self.tabbar.tabText(idx)
         self.status(f"Switched to: {tab_name}")
         self.forge_tab.refresh_readiness()
 
-        # Per-tab preview rules:
-        # - Images: start blank; ImageTab will emit preview on hover/selection.
-        # - Sound: show the mounted visualizer widget.
-        # - Message: show current message state (message.png if present; else wall fallback).
-        # - Forge: show the generated interactive viewer.
-        # - Command: preview hidden; still hard-cleared.
         if idx == 0:
-            self.preview_stack.setCurrentIndex(0)  # blank
-
+            self.preview_stack.setCurrentIndex(0)
         elif idx == 1:
             try:
                 self.sound_tab.activate_for_tab_change()
-                self._mount_sound_preview(self.sound_tab.shared_preview_widget())
+                self._mount_sound_preview(
+                    self.sound_tab.shared_preview_widget()
+                )
             except Exception as ex:
                 self.status(f"⚠️ Sound preview unavailable: {ex}")
             if self._sound_preview_index is not None:
                 self.preview_stack.setCurrentIndex(self._sound_preview_index)
             else:
                 self.preview_stack.setCurrentIndex(0)
-
         elif idx == 2:
-            # Let MessageTab decide what to show; it will emit preview_image.
             QtCore.QTimer.singleShot(0, self._request_message_preview)
-
         elif idx == 3:
-            # Forge: show the generated interactive viewer.
             QtCore.QTimer.singleShot(0, self._show_forge_preview)
-
         else:
             self.preview_stack.setCurrentIndex(0)
 
-        # Help: show on all tabs except Command
         self.help_icon.setVisible(idx != 4)
         if self.help_pop.isVisible():
-            self._refresh_help_text(idx)
-            self._reposition_help_popover()
+            if idx == 4:
+                self._hide_help_popover()
+            else:
+                self._refresh_help_text(idx)
+                self._reposition_help_popover()
+
+        QtCore.QTimer.singleShot(0, self._update_preview_geometry)
+
+    def _stop_shared_tab_animation(self) -> None:
+        """Stop and clean the ordinary TabSwitcher without starting another."""
+        switcher = self._tabswitch
+        if switcher is None:
+            return
+
+        stop = getattr(switcher, "_stop_active", None)
+        if callable(stop):
+            try:
+                stop()
+                return
+            except Exception:
+                pass
+
+        active = getattr(switcher, "_active", None)
+        if active is not None:
+            try:
+                active.stop()
+            except Exception:
+                pass
+
+    def _grab_body_snapshot(self) -> QPixmap:
+        """Capture the body without including temporary transition overlays."""
+        visibility: list[tuple[QLabel, bool]] = []
+        for overlay in self._command_fade_overlays:
+            try:
+                visibility.append((overlay, overlay.isVisible()))
+                overlay.hide()
+            except RuntimeError:
+                pass
+
+        try:
+            snapshot = self.body.grab()
+        finally:
+            for overlay, was_visible in visibility:
+                try:
+                    overlay.setVisible(was_visible)
+                    if was_visible:
+                        overlay.raise_()
+                except RuntimeError:
+                    pass
+
+        return snapshot
+
+    def _make_body_snapshot_overlay(self, pixmap: QPixmap) -> QLabel:
+        """Create a mouse-transparent snapshot over the complete body."""
+        overlay = QLabel(self.body)
+        overlay.setObjectName("CommandTransitionSnapshot")
+        overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        overlay.setAttribute(Qt.WA_NoSystemBackground, True)
+        overlay.setStyleSheet(
+            "QLabel#CommandTransitionSnapshot {"
+            "background: transparent; border: none; padding: 0; margin: 0;"
+            "}"
+        )
+        overlay.setGeometry(self.body.rect())
+        overlay.setPixmap(pixmap)
+        overlay.setScaledContents(False)
+        overlay.show()
+        overlay.raise_()
+        self._command_fade_overlays.append(overlay)
+        return overlay
+
+    def _settle_body_layout_for_snapshot(self) -> None:
+        """Commit pending destination layout while the old snapshot masks it."""
+        try:
+            body_layout = self.body.layout()
+            if body_layout is not None:
+                body_layout.invalidate()
+                body_layout.activate()
+
+            stack_layout = self.page_stack.layout()
+            if stack_layout is not None:
+                stack_layout.invalidate()
+                stack_layout.activate()
+
+            self.body.updateGeometry()
+            self.page_stack.updateGeometry()
+            QtWidgets.QApplication.processEvents(
+                QtCore.QEventLoop.ExcludeUserInputEvents
+                | QtCore.QEventLoop.ExcludeSocketNotifiers
+            )
+        except Exception:
+            pass
+
+    def _run_command_transition(self, new_idx: int) -> None:
+        """
+        Fade only Command while the complete source or destination stays fixed.
+
+        Entering Command fades a settled Command snapshot over the old body.
+        Leaving Command fades the old Command snapshot over the settled target.
+        """
+        self._stop_shared_tab_animation()
+        self._cancel_command_fade()
+
+        old_snapshot = self._grab_body_snapshot()
+        old_overlay = self._make_body_snapshot_overlay(old_snapshot)
+
+        self._apply_tab_state(new_idx, animate_page=False)
+        self._settle_body_layout_for_snapshot()
+
+        entering_command = new_idx == 4
+        if entering_command:
+            command_snapshot = self._grab_body_snapshot()
+            fading_overlay = self._make_body_snapshot_overlay(command_snapshot)
+            start_opacity = 0.0
+            end_opacity = 1.0
+        else:
+            fading_overlay = old_overlay
+            start_opacity = 1.0
+            end_opacity = 0.0
+
+        effect = QGraphicsOpacityEffect(fading_overlay)
+        effect.setOpacity(start_opacity)
+        fading_overlay.setGraphicsEffect(effect)
+
+        animation = QtCore.QPropertyAnimation(effect, b"opacity", self)
+        animation.setDuration(COMMAND_FADE_MS)
+        animation.setStartValue(start_opacity)
+        animation.setEndValue(end_opacity)
+        animation.setEasingCurve(QtCore.QEasingCurve.InOutSine)
+
+        self._command_fade_generation += 1
+        generation = self._command_fade_generation
+        self._command_fade_effect = effect
+        self._command_fade_animation = animation
+
+        def finish() -> None:
+            if generation != self._command_fade_generation:
+                return
+            self._clear_command_fade_objects()
+
+        animation.finished.connect(finish)
+        animation.start()
+
+    def _clear_command_fade_objects(self) -> None:
+        """Remove transition effects and snapshots without changing pages."""
+        animation = self._command_fade_animation
+        self._command_fade_animation = None
+        self._command_fade_effect = None
+
+        overlays = self._command_fade_overlays
+        self._command_fade_overlays = []
+        for overlay in overlays:
+            try:
+                overlay.setGraphicsEffect(None)
+                overlay.hide()
+                overlay.deleteLater()
+            except RuntimeError:
+                pass
+
+        if animation is not None:
+            try:
+                animation.deleteLater()
+            except RuntimeError:
+                pass
+
+    def _cancel_command_fade(self) -> None:
+        """Cancel a running fade and leave its committed target visible."""
+        self._command_fade_generation += 1
+        animation = self._command_fade_animation
+        if animation is not None:
+            try:
+                animation.stop()
+            except RuntimeError:
+                pass
+        self._clear_command_fade_objects()
 
     # ─────────────────────────────────────────────────────────
     # Preview rendering (image/html) + fade behavior
