@@ -97,6 +97,10 @@ class SavedLetterRestoreError(RuntimeError):
     pass
 
 
+class SavedLetterDeleteError(RuntimeError):
+    pass
+
+
 def _read_metadata(path: Path) -> dict[str, Any]:
     for name in _METADATA_NAMES:
         candidate = path / name
@@ -219,6 +223,41 @@ class SavedLetterCatalog:
             for entry in self.list_entries()
             if needle in f"{entry.recipient} {entry.title}".casefold()
         )
+
+    def delete(self, entry: SavedLetter) -> Path:
+        if not isinstance(entry, SavedLetter):
+            raise SavedLetterDeleteError("The saved letter is invalid.")
+        source = Path(entry.path)
+        if source.is_symlink():
+            raise SavedLetterDeleteError("Saved-letter links cannot be deleted.")
+        try:
+            target = source.resolve(strict=True)
+        except OSError as error:
+            raise SavedLetterDeleteError(
+                "The saved letter no longer exists."
+            ) from error
+
+        allowed_root: Optional[Path] = None
+        for root in (self.play_root, self.recovery_root):
+            try:
+                relative = target.relative_to(root)
+            except ValueError:
+                continue
+            if relative.parts:
+                allowed_root = root
+                break
+        if allowed_root is None or not self._is_valid_candidate(target):
+            raise SavedLetterDeleteError(
+                "The saved letter is outside the managed letter folders."
+            )
+
+        try:
+            shutil.rmtree(target)
+        except OSError as error:
+            raise SavedLetterDeleteError(
+                "The saved letter could not be deleted."
+            ) from error
+        return target
 
     @staticmethod
     def metadata(path: str | Path) -> dict[str, Any]:
@@ -859,6 +898,7 @@ __all__ = [
     "RestoredProject",
     "SavedLetter",
     "SavedLetterCatalog",
+    "SavedLetterDeleteError",
     "SavedLetterRestoreError",
     "SavedLetterRestorer",
     "update_saved_metadata",

@@ -787,6 +787,7 @@ class ForgeTab(QtWidgets.QWidget):
             ):
                 widget.deleteLater()
         if not self._saved_cards:
+            self.saved_cards_widget.setMinimumHeight(180)
             empty = QtWidgets.QLabel(
                 "No saved letters yet. Preview a letter to create one."
             )
@@ -800,6 +801,8 @@ class ForgeTab(QtWidgets.QWidget):
 
         available = max(184, self.saved_scroll.viewport().width() - 8)
         columns = max(1, available // 192)
+        rows = (len(self._saved_cards) + columns - 1) // columns
+        self.saved_cards_widget.setMinimumHeight((rows * 222) + 4)
         for index, card in enumerate(self._saved_cards):
             self.saved_cards_layout.addWidget(
                 card,
