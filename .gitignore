@@ -25,3 +25,16 @@ gallery/user/message/
 gallery/user/pages/
 gallery/user/sounds/archive/
 gallery/user/sounds/appssong/
+# Python environment and caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+# Generated letters and archives
+output/
+# Downloaded and bundled FFmpeg files
+tools/_ffmpeg_download/
+tools/ffmpeg.exe
+tools/ffprobe.exe
+# Oversized generated conversion file
+converted64/convert64.py
