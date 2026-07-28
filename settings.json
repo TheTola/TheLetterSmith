@@ -21,7 +21,7 @@
   "message_html_file": "message.html",
   "message_image_file": "message.png",
   "music_file": "",
-  "music_volume": 26,
+  "music_volume": 100,
   "output_dir": "converted64",
   "required_slides": [
     "cover.png",
@@ -31,7 +31,7 @@
   ],
   "sound_gif": "sound.gif",
   "sounds_dir": "sounds",
-  "starting_volume": 26,
+  "starting_volume": 100,
   "verbose": false,
   "recipient_title": "Growth & Ice Cream",
   "recipient_name": "Ijeoma Athenna Ahananu",

@@ -61,7 +61,6 @@ TEMPLATE_HTML = r"""
       <img src="gallery/controls/npage.png" alt="" aria-hidden="true">
     </button>
 
-    <div id="progress" aria-live="polite">Page 1 of 4</div>
     <div id="viewer-actions" aria-label="Letter controls">
       <div id="viewer-actions-left">
         <button
@@ -233,7 +232,6 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .nav-button[disabled]{opacity:.35;cursor:not-allowed;filter:grayscale(1);box-shadow:none}
 .nav-button[disabled]:hover{transform:translateY(-50%)}
 
-#progress{position:absolute;right:var(--corner-offset);bottom:var(--corner-offset);display:inline-flex;align-items:center;min-height:40px;padding:0 14px;border:1px solid rgba(255,255,255,.10);border-radius:var(--pill-radius);background:rgba(6,9,16,.56);box-shadow:var(--hud-shadow);color:var(--text-soft);font:700 clamp(12px,1.2vw,14px)/1 var(--font-ui);letter-spacing:.08em;text-transform:uppercase;z-index:101}
 #viewer-actions{position:absolute;top:var(--corner-offset);left:var(--corner-offset);right:var(--corner-offset);display:flex;align-items:center;justify-content:space-between;pointer-events:none;z-index:107}
 #viewer-actions-left{display:flex;align-items:center;gap:8px}
 #viewer-actions .viewer-action{width:auto;height:38px;padding:0 12px;font:700 12px/1 var(--font-ui);letter-spacing:.03em;pointer-events:auto}
@@ -283,7 +281,8 @@ body.stage-ready #volume-control{opacity:1;visibility:visible;pointer-events:aut
 #turnShadow{position:absolute;left:0;top:0;width:0;height:0;pointer-events:none;z-index:39;opacity:0;border-radius:var(--page-radius);overflow:hidden;--sx:18%;--sd:.28;--sb:14px;background:radial-gradient(140% 90% at var(--sx) 55%,rgba(0,0,0,var(--sd)) 0%,rgba(0,0,0,0) 62%);filter:blur(var(--sb))}
 
 @media (max-width: 900px){:root{--nav-size:clamp(48px,8vw,66px);--wall-gap:clamp(18px,4vw,30px)}.text-wall-content{font-size:clamp(16px,1.8vw,18px)}}
-@media (max-width: 640px){:root{--nav-size:34px;--nav-pad:4px;--icon-size:34px;--close-size:38px;--corner-offset:12px;--control-rail:50px;--bottom-control-rail:60px;--page-side-rail:50px}#prev,#next{top:50%}#volume-control{left:var(--corner-offset);right:auto;bottom:calc(5px + env(safe-area-inset-bottom));padding:4px;transform:none}body.stage-ready #volume-control{transform:none}#progress{right:var(--corner-offset);bottom:calc(5px + env(safe-area-inset-bottom));min-height:34px;padding:0 10px;font-size:10px}#viewer-actions{top:10px;left:10px;right:10px}#viewer-actions-left{gap:5px}#viewer-actions .viewer-action{height:32px;padding:0 8px;font-size:10px}#open-text{left:50%;bottom:calc(5px + env(safe-area-inset-bottom));transform:translateX(-50%)}#close-text{top:52px;right:10px}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - (2 * var(--wall-gap)) - 100px)}#volume-control.slider-open #volume-slider{width:min(28vw,64px)}}
+@media (min-aspect-ratio: 2/1){:root{--nav-size:clamp(34px,12vh,52px);--nav-pad:4px;--icon-size:clamp(34px,12vh,46px);--corner-offset:12px}#prev,#next{top:50%}#volume-control{bottom:var(--corner-offset);padding:4px}}
+@media (max-width: 640px){:root{--nav-size:34px;--nav-pad:4px;--icon-size:34px;--close-size:38px;--corner-offset:12px;--control-rail:50px;--bottom-control-rail:60px;--page-side-rail:50px}#prev,#next{top:50%}#volume-control{left:var(--corner-offset);right:auto;bottom:calc(5px + env(safe-area-inset-bottom));padding:4px;transform:none}body.stage-ready #volume-control{transform:none}#viewer-actions{top:10px;left:10px;right:10px}#viewer-actions-left{gap:5px}#viewer-actions .viewer-action{height:32px;padding:0 8px;font-size:10px}#open-text{left:50%;bottom:calc(5px + env(safe-area-inset-bottom));transform:translateX(-50%)}#close-text{top:52px;right:10px}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - (2 * var(--wall-gap)) - 100px)}#volume-control.slider-open #volume-slider{width:min(28vw,64px)}}
 @media (max-width: 220px){:root{--page-side-rail:58px}#viewer-actions .viewer-action{width:34px;padding:0;font-size:0}#restart-button::before{content:"↻";font-size:18px}#mute-button::before{content:"🔇";font-size:15px}#mute-button[aria-pressed="true"]::before{content:"🔊"}#fullscreen-button::before{content:"⛶";font-size:17px}}
 @media (prefers-reduced-motion: reduce){*,*::before,*::after{scroll-behavior:auto !important}#slideshow,#volume-control,#open-text,#close-text,.text-wall,#volume-slider{transition:none}#begin-button{animation:none}#curtain-overlay.is-visible,#curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
 """
@@ -298,7 +297,6 @@ document.addEventListener('DOMContentLoaded', () => {
   const slides    = Array.from(document.querySelectorAll('.slide'));
   const prevBtn   = document.getElementById('prev');
   const nextBtn   = document.getElementById('next');
-  const progress  = document.getElementById('progress');
   const restartBtn = document.getElementById('restart-button');
   const muteBtn = document.getElementById('mute-button');
   const fullscreenBtn = document.getElementById('fullscreen-button');
@@ -468,7 +466,6 @@ document.addEventListener('DOMContentLoaded', () => {
     requestAnimationFrame(() => overlay.classList.add('is-visible'));
   }
 
-  function updateProgress(){ progress.textContent = `Page ${idx + 1} of ${TOTAL}`; }
   function isWallPage(){ return idx === 2; }
   function setDisabled(btn, disabled){
     btn.disabled = !!disabled;
@@ -563,7 +560,6 @@ document.addEventListener('DOMContentLoaded', () => {
   function setActiveIndex(newIdx, opts = {}){
     const target = clamp(newIdx, 0, TOTAL - 1);
     if (target === idx && opts.force !== true){
-      updateProgress();
       syncButtons();
       syncWallUI();
       return;
@@ -578,7 +574,6 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     if (idx === 2) wallClosedByUser = false;
     if (opts.playSound !== false) playFlip();
-    updateProgress();
     syncButtons();
     syncWallUI();
   }

@@ -384,10 +384,7 @@ def main() -> None:
     win = Nexus(root)
     win.show()
 
-    try:
-        app.aboutToQuit.connect(win.shutdown)
-    except Exception:
-        pass
+    app.aboutToQuit.connect(win.shutdown)
 
     # Control transfers to Qt; this call blocks until the app exits.
     sys.exit(app.exec())

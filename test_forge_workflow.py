@@ -13,14 +13,19 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 import Forge_Tab
 import generate
 from Forge_Tab import ForgeTab
 from config import CONTROL_FILES, FLIP_COUNT, FLIP_PREFIX, GLISS_FILE, REQUIRED_SLIDES
-from publishing.models import PublishResult
+from publishing.github_pages import (
+    REPOSITORY_KEY,
+    WORKSPACE_KEY,
+    GitHubPagesPublisher,
+)
+from publishing.models import PublishConfiguration, PublishResult
 from readiness import evaluate_readiness
 from saved_letters import (
     SavedLetter,
@@ -247,10 +252,11 @@ class ForgeWorkflowTests(unittest.TestCase):
         )
         self.assertFalse(hasattr(tab, "generate_btn"))
         self.assertFalse(hasattr(tab, "seal_btn"))
-        self.assertEqual(tab.saved_panel.maximumWidth(), 820)
-        self.assertGreaterEqual(tab.saved_panel.minimumHeight(), 64)
-        self.assertGreaterEqual(tab.load_saved_btn.minimumHeight(), 36)
-        self.assertEqual(tab.load_saved_btn.text(), "Load Saved Letter")
+        self.assertEqual(tab.saved_panel.maximumWidth(), 1510)
+        self.assertGreaterEqual(tab.saved_panel.minimumHeight(), 250)
+        self.assertIsNotNone(tab.saved_scroll)
+        self.assertFalse(hasattr(tab, "refresh_saved_btn"))
+        self.assertFalse(hasattr(tab, "saved_selector"))
         self.assertIs(
             tab.published_url.parentWidget(),
             tab.identity_panel,
@@ -264,6 +270,222 @@ class ForgeWorkflowTests(unittest.TestCase):
         }
         self.assertEqual(visible, {"music", "published_url"})
         tab.close()
+
+    def test_saved_letters_use_cover_cards_and_missing_cover_placeholder(
+        self,
+    ) -> None:
+        published = _saved_letter(self.root)
+        cover = QtGui.QPixmap(30, 45)
+        cover.fill(QtGui.QColor("#cc66aa"))
+        self.assertTrue(cover.save(str(published.cover_path), "PNG"))
+        local = _catalog_build(
+            self.root,
+            "output/Play/local-letter",
+            html_title="Local Letter",
+            metadata={
+                "recipient_title": "Local Letter",
+                "recipient_name": "Local Recipient",
+                "published_page_url": "",
+            },
+        )
+        (local / "gallery/pages/cover.png").unlink()
+        root_cover = _catalog_build(
+            self.root,
+            "output/Play/root-cover",
+            html_title="Root Cover",
+            metadata={
+                "recipient_title": "Root Cover",
+                "recipient_name": "Root Recipient",
+            },
+        )
+        shutil.move(
+            str(root_cover / "gallery/pages/cover.png"),
+            str(root_cover / "cover.png"),
+        )
+        self.assertTrue(cover.save(str(root_cover / "cover.png"), "PNG"))
+
+        tab = ForgeTab(self.root)
+        tab.resize(1200, 600)
+        tab.show()
+        self.app.processEvents()
+
+        by_title = {card.entry.title: card for card in tab._saved_cards}
+        self.assertEqual(
+            by_title["Saved Title"].status_label.text(),
+            "Published",
+        )
+        self.assertFalse(by_title["Saved Title"].cover.pixmap().isNull())
+        self.assertEqual(
+            by_title["Local Letter"].status_label.text(),
+            "Local",
+        )
+        self.assertEqual(by_title["Local Letter"].cover.text(), "No cover")
+        self.assertEqual(
+            by_title["Root Cover"].entry.cover_path,
+            (root_cover / "cover.png").resolve(),
+        )
+        self.assertFalse(by_title["Root Cover"].cover.pixmap().isNull())
+        self.assertIn("Title:", by_title["Local Letter"].title_label.text())
+        self.assertIn(
+            "Recipient:",
+            by_title["Local Letter"].recipient_label.text(),
+        )
+
+        tab._select_saved_letter(by_title["Saved Title"].entry)
+        selected_path = tab._selected_saved_letter.path
+        tab.refresh_saved_letters()
+        self.assertEqual(tab._selected_saved_letter.path, selected_path)
+        tab.close()
+
+    def test_preview_opens_local_index_in_default_browser_without_publisher(
+        self,
+    ) -> None:
+        _populate_required(self.root)
+        play_dir = self.root / "output/Play/browser-preview"
+        play_dir.mkdir(parents=True)
+        index = play_dir / "index.html"
+        index.write_text("<html></html>", encoding="utf-8")
+        tab = ForgeTab(self.root)
+
+        def run_now(_activity, task, on_success, _error_message):
+            on_success(task())
+
+        with (
+            mock.patch.object(
+                generate,
+                "ensure_play_bundle",
+                return_value=(play_dir, True),
+            ),
+            mock.patch.object(
+                Forge_Tab,
+                "GitHubPagesPublisher",
+                side_effect=AssertionError("Preview must not publish"),
+            ),
+            mock.patch.object(
+                Forge_Tab.QtGui.QDesktopServices,
+                "openUrl",
+                return_value=True,
+            ) as opener,
+            mock.patch.object(tab, "_start_operation", side_effect=run_now),
+        ):
+            tab.preview_letter()
+
+        opened_url = opener.call_args.args[0]
+        self.assertTrue(opened_url.isLocalFile())
+        self.assertEqual(Path(opened_url.toLocalFile()).resolve(), index.resolve())
+        self.assertEqual(
+            tab.status.toPlainText(),
+            "Preview opened in your browser.",
+        )
+        tab._metadata_timer.stop()
+        tab.close()
+
+    def test_missing_github_cli_keeps_local_publish_build_usable(self) -> None:
+        _populate_required(self.root)
+        entry = _saved_letter(self.root)
+        SettingsStore(self.root).update_fields(
+            github_pages_public_warning_acknowledged=True
+        )
+        tab = ForgeTab(self.root)
+        publisher = mock.Mock()
+        publisher.is_configured.return_value = False
+        publisher.configure.return_value = PublishConfiguration(
+            False,
+            message=(
+                "GitHub CLI is required to configure publishing for the "
+                "first time."
+            ),
+        )
+
+        def run_now(_activity, task, on_success, _error_message):
+            on_success(task())
+
+        with (
+            mock.patch.object(
+                generate,
+                "ensure_play_bundle",
+                return_value=(entry.path, False),
+            ),
+            mock.patch.object(
+                Forge_Tab,
+                "update_saved_metadata",
+                return_value={},
+            ),
+            mock.patch.object(
+                Forge_Tab,
+                "GitHubPagesPublisher",
+                return_value=publisher,
+            ),
+            mock.patch.object(tab, "_start_operation", side_effect=run_now),
+        ):
+            tab.publish_letter()
+
+        self.assertIn("GitHub CLI", tab.status.toPlainText())
+        self.assertIn(
+            "local letter was generated successfully",
+            tab.status.toPlainText(),
+        )
+        self.assertTrue(entry.path.joinpath("index.html").is_file())
+        self.assertTrue(tab.preview_btn.isEnabled())
+        tab.close()
+
+    def test_worker_completion_runs_on_application_thread(self) -> None:
+        _populate_required(self.root)
+        tab = ForgeTab(self.root)
+        loop = QtCore.QEventLoop()
+        observed: dict[str, bool] = {}
+
+        def task():
+            observed["task_on_gui"] = (
+                QtCore.QThread.currentThread() is self.app.thread()
+            )
+            return "done"
+
+        def completed(result):
+            observed["result"] = result == "done"
+            observed["callback_on_gui"] = (
+                QtCore.QThread.currentThread() is self.app.thread()
+            )
+
+        tab._start_operation("Working…", task, completed, "Failed.")
+        self.assertIsNotNone(tab._worker_thread)
+        tab._worker_thread.finished.connect(loop.quit)
+        QtCore.QTimer.singleShot(3000, loop.quit)
+        loop.exec()
+        self.app.processEvents()
+
+        self.assertFalse(observed.get("task_on_gui", True))
+        self.assertTrue(observed.get("callback_on_gui", False))
+        self.assertTrue(observed.get("result", False))
+        self.assertFalse(tab._busy)
+        tab.close()
+
+    def test_configured_git_workspace_does_not_require_github_cli(
+        self,
+    ) -> None:
+        workspace = self.root / "publishing"
+        (workspace / ".git").mkdir(parents=True)
+        SettingsStore(self.root).update_fields(
+            **{
+                REPOSITORY_KEY: "owner/letters",
+                WORKSPACE_KEY: str(workspace),
+            }
+        )
+
+        def runner(command, **_kwargs):
+            self.assertEqual(command, ["git", "remote", "get-url", "origin"])
+            return mock.Mock(
+                returncode=0,
+                stdout="https://github.com/owner/letters.git\n",
+                stderr="",
+            )
+
+        publisher = GitHubPagesPublisher(self.root, runner=runner)
+        with (
+            mock.patch.object(publisher, "git_available", return_value=True),
+            mock.patch.object(publisher, "gh_available", return_value=False),
+        ):
+            self.assertTrue(publisher.is_configured())
 
     def test_saved_letter_load_is_transactional(self) -> None:
         _populate_required(self.root)

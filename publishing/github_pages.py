@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import secrets
 import shutil
 import subprocess
@@ -23,6 +24,7 @@ BRANCH_KEY = "github_pages_branch"
 PUBLIC_WARNING_KEY = "github_pages_public_warning_acknowledged"
 DEFAULT_REPOSITORY = "letter-smith-publishing"
 DEFAULT_BRANCH = "main"
+_LOGGER = logging.getLogger(__name__)
 
 PAGES_WORKFLOW = """name: Deploy Letter Smith pages
 on:
@@ -142,107 +144,269 @@ class GitHubPagesPublisher(Publisher):
     def authenticated(self) -> bool:
         if not self.gh_available():
             return False
-        result = self._run(("gh", "auth", "status"), check=False)
+        try:
+            result = self._run(("gh", "auth", "status"), check=False)
+        except (OSError, subprocess.SubprocessError):
+            return False
         return result.returncode == 0
 
+    @staticmethod
+    def _repository_is_valid(repository: str) -> bool:
+        parts = repository.strip().split("/")
+        return (
+            len(parts) == 2
+            and all(
+                part
+                and part not in {".", ".."}
+                and not any(character.isspace() for character in part)
+                for part in parts
+            )
+        )
+
+    @classmethod
+    def _origin_matches_repository(cls, origin: str, repository: str) -> bool:
+        if not cls._repository_is_valid(repository):
+            return False
+        normalized = origin.strip().rstrip("/")
+        if normalized.casefold().endswith(".git"):
+            normalized = normalized[:-4]
+        expected = repository.strip("/").casefold()
+        folded = normalized.casefold()
+        return folded.endswith(f"github.com/{expected}") or folded.endswith(
+            f"github.com:{expected}"
+        )
+
+    def _workspace_has_expected_origin(
+        self,
+        workspace: Path,
+        repository: str,
+    ) -> bool:
+        try:
+            result = self._run(
+                ("git", "remote", "get-url", "origin"),
+                cwd=workspace,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0 and self._origin_matches_repository(
+            result.stdout,
+            repository,
+        )
+
     def is_configured(self) -> bool:
-        settings = self.settings.snapshot()
-        repository = str(settings.get(REPOSITORY_KEY, "")).strip()
-        workspace = Path(str(settings.get(WORKSPACE_KEY, ""))).expanduser()
+        try:
+            settings = self.settings.snapshot()
+            repository = str(settings.get(REPOSITORY_KEY, "")).strip()
+            workspace_value = str(settings.get(WORKSPACE_KEY, "")).strip()
+        except OSError:
+            return False
+        if not workspace_value:
+            return False
+        workspace = Path(workspace_value).expanduser()
         return (
             self.git_available()
-            and self.gh_available()
-            and self.authenticated()
-            and "/" in repository
+            and self._repository_is_valid(repository)
             and workspace.is_dir()
             and (workspace / ".git").exists()
+            and self._workspace_has_expected_origin(workspace, repository)
         )
 
     def configure(self, parent=None) -> PublishConfiguration:
+        repository = ""
+        workspace: Path | None = None
+        if self.is_configured():
+            settings = self.settings.snapshot()
+            repository = str(settings.get(REPOSITORY_KEY, "")).strip()
+            workspace = Path(str(settings.get(WORKSPACE_KEY, ""))).expanduser()
+            return PublishConfiguration(
+                True,
+                repository,
+                workspace,
+                "GitHub Pages is ready.",
+            )
         if not self.git_available():
             return PublishConfiguration(False, message="Git is not installed.")
         if not self.gh_available():
-            return PublishConfiguration(False, message="GitHub CLI is not installed.")
-        if not self.authenticated():
-            login = self._run(("gh", "auth", "login", "--web"), check=False)
-            if login.returncode != 0 or not self.authenticated():
-                return PublishConfiguration(False, message="GitHub authentication was not completed.")
-
-        settings = self.settings.snapshot()
-        repository = str(settings.get(REPOSITORY_KEY, "")).strip()
-        if not repository:
-            owner_result = self._run(("gh", "api", "user", "--jq", ".login"))
-            owner = owner_result.stdout.strip()
-            repository = f"{owner}/{DEFAULT_REPOSITORY}"
-
-        view = self._run(("gh", "repo", "view", repository), check=False)
-        if view.returncode != 0:
-            create = self._run(
-                ("gh", "repo", "create", repository, "--public", "--confirm"),
-                check=False,
+            return PublishConfiguration(
+                False,
+                message=(
+                    "GitHub CLI is required to configure publishing for the "
+                    "first time."
+                ),
             )
-            if create.returncode != 0:
+
+        try:
+            if not self.authenticated():
+                login = self._run(
+                    ("gh", "auth", "login", "--web"),
+                    check=False,
+                )
+                if login.returncode != 0 or not self.authenticated():
+                    return PublishConfiguration(
+                        False,
+                        message="GitHub authentication was not completed.",
+                    )
+
+            settings = self.settings.snapshot()
+            repository = str(settings.get(REPOSITORY_KEY, "")).strip()
+            if not repository:
+                owner_result = self._run(
+                    ("gh", "api", "user", "--jq", ".login")
+                )
+                owner = owner_result.stdout.strip()
+                if not owner:
+                    return PublishConfiguration(
+                        False,
+                        message="GitHub account information could not be read.",
+                    )
+                repository = f"{owner}/{DEFAULT_REPOSITORY}"
+            if not self._repository_is_valid(repository):
                 return PublishConfiguration(
                     False,
                     repository=repository,
-                    message=create.stderr.strip() or "Could not create the publishing repository.",
+                    message=(
+                        "The GitHub repository must use the owner/name format."
+                    ),
                 )
 
-        workspace_value = str(settings.get(WORKSPACE_KEY, "")).strip()
-        workspace = (
-            Path(workspace_value).expanduser().resolve()
-            if workspace_value
-            else (self.project_root / ".lettersmith-publishing").resolve()
-        )
-        if not (workspace / ".git").is_dir():
-            if workspace.exists() and any(workspace.iterdir()):
+            view = self._run(
+                ("gh", "repo", "view", repository),
+                check=False,
+            )
+            if view.returncode != 0:
+                create = self._run(
+                    (
+                        "gh",
+                        "repo",
+                        "create",
+                        repository,
+                        "--public",
+                        "--confirm",
+                    ),
+                    check=False,
+                )
+                if create.returncode != 0:
+                    return PublishConfiguration(
+                        False,
+                        repository=repository,
+                        message="Could not create the publishing repository.",
+                    )
+
+            workspace_value = str(settings.get(WORKSPACE_KEY, "")).strip()
+            workspace = (
+                Path(workspace_value).expanduser().resolve()
+                if workspace_value
+                else (self.project_root / ".lettersmith-publishing").resolve()
+            )
+            if not (workspace / ".git").is_dir():
+                if workspace.exists() and any(workspace.iterdir()):
+                    return PublishConfiguration(
+                        False,
+                        repository=repository,
+                        workspace=workspace,
+                        message="The publishing workspace is not empty.",
+                    )
+                workspace.parent.mkdir(parents=True, exist_ok=True)
+                clone = self._run(
+                    ("gh", "repo", "clone", repository, str(workspace)),
+                    check=False,
+                )
+                if clone.returncode != 0:
+                    return PublishConfiguration(
+                        False,
+                        repository=repository,
+                        workspace=workspace,
+                        message="Could not prepare the publishing workspace.",
+                    )
+            if not self._workspace_has_expected_origin(
+                workspace,
+                repository,
+            ):
                 return PublishConfiguration(
                     False,
                     repository=repository,
                     workspace=workspace,
-                    message="The publishing workspace is not empty.",
+                    message=(
+                        "The publishing workspace does not have the expected "
+                        "GitHub origin."
+                    ),
                 )
-            workspace.parent.mkdir(parents=True, exist_ok=True)
-            clone = self._run(
-                ("gh", "repo", "clone", repository, str(workspace)),
+
+            self._install_pages_files(workspace)
+            self._run(
+                (
+                    "git",
+                    "add",
+                    ".github/workflows/pages.yml",
+                    "robots.txt",
+                ),
+                cwd=workspace,
+            )
+            status = self._run(
+                ("git", "status", "--porcelain"),
+                cwd=workspace,
+            )
+            if status.stdout.strip():
+                self._run(
+                    (
+                        "git",
+                        "commit",
+                        "-m",
+                        "Configure Letter Smith publishing",
+                    ),
+                    cwd=workspace,
+                )
+                self._run(
+                    ("git", "push", "origin", DEFAULT_BRANCH),
+                    cwd=workspace,
+                )
+
+            self._run(
+                (
+                    "gh",
+                    "api",
+                    "--method",
+                    "POST",
+                    f"repos/{repository}/pages",
+                    "-f",
+                    "build_type=workflow",
+                ),
                 check=False,
             )
-            if clone.returncode != 0:
+            verify = self._run(
+                ("gh", "api", f"repos/{repository}/pages"),
+                check=False,
+            )
+            if verify.returncode != 0:
                 return PublishConfiguration(
                     False,
                     repository=repository,
                     workspace=workspace,
-                    message=clone.stderr.strip() or "Could not prepare the publishing workspace.",
+                    message="GitHub Pages could not be enabled.",
                 )
 
-        self._install_pages_files(workspace)
-        self._run(("git", "add", ".github/workflows/pages.yml", "robots.txt"), cwd=workspace)
-        status = self._run(("git", "status", "--porcelain"), cwd=workspace)
-        if status.stdout.strip():
-            self._run(("git", "commit", "-m", "Configure Letter Smith publishing"), cwd=workspace)
-            self._run(("git", "push", "origin", DEFAULT_BRANCH), cwd=workspace)
-
-        self._run(
-            ("gh", "api", "--method", "POST", f"repos/{repository}/pages", "-f", "build_type=workflow"),
-            check=False,
-        )
-        verify = self._run(("gh", "api", f"repos/{repository}/pages"), check=False)
-        if verify.returncode != 0:
+            self.settings.update_fields(
+                **{
+                    REPOSITORY_KEY: repository,
+                    WORKSPACE_KEY: str(workspace),
+                    BRANCH_KEY: DEFAULT_BRANCH,
+                }
+            )
+        except (OSError, subprocess.SubprocessError):
+            _LOGGER.exception("GitHub Pages configuration failed.")
             return PublishConfiguration(
                 False,
                 repository=repository,
                 workspace=workspace,
-                message="GitHub Pages could not be enabled.",
+                message="GitHub publishing setup could not be completed.",
             )
-
-        self.settings.update_fields(
-            **{
-                REPOSITORY_KEY: repository,
-                WORKSPACE_KEY: str(workspace),
-                BRANCH_KEY: DEFAULT_BRANCH,
-            }
+        return PublishConfiguration(
+            True,
+            repository,
+            workspace,
+            "GitHub Pages is ready.",
         )
-        return PublishConfiguration(True, repository, workspace, "GitHub Pages is ready.")
 
     @staticmethod
     def _install_pages_files(workspace: Path) -> None:
@@ -266,10 +430,22 @@ class GitHubPagesPublisher(Publisher):
         )
         destination = workspace / "letters" / public_path
         transaction = PathTransaction(destination, staging_suffix=".publish-staging")
-        start_head = self._run(("git", "rev-parse", "HEAD"), cwd=workspace).stdout.strip()
+        start_head = ""
+        transaction_prepared = False
+        pushed = False
+        url = ""
 
         try:
+            start_head = self._run(
+                ("git", "rev-parse", "HEAD"),
+                cwd=workspace,
+            ).stdout.strip()
+            if not start_head:
+                raise RuntimeError(
+                    "The publishing workspace has no current Git revision."
+                )
             staging = transaction.prepare()
+            transaction_prepared = True
             shutil.copytree(build, staging)
             index = staging / "index.html"
             if not index.is_file():
@@ -288,22 +464,85 @@ class GitHubPagesPublisher(Publisher):
                 cwd=workspace,
             )
             self._run(("git", "push", "origin", branch), cwd=workspace)
+            pushed = True
             url = github_pages_url(repository, public_path)
             if not self.poller(url, 120.0, 2.0):
                 raise TimeoutError("The published URL did not become available in time.")
-            transaction.finalize()
+            try:
+                transaction.finalize()
+            except OSError:
+                _LOGGER.exception(
+                    "Published letter cleanup failed for %s",
+                    destination,
+                )
             return PublishResult(True, url, public_path, "Published.")
         except Exception as error:
-            try:
-                self._run(("git", "reset", "--mixed", start_head), cwd=workspace, check=False)
-                transaction.rollback()
-            except Exception:
-                transaction.abort()
+            cleanup_errors: list[str] = []
+            if pushed:
+                try:
+                    transaction.finalize()
+                except OSError as cleanup_error:
+                    _LOGGER.exception(
+                        "Post-push publishing cleanup failed for %s",
+                        destination,
+                    )
+                    cleanup_errors.append(
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                details = f"{type(error).__name__}: {error}"
+                if cleanup_errors:
+                    details += "; cleanup: " + "; ".join(cleanup_errors)
+                return PublishResult(
+                    False,
+                    url=url,
+                    public_path=public_path,
+                    message=(
+                        "The letter was pushed, but the published page could "
+                        "not be confirmed."
+                    ),
+                    technical_details=details,
+                )
+
+            rollback_ok = True
+            if start_head:
+                try:
+                    reset = self._run(
+                        ("git", "reset", "--mixed", start_head),
+                        cwd=workspace,
+                        check=False,
+                    )
+                    if reset.returncode != 0:
+                        rollback_ok = False
+                        cleanup_errors.append(
+                            "Git could not restore the previous revision."
+                        )
+                except (OSError, subprocess.SubprocessError) as cleanup_error:
+                    rollback_ok = False
+                    cleanup_errors.append(
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            if transaction_prepared:
+                try:
+                    transaction.rollback()
+                except Exception as cleanup_error:
+                    rollback_ok = False
+                    cleanup_errors.append(
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
             details = f"{type(error).__name__}: {error}"
+            if cleanup_errors:
+                details += "; rollback: " + "; ".join(cleanup_errors)
             return PublishResult(
                 False,
                 public_path=public_path,
-                message="Publishing failed. The previous live version was preserved.",
+                message=(
+                    "Publishing failed. The previous live version was preserved."
+                    if rollback_ok
+                    else (
+                        "Publishing failed, and the publishing workspace "
+                        "needs attention."
+                    )
+                ),
                 technical_details=details,
             )
 

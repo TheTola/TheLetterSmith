@@ -1717,7 +1717,10 @@ class SoundTab(QtWidgets.QWidget):
             thread.quit()
             thread.wait(3500)
 
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+    def shutdown(self) -> None:
+        """Stop Sound-owned workers and native multimedia resources once."""
+        if getattr(self, "_shutdown_complete", False):
+            return
         self._stop_background_threads()
         self.player.shutdown()
         self._preview.shutdown()
@@ -1726,6 +1729,10 @@ class SoundTab(QtWidgets.QWidget):
                 self._analysis.shutdown()
             except Exception:
                 pass
+        self._shutdown_complete = True
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.shutdown()
         super().closeEvent(event)
 
 

@@ -7,6 +7,7 @@ import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html import unescape
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import unquote, urlsplit
@@ -137,6 +138,38 @@ def _runtime_directory(
     return None
 
 
+def _runtime_file(
+    play_dir: Path,
+    *relative_paths: object,
+) -> Optional[Path]:
+    play_root = play_dir.resolve()
+    for raw_relative in relative_paths:
+        relative_text = str(raw_relative or "").strip()
+        if not relative_text:
+            continue
+        relative = Path(relative_text)
+        if relative.is_absolute() or ".." in relative.parts:
+            continue
+        candidate = play_dir / relative
+        if not candidate.is_file() or candidate.is_symlink():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(play_root)
+        except (OSError, ValueError):
+            continue
+        cursor = play_dir
+        unsafe = False
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                unsafe = True
+                break
+        if not unsafe:
+            return resolved
+    return None
+
+
 def _readable_file(path: Path) -> bool:
     try:
         with path.open("rb") as stream:
@@ -221,15 +254,19 @@ class SavedLetterCatalog:
             pages
             and message
             and controls
-            and all((pages / name).is_file() for name in REQUIRED_SLIDES)
+            and all(
+                (pages / name).is_file()
+                for name in REQUIRED_SLIDES
+                if name != "cover.png"
+            )
             and all((controls / name).is_file() for name in CONTROL_FILES)
             and (message / "message.html").is_file()
         )
 
     def _entry(self, path: Path, *, recovery: bool) -> SavedLetter:
         metadata = _read_metadata(path)
-        recipient = str(metadata.get("recipient_name") or "").strip()
-        title = str(metadata.get("recipient_title") or "").strip()
+        recipient = self._display_text(metadata.get("recipient_name"))
+        title = self._display_text(metadata.get("recipient_title"))
         if not title:
             title = self._html_title(path / "index.html") or "Untitled Letter"
         if not recipient:
@@ -242,12 +279,13 @@ class SavedLetterCatalog:
                 if parent_is_category
                 else self._humanize(path.parent.name)
             )
-        pages = _runtime_directory(
+        cover = _runtime_file(
             path,
-            "gallery/pages",
-            "gallery/user/pages",
+            metadata.get("cover_thumbnail_path"),
+            "gallery/pages/cover.png",
+            "gallery/user/pages/cover.png",
+            "cover.png",
         )
-        cover = pages / "cover.png" if pages else None
         return SavedLetter(
             path=path,
             recipient=recipient,
@@ -256,7 +294,7 @@ class SavedLetterCatalog:
             published_url=normalize_published_page_url(
                 metadata.get("published_page_url", "")
             ),
-            cover_path=cover.resolve() if cover and cover.is_file() else None,
+            cover_path=cover,
             recovery=recovery,
         )
 
@@ -267,15 +305,21 @@ class SavedLetterCatalog:
         except (OSError, UnicodeError):
             return ""
         match = re.search(r"<title>\s*(.*?)\s*</title>", value, re.I | re.S)
-        return re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
+        return (
+            SavedLetterCatalog._display_text(match.group(1))
+            if match
+            else ""
+        )
+
+    @staticmethod
+    def _display_text(value: object) -> str:
+        return re.sub(r"\s+", " ", unescape(str(value or ""))).strip()
 
     @staticmethod
     def _humanize(value: str) -> str:
-        return re.sub(
-            r"\s+",
-            " ",
-            value.replace("_", " ").replace("-", " "),
-        ).strip().title()
+        return SavedLetterCatalog._display_text(
+            value.replace("_", " ").replace("-", " ")
+        ).title()
 
 
 class SavedLetterRestorer:

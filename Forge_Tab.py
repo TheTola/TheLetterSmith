@@ -13,7 +13,7 @@ import generate
 from config import MESSAGE_HTML_FILE, OUTPUT_PLAY_DIR, ensure_output_dirs
 from message_html import read_text_normalized
 from project_state import ensure_project_identity
-from publishing import GitHubPagesPublisher
+from publishing import GitHubPagesPublisher, PublishResult
 from publishing.github_pages import PUBLIC_WARNING_KEY
 from readiness import ReadinessResult, evaluate_readiness
 from saved_letters import (
@@ -74,6 +74,143 @@ class _StatusLabel(QtWidgets.QLabel):
 
     def setPlainText(self, text: str) -> None:
         self.setText(text)
+
+
+class SavedLetterCard(QtWidgets.QFrame):
+    """Compact, keyboard-accessible saved-letter selector."""
+
+    selected = QtCore.Signal(object)
+    activated = QtCore.Signal(object)
+
+    def __init__(self, entry: SavedLetter, parent=None) -> None:
+        super().__init__(parent)
+        self.entry = entry
+        self.setObjectName("SavedLetterCard")
+        self.setProperty("selected", False)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setFixedSize(184, 214)
+        self.setToolTip(
+            f"{entry.title} — {entry.recipient}\n"
+            f"{entry.path}\nDouble-click or press Enter to load."
+        )
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(7, 7, 7, 7)
+        layout.setSpacing(3)
+
+        self.cover = QtWidgets.QLabel()
+        self.cover.setObjectName("SavedLetterCover")
+        self.cover.setFixedHeight(96)
+        self.cover.setAlignment(Qt.AlignCenter)
+        self.cover.setAttribute(Qt.WA_TransparentForMouseEvents)
+        pixmap = (
+            QtGui.QPixmap(str(entry.cover_path))
+            if entry.cover_path is not None
+            else QtGui.QPixmap()
+        )
+        if pixmap.isNull():
+            self.cover.setText("No cover")
+        else:
+            self.cover.setPixmap(
+                pixmap.scaled(
+                    168,
+                    92,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+            )
+        layout.addWidget(self.cover)
+
+        display_name = f"{entry.title} — {entry.recipient}"
+        self.name_label = QtWidgets.QLabel(display_name)
+        self.name_label.setObjectName("SavedLetterName")
+        self.name_label.setWordWrap(True)
+        self.name_label.setMaximumHeight(34)
+        self.name_label.setToolTip(display_name)
+        self.name_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        layout.addWidget(self.name_label)
+
+        self.title_label = QtWidgets.QLabel(
+            f"Title: {self._shorten(entry.title, 25)}"
+        )
+        self.title_label.setToolTip(entry.title)
+        self.title_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        layout.addWidget(self.title_label)
+
+        self.recipient_label = QtWidgets.QLabel(
+            f"Recipient: {self._shorten(entry.recipient, 21)}"
+        )
+        self.recipient_label.setToolTip(entry.recipient)
+        self.recipient_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        layout.addWidget(self.recipient_label)
+
+        self.status_label = QtWidgets.QLabel(
+            "Published" if entry.published else "Local"
+        )
+        self.status_label.setObjectName(
+            "PublishedStatus" if entry.published else "LocalStatus"
+        )
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setFixedHeight(20)
+        self.status_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        layout.addWidget(self.status_label)
+
+        self.setStyleSheet(
+            "QFrame#SavedLetterCard{background:#111b23;"
+            "border:1px solid #345160;border-radius:7px;}"
+            "QFrame#SavedLetterCard:hover{border-color:#00b9d8;"
+            "background:#14232d;}"
+            "QFrame#SavedLetterCard[selected=\"true\"]{"
+            "border:2px solid #00d4f4;background:#142630;}"
+            "QFrame#SavedLetterCard:focus{border:2px solid #8defff;}"
+            "QLabel#SavedLetterCover{background:#091116;color:#78909a;"
+            "border:1px solid #263e4a;border-radius:4px;"
+            "font:9pt 'Segoe UI';}"
+            "QLabel#SavedLetterName{color:#f0fbff;"
+            "font:600 9pt 'Segoe UI';border:none;background:transparent;}"
+            "QLabel{color:#aac0ca;font:8pt 'Segoe UI';"
+            "border:none;background:transparent;}"
+            "QLabel#LocalStatus{color:#b8c9d0;background:#1b2932;"
+            "border:1px solid #3b515d;border-radius:8px;"
+            "font:600 8pt 'Segoe UI';}"
+            "QLabel#PublishedStatus{color:#8bf0aa;background:#122a21;"
+            "border:1px solid #35734d;border-radius:8px;"
+            "font:600 8pt 'Segoe UI';}"
+        )
+
+    @staticmethod
+    def _shorten(text: str, limit: int) -> str:
+        value = " ".join(str(text or "").split())
+        if len(value) <= limit:
+            return value
+        return f"{value[:max(1, limit - 1)].rstrip()}…"
+
+    def set_selected(self, selected: bool) -> None:
+        self.setProperty("selected", bool(selected))
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self.setFocus(Qt.MouseFocusReason)
+            self.selected.emit(self.entry)
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self.activated.emit(self.entry)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.activated.emit(self.entry)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class ReadinessWindow(QtWidgets.QDialog):
@@ -221,6 +358,14 @@ class ForgeTab(QtWidgets.QWidget):
         self._busy = False
         self._worker: Optional[_TaskWorker] = None
         self._worker_thread: Optional[QtCore.QThread] = None
+        self._operation_success: Optional[Callable[[object], None]] = None
+        self._operation_error_message = ""
+        self._selected_saved_letter: Optional[SavedLetter] = None
+        self._saved_cards: list[SavedLetterCard] = []
+        self._pending_scroll_position = (0, 0)
+        self._pending_metadata_update: Optional[
+            tuple[Path, ReadinessResult]
+        ] = None
 
         self.readiness_window = ReadinessWindow(self.project_root, self.window())
         self.readiness_window.correction_requested.connect(
@@ -238,6 +383,27 @@ class ForgeTab(QtWidgets.QWidget):
         self._status_timer = QtCore.QTimer(self)
         self._status_timer.setSingleShot(True)
         self._status_timer.timeout.connect(self.status.clear)
+
+        self._catalog_refresh_timer = QtCore.QTimer(self)
+        self._catalog_refresh_timer.setSingleShot(True)
+        self._catalog_refresh_timer.setInterval(180)
+        self._catalog_refresh_timer.timeout.connect(self.refresh_saved_letters)
+        self._catalog_watcher = QtCore.QFileSystemWatcher(self)
+        self._catalog_watcher.directoryChanged.connect(
+            self._catalog_path_changed
+        )
+        self._catalog_watcher.fileChanged.connect(
+            self._catalog_path_changed
+        )
+
+        self._scroll_restore_timer = QtCore.QTimer(self)
+        self._scroll_restore_timer.setSingleShot(True)
+        self._scroll_restore_timer.timeout.connect(
+            self._restore_saved_scroll_position
+        )
+        self._metadata_timer = QtCore.QTimer(self)
+        self._metadata_timer.setSingleShot(True)
+        self._metadata_timer.timeout.connect(self._run_pending_metadata_update)
 
         self.refresh_saved_letters()
         self.refresh_project_state()
@@ -290,37 +456,49 @@ class ForgeTab(QtWidgets.QWidget):
 
         self.saved_panel = QtWidgets.QFrame()
         self.saved_panel.setObjectName("ForgeSavedPanel")
-        self.saved_panel.setMaximumWidth(820)
-        self.saved_panel.setMinimumHeight(64)
+        self.saved_panel.setMaximumWidth(1510)
+        self.saved_panel.setMinimumHeight(250)
+        self.saved_panel.setMaximumHeight(276)
         self.saved_panel.setStyleSheet(
             "QFrame#ForgeSavedPanel{background:#101820;"
             "border:1px solid #284554;border-radius:7px;}"
         )
-        saved_row = QtWidgets.QHBoxLayout(self.saved_panel)
-        saved_row.setContentsMargins(10, 12, 10, 12)
-        saved_row.setSpacing(8)
-        saved_row.addWidget(QtWidgets.QLabel("Saved Letter"))
-        self.saved_selector = QtWidgets.QComboBox()
-        self.saved_selector.setEditable(True)
-        self.saved_selector.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
-        self.saved_selector.setMinimumWidth(160)
-        self.saved_selector.setMinimumHeight(36)
-        self.saved_selector.setSizeAdjustPolicy(
-            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        saved_layout = QtWidgets.QVBoxLayout(self.saved_panel)
+        saved_layout.setContentsMargins(10, 8, 10, 8)
+        saved_layout.setSpacing(5)
+        saved_heading = QtWidgets.QLabel("Saved Letters")
+        saved_heading.setStyleSheet(
+            "color:#dff9ff;font:600 10pt 'Segoe UI';"
         )
-        completer = self.saved_selector.completer()
-        if completer is not None:
-            completer.setCaseSensitivity(Qt.CaseInsensitive)
-            completer.setCompletionMode(QtWidgets.QCompleter.PopupCompletion)
-        saved_row.addWidget(self.saved_selector, 1)
-        self.load_saved_btn = self._small_button("Load Saved Letter")
-        self.load_saved_btn.setMinimumSize(136, 36)
-        self.load_saved_btn.clicked.connect(self.load_selected_letter)
-        saved_row.addWidget(self.load_saved_btn)
-        self.refresh_saved_btn = self._small_button("Refresh")
-        self.refresh_saved_btn.setMinimumSize(72, 36)
-        self.refresh_saved_btn.clicked.connect(self.refresh_saved_letters)
-        saved_row.addWidget(self.refresh_saved_btn)
+        saved_layout.addWidget(saved_heading)
+
+        self.saved_scroll = QtWidgets.QScrollArea()
+        self.saved_scroll.setObjectName("SavedLettersScroll")
+        self.saved_scroll.setWidgetResizable(True)
+        self.saved_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.saved_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.saved_scroll.setMinimumHeight(216)
+        self.saved_scroll.setStyleSheet(
+            "QScrollArea#SavedLettersScroll{background:transparent;border:none;}"
+            "QScrollBar:vertical{background:#0c151b;width:9px;margin:0;}"
+            "QScrollBar::handle:vertical{background:#31505e;"
+            "border-radius:4px;min-height:28px;}"
+            "QScrollBar::handle:vertical:hover{background:#00a9c5;}"
+        )
+        self.saved_cards_widget = QtWidgets.QWidget()
+        self.saved_cards_widget.setObjectName("SavedLetterCards")
+        self.saved_cards_widget.setStyleSheet(
+            "QWidget#SavedLetterCards{background:transparent;}"
+        )
+        self.saved_cards_layout = QtWidgets.QGridLayout(
+            self.saved_cards_widget
+        )
+        self.saved_cards_layout.setContentsMargins(2, 2, 2, 2)
+        self.saved_cards_layout.setHorizontalSpacing(8)
+        self.saved_cards_layout.setVerticalSpacing(8)
+        self.saved_cards_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        self.saved_scroll.setWidget(self.saved_cards_widget)
+        saved_layout.addWidget(self.saved_scroll, 1)
 
         saved_holder = QtWidgets.QHBoxLayout()
         saved_holder.setContentsMargins(0, 0, 0, 0)
@@ -444,10 +622,11 @@ class ForgeTab(QtWidgets.QWidget):
             self.identity_panel.setFixedWidth(identity_width)
         saved_width = max(
             0,
-            min(820, self.width() - (side_margin * 2)),
+            min(1510, self.width() - (side_margin * 2)),
         )
         if saved_width:
             self.saved_panel.setFixedWidth(saved_width)
+        self._layout_saved_cards()
         self._sync_heading_balance()
         super().resizeEvent(event)
 
@@ -540,39 +719,37 @@ class ForgeTab(QtWidgets.QWidget):
         return result
 
     def refresh_saved_letters(self) -> None:
-        selected_path = ""
-        current = self.saved_selector.currentData()
-        if isinstance(current, SavedLetter):
-            selected_path = str(current.path)
+        selected_path = (
+            str(self._selected_saved_letter.path)
+            if self._selected_saved_letter is not None
+            else ""
+        )
+        horizontal = self.saved_scroll.horizontalScrollBar().value()
+        vertical = self.saved_scroll.verticalScrollBar().value()
         entries = self.catalog.list_entries()
-        self.saved_selector.clear()
-        selected_index = -1
-        for index, entry in enumerate(entries):
-            saved = entry.modified_at.strftime("%b %d, %Y")
-            state = "Published" if entry.published else "Local"
-            prefix = "Recovery — " if entry.recovery else ""
-            self.saved_selector.addItem(
-                f"{prefix}{entry.title} — {entry.recipient}  •  "
-                f"Saved {saved}  •  {state}",
-                entry,
-            )
-            self.saved_selector.setItemData(
-                index,
-                str(entry.path),
-                Qt.ToolTipRole,
-            )
+        for card in self._saved_cards:
+            self.saved_cards_layout.removeWidget(card)
+            card.deleteLater()
+        self._saved_cards = []
+        self._selected_saved_letter = None
+
+        for entry in entries:
+            card = SavedLetterCard(entry, self.saved_cards_widget)
+            card.setEnabled(not self._busy)
+            card.selected.connect(self._select_saved_letter)
+            card.activated.connect(self._activate_saved_letter)
             if str(entry.path) == selected_path:
-                selected_index = index
-        if selected_index >= 0:
-            self.saved_selector.setCurrentIndex(selected_index)
-        available = bool(entries)
-        if not available:
-            self.saved_selector.addItem("No saved letters found", None)
-        self.saved_selector.setEnabled(available and not self._busy)
-        self.load_saved_btn.setEnabled(available and not self._busy)
+                self._selected_saved_letter = entry
+                card.set_selected(True)
+            self._saved_cards.append(card)
+
+        self._layout_saved_cards()
+        self._watch_saved_letter_paths(entries)
+        self._pending_scroll_position = (horizontal, vertical)
+        self._scroll_restore_timer.start(0)
 
     def load_selected_letter(self) -> None:
-        entry = self.saved_selector.currentData()
+        entry = self._selected_saved_letter
         if not isinstance(entry, SavedLetter) or self._busy:
             return
 
@@ -585,6 +762,87 @@ class ForgeTab(QtWidgets.QWidget):
             self._complete_restore,
             "The selected saved letter could not be restored.",
         )
+
+    def _select_saved_letter(self, entry: object) -> None:
+        if not isinstance(entry, SavedLetter):
+            return
+        self._selected_saved_letter = entry
+        selected_path = entry.path
+        for card in self._saved_cards:
+            card.set_selected(card.entry.path == selected_path)
+
+    def _activate_saved_letter(self, entry: object) -> None:
+        self._select_saved_letter(entry)
+        self.load_selected_letter()
+
+    def _layout_saved_cards(self) -> None:
+        if not hasattr(self, "saved_cards_layout"):
+            return
+        while self.saved_cards_layout.count():
+            item = self.saved_cards_layout.takeAt(0)
+            widget = item.widget()
+            if (
+                widget is not None
+                and not isinstance(widget, SavedLetterCard)
+            ):
+                widget.deleteLater()
+        if not self._saved_cards:
+            empty = QtWidgets.QLabel(
+                "No saved letters yet. Preview a letter to create one."
+            )
+            empty.setObjectName("SavedLettersEmpty")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setStyleSheet(
+                "color:#8097a1;padding:42px 12px;background:transparent;"
+            )
+            self.saved_cards_layout.addWidget(empty, 0, 0)
+            return
+
+        available = max(184, self.saved_scroll.viewport().width() - 8)
+        columns = max(1, available // 192)
+        for index, card in enumerate(self._saved_cards):
+            self.saved_cards_layout.addWidget(
+                card,
+                index // columns,
+                index % columns,
+                Qt.AlignTop,
+            )
+
+    def _watch_saved_letter_paths(
+        self,
+        entries: tuple[SavedLetter, ...],
+    ) -> None:
+        watched = (
+            self._catalog_watcher.directories()
+            + self._catalog_watcher.files()
+        )
+        if watched:
+            self._catalog_watcher.removePaths(watched)
+        candidates = {
+            self.project_root / "output",
+            self.catalog.play_root,
+            self.catalog.recovery_root,
+        }
+        for entry in entries:
+            candidates.add(entry.path)
+            if entry.cover_path is not None:
+                candidates.add(entry.cover_path.parent)
+        paths = [
+            str(path.resolve())
+            for path in candidates
+            if path.exists() and not path.is_symlink()
+        ]
+        if paths:
+            self._catalog_watcher.addPaths(sorted(set(paths)))
+
+    @QtCore.Slot(str)
+    def _catalog_path_changed(self, _path: str) -> None:
+        self._catalog_refresh_timer.start()
+
+    def _restore_saved_scroll_position(self) -> None:
+        horizontal, vertical = self._pending_scroll_position
+        self.saved_scroll.horizontalScrollBar().setValue(horizontal)
+        self.saved_scroll.verticalScrollBar().setValue(vertical)
 
     def _load_saved_letter(self, entry: SavedLetter) -> None:
         """Synchronous compatibility path used by focused service tests."""
@@ -643,9 +901,18 @@ class ForgeTab(QtWidgets.QWidget):
         if index is not None:
             self.preview_requested.emit(str(index.resolve()), self._preview_mode)
 
-    def _required_gate(self) -> Optional[ReadinessResult]:
+    def _required_gate(
+        self,
+        *,
+        for_publish: bool = False,
+    ) -> Optional[ReadinessResult]:
         readiness = self.refresh_readiness()
-        if readiness.can_preview and readiness.can_publish:
+        allowed = (
+            readiness.can_publish
+            if for_publish
+            else readiness.can_preview
+        )
+        if allowed:
             return readiness
         missing = [
             item for item in readiness.missing_items if item.required
@@ -688,28 +955,38 @@ class ForgeTab(QtWidgets.QWidget):
     def _preview_completed(self, result: object) -> None:
         play_dir, _rebuilt, readiness = result
         self._last_play_dir = Path(play_dir)
-        self.request_preview()
-        self._set_status("Preview updated.")
-        QtCore.QTimer.singleShot(
-            0,
-            lambda: self._update_metadata_silently(
-                Path(play_dir),
-                readiness,
-            ),
+        index = self._last_play_dir / "index.html"
+        opened = index.is_file() and QtGui.QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(index.resolve()))
         )
+        if opened:
+            self._set_status("Preview opened in your browser.")
+        else:
+            self._set_status(
+                "The local preview was built, but the browser could not open it.",
+                error=True,
+            )
+        self._pending_metadata_update = (Path(play_dir), readiness)
+        self._metadata_timer.start(0)
+
+    def _run_pending_metadata_update(self) -> None:
+        pending = self._pending_metadata_update
+        self._pending_metadata_update = None
+        if pending is not None:
+            self._update_metadata_silently(*pending)
 
     def publish_letter(self) -> None:
         if self._busy:
             return
-        readiness = self._required_gate()
+        readiness = self._required_gate(for_publish=True)
         if readiness is None:
             return
         if not bool(self.settings.get(PUBLIC_WARNING_KEY, False)):
             answer = QtWidgets.QMessageBox.question(
                 self,
                 "Publish Letter",
-                "Published letters are placed in a public GitHub repository. "
-                "Continue?",
+                "Publishing may create or update a public GitHub Pages "
+                "repository using GitHub CLI. Continue?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
                 QtWidgets.QMessageBox.Cancel,
             )
@@ -743,8 +1020,20 @@ class ForgeTab(QtWidgets.QWidget):
             if not publisher.is_configured():
                 configured = publisher.configure(None)
                 if not configured.configured:
-                    raise _ForgeOperationError(
-                        configured.message or "Publishing is not configured."
+                    message = (
+                        "Publishing requires GitHub CLI or a configured Git "
+                        "remote. The local letter was generated successfully."
+                    )
+                    if configured.message:
+                        message = (
+                            f"{configured.message} "
+                            "The local letter was generated successfully."
+                        )
+                    return (
+                        play_path,
+                        readiness,
+                        metadata,
+                        PublishResult(False, message=message),
                     )
             publish_result = publisher.publish(play_path, metadata)
             return play_path, readiness, metadata, publish_result
@@ -759,7 +1048,7 @@ class ForgeTab(QtWidgets.QWidget):
     def _publish_completed(self, result: object) -> None:
         play_dir, _readiness, _metadata, publish_result = result
         self._last_play_dir = Path(play_dir)
-        self.request_preview()
+        self.refresh_saved_letters()
         if not getattr(publish_result, "success", False):
             details = str(getattr(publish_result, "technical_details", ""))
             if details:
@@ -879,57 +1168,82 @@ class ForgeTab(QtWidgets.QWidget):
         worker.moveToThread(thread)
         self._worker_thread = thread
         self._worker = worker
+        self._operation_success = on_success
+        self._operation_error_message = error_message
         thread.started.connect(worker.run)
 
-        def succeeded(result: object) -> None:
-            try:
-                on_success(result)
-            except Exception:
-                _LOGGER.exception("Forge completion handling failed.")
-                self._set_status(error_message, error=True)
-
-        def failed(
-            message: str,
-            technical: str,
-            user_safe: bool,
-        ) -> None:
-            _LOGGER.error(
-                "Forge operation failed: %s\n%s",
-                message,
-                technical,
-            )
-            safe_message = (
-                message
-                if user_safe
-                and isinstance(message, str)
-                and message
-                and len(message) <= 240
-                else error_message
-            )
-            self._set_status(safe_message or error_message, error=True)
-
-        worker.succeeded.connect(succeeded)
-        worker.failed.connect(failed)
+        worker.succeeded.connect(
+            self._operation_succeeded_on_ui,
+            Qt.QueuedConnection,
+        )
+        worker.failed.connect(
+            self._operation_failed_on_ui,
+            Qt.QueuedConnection,
+        )
         worker.finished.connect(worker.deleteLater)
         worker.finished.connect(thread.quit)
-        thread.finished.connect(self._operation_finished)
+        thread.finished.connect(
+            self._operation_finished,
+            Qt.QueuedConnection,
+        )
         thread.start()
+
+    @QtCore.Slot(object)
+    def _operation_succeeded_on_ui(self, result: object) -> None:
+        callback = self._operation_success
+        self._operation_success = None
+        if callback is None:
+            return
+        try:
+            callback(result)
+        except Exception:
+            _LOGGER.exception("Forge completion handling failed.")
+            self._set_status(
+                self._operation_error_message
+                or "The Forge operation could not be completed.",
+                error=True,
+            )
+
+    @QtCore.Slot(str, str, bool)
+    def _operation_failed_on_ui(
+        self,
+        message: str,
+        technical: str,
+        user_safe: bool,
+    ) -> None:
+        self._operation_success = None
+        _LOGGER.error(
+            "Forge operation failed: %s\n%s",
+            message,
+            technical,
+        )
+        error_message = self._operation_error_message
+        safe_message = (
+            message
+            if user_safe
+            and isinstance(message, str)
+            and message
+            and len(message) <= 240
+            else error_message
+        )
+        self._set_status(
+            safe_message or "The Forge operation could not be completed.",
+            error=True,
+        )
 
     def _operation_finished(self) -> None:
         thread = self._worker_thread
         self._worker = None
         self._worker_thread = None
+        self._operation_error_message = ""
         self._busy = False
         self._set_busy(False)
         if thread is not None:
             thread.deleteLater()
 
     def _set_busy(self, busy: bool) -> None:
-        self.saved_selector.setEnabled(not busy and self.saved_selector.count() > 0)
-        self.load_saved_btn.setEnabled(
-            not busy and isinstance(self.saved_selector.currentData(), SavedLetter)
-        )
-        self.refresh_saved_btn.setEnabled(not busy)
+        for card in self._saved_cards:
+            card.setEnabled(not busy)
         self.preview_mode.setEnabled(not busy)
         self.readiness_btn.setEnabled(not busy)
         if busy:
@@ -975,7 +1289,14 @@ class ForgeTab(QtWidgets.QWidget):
             return True
         thread.requestInterruption()
         thread.quit()
-        return thread.wait(timeout_ms)
+        stopped = thread.wait(timeout_ms)
+        if stopped:
+            self._worker = None
+            self._worker_thread = None
+            self._operation_success = None
+            self._operation_error_message = ""
+            self._busy = False
+        return stopped
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.settings.changed.disconnect(self._on_settings_changed)

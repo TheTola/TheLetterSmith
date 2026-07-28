@@ -301,9 +301,11 @@ class Nexus(QtWidgets.QMainWindow):
         super().__init__()
         self.project_root = str(project_root)
         self._forge_fullscreen_active = False
-        self._forge_fullscreen_was_maximized = False
-        self._forge_fullscreen_geometry: Optional[QtCore.QByteArray] = None
+        self._forge_fullscreen_previous_state = "normal"
+        self._forge_fullscreen_geometry: Optional[QtCore.QRect] = None
         self._forge_fullscreen_visibility: dict[QtWidgets.QWidget, bool] = {}
+        self._shutdown_in_progress = False
+        self._shutdown_complete = False
         self.setObjectName("NexusWindow")
 
         # Frameless + QSS
@@ -469,7 +471,15 @@ class Nexus(QtWidgets.QMainWindow):
         self.html_preview.page().fullScreenRequested.connect(
             self._on_web_fullscreen_requested
         )
-        self.html_preview.installEventFilter(self)
+        self._forge_fullscreen_escape = QtGui.QShortcut(
+            QtGui.QKeySequence(Qt.Key_Escape),
+            self,
+        )
+        self._forge_fullscreen_escape.setContext(Qt.ApplicationShortcut)
+        self._forge_fullscreen_escape.setEnabled(False)
+        self._forge_fullscreen_escape.activated.connect(
+            self._request_forge_fullscreen_exit
+        )
         self.preview_stack.addWidget(self.html_preview)
 
         pf_layout.addWidget(self.preview_stack)
@@ -1341,7 +1351,7 @@ class Nexus(QtWidgets.QMainWindow):
         )
 
     def _set_forge_preview_visible(self, visible: bool) -> None:
-        if visible:
+        if visible or self._forge_fullscreen_active:
             return
         self.html_preview.page().runJavaScript(
             "document.querySelectorAll('audio,video').forEach("
@@ -1358,10 +1368,30 @@ class Nexus(QtWidgets.QMainWindow):
             return
         self._restore_forge_preview_from_fullscreen()
 
+    def _request_forge_fullscreen_exit(self) -> None:
+        if not self._forge_fullscreen_active:
+            return
+        try:
+            self.html_preview.page().runJavaScript(
+                "if (document.fullscreenElement) document.exitFullscreen();"
+            )
+        except RuntimeError:
+            pass
+        self._restore_forge_preview_from_fullscreen()
+
     def _enter_forge_fullscreen(self) -> None:
         self._forge_fullscreen_active = True
-        self._forge_fullscreen_was_maximized = self.isMaximized()
-        self._forge_fullscreen_geometry = self.saveGeometry()
+        if self.isMinimized():
+            self._forge_fullscreen_previous_state = "minimized"
+        elif self.isMaximized():
+            self._forge_fullscreen_previous_state = "maximized"
+        else:
+            self._forge_fullscreen_previous_state = "normal"
+        geometry = self.normalGeometry()
+        if not geometry.isValid() or geometry.isEmpty():
+            geometry = self.geometry()
+        self._forge_fullscreen_geometry = QtCore.QRect(geometry)
+        self._forge_fullscreen_escape.setEnabled(True)
         chrome = (
             self.title_bar,
             self.tabbar,
@@ -1417,22 +1447,24 @@ class Nexus(QtWidgets.QMainWindow):
             body_layout.setContentsMargins(12, 12, 12, 12)
             body_layout.setSpacing(10)
 
-        if self._forge_fullscreen_was_maximized:
+        previous_state = self._forge_fullscreen_previous_state
+        previous_geometry = self._forge_fullscreen_geometry
+        self.showNormal()
+        if previous_geometry is not None and previous_geometry.isValid():
+            self.setGeometry(previous_geometry)
+        if previous_state == "maximized":
             self.showMaximized()
-        else:
-            self.showNormal()
-            if self._forge_fullscreen_geometry is not None:
-                self.restoreGeometry(self._forge_fullscreen_geometry)
+        elif previous_state == "minimized":
+            self.showMinimized()
 
         for widget, was_visible in self._forge_fullscreen_visibility.items():
             widget.setVisible(was_visible)
         self._forge_fullscreen_visibility.clear()
+        self._forge_fullscreen_previous_state = "normal"
         self._forge_fullscreen_geometry = None
+        self._forge_fullscreen_escape.setEnabled(False)
+        self.preview_stack.setCurrentWidget(self.html_preview)
         QtCore.QTimer.singleShot(0, self._update_preview_geometry)
-        QtCore.QTimer.singleShot(
-            0,
-            lambda: self.preview_stack.setCurrentWidget(self.html_preview),
-        )
         self.html_preview.setFocus()
 
     def _read_project_title(self) -> str:
@@ -1539,12 +1571,62 @@ class Nexus(QtWidgets.QMainWindow):
         super().moveEvent(event)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        if not self.forge_tab.shutdown_operations():
+        if not self.shutdown():
             self.status("Finish the current Forge operation before closing.")
             event.ignore()
             return
-        self._set_forge_preview_visible(False)
         super().closeEvent(event)
+
+    def shutdown(self) -> bool:
+        """Stop native and background resources once before application exit."""
+        if self._shutdown_complete:
+            return True
+        if self._shutdown_in_progress:
+            return False
+        self._shutdown_in_progress = True
+        try:
+            forge = getattr(self, "forge_tab", None)
+            stop_forge = getattr(forge, "shutdown_operations", None)
+            if callable(stop_forge) and not stop_forge():
+                return False
+
+            escape = getattr(self, "_forge_fullscreen_escape", None)
+            if escape is not None:
+                escape.setEnabled(False)
+            self._forge_fullscreen_active = False
+
+            web_view = getattr(self, "html_preview", None)
+            if web_view is not None:
+                try:
+                    web_view.page().setAudioMuted(True)
+                    web_view.stop()
+                except RuntimeError:
+                    pass
+
+            owners = (
+                getattr(self, "sound_tab", None),
+                getattr(self, "message_tab", None),
+                getattr(self, "image_tab", None),
+                getattr(self, "command_tab", None),
+                getattr(self, "_prompt_writer_win", None),
+                getattr(self, "_over", None),
+            )
+            for owner in owners:
+                stop = getattr(owner, "shutdown", None)
+                if not callable(stop):
+                    continue
+                try:
+                    stop()
+                except Exception as error:
+                    print(
+                        f"[Shutdown] {type(owner).__name__} cleanup failed: "
+                        f"{error}"
+                    )
+
+            self._shutdown_complete = True
+            return True
+        finally:
+            self._shutdown_in_progress = False
 
     # ─────────────────────────────────────────────────────────
     # Target Browser (title-bar button)
@@ -1724,19 +1806,6 @@ class Nexus(QtWidgets.QMainWindow):
         # Safe object lookups (avoid AttributeError if Qt routes to a different QObject)
         icon = getattr(self, "help_icon", None)
         pop  = getattr(self, "help_pop", None)
-        web_view = getattr(self, "html_preview", None)
-
-        if (
-            web_view is not None
-            and watched is web_view
-            and self._forge_fullscreen_active
-            and event.type() == QEvent.KeyPress
-            and isinstance(event, QtGui.QKeyEvent)
-            and event.key() == Qt.Key_Escape
-        ):
-            web_view.page().runJavaScript(
-                "if (document.fullscreenElement) document.exitFullscreen();"
-            )
 
         if icon is not None and watched is icon:
             t = event.type()
