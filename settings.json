@@ -36,7 +36,7 @@
   "recipient_title": "Growth & Ice Cream",
   "recipient_name": "Ijeoma Athenna Ahananu",
   "prompt_writer_state": {
-    "type": "\u2014 none \u2014",
+    "type": "— none —",
     "subject": "----",
     "color": "",
     "global": "",
@@ -59,12 +59,15 @@
     "generated_prompts": {}
   },
   "published_page_url": "",
-  "message_overlay_preset": "black",
+  "message_overlay_preset": "paper",
   "message_overlay_opacity": 66,
   "recipient_name_locked": true,
   "published_page_url_locked": false,
   "curtain_style": "average_color",
   "project_id": "22674ffd-e63c-4daa-ae3f-50c3a12ae397",
   "project_schema_version": 1,
-  "forge_preview_mode": "portrait"
+  "forge_preview_mode": "window",
+  "required_features": {
+    "music": false
+  }
 }

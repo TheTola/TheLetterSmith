@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -377,20 +378,12 @@ def _safe_clear_dir_contents(
         return
 
     for entry in directory_path.iterdir():
-        try:
-            if entry.is_file() or entry.is_symlink():
-                entry.unlink(
-                    missing_ok=True
-                )
-
-            elif entry.is_dir():
-                shutil.rmtree(
-                    entry,
-                    ignore_errors=True,
-                )
-
-        except Exception:
-            pass
+        if entry.is_file() or entry.is_symlink():
+            entry.unlink(
+                missing_ok=True
+            )
+        elif entry.is_dir():
+            shutil.rmtree(entry)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -443,15 +436,12 @@ def plan_build(
 
     ensure_output_dirs(pr)
 
-    stable_id = str(project_id).strip()
-
-    if not re.fullmatch(
-        r"[0-9a-fA-F-]{36}",
-        stable_id,
-    ):
+    try:
+        stable_id = str(uuid.UUID(str(project_id).strip()))
+    except (ValueError, TypeError, AttributeError):
         raise ValueError(
             "project_id must be a UUID string"
-        )
+        ) from None
 
     final_play_dir = (
         pr

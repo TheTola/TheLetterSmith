@@ -79,6 +79,14 @@ TEMPLATE_HTML = r"""
 
   <div id="volume-control" aria-hidden="true">
     <button
+      id="music-playback"
+      class="hud-button audio-action"
+      type="button"
+      title="Play music"
+      aria-label="Play music"
+      disabled
+    ><span id="music-playback-glyph" aria-hidden="true">▶</span></button>
+    <button
       id="volume-icon"
       class="hud-button hud-button-icon"
       type="button"
@@ -230,6 +238,8 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 #volume-control{position:absolute;top:calc(50% + var(--nav-size) + 34px);right:var(--nav-offset);display:flex;align-items:center;gap:10px;padding:8px 10px 8px 8px;border:1px solid rgba(255,255,255,.08);border-radius:var(--pill-radius);background:rgba(42,46,54,.72);box-shadow:var(--hud-shadow);backdrop-filter:blur(10px);z-index:99;opacity:0;visibility:hidden;pointer-events:none;transform:translateY(0);transition:opacity var(--motion-fast),transform var(--motion-medium),visibility 0s linear 220ms}
 body.stage-ready #volume-control{opacity:1;visibility:visible;pointer-events:auto;transition-delay:0s}
 #volume-control.slider-open{border-color:rgba(155,255,251,.18);background:rgba(50,55,64,.82)}
+#music-playback{flex:none;font:700 20px/1 var(--font-ui)}
+#music-playback[disabled]{opacity:.42;cursor:not-allowed}
 #volume-icon{flex:none}
 #volume-icon-img{width:var(--icon-size);height:var(--icon-size);padding:6px}
 #volume-slider{width:0;min-width:0;-webkit-appearance:none;appearance:none;height:4px;opacity:0;pointer-events:none;background:rgba(255,255,255,.30);border-radius:2px;transform:scaleX(.92);transform-origin:right center;transition:width var(--motion-medium),opacity var(--motion-fast),transform var(--motion-fast)}
@@ -261,6 +271,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const slideshowEl = document.getElementById('slideshow');
   const volumeControl = document.getElementById('volume-control');
+  const playbackBtn = document.getElementById('music-playback');
+  const playbackGlyph = document.getElementById('music-playback-glyph');
   const volIcon   = document.getElementById('volume-icon');
   const volIconImg = document.getElementById('volume-icon-img');
   let music       = document.getElementById('bg-music');
@@ -558,6 +570,18 @@ document.addEventListener('DOMContentLoaded', () => {
   function musicSources(){
     return Array.isArray(MUSIC_PLAYLIST) ? MUSIC_PLAYLIST.filter((value) => typeof value === 'string' && value) : [];
   }
+  function syncPlaybackButton(){
+    if (!playbackBtn) return;
+    const available = musicSources().length > 0;
+    const playing = available && (
+      (music && !music.paused) || (musicStandby && !musicStandby.paused)
+    );
+    const label = playing ? 'Pause music' : 'Play music';
+    playbackBtn.disabled = !available || !started;
+    playbackBtn.title = label;
+    playbackBtn.setAttribute('aria-label', label);
+    if (playbackGlyph) playbackGlyph.textContent = playing ? 'Ⅱ' : '▶';
+  }
   function ensureInitialMusicSource(){
     const sources = musicSources();
     if (!sources.length || !music) return false;
@@ -568,6 +592,8 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   function installPlaylistListeners(audio){
     if (!audio) return;
+    audio.addEventListener('play', syncPlaybackButton);
+    audio.addEventListener('pause', syncPlaybackButton);
     audio.addEventListener('timeupdate', () => {
       if (audio !== music || playlistTransitioning) return;
       const sources = musicSources();
@@ -597,6 +623,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const startedAt = performance.now();
     musicStandby.play().catch(() => {
       playlistTransitioning = false;
+      syncPlaybackButton();
     });
     function step(now){
       if (!playlistTransitioning) return;
@@ -615,12 +642,14 @@ document.addEventListener('DOMContentLoaded', () => {
       musicStandby.volume = target;
       musicStandby.muted = muted;
       playlistTransitioning = false;
+      syncPlaybackButton();
     }
     requestAnimationFrame(step);
   }
   installPlaylistListeners(music);
   installPlaylistListeners(musicStandby);
   if (!musicSources().length && volumeControl) volumeControl.style.display = 'none';
+  syncPlaybackButton();
   function setSliderOpen(open){
     const shouldOpen = !!open;
     volumeControl.classList.toggle('slider-open', shouldOpen);
@@ -684,6 +713,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const v = loadVolume0to100();
       setVolume0to100(v);
       if (!ensureInitialMusicSource()){
+        syncPlaybackButton();
         tryUnlockIntroControls();
         return;
       }
@@ -691,7 +721,7 @@ document.addEventListener('DOMContentLoaded', () => {
         music.currentTime = 0;
         music.volume = 0;
         music.muted = (v === 0);
-        music.play().catch(()=>{});
+        music.play().catch(()=>{ syncPlaybackButton(); });
       }catch(_){ }
       const target = clamp(v / 100, 0, 1);
       const start = performance.now();
@@ -735,6 +765,31 @@ document.addEventListener('DOMContentLoaded', () => {
   bindPress(beginBtn, (e) => { e.preventDefault(); openCurtain(); });
   prevBtn.addEventListener('click', () => go(-1));
   nextBtn.addEventListener('click', () => go(1));
+  if (playbackBtn){
+    playbackBtn.addEventListener('click', () => {
+      if (!started || !musicSources().length) return;
+      const playing = (
+        (music && !music.paused) || (musicStandby && !musicStandby.paused)
+      );
+      if (playing){
+        playlistTransitioning = false;
+        if (music) music.pause();
+        if (musicStandby){
+          musicStandby.pause();
+          musicStandby.currentTime = 0;
+        }
+        setVolume0to100(loadVolume0to100());
+        syncPlaybackButton();
+        return;
+      }
+      if (!ensureInitialMusicSource()){
+        syncPlaybackButton();
+        return;
+      }
+      setVolume0to100(loadVolume0to100());
+      music.play().catch(()=>{ syncPlaybackButton(); });
+    });
+  }
   if (fullscreenBtn){
     fullscreenBtn.addEventListener('click', async () => {
       try{

@@ -48,14 +48,17 @@ from message_history import (
     write_message_with_revision,
 )
 from message_html import is_lettersmith_message_html
+from settings_store import (
+    PUBLISHED_PAGE_URL_KEY,
+    SettingsStore,
+    normalize_published_page_url,
+)
 from config import (
     SETTINGS_FILE,
     USER_PAGES_DIR,
     MESSAGE_HTML_FILE,
     MESSAGE_IMAGE_FILE,
 )
-
-PUBLISHED_PAGE_URL_KEY = "published_page_url"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities
@@ -145,20 +148,7 @@ def _reading_time_label(word_count: int) -> str:
     return f"~{math.ceil(word_count / 200)} min read"
 
 
-def _normalize_published_page_url(value: str) -> str:
-    """Return a canonical HTTP(S) URL, or an empty string when invalid."""
-    candidate = (value or "").strip()
-    if not candidate:
-        return ""
-
-    parsed = QtCore.QUrl.fromUserInput(candidate)
-    if not parsed.isValid():
-        return ""
-    if parsed.scheme().lower() not in {"http", "https"}:
-        return ""
-    if not parsed.host():
-        return ""
-    return parsed.toString()
+_normalize_published_page_url = normalize_published_page_url
 
 
 MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
@@ -374,11 +364,13 @@ class MessageTab(QtWidgets.QWidget):
     preview_image = Signal(QPixmap)
     wall_preview = Signal(QPixmap)
     published_page_url_changed = Signal(str)
+    project_changed = Signal()
 
     def __init__(self, project_root: str) -> None:
         super().__init__()
         self.project_root = project_root
         self.settings_path = os.path.join(project_root, SETTINGS_FILE)
+        self.settings_store = SettingsStore(project_root)
 
         # Compatibility cache; disk remains authoritative.
         self.current_html: str = ""
@@ -440,7 +432,7 @@ class MessageTab(QtWidgets.QWidget):
         self.url_input.setPlaceholderText("https://your-published-letter-page")
         self.url_input.setToolTip(
             "Save the public page address for this letter. "
-            "The Forge tab's Go to Page button opens this URL."
+            "Forge uses this address for Open Published Letter and sharing."
         )
 
         title_recipient_layout.addRow("Letter Title:", self.title_input)
@@ -515,6 +507,10 @@ class MessageTab(QtWidgets.QWidget):
     # ──────────────────────────────────────────────────────────────────
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
         super().showEvent(event)
+        self.refresh_from_disk()
+
+    def refresh_from_disk(self) -> None:
+        """Refresh Message-owned settings, editor state, and preview."""
         self._load_settings()
         self.title_input.setText(str(self.settings.get("recipient_title", "")))
         self.name_input.setText(str(self.settings.get("recipient_name", "")))
@@ -531,6 +527,17 @@ class MessageTab(QtWidgets.QWidget):
         self._ensure_message_exists()
         self._emit_best_preview()
         self._update_message_summary()
+
+    def focus_field(self, target: str) -> None:
+        """Focus the Message correction requested by Project Readiness."""
+        widget = {
+            "recipient": self.name_input,
+            "title": self.title_input,
+            "published_url": self.url_input,
+            "message": self.edit_btn,
+        }.get(str(target))
+        if widget is not None:
+            widget.setFocus(Qt.OtherFocusReason)
 
     # ──────────────────────────────────────────────────────────────────
     # Nexus / Over_Nexus hooks
@@ -702,25 +709,30 @@ class MessageTab(QtWidgets.QWidget):
     # Settings
     # ──────────────────────────────────────────────────────────────────
     def _load_settings(self) -> None:
-        try:
-            with open(self.settings_path, "r", encoding="utf-8") as f:
-                self.settings = json.load(f)
-        except Exception:
-            self.settings = {}
-        if not isinstance(self.settings, dict):
-            self.settings = {}
+        self.settings = self.settings_store.snapshot()
 
-    def _persist_settings(self, *, announce: bool) -> None:
-        self.settings.setdefault(PUBLISHED_PAGE_URL_KEY, "")
+    def _persist_settings(self, *, announce: bool) -> bool:
         try:
-            Path(self.settings_path).parent.mkdir(parents=True, exist_ok=True)
-            with open(self.settings_path, "w", encoding="utf-8") as f:
-                json.dump(self.settings, f, indent=2)
+            fields = {
+                key: self.settings[key]
+                for key in (
+                    "recipient_title",
+                    "recipient_name",
+                    PUBLISHED_PAGE_URL_KEY,
+                    MESSAGE_OVERLAY_PRESET_KEY,
+                    MESSAGE_OVERLAY_OPACITY_KEY,
+                )
+                if key in self.settings
+            }
+            self.settings = self.settings_store.update_fields(fields)
             if announce:
                 self.status.setText("Message details saved.")
         except Exception as error:
             if announce:
                 self.status.setText(f"Error saving settings: {error}")
+            return False
+        self.project_changed.emit()
+        return True
 
     def _save_settings(self) -> None:
         self.settings["recipient_title"] = self.title_input.text().strip()
@@ -739,8 +751,8 @@ class MessageTab(QtWidgets.QWidget):
 
         self.settings[PUBLISHED_PAGE_URL_KEY] = normalized_url
         self.url_input.setText(normalized_url)
-        self._persist_settings(announce=True)
-        self.published_page_url_changed.emit(normalized_url)
+        if self._persist_settings(announce=True):
+            self.published_page_url_changed.emit(normalized_url)
 
     def set_published_page_url(self, url: str, *, persist: bool = True, announce: bool = True) -> bool:
         raw_url = (url or "").strip()
@@ -754,7 +766,11 @@ class MessageTab(QtWidgets.QWidget):
         if hasattr(self, "url_input"):
             self.url_input.setText(normalized_url)
         if persist:
-            self._persist_settings(announce=announce)
+            if not self._persist_settings(announce=announce):
+                return False
+        else:
+            self.settings = self.settings_store.snapshot()
+            self.settings[PUBLISHED_PAGE_URL_KEY] = normalized_url
         self.published_page_url_changed.emit(normalized_url)
         return True
 
@@ -980,6 +996,7 @@ class MessageTab(QtWidgets.QWidget):
         self._generate_image(new_html)
         self._emit_best_preview()
         self.status.setText("Message saved.")
+        self.project_changed.emit()
 
     # ──────────────────────────────────────────────────────────────────
     # Preview button
@@ -1093,6 +1110,7 @@ class MessageTab(QtWidgets.QWidget):
         self._ensure_wall_exists()
         self._generate_image(html)
         self._emit_best_preview()
+        self.project_changed.emit()
 
     # ──────────────────────────────────────────────────────────────────
     # Render message.png (stable, saved in same folder as message.html)

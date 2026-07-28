@@ -7,24 +7,18 @@ persists for the lifetime of the project.
 """
 from __future__ import annotations
 
-import json
-import os
 import uuid
 from pathlib import Path
 from threading import RLock
 from typing import Any, Mapping
 
-from config import SETTINGS_FILE
+from settings_store import SettingsStore
 
 PROJECT_ID_KEY = "project_id"
 PROJECT_SCHEMA_KEY = "project_schema_version"
 PROJECT_SCHEMA_VERSION = 1
 
 _lock = RLock()
-
-
-def _settings_path(project_root: str | Path) -> Path:
-    return Path(project_root).resolve() / SETTINGS_FILE
 
 
 def _valid_project_id(value: object) -> str:
@@ -40,39 +34,15 @@ def _new_project_id() -> str:
 
 def atomic_write_settings(project_root: str | Path, data: Mapping[str, Any]) -> None:
     """Write settings without exposing readers to a partially written file."""
-    path = _settings_path(project_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(dict(data), indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    SettingsStore(project_root).replace_snapshot(data)
 
 
 def load_project_settings(project_root: str | Path, *, ensure_identity: bool = True) -> dict[str, Any]:
     """Load settings and, by default, migrate the active project to a stable ID."""
-    path = _settings_path(project_root)
     with _lock:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        except (OSError, json.JSONDecodeError, TypeError):
-            data = {}
-        if not isinstance(data, dict):
-            data = {}
-
-        changed = False
-        if ensure_identity:
-            project_id = _valid_project_id(data.get(PROJECT_ID_KEY))
-            if not project_id:
-                project_id = _new_project_id()
-                changed = True
-            if data.get(PROJECT_ID_KEY) != project_id:
-                data[PROJECT_ID_KEY] = project_id
-                changed = True
-            if data.get(PROJECT_SCHEMA_KEY) != PROJECT_SCHEMA_VERSION:
-                data[PROJECT_SCHEMA_KEY] = PROJECT_SCHEMA_VERSION
-                changed = True
-
-        if changed:
-            atomic_write_settings(project_root, data)
+        data = SettingsStore(project_root).snapshot()
+        if not ensure_identity:
+            return data
         return data
 
 
@@ -92,23 +62,25 @@ def autosave_project_settings(
     must use an explicit project-management operation instead.
     """
     with _lock:
-        data = load_project_settings(project_root, ensure_identity=True)
+        store = SettingsStore(project_root)
+        data = store.snapshot()
         stable_id = data[PROJECT_ID_KEY]
+        accepted: dict[str, Any] = {}
         for key, value in updates.items():
             if preserve_project_id and key == PROJECT_ID_KEY:
                 continue
-            data[key] = value
-        data[PROJECT_ID_KEY] = stable_id
-        data[PROJECT_SCHEMA_KEY] = PROJECT_SCHEMA_VERSION
-        atomic_write_settings(project_root, data)
-        return data
+            accepted[key] = value
+        accepted[PROJECT_ID_KEY] = stable_id
+        accepted[PROJECT_SCHEMA_KEY] = PROJECT_SCHEMA_VERSION
+        return store.update_fields(accepted)
 
 
 def adopt_loaded_project(project_root: str | Path, metadata: Mapping[str, Any]) -> dict[str, Any]:
     """Load a saved project's identity and editable metadata into the workspace."""
     loaded_id = _valid_project_id(metadata.get(PROJECT_ID_KEY)) or _new_project_id()
     with _lock:
-        current = load_project_settings(project_root, ensure_identity=False)
+        store = SettingsStore(project_root)
+        current = store.snapshot()
         current.update({
             PROJECT_ID_KEY: loaded_id,
             PROJECT_SCHEMA_KEY: PROJECT_SCHEMA_VERSION,
@@ -117,5 +89,4 @@ def adopt_loaded_project(project_root: str | Path, metadata: Mapping[str, Any]) 
         })
         if "published_page_url" in metadata:
             current["published_page_url"] = str(metadata.get("published_page_url", "")).strip()
-        atomic_write_settings(project_root, current)
-        return current
+        return store.replace_snapshot(current)

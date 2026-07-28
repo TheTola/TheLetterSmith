@@ -458,6 +458,10 @@ class Nexus(QtWidgets.QMainWindow):
             QWebEngineSettings.FullScreenSupportEnabled,
             True,
         )
+        self.html_preview.settings().setAttribute(
+            QWebEngineSettings.LocalContentCanAccessFileUrls,
+            True,
+        )
         self.html_preview.page().fullScreenRequested.connect(
             self._on_web_fullscreen_requested
         )
@@ -610,9 +614,14 @@ class Nexus(QtWidgets.QMainWindow):
         body_layout.addWidget(self.page_stack)
 
         self.forge_tab.attach_readiness_window(self)
-        self.forge_tab.letter_loaded.connect(self._on_letter_loaded)
-        self.forge_tab.fix_requested.connect(self._fix_readiness_item)
+        self.forge_tab.project_restored.connect(self._on_project_restored)
+        self.forge_tab.correction_requested.connect(
+            self._route_forge_correction
+        )
         self.forge_tab.preview_requested.connect(self._load_forge_preview)
+        self.forge_tab.preview_visibility_changed.connect(
+            self._set_forge_preview_visible
+        )
         self.forge_tab.published_url_changed.connect(
             lambda url: self.message_tab.set_published_page_url(
                 url,
@@ -624,17 +633,14 @@ class Nexus(QtWidgets.QMainWindow):
             self.forge_tab.set_saved_page_url
         )
         self.image_tab.image_selected.connect(
-            lambda _pixmap: self.forge_tab.refresh_readiness()
+            lambda _pixmap: self.forge_tab.schedule_refresh()
         )
-        self.image_tab.clear_preview.connect(self.forge_tab.refresh_readiness)
+        self.image_tab.clear_preview.connect(self.forge_tab.schedule_refresh)
         self.sound_tab.project_sound.changed.connect(
-            self.forge_tab.refresh_readiness
+            self.forge_tab.schedule_refresh
         )
-        self.message_tab.title_input.editingFinished.connect(
-            self.forge_tab.refresh_readiness
-        )
-        self.message_tab.name_input.editingFinished.connect(
-            self.forge_tab.refresh_readiness
+        self.message_tab.project_changed.connect(
+            self.forge_tab.schedule_refresh
         )
 
         main_layout.addWidget(self.body)
@@ -694,6 +700,7 @@ class Nexus(QtWidgets.QMainWindow):
         self._sound_preview_widget: Optional[QtWidgets.QWidget] = None
         self._sound_preview_index: Optional[int] = None
         self._forge_preview_mode = "portrait"
+        self._forge_preview_generation = 0
         self._forge_fullscreen_host: Optional[QtWidgets.QDialog] = None
 
         # Remember last image pixmap for proper re-scaling on resize
@@ -746,7 +753,6 @@ class Nexus(QtWidgets.QMainWindow):
 
         # Diagnostics after event loop starts
         QtCore.QTimer.singleShot(0, self._post_init_diagnostics)
-        QtCore.QTimer.singleShot(0, self.forge_tab.show_readiness_window)
 
     def _make_page_surface(
         self,
@@ -850,57 +856,37 @@ class Nexus(QtWidgets.QMainWindow):
         widget.setParent(self.sound_tab)
         self._sound_preview_index = None
 
-    def _on_letter_loaded(self, _payload: Optional[dict] = None) -> None:
-        try:
-            self.image_tab.refresh_cards()
-        except Exception as exc:
-            self.status(f"Image state refresh failed: {exc}")
-        try:
-            self.message_tab._load_settings()
-            self.message_tab.title_input.setText(
-                str(self.message_tab.settings.get("recipient_title", ""))
-            )
-            self.message_tab.name_input.setText(
-                str(self.message_tab.settings.get("recipient_name", ""))
-            )
-            self.message_tab.url_input.setText(
-                str(self.message_tab.settings.get("published_page_url", ""))
-            )
-            self.message_tab._check_existing()
-        except Exception as exc:
-            self.status(f"Message state refresh failed: {exc}")
-        try:
-            self.sound_tab.reload_project_from_disk()
-        except Exception as exc:
-            self.status(f"⚠️ Sound state refresh failed: {exc}")
-        self.forge_tab.refresh_saved_page_url()
-        self.forge_tab.refresh_readiness()
+    def _on_project_restored(self, _payload: Optional[dict] = None) -> None:
+        """Coordinate public refresh contracts after an atomic restore."""
+        refreshers = (
+            ("Images", self.image_tab.refresh_from_disk),
+            ("Message", self.message_tab.refresh_from_disk),
+            ("Sound", self.sound_tab.refresh_from_disk),
+        )
+        for owner, refresh in refreshers:
+            try:
+                refresh()
+            except Exception as error:
+                self.status(f"{owner} could not refresh: {error}")
+        self.forge_tab.refresh_project_state()
+        self.forge_tab.refresh_saved_letters()
         self._show_forge_preview()
 
-    def _fix_readiness_item(self, key: str) -> None:
-        image_slots = {"cover": 1, "letter": 2, "wall": 3, "back": 4}
-        if key in image_slots:
-            self.tabbar.setCurrentIndex(0)
-            QtCore.QTimer.singleShot(
-                0,
-                lambda slot=image_slots[key]: self.image_tab._pick_image_dialog(
-                    slot
-                ),
-            )
+    def _route_forge_correction(self, tab: str, target: str) -> None:
+        destinations = {
+            "images": (0, self.image_tab.focus_asset_slot),
+            "sound": (1, self.sound_tab.focus_music_editor),
+            "message": (2, self.message_tab.focus_field),
+        }
+        destination = destinations.get(str(tab))
+        if destination is None:
             return
-        if key == "music":
-            self.tabbar.setCurrentIndex(1)
-            QtCore.QTimer.singleShot(0, self.sound_tab.setFocus)
-            return
-        if key in {"message", "recipient", "title", "published_url"}:
-            self.tabbar.setCurrentIndex(2)
-            target = {
-                "message": self.message_tab.edit_btn,
-                "recipient": self.message_tab.name_input,
-                "title": self.message_tab.title_input,
-                "published_url": self.message_tab.url_input,
-            }[key]
-            QtCore.QTimer.singleShot(0, target.setFocus)
+        index, focus = destination
+        self.tabbar.setCurrentIndex(index)
+        if tab == "sound":
+            QtCore.QTimer.singleShot(0, focus)
+        else:
+            QtCore.QTimer.singleShot(0, lambda: focus(target))
 
     # ─────────────────────────────────────────────────────────
     # Message double-click → full dialog preview
@@ -976,7 +962,8 @@ class Nexus(QtWidgets.QMainWindow):
 
         tab_name = self.tabbar.tabText(idx)
         self.status(f"Switched to: {tab_name}")
-        self.forge_tab.refresh_readiness()
+        self.forge_tab.schedule_refresh()
+        self._set_forge_preview_visible(idx == 3)
 
         if idx == 0:
             self.preview_stack.setCurrentIndex(0)
@@ -1261,11 +1248,11 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _show_forge_preview(self) -> None:
         """Show the actual generated viewer, never a static Forge stand-in."""
-        index = self.forge_tab._current_play_index()
+        index = self.forge_tab.current_play_index()
         if index is not None:
             self._load_forge_preview(
                 str(index),
-                self.forge_tab._preview_mode,
+                self.forge_tab.preview_mode_value,
             )
             return
         self._last_pixmap = None
@@ -1288,11 +1275,28 @@ class Nexus(QtWidgets.QMainWindow):
         self._last_pixmap = None
         self._clear_preview()
         self.preview_caption.setVisible(False)
-        self.html_preview.setUrl(QUrl.fromLocalFile(str(index.resolve())))
+        self._forge_preview_generation += 1
+        viewer_url = QUrl.fromLocalFile(str(index.resolve()))
+        try:
+            modified = index.stat().st_mtime_ns
+        except OSError:
+            modified = self._forge_preview_generation
+        viewer_url.setQuery(
+            f"lettersmith={modified}-{self._forge_preview_generation}"
+        )
+        self.html_preview.setUrl(viewer_url)
         self.preview_stack.setCurrentWidget(self.html_preview)
         self.status(
             f"Interactive letter preview: "
             f"{self._forge_preview_mode.replace('-', ' ')}"
+        )
+
+    def _set_forge_preview_visible(self, visible: bool) -> None:
+        if visible:
+            return
+        self.html_preview.page().runJavaScript(
+            "document.querySelectorAll('audio,video').forEach("
+            "media => { try { media.pause(); } catch (_) {} });"
         )
 
     def _on_web_fullscreen_requested(self, request) -> None:
@@ -1369,13 +1373,16 @@ class Nexus(QtWidgets.QMainWindow):
             max_w = max(420, int(window_width * 0.82))
             if mode == "portrait":
                 h = max_h
-                w = int(h * (9 / 16))
+                w = int(h * (2 / 3))
+                if w > max_w:
+                    w = max_w
+                    h = int(w * (3 / 2))
             elif mode == "landscape":
                 w = min(max_w, int(max_h * (16 / 9)))
                 h = int(w * (9 / 16))
             else:
-                w = min(max_w, int(max_h * (16 / 10)))
-                h = int(w * (10 / 16))
+                w = max_w
+                h = max_h
             self.preview_frame.setFixedSize(
                 max(240, w + 12),
                 max(180, h + 12),
@@ -1427,6 +1434,14 @@ class Nexus(QtWidgets.QMainWindow):
         if self.help_pop.isVisible():
             self._reposition_help_popover()
         super().moveEvent(event)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if not self.forge_tab.shutdown_operations():
+            self.status("Finish the current Forge operation before closing.")
+            event.ignore()
+            return
+        self._set_forge_preview_visible(False)
+        super().closeEvent(event)
 
     # ─────────────────────────────────────────────────────────
     # Target Browser (title-bar button)

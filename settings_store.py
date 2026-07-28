@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import logging
+import re
 import shutil
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
+from urllib.parse import urlsplit
 
 from transactional_io import atomic_write_text
 
@@ -34,6 +39,55 @@ CURTAIN_STYLE_ALIASES = {
     "complementary average": "complementary_average_color",
     "complementary average color": "complementary_average_color",
 }
+PUBLISHED_PAGE_URL_KEY = "published_page_url"
+REQUIRED_FEATURES_KEY = "required_features"
+PROJECT_ID_KEY = "project_id"
+PROJECT_SCHEMA_KEY = "project_schema_version"
+PROJECT_SCHEMA_VERSION = 1
+_LOGGER = logging.getLogger(__name__)
+
+
+def normalize_published_page_url(value: object) -> str:
+    """Return a trimmed HTTP(S) URL without inventing a missing scheme."""
+    candidate = str(value or "").strip()
+    if not candidate or any(character.isspace() for character in candidate):
+        return ""
+    try:
+        parsed = urlsplit(candidate)
+        _port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        return ""
+    if not parsed.netloc or not parsed.hostname:
+        return ""
+    if "\\" in candidate:
+        return ""
+    if re.search(r"%(?![0-9A-Fa-f]{2})", candidate):
+        return ""
+    hostname = parsed.hostname.rstrip(".")
+    if not hostname:
+        return ""
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        if all(part.isdigit() for part in hostname.split(".")):
+            return ""
+        try:
+            ascii_hostname = hostname.encode("idna").decode("ascii")
+        except UnicodeError:
+            return ""
+        labels = ascii_hostname.split(".")
+        if any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or not all(character.isalnum() or character == "-" for character in label)
+            for label in labels
+        ):
+            return ""
+    return candidate
 
 
 class SettingsChanged:
@@ -50,7 +104,13 @@ class SettingsChanged:
 
     def emit(self, settings: dict[str, Any], keys: tuple[str, ...]) -> None:
         for callback in tuple(self._callbacks):
-            callback(dict(settings), keys)
+            try:
+                callback(dict(settings), keys)
+            except Exception:
+                _LOGGER.exception(
+                    "Settings change callback failed for keys: %s",
+                    ", ".join(keys),
+                )
 
 
 class SettingsStore:
@@ -58,11 +118,13 @@ class SettingsStore:
 
     _locks_guard = threading.Lock()
     _locks: dict[str, threading.RLock] = {}
+    _signals_guard = threading.Lock()
+    _signals: dict[str, SettingsChanged] = {}
 
     def __init__(self, project_root: str | Path) -> None:
         self.project_root = Path(project_root).resolve()
         self.path = self.project_root / SETTINGS_FILENAME
-        self.changed = SettingsChanged()
+        self.changed = self._signal_for(self.path)
         self._settings: dict[str, Any] = {}
         self.validate_and_migrate()
 
@@ -71,6 +133,12 @@ class SettingsStore:
         key = str(path.resolve()).casefold()
         with cls._locks_guard:
             return cls._locks.setdefault(key, threading.RLock())
+
+    @classmethod
+    def _signal_for(cls, path: Path) -> SettingsChanged:
+        key = str(path.resolve()).casefold()
+        with cls._signals_guard:
+            return cls._signals.setdefault(key, SettingsChanged())
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.reload().get(key, default)
@@ -123,6 +191,26 @@ class SettingsStore:
             self.changed.emit(self._settings, changed_keys)
         return dict(self._settings)
 
+    def replace_snapshot(self, settings: Mapping[str, Any]) -> dict[str, Any]:
+        """Atomically replace project settings and notify every live store."""
+        lock = self._lock_for(self.path)
+        with lock:
+            before, _invalid = self._read_unlocked()
+            before = self._normalize(before)
+            replacement = self._normalize(settings)
+            self._write_unlocked(replacement)
+            self._settings = replacement
+        changed_keys = tuple(
+            sorted(
+                key
+                for key in set(before) | set(replacement)
+                if before.get(key) != replacement.get(key)
+            )
+        )
+        if changed_keys:
+            self.changed.emit(self._settings, changed_keys)
+        return dict(self._settings)
+
     def _read_unlocked(self) -> tuple[dict[str, Any], bool]:
         if not self.path.exists():
             return {}, False
@@ -155,6 +243,24 @@ class SettingsStore:
         normalized = dict(settings)
 
         try:
+            project_id = str(uuid.UUID(str(normalized.get(PROJECT_ID_KEY, ""))))
+        except (ValueError, TypeError, AttributeError):
+            project_id = str(uuid.uuid4())
+        normalized[PROJECT_ID_KEY] = project_id
+        normalized[PROJECT_SCHEMA_KEY] = PROJECT_SCHEMA_VERSION
+
+        normalized[PUBLISHED_PAGE_URL_KEY] = normalize_published_page_url(
+            normalized.get(PUBLISHED_PAGE_URL_KEY, "")
+        )
+
+        raw_required = normalized.get(REQUIRED_FEATURES_KEY, {})
+        required = dict(raw_required) if isinstance(raw_required, Mapping) else {}
+        required["music"] = bool(
+            required.get("music", normalized.get("music_required", False))
+        )
+        normalized[REQUIRED_FEATURES_KEY] = required
+
+        try:
             starting_volume = int(normalized.get("starting_volume", DEFAULT_SETTINGS["starting_volume"]))
         except (TypeError, ValueError):
             starting_volume = int(DEFAULT_SETTINGS["starting_volume"])
@@ -179,3 +285,12 @@ class SettingsStore:
             style = str(DEFAULT_SETTINGS["curtain_style"])
         normalized["curtain_style"] = style
         return normalized
+
+
+__all__ = [
+    "PUBLISHED_PAGE_URL_KEY",
+    "REQUIRED_FEATURES_KEY",
+    "SettingsChanged",
+    "SettingsStore",
+    "normalize_published_page_url",
+]

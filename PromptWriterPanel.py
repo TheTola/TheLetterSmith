@@ -1018,7 +1018,7 @@ def _build_prompt_payload(
     if subject:
         s = _normalize_text(subject, strip=True, max_length=300).rstrip(" .")
         if s:
-            subject_core = s.lower()
+            subject_core = s
 
     payload = PromptPayload(
         image_name=image_name,
@@ -1275,21 +1275,15 @@ class PromptWriterPanel(QtWidgets.QWidget):
         seeded_role = _clean_choice_line(role_lines[0]) if role_lines and any(l.strip() for l in role_lines) else "Artist"
 
         default_format = (
-            "The image must be produced in portrait orientation at exactly 2048×3072 pixels. "
-            "Its layout should remain graceful and well-proportioned, with a clear visual order that ensures "
-            "the subject can be recognized both at thumbnail scale and in full size. The color scheme should feel "
-            "unified and harmonious. The subject’s outline must stay sharp and distinct, with lighting handled "
-            "consistently in direction, strength, and temperature. Depth should emerge through perspective and "
-            "atmospheric layering, while unnecessary clutter is avoided. Fine detail is required, and margins must be "
-            "respected to prevent cropping. Colors should look smooth and natural, steering clear of harsh banding or "
-            "oversaturation unless otherwise specified. Negative space should be used deliberately to protect readability "
-            "and focus. If any demands conflict, resolution fidelity, clarity, and cohesion take precedence."
+            "Deliver a portrait image at exactly 2048×3072 pixels. Maintain accurate perspective, consistent lighting, "
+            "clear silhouettes, safe margins, smooth color transitions, and deliberate negative space. Avoid clutter, "
+            "banding, oversaturation, duplicated or merged objects, disconnected handles, heads, nibs, feathers, limbs, "
+            "or other structural parts, malformed text, unintended symbols, and cropped essential details."
         )
 
         ultra_effort = (
-            "Operate at the absolute highest standard. Think at the highest creative and technical level, "
-            "reason through composition, lighting, color, texture, and mood in exhaustive detail, and produce "
-            "output that fully documents the rationale and choices made — maximum verbosity and forensic clarity."
+            "use maximum visual fidelity, physically coherent construction, correct anatomy and object geometry, "
+            "deliberate composition, and clearly defined materials and textures."
         )
 
         self._data = {

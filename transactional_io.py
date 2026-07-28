@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
@@ -146,9 +147,13 @@ class PathTransaction:
         *,
         staging_suffix: str = ".staging",
         backup_suffix: str = ".backup",
+        unique_staging: bool = False,
     ) -> None:
         self.final_path = Path(final_path).resolve()
-        self.staging_path = self.final_path.with_name(self.final_path.name + staging_suffix)
+        unique_suffix = f".{uuid.uuid4().hex}" if unique_staging else ""
+        self.staging_path = self.final_path.with_name(
+            self.final_path.name + staging_suffix + unique_suffix
+        )
         self.backup_path = self.final_path.with_name(self.final_path.name + backup_suffix)
         self._committed = False
         self._validate_paths()

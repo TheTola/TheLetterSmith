@@ -897,6 +897,31 @@ class ImageTab(QtWidgets.QWidget):
         for index in self.labels:
             self._refresh_card_from_disk(index)
 
+    def refresh_from_disk(self) -> None:
+        """Refresh Image-owned card state after a project restoration."""
+        self.refresh_cards()
+
+    def focus_asset_slot(
+            self,
+            target: str,
+            *,
+            open_picker: bool = True,
+    ) -> None:
+        """Focus the named image slot and optionally open its picker."""
+        index = {
+            "cover": 1,
+            "letter": 2,
+            "wall": 3,
+            "back": 4,
+        }.get(str(target))
+        if index is None:
+            return
+        card = self.cards.get(index)
+        if card is not None:
+            card.setFocus(Qt.OtherFocusReason)
+        if open_picker:
+            self._pick_image_dialog(index)
+
     # ─────────────────────────────────────────────────────────────────────
     # Prompt Writer positioning
     # ─────────────────────────────────────────────────────────────────────

@@ -1688,6 +1688,19 @@ class SoundTab(QtWidgets.QWidget):
         self._reload_player_queue()
         self._refresh_ui()
 
+    def refresh_from_disk(self) -> None:
+        """Refresh Sound-owned assignment, playlist, and preview state."""
+        self.reload_project_from_disk()
+
+    def focus_music_editor(self) -> None:
+        """Focus the primary Sound action requested by Project Readiness."""
+        target = (
+            self.add_track_btn
+            if self.project_sound.state.mode == "playlist"
+            else self.single_action_btn
+        )
+        target.setFocus(Qt.OtherFocusReason)
+
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
         self.activate_for_tab_change()
