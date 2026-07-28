@@ -12,7 +12,7 @@ Design goals
 
 Public API (stable)
 - ParticleBurst            : transparent overlay for sparks + rings + flash
-- TabSwitcher              : slide+fade transitions for QStackedWidget
+- TabSwitcher              : normal slide+fade plus Command-only cross-fade
 - install_click_fx         : global hover glow + press pulse installer
 - set_excitement_level     : global intensity scalar for bursts
 - get_excitement_level
@@ -20,7 +20,8 @@ Public API (stable)
 Important Qt constraint
 - A QWidget can have ONLY ONE graphicsEffect at a time. This module:
   - avoids overwriting existing effects when installing click FX
-  - makes TabSwitcher NON-DESTRUCTIVE: if either page has an effect, it uses slide-only
+  - keeps normal TabSwitcher non-destructive when pages already own effects
+  - uses snapshot layers for the Command override, preserving page effects
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ def _dbg(msg: str) -> None:
 # Version + exports
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION = "2.0.1-master"
+VERSION = "2.1.0-command-fade"
 
 __all__ = [
     "VERSION",
@@ -60,6 +61,7 @@ __all__ = [
     "get_excitement_level",
     "ParticleBurst",
     "TabSwitcher",
+    "install_hover_tab_switch",
     "install_click_fx",
     "ButtonPulseFilter",
 ]
@@ -76,6 +78,8 @@ class FX:
     PRESS_MS = 140
     HOVER_GLOW_MS = 120
     TAB_MS = 220
+    COMMAND_TAB_MULTIPLIER = 2.0
+    TAB_HOVER_DELAY_MS = 333
 
     TICK_MS = 16  # ~60fps for overlay (sparks/rings/flash)
     WAVE_INTERVAL_MS = 28  # emit in small waves under heavy load
@@ -632,13 +636,121 @@ class _HoverGlowFilter(QtCore.QObject):
 # TabSwitcher (QStackedWidget transitions)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _HoverTabSwitchFilter(QtCore.QObject):
+    """Switch a QTabBar after the cursor rests on a tab for a short delay."""
+
+    def __init__(self, tabbar: QtWidgets.QTabBar, delay_ms: int = FX.TAB_HOVER_DELAY_MS) -> None:
+        super().__init__(tabbar)
+        self.tabbar = tabbar
+        self._pending_index = -1
+        self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(max(1, int(delay_ms)))
+        self._timer.timeout.connect(self._activate_pending_tab)
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if watched is not self.tabbar:
+            return False
+
+        event_type = event.type()
+        if event_type in (QEvent.MouseMove, QEvent.HoverMove, QEvent.Enter, QEvent.HoverEnter):
+            if QtWidgets.QApplication.mouseButtons() != Qt.NoButton:
+                self._cancel()
+                return False
+
+            position = self._event_position(event)
+            if position is not None:
+                self._schedule(self.tabbar.tabAt(position))
+
+        elif event_type in (QEvent.Leave, QEvent.HoverLeave, QEvent.MouseButtonPress):
+            self._cancel()
+
+        return False
+
+    def _event_position(self, event: QtCore.QEvent) -> Optional[QtCore.QPoint]:
+        try:
+            if hasattr(event, "position"):
+                return event.position().toPoint()  # type: ignore[attr-defined]
+            if hasattr(event, "pos"):
+                return event.pos()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            return self.tabbar.mapFromGlobal(QtGui.QCursor.pos())
+        except RuntimeError:
+            return None
+
+    def _schedule(self, index: int) -> None:
+        if index < 0 or index == self.tabbar.currentIndex():
+            self._cancel()
+            return
+        if index != self._pending_index:
+            self._pending_index = index
+            self._timer.start()
+
+    def _cancel(self) -> None:
+        self._pending_index = -1
+        self._timer.stop()
+
+    def _activate_pending_tab(self) -> None:
+        index = self._pending_index
+        self._cancel()
+        if index < 0:
+            return
+
+        try:
+            cursor_pos = self.tabbar.mapFromGlobal(QtGui.QCursor.pos())
+            cursor_index = self.tabbar.tabAt(cursor_pos)
+            if index == cursor_index and index != self.tabbar.currentIndex():
+                self.tabbar.setCurrentIndex(index)
+        except RuntimeError:
+            pass
+
+
+def install_hover_tab_switch(
+    tabbar: QtWidgets.QTabBar,
+    *,
+    delay_ms: int = FX.TAB_HOVER_DELAY_MS,
+) -> _HoverTabSwitchFilter:
+    """
+    Restore switch-on-hover behavior for a QTabBar.
+
+    The filter is retained on the tab bar, duplicate installation is avoided,
+    and a click/drag immediately cancels any pending hover switch.
+    """
+    existing = getattr(tabbar, "_anima_hover_tab_switch", None)
+    if isinstance(existing, _HoverTabSwitchFilter):
+        return existing
+
+    tabbar.setMouseTracking(True)
+    tabbar.setAttribute(Qt.WA_Hover, True)
+
+    hover_filter = _HoverTabSwitchFilter(tabbar, delay_ms=delay_ms)
+    tabbar.installEventFilter(hover_filter)
+    setattr(tabbar, "_anima_hover_tab_switch", hover_filter)
+    tabbar.setProperty("anima.HoverTabSwitchInstalled", True)
+    return hover_filter
+
+
 class TabSwitcher(QtCore.QObject):
     """
-    Slide+fade transitions for QStackedWidget.
+    Animated transitions for QStackedWidget.
 
-    NON-DESTRUCTIVE RULE:
-    - If either page already has a graphicsEffect, we do slide-only (no fade).
-      This avoids clobbering existing effects (Qt: one effect per widget).
+    Normal tabs:
+    - slide in from the right
+    - fade when neither page already owns a graphics effect
+
+    Command tab override:
+    - pure cross-fade, no slide
+    - double the normal transition duration
+    - applies both entering and leaving Command
+    - cancels any transition already in progress
+    - uses snapshots, so it does not replace page graphics effects
+
+    Hover switching:
+    - preserves an existing Nexus hover filter
+    - otherwise restores hover switching automatically when a matching QTabBar
+      can be found on the stack's window
     """
 
     def __init__(self, stack: QtWidgets.QStackedWidget, parent: Optional[QtCore.QObject] = None) -> None:
@@ -647,6 +759,63 @@ class TabSwitcher(QtCore.QObject):
         self._active: Optional[QtCore.QParallelAnimationGroup] = None
         self._active_target: Optional[QtWidgets.QWidget] = None
         self._active_cleanup = None
+        self._hover_tab_switch: Optional[_HoverTabSwitchFilter] = None
+        self._restore_hover_switching()
+
+    def _restore_hover_switching(self) -> None:
+        """Install hover switching only when Nexus has not already installed it."""
+        try:
+            window = self.stack.window()
+            existing = getattr(window, "_hover_tab_switch", None)
+            existing_tabbar = getattr(existing, "tabbar", None)
+            if isinstance(existing_tabbar, QtWidgets.QTabBar):
+                return
+
+            candidate = getattr(window, "tabbar", None)
+            if not isinstance(candidate, QtWidgets.QTabBar):
+                candidates = [
+                    tabbar
+                    for tabbar in window.findChildren(QtWidgets.QTabBar)
+                    if tabbar.count() == self.stack.count()
+                ]
+                candidate = candidates[0] if candidates else None
+
+            if isinstance(candidate, QtWidgets.QTabBar):
+                self._hover_tab_switch = install_hover_tab_switch(candidate)
+        except Exception:
+            self._hover_tab_switch = None
+
+    @staticmethod
+    def _is_command_page(widget: Optional[QtWidgets.QWidget]) -> bool:
+        if widget is None:
+            return False
+
+        try:
+            mode = str(widget.property("anima.Transition") or "").strip().lower()
+            if mode in {"fade", "command-fade", "command_fade"}:
+                return True
+        except Exception:
+            pass
+
+        try:
+            if widget.objectName().strip().lower() == "commandtab":
+                return True
+        except Exception:
+            pass
+
+        return widget.__class__.__name__.strip().lower() == "commandtab"
+
+    @staticmethod
+    def _command_duration(old_w: QtWidgets.QWidget, new_w: QtWidgets.QWidget) -> int:
+        multiplier = float(FX.COMMAND_TAB_MULTIPLIER)
+        for widget in (old_w, new_w):
+            try:
+                value = widget.property("anima.TransitionDurationMultiplier")
+                if value is not None:
+                    multiplier = max(multiplier, float(value))
+            except (TypeError, ValueError, RuntimeError):
+                pass
+        return max(1, int(round(FX.TAB_MS * multiplier)))
 
     def _stop_active(self) -> None:
         grp = self._active
@@ -669,6 +838,132 @@ class TabSwitcher(QtCore.QObject):
                 grp.deleteLater()
             except RuntimeError:
                 pass
+
+    @staticmethod
+    def _grab_page(widget: QtWidgets.QWidget, size: QtCore.QSize) -> QtGui.QPixmap:
+        """Capture a page at the live stack size without changing its effects."""
+        try:
+            widget.ensurePolished()
+            widget.repaint()
+            pixmap = widget.grab()
+        except RuntimeError:
+            return QtGui.QPixmap()
+
+        if pixmap.isNull() or not size.isValid():
+            return pixmap
+        if pixmap.size() != size:
+            pixmap = pixmap.scaled(size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        return pixmap
+
+    def _go_to_command_fade(
+        self,
+        index: int,
+        old_w: QtWidgets.QWidget,
+        new_w: QtWidgets.QWidget,
+        new_geo: QRect,
+    ) -> None:
+        """Run the Command-only snapshot cross-fade override."""
+        viewport = self.stack.contentsRect()
+        if viewport.isEmpty():
+            self.stack.setCurrentIndex(index)
+            return
+
+        old_pixmap = self._grab_page(old_w, viewport.size())
+
+        # Commit the requested page before capturing it. The snapshots cover the
+        # viewport during the fade, and this makes interruption deterministic:
+        # a new hover target starts from whichever page was most recently chosen.
+        self.stack.setCurrentWidget(new_w)
+        new_w.setGeometry(new_geo)
+        new_w.show()
+        new_w.raise_()
+        new_pixmap = self._grab_page(new_w, viewport.size())
+
+        if old_pixmap.isNull() or new_pixmap.isNull():
+            new_w.show()
+            new_w.raise_()
+            return
+
+        old_layer = QtWidgets.QLabel(self.stack)
+        new_layer = QtWidgets.QLabel(self.stack)
+        for layer, pixmap in ((old_layer, old_pixmap), (new_layer, new_pixmap)):
+            layer.setGeometry(viewport)
+            layer.setPixmap(pixmap)
+            layer.setScaledContents(True)
+            layer.setStyleSheet("background:transparent; border:none; padding:0; margin:0;")
+            layer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            layer.show()
+
+        new_layer.raise_()
+        old_layer.raise_()
+
+        old_eff = QtWidgets.QGraphicsOpacityEffect(old_layer)
+        new_eff = QtWidgets.QGraphicsOpacityEffect(new_layer)
+        old_eff.setOpacity(1.0)
+        new_eff.setOpacity(0.0)
+        old_layer.setGraphicsEffect(old_eff)
+        new_layer.setGraphicsEffect(new_eff)
+
+        # Hide the live page until the new snapshot has fully faded in.
+        new_w.hide()
+
+        duration = self._command_duration(old_w, new_w)
+        grp = QtCore.QParallelAnimationGroup(self)
+
+        fade_out = QtCore.QPropertyAnimation(old_eff, b"opacity", grp)
+        fade_out.setDuration(duration)
+        fade_out.setStartValue(1.0)
+        fade_out.setEndValue(0.0)
+        fade_out.setEasingCurve(QEasingCurve.InOutSine)
+
+        fade_in = QtCore.QPropertyAnimation(new_eff, b"opacity", grp)
+        fade_in.setDuration(duration)
+        fade_in.setStartValue(0.0)
+        fade_in.setEndValue(1.0)
+        fade_in.setEasingCurve(QEasingCurve.InOutSine)
+
+        grp.addAnimation(fade_out)
+        grp.addAnimation(fade_in)
+
+        cleaned = False
+
+        def _cleanup() -> None:
+            nonlocal cleaned
+            if cleaned:
+                return
+            cleaned = True
+
+            for layer in (old_layer, new_layer):
+                try:
+                    layer.hide()
+                    layer.setGraphicsEffect(None)
+                    layer.deleteLater()
+                except RuntimeError:
+                    pass
+
+            try:
+                current_w = self.stack.currentWidget()
+                if current_w is not None:
+                    current_w.setGeometry(new_geo)
+                    current_w.show()
+                    current_w.raise_()
+            except RuntimeError:
+                pass
+
+        def _finish() -> None:
+            if self._active is not grp:
+                return
+            self._active = None
+            self._active_target = None
+            self._active_cleanup = None
+            _cleanup()
+            grp.deleteLater()
+
+        grp.finished.connect(_finish)
+        self._active = grp
+        self._active_target = new_w
+        self._active_cleanup = _cleanup
+        grp.start()
 
     def go_to(self, index: int) -> None:
         if index < 0 or index >= self.stack.count():
@@ -696,21 +991,23 @@ class TabSwitcher(QtCore.QObject):
             new_geo = self.stack.contentsRect()
         new_w.setGeometry(new_geo)
 
-        # Always ensure new widget is visible and on top during animation
+        # Command overrides every ordinary transition both entering and leaving.
+        if self._is_command_page(old_w) or self._is_command_page(new_w):
+            self._go_to_command_fade(index, old_w, new_w, new_geo)
+            return
+
+        # Always ensure new widget is visible and on top during normal animation.
         new_w.setVisible(True)
         new_w.raise_()
 
-        # Decide whether we can fade safely
         can_fade = (old_w.graphicsEffect() is None) and (new_w.graphicsEffect() is None)
 
-        # Slide setup
         start_pos = QtCore.QPoint(new_geo.x() + FX.TAB_OFFSET_PX, new_geo.y())
         end_pos = new_geo.topLeft()
         new_w.move(start_pos)
 
         grp = QtCore.QParallelAnimationGroup(self)
 
-        # Optional fade (only when safe)
         old_eff = None
         new_eff = None
         if can_fade:
@@ -722,13 +1019,13 @@ class TabSwitcher(QtCore.QObject):
             old_w.setGraphicsEffect(old_eff)
             new_w.setGraphicsEffect(new_eff)
 
-            fade_out = QtCore.QPropertyAnimation(old_eff, b"opacity", self)
+            fade_out = QtCore.QPropertyAnimation(old_eff, b"opacity", grp)
             fade_out.setDuration(FX.TAB_MS)
             fade_out.setStartValue(1.0)
             fade_out.setEndValue(0.0)
             fade_out.setEasingCurve(QEasingCurve.InOutSine)
 
-            fade_in = QtCore.QPropertyAnimation(new_eff, b"opacity", self)
+            fade_in = QtCore.QPropertyAnimation(new_eff, b"opacity", grp)
             fade_in.setDuration(FX.TAB_MS)
             fade_in.setStartValue(0.0)
             fade_in.setEndValue(1.0)
@@ -737,15 +1034,21 @@ class TabSwitcher(QtCore.QObject):
             grp.addAnimation(fade_out)
             grp.addAnimation(fade_in)
 
-        # Slide animation (always)
-        slide_in = QtCore.QPropertyAnimation(new_w, b"pos", self)
+        slide_in = QtCore.QPropertyAnimation(new_w, b"pos", grp)
         slide_in.setDuration(FX.TAB_MS)
         slide_in.setStartValue(start_pos)
         slide_in.setEndValue(end_pos)
         slide_in.setEasingCurve(QEasingCurve.OutCubic)
         grp.addAnimation(slide_in)
 
+        cleaned = False
+
         def _cleanup() -> None:
+            nonlocal cleaned
+            if cleaned:
+                return
+            cleaned = True
+
             for widget, effect in ((old_w, old_eff), (new_w, new_eff)):
                 if effect is None:
                     continue

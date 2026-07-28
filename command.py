@@ -599,6 +599,10 @@ class CommandTab(QtWidgets.QWidget):
         super().__init__(parent)
         self.project_root = Path(project_root).resolve()
         self.setObjectName("CommandTab")
+        # TabSwitcher reads these properties. Any transition entering or
+        # leaving Command becomes a pure fade at twice normal tab speed.
+        self.setProperty("anima.Transition", "command-fade")
+        self.setProperty("anima.TransitionDurationMultiplier", 2.0)
         self.setStyleSheet("QWidget#CommandTab { background:#0b0c10; }")
 
         icons_dir = self.project_root / "gallery" / "app" / "icons"
