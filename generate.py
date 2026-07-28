@@ -47,6 +47,11 @@ from typing import Optional
 from urllib.parse import unquote, urlsplit
 
 from Template import TEMPLATE_HTML, TEMPLATE_CSS, TEMPLATE_JS
+from curtain_color import (
+    FALLBACK_CURTAIN_RGB,
+    extract_deep_dominant_color_from_images,
+    write_tinted_curtain_image,
+)
 from sound_model import (
     BUILD_SOUND_MANIFEST_NAME,
     build_sound_manifest,
@@ -54,7 +59,7 @@ from sound_model import (
     resolve_track_path,
 )
 from project_state import ensure_project_identity
-from settings_store import SettingsStore
+from settings_store import DEFAULT_SETTINGS, SettingsStore, VALID_CURTAIN_STYLES
 from transactional_io import PathTransaction, cleanup_abandoned_staging
 from config import (
     SETTINGS_FILE,
@@ -86,6 +91,13 @@ LEGACY_SFX_DIRS = (
 )
 BUILD_STATE_FILE = "lettersmith-build.json"
 BUILD_SCHEMA_VERSION = 2
+CURTAIN_FILES = {"cleft.png", "cright.png"}
+CURTAIN_ANALYSIS_PAGE_ORDER = (
+    "wall.png",
+    "cover.png",
+    "letter.png",
+    "back.png",
+)
 _FINGERPRINT_SETTING_KEYS = (
     "recipient_name",
     "recipient_title",
@@ -147,6 +159,23 @@ def _copy_required_files(src_dir: Path, dst_dir: Path, names: list[str]) -> None
         s = src_dir / name
         d = dst_dir / name
         _atomic_copy_file(s, d)
+
+
+def _copy_control_files(
+    src_dir: Path,
+    dst_dir: Path,
+    names: list[str],
+    *,
+    curtain_rgb: tuple[int, int, int],
+) -> None:
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        source = src_dir / name
+        destination = dst_dir / name
+        if name in CURTAIN_FILES:
+            write_tinted_curtain_image(source, destination, curtain_rgb)
+        else:
+            _atomic_copy_file(source, destination)
 
 
 def _copy_directory_files(source: Path, destination: Path) -> None:
@@ -404,6 +433,30 @@ def play_bundle_directory(project_root: str | Path) -> Path:
     return (root / OUTPUT_PLAY_DIR / ensure_project_identity(root)).resolve()
 
 
+def _curtain_rgb_for_settings(
+    project_root: Path,
+    settings: dict,
+) -> tuple[int, int, int]:
+    style = str(
+        settings.get(
+            "curtain_style",
+            DEFAULT_SETTINGS["curtain_style"],
+        )
+    )
+    if style not in VALID_CURTAIN_STYLES:
+        style = str(DEFAULT_SETTINGS["curtain_style"])
+    if style == "pure_white":
+        return FALLBACK_CURTAIN_RGB
+    page_paths = [
+        project_root / USER_PAGES_DIR / name
+        for name in CURTAIN_ANALYSIS_PAGE_ORDER
+    ]
+    return extract_deep_dominant_color_from_images(
+        page_paths,
+        hue_shift=0.5 if style == "complementary_average_color" else 0.0,
+    )
+
+
 def _hash_file(digest: "hashlib._Hash", root: Path, path: Path) -> None:
     resolved = path.resolve()
     try:
@@ -608,6 +661,22 @@ def validate_play_bundle(directory: str | Path) -> Path:
             ) from error
         for reference in _runtime_asset_references(content):
             _validate_runtime_asset_reference(root, base, reference)
+    forbidden_counter_patterns = (
+        (root / "index.html", r"""\bid\s*=\s*["']progress["']"""),
+        (root / "styles.css", r"""#progress\b"""),
+        (root / "script.js", r"""\bupdateProgress\s*\("""),
+    )
+    for path, pattern in forbidden_counter_patterns:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise RuntimeError(
+                f"The staged viewer cannot be read: {path.name}"
+            ) from error
+        if re.search(pattern, content, flags=re.IGNORECASE):
+            raise RuntimeError(
+                f"The staged viewer still contains a page counter: {path.name}"
+            )
     if (
         not isinstance(build_state, dict)
         or build_state.get("schema_version") != BUILD_SCHEMA_VERSION
@@ -684,7 +753,12 @@ def build_play_bundle_to(
     controls_src = pr / USER_CONTROLS_DIR
     message_src = pr / USER_MESSAGE_DIR
     _copy_required_files(pages_src, bp.play_pages_dir, REQUIRED_SLIDES)
-    _copy_required_files(controls_src, bp.play_controls_dir, CONTROL_FILES)
+    _copy_control_files(
+        controls_src,
+        bp.play_controls_dir,
+        CONTROL_FILES,
+        curtain_rgb=_curtain_rgb_for_settings(pr, settings),
+    )
     _copy_directory_files(message_src, bp.play_message_dir)
     _atomic_write_text(bp.play_message_dir / "message.html", message_html)
 

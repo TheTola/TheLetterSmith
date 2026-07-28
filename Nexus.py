@@ -18,6 +18,13 @@ import os, sys, subprocess, json
 from pathlib import Path
 from typing import Optional
 
+from settings_store import (
+    CURTAIN_STYLE_LABELS,
+    DEFAULT_SETTINGS,
+    SettingsStore,
+    VALID_CURTAIN_STYLES,
+)
+
 # ─────────────────────────────────────────────────────────────
 # Overlay integration (robust, guarded)
 # ─────────────────────────────────────────────────────────────
@@ -113,6 +120,47 @@ class TitleBar(QtWidgets.QWidget):
         layout.addWidget(title)
         layout.addStretch()
 
+        self.settings_button = QtWidgets.QToolButton(self)
+        self.settings_button.setText("Settings")
+        self.settings_button.setToolTip("Application settings")
+        self.settings_button.setCursor(Qt.PointingHandCursor)
+        self.settings_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.settings_button.setFixedHeight(30)
+        self.settings_button.setStyleSheet(
+            "QToolButton{color:#d7f8ff;background:transparent;"
+            "border:1px solid transparent;border-radius:5px;padding:4px 9px;}"
+            "QToolButton:hover,QToolButton::menu-button:hover{"
+            "background:rgba(0,255,255,0.12);border-color:#2f6672;}"
+            "QToolButton::menu-indicator{image:none;}"
+        )
+        self.settings_menu = QtWidgets.QMenu(self.settings_button)
+        self.settings_menu.setStyleSheet(
+            "QMenu{background:#101820;color:#dff9ff;"
+            "border:1px solid #31515f;padding:5px;}"
+            "QMenu::item{padding:7px 26px 7px 10px;border-radius:4px;}"
+            "QMenu::item:selected{background:#18323d;color:#fff;}"
+            "QMenu::indicator:checked{background:#00b8d4;"
+            "border:1px solid #8cf3ff;}"
+        )
+        self.curtain_menu = self.settings_menu.addMenu("Curtains")
+        self._curtain_actions: dict[str, QtGui.QAction] = {}
+        self._curtain_group = QtGui.QActionGroup(self)
+        self._curtain_group.setExclusive(True)
+        for style, label in CURTAIN_STYLE_LABELS.items():
+            action = self.curtain_menu.addAction(label)
+            action.setCheckable(True)
+            action.setData(style)
+            self._curtain_group.addAction(action)
+            action.triggered.connect(
+                lambda _checked=False, value=style: self._set_curtain_style(
+                    value
+                )
+            )
+            self._curtain_actions[style] = action
+        self.settings_menu.aboutToShow.connect(self._sync_curtain_menu)
+        self.settings_button.setMenu(self.settings_menu)
+        layout.addWidget(self.settings_button)
+
         # Target (reticle) button
         btn_target = QtWidgets.QPushButton()
         btn_target.setFixedSize(32, 32)
@@ -161,6 +209,30 @@ class TitleBar(QtWidgets.QWidget):
         layout.addWidget(btn_close)
 
         self._drag_start = QtCore.QPoint()
+
+    def _sync_curtain_menu(self) -> None:
+        current = str(
+            SettingsStore(self.parent.project_root).get(
+                "curtain_style",
+                DEFAULT_SETTINGS["curtain_style"],
+            )
+        )
+        for style, action in self._curtain_actions.items():
+            action.setChecked(style == current)
+
+    def _set_curtain_style(self, style: str) -> None:
+        if style not in VALID_CURTAIN_STYLES:
+            style = str(DEFAULT_SETTINGS["curtain_style"])
+        SettingsStore(self.parent.project_root).update_fields(
+            curtain_style=style
+        )
+        self._sync_curtain_menu()
+        self.parent.status(
+            f"Curtain style set to {CURTAIN_STYLE_LABELS[style]}."
+        )
+        forge = getattr(self.parent, "forge_tab", None)
+        if forge is not None and forge.isVisible():
+            forge.ensure_preview_current()
 
     def _toggle_max_restore(self):
         if self.parent.isMaximized():
@@ -1284,6 +1356,8 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _show_forge_preview(self) -> None:
         """Show the actual generated viewer, never a static Forge stand-in."""
+        if not self.forge_tab.preview_refresh_pending:
+            self.forge_tab.ensure_preview_current()
         index = self.forge_tab.current_play_index()
         if index is not None:
             self._load_forge_preview(

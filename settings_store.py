@@ -26,6 +26,11 @@ VALID_CURTAIN_STYLES = {
     "average_color",
     "complementary_average_color",
 }
+CURTAIN_STYLE_LABELS = {
+    "pure_white": "Pure White",
+    "average_color": "Average Color",
+    "complementary_average_color": "Complementary Average Color",
+}
 CURTAIN_STYLE_ALIASES = {
     "white": "pure_white",
     "pure white": "pure_white",
@@ -288,9 +293,12 @@ class SettingsStore:
 
 
 __all__ = [
+    "CURTAIN_STYLE_LABELS",
+    "DEFAULT_SETTINGS",
     "PUBLISHED_PAGE_URL_KEY",
     "REQUIRED_FEATURES_KEY",
     "SettingsChanged",
     "SettingsStore",
+    "VALID_CURTAIN_STYLES",
     "normalize_published_page_url",
 ]

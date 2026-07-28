@@ -45,13 +45,6 @@ html, body { width: 100%; height: 100%; background: #111; overflow: hidden; font
 #next { right: 50px; top: 50%; transform: translateY(-50%); }
 #prev img,#next img { width: 120px; height: 120px; }
 
-/* Progress */
-#progress {
-  position: absolute; bottom: 20px; right: 20px;
-  background: rgba(0,0,0,0.5); color: #fff; padding: .3em .6em; border-radius: 6px;
-  font-weight: 600; letter-spacing: .2px;
-}
-
 /* Show-message icon (reopen only) */
 #open-text { position: absolute; bottom: 20px; left: 20px; width: 64px; height: 64px; cursor: pointer; z-index: 100; transition: transform .15s; display: none; }
 #open-text:hover { transform: scale(1.08); }

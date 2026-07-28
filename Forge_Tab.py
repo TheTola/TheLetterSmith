@@ -108,6 +108,7 @@ class SavedLetterCard(QtWidgets.QFrame):
         self.delete_button.setAccessibleName("Delete saved letter")
         self.delete_button.setCursor(Qt.PointingHandCursor)
         self.delete_button.setFixedSize(24, 24)
+        self.delete_button.hide()
         self.delete_button.clicked.connect(
             lambda: self.delete_requested.emit(self.entry)
         )
@@ -210,6 +211,9 @@ class SavedLetterCard(QtWidgets.QFrame):
         self.style().unpolish(self)
         self.style().polish(self)
         self.update()
+
+    def set_delete_mode(self, enabled: bool) -> None:
+        self.delete_button.setVisible(bool(enabled))
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         self.delete_button.move(self.width() - 30, 7)
@@ -387,6 +391,9 @@ class ForgeTab(QtWidgets.QWidget):
         self._operation_error_message = ""
         self._selected_saved_letter: Optional[SavedLetter] = None
         self._saved_cards: list[SavedLetterCard] = []
+        self._saved_delete_mode = False
+        self._preview_refresh_pending = False
+        self._preview_refresh_requested = False
         self._pending_scroll_position = (0, 0)
         self._pending_metadata_update: Optional[
             tuple[Path, ReadinessResult]
@@ -483,7 +490,7 @@ class ForgeTab(QtWidgets.QWidget):
         heading_row.addWidget(self._readiness_controls)
         self._main_layout.addLayout(heading_row)
 
-        self.load_saved_btn = self._small_button("Load Saved Letter")
+        self.load_saved_btn = self._small_button("Load Letters")
         self.load_saved_btn.setMinimumSize(150, 36)
         self.load_saved_btn.clicked.connect(self.show_saved_letters)
         saved_holder = QtWidgets.QHBoxLayout()
@@ -507,11 +514,36 @@ class ForgeTab(QtWidgets.QWidget):
         saved_layout = QtWidgets.QVBoxLayout(self.saved_panel)
         saved_layout.setContentsMargins(12, 10, 12, 12)
         saved_layout.setSpacing(8)
+        saved_header = QtWidgets.QHBoxLayout()
+        saved_header.setContentsMargins(0, 0, 0, 0)
         saved_heading = QtWidgets.QLabel("Saved Letters")
         saved_heading.setStyleSheet(
             "color:#dff9ff;font:600 11pt 'Segoe UI';"
         )
-        saved_layout.addWidget(saved_heading)
+        saved_header.addWidget(saved_heading)
+        saved_header.addStretch(1)
+        self.saved_delete_toggle = QtWidgets.QToolButton()
+        self.saved_delete_toggle.setObjectName("SavedLetterDeleteToggle")
+        self.saved_delete_toggle.setText("−")
+        self.saved_delete_toggle.setCheckable(True)
+        self.saved_delete_toggle.setFixedSize(28, 28)
+        self.saved_delete_toggle.setCursor(Qt.PointingHandCursor)
+        self.saved_delete_toggle.setAccessibleName(
+            "Show saved-letter delete controls"
+        )
+        self.saved_delete_toggle.setStyleSheet(
+            "QToolButton{background:#15212b;color:#ffb2b2;"
+            "border:1px solid #65434a;border-radius:13px;"
+            "font:700 15pt 'Segoe UI';padding:0;}"
+            "QToolButton:hover{background:#40272d;border-color:#ff9a9a;}"
+            "QToolButton:checked{background:#702f38;color:#fff;"
+            "border-color:#ffb2b2;}"
+        )
+        self.saved_delete_toggle.clicked.connect(
+            self._set_saved_delete_mode
+        )
+        saved_header.addWidget(self.saved_delete_toggle)
+        saved_layout.addLayout(saved_header)
 
         self.saved_scroll = QtWidgets.QScrollArea()
         self.saved_scroll.setObjectName("SavedLettersScroll")
@@ -560,18 +592,6 @@ class ForgeTab(QtWidgets.QWidget):
             "color:#f2fbff;font:600 10pt 'Segoe UI';"
         )
         identity_row.addWidget(self.identity_recipient, 1)
-        identity_row.addWidget(self._muted_label("Published URL"))
-        self.published_url = QtWidgets.QLineEdit()
-        self.published_url.setReadOnly(True)
-        self.published_url.setMaximumWidth(380)
-        self.published_url.setPlaceholderText(
-            "Save the deployed URL in Message after publishing"
-        )
-        identity_row.addWidget(self.published_url, 1)
-        self.copy_link_btn = self._small_button("Copy Published Link")
-        self.copy_link_btn.clicked.connect(self.copy_published_link)
-        identity_row.addWidget(self.copy_link_btn)
-
         identity_holder = QtWidgets.QHBoxLayout()
         identity_holder.setContentsMargins(0, 0, 0, 0)
         identity_holder.addStretch(1)
@@ -743,6 +763,7 @@ class ForgeTab(QtWidgets.QWidget):
     def show_saved_letters(self) -> None:
         if self._busy:
             return
+        self._set_saved_delete_mode(False)
         self.refresh_saved_letters()
         owner = self.window()
         screen = owner.screen() or QtGui.QGuiApplication.primaryScreen()
@@ -794,6 +815,7 @@ class ForgeTab(QtWidgets.QWidget):
         vertical = self.saved_scroll.verticalScrollBar().value()
         entries = self.catalog.list_entries()
         for card in self._saved_cards:
+            card.hide()
             self.saved_cards_layout.removeWidget(card)
             card.deleteLater()
         self._saved_cards = []
@@ -802,6 +824,7 @@ class ForgeTab(QtWidgets.QWidget):
         for entry in entries:
             card = SavedLetterCard(entry, self.saved_cards_widget)
             card.setEnabled(not self._busy)
+            card.set_delete_mode(self._saved_delete_mode)
             card.selected.connect(self._select_saved_letter)
             card.activated.connect(self._activate_saved_letter)
             card.delete_requested.connect(self._delete_saved_letter)
@@ -814,6 +837,20 @@ class ForgeTab(QtWidgets.QWidget):
         self._watch_saved_letter_paths(entries)
         self._pending_scroll_position = (horizontal, vertical)
         self._scroll_restore_timer.start(0)
+
+    def _set_saved_delete_mode(self, enabled: bool) -> None:
+        self._saved_delete_mode = bool(enabled)
+        self.saved_delete_toggle.setChecked(self._saved_delete_mode)
+        if self._saved_delete_mode:
+            tooltip = "Hide saved-letter delete controls"
+            accessible = tooltip
+        else:
+            tooltip = "Show saved-letter delete controls"
+            accessible = tooltip
+        self.saved_delete_toggle.setToolTip(tooltip)
+        self.saved_delete_toggle.setAccessibleName(accessible)
+        for card in self._saved_cards:
+            card.set_delete_mode(self._saved_delete_mode)
 
     def load_selected_letter(self) -> None:
         entry = self._selected_saved_letter
@@ -873,6 +910,7 @@ class ForgeTab(QtWidgets.QWidget):
             and self._selected_saved_letter.path == entry.path
         ):
             self._selected_saved_letter = None
+        self._set_saved_delete_mode(False)
         self.refresh_saved_letters()
         self._set_status("Saved letter deleted.")
 
@@ -967,14 +1005,14 @@ class ForgeTab(QtWidgets.QWidget):
                 error=True,
             )
             return
-        self._last_play_dir = restored.play_dir
+        self._last_play_dir = None
         self.refresh_project_state()
         self.refresh_saved_letters()
-        self.request_preview()
         payload = restored.as_payload()
         self.project_restored.emit(payload)
         self.letter_loaded.emit(payload)
         self._set_status("Saved letter loaded.")
+        self.ensure_preview_current()
 
     def _preview_mode_changed(self) -> None:
         mode = str(self.preview_mode.currentData() or "portrait")
@@ -993,14 +1031,20 @@ class ForgeTab(QtWidgets.QWidget):
 
     def current_play_index(self) -> Optional[Path]:
         """Return the current playable viewer entry point, when available."""
+        if self._preview_refresh_pending:
+            return None
         return self._current_play_index()
 
     @property
     def preview_mode_value(self) -> str:
         return self._preview_mode
 
+    @property
+    def preview_refresh_pending(self) -> bool:
+        return self._preview_refresh_pending
+
     def request_preview(self) -> None:
-        index = self._current_play_index()
+        index = self.current_play_index()
         if index is not None:
             self.preview_requested.emit(str(index.resolve()), self._preview_mode)
 
@@ -1025,6 +1069,19 @@ class ForgeTab(QtWidgets.QWidget):
         return None
 
     def preview_letter(self) -> None:
+        self._prepare_preview(open_in_browser=True)
+
+    def ensure_preview_current(self) -> None:
+        """Refresh an existing embedded preview before it is displayed."""
+        if self._busy:
+            self._preview_refresh_pending = True
+            self._preview_refresh_requested = True
+            return
+        if self._current_play_index() is None:
+            return
+        self._prepare_preview(open_in_browser=False)
+
+    def _prepare_preview(self, *, open_in_browser: bool) -> None:
         if self._busy:
             return
         readiness = self._required_gate()
@@ -1054,18 +1111,31 @@ class ForgeTab(QtWidgets.QWidget):
                 ) from error
             return Path(play_dir).resolve(), rebuilt, readiness
 
+        self._preview_refresh_pending = True
         self.preview_files_release_requested.emit()
         self._start_operation(
             "Preparing preview…",
             task,
-            self._preview_completed,
+            (
+                self._preview_completed
+                if open_in_browser
+                else self._embedded_preview_completed
+            ),
             "Preview could not be updated. The previous preview was preserved.",
         )
 
-    def _preview_completed(self, result: object) -> None:
+    def _finish_preview(self, result: object) -> tuple[Path, Path]:
         play_dir, _rebuilt, readiness = result
         self._last_play_dir = Path(play_dir)
         index = self._last_play_dir / "index.html"
+        self._preview_refresh_pending = False
+        self.request_preview()
+        self._pending_metadata_update = (Path(play_dir), readiness)
+        self._metadata_timer.start(0)
+        return self._last_play_dir, index
+
+    def _preview_completed(self, result: object) -> None:
+        _play_dir, index = self._finish_preview(result)
         opened = index.is_file() and QtGui.QDesktopServices.openUrl(
             QUrl.fromLocalFile(str(index.resolve()))
         )
@@ -1076,8 +1146,11 @@ class ForgeTab(QtWidgets.QWidget):
                 "The local preview was built, but the browser could not open it.",
                 error=True,
             )
-        self._pending_metadata_update = (Path(play_dir), readiness)
-        self._metadata_timer.start(0)
+
+    def _embedded_preview_completed(self, result: object) -> None:
+        _play_dir, index = self._finish_preview(result)
+        if index.is_file():
+            self._set_status("Preview updated.")
 
     def _run_pending_metadata_update(self) -> None:
         pending = self._pending_metadata_update
@@ -1237,26 +1310,12 @@ class ForgeTab(QtWidgets.QWidget):
 
     def _sync_published_url(self) -> None:
         available = bool(self.saved_page_url)
-        self.published_url.setText(self.saved_page_url)
-        self.published_url.setCursorPosition(0)
-        self.published_url.setToolTip(self.saved_page_url)
         self.open_published_btn.setEnabled(available)
-        self.copy_link_btn.setEnabled(available)
         if available:
             self.open_published_btn.setToolTip(self.saved_page_url)
-            self.copy_link_btn.setToolTip(self.saved_page_url)
         else:
             disabled = "Save a valid HTTP or HTTPS published URL in Message."
             self.open_published_btn.setToolTip(disabled)
-            self.copy_link_btn.setToolTip(disabled)
-
-    def copy_published_link(self) -> None:
-        url = self.refresh_saved_page_url()
-        if not url:
-            self._set_status("No valid published link is available.", error=True)
-            return
-        QtWidgets.QApplication.clipboard().setText(url)
-        self._set_status("Published link copied.")
 
     def open_published_letter(self) -> None:
         url = self.refresh_saved_page_url()
@@ -1362,11 +1421,15 @@ class ForgeTab(QtWidgets.QWidget):
         self._set_busy(False)
         if thread is not None:
             thread.deleteLater()
+        if self._preview_refresh_requested:
+            self._preview_refresh_requested = False
+            QtCore.QTimer.singleShot(0, self.ensure_preview_current)
 
     def _set_busy(self, busy: bool) -> None:
         for card in self._saved_cards:
             card.setEnabled(not busy)
         self.load_saved_btn.setEnabled(not busy)
+        self.saved_delete_toggle.setEnabled(not busy)
         self.preview_mode.setEnabled(not busy)
         self.readiness_btn.setEnabled(not busy)
         if busy:
@@ -1399,7 +1462,7 @@ class ForgeTab(QtWidgets.QWidget):
         super().showEvent(event)
         self.refresh_project_state()
         self.refresh_saved_letters()
-        self.request_preview()
+        self.ensure_preview_current()
         self.preview_visibility_changed.emit(True)
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:

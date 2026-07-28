@@ -15,6 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
+from PIL import Image
 
 import Forge_Tab
 import generate
@@ -109,7 +110,11 @@ def _populate_runtime_assets(root: Path) -> None:
     controls = root / "gallery/user/card/controls"
     controls.mkdir(parents=True)
     for name in CONTROL_FILES:
-        (controls / name).write_bytes(b"control")
+        path = controls / name
+        if name in {"cleft.png", "cright.png"}:
+            Image.new("RGBA", (6, 6), (128, 128, 128, 255)).save(path)
+        else:
+            path.write_bytes(b"control")
     app_sounds = root / "gallery/app/sounds"
     app_sounds.mkdir(parents=True)
     (app_sounds / GLISS_FILE).write_bytes(b"sound")
@@ -252,7 +257,7 @@ class ForgeWorkflowTests(unittest.TestCase):
         )
         self.assertFalse(hasattr(tab, "generate_btn"))
         self.assertFalse(hasattr(tab, "seal_btn"))
-        self.assertEqual(tab.load_saved_btn.text(), "Load Saved Letter")
+        self.assertEqual(tab.load_saved_btn.text(), "Load Letters")
         self.assertTrue(tab.saved_panel.isWindow())
         self.assertTrue(bool(tab.saved_panel.windowFlags() & Qt.Popup))
         self.assertGreaterEqual(tab.saved_panel.minimumHeight(), 480)
@@ -260,10 +265,9 @@ class ForgeWorkflowTests(unittest.TestCase):
         self.assertIsNotNone(tab.saved_scroll)
         self.assertFalse(hasattr(tab, "refresh_saved_btn"))
         self.assertFalse(hasattr(tab, "saved_selector"))
-        self.assertIs(
-            tab.published_url.parentWidget(),
-            tab.identity_panel,
-        )
+        self.assertFalse(hasattr(tab, "published_url"))
+        self.assertFalse(hasattr(tab, "copy_link_btn"))
+        self.assertIsNotNone(tab.saved_delete_toggle)
         self.assertEqual(tab.heading_title.alignment(), Qt.AlignCenter)
         self.assertIsNotNone(tab.preview_format_panel)
         visible = {
@@ -342,6 +346,12 @@ class ForgeWorkflowTests(unittest.TestCase):
             by_title["Local Letter"].recipient_label.text(),
         )
         self.assertEqual(by_title["Local Letter"].delete_button.text(), "−")
+        self.assertTrue(by_title["Local Letter"].delete_button.isHidden())
+
+        tab.saved_delete_toggle.click()
+        self.app.processEvents()
+        self.assertTrue(tab.saved_delete_toggle.isChecked())
+        self.assertFalse(by_title["Local Letter"].delete_button.isHidden())
 
         tab._select_saved_letter(by_title["Saved Title"].entry)
         selected_path = tab._selected_saved_letter.path
@@ -360,6 +370,7 @@ class ForgeWorkflowTests(unittest.TestCase):
         ):
             tab._delete_saved_letter(local_entry)
         self.assertFalse(local.exists())
+        self.assertFalse(tab.saved_delete_toggle.isChecked())
         self.assertNotIn(
             "Local Letter",
             {card.entry.title for card in tab._saved_cards},
@@ -375,6 +386,10 @@ class ForgeWorkflowTests(unittest.TestCase):
         index = play_dir / "index.html"
         index.write_text("<html></html>", encoding="utf-8")
         tab = ForgeTab(self.root)
+        releases: list[bool] = []
+        tab.preview_files_release_requested.connect(
+            lambda: releases.append(True)
+        )
 
         def run_now(_activity, task, on_success, _error_message):
             on_success(task())
@@ -406,6 +421,7 @@ class ForgeWorkflowTests(unittest.TestCase):
             tab.status.toPlainText(),
             "Preview opened in your browser.",
         )
+        self.assertEqual(releases, [True])
         tab._metadata_timer.stop()
         tab.close()
 
@@ -784,6 +800,38 @@ class ForgeWorkflowTests(unittest.TestCase):
         )
         self.assertTrue(failed)
 
+    def test_path_transaction_retries_brief_windows_sharing_violation(
+        self,
+    ) -> None:
+        final = self.root / "build"
+        final.mkdir()
+        (final / "state.txt").write_text("old", encoding="utf-8")
+        transaction = PathTransaction(final)
+        staging = transaction.prepare()
+        staging.mkdir()
+        (staging / "state.txt").write_text("new", encoding="utf-8")
+        real_replace = os.replace
+        attempts = 0
+
+        def briefly_locked(source, destination):
+            nonlocal attempts
+            if Path(source).resolve() == final.resolve() and attempts == 0:
+                attempts += 1
+                raise PermissionError("simulated viewer lock")
+            return real_replace(source, destination)
+
+        with mock.patch(
+            "transactional_io.os.replace",
+            side_effect=briefly_locked,
+        ):
+            transaction.commit()
+
+        self.assertEqual(attempts, 1)
+        self.assertEqual(
+            (final / "state.txt").read_text(encoding="utf-8"),
+            "new",
+        )
+
     def test_abandoned_build_staging_is_cleaned(self) -> None:
         _populate_required(self.root)
         _populate_runtime_assets(self.root)
@@ -811,10 +859,48 @@ class ForgeWorkflowTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
         )
         self.assertEqual(manifest["tracks"], [])
+        index_html = (result / "index.html").read_text(encoding="utf-8")
+        styles = (result / "styles.css").read_text(encoding="utf-8")
+        script = (result / "script.js").read_text(encoding="utf-8")
+        self.assertNotIn('id="progress"', index_html)
+        self.assertNotIn("#progress", styles)
+        self.assertNotIn("updateProgress", script)
+
+        (result / "script.js").write_text(
+            script + "\nfunction updateProgress() {}\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(RuntimeError, "page counter"):
+            generate.validate_play_bundle(result)
+        (result / "script.js").write_text(script, encoding="utf-8")
 
         (result / "gallery/pages/back.png").unlink()
         with self.assertRaises(RuntimeError):
             generate.validate_play_bundle(result)
+
+    def test_curtain_style_changes_generated_curtain_colors(self) -> None:
+        _populate_required(self.root)
+        _populate_runtime_assets(self.root)
+        pages = self.root / "gallery/user/pages"
+        Image.new("RGB", (10, 10), (220, 25, 25)).save(pages / "wall.png")
+
+        store = SettingsStore(self.root)
+        pixels: dict[str, tuple[int, int, int]] = {}
+        for style in (
+            "pure_white",
+            "average_color",
+            "complementary_average_color",
+        ):
+            store.update_fields(curtain_style=style)
+            result = generate.generate_play_bundle(str(self.root))
+            with Image.open(result / "gallery/controls/cleft.png") as curtain:
+                pixels[style] = curtain.convert("RGB").getpixel((2, 2))
+
+        self.assertEqual(
+            len(set(pixels.values())),
+            3,
+            pixels,
+        )
 
     def test_preview_mode_does_not_invalidate_playable_build(self) -> None:
         _populate_required(self.root)
