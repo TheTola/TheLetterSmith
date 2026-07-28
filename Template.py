@@ -55,13 +55,30 @@ TEMPLATE_HTML = r"""
     </button>
 
     <div id="progress" aria-live="polite">Page 1 of 4</div>
-    <button
-      id="fullscreen-button"
-      class="hud-button fullscreen-action"
-      type="button"
-      title="Enter fullscreen"
-      aria-label="Enter fullscreen"
-    >Fullscreen</button>
+    <div id="viewer-actions" aria-label="Letter controls">
+      <button
+        id="restart-button"
+        class="hud-button viewer-action"
+        type="button"
+        title="Restart letter"
+        aria-label="Restart letter"
+      >Restart</button>
+      <button
+        id="mute-button"
+        class="hud-button viewer-action"
+        type="button"
+        title="Mute letter audio"
+        aria-label="Mute letter audio"
+        aria-pressed="false"
+      >Mute</button>
+      <button
+        id="fullscreen-button"
+        class="hud-button viewer-action"
+        type="button"
+        title="Enter fullscreen"
+        aria-label="Enter fullscreen"
+      >Fullscreen</button>
+    </div>
 
     <button
       id="open-text"
@@ -209,7 +226,9 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .nav-button[disabled]:hover{transform:translateY(-50%)}
 
 #progress{position:absolute;right:var(--corner-offset);bottom:var(--corner-offset);display:inline-flex;align-items:center;min-height:40px;padding:0 14px;border:1px solid rgba(255,255,255,.10);border-radius:var(--pill-radius);background:rgba(6,9,16,.56);box-shadow:var(--hud-shadow);color:var(--text-soft);font:700 clamp(12px,1.2vw,14px)/1 var(--font-ui);letter-spacing:.08em;text-transform:uppercase;z-index:101}
-#fullscreen-button{position:absolute;top:var(--corner-offset);right:var(--corner-offset);width:auto;height:40px;padding:0 14px;z-index:107;font:700 12px/1 var(--font-ui);letter-spacing:.03em}
+#viewer-actions{position:absolute;top:var(--corner-offset);right:var(--corner-offset);display:flex;align-items:center;gap:8px;z-index:107}
+#viewer-actions .viewer-action{width:auto;height:40px;padding:0 14px;font:700 12px/1 var(--font-ui);letter-spacing:.03em}
+#mute-button[aria-pressed="true"]{border-color:rgba(155,255,251,.55);background:linear-gradient(180deg,rgba(20,55,64,.92),rgba(8,25,34,.86));color:#eaffff}
 
 .text-wall{position:absolute;top:50%;left:50%;width:min(var(--wall-max-width),calc(100% - (2 * var(--wall-gap))));max-height:calc(100% - (2 * var(--wall-gap)));overflow:auto;padding:var(--wall-frame-pad);border:1px solid var(--paper-edge);border-radius:var(--panel-radius);background:linear-gradient(180deg,rgba(var(--message-overlay-rgb),var(--message-overlay-opacity)),rgba(var(--message-overlay-rgb),var(--message-overlay-opacity)));color:var(--message-ink);box-shadow:0 30px 80px var(--paper-shadow),0 12px 28px rgba(0,0,0,.22),inset 0 1px 0 var(--paper-line);z-index:105;opacity:0;visibility:hidden;pointer-events:none;transform:translate(-50%,-48%);transition:opacity var(--wall-fade-ms) ease,transform var(--motion-medium),visibility 0s linear var(--wall-fade-ms);isolation:isolate;scrollbar-width:thin;scrollbar-color:rgba(92,67,40,.52) rgba(0,0,0,.06)}
 .text-wall.is-open{opacity:1;visibility:visible;pointer-events:auto;transform:translate(-50%,-50%);transition:opacity var(--wall-fade-ms) ease,transform var(--motion-medium),visibility 0s}
@@ -248,7 +267,7 @@ body.stage-ready #volume-control{opacity:1;visibility:visible;pointer-events:aut
 #volume-slider::-moz-range-thumb{width:16px;height:16px;background:var(--accent-strong);border:2px solid #fff;border-radius:50%;cursor:pointer;box-shadow:0 0 0 4px rgba(0,255,255,.12)}
 
 @media (max-width: 900px){:root{--nav-size:clamp(68px,11vw,96px);--wall-gap:clamp(18px,4vw,30px)}.text-wall-content{font-size:clamp(16px,1.8vw,18px)}}
-@media (max-width: 640px){:root{--nav-size:clamp(60px,18vw,76px);--icon-size:44px;--close-size:40px;--corner-offset:16px}#prev,#next{top:auto;bottom:calc(var(--corner-offset) + 8px + env(safe-area-inset-bottom));transform:none}#prev:hover,#next:hover{transform:scale(1.04)}.nav-button[disabled]:hover{transform:none}#volume-control{top:auto;right:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom));transform:none}body.stage-ready #volume-control{transform:none}#progress{left:50%;right:auto;bottom:calc(var(--corner-offset) + env(safe-area-inset-bottom));transform:translateX(-50%)}#fullscreen-button{top:16px;right:16px}#open-text{left:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom))}#close-text{top:64px;right:16px}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - (2 * var(--wall-gap)) - 110px)}#volume-control.slider-open #volume-slider{width:min(34vw,128px)}}
+@media (max-width: 640px){:root{--nav-size:clamp(60px,18vw,76px);--icon-size:44px;--close-size:40px;--corner-offset:16px}#prev,#next{top:auto;bottom:calc(var(--corner-offset) + 8px + env(safe-area-inset-bottom));transform:none}#prev:hover,#next:hover{transform:scale(1.04)}.nav-button[disabled]:hover{transform:none}#volume-control{top:auto;right:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom));transform:none}body.stage-ready #volume-control{transform:none}#progress{left:50%;right:auto;bottom:calc(var(--corner-offset) + env(safe-area-inset-bottom));transform:translateX(-50%)}#viewer-actions{top:16px;right:16px;gap:6px}#viewer-actions .viewer-action{height:38px;padding:0 10px;font-size:11px}#open-text{left:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom))}#close-text{top:64px;right:16px}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - (2 * var(--wall-gap)) - 110px)}#volume-control.slider-open #volume-slider{width:min(34vw,128px)}}
 @media (prefers-reduced-motion: reduce){*,*::before,*::after{scroll-behavior:auto !important}#slideshow,#volume-control,#open-text,#close-text,.text-wall,#volume-slider{transition:none}#begin-button{animation:none}#curtain-overlay.is-visible,#curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
 """
 
@@ -263,6 +282,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const prevBtn   = document.getElementById('prev');
   const nextBtn   = document.getElementById('next');
   const progress  = document.getElementById('progress');
+  const restartBtn = document.getElementById('restart-button');
+  const muteBtn = document.getElementById('mute-button');
   const fullscreenBtn = document.getElementById('fullscreen-button');
 
   const wall       = document.getElementById('textWall');
@@ -300,6 +321,9 @@ document.addEventListener('DOMContentLoaded', () => {
   let deferredWarmStarted = false;
   let musicPlaylistIndex = 0;
   let playlistTransitioning = false;
+  const muteStorageKey = 'lettersmith.viewerMuted';
+  let viewerMuted = loadViewerMuted();
+  let currentVolume = loadVolume0to100();
 
   const flipPool = Array.from({length: 10}, (_, i) => `gallery/sounds/flip${i+1}.mp3`);
   const glissSrc = 'gallery/sounds/glissando.mp3';
@@ -502,6 +526,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const a = new Audio(src);
       a.preload = 'auto';
       a.volume = clamp(volume01, 0, 1);
+      a.muted = viewerMuted;
       a.play().catch(()=>{});
     }catch(_){ }
   }
@@ -553,18 +578,48 @@ document.addEventListener('DOMContentLoaded', () => {
     const v0 = (typeof INITIAL_VOLUME === 'number') ? INITIAL_VOLUME : 50;
     return clamp(Math.round(v0), 0, 100);
   }
+  function loadViewerMuted(){
+    try{
+      return window.sessionStorage.getItem(muteStorageKey) === 'true';
+    }catch(_){
+      return false;
+    }
+  }
+  function saveViewerMuted(){
+    try{
+      window.sessionStorage.setItem(muteStorageKey, viewerMuted ? 'true' : 'false');
+    }catch(_){ }
+  }
   function setVolume0to100(v){
     const vv = clamp(Math.round(v), 0, 100);
+    currentVolume = vv;
     const vol01 = vv / 100;
-    const muted = vv === 0;
+    const muted = viewerMuted || vv === 0;
     [music, musicStandby].forEach((audio) => {
       if (!audio) return;
       audio.volume = vol01;
       audio.muted = muted;
     });
     volIconImg.src = muted ? 'gallery/controls/voloff.png' : 'gallery/controls/volon.png';
-    volIcon.setAttribute('aria-label', muted ? 'Volume muted. Toggle volume slider' : 'Toggle volume slider');
+    volIcon.setAttribute('aria-label', muted ? 'Audio muted. Toggle volume slider' : 'Toggle volume slider');
     if (slider) slider.value = String(vv);
+  }
+
+  function syncMuteButton(){
+    if (!muteBtn) return;
+    const label = viewerMuted ? 'Unmute' : 'Mute';
+    const description = viewerMuted ? 'Unmute letter audio' : 'Mute letter audio';
+    muteBtn.textContent = label;
+    muteBtn.title = description;
+    muteBtn.setAttribute('aria-label', description);
+    muteBtn.setAttribute('aria-pressed', viewerMuted ? 'true' : 'false');
+  }
+
+  function setViewerMuted(muted){
+    viewerMuted = !!muted;
+    saveViewerMuted();
+    setVolume0to100(currentVolume);
+    syncMuteButton();
   }
 
   function musicSources(){
@@ -613,8 +668,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (playlistTransitioning || musicPlaylistIndex + 1 >= sources.length || !music || !musicStandby) return;
     playlistTransitioning = true;
     const nextIndex = musicPlaylistIndex + 1;
-    const target = clamp(loadVolume0to100() / 100, 0, 1);
-    const muted = target === 0;
+    const target = clamp(currentVolume / 100, 0, 1);
+    const muted = viewerMuted || target === 0;
     musicStandby.src = sources[nextIndex];
     musicStandby.currentTime = 0;
     musicStandby.volume = 0;
@@ -710,7 +765,7 @@ document.addEventListener('DOMContentLoaded', () => {
       musicStarted = true;
       glissDone = true;
       if (safetyTimer !== null){ clearTimeout(safetyTimer); safetyTimer = null; }
-      const v = loadVolume0to100();
+      const v = currentVolume;
       setVolume0to100(v);
       if (!ensureInitialMusicSource()){
         syncPlaybackButton();
@@ -720,7 +775,7 @@ document.addEventListener('DOMContentLoaded', () => {
       try{
         music.currentTime = 0;
         music.volume = 0;
-        music.muted = (v === 0);
+        music.muted = viewerMuted || v === 0;
         music.play().catch(()=>{ syncPlaybackButton(); });
       }catch(_){ }
       const target = clamp(v / 100, 0, 1);
@@ -751,6 +806,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const g = new Audio(glissSrc);
       g.preload = 'auto';
       g.volume = 0.10;
+      g.muted = viewerMuted;
       g.addEventListener('ended', startMusicAfterGliss, { once: true });
       g.addEventListener('error', () => { beginGlissAndCurtain(g); startMusicAfterGliss(); }, { once: true });
       g.addEventListener('loadedmetadata', () => beginGlissAndCurtain(g), { once: true });
@@ -765,6 +821,16 @@ document.addEventListener('DOMContentLoaded', () => {
   bindPress(beginBtn, (e) => { e.preventDefault(); openCurtain(); });
   prevBtn.addEventListener('click', () => go(-1));
   nextBtn.addEventListener('click', () => go(1));
+  if (restartBtn){
+    restartBtn.addEventListener('click', () => {
+      window.location.reload();
+    });
+  }
+  if (muteBtn){
+    muteBtn.addEventListener('click', () => {
+      setViewerMuted(!viewerMuted);
+    });
+  }
   if (playbackBtn){
     playbackBtn.addEventListener('click', () => {
       if (!started || !musicSources().length) return;
@@ -778,7 +844,7 @@ document.addEventListener('DOMContentLoaded', () => {
           musicStandby.pause();
           musicStandby.currentTime = 0;
         }
-        setVolume0to100(loadVolume0to100());
+        setVolume0to100(currentVolume);
         syncPlaybackButton();
         return;
       }
@@ -786,7 +852,7 @@ document.addEventListener('DOMContentLoaded', () => {
         syncPlaybackButton();
         return;
       }
-      setVolume0to100(loadVolume0to100());
+      setVolume0to100(currentVolume);
       music.play().catch(()=>{ syncPlaybackButton(); });
     });
   }
@@ -853,6 +919,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   ensureSlider();
   setSliderOpen(false);
+  syncMuteButton();
   setVolume0to100(loadVolume0to100());
   setHiddenState(wall, true);
   setHiddenState(openText, true);

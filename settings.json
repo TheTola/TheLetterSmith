@@ -66,7 +66,7 @@
   "curtain_style": "average_color",
   "project_id": "22674ffd-e63c-4daa-ae3f-50c3a12ae397",
   "project_schema_version": 1,
-  "forge_preview_mode": "window",
+  "forge_preview_mode": "landscape",
   "required_features": {
     "music": false
   }
