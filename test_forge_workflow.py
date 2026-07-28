@@ -252,8 +252,11 @@ class ForgeWorkflowTests(unittest.TestCase):
         )
         self.assertFalse(hasattr(tab, "generate_btn"))
         self.assertFalse(hasattr(tab, "seal_btn"))
-        self.assertEqual(tab.saved_panel.maximumWidth(), 1510)
-        self.assertGreaterEqual(tab.saved_panel.minimumHeight(), 250)
+        self.assertEqual(tab.load_saved_btn.text(), "Load Saved Letter")
+        self.assertTrue(tab.saved_panel.isWindow())
+        self.assertTrue(bool(tab.saved_panel.windowFlags() & Qt.Popup))
+        self.assertGreaterEqual(tab.saved_panel.minimumHeight(), 480)
+        self.assertGreaterEqual(tab.saved_panel.maximumHeight(), 720)
         self.assertIsNotNone(tab.saved_scroll)
         self.assertFalse(hasattr(tab, "refresh_saved_btn"))
         self.assertFalse(hasattr(tab, "saved_selector"))
@@ -269,6 +272,14 @@ class ForgeWorkflowTests(unittest.TestCase):
             if not button.isHidden()
         }
         self.assertEqual(visible, {"music", "published_url"})
+        tab.resize(1200, 800)
+        tab.show()
+        self.app.processEvents()
+        tab.show_saved_letters()
+        self.app.processEvents()
+        self.assertTrue(tab.saved_panel.isVisible())
+        self.assertGreaterEqual(tab.saved_panel.height(), 480)
+        tab.saved_panel.hide()
         tab.close()
 
     def test_saved_letters_use_cover_cards_and_missing_cover_placeholder(
@@ -330,11 +341,29 @@ class ForgeWorkflowTests(unittest.TestCase):
             "Recipient:",
             by_title["Local Letter"].recipient_label.text(),
         )
+        self.assertEqual(by_title["Local Letter"].delete_button.text(), "−")
 
         tab._select_saved_letter(by_title["Saved Title"].entry)
         selected_path = tab._selected_saved_letter.path
         tab.refresh_saved_letters()
         self.assertEqual(tab._selected_saved_letter.path, selected_path)
+
+        local_entry = next(
+            card.entry
+            for card in tab._saved_cards
+            if card.entry.title == "Local Letter"
+        )
+        with mock.patch.object(
+            QtWidgets.QMessageBox,
+            "question",
+            return_value=QtWidgets.QMessageBox.Yes,
+        ):
+            tab._delete_saved_letter(local_entry)
+        self.assertFalse(local.exists())
+        self.assertNotIn(
+            "Local Letter",
+            {card.entry.title for card in tab._saved_cards},
+        )
         tab.close()
 
     def test_preview_opens_local_index_in_default_browser_without_publisher(

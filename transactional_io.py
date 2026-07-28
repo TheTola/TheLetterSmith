@@ -12,12 +12,26 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 
 DirectoryValidator = Callable[[Path], bool | None]
+_DIRECTORY_REPLACE_TIMEOUT_SECONDS = 2.0
 
 
 def _temporary_path(target: Path) -> Path:
     return target.with_name(
         f".{target.name}.tmp.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}"
     )
+
+
+def _replace_directory_path(source: Path, destination: Path) -> None:
+    """Retry brief Windows sharing violations while viewers release files."""
+    deadline = time.monotonic() + _DIRECTORY_REPLACE_TIMEOUT_SECONDS
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
 
 
 def atomic_write_bytes(path: str | Path, value: bytes) -> Path:
@@ -172,7 +186,10 @@ class PathTransaction:
             if self.final_path.exists():
                 _remove_path(self.backup_path)
             else:
-                os.replace(self.backup_path, self.final_path)
+                _replace_directory_path(
+                    self.backup_path,
+                    self.final_path,
+                )
         _remove_path(self.staging_path)
         self._committed = False
         return self.staging_path
@@ -191,15 +208,24 @@ class PathTransaction:
 
         _remove_path(self.backup_path)
         if self.final_path.exists():
-            os.replace(self.final_path, self.backup_path)
+            _replace_directory_path(
+                self.final_path,
+                self.backup_path,
+            )
 
         try:
             if replace:
-                os.replace(self.staging_path, self.final_path)
+                _replace_directory_path(
+                    self.staging_path,
+                    self.final_path,
+                )
             self._committed = True
         except Exception:
             if self.backup_path.exists() and not self.final_path.exists():
-                os.replace(self.backup_path, self.final_path)
+                _replace_directory_path(
+                    self.backup_path,
+                    self.final_path,
+                )
             raise
 
         if not keep_backup:
@@ -209,7 +235,10 @@ class PathTransaction:
         if self._committed and self.final_path.exists():
             _remove_path(self.final_path)
         if self.backup_path.exists():
-            os.replace(self.backup_path, self.final_path)
+            _replace_directory_path(
+                self.backup_path,
+                self.final_path,
+            )
         self._committed = False
         _remove_path(self.staging_path)
 

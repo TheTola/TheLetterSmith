@@ -642,6 +642,9 @@ class Nexus(QtWidgets.QMainWindow):
             self._route_forge_correction
         )
         self.forge_tab.preview_requested.connect(self._load_forge_preview)
+        self.forge_tab.preview_files_release_requested.connect(
+            self._release_forge_preview_files
+        )
         self.forge_tab.preview_visibility_changed.connect(
             self._set_forge_preview_visible
         )
@@ -1349,6 +1352,20 @@ class Nexus(QtWidgets.QMainWindow):
             f"Interactive letter preview: "
             f"{self._forge_preview_mode.replace('-', ' ')}"
         )
+
+    def _release_forge_preview_files(self) -> None:
+        """Release local viewer handles before transactional replacement."""
+        if self._forge_fullscreen_active:
+            self._restore_forge_preview_from_fullscreen()
+        self.html_preview.page().runJavaScript(
+            "document.querySelectorAll('audio,video').forEach("
+            "media => { try { media.pause(); } catch (_) {} });"
+        )
+        self.html_preview.stop()
+        self.html_preview.setUrl(QUrl("about:blank"))
+        self.preview_stack.setCurrentIndex(0)
+        self.preview_caption.setText("Preparing local letter…")
+        self.preview_caption.setVisible(True)
 
     def _set_forge_preview_visible(self, visible: bool) -> None:
         if visible or self._forge_fullscreen_active:

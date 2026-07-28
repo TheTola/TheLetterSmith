@@ -20,6 +20,7 @@ from saved_letters import (
     RestoredProject,
     SavedLetter,
     SavedLetterCatalog,
+    SavedLetterDeleteError,
     SavedLetterRestorer,
     update_saved_metadata,
 )
@@ -81,6 +82,7 @@ class SavedLetterCard(QtWidgets.QFrame):
 
     selected = QtCore.Signal(object)
     activated = QtCore.Signal(object)
+    delete_requested = QtCore.Signal(object)
 
     def __init__(self, entry: SavedLetter, parent=None) -> None:
         super().__init__(parent)
@@ -98,6 +100,17 @@ class SavedLetterCard(QtWidgets.QFrame):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(7, 7, 7, 7)
         layout.setSpacing(3)
+
+        self.delete_button = QtWidgets.QToolButton(self)
+        self.delete_button.setObjectName("SavedLetterDelete")
+        self.delete_button.setText("−")
+        self.delete_button.setToolTip("Delete saved letter")
+        self.delete_button.setAccessibleName("Delete saved letter")
+        self.delete_button.setCursor(Qt.PointingHandCursor)
+        self.delete_button.setFixedSize(24, 24)
+        self.delete_button.clicked.connect(
+            lambda: self.delete_requested.emit(self.entry)
+        )
 
         self.cover = QtWidgets.QLabel()
         self.cover.setObjectName("SavedLetterCover")
@@ -164,6 +177,12 @@ class SavedLetterCard(QtWidgets.QFrame):
             "QFrame#SavedLetterCard[selected=\"true\"]{"
             "border:2px solid #00d4f4;background:#142630;}"
             "QFrame#SavedLetterCard:focus{border:2px solid #8defff;}"
+            "QToolButton#SavedLetterDelete{background:rgba(8,16,21,.90);"
+            "color:#ff9a9a;border:1px solid #74454b;border-radius:11px;"
+            "font:700 14pt 'Segoe UI';padding:0;}"
+            "QToolButton#SavedLetterDelete:hover{background:#702f38;"
+            "color:#fff;border-color:#ff9a9a;}"
+            "QToolButton#SavedLetterDelete:focus{border-color:#fff;}"
             "QLabel#SavedLetterCover{background:#091116;color:#78909a;"
             "border:1px solid #263e4a;border-radius:4px;"
             "font:9pt 'Segoe UI';}"
@@ -191,6 +210,11 @@ class SavedLetterCard(QtWidgets.QFrame):
         self.style().unpolish(self)
         self.style().polish(self)
         self.update()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        self.delete_button.move(self.width() - 30, 7)
+        self.delete_button.raise_()
+        super().resizeEvent(event)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == Qt.LeftButton:
@@ -341,6 +365,7 @@ class ForgeTab(QtWidgets.QWidget):
     project_restored = QtCore.Signal(dict)
     letter_loaded = QtCore.Signal(dict)
     preview_requested = QtCore.Signal(str, str)
+    preview_files_release_requested = QtCore.Signal()
     preview_visibility_changed = QtCore.Signal(bool)
     published_url_changed = QtCore.Signal(str)
     _settings_refresh_requested = QtCore.Signal()
@@ -372,6 +397,10 @@ class ForgeTab(QtWidgets.QWidget):
             self.correction_requested.emit
         )
         self._init_ui()
+
+        self._card_layout_timer = QtCore.QTimer(self)
+        self._card_layout_timer.setSingleShot(True)
+        self._card_layout_timer.timeout.connect(self._layout_saved_cards)
 
         self._refresh_timer = QtCore.QTimer(self)
         self._refresh_timer.setSingleShot(True)
@@ -454,21 +483,33 @@ class ForgeTab(QtWidgets.QWidget):
         heading_row.addWidget(self._readiness_controls)
         self._main_layout.addLayout(heading_row)
 
-        self.saved_panel = QtWidgets.QFrame()
+        self.load_saved_btn = self._small_button("Load Saved Letter")
+        self.load_saved_btn.setMinimumSize(150, 36)
+        self.load_saved_btn.clicked.connect(self.show_saved_letters)
+        saved_holder = QtWidgets.QHBoxLayout()
+        saved_holder.setContentsMargins(0, 0, 0, 0)
+        saved_holder.addStretch(1)
+        saved_holder.addWidget(self.load_saved_btn)
+        saved_holder.addStretch(1)
+        self._main_layout.addLayout(saved_holder)
+
+        self.saved_panel = QtWidgets.QFrame(
+            self,
+            Qt.Popup | Qt.FramelessWindowHint,
+        )
         self.saved_panel.setObjectName("ForgeSavedPanel")
-        self.saved_panel.setMaximumWidth(1510)
-        self.saved_panel.setMinimumHeight(250)
-        self.saved_panel.setMaximumHeight(276)
+        self.saved_panel.setMinimumSize(560, 480)
+        self.saved_panel.setMaximumSize(1100, 720)
         self.saved_panel.setStyleSheet(
             "QFrame#ForgeSavedPanel{background:#101820;"
-            "border:1px solid #284554;border-radius:7px;}"
+            "border:1px solid #3b6678;border-radius:8px;}"
         )
         saved_layout = QtWidgets.QVBoxLayout(self.saved_panel)
-        saved_layout.setContentsMargins(10, 8, 10, 8)
-        saved_layout.setSpacing(5)
+        saved_layout.setContentsMargins(12, 10, 12, 12)
+        saved_layout.setSpacing(8)
         saved_heading = QtWidgets.QLabel("Saved Letters")
         saved_heading.setStyleSheet(
-            "color:#dff9ff;font:600 10pt 'Segoe UI';"
+            "color:#dff9ff;font:600 11pt 'Segoe UI';"
         )
         saved_layout.addWidget(saved_heading)
 
@@ -477,7 +518,6 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_scroll.setWidgetResizable(True)
         self.saved_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         self.saved_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.saved_scroll.setMinimumHeight(216)
         self.saved_scroll.setStyleSheet(
             "QScrollArea#SavedLettersScroll{background:transparent;border:none;}"
             "QScrollBar:vertical{background:#0c151b;width:9px;margin:0;}"
@@ -499,13 +539,6 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_cards_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
         self.saved_scroll.setWidget(self.saved_cards_widget)
         saved_layout.addWidget(self.saved_scroll, 1)
-
-        saved_holder = QtWidgets.QHBoxLayout()
-        saved_holder.setContentsMargins(0, 0, 0, 0)
-        saved_holder.addStretch(1)
-        saved_holder.addWidget(self.saved_panel, 1)
-        saved_holder.addStretch(1)
-        self._main_layout.addLayout(saved_holder)
 
         self.identity_panel = QtWidgets.QFrame()
         self.identity_panel.setObjectName("ForgeIdentity")
@@ -614,19 +647,8 @@ class ForgeTab(QtWidgets.QWidget):
             side_margin,
             12,
         )
-        identity_width = max(
-            0,
-            min(1510, self.width() - (side_margin * 2)),
-        )
-        if identity_width:
-            self.identity_panel.setFixedWidth(identity_width)
-        saved_width = max(
-            0,
-            min(1510, self.width() - (side_margin * 2)),
-        )
-        if saved_width:
-            self.saved_panel.setFixedWidth(saved_width)
         self._layout_saved_cards()
+        self._card_layout_timer.start(0)
         self._sync_heading_balance()
         super().resizeEvent(event)
 
@@ -718,6 +740,50 @@ class ForgeTab(QtWidgets.QWidget):
         self.publish_btn.setEnabled(not self._busy and result.can_publish)
         return result
 
+    def show_saved_letters(self) -> None:
+        if self._busy:
+            return
+        self.refresh_saved_letters()
+        owner = self.window()
+        screen = owner.screen() or QtGui.QGuiApplication.primaryScreen()
+        available = (
+            screen.availableGeometry()
+            if screen is not None
+            else QtCore.QRect(0, 0, 1200, 800)
+        )
+        width = min(
+            self.saved_panel.maximumWidth(),
+            max(self.saved_panel.minimumWidth(), int(owner.width() * 0.72)),
+            max(1, available.width() - 32),
+        )
+        height = min(
+            self.saved_panel.maximumHeight(),
+            max(self.saved_panel.minimumHeight(), int(owner.height() * 0.74)),
+            max(1, available.height() - 32),
+        )
+        self.saved_panel.resize(width, height)
+        center = owner.mapToGlobal(owner.rect().center())
+        x = max(
+            available.left() + 16,
+            min(
+                center.x() - (width // 2),
+                available.right() - width - 15,
+            ),
+        )
+        y = max(
+            available.top() + 16,
+            min(
+                center.y() - (height // 2),
+                available.bottom() - height - 15,
+            ),
+        )
+        self.saved_panel.move(x, y)
+        self.saved_panel.show()
+        self.saved_panel.raise_()
+        self.saved_panel.activateWindow()
+        self.saved_scroll.setFocus(Qt.PopupFocusReason)
+        QtCore.QTimer.singleShot(0, self._layout_saved_cards)
+
     def refresh_saved_letters(self) -> None:
         selected_path = (
             str(self._selected_saved_letter.path)
@@ -738,6 +804,7 @@ class ForgeTab(QtWidgets.QWidget):
             card.setEnabled(not self._busy)
             card.selected.connect(self._select_saved_letter)
             card.activated.connect(self._activate_saved_letter)
+            card.delete_requested.connect(self._delete_saved_letter)
             if str(entry.path) == selected_path:
                 self._selected_saved_letter = entry
                 card.set_selected(True)
@@ -752,6 +819,7 @@ class ForgeTab(QtWidgets.QWidget):
         entry = self._selected_saved_letter
         if not isinstance(entry, SavedLetter) or self._busy:
             return
+        self.saved_panel.hide()
 
         def task() -> RestoredProject:
             return self.restorer.restore(entry)
@@ -774,6 +842,39 @@ class ForgeTab(QtWidgets.QWidget):
     def _activate_saved_letter(self, entry: object) -> None:
         self._select_saved_letter(entry)
         self.load_selected_letter()
+
+    def _delete_saved_letter(self, entry: object) -> None:
+        if not isinstance(entry, SavedLetter) or self._busy:
+            return
+        answer = QtWidgets.QMessageBox.question(
+            self.saved_panel,
+            "Delete Saved Letter",
+            (
+                f'Delete "{entry.title}" for {entry.recipient}?\n\n'
+                "This cannot be undone."
+            ),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Cancel,
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            deleted = self.catalog.delete(entry)
+        except SavedLetterDeleteError as error:
+            self._set_status(str(error), error=True)
+            return
+        if (
+            self._last_play_dir is not None
+            and self._last_play_dir.resolve() == deleted
+        ):
+            self._last_play_dir = None
+        if (
+            self._selected_saved_letter is not None
+            and self._selected_saved_letter.path == entry.path
+        ):
+            self._selected_saved_letter = None
+        self.refresh_saved_letters()
+        self._set_status("Saved letter deleted.")
 
     def _layout_saved_cards(self) -> None:
         if not hasattr(self, "saved_cards_layout"):
@@ -813,7 +914,7 @@ class ForgeTab(QtWidgets.QWidget):
 
     def _watch_saved_letter_paths(
         self,
-        entries: tuple[SavedLetter, ...],
+        _entries: tuple[SavedLetter, ...],
     ) -> None:
         watched = (
             self._catalog_watcher.directories()
@@ -826,10 +927,9 @@ class ForgeTab(QtWidgets.QWidget):
             self.catalog.play_root,
             self.catalog.recovery_root,
         }
-        for entry in entries:
-            candidates.add(entry.path)
-            if entry.cover_path is not None:
-                candidates.add(entry.cover_path.parent)
+        # Watching build folders themselves can prevent transactional directory
+        # replacement on Windows. Root watches plus explicit operation signals
+        # keep the catalog current without holding saved-letter directories.
         paths = [
             str(path.resolve())
             for path in candidates
@@ -941,13 +1041,20 @@ class ForgeTab(QtWidgets.QWidget):
             return
 
         def task() -> tuple[Path, bool, ReadinessResult]:
-            play_dir, rebuilt = generate.ensure_play_bundle(
-                self.project_root,
-                message_html=message,
-                force=False,
-            )
+            try:
+                play_dir, rebuilt = generate.ensure_play_bundle(
+                    self.project_root,
+                    message_html=message,
+                    force=False,
+                )
+            except PermissionError as error:
+                raise _ForgeOperationError(
+                    "The previous preview is still in use. Close any open "
+                    "letter preview and try again."
+                ) from error
             return Path(play_dir).resolve(), rebuilt, readiness
 
+        self.preview_files_release_requested.emit()
         self._start_operation(
             "Preparing preview…",
             task,
@@ -1008,11 +1115,17 @@ class ForgeTab(QtWidgets.QWidget):
             return
 
         def task() -> tuple[Path, ReadinessResult, dict, object]:
-            play_dir, _rebuilt = generate.ensure_play_bundle(
-                self.project_root,
-                message_html=message,
-                force=True,
-            )
+            try:
+                play_dir, _rebuilt = generate.ensure_play_bundle(
+                    self.project_root,
+                    message_html=message,
+                    force=True,
+                )
+            except PermissionError as error:
+                raise _ForgeOperationError(
+                    "The previous preview is still in use. Close any open "
+                    "letter preview and try publishing again."
+                ) from error
             play_path = Path(play_dir).resolve()
             metadata = update_saved_metadata(
                 play_path,
@@ -1044,6 +1157,7 @@ class ForgeTab(QtWidgets.QWidget):
             publish_result = publisher.publish(play_path, metadata)
             return play_path, readiness, metadata, publish_result
 
+        self.preview_files_release_requested.emit()
         self._start_operation(
             "Publishing letter…",
             task,
@@ -1054,6 +1168,7 @@ class ForgeTab(QtWidgets.QWidget):
     def _publish_completed(self, result: object) -> None:
         play_dir, _readiness, _metadata, publish_result = result
         self._last_play_dir = Path(play_dir)
+        self.request_preview()
         self.refresh_saved_letters()
         if not getattr(publish_result, "success", False):
             details = str(getattr(publish_result, "technical_details", ""))
@@ -1236,6 +1351,7 @@ class ForgeTab(QtWidgets.QWidget):
             safe_message or "The Forge operation could not be completed.",
             error=True,
         )
+        self.request_preview()
 
     def _operation_finished(self) -> None:
         thread = self._worker_thread
@@ -1250,6 +1366,7 @@ class ForgeTab(QtWidgets.QWidget):
     def _set_busy(self, busy: bool) -> None:
         for card in self._saved_cards:
             card.setEnabled(not busy)
+        self.load_saved_btn.setEnabled(not busy)
         self.preview_mode.setEnabled(not busy)
         self.readiness_btn.setEnabled(not busy)
         if busy:
@@ -1286,6 +1403,7 @@ class ForgeTab(QtWidgets.QWidget):
         self.preview_visibility_changed.emit(True)
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        self.saved_panel.hide()
         self.preview_visibility_changed.emit(False)
         super().hideEvent(event)
 
@@ -1306,6 +1424,7 @@ class ForgeTab(QtWidgets.QWidget):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.settings.changed.disconnect(self._on_settings_changed)
+        self.saved_panel.close()
         self.readiness_window.close()
         if not self.shutdown_operations():
             event.ignore()
