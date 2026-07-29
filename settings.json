@@ -33,8 +33,8 @@
   "sounds_dir": "sounds",
   "starting_volume": 21,
   "verbose": false,
-  "recipient_title": "The One Piece",
-  "recipient_name": "Marjella Lajuan",
+  "recipient_title": "Growth & Ice Cream",
+  "recipient_name": "Ijeomma Athenna Ahananu",
   "prompt_writer_state": {
     "type": "— none —",
     "subject": "----",
@@ -58,7 +58,7 @@
     },
     "generated_prompts": {}
   },
-  "published_page_url": "https://thetola.github.io/Pirates-of-Light/",
+  "published_page_url": "",
   "message_overlay_preset": "white",
   "message_overlay_opacity": 66,
   "recipient_name_locked": true,

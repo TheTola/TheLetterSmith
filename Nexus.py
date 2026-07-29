@@ -95,89 +95,282 @@ class _DoubleClickFilter(QtCore.QObject):
         return False
 
 
-# ===================================================================================================================================================================================
-# Custom Title Bar (frameless) ΓÇö Target button opens target.py
-# ===================================================================================================================================================================================
+# =============================================================================
+# Custom Title Bar
+# =============================================================================
+
 class TitleBar(QtWidgets.QWidget):
+    """
+    Custom frameless title bar.
+
+    Unicode symbols are written as escape codes rather than literal characters.
+    This prevents UTF-8/CP437 encoding corruption.
+    """
+
+    TARGET_SYMBOL = "\uFF0B"      # ＋
+    MINIMIZE_SYMBOL = "\u2013"    # –
+    MAXIMIZE_SYMBOL = "\u25A1"    # □
+    RESTORE_SYMBOL = "\u2750"     # ❐
+    CLOSE_SYMBOL = "\u2715"       # ✕
+
     def __init__(self, parent=None):
         super().__init__(parent)
+
         self.parent = parent
+        self._drag_start = QtCore.QPoint()
+
         self.setFixedHeight(40)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 0, 8, 0)
         layout.setSpacing(6)
 
-        title = QtWidgets.QLabel("The Silver-Tongued Lettersmith", self)
-        title.setStyleSheet("color:#00ffff; font:16px 'Segoe UI Semibold'; letter-spacing:1px;")
+        # ---------------------------------------------------------------------
+        # Window title
+        # ---------------------------------------------------------------------
+
+        title = QtWidgets.QLabel(
+            "The Silver-Tongued Lettersmith",
+            self,
+        )
+
+        title.setStyleSheet(
+            """
+            QLabel {
+                color: #00ffff;
+                background: transparent;
+                font-family: "Segoe UI Semibold";
+                font-size: 16px;
+                letter-spacing: 1px;
+            }
+            """
+        )
+
         layout.addWidget(title)
         layout.addStretch()
 
-        # Target (reticle) button
-        btn_target = QtWidgets.QPushButton()
-        btn_target.setFixedSize(32, 32)
-        btn_target.setToolTip("Open Target Browser")
-        ico = os.path.join(self.parent.project_root, REL_RETICLE_ICON)
-        if os.path.exists(ico):
-            btn_target.setIcon(QIcon(ico))
-            btn_target.setIconSize(QSize(24, 24))
-        else:
-            btn_target.setText("∩╝ï")
-        btn_target.setStyleSheet(
-            "QPushButton{background:transparent; border:none; padding:0;}"
-            "QPushButton:hover{background:rgba(0,0,0,0.0);}"
-        )
-        btn_target.clicked.connect(self.parent.open_target_browser)
-        layout.addWidget(btn_target)
+        # ---------------------------------------------------------------------
+        # Target Browser
+        # ---------------------------------------------------------------------
 
+        self.btn_target = self._make_button(
+            text=self.TARGET_SYMBOL,
+            tooltip="Open Target Browser",
+            hover_background="rgba(0, 255, 255, 0.15)",
+        )
+
+        target_icon_path = os.path.join(
+            self.parent.project_root,
+            REL_RETICLE_ICON,
+        )
+
+        if os.path.exists(target_icon_path):
+            self.btn_target.setText("")
+            self.btn_target.setIcon(
+                QIcon(target_icon_path)
+            )
+            self.btn_target.setIconSize(
+                QSize(24, 24)
+            )
+
+        self.btn_target.clicked.connect(
+            self.parent.open_target_browser
+        )
+
+        layout.addWidget(self.btn_target)
+
+        # ---------------------------------------------------------------------
         # Minimize
-        btn_min = QtWidgets.QPushButton("ΓÇô")
-        btn_min.setFixedSize(32, 32)
-        btn_min.setStyleSheet(
-            "QPushButton{color:#ccc; background:transparent; border:none; padding:0;}"
-            "QPushButton:hover{background:rgba(0,255,255,0.15);}"
-        )
-        btn_min.clicked.connect(self.parent.showMinimized)
-        layout.addWidget(btn_min)
+        # ---------------------------------------------------------------------
 
-        # Max/Restore
-        self.btn_max = QtWidgets.QPushButton("Γûí")
-        self.btn_max.setFixedSize(32, 32)
-        self.btn_max.setStyleSheet(
-            "QPushButton{color:#ccc; background:transparent; border:none; padding:0;}"
-            "QPushButton:hover{background:rgba(0,255,255,0.15);}"
+        self.btn_minimize = self._make_button(
+            text=self.MINIMIZE_SYMBOL,
+            tooltip="Minimize",
+            hover_background="rgba(0, 255, 255, 0.15)",
         )
-        self.btn_max.clicked.connect(self._toggle_max_restore)
+
+        self.btn_minimize.clicked.connect(
+            self.parent.showMinimized
+        )
+
+        layout.addWidget(self.btn_minimize)
+
+        # ---------------------------------------------------------------------
+        # Maximize / Restore
+        # ---------------------------------------------------------------------
+
+        self.btn_max = self._make_button(
+            text=self.MAXIMIZE_SYMBOL,
+            tooltip="Maximize",
+            hover_background="rgba(0, 255, 255, 0.15)",
+        )
+
+        self.btn_max.clicked.connect(
+            self._toggle_max_restore
+        )
+
         layout.addWidget(self.btn_max)
 
+        # ---------------------------------------------------------------------
         # Close
-        btn_close = QtWidgets.QPushButton("Γ£ò")
-        btn_close.setFixedSize(32, 32)
-        btn_close.setStyleSheet(
-            "QPushButton{color:#ccc; background:transparent; border:none; padding:0;}"
-            "QPushButton:hover{background:rgba(255,0,0,0.25);}"
+        # ---------------------------------------------------------------------
+
+        self.btn_close = self._make_button(
+            text=self.CLOSE_SYMBOL,
+            tooltip="Close",
+            hover_background="rgba(255, 0, 0, 0.30)",
         )
-        btn_close.clicked.connect(self.parent.close)
-        layout.addWidget(btn_close)
 
-        self._drag_start = QtCore.QPoint()
+        self.btn_close.clicked.connect(
+            self.parent.close
+        )
 
-    def _toggle_max_restore(self):
+        layout.addWidget(self.btn_close)
+
+        # Keep the maximize/restore symbol synchronized when Windows changes
+        # the window state outside this button.
+        self.parent.installEventFilter(self)
+        self._sync_max_restore_button()
+
+    def _make_button(
+        self,
+        text: str,
+        tooltip: str,
+        hover_background: str,
+    ) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton(
+            text,
+            self,
+        )
+
+        button.setFixedSize(32, 32)
+        button.setCursor(Qt.PointingHandCursor)
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+
+        symbol_font = QFont(
+            "Segoe UI Symbol",
+            15,
+        )
+        symbol_font.setBold(False)
+        button.setFont(symbol_font)
+
+        button.setStyleSheet(
+            f"""
+            QPushButton {{
+                color: #d0d0d0;
+                background: transparent;
+                border: none;
+                padding: 0;
+                margin: 0;
+            }}
+
+            QPushButton:hover {{
+                color: #ffffff;
+                background: {hover_background};
+            }}
+
+            QPushButton:pressed {{
+                background: rgba(255, 255, 255, 0.12);
+            }}
+            """
+        )
+
+        return button
+
+    def _sync_max_restore_button(self) -> None:
+        if self.parent.isMaximized():
+            self.btn_max.setText(
+                self.RESTORE_SYMBOL
+            )
+            self.btn_max.setToolTip(
+                "Restore"
+            )
+            self.btn_max.setAccessibleName(
+                "Restore"
+            )
+        else:
+            self.btn_max.setText(
+                self.MAXIMIZE_SYMBOL
+            )
+            self.btn_max.setToolTip(
+                "Maximize"
+            )
+            self.btn_max.setAccessibleName(
+                "Maximize"
+            )
+
+    def _toggle_max_restore(self) -> None:
         if self.parent.isMaximized():
             self.parent.showNormal()
         else:
             self.parent.showMaximized()
 
-    def mousePressEvent(self, event):
+        QtCore.QTimer.singleShot(
+            0,
+            self._sync_max_restore_button,
+        )
+
+    def eventFilter(self, watched, event):
+        if (
+            watched is self.parent
+            and event.type() == QEvent.WindowStateChange
+        ):
+            QtCore.QTimer.singleShot(
+                0,
+                self._sync_max_restore_button,
+            )
+
+        return super().eventFilter(
+            watched,
+            event,
+        )
+
+    def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
-            self._drag_start = event.globalPosition().toPoint()
+            self._toggle_max_restore()
+            event.accept()
+            return
 
-    def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.LeftButton and not self.parent.isMaximized():
-            delta = event.globalPosition().toPoint() - self._drag_start
-            self.parent.move(self.parent.pos() + delta)
-            self._drag_start = event.globalPosition().toPoint()
+        super().mouseDoubleClickEvent(event)
 
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._drag_start = (
+                event.globalPosition().toPoint()
+            )
+            event.accept()
+            return
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (
+            event.buttons() & Qt.LeftButton
+            and not self.parent.isMaximized()
+        ):
+            current_position = (
+                event.globalPosition().toPoint()
+            )
+
+            delta = (
+                current_position
+                - self._drag_start
+            )
+
+            self.parent.move(
+                self.parent.pos() + delta
+            )
+
+            self._drag_start = current_position
+            event.accept()
+            return
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_start = QtCore.QPoint()
+        super().mouseReleaseEvent(event)
 
 # ===================================================================================================================================================================================
 # Small hover-help popover (top-level tooltip window)
@@ -635,6 +828,9 @@ class Nexus(QtWidgets.QMainWindow):
         self.forge_tab.preview_visibility_changed.connect(
             self._set_forge_preview_visible
         )
+        self.forge_tab.preview_files_release_requested.connect(
+            self._release_forge_preview_files
+        )
         self.forge_tab.published_url_changed.connect(
             lambda url: self.message_tab.set_published_page_url(
                 url,
@@ -953,6 +1149,19 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _apply_tab_state(self, idx: int, *, animate_page: bool) -> None:
         """Apply the complete settled UI state for one tab."""
+        old_idx = self.page_stack.currentIndex()
+        if old_idx != idx:
+            if old_idx == 2:
+                try:
+                    self.message_tab.deactivate_for_tab_change()
+                except Exception as ex:
+                    self.status(f"Message could not save on exit: {ex}")
+            elif old_idx == 3:
+                try:
+                    self.forge_tab.deactivate_for_tab_change()
+                except Exception as ex:
+                    self.status(f"Forge could not reset on exit: {ex}")
+
         if idx != 1:
             try:
                 self.sound_tab.deactivate_for_tab_change()
@@ -976,8 +1185,10 @@ class Nexus(QtWidgets.QMainWindow):
 
         tab_name = self.tabbar.tabText(idx)
         self.status(f"Switched to: {tab_name}")
-        self.forge_tab.schedule_refresh()
         self._set_forge_preview_visible(idx == 3)
+        self.forge_tab.set_readiness_context_visible(
+            idx in {0, 1, 2, 3}
+        )
 
         if idx == 0:
             self.preview_stack.setCurrentIndex(0)
@@ -994,8 +1205,16 @@ class Nexus(QtWidgets.QMainWindow):
             else:
                 self.preview_stack.setCurrentIndex(0)
         elif idx == 2:
+            try:
+                self.message_tab.activate_for_tab_change()
+            except Exception as ex:
+                self.status(f"Message could not refresh: {ex}")
             QtCore.QTimer.singleShot(0, self._request_message_preview)
         elif idx == 3:
+            try:
+                self.forge_tab.activate_for_tab_change()
+            except Exception as ex:
+                self.status(f"Forge could not refresh: {ex}")
             QtCore.QTimer.singleShot(0, self._show_forge_preview)
         else:
             self.preview_stack.setCurrentIndex(0)
@@ -1242,7 +1461,20 @@ class Nexus(QtWidgets.QMainWindow):
         self.image_preview.clear()
 
     def _on_command_wiped(self) -> None:
-        """Redundancy: Command tab wiped data; also hard-clear any preview residue."""
+        """Clear every live project surface after one confirmed reset."""
+        try:
+            self.message_tab.sync_from_disk(force=True)
+        except Exception:
+            pass
+        try:
+            self.forge_tab.reset_after_project_wipe()
+        except Exception:
+            pass
+        try:
+            self._set_forge_preview_visible(False)
+            self.html_preview.setUrl(QUrl("about:blank"))
+        except Exception:
+            pass
         self._last_pixmap = None
         self._clear_preview()
         try:
@@ -1271,6 +1503,17 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _show_forge_preview(self) -> None:
         """Show the actual generated viewer, never a static Forge stand-in."""
+        try:
+            self.forge_tab.ensure_preview_current()
+        except Exception as ex:
+            self._release_forge_preview_files()
+            self.preview_caption.setText(
+                f"Forge preview unavailable: {ex}"
+            )
+            self.preview_caption.setVisible(True)
+            self.status(f"Forge preview could not be rebuilt: {ex}")
+            return
+
         index = self.forge_tab.current_play_index()
         if index is not None:
             self._load_forge_preview(
@@ -1347,6 +1590,29 @@ class Nexus(QtWidgets.QMainWindow):
             "document.querySelectorAll('audio,video').forEach("
             "media => { try { media.pause(); } catch (_) {} });"
         )
+
+    def _release_forge_preview_files(self) -> None:
+        """Stop playback and release the generated viewer's file handles."""
+        if self._forge_fullscreen_active:
+            self._restore_forge_preview_from_fullscreen()
+        try:
+            self.html_preview.page().runJavaScript(
+                "document.querySelectorAll('audio,video').forEach("
+                "media => { try { media.pause(); media.currentTime = 0; } catch (_) {} });"
+            )
+        except Exception:
+            pass
+        if self.preview_stack.currentWidget() is self.html_preview:
+            self.preview_stack.setCurrentIndex(0)
+        self.preview_caption.setVisible(False)
+        self.html_preview.stop()
+        self.html_preview.setUrl(QUrl("about:blank"))
+
+    def restart_forge_preview(self, _reason: str = "") -> None:
+        """Reset playback so every Forge entry starts at the curtain."""
+        self._release_forge_preview_files()
+
+    reset_forge_preview = restart_forge_preview
 
     def _on_web_fullscreen_requested(self, request) -> None:
         toggle_on = bool(request.toggleOn())
@@ -1543,7 +1809,20 @@ class Nexus(QtWidgets.QMainWindow):
             self.status("Finish the current Forge operation before closing.")
             event.ignore()
             return
-        self._set_forge_preview_visible(False)
+        try:
+            self.message_tab.shutdown()
+        except Exception:
+            pass
+        try:
+            self.forge_tab.deactivate_for_tab_change()
+            self.forge_tab.set_readiness_context_visible(False)
+        except Exception:
+            pass
+        try:
+            self.sound_tab.deactivate_for_tab_change()
+        except Exception:
+            pass
+        self._release_forge_preview_files()
         super().closeEvent(event)
 
     # =============================================================================================

@@ -49,8 +49,12 @@ from message_history import (
     restore_revision,
     write_message_with_revision,
 )
+from message_format import normalize_ultralinks_in_document
 from message_html import is_lettersmith_message_html
-from settings_store import SettingsStore
+from settings_store import (
+    SettingsStore,
+    normalize_published_page_url,
+)
 from config import (
     SETTINGS_FILE,
     PUBLISHED_PAGE_URL_KEY,
@@ -148,19 +152,9 @@ def _reading_time_label(word_count: int) -> str:
 
 
 def _normalize_published_page_url(value: str) -> str:
-    """Return a canonical HTTP(S) URL, or an empty string when invalid."""
-    candidate = str(value or "").strip()
-    if not candidate:
-        return ""
-
-    parsed = QtCore.QUrl.fromUserInput(candidate)
-    if not parsed.isValid():
-        return ""
-    if parsed.scheme().lower() not in {"http", "https"}:
-        return ""
-    if not parsed.host():
-        return ""
-    return parsed.toString()
+    return normalize_published_page_url(
+        value
+    )
 
 
 MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
@@ -1279,6 +1273,7 @@ class MessageTab(QtWidgets.QWidget):
             )
 
             doc.setHtml(html)
+            normalize_ultralinks_in_document(doc)
             doc.setTextWidth(TEXT_WIDTH)
             doc.setPageSize(QSizeF(TEXT_WIDTH, TEXT_HEIGHT))
 
@@ -1304,4 +1299,3 @@ class MessageTab(QtWidgets.QWidget):
             self.sync_to_disk()
         except Exception:
             pass
-

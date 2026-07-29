@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import traceback
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
@@ -44,9 +44,19 @@ from settings_store import (
     CURTAIN_STYLE_LABELS,
     DEFAULT_SETTINGS,
     SettingsStore,
+    normalize_published_page_url,
 )
 from project_sync import project_fingerprint
-from saved_letters import SavedLetter, SavedLetterCatalog
+from publishing import GitHubPagesPublisher
+from publishing.github_pages import PUBLIC_WARNING_KEY
+from readiness import ReadinessResult, evaluate_readiness
+from saved_letters import (
+    RestoredProject,
+    SavedLetter,
+    SavedLetterCatalog,
+    SavedLetterRestorer,
+    update_saved_metadata,
+)
 from sound_model import (
     BUILD_SOUND_MANIFEST_NAME,
     ProjectSoundState,
@@ -55,6 +65,19 @@ from sound_model import (
     save_project_state,
     sync_current_compatibility,
 )
+
+
+def _forge_source_fingerprint(
+    project_root: str | Path,
+) -> str:
+    builder = getattr(
+        generate,
+        "build_source_fingerprint",
+        None,
+    )
+    if callable(builder):
+        return str(builder(project_root))
+    return project_fingerprint(project_root)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,33 +203,9 @@ def _write_settings(
 def _normalize_page_url(
     value: str,
 ) -> str:
-    candidate = (
-        value or ""
-    ).strip()
-
-    if not candidate:
-        return ""
-
-    parsed = QUrl.fromUserInput(
-        candidate
+    return normalize_published_page_url(
+        value
     )
-
-    if not parsed.isValid():
-        return ""
-
-    if (
-        parsed.scheme().lower()
-        not in {
-            "http",
-            "https",
-        }
-    ):
-        return ""
-
-    if not parsed.host():
-        return ""
-
-    return parsed.toString()
 
 
 def _metadata_path(
@@ -1069,6 +1068,223 @@ class SavedLettersDialog(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+class _TaskWorker(QtCore.QObject):
+    succeeded = QtCore.Signal(object)
+    failed = QtCore.Signal(str, str)
+    finished = QtCore.Signal()
+
+    def __init__(
+        self,
+        task: Callable[[], object],
+    ) -> None:
+        super().__init__()
+        self._task = task
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            self.succeeded.emit(
+                self._task()
+            )
+        except Exception as error:
+            self.failed.emit(
+                str(error),
+                traceback.format_exc(),
+            )
+        finally:
+            self.finished.emit()
+
+
+class ReadinessWindow(QtWidgets.QDialog):
+    correction_requested = QtCore.Signal(str, str)
+
+    def __init__(
+        self,
+        project_root: str | Path,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(parent, Qt.Tool)
+        self.project_root = Path(project_root).resolve()
+        self.user_closed = False
+        self._positioned = False
+        self.setWindowTitle("Project Readiness")
+        self.setWindowModality(Qt.NonModal)
+        self.setMinimumWidth(290)
+        self.setMaximumWidth(360)
+        self.setMaximumHeight(520)
+        self.setStyleSheet(
+            "QDialog{background:#101820;border:1px solid #2e596a;}"
+            "QLabel{background:transparent;}"
+            "QPushButton{font:500 10pt 'Segoe UI';}"
+            "QScrollArea{background:transparent;border:none;}"
+        )
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
+
+        top = QtWidgets.QHBoxLayout()
+        self.percentage = QtWidgets.QLabel()
+        self.percentage.setStyleSheet(
+            "color:#dffcff;font:700 13px 'Segoe UI';"
+        )
+        top.addWidget(self.percentage)
+        top.addStretch(1)
+        self.status = QtWidgets.QLabel()
+        self.status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        top.addWidget(self.status)
+        layout.addLayout(top)
+
+        divider = QtWidgets.QFrame()
+        divider.setFrameShape(QtWidgets.QFrame.HLine)
+        divider.setStyleSheet("color:#284451;")
+        layout.addWidget(divider)
+
+        self.items = QtWidgets.QWidget()
+        self.items.setStyleSheet("background:transparent;")
+        self.items_layout = QtWidgets.QVBoxLayout(self.items)
+        self.items_layout.setContentsMargins(0, 0, 0, 0)
+        self.items_layout.setSpacing(3)
+
+        self.scroll = QtWidgets.QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff
+        )
+        self.scroll.setWidget(self.items)
+        layout.addWidget(self.scroll)
+
+        self._missing_buttons: dict[
+            str,
+            QtWidgets.QPushButton,
+        ] = {}
+        for item in evaluate_readiness(
+            self.project_root
+        ).items:
+            button = QtWidgets.QPushButton(
+                item.label
+            )
+            button.setCursor(
+                Qt.PointingHandCursor
+            )
+            button.clicked.connect(
+                lambda _checked=False,
+                tab=item.correction_tab,
+                target=item.correction_target:
+                self.correction_requested.emit(
+                    tab,
+                    target,
+                )
+            )
+            self.items_layout.addWidget(button)
+            self._missing_buttons[item.key] = button
+
+    def refresh(
+        self,
+        result: ReadinessResult,
+    ) -> None:
+        self.percentage.setText(
+            f"{result.completion_percentage}% complete"
+        )
+        self.status.setText(result.status)
+        self.status.setStyleSheet(
+            f"color:{'#7fe29a' if result.status != 'Not Ready' else '#ff8585'};"
+            "font:600 10pt 'Segoe UI';"
+        )
+
+        missing = {
+            item.key: item
+            for item in result.missing_items
+        }
+        for key, button in self._missing_buttons.items():
+            item = missing.get(key)
+            button.setVisible(item is not None)
+            if item is None:
+                continue
+            color = (
+                "#ff9b9b"
+                if item.required
+                else "#dcc979"
+            )
+            border = (
+                "#6b3f49"
+                if item.required
+                else "#625b38"
+            )
+            prefix = (
+                "Required"
+                if item.required
+                else "Optional"
+            )
+            button.setText(
+                f"{prefix}: {item.label}"
+            )
+            button.setToolTip(item.detail)
+            button.setStyleSheet(
+                "QPushButton{text-align:left;padding:6px 8px;"
+                f"border:1px solid {border};border-radius:5px;"
+                f"background:#131e26;color:{color};}}"
+                "QPushButton:hover{background:#182a35;border-color:#00cdec;}"
+                "QPushButton:focus{border:1px solid #00d5f5;}"
+            )
+
+        has_missing = bool(missing)
+        self.scroll.setVisible(has_missing)
+        if has_missing:
+            self.scroll.setMinimumHeight(
+                min(
+                    300,
+                    max(
+                        44,
+                        len(missing) * 42,
+                    ),
+                )
+            )
+        self.adjustSize()
+
+    def position_near_owner(self) -> None:
+        if self._positioned:
+            return
+        owner = self.parentWidget()
+        if owner is None:
+            return
+        target = owner.mapToGlobal(
+            QtCore.QPoint(24, 96)
+        )
+        screen = owner.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            target.setX(
+                max(
+                    available.left(),
+                    min(
+                        target.x(),
+                        available.right()
+                        - self.width(),
+                    ),
+                )
+            )
+            target.setY(
+                max(
+                    available.top(),
+                    min(
+                        target.y(),
+                        available.bottom()
+                        - self.height(),
+                    ),
+                )
+            )
+        self.move(target)
+        self._positioned = True
+
+    def closeEvent(
+        self,
+        event: QtGui.QCloseEvent,
+    ) -> None:
+        self.user_closed = True
+        super().closeEvent(event)
+
+
 class ForgeTab(
     QtWidgets.QWidget
 ):
@@ -1117,11 +1333,27 @@ class ForgeTab(
         self.settings_store = SettingsStore(
             self.project_root
         )
+        self.restorer = SavedLetterRestorer(
+            self.project_root
+        )
 
         self.saved_page_url = ""
 
+        saved_preview_mode = str(
+            self.settings_store.snapshot().get(
+                "forge_preview_mode",
+                "portrait",
+            )
+        )
         self.preview_mode_value = (
-            "portrait"
+            saved_preview_mode
+            if saved_preview_mode
+            in {
+                "portrait",
+                "landscape",
+                "window",
+            }
+            else "portrait"
         )
 
         self.preview_refresh_pending = (
@@ -1133,13 +1365,19 @@ class ForgeTab(
         ] = None
 
         self._project_fingerprint = (
-            project_fingerprint(
+            _forge_source_fingerprint(
                 self.project_root
             )
         )
 
         self._operation_active = False
         self._tab_active = False
+        self._worker: Optional[
+            _TaskWorker
+        ] = None
+        self._worker_thread: Optional[
+            QtCore.QThread
+        ] = None
 
         self._host_window: Optional[
             QtWidgets.QWidget
@@ -1149,9 +1387,29 @@ class ForgeTab(
             SavedLettersDialog
         ] = None
 
+        self._readiness_result = (
+            evaluate_readiness(
+                self.project_root
+            )
+        )
+        self._readiness_requested = False
+        self.readiness_window = (
+            ReadinessWindow(
+                self.project_root,
+                self,
+            )
+        )
+        self._readiness_window = (
+            self.readiness_window
+        )
+        self.readiness_window.correction_requested.connect(
+            self.correction_requested.emit
+        )
+
         self._init_ui()
 
         self.refresh_saved_page_url()
+        self.refresh_readiness()
 
     # ─────────────────────────────────────────────────────────────────────
     # UI
@@ -1170,6 +1428,7 @@ class ForgeTab(
         layout.setSpacing(12)
 
         title = QLabel("Forge")
+        self.heading_title = title
 
         title.setFont(
             QFont(
@@ -1191,6 +1450,33 @@ class ForgeTab(
         )
 
         layout.addWidget(title)
+
+        readiness_row = QHBoxLayout()
+        readiness_row.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+        self.readiness_summary = QLabel()
+        self.readiness_summary.setStyleSheet(
+            "color:#a9cbd6;"
+            "font:600 10px 'Segoe UI';"
+        )
+        readiness_row.addWidget(
+            self.readiness_summary
+        )
+        readiness_row.addStretch(1)
+        self.readiness_btn = self._tiny_button(
+            "Review Readiness"
+        )
+        self.readiness_btn.clicked.connect(
+            self.show_readiness_window
+        )
+        readiness_row.addWidget(
+            self.readiness_btn
+        )
+        layout.addLayout(readiness_row)
 
         self.preview_format_panel = (
             QtWidgets.QFrame()
@@ -1214,7 +1500,7 @@ class ForgeTab(
         format_layout.setSpacing(6)
 
         format_label = QLabel(
-            "Preview"
+            "Page Preview"
         )
 
         format_label.setStyleSheet(
@@ -1239,8 +1525,20 @@ class ForgeTab(
         )
 
         self.preview_mode_combo.addItem(
-            "Window",
+            "Window / Desktop",
             "window",
+        )
+
+        saved_mode_index = (
+            self.preview_mode_combo.findData(
+                self.preview_mode_value
+            )
+        )
+        self.preview_mode_combo.setCurrentIndex(
+            max(
+                0,
+                saved_mode_index,
+            )
         )
 
         self.preview_mode_combo.currentIndexChanged.connect(
@@ -1783,6 +2081,11 @@ class ForgeTab(
             }
             else "portrait"
         )
+        self.settings_store.update_fields(
+            forge_preview_mode=(
+                self.preview_mode_value
+            )
+        )
 
         current = (
             self.current_play_index()
@@ -1846,6 +2149,53 @@ class ForgeTab(
         )
 
     def _load_saved_letter(
+        self,
+        entry: SavedLetter,
+    ) -> None:
+        if self._operation_active:
+            return
+        self.preview_files_release_requested.emit()
+
+        def task() -> object:
+            return self.restorer.restore(
+                entry
+            )
+
+        self._start_operation(
+            "Loading saved letter...",
+            task,
+            self._complete_restore,
+            "The selected saved letter could "
+            "not be restored.",
+        )
+
+    def _complete_restore(
+        self,
+        restored: object,
+    ) -> None:
+        if not isinstance(
+            restored,
+            RestoredProject,
+        ):
+            self._log(
+                "The selected saved letter "
+                "could not be restored."
+            )
+            return
+
+        self._current_play_dir = (
+            restored.play_dir
+        )
+        self.preview_refresh_pending = True
+        self.refresh_saved_page_url()
+        self.refresh_readiness()
+        self.refresh_saved_letters()
+        payload = restored.as_payload()
+        self.project_restored.emit(payload)
+        self.letter_loaded.emit(payload)
+        self._log("Saved letter loaded.")
+
+    def _load_saved_letter_legacy(
         self,
         entry: SavedLetter,
     ) -> None:
@@ -2076,7 +2426,7 @@ class ForgeTab(
         )
 
         self._project_fingerprint = (
-            project_fingerprint(
+            _forge_source_fingerprint(
                 self.project_root
             )
         )
@@ -2420,7 +2770,7 @@ class ForgeTab(
             self._project_fingerprint
         )
 
-        after = project_fingerprint(
+        after = _forge_source_fingerprint(
             self.project_root
         )
 
@@ -2456,15 +2806,24 @@ class ForgeTab(
         self,
         *_args,
     ) -> None:
-        self.preview_refresh_pending = (
-            True
+        current = _forge_source_fingerprint(
+            self.project_root
         )
+        if current != self._project_fingerprint:
+            self.preview_refresh_pending = True
+        self.refresh_readiness()
 
     def attach_readiness_window(
         self,
         host: QtWidgets.QWidget,
     ) -> None:
         self._host_window = host
+        self.readiness_window.setParent(
+            host,
+            Qt.Tool,
+        )
+        self.readiness_window.hide()
+        self.readiness_window._positioned = False
 
     def refresh_project_state(
         self,
@@ -2472,6 +2831,73 @@ class ForgeTab(
         self.sync_all_from_disk(
             notify_host=False
         )
+        self.refresh_readiness()
+
+    def refresh_readiness(
+        self,
+    ) -> ReadinessResult:
+        result = evaluate_readiness(
+            self.project_root
+        )
+        self._readiness_result = result
+        self.readiness_window.refresh(result)
+
+        if hasattr(
+            self,
+            "readiness_summary",
+        ):
+            self.readiness_summary.setText(
+                f"{result.completion_percentage}% · "
+                f"{result.status}"
+            )
+            self.readiness_summary.setToolTip(
+                "\n".join(
+                    item.detail
+                    for item in result.missing_items
+                )
+            )
+
+        if (
+            not self._operation_active
+            and hasattr(
+                self,
+                "generate_btn",
+            )
+        ):
+            self.generate_btn.setEnabled(
+                result.can_preview
+            )
+            self.seal_btn.setEnabled(
+                result.can_publish
+            )
+
+        return result
+
+    def show_readiness_window(
+        self,
+    ) -> None:
+        self.refresh_readiness()
+        self._readiness_requested = True
+        self.readiness_window.user_closed = False
+        self.readiness_window.show()
+        self.readiness_window.position_near_owner()
+        self.readiness_window.raise_()
+        self.readiness_window.activateWindow()
+
+    def set_readiness_context_visible(
+        self,
+        visible: bool,
+    ) -> None:
+        if not visible:
+            self.readiness_window.hide()
+            return
+        if (
+            self._readiness_requested
+            and not self.readiness_window.user_closed
+        ):
+            self.refresh_readiness()
+            self.readiness_window.show()
+            self.readiness_window.raise_()
 
     def refresh_saved_letters(
         self,
@@ -2484,6 +2910,20 @@ class ForgeTab(
             dialog.refresh_from_disk(
                 force=True
             )
+
+    def reset_after_project_wipe(self) -> None:
+        """Drop every live reference to the project that was just erased."""
+        self._current_play_dir = None
+        self.preview_refresh_pending = True
+        self.saved_page_url = ""
+        self._project_fingerprint = _forge_source_fingerprint(
+            self.project_root
+        )
+        self._sync_go_to_page_button()
+        self.preview_visibility_changed.emit(False)
+        self.preview_restart_requested.emit("reset")
+        self._log("Ready.")
+        self.refresh_readiness()
 
     def current_play_index(
         self,
@@ -2793,16 +3233,108 @@ class ForgeTab(
     # ─────────────────────────────────────────────────────────────────────
 
     def generate(self) -> None:
+        readiness = self.refresh_readiness()
+        if not readiness.can_preview:
+            self.show_readiness_window()
+            self._log(
+                "Complete the required readiness items "
+                "before previewing."
+            )
+            return
         self._run_pipeline(
             mode="preview"
         )
 
+    def preview_letter(self) -> None:
+        self.generate()
+
     def seal_the_letter(
         self,
     ) -> None:
-        self._run_pipeline(
-            mode="publish"
+        if self._operation_active:
+            return
+        readiness = self.refresh_readiness()
+        if not readiness.can_publish:
+            self.show_readiness_window()
+            self._log(
+                "Complete the required readiness items "
+                "before publishing."
+            )
+            return
+
+        settings = self.settings_store.snapshot()
+        if not bool(
+            settings.get(
+                PUBLIC_WARNING_KEY,
+                False,
+            )
+        ):
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Publish Letter",
+                "Published letters are placed in a public "
+                "GitHub repository. Continue?",
+                QtWidgets.QMessageBox.Yes
+                | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Cancel,
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                self._log("Publishing canceled.")
+                return
+            self.settings_store.update_fields(
+                {
+                    PUBLIC_WARNING_KEY: True,
+                }
+            )
+
+        try:
+            play_directory = self._build_local_bundle(
+                open_in_browser=False
+            )
+            metadata = update_saved_metadata(
+                play_directory,
+                self.project_root,
+                readiness,
+            )
+        except Exception as error:
+            self._log(
+                "Publishing could not start. "
+                "The previous local preview was preserved.\n"
+                f"{type(error).__name__}: {error}"
+            )
+            return
+
+        def task() -> object:
+            publisher = GitHubPagesPublisher(
+                self.project_root
+            )
+            if not publisher.is_configured():
+                configuration = publisher.configure()
+                if not configuration.configured:
+                    raise RuntimeError(
+                        configuration.message
+                        or "GitHub Pages publishing "
+                        "is not configured."
+                    )
+            publish_result = publisher.publish(
+                play_directory,
+                metadata,
+            )
+            return (
+                play_directory,
+                publish_result,
+            )
+
+        self._start_operation(
+            "Publishing letter...",
+            task,
+            self._publish_completed,
+            "Publishing failed. The local preview "
+            "was preserved.",
         )
+
+    def publish_letter(self) -> None:
+        self.seal_the_letter()
 
     def _set_operation_buttons_enabled(
         self,
@@ -2811,6 +3343,7 @@ class ForgeTab(
         buttons = (
             self.settings_btn,
             self.load_btn,
+            self.readiness_btn,
             self.generate_btn,
             self.seal_btn,
             self.go_to_page_btn,
@@ -2834,6 +3367,170 @@ class ForgeTab(
                 button.setEnabled(
                     enabled
                 )
+
+    def _start_operation(
+        self,
+        activity: str,
+        task: Callable[[], object],
+        on_success: Callable[[object], None],
+        error_message: str,
+    ) -> None:
+        if self._operation_active:
+            return
+        self._operation_active = True
+        self._set_operation_buttons_enabled(
+            False
+        )
+        self._log(activity)
+
+        thread = QtCore.QThread(self)
+        worker = _TaskWorker(task)
+        worker.moveToThread(thread)
+        self._worker_thread = thread
+        self._worker = worker
+        thread.started.connect(worker.run)
+
+        def succeeded(
+            result: object,
+        ) -> None:
+            try:
+                on_success(result)
+            except Exception as error:
+                self._log(
+                    f"{error_message}\n"
+                    f"{type(error).__name__}: {error}"
+                )
+
+        def failed(
+            message: str,
+            technical: str,
+        ) -> None:
+            detail = (
+                message.strip()
+                if message.strip()
+                else error_message
+            )
+            self._log(
+                f"{error_message}\n"
+                f"{detail}\n\n{technical}"
+            )
+
+        worker.succeeded.connect(succeeded)
+        worker.failed.connect(failed)
+        worker.finished.connect(
+            worker.deleteLater
+        )
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(
+            self._operation_finished
+        )
+        thread.start()
+
+    def _operation_finished(
+        self,
+    ) -> None:
+        thread = self._worker_thread
+        self._worker = None
+        self._worker_thread = None
+        self._operation_active = False
+        self._set_operation_buttons_enabled(
+            True
+        )
+        self.refresh_readiness()
+        if thread is not None:
+            thread.deleteLater()
+
+    def _publish_completed(
+        self,
+        result: object,
+    ) -> None:
+        play_directory, publish_result = result
+        play_path = Path(
+            play_directory
+        ).resolve()
+        self._current_play_dir = play_path
+
+        if not getattr(
+            publish_result,
+            "success",
+            False,
+        ):
+            message = str(
+                getattr(
+                    publish_result,
+                    "message",
+                    "",
+                )
+            ).strip()
+            technical = str(
+                getattr(
+                    publish_result,
+                    "technical_details",
+                    "",
+                )
+            ).strip()
+            self._log(
+                message
+                or "Publishing failed. The local "
+                "preview was preserved."
+                + (
+                    f"\n\n{technical}"
+                    if technical
+                    else ""
+                )
+            )
+            return
+
+        url = normalize_published_page_url(
+            getattr(
+                publish_result,
+                "url",
+                "",
+            )
+        )
+        if not url:
+            self._log(
+                "Publishing completed without a "
+                "valid public URL."
+            )
+            return
+
+        self.settings_store.update_fields(
+            {
+                PUBLISHED_PAGE_URL_KEY: url,
+            }
+        )
+        self.saved_page_url = url
+        self._sync_go_to_page_button()
+        self.published_url_changed.emit(url)
+
+        published_readiness = (
+            self.refresh_readiness()
+        )
+        update_saved_metadata(
+            play_path,
+            self.project_root,
+            published_readiness,
+            public_path=str(
+                getattr(
+                    publish_result,
+                    "public_path",
+                    "",
+                )
+            ),
+        )
+        self.refresh_saved_letters()
+        self.preview_requested.emit(
+            str(
+                play_path
+                / "index.html"
+            ),
+            self.preview_mode_value,
+        )
+        self._log(
+            "Published successfully.\n"
+            f"{url}"
+        )
 
     def _build_local_bundle(
         self,
@@ -2915,10 +3612,17 @@ class ForgeTab(
         )
 
         self._project_fingerprint = (
-            project_fingerprint(
+            _forge_source_fingerprint(
                 self.project_root
             )
         )
+
+        update_saved_metadata(
+            play_directory,
+            self.project_root,
+            self.refresh_readiness(),
+        )
+        self.refresh_saved_letters()
 
         self.preview_visibility_changed.emit(
             True
@@ -3032,6 +3736,7 @@ class ForgeTab(
             self._set_operation_buttons_enabled(
                 True
             )
+            self.refresh_readiness()
 
     def _run_command(
         self,
@@ -3537,6 +4242,7 @@ class ForgeTab(
         event: QtGui.QCloseEvent,
     ) -> None:
         if self.shutdown_operations():
+            self.readiness_window.hide()
             event.accept()
         else:
             event.ignore()

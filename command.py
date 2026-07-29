@@ -59,6 +59,7 @@ try:
         USER_MESSAGE_DIR,
         USER_SOUNDS_DIR,
         MUSIC_FILE,
+        OUTPUT_PLAY_DIR,
     )
 except Exception:
     SETTINGS_FILE = "settings.json"
@@ -67,6 +68,7 @@ except Exception:
     USER_MESSAGE_DIR = "gallery/user/message"
     USER_SOUNDS_DIR = "gallery/user/sounds"
     MUSIC_FILE = "music.mp3"
+    OUTPUT_PLAY_DIR = os.path.join("output", "Play")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -573,6 +575,10 @@ def reset_everything(
         root / USER_MESSAGE_DIR
     ).resolve()
 
+    play_dir = (
+        root / OUTPUT_PLAY_DIR
+    ).resolve()
+
     pages_dir.mkdir(
         parents=True,
         exist_ok=True,
@@ -608,6 +614,14 @@ def reset_everything(
 
     total_files += files
     total_dirs += directories
+
+    if play_dir.is_dir():
+        files, directories = _safe_clear_dir_contents(
+            play_dir
+        )
+
+        total_files += files
+        total_dirs += directories
 
     # Remove active generated music and compatibility manifest.
     total_files += _delete_music_and_manifest(
@@ -903,7 +917,7 @@ def _toast(
 
 def confirm_and_reset(
     parent: Optional[QtWidgets.QWidget] = None,
-) -> None:
+) -> bool:
     dialog = _ConfirmDialog(
         parent
     )
@@ -918,31 +932,32 @@ def confirm_and_reset(
             center.y() - dialog.height() // 2,
         )
 
-    if (
-        dialog.exec()
-        == QtWidgets.QDialog.Accepted
-    ):
-        files, _directories = reset_everything(
-            parent=parent
-        )
+    if dialog.exec() != QtWidgets.QDialog.Accepted:
+        return False
 
-        _toast(
-            parent,
-            f"Wiped. ({files} files)",
-        )
+    files, _directories = reset_everything(
+        parent=parent
+    )
 
-        try:
-            if (
-                parent is not None
-                and hasattr(
-                    parent,
-                    "wiped",
-                )
-            ):
-                parent.wiped.emit()
+    _toast(
+        parent,
+        f"Wiped. ({files} files)",
+    )
 
-        except Exception:
-            pass
+    try:
+        if (
+            parent is not None
+            and hasattr(
+                parent,
+                "wiped",
+            )
+        ):
+            parent.wiped.emit()
+
+    except Exception:
+        pass
+
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1319,12 +1334,6 @@ class CommandTab(
         confirm_and_reset(
             self
         )
-
-        try:
-            self.wiped.emit()
-
-        except Exception:
-            pass
 
     def resizeEvent(
         self,

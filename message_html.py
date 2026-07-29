@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 BODY_RE = re.compile(r"<body\b[^>]*>(.*?)</body>", re.IGNORECASE | re.DOTALL)
 DOC_GUID_RE = re.compile(
@@ -56,6 +57,10 @@ NORMALIZED_TRANSPARENT_STYLE_VALUES = {
     entry.replace(" ", "") for entry in TRANSPARENT_STYLE_VALUES
 }
 
+ULTRALINK_SCHEME = "ultralink:"
+LEGACY_ULTRALINK_SCHEME = "hypernote:"
+ULTRALINK_SCHEMES = (ULTRALINK_SCHEME, LEGACY_ULTRALINK_SCHEME)
+
 DROP_STYLE_PROPS = {
     "margin-left",
     "margin-right",
@@ -65,6 +70,25 @@ DROP_STYLE_PROPS = {
 
 def _normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def is_ultralink_href(href: str) -> bool:
+    value = (href or "").casefold()
+    return any(value.startswith(scheme) for scheme in ULTRALINK_SCHEMES)
+
+
+def make_ultralink_href(message: str) -> str:
+    """Encode tooltip text in the anchor href that Qt preserves in rich HTML."""
+    return ULTRALINK_SCHEME + quote(_normalize_newlines(message or ""), safe="")
+
+
+def ultralink_message_from_href(href: str) -> str | None:
+    value = href or ""
+    lowered = value.casefold()
+    for scheme in ULTRALINK_SCHEMES:
+        if lowered.startswith(scheme):
+            return unquote(value[len(scheme) :])
+    return None
 
 
 def _format_decimal(value: float) -> str:

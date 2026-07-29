@@ -79,6 +79,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QDialogButtonBox,
     QLineEdit,
+    QPlainTextEdit,
     QToolButton,
     QMenu,
     QSplitter,
@@ -92,7 +93,13 @@ from config import (
     MESSAGE_HTML_FILE,
 )
 from message_history import write_message_with_revision
-from message_html import mark_lettersmith_message_html
+from message_format import normalize_ultralinks_in_document
+from message_html import (
+    is_ultralink_href,
+    make_ultralink_href,
+    mark_lettersmith_message_html,
+    ultralink_message_from_href,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants & Helpers
@@ -106,6 +113,8 @@ SETTINGS_ORG = "LetterSmith"
 SETTINGS_APP = "Editor"
 SETTINGS_KEY_COLOR = "textColor"
 SETTINGS_KEY_GEOMETRY = "windowGeometry"
+SETTINGS_KEY_ULTRALINK_COLOR = "ultralinkColor"
+DEFAULT_ULTRALINK_COLOR = QColor("#ffd84d")
 ASSET_SUBDIR = "message_assets"  # under gallery/
 
 
@@ -154,16 +163,13 @@ def _atomic_write(path: Path, data: str, *, encoding: str = "utf-8") -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FindReplaceDialog(QDialog):
-    """
-    Robust find/replace:
-      - Wrap-around search
-      - Enter in Find triggers find-next
-      - Optional match-case
-    """
+    """Persistent, formatting-safe find/replace tool."""
+
     def __init__(self, parent: "Editor") -> None:
         super().__init__(parent)
         self.setWindowTitle("Find / Replace")
-        self.setModal(True)
+        self.setModal(False)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
 
         self._editor: QTextEdit = parent.editor
 
@@ -171,76 +177,199 @@ class FindReplaceDialog(QDialog):
         self.replace_input = QLineEdit(placeholderText="Replace with…")
         self.match_case = QCheckBox("Match case")
         self.match_case.setChecked(False)
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("findStatus")
 
-        self.find_input.returnPressed.connect(self.find_next)
+        self.find_input.returnPressed.connect(self._find_from_return)
         self.replace_input.returnPressed.connect(self.replace_one)
 
         row = QHBoxLayout()
-        row.addWidget(self.find_input)
-        row.addWidget(self.replace_input)
+        row.addWidget(self.find_input, 1)
+        row.addWidget(self.replace_input, 1)
 
         opts = QHBoxLayout()
         opts.addWidget(self.match_case)
         opts.addStretch(1)
+        opts.addWidget(self.status_label)
 
-        box = QDialogButtonBox(QDialogButtonBox.Find | QDialogButtonBox.Replace | QDialogButtonBox.Close)
-        box.button(QDialogButtonBox.Find).clicked.connect(self.find_next)
-        box.button(QDialogButtonBox.Replace).clicked.connect(self.replace_one)
-        box.rejected.connect(self.reject)
+        buttons = QHBoxLayout()
+        self.previous_button = QPushButton("Previous")
+        self.next_button = QPushButton("Next")
+        self.replace_button = QPushButton("Replace")
+        self.close_button = QPushButton("Close")
+        self.previous_button.clicked.connect(self.find_previous)
+        self.next_button.clicked.connect(self.find_next)
+        self.replace_button.clicked.connect(self.replace_one)
+        self.close_button.clicked.connect(self.hide)
+        buttons.addWidget(self.previous_button)
+        buttons.addWidget(self.next_button)
+        buttons.addWidget(self.replace_button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.close_button)
 
         root = QVBoxLayout(self)
         root.addLayout(row)
         root.addLayout(opts)
-        root.addWidget(box)
+        root.addLayout(buttons)
+
+        self.find_input.textChanged.connect(self._clear_status)
+        self.match_case.toggled.connect(self._clear_status)
+        self.setMinimumWidth(560)
 
         self.setStyleSheet(
             "QDialog{background:#141414;border:1px solid #00d0ff;border-radius:8px;}"
             "QLineEdit{background:#1e1e1e;color:#eee;border:1px solid #2a2a2a;padding:6px;border-radius:4px;}"
-            "QCheckBox{color:#ddd; padding-left:2px;}"
+            "QLabel,QCheckBox{color:#ddd; padding-left:2px;}"
+            "QLabel#findStatus{color:#80eaff;}"
             "QPushButton{background:#232323;color:#fff;border:1px solid #00d0ff;border-radius:4px;padding:6px 12px;}"
             "QPushButton:hover{background:#00d0ff;color:#111}"
         )
 
-    def _find_options(self) -> QTextDocument.FindFlags:
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self.find_input.setFocus(Qt.OtherFocusReason)
+        self.find_input.selectAll()
+
+    def _clear_status(self, *_args) -> None:
+        self.status_label.clear()
+
+    def _find_from_return(self) -> None:
+        if QtWidgets.QApplication.keyboardModifiers() & Qt.ShiftModifier:
+            self.find_previous()
+        else:
+            self.find_next()
+
+    def _find_options(self, *, backward: bool = False) -> QTextDocument.FindFlags:
         flags = QTextDocument.FindFlags()
         if self.match_case.isChecked():
             flags |= QTextDocument.FindCaseSensitively
+        if backward:
+            flags |= QTextDocument.FindBackward
         return flags
 
-    def find_next(self) -> None:
+    def _find(self, *, backward: bool) -> bool:
         term = self.find_input.text()
         if not term:
-            return
+            self.status_label.setText("Enter text to find.")
+            return False
 
         doc = self._editor.document()
-        flags = self._find_options()
+        flags = self._find_options(backward=backward)
 
         cur = self._editor.textCursor()
         start_cursor = QTextCursor(cur)
         if cur.hasSelection():
-            start_cursor.setPosition(cur.selectionEnd())
+            start_cursor.setPosition(
+                cur.selectionStart() if backward else cur.selectionEnd()
+            )
         else:
             start_cursor.setPosition(cur.position())
 
         found = doc.find(term, start_cursor, flags)
+        wrapped = False
 
         if found.isNull():
-            top = QTextCursor(doc)
-            top.movePosition(QTextCursor.Start)
-            found = doc.find(term, top, flags)
+            wrapped = True
+            boundary = QTextCursor(doc)
+            boundary.movePosition(
+                QTextCursor.End if backward else QTextCursor.Start
+            )
+            found = doc.find(term, boundary, flags)
 
         if found.isNull():
             QtWidgets.QApplication.beep()
-            return
+            self.status_label.setText("No matches found.")
+            return False
 
         self._editor.setTextCursor(found)
+        self._editor.ensureCursorVisible()
+        if wrapped:
+            self.status_label.setText(
+                "Wrapped to end." if backward else "Wrapped to beginning."
+            )
+        else:
+            self.status_label.setText("Match found.")
+        return True
+
+    def find_next(self) -> bool:
+        return self._find(backward=False)
+
+    def find_previous(self) -> bool:
+        return self._find(backward=True)
 
     def replace_one(self) -> None:
+        term = self.find_input.text()
+        if not term:
+            self.status_label.setText("Enter text to find.")
+            return
+
         cur = self._editor.textCursor()
-        if cur.hasSelection():
+        selected = cur.selectedText()
+        matches = (
+            selected == term
+            if self.match_case.isChecked()
+            else selected.casefold() == term.casefold()
+        )
+        if cur.hasSelection() and matches:
             cur.insertText(self.replace_input.text())
             self._editor.setTextCursor(cur)
         self.find_next()
+
+
+class UltralinkDialog(QDialog):
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        allow_remove: bool = False,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Ultralink")
+        self.setModal(True)
+        self.remove_requested = False
+
+        self.message_edit = QPlainTextEdit(self)
+        self.message_edit.setPlainText(message or "")
+        self.message_edit.setPlaceholderText("Text shown when the reader hovers")
+        self.message_edit.setMinimumSize(360, 130)
+
+        buttons = QDialogButtonBox(self)
+        buttons.addButton("Save", QDialogButtonBox.AcceptRole)
+        buttons.addButton("Cancel", QDialogButtonBox.RejectRole)
+        if allow_remove:
+            remove_button = buttons.addButton(
+                "Remove Ultralink",
+                QDialogButtonBox.DestructiveRole,
+            )
+            remove_button.clicked.connect(self._remove)
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+
+        root = QVBoxLayout(self)
+        root.addWidget(self.message_edit)
+        root.addWidget(buttons)
+
+        self.setStyleSheet(
+            "QDialog{background:#141414;border:1px solid #00d0ff;border-radius:8px;}"
+            "QPlainTextEdit{background:#0f0f0f;color:#eee;border:1px solid #2a2a2a;border-radius:6px;padding:8px;}"
+            "QPushButton{background:#232323;color:#fff;border:1px solid #00d0ff;border-radius:4px;padding:6px 12px;}"
+            "QPushButton:hover{background:#00d0ff;color:#111;}"
+        )
+
+    def message_text(self) -> str:
+        return self.message_edit.toPlainText().strip()
+
+    def _save(self) -> None:
+        if not self.message_text():
+            QtWidgets.QApplication.beep()
+            self.message_edit.setFocus(Qt.OtherFocusReason)
+            return
+        self.accept()
+
+    def _remove(self) -> None:
+        self.remove_requested = True
+        self.accept()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -253,6 +382,21 @@ class RichTextEdit(QTextEdit):
         self.project_root = Path(project_root)
         self.setAcceptRichText(True)
         self.setAcceptDrops(True)
+        self.viewport().setMouseTracking(True)
+
+    def viewportEvent(self, event: QtCore.QEvent) -> bool:
+        if event.type() == QtCore.QEvent.ToolTip:
+            href = self.anchorAt(event.pos())
+            message = ultralink_message_from_href(href)
+            if message:
+                QtWidgets.QToolTip.showText(
+                    event.globalPos(),
+                    message,
+                    self.viewport(),
+                )
+                return True
+            QtWidgets.QToolTip.hideText()
+        return super().viewportEvent(event)
 
     def _assets_dir(self) -> Path:
         return self.project_root / GALLERY_DIR / ASSET_SUBDIR
@@ -575,6 +719,26 @@ class Editor(QDialog):
         act_col.triggered.connect(self.choose_color)
         self.toolbar.addAction(act_col)
 
+        self.btn_links = QToolButton(self)
+        self.btn_links.setText("Links")
+        self.btn_links.setPopupMode(QToolButton.InstantPopup)
+        self.btn_links.setAutoRaise(True)
+
+        link_menu = QMenu(self)
+        self.act_add_edit_link = link_menu.addAction("Add / Edit Link")
+        self.act_add_edit_link.setShortcut(QKeySequence("Ctrl+K"))
+        self.act_add_edit_link.triggered.connect(self.add_or_edit_link)
+        self.act_remove_link = link_menu.addAction("Remove Link")
+        self.act_remove_link.setShortcut(QKeySequence("Ctrl+Shift+K"))
+        self.act_remove_link.triggered.connect(self.remove_link)
+        self.btn_links.setMenu(link_menu)
+        self.toolbar.addWidget(self.btn_links)
+        self.addAction(self.act_add_edit_link)
+        self.addAction(self.act_remove_link)
+        self.editor.cursorPositionChanged.connect(self._update_link_actions)
+        self.editor.selectionChanged.connect(self._update_link_actions)
+        self._update_link_actions()
+
         self.toolbar.addSeparator()
 
         # Undo / Redo / Find
@@ -803,6 +967,141 @@ class Editor(QDialog):
 
     def open_find_replace(self) -> None:
         FindReplaceDialog(self).exec()
+
+    def _anchor_cursor_at_position(self, position: int) -> Optional[QTextCursor]:
+        """Return the complete link at a document position, if one exists."""
+        document = self.editor.document()
+        spans: list[tuple[int, int, str]] = []
+        block = document.begin()
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    fmt = fragment.charFormat()
+                    href = fmt.anchorHref() if fmt.isAnchor() else ""
+                    if href:
+                        spans.append(
+                            (
+                                fragment.position(),
+                                fragment.position() + fragment.length(),
+                                href,
+                            )
+                        )
+                iterator += 1
+            block = block.next()
+
+        match_index: Optional[int] = None
+        for index, (start, end, _href) in enumerate(spans):
+            if start <= position < end or (
+                position > 0 and start <= position - 1 < end
+            ):
+                match_index = index
+                break
+        if match_index is None:
+            return None
+
+        start, end, href = spans[match_index]
+        left = match_index - 1
+        while left >= 0 and spans[left][1] == start and spans[left][2] == href:
+            start = spans[left][0]
+            left -= 1
+        right = match_index + 1
+        while right < len(spans) and spans[right][0] == end and spans[right][2] == href:
+            end = spans[right][1]
+            right += 1
+
+        cursor = QTextCursor(document)
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.KeepAnchor)
+        return cursor
+
+    def _link_target_cursor(self) -> Optional[QTextCursor]:
+        cursor = QTextCursor(self.editor.textCursor())
+        if cursor.hasSelection():
+            return cursor
+
+        anchor_cursor = self._anchor_cursor_at_position(cursor.position())
+        if anchor_cursor is not None:
+            return anchor_cursor
+
+        cursor.select(QTextCursor.WordUnderCursor)
+        return cursor if cursor.hasSelection() else None
+
+    def _current_link_href(self) -> str:
+        cursor = self.editor.textCursor()
+        anchor_cursor = self._anchor_cursor_at_position(cursor.position())
+        if anchor_cursor is not None:
+            return anchor_cursor.charFormat().anchorHref()
+
+        if not cursor.hasSelection():
+            fmt = self.editor.currentCharFormat()
+            return fmt.anchorHref() if fmt.isAnchor() else ""
+
+        hrefs: set[str] = set()
+        document = self.editor.document()
+        position = cursor.selectionStart()
+        while position < cursor.selectionEnd():
+            probe = QTextCursor(document)
+            probe.setPosition(position)
+            probe.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor)
+            fmt = probe.charFormat()
+            if fmt.isAnchor() and fmt.anchorHref():
+                hrefs.add(fmt.anchorHref())
+            position += 1
+        return next(iter(hrefs)) if len(hrefs) == 1 else ""
+
+    def _update_link_actions(self) -> None:
+        target = self._link_target_cursor()
+        href = self._current_link_href()
+        self.act_add_edit_link.setEnabled(target is not None)
+        self.act_remove_link.setEnabled(bool(href))
+
+    def add_or_edit_link(self) -> None:
+        cursor = self._link_target_cursor()
+        if cursor is None:
+            QMessageBox.information(
+                self,
+                "Link",
+                "Select text or place the cursor on a word first.",
+            )
+            return
+
+        current_href = self._current_link_href() or "https://"
+        href, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            "Add or Edit Link",
+            "URL",
+            text=current_href,
+        )
+        if not accepted:
+            return
+
+        href = href.strip()
+        if not href:
+            return
+        if "://" not in href and not href.casefold().startswith("mailto:"):
+            href = f"https://{href}"
+
+        fmt = QTextCharFormat()
+        fmt.setAnchor(True)
+        fmt.setAnchorHref(href)
+        fmt.setFontUnderline(True)
+        self.editor.setTextCursor(cursor)
+        self._apply_char_format(fmt)
+        self._update_link_actions()
+
+    def remove_link(self) -> None:
+        cursor = self._link_target_cursor()
+        if cursor is None or not self._current_link_href():
+            return
+
+        fmt = QTextCharFormat()
+        fmt.setAnchor(False)
+        fmt.setAnchorHref("")
+        self.editor.setTextCursor(cursor)
+        self._apply_char_format(fmt)
+        self._update_link_actions()
 
     # ──────────────────────────────────────────────────────────────────────
     # Formatting

@@ -7,6 +7,8 @@ from html.parser import HTMLParser
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument
 
+from message_html import is_ultralink_href
+
 
 DEFAULT_MESSAGE_FONT = "Papyrus"
 DEFAULT_MESSAGE_ALIGNMENT = Qt.AlignCenter
@@ -104,6 +106,47 @@ def _apply_block_defaults(document: QTextDocument) -> None:
         )
         cursor.setBlockFormat(block_format)
         block = block.next()
+
+
+def normalize_ultralinks_in_document(document: QTextDocument) -> int:
+    """Restore Ultralink styling that Qt does not fully retain on HTML import."""
+    spans: list[tuple[int, int, QTextCharFormat]] = []
+    block = document.begin()
+    while block.isValid():
+        iterator = block.begin()
+        while not iterator.atEnd():
+            fragment = iterator.fragment()
+            if fragment.isValid():
+                char_format = QTextCharFormat(fragment.charFormat())
+                if (
+                    char_format.isAnchor()
+                    and is_ultralink_href(char_format.anchorHref())
+                ):
+                    spans.append(
+                        (
+                            fragment.position(),
+                            fragment.position() + fragment.length(),
+                            char_format,
+                        )
+                    )
+            iterator += 1
+        block = block.next()
+
+    work = QTextCursor(document)
+    work.beginEditBlock()
+    try:
+        for start, end, char_format in spans:
+            char_format.setFontItalic(True)
+            char_format.setFontUnderline(False)
+            char_format.setUnderlineStyle(
+                QTextCharFormat.UnderlineStyle.NoUnderline
+            )
+            work.setPosition(start)
+            work.setPosition(end, QTextCursor.KeepAnchor)
+            work.setCharFormat(char_format)
+    finally:
+        work.endEditBlock()
+    return len(spans)
 
 
 def apply_blank_editor_defaults(editor) -> None:

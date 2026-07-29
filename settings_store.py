@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import re
 import shutil
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 from transactional_io import atomic_write_text
 
@@ -78,77 +80,68 @@ CURTAIN_STYLE_ALIASES = {
 def normalize_published_page_url(
     value: object,
 ) -> str:
-    """
-    Return a normalized HTTP or HTTPS address.
-
-    Blank or invalid values return an empty string.
-    """
+    """Return a trimmed HTTP(S) URL without inventing a missing scheme."""
     candidate = str(value or "").strip()
-
-    if not candidate:
+    if (
+        not candidate
+        or any(
+            character.isspace()
+            for character in candidate
+        )
+    ):
         return ""
-
-    if "://" not in candidate:
-        candidate = f"https://{candidate}"
-
     try:
         parsed = urlsplit(candidate)
-    except ValueError:
+        _port = parsed.port
+    except (TypeError, ValueError):
         return ""
-
-    scheme = parsed.scheme.lower()
-
-    if scheme not in {
+    if parsed.scheme.casefold() not in {
         "http",
         "https",
     }:
         return ""
-
-    if not parsed.netloc:
+    if not parsed.netloc or not parsed.hostname:
         return ""
-
-    if not parsed.hostname:
+    if "\\" in candidate:
         return ""
-
+    if re.search(
+        r"%(?![0-9A-Fa-f]{2})",
+        candidate,
+    ):
+        return ""
+    hostname = parsed.hostname.rstrip(".")
+    if not hostname:
+        return ""
     try:
-        port = parsed.port
+        ipaddress.ip_address(hostname)
     except ValueError:
-        return ""
-
-    hostname = parsed.hostname.lower()
-
-    if ":" in hostname and not hostname.startswith("["):
-        hostname = f"[{hostname}]"
-
-    username = parsed.username
-    password = parsed.password
-
-    user_information = ""
-
-    if username:
-        user_information = username
-
-        if password:
-            user_information += f":{password}"
-
-        user_information += "@"
-
-    network_location = (
-        f"{user_information}{hostname}"
-    )
-
-    if port is not None:
-        network_location += f":{port}"
-
-    return urlunsplit(
-        (
-            scheme,
-            network_location,
-            parsed.path or "",
-            parsed.query,
-            parsed.fragment,
-        )
-    )
+        if all(
+            part.isdigit()
+            for part in hostname.split(".")
+        ):
+            return ""
+        try:
+            ascii_hostname = (
+                hostname.encode("idna")
+                .decode("ascii")
+            )
+        except UnicodeError:
+            return ""
+        labels = ascii_hostname.split(".")
+        if any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or not all(
+                character.isalnum()
+                or character == "-"
+                for character in label
+            )
+            for label in labels
+        ):
+            return ""
+    return candidate
 
 
 class SettingsChanged:
