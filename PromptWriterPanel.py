@@ -10,7 +10,7 @@ import json
 import random
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Callable
@@ -33,7 +33,8 @@ VISIONARY_URL = "https://chatgpt.com/g/g-68ce5925196c8191a222e24d29323813-the-vi
 
 _FILE_CACHE: Dict[str, Tuple[List[str], Optional[Path], Optional[Tuple[int, int]]]] = {}
 PROMPTER_ROOT = Path(__file__).resolve().parent
-PROMPT_WRITER_STATE_VERSION = 4
+PROMPT_WRITER_STATE_VERSION = 5
+STATE_PERSIST_DEBOUNCE_MS = 350
 MAX_STATE_TEXT_LENGTH = 24000
 REFERENCE_IMAGE_MAX_COUNT = 3
 REFERENCE_IMAGE_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
@@ -91,12 +92,72 @@ COMMON_ENTRY_FIXES: Dict[str, str] = {
     "colour": "Color",
 }
 
-IMAGE_COLOR_MAP = {
-    "Cover Prompt": COL_COVER,
-    "Letter Prompt": COL_LETTER,
-    "Wall Prompt": COL_WALL,
-    "Back Prompt": COL_BACK,
-}
+@dataclass
+class PageSpec:
+    key: str
+    display_label: str
+    output_filename: str
+    preview_color: str
+    baseline: str
+    detail_help: str
+    detail_widget: Optional[QtWidgets.QPlainTextEdit] = None
+    preview_widget: Optional[QtWidgets.QTextEdit] = None
+    copy_button: Optional[QtWidgets.QPushButton] = None
+
+
+PAGE_SPECS: Tuple[PageSpec, ...] = (
+    PageSpec(
+        key="cover",
+        display_label="Cover Prompt",
+        output_filename="cover.png",
+        preview_color=COL_COVER,
+        baseline="The Cover Page is a bold, decorative opening image that captures attention and sets the tone.",
+        detail_help="Use it for cover-specific details, composition, or mood.",
+    ),
+    PageSpec(
+        key="letter",
+        display_label="Letter Prompt",
+        output_filename="letter.png",
+        preview_color=COL_LETTER,
+        baseline="The Letter Page is a subtle, elegant backdrop that frames the main written message without distraction.",
+        detail_help="Use it for letter-specific details or layout direction.",
+    ),
+    PageSpec(
+        key="wall",
+        display_label="Wall Prompt",
+        output_filename="wall.png",
+        preview_color=COL_WALL,
+        baseline="The Wall Page is a calm, minimalist background designed to support large blocks of text.",
+        detail_help="Use it for wall-specific environment or background details.",
+    ),
+    PageSpec(
+        key="back",
+        display_label="Back Prompt",
+        output_filename="back.png",
+        preview_color=COL_BACK,
+        baseline="The Back Page is a simple, graceful closing image that echoes the cover while providing a sense of finality.",
+        detail_help="Use it for back-page details or closing visual accents.",
+    ),
+)
+
+
+def _page_spec_for(identifier: object) -> Optional[PageSpec]:
+    text = _normalize_text(identifier, strip=True, max_length=80).casefold()
+    if not text:
+        return None
+    return next(
+        (
+            page
+            for page in PAGE_SPECS
+            if text
+            in {
+                page.key.casefold(),
+                page.display_label.casefold(),
+                page.output_filename.casefold(),
+            }
+        ),
+        None,
+    )
 
 POLICY_DETAIL_OPTION_SPECS: Tuple[Tuple[str, str, str], ...] = (
     (
@@ -189,7 +250,7 @@ def _normalize_exclusive_check_states(checks_raw: object) -> Dict[str, bool]:
 
 @dataclass(frozen=True)
 class PromptPayload:
-    image_name: str
+    page_key: str
     role_sentence: str
     order_fragment: str
     subject_fragment: str
@@ -201,6 +262,11 @@ class PromptPayload:
     effort_line: str = ""
     guidance_lines: Tuple[str, ...] = ()
     format_paragraph: str = ""
+
+    @property
+    def image_name(self) -> str:
+        page = _page_spec_for(self.page_key)
+        return page.display_label if page is not None else self.page_key
 
     def first_paragraph(self) -> str:
         return _join_nonempty(self.role_sentence, self.order_fragment, self.subject_fragment)
@@ -763,7 +829,8 @@ def _serialize_managed_list_entries(entries: List[ManagedListEntry], *, allow_he
 
 def render_prompt_html(payload: PromptPayload) -> str:
     """Render the preview with colored values (preview should match emitted text)."""
-    col_img = IMAGE_COLOR_MAP.get(payload.image_name, COL_BACK)
+    page = _page_spec_for(payload.page_key)
+    col_img = page.preview_color if page is not None else COL_BACK
     parts: list[str] = []
 
     first = _join_nonempty(payload.role_sentence, payload.order_fragment)
@@ -850,27 +917,6 @@ class GoldenCheckBox(QtWidgets.QCheckBox):
         painter.setPen(QColor("#dcdce0" if self.isEnabled() else "#777a84"))
         painter.drawText(contents, Qt.AlignVCenter | Qt.AlignLeft, self.text())
         painter.end()
-
-
-_IMAGE_BASELINES: Dict[str, str] = {
-    "cover": "The Cover Page is a bold, decorative opening image that captures attention and sets the tone.",
-    "letter": "The Letter Page is a subtle, elegant backdrop that frames the main written message without distraction.",
-    "wall": "The Wall Page is a calm, minimalist background designed to support large blocks of text.",
-    "back": "The Back Page is a simple, graceful closing image that echoes the cover while providing a sense of finality.",
-}
-
-
-def _baseline_for(image_name: str) -> str:
-    key = image_name.strip().lower()
-    if "cover" in key:
-        return _IMAGE_BASELINES["cover"]
-    if "letter" in key:
-        return _IMAGE_BASELINES["letter"]
-    if "wall" in key:
-        return _IMAGE_BASELINES["wall"]
-    if "back" in key:
-        return _IMAGE_BASELINES["back"]
-    return ""
 
 
 def _file_signature(path: Path) -> Optional[Tuple[int, int]]:
@@ -971,7 +1017,7 @@ def _pick_random_order(name: str) -> Tuple[Optional[List[str]], Optional[Path]]:
 def _build_prompt_payload(
     subject: str,
     data: dict,
-    image_name: str,
+    page_identifier: str,
     *,
     type_choice: Optional[str] = None,
     color_choice: Optional[str] = None,
@@ -979,7 +1025,10 @@ def _build_prompt_payload(
     global_extra: Optional[str] = None,
     image_extra: Optional[str] = None,
 ) -> Tuple[PromptPayload, dict]:
-    baseline_text = _baseline_for(image_name)
+    page = _page_spec_for(page_identifier)
+    page_key = page.key if page is not None else _normalize_text(page_identifier, strip=True, max_length=80)
+    display_label = page.display_label if page is not None else page_key
+    baseline_text = page.baseline if page is not None else ""
 
     role = _normalize_text(data.get("role", "Artist"), strip=True)
     order = data.get("order", [])
@@ -992,7 +1041,8 @@ def _build_prompt_payload(
     guidance_lines = _normalize_guidance_lines(guidance)
 
     dbg = {
-        "image": image_name,
+        "page": page_key,
+        "image": display_label,
         "role": role,
         "order": order,
         "effort": effort_line,
@@ -1022,7 +1072,7 @@ def _build_prompt_payload(
             subject_core = s
 
     payload = PromptPayload(
-        image_name=image_name,
+        page_key=page_key,
         role_sentence=role_sentence,
         order_fragment=order_core,
         subject_fragment=subject_core,
@@ -1041,7 +1091,7 @@ def _build_prompt_payload(
 def assemble_prompt_for_image(
     subject: str,
     data: dict,
-    image_name: str,
+    page_identifier: str,
     *,
     type_choice: Optional[str] = None,
     color_choice: Optional[str] = None,
@@ -1052,7 +1102,7 @@ def assemble_prompt_for_image(
     payload, dbg = _build_prompt_payload(
         subject,
         data,
-        image_name,
+        page_identifier,
         type_choice=type_choice,
         color_choice=color_choice,
         guidance=guidance,
@@ -1262,6 +1312,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._persist_timer = QtCore.QTimer(self)
         self._persist_timer.setSingleShot(True)
         self._persist_timer.timeout.connect(self._persist_state_now)
+        self._state_persistence_suspended = False
         self._shutdown = False
 
         self._drag_pos: Optional[QtCore.QPoint] = None
@@ -1294,9 +1345,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "format": default_format,
         }
 
-        self._images = ["Cover Prompt", "Letter Prompt", "Wall Prompt", "Back Prompt"]
-        self.preview_widgets: Dict[str, QtWidgets.QTextEdit] = {}
-        self.copy_buttons: Dict[str, QtWidgets.QPushButton] = {}
+        self._page_specs = [replace(page) for page in PAGE_SPECS]
         self._generated_prompts: Dict[str, str] = {}
         self._generated_input_signature = ""
         self._generated_output_valid = False
@@ -1422,29 +1471,31 @@ class PromptWriterPanel(QtWidgets.QWidget):
         current_text = combo.currentText().strip()
         is_editable = combo.isEditable()
 
-        combo.blockSignals(True)
-        combo.clear()
-        if allow_none:
-            combo.addItem(NONE_CHOICE_LABEL)
-        for entry in entries:
-            combo.addItem(entry.text)
-            model_item = combo.model().item(combo.count() - 1)
-            if entry.is_header:
-                self._style_header_item(model_item)
-            elif model_item is not None:
-                model_item.setData(False, MANAGED_LIST_HEADER_ROLE)
+        signals_were_blocked = combo.blockSignals(True)
+        try:
+            combo.clear()
+            if allow_none:
+                combo.addItem(NONE_CHOICE_LABEL)
+            for entry in entries:
+                combo.addItem(entry.text)
+                model_item = combo.model().item(combo.count() - 1)
+                if entry.is_header:
+                    self._style_header_item(model_item)
+                elif model_item is not None:
+                    model_item.setData(False, MANAGED_LIST_HEADER_ROLE)
 
-        if current_text:
-            restored_index = combo.findText(current_text)
-            if restored_index >= 0:
-                combo.setCurrentIndex(restored_index)
-            elif is_editable:
-                combo.setEditText(current_text)
-            elif allow_none:
+            if current_text:
+                restored_index = combo.findText(current_text)
+                if restored_index >= 0:
+                    combo.setCurrentIndex(restored_index)
+                elif is_editable:
+                    combo.setEditText(current_text)
+                elif allow_none:
+                    combo.setCurrentIndex(0)
+            elif allow_none and combo.count() > 0:
                 combo.setCurrentIndex(0)
-        elif allow_none and combo.count() > 0:
-            combo.setCurrentIndex(0)
-        combo.blockSignals(False)
+        finally:
+            combo.blockSignals(signals_were_blocked)
 
     def _reload_managed_list(self, key: str) -> None:
         config = self._managed_list_config(key)
@@ -1501,9 +1552,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
         widget.setProperty("managed_list_key", key)
         widget.installEventFilter(self)
 
-    def _schedule_persist_state(self, delay_ms: int = 350) -> None:
+    def _schedule_persist_state(self, delay_ms: Optional[int] = None) -> None:
         try:
-            self._persist_timer.start(int(delay_ms))
+            if self._state_persistence_suspended or self._shutdown:
+                return
+            delay = STATE_PERSIST_DEBOUNCE_MS if delay_ms is None else max(0, int(delay_ms))
+            self._persist_timer.start(delay)
         except Exception:
             pass
 
@@ -1566,6 +1620,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         cannot clobber Prompt Writer state.
         """
         try:
+            self._persist_timer.stop()
             state = self._capture_state()
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = self._state_path.with_name(f".{self._state_path.name}.tmp")
@@ -1584,6 +1639,18 @@ class PromptWriterPanel(QtWidgets.QWidget):
         if not isinstance(generated_raw, dict):
             generated_raw = {}
 
+        generated_prompts: Dict[str, str] = {}
+        page_details: Dict[str, str] = {}
+        for page in self._page_specs:
+            page_details[page.key] = _normalize_text(state.get(page.key, ""))
+            generated_value = generated_raw.get(
+                page.key,
+                generated_raw.get(page.display_label, ""),
+            )
+            generated_text = _normalize_text(generated_value)
+            if generated_text.strip():
+                generated_prompts[page.key] = generated_text
+
         reference_images = self._normalize_reference_images(state.get("reference_images", []))
 
         return {
@@ -1592,16 +1659,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "subject": _normalize_text(state.get("subject", ""), strip=True, max_length=300),
             "color": _normalize_text(state.get("color", ""), strip=True, max_length=300),
             "global": _normalize_text(state.get("global", "")),
-            "cover": _normalize_text(state.get("cover", "")),
-            "letter": _normalize_text(state.get("letter", "")),
-            "wall": _normalize_text(state.get("wall", "")),
-            "back": _normalize_text(state.get("back", "")),
+            **page_details,
             "checks": _normalize_exclusive_check_states(checks_raw),
-            "generated_prompts": {
-                image_name: _normalize_text(generated_raw.get(image_name, ""))
-                for image_name in self._images
-                if _normalize_text(generated_raw.get(image_name, "")).strip()
-            },
+            "generated_prompts": generated_prompts,
             "generated_input_signature": _normalize_text(
                 state.get("generated_input_signature", ""),
                 strip=True,
@@ -1675,15 +1735,19 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "subject": self.cmb_subject.currentText().strip(),
             "color": self._get_color_choice() or "",
             "global": self.txt_global.toPlainText().strip(),
-            "cover": self.txt_cover.toPlainText().strip(),
-            "letter": self.txt_letter.toPlainText().strip(),
-            "wall": self.txt_wall.toPlainText().strip(),
-            "back": self.txt_back.toPlainText().strip(),
             "checks": {
                 state_key: bool(checkbox.isChecked())
                 for checkbox, state_key in self._checkbox_state_specs()
             },
         }
+        input_state.update(
+            {
+                page.key: page.detail_widget.toPlainText().strip()
+                if page.detail_widget is not None
+                else ""
+                for page in self._page_specs
+            }
+        )
         encoded = json.dumps(
             input_state,
             ensure_ascii=False,
@@ -1706,16 +1770,20 @@ class PromptWriterPanel(QtWidgets.QWidget):
         except Exception:
             color_txt = ""
 
+        page_details = {
+            page.key: page.detail_widget.toPlainText()
+            if page.detail_widget is not None
+            else ""
+            for page in self._page_specs
+        }
+
         return {
             "version": PROMPT_WRITER_STATE_VERSION,
             "type": self.cmb_type.currentText().strip(),
             "subject": self.cmb_subject.currentText().strip(),
             "color": color_txt,
             "global": self.txt_global.toPlainText(),
-            "cover": self.txt_cover.toPlainText(),
-            "letter": self.txt_letter.toPlainText(),
-            "wall": self.txt_wall.toPlainText(),
-            "back": self.txt_back.toPlainText(),
+            **page_details,
             "checks": {
                 state_key: _cb(checkbox)
                 for checkbox, state_key in self._checkbox_state_specs()
@@ -1757,12 +1825,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 t = str(state.get("type", "")).strip()
                 if t:
                     self.cmb_type.setCurrentText(t)
+                else:
+                    self.cmb_type.setCurrentIndex(0)
             except Exception:
                 pass
             try:
                 s = str(state.get("subject", "")).strip()
                 if s:
                     self.cmb_subject.setCurrentText(s)
+                else:
+                    self.cmb_subject.setCurrentIndex(-1)
             except Exception:
                 pass
             try:
@@ -1771,16 +1843,17 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     idx = self.cmb_color.findText(c)
                     if idx >= 0:
                         self.cmb_color.setCurrentIndex(idx)
+                else:
+                    self.cmb_color.setCurrentIndex(0)
             except Exception:
                 pass
 
             # Text
             try:
                 self.txt_global.setPlainText(str(state.get("global", "") or ""))
-                self.txt_cover.setPlainText(str(state.get("cover", "") or ""))
-                self.txt_letter.setPlainText(str(state.get("letter", "") or ""))
-                self.txt_wall.setPlainText(str(state.get("wall", "") or ""))
-                self.txt_back.setPlainText(str(state.get("back", "") or ""))
+                for page in self._page_specs:
+                    if page.detail_widget is not None:
+                        page.detail_widget.setPlainText(str(state.get(page.key, "") or ""))
             except Exception:
                 pass
 
@@ -1804,10 +1877,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 ):
                     self._generated_prompts = generated_prompts
                     self._generated_input_signature = saved_signature
-                    for img, txt in self._generated_prompts.items():
-                        w = self.preview_widgets.get(img)
-                        if w is not None and txt.strip():
-                            w.setPlainText(txt)
+                    for page in self._page_specs:
+                        txt = self._generated_prompts.get(page.key, "")
+                        if page.preview_widget is not None and txt.strip():
+                            page.preview_widget.setPlainText(txt)
                     self._set_generated_output_valid(True)
                 else:
                     self._invalidate_generated_output()
@@ -2101,56 +2174,24 @@ class PromptWriterPanel(QtWidgets.QWidget):
         )
         left_v.addWidget(per_lbl)
 
-        self.txt_cover = QtWidgets.QPlainTextEdit(); self.txt_cover.setMaximumHeight(70)
-        self.txt_letter = QtWidgets.QPlainTextEdit(); self.txt_letter.setMaximumHeight(70)
-        self.txt_wall = QtWidgets.QPlainTextEdit(); self.txt_wall.setMaximumHeight(70)
-        self.txt_back = QtWidgets.QPlainTextEdit(); self.txt_back.setMaximumHeight(70)
-
-        self.txt_cover.setPlaceholderText("Add details that should apply only to cover.png.")
-        self.txt_letter.setPlaceholderText("Add details that should apply only to letter.png.")
-        self.txt_wall.setPlaceholderText("Add details that should apply only to wall.png.")
-        self.txt_back.setPlaceholderText("Add details that should apply only to back.png.")
-
-        lbl = QtWidgets.QLabel("cover.png"); lbl.setStyleSheet(f"font-weight:900; color:{COL_COVER};")
-        _set_help(
-            lbl,
-            "Anything written here is added only to the cover.png prompt. Use it for cover-specific details, composition, or mood.",
-        )
-        _set_help(
-            self.txt_cover,
-            "Anything written here is added only to the cover.png prompt. Use it for cover-specific details, composition, or mood.",
-        )
-        left_v.addWidget(lbl); left_v.addWidget(self.txt_cover)
-        lbl = QtWidgets.QLabel("letter.png"); lbl.setStyleSheet(f"font-weight:900; color:{COL_LETTER};")
-        _set_help(
-            lbl,
-            "Anything written here is added only to the letter.png prompt. Use it for letter-specific details or layout direction.",
-        )
-        _set_help(
-            self.txt_letter,
-            "Anything written here is added only to the letter.png prompt. Use it for letter-specific details or layout direction.",
-        )
-        left_v.addWidget(lbl); left_v.addWidget(self.txt_letter)
-        lbl = QtWidgets.QLabel("wall.png"); lbl.setStyleSheet(f"font-weight:900; color:{COL_WALL};")
-        _set_help(
-            lbl,
-            "Anything written here is added only to the wall.png prompt. Use it for wall-specific environment or background details.",
-        )
-        _set_help(
-            self.txt_wall,
-            "Anything written here is added only to the wall.png prompt. Use it for wall-specific environment or background details.",
-        )
-        left_v.addWidget(lbl); left_v.addWidget(self.txt_wall)
-        lbl = QtWidgets.QLabel("back.png"); lbl.setStyleSheet(f"font-weight:900; color:{COL_BACK};")
-        _set_help(
-            lbl,
-            "Anything written here is added only to the back.png prompt. Use it for back-page details or closing visual accents.",
-        )
-        _set_help(
-            self.txt_back,
-            "Anything written here is added only to the back.png prompt. Use it for back-page details or closing visual accents.",
-        )
-        left_v.addWidget(lbl); left_v.addWidget(self.txt_back)
+        for page in self._page_specs:
+            editor = QtWidgets.QPlainTextEdit()
+            editor.setMaximumHeight(70)
+            editor.setPlaceholderText(
+                f"Add details that should apply only to {page.output_filename}."
+            )
+            help_text = (
+                f"Anything written here is added only to the {page.output_filename} prompt. "
+                f"{page.detail_help}"
+            )
+            label = QtWidgets.QLabel(page.output_filename)
+            label.setStyleSheet(f"font-weight:900; color:{page.preview_color};")
+            _set_help(label, help_text)
+            _set_help(editor, help_text)
+            left_v.addWidget(label)
+            left_v.addWidget(editor)
+            page.detail_widget = editor
+            setattr(self, f"txt_{page.key}", editor)
         left_v.addStretch(1)
 
         right_v = QtWidgets.QVBoxLayout(); right_v.setSpacing(8)
@@ -2194,7 +2235,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._preview_layout.setContentsMargins(0, 0, 0, 0)
         self._preview_layout.setSpacing(12)
 
-        for img in self._images:
+        for page in self._page_specs:
             block = QtWidgets.QFrame()
             block.setFrameShape(QtWidgets.QFrame.Box)
             block.setFrameShadow(QtWidgets.QFrame.Plain)
@@ -2204,13 +2245,13 @@ class PromptWriterPanel(QtWidgets.QWidget):
             bl.setSpacing(6)
 
             header_row = QtWidgets.QHBoxLayout()
-            header_label = QtWidgets.QLabel(img)
-            header_label.setStyleSheet(f"font-weight:900; color: {IMAGE_COLOR_MAP.get(img, '#dcdce0')};")
+            header_label = QtWidgets.QLabel(page.display_label)
+            header_label.setStyleSheet(f"font-weight:900; color: {page.preview_color};")
             header_row.addWidget(header_label)
             header_row.addStretch(1)
             copy_btn = QtWidgets.QPushButton("Copy")
             copy_btn.setFixedSize(64, 24)
-            copy_btn.setToolTip(f"Copy {img}")
+            copy_btn.setToolTip(f"Copy {page.display_label}")
             copy_btn.setEnabled(False)
             header_row.addWidget(copy_btn)
             bl.addLayout(header_row)
@@ -2218,16 +2259,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
             editor = FocusablePlainTextEdit()
             editor.setReadOnly(True)
             editor.setAcceptRichText(True)
-            editor.setPlaceholderText(f"Prompt for {img}")
+            editor.setPlaceholderText(f"Prompt for {page.display_label}")
             editor.setMinimumHeight(140)
             editor.setMaximumHeight(260)
             bl.addWidget(editor)
 
             self._preview_layout.addWidget(block)
-            self.preview_widgets[img] = editor
-            self.copy_buttons[img] = copy_btn
+            page.preview_widget = editor
+            page.copy_button = copy_btn
 
-            copy_btn.clicked.connect(lambda _, image_name=img: self._copy_prompt(image_name))
+            copy_btn.clicked.connect(lambda _, page_key=page.key: self._copy_prompt(page_key))
             editor.focused.connect(lambda ed=editor: self._set_last_focused(ed))
 
         self._preview_layout.addStretch(1)
@@ -2382,10 +2423,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self.cmb_subject.currentTextChanged.connect(self._on_prompt_input_changed)
             self.cmb_color.currentIndexChanged.connect(self._on_prompt_input_changed)
             self.txt_global.textChanged.connect(self._on_prompt_input_changed)
-            self.txt_cover.textChanged.connect(self._on_prompt_input_changed)
-            self.txt_letter.textChanged.connect(self._on_prompt_input_changed)
-            self.txt_wall.textChanged.connect(self._on_prompt_input_changed)
-            self.txt_back.textChanged.connect(self._on_prompt_input_changed)
+            for page in self._page_specs:
+                if page.detail_widget is not None:
+                    page.detail_widget.textChanged.connect(self._on_prompt_input_changed)
             for group, fallback in self._exclusive_checkbox_groups():
                 self._wire_exclusive_group(group, fallback)
             for checkbox, _ in self._checkbox_state_specs():
@@ -2396,17 +2436,19 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def _set_generated_output_valid(self, valid: bool) -> None:
         self._generated_output_valid = bool(valid and self._generated_prompts)
         self.btn_copy.setEnabled(self._generated_output_valid)
-        for image_name, button in self.copy_buttons.items():
-            button.setEnabled(
-                self._generated_output_valid
-                and bool(self._generated_prompts.get(image_name, "").strip())
-            )
+        for page in self._page_specs:
+            if page.copy_button is not None:
+                page.copy_button.setEnabled(
+                    self._generated_output_valid
+                    and bool(self._generated_prompts.get(page.key, "").strip())
+                )
 
     def _invalidate_generated_output(self) -> None:
         self._generated_prompts = {}
         self._generated_input_signature = ""
-        for widget in self.preview_widgets.values():
-            widget.clear()
+        for page in self._page_specs:
+            if page.preview_widget is not None:
+                page.preview_widget.clear()
         self._set_generated_output_valid(False)
 
     def _on_prompt_input_changed(self, *_args: object) -> None:
@@ -2734,13 +2776,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
         if not self._generated_output_valid:
             return ""
         parts: List[str] = []
-        for key in self._images:
-            text = self._generated_prompts.get(key, "").strip()
+        for page in self._page_specs:
+            text = self._generated_prompts.get(page.key, "").strip()
             if not text:
-                w = self.preview_widgets.get(key)
-                if w:
-                    text = w.toPlainText().strip()
-            parts.append(f"--- {key} ---\n\n{text}" if text else f"--- {key} ---\n\n")
+                if page.preview_widget is not None:
+                    text = page.preview_widget.toPlainText().strip()
+            parts.append(
+                f"--- {page.display_label} ---\n\n{text}"
+                if text
+                else f"--- {page.display_label} ---\n\n"
+            )
         return "\n\n".join(parts).strip()
 
     def copy_all_with_references(self) -> str:
@@ -2795,10 +2840,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
         guidance = self._collect_guidance()
         global_extra = self.txt_global.toPlainText().strip()
         per_extras = {
-            "Cover Prompt": self.txt_cover.toPlainText().strip(),
-            "Letter Prompt": self.txt_letter.toPlainText().strip(),
-            "Wall Prompt": self.txt_wall.toPlainText().strip(),
-            "Back Prompt": self.txt_back.toPlainText().strip(),
+            page.key: page.detail_widget.toPlainText().strip()
+            if page.detail_widget is not None
+            else ""
+            for page in self._page_specs
         }
 
         prompts: Dict[str, str] = {}
@@ -2806,38 +2851,48 @@ class PromptWriterPanel(QtWidgets.QWidget):
         per_data_map: Dict[str, dict] = {}
         shared_prompt_data = self._roll_shared_prompt_data()
 
-        for img in self._images:
+        for page in self._page_specs:
             per_image_data = dict(shared_prompt_data)
-            per_data_map[img] = per_image_data
+            per_data_map[page.key] = per_image_data
             prompt, payload, dbg = assemble_prompt_for_image(
                 subject,
                 per_image_data,
-                img,
+                page.key,
                 type_choice=t,
                 color_choice=c,
                 guidance=guidance,
                 global_extra=global_extra,
-                image_extra=per_extras.get(img, ""),
+                image_extra=per_extras.get(page.key, ""),
             )
-            prompts[img] = prompt
-            per_data_map[img]["payload"] = payload
-            debug_map[img] = dbg
+            prompts[page.key] = prompt
+            per_data_map[page.key]["payload"] = payload
+            debug_map[page.key] = dbg
 
         self._generated_prompts = dict(prompts)
         self._generated_input_signature = self._current_prompt_input_signature()
         self._set_generated_output_valid(True)
 
-        for img in self._images:
-            w = self.preview_widgets.get(img)
-            if not w:
+        for page in self._page_specs:
+            if page.preview_widget is None:
                 continue
-            payload = per_data_map.get(img, {}).get("payload")
+            payload = per_data_map.get(page.key, {}).get("payload")
             if not isinstance(payload, PromptPayload):
                 continue
             html_view = render_prompt_html(payload)
-            w.setHtml(html_view)
+            page.preview_widget.setHtml(html_view)
 
-        self.prompts_generated.emit(prompts, debug_map)
+        self.prompts_generated.emit(
+            {
+                page.display_label: prompts[page.key]
+                for page in self._page_specs
+                if page.key in prompts
+            },
+            {
+                page.display_label: debug_map[page.key]
+                for page in self._page_specs
+                if page.key in debug_map
+            },
+        )
         self._persist_state_now()
 
     def _roll_data_for_image(self) -> dict:
@@ -2862,33 +2917,67 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def _copy_all_prompts(self):
         return self._copy_all_prompts_text()
 
-    def _copy_prompt(self, image_name: str) -> None:
+    def _copy_prompt(self, page_identifier: str) -> None:
         if not self._generated_output_valid:
             return
-        text = self._generated_prompts.get(image_name, "").strip()
+        page = _page_spec_for(page_identifier)
+        if page is None:
+            return
+        panel_page = next((item for item in self._page_specs if item.key == page.key), None)
+        if panel_page is None:
+            return
+        text = self._generated_prompts.get(panel_page.key, "").strip()
         if not text:
-            widget = self.preview_widgets.get(image_name)
-            if widget is not None:
-                text = widget.toPlainText().strip()
+            if panel_page.preview_widget is not None:
+                text = panel_page.preview_widget.toPlainText().strip()
         if text:
             QtWidgets.QApplication.clipboard().setText(text)
 
     def _on_erase_all(self):
-        self.cmb_subject.setCurrentIndex(-1)
-        self.cmb_type.setCurrentIndex(0)
-        self.cmb_color.setCurrentIndex(0)
-        for checkbox, _ in self._checkbox_state_specs():
-            checkbox.setChecked(False)
-        self.cb_neutral_style.setChecked(True)
-        self.cb_unspecified_framing.setChecked(True)
+        signal_widgets: List[QtCore.QObject] = [
+            self.cmb_subject,
+            self.cmb_type,
+            self.cmb_color,
+            self.txt_global,
+            *(
+                page.detail_widget
+                for page in self._page_specs
+                if page.detail_widget is not None
+            ),
+            *(checkbox for checkbox, _ in self._checkbox_state_specs()),
+        ]
+        signal_blockers = [QtCore.QSignalBlocker(widget) for widget in signal_widgets]
+        self._persist_timer.stop()
+        self._state_persistence_suspended = True
+        reset_completed = False
+        try:
+            for key in ("type", "subject", "color"):
+                self._reload_managed_list(key)
 
-        self._reference_images = []
-        self.txt_global.clear(); self.txt_cover.clear(); self.txt_letter.clear(); self.txt_wall.clear(); self.txt_back.clear()
-        self._invalidate_generated_output()
+            self.cmb_subject.setCurrentIndex(-1)
+            self.cmb_type.setCurrentIndex(0)
+            self.cmb_color.setCurrentIndex(0)
+            for checkbox, _ in self._checkbox_state_specs():
+                checkbox.setChecked(False)
+            self.cb_neutral_style.setChecked(True)
+            self.cb_unspecified_framing.setChecked(True)
 
-        self._load_colors_into_combo()
-        self._refresh_reference_image_panel()
-        self._persist_state_now()
+            self._reference_images = []
+            self._references_visible = True
+            self.txt_global.clear()
+            for page in self._page_specs:
+                if page.detail_widget is not None:
+                    page.detail_widget.clear()
+            self._invalidate_generated_output()
+            self._refresh_reference_image_panel()
+            reset_completed = True
+        finally:
+            for blocker in signal_blockers:
+                blocker.unblock()
+            self._state_persistence_suspended = False
+
+        if reset_completed:
+            self._persist_state_now()
 
     def _toggle_max_restore(self) -> None:
         screen_obj = self.screen() or QtGui.QGuiApplication.primaryScreen()

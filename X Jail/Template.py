@@ -1,4 +1,4 @@
-﻿# ===============================
+# ===============================
 # File: Template.py
 # Purpose: HTML/CSS/JS templates for the eLetter viewer
 # ===============================
@@ -20,6 +20,8 @@ TEMPLATE_HTML = r"""
 </head>
 
 <body>
+  <button id="fullscreen-toggle" type="button" title="Enter full screen" aria-label="Enter full screen">⛶</button>
+
   <div id="curtain-overlay" aria-hidden="false" role="dialog" aria-modal="true" aria-labelledby="begin-button">
     <img id="curtain-left"  src="gallery/controls/cleft.png"  alt="" aria-hidden="true" decoding="async" fetchpriority="high">
     <img id="curtain-right" src="gallery/controls/cright.png" alt="" aria-hidden="true" decoding="async" fetchpriority="high">
@@ -27,13 +29,6 @@ TEMPLATE_HTML = r"""
   </div>
 
   <div id="slideshow" aria-hidden="true">
-    <div id="turn" aria-hidden="true">
-      <div class="sheet sheet-front visible" id="sheetFront">
-        <img id="turnFrontImg" alt="">
-      </div>
-    </div>
-    <div id="turnShadow" aria-hidden="true"></div>
-
     <section class="slide active" data-index="0" id="slide-0">
       <img src="gallery/pages/cover.png" alt="Cover Page" decoding="async" fetchpriority="high">
     </section>
@@ -62,32 +57,6 @@ TEMPLATE_HTML = r"""
     </button>
 
     <div id="progress" aria-live="polite">Page 1 of 4</div>
-    <div id="viewer-actions" aria-label="Letter controls">
-      <div id="viewer-actions-left">
-        <button
-          id="restart-button"
-          class="hud-button viewer-action"
-          type="button"
-          title="Restart letter"
-          aria-label="Restart letter"
-        >Restart</button>
-        <button
-          id="mute-button"
-          class="hud-button viewer-action"
-          type="button"
-          title="Mute letter audio"
-          aria-label="Mute letter audio"
-          aria-pressed="false"
-        >Mute</button>
-      </div>
-      <button
-        id="fullscreen-button"
-        class="hud-button viewer-action"
-        type="button"
-        title="Enter fullscreen"
-        aria-label="Enter fullscreen"
-      >Fullscreen</button>
-    </div>
 
     <button
       id="open-text"
@@ -166,15 +135,12 @@ TEMPLATE_CSS = r"""
   --shadow-page:0 18px 40px rgba(0,0,0,.45);
   --motion-fast:180ms ease;
   --motion-medium:240ms cubic-bezier(.2,.8,.2,1);
-  --nav-offset:clamp(14px,3vw,36px);
-  --nav-size:clamp(52px,6vw,78px);
-  --nav-pad:clamp(5px,.7vw,8px);
+  --nav-offset:clamp(16px,4vw,50px);
+  --nav-size:clamp(78px,9.5vw,120px);
+  --nav-pad:clamp(8px,1vw,12px);
   --icon-size:clamp(46px,5vw,56px);
   --close-size:clamp(42px,4.8vw,48px);
   --corner-offset:clamp(14px,3vw,20px);
-  --control-rail:54px;
-  --bottom-control-rail:0px;
-  --page-side-rail:0px;
   --slider-width:clamp(112px,16vw,150px);
   --wall-gap:clamp(20px,4vw,42px);
   --wall-max-width:960px;
@@ -192,11 +158,13 @@ button{margin:0;border:0;background:none;color:inherit}
   opacity:0;visibility:hidden;pointer-events:none;
   transition:opacity var(--motion-fast);
   background:var(--stage-backdrop);
-  perspective:6000px;
-  transform-style:preserve-3d;
 }
 body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 
+#fullscreen-toggle{position:fixed;top:var(--corner-offset);right:var(--corner-offset);z-index:10020;width:clamp(48px,5.5vw,64px);height:clamp(48px,5.5vw,64px);display:inline-flex;align-items:center;justify-content:center;border:1px solid rgba(155,255,251,.56);border-radius:50%;background:linear-gradient(180deg,rgba(15,24,38,.94),rgba(6,10,18,.84));color:#fff;font-size:clamp(24px,3vw,34px);line-height:1;cursor:pointer;box-shadow:var(--hud-shadow),0 0 18px rgba(0,255,255,.34);transition:transform var(--motion-fast),box-shadow var(--motion-fast),border-color var(--motion-fast)}
+#fullscreen-toggle:hover{transform:scale(1.06);border-color:rgba(255,255,255,.88);box-shadow:var(--hud-shadow-strong),0 0 26px rgba(0,255,255,.52)}
+body:not(.stage-started) #fullscreen-toggle{animation:fullscreenBeacon 1.8s ease-in-out infinite}
+@keyframes fullscreenBeacon{0%,100%{transform:scale(1);box-shadow:var(--hud-shadow),0 0 12px rgba(0,255,255,.28)}50%{transform:scale(1.09);box-shadow:var(--hud-shadow-strong),0 0 34px rgba(0,255,255,.72),0 0 0 6px rgba(0,255,255,.10)}}
 #curtain-overlay{position:absolute;inset:0;z-index:9999;overflow:hidden;pointer-events:all;opacity:0;background:var(--stage-backdrop);will-change:opacity}
 #curtain-overlay.is-visible{animation:curtainIntroFadeIn 520ms ease-out forwards}
 #curtain-left,#curtain-right{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;z-index:10000;pointer-events:none;opacity:0;will-change:opacity,transform}
@@ -213,19 +181,17 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 
 .slide{position:absolute;inset:0;opacity:0;pointer-events:none;z-index:5}
 .slide.active{opacity:1;pointer-events:auto}
-.slide.peek{opacity:1;pointer-events:none;z-index:4}
-.slide.ghost{opacity:0;pointer-events:none}
 .slide.asset-failed img{opacity:0}
 .slide.asset-failed::after{content:attr(data-fallback-label);position:absolute;inset:50% auto auto 50%;transform:translate(-50%,-50%);width:min(520px,72%);padding:18px 22px;color:var(--text-main);text-align:center;font:700 20px/1.4 var(--font-ui);background:rgba(0,0,0,.58);border:1px solid var(--hud-border);border-radius:var(--page-radius);box-shadow:var(--shadow-page);z-index:6}
-.slide img{max-width:calc(100% - (2 * var(--page-side-rail)));max-height:calc(100% - var(--control-rail) - var(--bottom-control-rail));position:absolute;inset:var(--control-rail) var(--page-side-rail) var(--bottom-control-rail);margin:auto;object-fit:contain;border-radius:var(--page-radius);box-shadow:inset 0 0 30px rgba(0,0,0,.20),var(--shadow-page)}
+.slide img{max-width:100%;max-height:100%;position:absolute;inset:0;margin:auto;object-fit:contain;border-radius:var(--page-radius);box-shadow:inset 0 0 30px rgba(0,0,0,.20),var(--shadow-page)}
 
 .nav-button,.hud-button{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--hud-border);background:linear-gradient(180deg,var(--hud-surface-top),var(--hud-surface-bottom));color:var(--text-main);box-shadow:var(--hud-shadow);backdrop-filter:blur(10px);cursor:pointer;transition:transform var(--motion-fast),background var(--motion-fast),border-color var(--motion-fast),box-shadow var(--motion-fast),opacity var(--motion-fast),visibility 0s linear 220ms}
 .nav-button:hover,.hud-button:hover{background:linear-gradient(180deg,rgba(25,37,55,.88),rgba(10,14,24,.76));border-color:var(--hud-border-strong);box-shadow:var(--hud-shadow-strong)}
 .nav-button:active,.hud-button:active{transform:scale(.98)}
 .nav-button img,.hud-button img{display:block;width:100%;height:100%;object-fit:contain;pointer-events:none;filter:drop-shadow(0 6px 12px rgba(0,0,0,.34))}
-#begin-button:focus-visible,.nav-button:focus-visible,.hud-button:focus-visible,#volume-slider:focus-visible{outline:3px solid rgba(255,255,255,.94);outline-offset:4px}
+#fullscreen-toggle:focus-visible,#begin-button:focus-visible,.nav-button:focus-visible,.hud-button:focus-visible,#volume-slider:focus-visible{outline:3px solid rgba(255,255,255,.94);outline-offset:4px}
 
-.nav-button{position:absolute;top:calc(50% + 27px);width:calc(var(--nav-size) + (2 * var(--nav-pad)));height:calc(var(--nav-size) + (2 * var(--nav-pad)));padding:var(--nav-pad);border-radius:50%;z-index:100}
+.nav-button{position:absolute;top:50%;width:calc(var(--nav-size) + (2 * var(--nav-pad)));height:calc(var(--nav-size) + (2 * var(--nav-pad)));padding:var(--nav-pad);border-radius:50%;z-index:100}
 #prev{left:var(--nav-offset);transform:translateY(-50%)}
 #next{right:var(--nav-offset);transform:translateY(-50%)}
 .nav-button:hover{transform:translateY(-50%) scale(1.04)}
@@ -234,10 +200,6 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .nav-button[disabled]:hover{transform:translateY(-50%)}
 
 #progress{position:absolute;right:var(--corner-offset);bottom:var(--corner-offset);display:inline-flex;align-items:center;min-height:40px;padding:0 14px;border:1px solid rgba(255,255,255,.10);border-radius:var(--pill-radius);background:rgba(6,9,16,.56);box-shadow:var(--hud-shadow);color:var(--text-soft);font:700 clamp(12px,1.2vw,14px)/1 var(--font-ui);letter-spacing:.08em;text-transform:uppercase;z-index:101}
-#viewer-actions{position:absolute;top:var(--corner-offset);left:var(--corner-offset);right:var(--corner-offset);display:flex;align-items:center;justify-content:space-between;pointer-events:none;z-index:107}
-#viewer-actions-left{display:flex;align-items:center;gap:8px}
-#viewer-actions .viewer-action{width:auto;height:38px;padding:0 12px;font:700 12px/1 var(--font-ui);letter-spacing:.03em;pointer-events:auto}
-#mute-button[aria-pressed="true"]{border-color:rgba(155,255,251,.55);background:linear-gradient(180deg,rgba(20,55,64,.92),rgba(8,25,34,.86));color:#eaffff}
 
 .text-wall{position:absolute;top:50%;left:50%;width:min(var(--wall-max-width),calc(100% - (2 * var(--wall-gap))));max-height:calc(100% - (2 * var(--wall-gap)));overflow:auto;padding:var(--wall-frame-pad);border:1px solid var(--paper-edge);border-radius:var(--panel-radius);background:linear-gradient(180deg,rgba(var(--message-overlay-rgb),var(--message-overlay-opacity)),rgba(var(--message-overlay-rgb),var(--message-overlay-opacity)));color:var(--message-ink);box-shadow:0 30px 80px var(--paper-shadow),0 12px 28px rgba(0,0,0,.22),inset 0 1px 0 var(--paper-line);z-index:105;opacity:0;visibility:hidden;pointer-events:none;transform:translate(-50%,-48%);transition:opacity var(--wall-fade-ms) ease,transform var(--motion-medium),visibility 0s linear var(--wall-fade-ms);isolation:isolate;scrollbar-width:thin;scrollbar-color:rgba(92,67,40,.52) rgba(0,0,0,.06)}
 .text-wall.is-open{opacity:1;visibility:visible;pointer-events:auto;transform:translate(-50%,-50%);transition:opacity var(--wall-fade-ms) ease,transform var(--motion-medium),visibility 0s}
@@ -263,7 +225,7 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 #close-text{position:absolute;top:clamp(16px,4vw,40px);right:clamp(16px,4vw,40px);width:var(--close-size);height:var(--close-size);border-radius:14px;font-size:clamp(24px,2.8vw,28px);line-height:1;z-index:106;transform:scale(.96)}
 #close-text.is-visible{transform:scale(1)}
 
-#volume-control{position:absolute;right:var(--corner-offset);bottom:calc(var(--corner-offset) + 52px);display:flex;align-items:center;gap:10px;padding:6px;border:1px solid rgba(255,255,255,.08);border-radius:var(--pill-radius);background:rgba(42,46,54,.72);box-shadow:var(--hud-shadow);backdrop-filter:blur(10px);z-index:102;opacity:0;visibility:hidden;pointer-events:none;transform:translateY(0);transition:opacity var(--motion-fast),transform var(--motion-medium),visibility 0s linear 220ms}
+#volume-control{position:absolute;top:calc(50% + var(--nav-size) + 34px);right:var(--nav-offset);display:flex;align-items:center;gap:10px;padding:8px 10px 8px 8px;border:1px solid rgba(255,255,255,.08);border-radius:var(--pill-radius);background:rgba(42,46,54,.72);box-shadow:var(--hud-shadow);backdrop-filter:blur(10px);z-index:99;opacity:0;visibility:hidden;pointer-events:none;transform:translateY(0);transition:opacity var(--motion-fast),transform var(--motion-medium),visibility 0s linear 220ms}
 body.stage-ready #volume-control{opacity:1;visibility:visible;pointer-events:auto;transition-delay:0s}
 #volume-control.slider-open{border-color:rgba(155,255,251,.18);background:rgba(50,55,64,.82)}
 #volume-icon{flex:none}
@@ -273,19 +235,9 @@ body.stage-ready #volume-control{opacity:1;visibility:visible;pointer-events:aut
 #volume-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;background:var(--accent-strong);border-radius:50%;cursor:pointer;border:2px solid #fff;box-shadow:0 0 0 4px rgba(0,255,255,.12)}
 #volume-slider::-moz-range-thumb{width:16px;height:16px;background:var(--accent-strong);border:2px solid #fff;border-radius:50%;cursor:pointer;box-shadow:0 0 0 4px rgba(0,255,255,.12)}
 
-#turn{position:absolute;left:0;top:0;width:0;height:0;opacity:0;pointer-events:none;overflow:hidden;border-radius:var(--page-radius);z-index:40;transform-style:preserve-3d;backface-visibility:hidden;will-change:transform,opacity}
-.sheet{position:absolute;inset:0;overflow:hidden;border-radius:var(--page-radius);transform-style:preserve-3d;backface-visibility:hidden;transform-origin:0 50%;--edgeA:0;--glintA:0}
-.sheet img{display:block;width:100%;height:100%;object-fit:contain;border-radius:var(--page-radius)}
-.sheet.hidden{opacity:0;visibility:hidden}
-.sheet.visible{opacity:1;visibility:visible}
-.sheet::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(90deg,rgba(255,255,255,0) 60%,rgba(255,255,255,var(--edgeA)) 86%,rgba(255,255,255,0) 100%);mix-blend-mode:screen}
-.sheet::before{content:"";position:absolute;inset:-10%;pointer-events:none;background:radial-gradient(320px 220px at 92% 45%,rgba(255,255,255,var(--glintA)) 0%,rgba(255,255,255,0) 62%);mix-blend-mode:overlay}
-#turnShadow{position:absolute;left:0;top:0;width:0;height:0;pointer-events:none;z-index:39;opacity:0;border-radius:var(--page-radius);overflow:hidden;--sx:18%;--sd:.28;--sb:14px;background:radial-gradient(140% 90% at var(--sx) 55%,rgba(0,0,0,var(--sd)) 0%,rgba(0,0,0,0) 62%);filter:blur(var(--sb))}
-
-@media (max-width: 900px){:root{--nav-size:clamp(48px,8vw,66px);--wall-gap:clamp(18px,4vw,30px)}.text-wall-content{font-size:clamp(16px,1.8vw,18px)}}
-@media (max-width: 640px){:root{--nav-size:34px;--nav-pad:4px;--icon-size:34px;--close-size:38px;--corner-offset:12px;--control-rail:50px;--bottom-control-rail:60px;--page-side-rail:50px}#prev,#next{top:50%}#volume-control{left:var(--corner-offset);right:auto;bottom:calc(5px + env(safe-area-inset-bottom));padding:4px;transform:none}body.stage-ready #volume-control{transform:none}#progress{right:var(--corner-offset);bottom:calc(5px + env(safe-area-inset-bottom));min-height:34px;padding:0 10px;font-size:10px}#viewer-actions{top:10px;left:10px;right:10px}#viewer-actions-left{gap:5px}#viewer-actions .viewer-action{height:32px;padding:0 8px;font-size:10px}#open-text{left:50%;bottom:calc(5px + env(safe-area-inset-bottom));transform:translateX(-50%)}#close-text{top:52px;right:10px}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - (2 * var(--wall-gap)) - 100px)}#volume-control.slider-open #volume-slider{width:min(28vw,64px)}}
-@media (max-width: 220px){:root{--page-side-rail:58px}#viewer-actions .viewer-action{width:34px;padding:0;font-size:0}#restart-button::before{content:"Γå╗";font-size:18px}#mute-button::before{content:"≡ƒöç";font-size:15px}#mute-button[aria-pressed="true"]::before{content:"≡ƒöè"}#fullscreen-button::before{content:"Γ¢╢";font-size:17px}}
-@media (prefers-reduced-motion: reduce){*,*::before,*::after{scroll-behavior:auto !important}#slideshow,#volume-control,#open-text,#close-text,.text-wall,#volume-slider{transition:none}#begin-button{animation:none}#curtain-overlay.is-visible,#curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
+@media (max-width: 900px){:root{--nav-size:clamp(68px,11vw,96px);--wall-gap:clamp(18px,4vw,30px)}.text-wall-content{font-size:clamp(16px,1.8vw,18px)}}
+@media (max-width: 640px){:root{--nav-size:clamp(60px,18vw,76px);--icon-size:44px;--close-size:40px;--corner-offset:16px}#prev,#next{top:auto;bottom:calc(var(--corner-offset) + 8px + env(safe-area-inset-bottom));transform:none}#prev:hover,#next:hover{transform:scale(1.04)}.nav-button[disabled]:hover{transform:none}#volume-control{top:auto;right:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom));transform:none}body.stage-ready #volume-control{transform:none}#progress{left:50%;right:auto;bottom:calc(var(--corner-offset) + env(safe-area-inset-bottom));transform:translateX(-50%)}#open-text{left:var(--corner-offset);bottom:calc(var(--corner-offset) + 88px + env(safe-area-inset-bottom))}#close-text{top:16px;right:16px}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - (2 * var(--wall-gap)) - 110px)}#volume-control.slider-open #volume-slider{width:min(34vw,128px)}}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{scroll-behavior:auto !important}#slideshow,#volume-control,#open-text,#close-text,.text-wall,#volume-slider{transition:none}#begin-button,#fullscreen-toggle{animation:none}#curtain-overlay.is-visible,#curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
 """
 
 TEMPLATE_JS = r"""
@@ -294,18 +246,12 @@ document.addEventListener('DOMContentLoaded', () => {
   const cLeft     = document.getElementById('curtain-left');
   const cRight    = document.getElementById('curtain-right');
   const beginBtn  = document.getElementById('begin-button');
+  const fullscreenBtn = document.getElementById('fullscreen-toggle');
 
   const slides    = Array.from(document.querySelectorAll('.slide'));
   const prevBtn   = document.getElementById('prev');
   const nextBtn   = document.getElementById('next');
   const progress  = document.getElementById('progress');
-  const restartBtn = document.getElementById('restart-button');
-  const muteBtn = document.getElementById('mute-button');
-  const fullscreenBtn = document.getElementById('fullscreen-button');
-  const turn = document.getElementById('turn');
-  const turnShadow = document.getElementById('turnShadow');
-  const sheetFront = document.getElementById('sheetFront');
-  const imgFront = document.getElementById('turnFrontImg');
 
   const wall       = document.getElementById('textWall');
   const closeText  = document.getElementById('close-text');
@@ -338,12 +284,8 @@ document.addEventListener('DOMContentLoaded', () => {
   let stageReady = false;
   let introStarted = false;
   let deferredWarmStarted = false;
-  let flipping = false;
   let musicPlaylistIndex = 0;
   let playlistTransitioning = false;
-  const muteStorageKey = 'lettersmith.viewerMuted';
-  let viewerMuted = loadViewerMuted();
-  let currentVolume = loadVolume0to100();
 
   const flipPool = Array.from({length: 10}, (_, i) => `gallery/sounds/flip${i+1}.mp3`);
   const glissSrc = 'gallery/sounds/glissando.mp3';
@@ -375,6 +317,30 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  function fullscreenElement(){
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  }
+  async function toggleFullscreen(){
+    try{
+      if (fullscreenElement()){
+        const exit = document.exitFullscreen || document.webkitExitFullscreen;
+        if (exit) await exit.call(document);
+      }else{
+        const target = document.documentElement;
+        const request = target.requestFullscreen || target.webkitRequestFullscreen;
+        if (request) await request.call(target);
+      }
+    }catch(_){ }
+  }
+  function syncFullscreenButton(){
+    if (!fullscreenBtn) return;
+    const active = !!fullscreenElement();
+    fullscreenBtn.textContent = active ? '🗗' : '⛶';
+    fullscreenBtn.title = active ? 'Exit full screen' : 'Enter full screen';
+    fullscreenBtn.setAttribute('aria-label', fullscreenBtn.title);
+    fullscreenBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+
   function warmDeferredAssets(){
     if (deferredWarmStarted) return;
     deferredWarmStarted = true;
@@ -396,10 +362,6 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function slideImageEl(slide){ return slide ? slide.querySelector('img') : null; }
-  function slideImageSrc(slide){
-    const image = slideImageEl(slide);
-    return image ? image.getAttribute('src') || '' : '';
-  }
   function markSlideAssetFailed(slide, img){
     if (!slide || slide.classList.contains('asset-failed')) return;
     slide.classList.add('asset-failed');
@@ -475,7 +437,7 @@ document.addEventListener('DOMContentLoaded', () => {
     btn.setAttribute('aria-disabled', disabled ? 'true' : 'false');
   }
   function syncButtons(){
-    const locked = !started || introControlsLocked || wallRevealLocked || flipping;
+    const locked = !started || introControlsLocked || wallRevealLocked;
     setDisabled(prevBtn, locked || idx === 0);
     setDisabled(nextBtn, locked || idx === TOTAL - 1);
   }
@@ -550,7 +512,6 @@ document.addEventListener('DOMContentLoaded', () => {
       const a = new Audio(src);
       a.preload = 'auto';
       a.volume = clamp(volume01, 0, 1);
-      a.muted = viewerMuted;
       a.play().catch(()=>{});
     }catch(_){ }
   }
@@ -571,127 +532,16 @@ document.addEventListener('DOMContentLoaded', () => {
     clearWallRevealTimers();
     wallRevealLocked = false;
     idx = target;
-    slides.forEach((s, i) => {
-      s.classList.toggle('active', i === idx);
-      s.classList.remove('peek');
-      s.classList.remove('ghost');
-    });
+    slides.forEach((s, i) => s.classList.toggle('active', i === idx));
     if (idx === 2) wallClosedByUser = false;
     if (opts.playSound !== false) playFlip();
     updateProgress();
     syncButtons();
     syncWallUI();
   }
-
-  function activeSlide(){ return slides[idx]; }
-  function activeImageRect(){
-    const image = slideImageEl(activeSlide());
-    if (!image) return null;
-    const rect = image.getBoundingClientRect();
-    return rect.width > 2 && rect.height > 2 ? rect : null;
-  }
-  function placeTurn(rect){
-    for (const element of [turn, turnShadow]){
-      element.style.left = `${rect.left}px`;
-      element.style.top = `${rect.top}px`;
-      element.style.width = `${rect.width}px`;
-      element.style.height = `${rect.height}px`;
-    }
-  }
-  function setTurnVisible(visible){
-    turn.style.opacity = visible ? '1' : '0';
-    turnShadow.style.opacity = visible ? '1' : '0';
-  }
-  function setTurnRotation(degrees){
-    turn.style.transformOrigin = '0% 50%';
-    turn.style.transform = `rotateY(${degrees}deg)`;
-    const amount = clamp(Math.abs(degrees) / 180, 0, 1);
-    const edge = Math.pow(Math.sin(amount * Math.PI), 1.2);
-    const glint = Math.pow(Math.sin(amount * Math.PI), 2);
-    sheetFront.style.setProperty('--edgeA', String(0.28 * edge));
-    sheetFront.style.setProperty('--glintA', String(0.22 * glint));
-    turnShadow.style.setProperty('--sx', degrees < 0 ? '26%' : '16%');
-    turnShadow.style.setProperty('--sd', String(0.14 + (0.22 * edge)));
-    turnShadow.style.setProperty('--sb', `${10 + (10 * edge)}px`);
-  }
-  function finishTurn(currentSlide, targetSlide, targetIndex){
-    currentSlide.classList.remove('ghost');
-    targetSlide.classList.remove('peek');
-    setActiveIndex(targetIndex, { playSound: false });
-    setTurnVisible(false);
-    for (const element of [turn, turnShadow]){
-      element.style.width = '0px';
-      element.style.height = '0px';
-    }
-    slideshowEl.classList.remove('page-turning');
-    slideshowEl.setAttribute('aria-busy', 'false');
-    flipping = false;
-    syncButtons();
-  }
-  function flipTo(targetIndex){
-    if (!started || flipping || introControlsLocked || wallRevealLocked) return;
-    const target = clamp(targetIndex, 0, TOTAL - 1);
-    if (target === idx) return;
-    const rect = activeImageRect();
-    if (!rect || prefersReducedMotion){
-      playFlip();
-      setActiveIndex(target, { playSound: false });
-      return;
-    }
-
-    flipping = true;
-    syncButtons();
-    slideshowEl.classList.add('page-turning');
-    slideshowEl.setAttribute('aria-busy', 'true');
-
-    const goingNext = target > idx;
-    const currentSlide = slides[idx];
-    const targetSlide = slides[target];
-    placeTurn(rect);
-    sheetFront.classList.remove('hidden');
-    sheetFront.classList.add('visible');
-    imgFront.src = goingNext
-      ? slideImageSrc(currentSlide)
-      : slideImageSrc(targetSlide);
-
-    if (goingNext){
-      targetSlide.classList.add('peek');
-      currentSlide.classList.add('ghost');
-      setTurnRotation(0);
-    } else {
-      setTurnRotation(-180);
-    }
-    setTurnVisible(true);
-    playFlip();
-
-    const duration = 620;
-    const startedAt = performance.now();
-    function animate(now){
-      const raw = clamp((now - startedAt) / duration, 0, 1);
-      const eased = raw < 0.5
-        ? 4 * raw * raw * raw
-        : 1 - (Math.pow((-2 * raw) + 2, 3) / 2);
-      const degrees = goingNext
-        ? -180 * eased
-        : -180 + (180 * eased);
-      setTurnRotation(degrees);
-      if (raw < 1){
-        requestAnimationFrame(animate);
-        return;
-      }
-      finishTurn(currentSlide, targetSlide, target);
-    }
-    requestAnimationFrame(animate);
-  }
-  window.addEventListener('resize', () => {
-    if (!flipping) return;
-    const rect = activeImageRect();
-    if (rect) placeTurn(rect);
-  });
-
   function go(delta){
-    if (!started || introControlsLocked || wallRevealLocked || flipping) return;
-    flipTo(idx + delta);
+    if (!started || introControlsLocked || wallRevealLocked) return;
+    setActiveIndex(idx + delta);
   }
 
   function ensureSlider(){
@@ -713,48 +563,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const v0 = (typeof INITIAL_VOLUME === 'number') ? INITIAL_VOLUME : 50;
     return clamp(Math.round(v0), 0, 100);
   }
-  function loadViewerMuted(){
-    try{
-      return window.sessionStorage.getItem(muteStorageKey) === 'true';
-    }catch(_){
-      return false;
-    }
-  }
-  function saveViewerMuted(){
-    try{
-      window.sessionStorage.setItem(muteStorageKey, viewerMuted ? 'true' : 'false');
-    }catch(_){ }
-  }
   function setVolume0to100(v){
     const vv = clamp(Math.round(v), 0, 100);
-    currentVolume = vv;
     const vol01 = vv / 100;
-    const muted = viewerMuted || vv === 0;
+    const muted = vv === 0;
     [music, musicStandby].forEach((audio) => {
       if (!audio) return;
       audio.volume = vol01;
       audio.muted = muted;
     });
     volIconImg.src = muted ? 'gallery/controls/voloff.png' : 'gallery/controls/volon.png';
-    volIcon.setAttribute('aria-label', muted ? 'Audio muted. Toggle volume slider' : 'Toggle volume slider');
+    volIcon.setAttribute('aria-label', muted ? 'Volume muted. Toggle volume slider' : 'Toggle volume slider');
     if (slider) slider.value = String(vv);
-  }
-
-  function syncMuteButton(){
-    if (!muteBtn) return;
-    const label = viewerMuted ? 'Unmute' : 'Mute';
-    const description = viewerMuted ? 'Unmute letter audio' : 'Mute letter audio';
-    muteBtn.textContent = label;
-    muteBtn.title = description;
-    muteBtn.setAttribute('aria-label', description);
-    muteBtn.setAttribute('aria-pressed', viewerMuted ? 'true' : 'false');
-  }
-
-  function setViewerMuted(muted){
-    viewerMuted = !!muted;
-    saveViewerMuted();
-    setVolume0to100(currentVolume);
-    syncMuteButton();
   }
 
   function musicSources(){
@@ -789,8 +609,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (playlistTransitioning || musicPlaylistIndex + 1 >= sources.length || !music || !musicStandby) return;
     playlistTransitioning = true;
     const nextIndex = musicPlaylistIndex + 1;
-    const target = clamp(currentVolume / 100, 0, 1);
-    const muted = viewerMuted || target === 0;
+    const target = clamp(loadVolume0to100() / 100, 0, 1);
+    const muted = target === 0;
     musicStandby.src = sources[nextIndex];
     musicStandby.currentTime = 0;
     musicStandby.volume = 0;
@@ -860,6 +680,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function openCurtain(){
     if (started) return;
     started = true;
+    document.body.classList.add('stage-started');
     introControlsLocked = true;
     syncButtons();
     revealStage();
@@ -883,7 +704,7 @@ document.addEventListener('DOMContentLoaded', () => {
       musicStarted = true;
       glissDone = true;
       if (safetyTimer !== null){ clearTimeout(safetyTimer); safetyTimer = null; }
-      const v = currentVolume;
+      const v = loadVolume0to100();
       setVolume0to100(v);
       if (!ensureInitialMusicSource()){
         tryUnlockIntroControls();
@@ -892,7 +713,7 @@ document.addEventListener('DOMContentLoaded', () => {
       try{
         music.currentTime = 0;
         music.volume = 0;
-        music.muted = viewerMuted || v === 0;
+        music.muted = (v === 0);
         music.play().catch(()=>{});
       }catch(_){ }
       const target = clamp(v / 100, 0, 1);
@@ -923,7 +744,6 @@ document.addEventListener('DOMContentLoaded', () => {
       const g = new Audio(glissSrc);
       g.preload = 'auto';
       g.volume = 0.10;
-      g.muted = viewerMuted;
       g.addEventListener('ended', startMusicAfterGliss, { once: true });
       g.addEventListener('error', () => { beginGlissAndCurtain(g); startMusicAfterGliss(); }, { once: true });
       g.addEventListener('loadedmetadata', () => beginGlissAndCurtain(g), { once: true });
@@ -935,39 +755,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  bindPress(fullscreenBtn, (e) => { e.preventDefault(); toggleFullscreen(); });
+  document.addEventListener('fullscreenchange', syncFullscreenButton);
+  document.addEventListener('webkitfullscreenchange', syncFullscreenButton);
+  syncFullscreenButton();
   bindPress(beginBtn, (e) => { e.preventDefault(); openCurtain(); });
   prevBtn.addEventListener('click', () => go(-1));
   nextBtn.addEventListener('click', () => go(1));
-  if (restartBtn){
-    restartBtn.addEventListener('click', () => {
-      window.location.reload();
-    });
-  }
-  if (muteBtn){
-    muteBtn.addEventListener('click', () => {
-      setViewerMuted(!viewerMuted);
-    });
-  }
-  if (fullscreenBtn){
-    fullscreenBtn.addEventListener('click', async () => {
-      try{
-        if (document.fullscreenElement){
-          await document.exitFullscreen();
-        } else {
-          await document.documentElement.requestFullscreen();
-        }
-      }catch(err){
-        console.warn('Fullscreen request failed', err);
-      }
-    });
-    document.addEventListener('fullscreenchange', () => {
-      const active = Boolean(document.fullscreenElement);
-      const label = active ? 'Exit fullscreen' : 'Fullscreen';
-      fullscreenBtn.textContent = label;
-      fullscreenBtn.title = active ? 'Exit fullscreen' : 'Enter fullscreen';
-      fullscreenBtn.setAttribute('aria-label', fullscreenBtn.title);
-    });
-  }
   window.addEventListener('keydown', (e) => {
     if (!started || introControlsLocked || wallRevealLocked) return;
     if (e.key === 'ArrowLeft'){
@@ -1011,7 +805,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   ensureSlider();
   setSliderOpen(false);
-  syncMuteButton();
   setVolume0to100(loadVolume0to100());
   setHiddenState(wall, true);
   setHiddenState(openText, true);

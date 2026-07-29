@@ -213,7 +213,7 @@ class DropMessageButton(ArtworkButton):
     file_dropped = Signal(str)
 
     def __init__(self, project_root: str | Path, label: str = "Import") -> None:
-        super().__init__(label, project_root, "LButton.png")
+        super().__init__(label, project_root, "EButton.png")
         self.setFont(QFont("Segoe UI Semibold", 12, QFont.Bold))
         self.setFixedSize(198, 69)
         self.setAcceptDrops(True)
@@ -487,7 +487,7 @@ class MessageTab(QtWidgets.QWidget):
         self.btn.file_dropped.connect(self.handle_drop)
         actions.addWidget(self.btn, 0, 1)
 
-        self.edit_btn = ArtworkButton("Edit", self.project_root, "PButton.png", self)
+        self.edit_btn = ArtworkButton("Edit", self.project_root, "ROButton.png", self)
         self.edit_btn.setFixedSize(198, 69)
         self.edit_btn.setFont(QFont("Segoe UI Semibold", 12, QFont.Bold))
         if not self.edit_btn.has_artwork:

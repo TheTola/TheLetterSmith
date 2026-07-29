@@ -1,11 +1,11 @@
-﻿# ===============================
+# ===============================
 # File: Nexus.py
 # ===============================
 """
-Nexus ΓÇö main shell for Letter Smith
-Clean placement ΓÇó Robust overlay ΓÇó Sound visualizer ΓÇó Prompt Writer FAB owned by Image_tab
+Nexus — main shell for Letter Smith
+Clean placement • Robust overlay • Sound visualizer • Prompt Writer FAB owned by Image_tab
 + Help.gif (idle, plays constantly) swaps to HHelp.gif on hover
-+ Per-tab Help popover header: Γ£¿The Image tabΓ£¿ / Γ£¿The sound tabΓ£¿ / Γ£¿The message tabΓ£¿ / Γ£¿The forge tabΓ£¿
++ Per-tab Help popover header: ✨The Image tab✨ / ✨The sound tab✨ / ✨The message tab✨ / ✨The forge tab✨
 
 Notes
 - If Qt WebEngine is missing, we exit with a clear tip: pip install PySide6-Addons
@@ -18,18 +18,25 @@ import os, sys, subprocess, json
 from pathlib import Path
 from typing import Optional
 
-# ===================================================================================================================================================================================
+from settings_store import (
+    CURTAIN_STYLE_LABELS,
+    DEFAULT_SETTINGS,
+    SettingsStore,
+    VALID_CURTAIN_STYLES,
+)
+
+# ─────────────────────────────────────────────────────────────
 # Overlay integration (robust, guarded)
-# ===================================================================================================================================================================================
+# ─────────────────────────────────────────────────────────────
 try:
     from Over_Nexus import install_over_nexus, Config as OverConfig
 except Exception:
     install_over_nexus = None  # type: ignore
     OverConfig = None          # type: ignore
 
-# ===================================================================================================================================================================================
+# ─────────────────────────────────────────────────────────────
 # Qt
-# ===================================================================================================================================================================================
+# ─────────────────────────────────────────────────────────────
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl, QEvent, QSize, QPoint
 from PySide6.QtGui import QColor, QPixmap, QIcon, QMouseEvent, QMovie, QFont
@@ -58,9 +65,9 @@ except Exception:
     def install_click_fx(_):  # type: ignore
         pass
 
-# ===================================================================================================================================================================================
+# ─────────────────────────────────────────────────────────────
 # Relative asset hints & sizing
-# ===================================================================================================================================================================================
+# ─────────────────────────────────────────────────────────────
 
 REL_RETICLE_ICON = "gallery/app/icons/reticle.png"   # optional (title bar icon)
 REL_HELP_GIF     = "gallery/app/icons/Help.gif"      # idle (plays constantly)
@@ -68,7 +75,7 @@ REL_HELP_HOVER   = "gallery/app/icons/HHelp.gif"     # hover variant (plays on h
 REL_HELP_PNG     = "gallery/app/icons/Help.png"      # final static fallback
 
 WIN_W, WIN_H = 1400, 900
-_PREVIEW_AR = 169 / 253  # preview frame aspect (matches your 169├ù253 scaling)
+_PREVIEW_AR = 169 / 253  # preview frame aspect (matches your 169×253 scaling)
 
 # Help icon display size
 HELP_ICON_PX = 125
@@ -79,9 +86,9 @@ HELP_ICON_HALF = HELP_ICON_PX // 2
 COMMAND_FADE_MS = 440
 
 
-# =============================================================================================
+# ─────────────────────────────────────────────────────────────
 # Event filter for message double-click on QWebEngineView
-# ===================================================================================================================================================================================
+# ─────────────────────────────────────────────────────────────
 class _DoubleClickFilter(QtCore.QObject):
     def __init__(self, nexus: "Nexus"):
         super().__init__(nexus)
@@ -95,9 +102,9 @@ class _DoubleClickFilter(QtCore.QObject):
         return False
 
 
-# ===================================================================================================================================================================================
-# Custom Title Bar (frameless) ΓÇö Target button opens target.py
-# ===================================================================================================================================================================================
+# ─────────────────────────────────────────────────────────────
+# Custom Title Bar (frameless) — Target button opens target.py
+# ─────────────────────────────────────────────────────────────
 class TitleBar(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -113,6 +120,47 @@ class TitleBar(QtWidgets.QWidget):
         layout.addWidget(title)
         layout.addStretch()
 
+        self.settings_button = QtWidgets.QToolButton(self)
+        self.settings_button.setText("Settings")
+        self.settings_button.setToolTip("Application settings")
+        self.settings_button.setCursor(Qt.PointingHandCursor)
+        self.settings_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.settings_button.setFixedHeight(30)
+        self.settings_button.setStyleSheet(
+            "QToolButton{color:#d7f8ff;background:transparent;"
+            "border:1px solid transparent;border-radius:5px;padding:4px 9px;}"
+            "QToolButton:hover,QToolButton::menu-button:hover{"
+            "background:rgba(0,255,255,0.12);border-color:#2f6672;}"
+            "QToolButton::menu-indicator{image:none;}"
+        )
+        self.settings_menu = QtWidgets.QMenu(self.settings_button)
+        self.settings_menu.setStyleSheet(
+            "QMenu{background:#101820;color:#dff9ff;"
+            "border:1px solid #31515f;padding:5px;}"
+            "QMenu::item{padding:7px 26px 7px 10px;border-radius:4px;}"
+            "QMenu::item:selected{background:#18323d;color:#fff;}"
+            "QMenu::indicator:checked{background:#00b8d4;"
+            "border:1px solid #8cf3ff;}"
+        )
+        self.curtain_menu = self.settings_menu.addMenu("Curtains")
+        self._curtain_actions: dict[str, QtGui.QAction] = {}
+        self._curtain_group = QtGui.QActionGroup(self)
+        self._curtain_group.setExclusive(True)
+        for style, label in CURTAIN_STYLE_LABELS.items():
+            action = self.curtain_menu.addAction(label)
+            action.setCheckable(True)
+            action.setData(style)
+            self._curtain_group.addAction(action)
+            action.triggered.connect(
+                lambda _checked=False, value=style: self._set_curtain_style(
+                    value
+                )
+            )
+            self._curtain_actions[style] = action
+        self.settings_menu.aboutToShow.connect(self._sync_curtain_menu)
+        self.settings_button.setMenu(self.settings_menu)
+        layout.addWidget(self.settings_button)
+
         # Target (reticle) button
         btn_target = QtWidgets.QPushButton()
         btn_target.setFixedSize(32, 32)
@@ -122,7 +170,7 @@ class TitleBar(QtWidgets.QWidget):
             btn_target.setIcon(QIcon(ico))
             btn_target.setIconSize(QSize(24, 24))
         else:
-            btn_target.setText("∩╝ï")
+            btn_target.setText("＋")
         btn_target.setStyleSheet(
             "QPushButton{background:transparent; border:none; padding:0;}"
             "QPushButton:hover{background:rgba(0,0,0,0.0);}"
@@ -131,7 +179,7 @@ class TitleBar(QtWidgets.QWidget):
         layout.addWidget(btn_target)
 
         # Minimize
-        btn_min = QtWidgets.QPushButton("ΓÇô")
+        btn_min = QtWidgets.QPushButton("–")
         btn_min.setFixedSize(32, 32)
         btn_min.setStyleSheet(
             "QPushButton{color:#ccc; background:transparent; border:none; padding:0;}"
@@ -141,7 +189,7 @@ class TitleBar(QtWidgets.QWidget):
         layout.addWidget(btn_min)
 
         # Max/Restore
-        self.btn_max = QtWidgets.QPushButton("Γûí")
+        self.btn_max = QtWidgets.QPushButton("□")
         self.btn_max.setFixedSize(32, 32)
         self.btn_max.setStyleSheet(
             "QPushButton{color:#ccc; background:transparent; border:none; padding:0;}"
@@ -151,7 +199,7 @@ class TitleBar(QtWidgets.QWidget):
         layout.addWidget(self.btn_max)
 
         # Close
-        btn_close = QtWidgets.QPushButton("Γ£ò")
+        btn_close = QtWidgets.QPushButton("✕")
         btn_close.setFixedSize(32, 32)
         btn_close.setStyleSheet(
             "QPushButton{color:#ccc; background:transparent; border:none; padding:0;}"
@@ -161,6 +209,34 @@ class TitleBar(QtWidgets.QWidget):
         layout.addWidget(btn_close)
 
         self._drag_start = QtCore.QPoint()
+
+    def _sync_curtain_menu(self) -> None:
+        current = str(
+            SettingsStore(self.parent.project_root).get(
+                "curtain_style",
+                DEFAULT_SETTINGS["curtain_style"],
+            )
+        )
+        for style, action in self._curtain_actions.items():
+            action.setChecked(style == current)
+
+    def _set_curtain_style(self, style: str) -> None:
+        if style not in VALID_CURTAIN_STYLES:
+            style = str(DEFAULT_SETTINGS["curtain_style"])
+        SettingsStore(self.parent.project_root).update_fields(
+            curtain_style=style
+        )
+        self._sync_curtain_menu()
+        self.parent.status(
+            f"Curtain style set to {CURTAIN_STYLE_LABELS[style]}."
+        )
+        forge = getattr(self.parent, "forge_tab", None)
+        if forge is not None:
+            schedule = getattr(forge, "schedule_refresh", None)
+            if callable(schedule):
+                schedule()
+            if forge.isVisible():
+                forge.ensure_preview_current()
 
     def _toggle_max_restore(self):
         if self.parent.isMaximized():
@@ -179,9 +255,9 @@ class TitleBar(QtWidgets.QWidget):
             self._drag_start = event.globalPosition().toPoint()
 
 
-# ===================================================================================================================================================================================
+# ─────────────────────────────────────────────────────────────
 # Small hover-help popover (top-level tooltip window)
-# ===================================================================================================================================================================================
+# ─────────────────────────────────────────────────────────────
 class HelpPopover(QFrame):
     def __init__(self, parent: QtWidgets.QWidget):
         super().__init__(parent)
@@ -293,17 +369,21 @@ class HelpPopover(QFrame):
         self.setVisible(False)
 
 
-# ===================================================================================================================================================================================
+# ─────────────────────────────────────────────────────────────
 # Nexus Main Window
-# ===================================================================================================================================================================================
+# ─────────────────────────────────────────────────────────────
 class Nexus(QtWidgets.QMainWindow):
     def __init__(self, project_root: str | Path):
         super().__init__()
         self.project_root = str(project_root)
         self._forge_fullscreen_active = False
-        self._forge_fullscreen_was_maximized = False
-        self._forge_fullscreen_geometry: Optional[QtCore.QByteArray] = None
+        self._forge_fullscreen_previous_state = "normal"
+        self._forge_fullscreen_geometry: Optional[QtCore.QRect] = None
         self._forge_fullscreen_visibility: dict[QtWidgets.QWidget, bool] = {}
+        self._shutdown_in_progress = False
+        self._shutdown_complete = False
+        self._active_tab_index = -1
+        self._tab_sync_in_progress = False
         self.setObjectName("NexusWindow")
 
         # Frameless + QSS
@@ -469,7 +549,18 @@ class Nexus(QtWidgets.QMainWindow):
         self.html_preview.page().fullScreenRequested.connect(
             self._on_web_fullscreen_requested
         )
-        self.html_preview.installEventFilter(self)
+        self.html_preview.loadFinished.connect(
+            self._on_forge_preview_loaded
+        )
+        self._forge_fullscreen_escape = QtGui.QShortcut(
+            QtGui.QKeySequence(Qt.Key_Escape),
+            self,
+        )
+        self._forge_fullscreen_escape.setContext(Qt.ApplicationShortcut)
+        self._forge_fullscreen_escape.setEnabled(False)
+        self._forge_fullscreen_escape.activated.connect(
+            self._request_forge_fullscreen_exit
+        )
         self.preview_stack.addWidget(self.html_preview)
 
         pf_layout.addWidget(self.preview_stack)
@@ -483,10 +574,10 @@ class Nexus(QtWidgets.QMainWindow):
         )
         body_layout.addWidget(self.preview_caption, alignment=Qt.AlignHCenter)
 
-        # =============================================================================================
-        # Help (top-right above the feature panel) ΓÇö dual-GIF swap
+        # ─────────────────────────────────────────────────────────
+        # Help (top-right above the feature panel) — dual-GIF swap
         # Idle = Help.gif (plays constantly), Hover = HHelp.gif
-        # =============================================================================================
+        # ─────────────────────────────────────────────────────────
         help_row = QHBoxLayout()
         help_row.setContentsMargins(0, 0, 0, 0)
         help_row.setSpacing(0)
@@ -507,7 +598,7 @@ class Nexus(QtWidgets.QMainWindow):
             }
         """)
         self.help_icon.setCursor(Qt.WhatsThisCursor)
-        self.help_icon.setAccessibleName("Help ΓÇö instructions for this tab")
+        self.help_icon.setAccessibleName("Help — instructions for this tab")
         self.help_icon.setToolTip("Help")
         self.help_icon.setFixedSize(HELP_ICON_PX, HELP_ICON_PX)
         self.help_icon.setMouseTracking(True)
@@ -534,7 +625,7 @@ class Nexus(QtWidgets.QMainWindow):
         self._help_movie_idle  = _load_movie(_abs(REL_HELP_GIF))
         self._help_movie_hover = _load_movie(_abs(REL_HELP_HOVER))
 
-        # Initial visual: prefer idle movie ΓåÆ hover movie ΓåÆ PNG fallback ΓåÆ text
+        # Initial visual: prefer idle movie → hover movie → PNG fallback → text
         if self._help_movie_idle:
             self.help_icon.setMovie(self._help_movie_idle)
         elif self._help_movie_hover:
@@ -554,12 +645,12 @@ class Nexus(QtWidgets.QMainWindow):
         # Show/hide timers for hover UX
         self._help_show_timer = QtCore.QTimer(self)
         self._help_show_timer.setSingleShot(True)
-        self._help_show_timer.setInterval(150)  # 120ΓÇô160 ms
+        self._help_show_timer.setInterval(150)  # 120–160 ms
         self._help_show_timer.timeout.connect(self._show_help_from_icon)
 
         self._help_hide_timer = QtCore.QTimer(self)
         self._help_hide_timer.setSingleShot(True)
-        self._help_hide_timer.setInterval(360)  # 300ΓÇô400 ms
+        self._help_hide_timer.setInterval(360)  # 300–400 ms
         self._help_hide_timer.timeout.connect(self._hide_help_popover)
 
         # Install event filters to manage hover persistence and GIF swap
@@ -632,6 +723,9 @@ class Nexus(QtWidgets.QMainWindow):
             self._route_forge_correction
         )
         self.forge_tab.preview_requested.connect(self._load_forge_preview)
+        self.forge_tab.preview_files_release_requested.connect(
+            self._release_forge_preview_files
+        )
         self.forge_tab.preview_visibility_changed.connect(
             self._set_forge_preview_visible
         )
@@ -649,8 +743,17 @@ class Nexus(QtWidgets.QMainWindow):
             lambda _pixmap: self.forge_tab.schedule_refresh()
         )
         self.image_tab.clear_preview.connect(self.forge_tab.schedule_refresh)
+        self.image_tab.images_changed.connect(
+            lambda _reason: self.forge_tab.schedule_refresh()
+        )
         self.sound_tab.project_sound.changed.connect(
             self.forge_tab.schedule_refresh
+        )
+        self.sound_tab.volume_changed.connect(
+            self._on_sound_volume_changed
+        )
+        self.sound_tab.sound_state_changed.connect(
+            self._on_sound_state_changed
         )
         self.message_tab.project_changed.connect(
             self.forge_tab.schedule_refresh
@@ -677,7 +780,7 @@ class Nexus(QtWidgets.QMainWindow):
         self._fade_timer: Optional[QtCore.QTimer] = None
         self._fade_anim: Optional[QtCore.QPropertyAnimation] = None
 
-        # Overlay installer ΓÇö disables the Over_Nexus Prompt Writer launcher.
+        # Overlay installer — disables the Over_Nexus Prompt Writer launcher.
         # The visible Prompt Writer FAB is owned by Image_tab.py.
         self._over = None
         if callable(install_over_nexus) and OverConfig is not None:
@@ -787,18 +890,18 @@ class Nexus(QtWidgets.QMainWindow):
         content.setAutoFillBackground(False)
         return surface
 
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     # Diagnostics: show key state once live
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     def _post_init_diagnostics(self) -> None:
         over = getattr(self, "_over", None)
         panel = getattr(over, "panel", None) if over is not None else None
         print(f"[Boot] Nexus visible={self.isVisible()} minimized={self.isMinimized()} "
               f"over_panel={'yes' if panel else 'no'}")
 
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     # Shortcuts
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     def _install_shortcuts(self) -> None:
         # Ctrl+Alt+P opens prompt writer (no button)
         sc = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Alt+P"), self)
@@ -808,9 +911,9 @@ class Nexus(QtWidgets.QMainWindow):
         sc2 = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+H"), self)
         sc2.activated.connect(lambda: (self._show_help_from_icon() if not self.help_pop.isVisible() else self._hide_help_popover()))
 
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     # Status / Toast utilities
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     def status(self, msg: str) -> None:
         try:
             self._status.showMessage(msg, 5000)
@@ -833,9 +936,9 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     # Sound preview mounting (widget-based visualizer)
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     def _mount_sound_preview(self, widget: QtWidgets.QWidget) -> None:
         if not isinstance(widget, QtWidgets.QWidget):
             return
@@ -900,9 +1003,9 @@ class Nexus(QtWidgets.QMainWindow):
         else:
             QtCore.QTimer.singleShot(0, lambda: focus(target))
 
-    # =============================================================================================
-    # Message double-click ΓåÆ full dialog preview
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
+    # Message double-click → full dialog preview
+    # ─────────────────────────────────────────────────────────
     def _on_message_double_click(self):
         try:
             dlg = QDialog(self)
@@ -924,26 +1027,184 @@ class Nexus(QtWidgets.QMainWindow):
             self.status("Message preview opened.")
             dlg.exec()
         except Exception as ex:
-            self.status(f"Γ¥î Message preview failed: {ex}")
+            self.status(f"❌ Message preview failed: {ex}")
 
-    # =============================================================================================
-    # Tabs ΓÇö show correct preview per tab + update help visibility/content
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
+    # Tabs — show correct preview per tab + update help visibility/content
+    # ─────────────────────────────────────────────────────────
+    def _tab_owner(self, idx: int):
+        return {
+            0: getattr(self, "image_tab", None),
+            1: getattr(self, "sound_tab", None),
+            2: getattr(self, "message_tab", None),
+            3: getattr(self, "forge_tab", None),
+        }.get(idx)
+
+    @staticmethod
+    def _call_lifecycle(owner, method_name: str) -> bool:
+        callback = getattr(owner, method_name, None)
+        if not callable(callback):
+            return False
+        callback()
+        return True
+
+    def _sync_tab_departure(self, old_idx: int, new_idx: int) -> None:
+        if old_idx < 0 or old_idx == new_idx:
+            return
+        owner = self._tab_owner(old_idx)
+        try:
+            if not self._call_lifecycle(owner, "deactivate_for_tab_change"):
+                self._call_lifecycle(owner, "sync_to_disk")
+        except Exception as error:
+            self.status(f"Could not finish {self.tabbar.tabText(old_idx)} synchronization: {error}")
+
+
+    def _sync_tab_arrival(self, new_idx: int, old_idx: int) -> None:
+        if new_idx < 0:
+            return
+        owner = self._tab_owner(new_idx)
+        try:
+            if not self._call_lifecycle(owner, "activate_for_tab_change"):
+                self._call_lifecycle(owner, "sync_from_disk")
+        except Exception as error:
+            self.status(f"Could not refresh {self.tabbar.tabText(new_idx)}: {error}")
+
+        if new_idx == 3:
+            self.sync_all_project_state()
+            self._apply_sound_volume_to_forge_preview()
+
+    def sync_all_project_state(self, *, force: bool = False) -> bool:
+        """Refresh every content owner and invalidate Forge only when needed."""
+        if self._tab_sync_in_progress:
+            return False
+        self._tab_sync_in_progress = True
+        changed = False
+        try:
+            for owner, method_name in (
+                (self.image_tab, "sync_from_disk"),
+                (self.message_tab, "sync_from_disk"),
+                (self.sound_tab, "sync_from_disk"),
+            ):
+                callback = getattr(owner, method_name, None)
+                if not callable(callback):
+                    callback = getattr(owner, "refresh_from_disk", None)
+                if not callable(callback):
+                    continue
+                try:
+                    result = callback(force=force)
+                except TypeError:
+                    result = callback()
+                changed = bool(result) or changed
+
+            forge_sync = getattr(self.forge_tab, "sync_all_from_disk", None)
+            if callable(forge_sync):
+                try:
+                    changed = bool(forge_sync(force=force, notify_host=False)) or changed
+                except TypeError:
+                    changed = bool(forge_sync(force=force)) or changed
+
+            if changed or force:
+                self.forge_tab.schedule_refresh()
+            self._apply_sound_volume_to_forge_preview()
+            return changed
+        finally:
+            self._tab_sync_in_progress = False
+
+    def refresh_all_project_state(self) -> bool:
+        return self.sync_all_project_state(force=True)
+
+    def refresh_forge_preview(self) -> None:
+        self.forge_tab.schedule_refresh()
+        if self.tabbar.currentIndex() == 3:
+            QtCore.QTimer.singleShot(0, self._show_forge_preview)
+
+    def restart_forge_preview(self, reason: str = "manual") -> None:
+        """Stop playback and reload the current letter at the curtain screen."""
+        if self._forge_fullscreen_active:
+            self._restore_forge_preview_from_fullscreen()
+        try:
+            self.html_preview.page().runJavaScript(
+                "document.querySelectorAll('audio,video').forEach(media => {"
+                "try { media.pause(); media.currentTime = 0; } catch (_) {}"
+                "});"
+            )
+        except RuntimeError:
+            pass
+
+        index = self.forge_tab.current_play_index()
+        if index is None or not Path(index).is_file():
+            return
+        mode = getattr(self.forge_tab, "preview_mode_value", "portrait")
+        self.html_preview.stop()
+        self.html_preview.setUrl(QUrl("about:blank"))
+        QtCore.QTimer.singleShot(
+            0,
+            lambda path=str(index), preview_mode=mode: self._load_forge_preview(path, preview_mode),
+        )
+        self.status(f"Forge preview restarted from the beginning ({reason}).")
+
+    def reset_forge_preview(self) -> None:
+        self.restart_forge_preview("reset")
+
+    def restart_preview(self) -> None:
+        self.restart_forge_preview("request")
+
+    def _sound_volume_state(self) -> tuple[int, bool]:
+        try:
+            volume = int(self.sound_tab.volume.value())
+        except Exception:
+            volume = 50
+        try:
+            muted = bool(self.sound_tab.player.is_muted())
+        except Exception:
+            muted = False
+        return max(0, min(100, volume)), muted
+
+    def _apply_sound_volume_to_forge_preview(self) -> None:
+        volume, muted = self._sound_volume_state()
+        script = (
+            "(() => {"
+            f"const value={volume}; const muted={str(muted).lower()};"
+            "document.querySelectorAll('audio,video').forEach(media => {"
+            "try { media.volume=value/100; media.muted=muted || value===0; } catch (_) {}"
+            "});"
+            "const slider=document.getElementById('volume-slider');"
+            "if(slider) slider.value=String(value);"
+            "const icon=document.getElementById('volume-icon-img');"
+            "if(icon) icon.src=(muted||value===0)?'gallery/controls/voloff.png':'gallery/controls/volon.png';"
+            "})();"
+        )
+        try:
+            self.html_preview.page().runJavaScript(script)
+        except RuntimeError:
+            pass
+
+    def _on_sound_volume_changed(self, _value: int) -> None:
+        self.forge_tab.schedule_refresh()
+        self._apply_sound_volume_to_forge_preview()
+
+    def _on_sound_state_changed(self, _reason: str) -> None:
+        self.forge_tab.schedule_refresh()
+        self._apply_sound_volume_to_forge_preview()
+
+    def _on_forge_preview_loaded(self, ok: bool) -> None:
+        if ok and self.tabbar.currentIndex() == 3:
+            self._apply_sound_volume_to_forge_preview()
+
     def _tab_changed(self, idx: int) -> None:
-        """
-        Route the requested tab transition.
-
-        Ordinary tabs keep the shared slide animation. Any transition entering
-        or leaving Command bypasses TabSwitcher and uses a fixed body-snapshot
-        fade so no page, preview, or help movement leaks through.
-        """
+        """Synchronize the departing and arriving owners around one transition."""
         if idx < 0 or idx >= self.page_stack.count():
             return
 
-        # A new request supersedes an in-progress Command fade. Its target page
-        # was already committed underneath the snapshots.
         self._cancel_command_fade()
-        old_idx = self.page_stack.currentIndex()
+        old_idx = self._active_tab_index
+        if old_idx < 0:
+            old_idx = self.page_stack.currentIndex()
+
+        if old_idx != idx:
+            self._sync_tab_departure(old_idx, idx)
+        self._sync_tab_arrival(idx, old_idx)
+        self._active_tab_index = idx
 
         if old_idx != idx and (old_idx == 4 or idx == 4):
             self._run_command_transition(idx)
@@ -954,10 +1215,6 @@ class Nexus(QtWidgets.QMainWindow):
     def _apply_tab_state(self, idx: int, *, animate_page: bool) -> None:
         """Apply the complete settled UI state for one tab."""
         if idx != 1:
-            try:
-                self.sound_tab.deactivate_for_tab_change()
-            except Exception:
-                pass
             self._detach_sound_preview()
 
         self._last_pixmap = None
@@ -983,12 +1240,11 @@ class Nexus(QtWidgets.QMainWindow):
             self.preview_stack.setCurrentIndex(0)
         elif idx == 1:
             try:
-                self.sound_tab.activate_for_tab_change()
                 self._mount_sound_preview(
                     self.sound_tab.shared_preview_widget()
                 )
             except Exception as ex:
-                self.status(f"ΓÜá∩╕Å Sound preview unavailable: {ex}")
+                self.status(f"⚠️ Sound preview unavailable: {ex}")
             if self._sound_preview_index is not None:
                 self.preview_stack.setCurrentIndex(self._sound_preview_index)
             else:
@@ -997,6 +1253,7 @@ class Nexus(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(0, self._request_message_preview)
         elif idx == 3:
             QtCore.QTimer.singleShot(0, self._show_forge_preview)
+            QtCore.QTimer.singleShot(80, self._apply_sound_volume_to_forge_preview)
         else:
             self.preview_stack.setCurrentIndex(0)
 
@@ -1187,9 +1444,9 @@ class Nexus(QtWidgets.QMainWindow):
                 pass
         self._clear_command_fade_objects()
 
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     # Preview rendering (image/html) + fade behavior
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     def _show_image(self, pixmap: QPixmap):
         if not isinstance(pixmap, QPixmap) or pixmap.isNull():
             return
@@ -1271,19 +1528,59 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _show_forge_preview(self) -> None:
         """Show the actual generated viewer, never a static Forge stand-in."""
-        index = self.forge_tab.current_play_index()
+
+        refresh_pending = bool(
+            getattr(
+                self.forge_tab,
+                "preview_refresh_pending",
+                False,
+            )
+        )
+
+        if not refresh_pending:
+            ensure_current = getattr(
+                self.forge_tab,
+                "ensure_preview_current",
+                None,
+            )
+
+            if callable(ensure_current):
+                ensure_current()
+
+        current_play_index = getattr(
+            self.forge_tab,
+            "current_play_index",
+            None,
+        )
+
+        index = (
+            current_play_index()
+            if callable(current_play_index)
+            else None
+        )
+
         if index is not None:
+            preview_mode = getattr(
+                self.forge_tab,
+                "preview_mode_value",
+                "portrait",
+            )
+
             self._load_forge_preview(
                 str(index),
-                self.forge_tab.preview_mode_value,
+                preview_mode,
             )
+
             return
+
         self._last_pixmap = None
         self._clear_preview()
         self.preview_stack.setCurrentIndex(0)
+
         self.preview_caption.setText(
             "Select Preview Letter to build the interactive viewer."
         )
+
         self.preview_caption.setVisible(True)
 
     def _load_forge_preview(self, index_path: str, mode: str) -> None:
@@ -1340,8 +1637,22 @@ class Nexus(QtWidgets.QMainWindow):
             f"{self._forge_preview_mode.replace('-', ' ')}"
         )
 
+    def _release_forge_preview_files(self) -> None:
+        """Release local viewer handles before transactional replacement."""
+        if self._forge_fullscreen_active:
+            self._restore_forge_preview_from_fullscreen()
+        self.html_preview.page().runJavaScript(
+            "document.querySelectorAll('audio,video').forEach("
+            "media => { try { media.pause(); } catch (_) {} });"
+        )
+        self.html_preview.stop()
+        self.html_preview.setUrl(QUrl("about:blank"))
+        self.preview_stack.setCurrentIndex(0)
+        self.preview_caption.setText("Preparing local letter…")
+        self.preview_caption.setVisible(True)
+
     def _set_forge_preview_visible(self, visible: bool) -> None:
-        if visible:
+        if visible or self._forge_fullscreen_active:
             return
         self.html_preview.page().runJavaScript(
             "document.querySelectorAll('audio,video').forEach("
@@ -1358,10 +1669,30 @@ class Nexus(QtWidgets.QMainWindow):
             return
         self._restore_forge_preview_from_fullscreen()
 
+    def _request_forge_fullscreen_exit(self) -> None:
+        if not self._forge_fullscreen_active:
+            return
+        try:
+            self.html_preview.page().runJavaScript(
+                "if (document.fullscreenElement) document.exitFullscreen();"
+            )
+        except RuntimeError:
+            pass
+        self._restore_forge_preview_from_fullscreen()
+
     def _enter_forge_fullscreen(self) -> None:
         self._forge_fullscreen_active = True
-        self._forge_fullscreen_was_maximized = self.isMaximized()
-        self._forge_fullscreen_geometry = self.saveGeometry()
+        if self.isMinimized():
+            self._forge_fullscreen_previous_state = "minimized"
+        elif self.isMaximized():
+            self._forge_fullscreen_previous_state = "maximized"
+        else:
+            self._forge_fullscreen_previous_state = "normal"
+        geometry = self.normalGeometry()
+        if not geometry.isValid() or geometry.isEmpty():
+            geometry = self.geometry()
+        self._forge_fullscreen_geometry = QtCore.QRect(geometry)
+        self._forge_fullscreen_escape.setEnabled(True)
         chrome = (
             self.title_bar,
             self.tabbar,
@@ -1417,22 +1748,24 @@ class Nexus(QtWidgets.QMainWindow):
             body_layout.setContentsMargins(12, 12, 12, 12)
             body_layout.setSpacing(10)
 
-        if self._forge_fullscreen_was_maximized:
+        previous_state = self._forge_fullscreen_previous_state
+        previous_geometry = self._forge_fullscreen_geometry
+        self.showNormal()
+        if previous_geometry is not None and previous_geometry.isValid():
+            self.setGeometry(previous_geometry)
+        if previous_state == "maximized":
             self.showMaximized()
-        else:
-            self.showNormal()
-            if self._forge_fullscreen_geometry is not None:
-                self.restoreGeometry(self._forge_fullscreen_geometry)
+        elif previous_state == "minimized":
+            self.showMinimized()
 
         for widget, was_visible in self._forge_fullscreen_visibility.items():
             widget.setVisible(was_visible)
         self._forge_fullscreen_visibility.clear()
+        self._forge_fullscreen_previous_state = "normal"
         self._forge_fullscreen_geometry = None
+        self._forge_fullscreen_escape.setEnabled(False)
+        self.preview_stack.setCurrentWidget(self.html_preview)
         QtCore.QTimer.singleShot(0, self._update_preview_geometry)
-        QtCore.QTimer.singleShot(
-            0,
-            lambda: self.preview_stack.setCurrentWidget(self.html_preview),
-        )
         self.html_preview.setFocus()
 
     def _read_project_title(self) -> str:
@@ -1448,9 +1781,9 @@ class Nexus(QtWidgets.QMainWindow):
             pass
         return ""
 
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     # Resize/Move: keep preview aspect; keep popover aligned
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     def _update_preview_geometry(self) -> None:
         """Keep Sound usable in normal windows without changing full-screen layout."""
         if self._forge_fullscreen_active:
@@ -1539,21 +1872,71 @@ class Nexus(QtWidgets.QMainWindow):
         super().moveEvent(event)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        if not self.forge_tab.shutdown_operations():
+        if not self.shutdown():
             self.status("Finish the current Forge operation before closing.")
             event.ignore()
             return
-        self._set_forge_preview_visible(False)
         super().closeEvent(event)
 
-    # =============================================================================================
+    def shutdown(self) -> bool:
+        """Stop native and background resources once before application exit."""
+        if self._shutdown_complete:
+            return True
+        if self._shutdown_in_progress:
+            return False
+        self._shutdown_in_progress = True
+        try:
+            forge = getattr(self, "forge_tab", None)
+            stop_forge = getattr(forge, "shutdown_operations", None)
+            if callable(stop_forge) and not stop_forge():
+                return False
+
+            escape = getattr(self, "_forge_fullscreen_escape", None)
+            if escape is not None:
+                escape.setEnabled(False)
+            self._forge_fullscreen_active = False
+
+            web_view = getattr(self, "html_preview", None)
+            if web_view is not None:
+                try:
+                    web_view.page().setAudioMuted(True)
+                    web_view.stop()
+                except RuntimeError:
+                    pass
+
+            owners = (
+                getattr(self, "sound_tab", None),
+                getattr(self, "message_tab", None),
+                getattr(self, "image_tab", None),
+                getattr(self, "command_tab", None),
+                getattr(self, "_prompt_writer_win", None),
+                getattr(self, "_over", None),
+            )
+            for owner in owners:
+                stop = getattr(owner, "shutdown", None)
+                if not callable(stop):
+                    continue
+                try:
+                    stop()
+                except Exception as error:
+                    print(
+                        f"[Shutdown] {type(owner).__name__} cleanup failed: "
+                        f"{error}"
+                    )
+
+            self._shutdown_complete = True
+            return True
+        finally:
+            self._shutdown_in_progress = False
+
+    # ─────────────────────────────────────────────────────────
     # Target Browser (title-bar button)
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     def open_target_browser(self):
         try:
             script = os.path.join(self.project_root, "target.py")
             if not os.path.exists(script):
-                self.status("Γ¥î target.py not found")
+                self.status("❌ target.py not found")
                 self.toast("target.py missing")
                 return
             pos = QtGui.QCursor.pos()
@@ -1564,12 +1947,12 @@ class Nexus(QtWidgets.QMainWindow):
             self.status("Target Browser opened.")
             self.toast("Target Browser launched")
         except Exception as ex:
-            self.status(f"Γ¥î Could not open Target Browser: {ex}")
+            self.status(f"❌ Could not open Target Browser: {ex}")
             self.toast("Target launch failed")
 
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     # Prompt Writer opener (used by Image_tab FAB and Ctrl+Alt+P shortcut)
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     def open_prompt_writer(self):
         """
         Open Prompt Writer inline as an overlay panel (if available).
@@ -1645,12 +2028,12 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception as ex:
             print(f"[PromptWriter] Prompter launch failed: {ex}")
 
-        self.status("Γ¥î Prompt Writer could not be opened.")
+        self.status("❌ Prompt Writer could not be opened.")
         self.toast("Prompt Writer unavailable")
 
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     # Help icon support
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     def _set_help_fallback_icon(self, png_path: str):
         if os.path.exists(png_path):
             pm = QPixmap(png_path)
@@ -1674,26 +2057,26 @@ class Nexus(QtWidgets.QMainWindow):
     def _refresh_help_text(self, idx: int):
         # Header (per tab)
         if idx == 0:
-            header = "<b>Γ£¿The Image tabΓ£¿</b>"
+            header = "<b>✨The Image tab✨</b>"
             body = ("Here you choose the three pictures that make up your letter. "
                     "The cover is the front image, the letter is the main picture inside, and the back is the closing image at the end. "
                     "Each time you select one, it appears in the preview so you can see exactly how it will look in the final letter.")
         elif idx == 1:
-            header = "<b>Γ£¿The Sound tabΓ£¿</b>"
+            header = "<b>✨The Sound tab✨</b>"
             body = ("This tab lets you add background music to your letter. "
                     "Pick an MP3 file, and it will play while someone reads. "
-                    "If you donΓÇÖt want music, you can leave it empty and the letter will stay silent.")
+                    "If you don’t want music, you can leave it empty and the letter will stay silent.")
         elif idx == 2:
-            header = "<b>Γ£¿The Message tabΓ£¿</b>"
-            body = ("Here is where you load your words. Click Load Message File and select your note ΓÇö "
+            header = "<b>✨The Message tab✨</b>"
+            body = ("Here is where you load your words. Click Load Message File and select your note — "
                     "it can be a text file, a Word document, or a PDF. "
                     "The program will bring in up to a thousand words and display them in the preview so you can review the message before finishing.")
         elif idx == 3:
-            header = "<b>Γ£¿The Forge tabΓ£¿</b>"
+            header = "<b>✨The Forge tab✨</b>"
             body = (
                 "Check readiness, load a saved letter, and select Preview Letter "
                 "to test the complete interactive viewer. Publish Letter creates "
-                "the hosted result, and Open Published Letter opens its saved link."
+                "the hosted result, and Open Letter opens the published link or the current local build."
             )
         else:
             header, body = "", ""
@@ -1704,12 +2087,12 @@ class Nexus(QtWidgets.QMainWindow):
     def _reposition_help_popover(self):
         # Place adjacent to the help icon; flip to left if near right edge
         global_center = self.help_icon.mapToGlobal(self.help_icon.rect().center())
-        prefer_left = True  # prefer left so it doesnΓÇÖt collide with right edge
+        prefer_left = True  # prefer left so it doesn’t collide with right edge
         self.help_pop.popup_at(global_center, prefer_left, self.body, icon_px=HELP_ICON_PX)
 
     def _show_help_from_icon(self):
         idx = self.tabbar.currentIndex()
-        if idx == 4:  # Command ΓÇö hide help
+        if idx == 4:  # Command — hide help
             return
         self._refresh_help_text(idx)
         self._reposition_help_popover()
@@ -1717,26 +2100,13 @@ class Nexus(QtWidgets.QMainWindow):
     def _hide_help_popover(self):
         self.help_pop.popdown()
 
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     # Global event filter for help hover (robust)
-    # =============================================================================================
+    # ─────────────────────────────────────────────────────────
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
         # Safe object lookups (avoid AttributeError if Qt routes to a different QObject)
         icon = getattr(self, "help_icon", None)
         pop  = getattr(self, "help_pop", None)
-        web_view = getattr(self, "html_preview", None)
-
-        if (
-            web_view is not None
-            and watched is web_view
-            and self._forge_fullscreen_active
-            and event.type() == QEvent.KeyPress
-            and isinstance(event, QtGui.QKeyEvent)
-            and event.key() == Qt.Key_Escape
-        ):
-            web_view.page().runJavaScript(
-                "if (document.fullscreenElement) document.exitFullscreen();"
-            )
 
         if icon is not None and watched is icon:
             t = event.type()

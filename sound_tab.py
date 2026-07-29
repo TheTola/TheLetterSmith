@@ -1,7 +1,7 @@
-# ===============================
+# =============================================================================================
 # File: sound_tab.py
 # Purpose: Single-track-first Sound tab with optional playlists and archive
-# ===============================
+# =============================================================================================
 
 from __future__ import annotations
 
@@ -431,9 +431,21 @@ class CleanSlider(
 
 class ArtworkButton(QtWidgets.QPushButton):
     """
-    QPushButton that uses a PNG as its visual body while retaining
-    normal button behavior, text, keyboard focus, tooltips, and signals.
+    PNG-backed button with direct controls for:
+    - visible button width
+    - visible button height
+    - text size
+    - artwork size
     """
+
+    # ==========================================================
+    # CHANGE THESE VALUES TO RESIZE THE BUTTONS
+    # ==========================================================
+
+    BUTTON_WIDTH = 150
+    BUTTON_HEIGHT = 50
+    TEXT_POINT_SIZE = 13
+    ARTWORK_ZOOM = 1.00
 
     def __init__(
         self,
@@ -441,94 +453,275 @@ class ArtworkButton(QtWidgets.QPushButton):
         artwork_path: str | Path,
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
-        super().__init__(text, parent)
-
-        self._artwork_path = Path(artwork_path)
-        self._artwork = QtGui.QPixmap(
-            str(self._artwork_path)
+        super().__init__(
+            text,
+            parent,
         )
 
-        font = self.font()
-        font.setBold(True)
-        font.setPointSize(11)
-        self.setFont(font)
+        self._artwork_path = Path(
+            artwork_path
+        )
 
-        self.setCursor(Qt.PointingHandCursor)
-        self.setMinimumSize(138, 52)
+        self._artwork = QtGui.QPixmap(
+            str(
+                self._artwork_path
+            )
+        )
+
+        if not self._artwork.isNull():
+            self._artwork = (
+                self._crop_transparent_edges(
+                    self._artwork
+                )
+            )
+
+        self._button_font = QtGui.QFont(
+            "Segoe UI",
+            self.TEXT_POINT_SIZE,
+        )
+
+        self._button_font.setBold(
+            True
+        )
+
+        self.setFont(
+            self._button_font
+        )
+
+        self.setCursor(
+            Qt.PointingHandCursor
+        )
+
+        self.setFixedSize(
+            self.BUTTON_WIDTH,
+            self.BUTTON_HEIGHT,
+        )
+
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Fixed,
             QtWidgets.QSizePolicy.Fixed,
         )
 
-        if not self._artwork.isNull():
-            self.setStyleSheet(
-                """
-                QPushButton {
-                    background: transparent;
-                    border: none;
-                    padding: 0;
-                    margin: 0;
-                    color: #f2fbff;
-                }
-                """
-            )
+        self.setStyleSheet(
+            """
+            QPushButton {
+                background: transparent;
+                border: none;
+                padding: 0px;
+                margin: 0px;
+                color: #f2fbff;
+            }
+            """
+        )
+
+    @staticmethod
+    def _crop_transparent_edges(
+        pixmap: QtGui.QPixmap,
+    ) -> QtGui.QPixmap:
+        """
+        Remove transparent space surrounding the PNG artwork.
+        """
+
+        image = pixmap.toImage().convertToFormat(
+            QtGui.QImage.Format_RGBA8888
+        )
+
+        width = image.width()
+        height = image.height()
+
+        if width <= 0 or height <= 0:
+            return pixmap
+
+        left = width
+        right = -1
+        top = height
+        bottom = -1
+
+        alpha_threshold = 10
+
+        for y in range(
+            height
+        ):
+            for x in range(
+                width
+            ):
+                alpha = image.pixelColor(
+                    x,
+                    y,
+                ).alpha()
+
+                if alpha <= alpha_threshold:
+                    continue
+
+                left = min(
+                    left,
+                    x,
+                )
+
+                right = max(
+                    right,
+                    x,
+                )
+
+                top = min(
+                    top,
+                    y,
+                )
+
+                bottom = max(
+                    bottom,
+                    y,
+                )
+
+        if (
+            right < left
+            or bottom < top
+        ):
+            return pixmap
+
+        crop_rect = QtCore.QRect(
+            left,
+            top,
+            right - left + 1,
+            bottom - top + 1,
+        )
+
+        cropped_image = image.copy(
+            crop_rect
+        )
+
+        return QtGui.QPixmap.fromImage(
+            cropped_image
+        )
+
+    def sizeHint(
+        self,
+    ) -> QtCore.QSize:
+        return QtCore.QSize(
+            self.BUTTON_WIDTH,
+            self.BUTTON_HEIGHT,
+        )
+
+    def minimumSizeHint(
+        self,
+    ) -> QtCore.QSize:
+        return self.sizeHint()
 
     def paintEvent(
         self,
         event: QtGui.QPaintEvent,
     ) -> None:
-        if self._artwork.isNull():
-            # Missing image: retain the normal styled text button.
-            super().paintEvent(event)
-            return
+        del event
 
-        painter = QtGui.QPainter(self)
+        painter = QtGui.QPainter(
+            self
+        )
+
         painter.setRenderHint(
             QtGui.QPainter.Antialiasing,
             True,
         )
+
         painter.setRenderHint(
             QtGui.QPainter.SmoothPixmapTransform,
             True,
         )
 
-        target = self.rect().adjusted(
-            1,
-            1,
-            -1,
-            -1,
+        button_rect = self.rect().adjusted(
+            0,
+            0,
+            0,
+            0,
         )
 
-        artwork = self._artwork.scaled(
-            target.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
+        if not self._artwork.isNull():
+            artwork_width = max(
+                1,
+                round(
+                    button_rect.width()
+                    * self.ARTWORK_ZOOM
+                ),
+            )
 
-        artwork_rect = QtCore.QRect(
-            target.center().x()
-            - artwork.width() // 2,
-            target.center().y()
-            - artwork.height() // 2,
-            artwork.width(),
-            artwork.height(),
-        )
+            artwork_height = max(
+                1,
+                round(
+                    button_rect.height()
+                    * self.ARTWORK_ZOOM
+                ),
+            )
 
-        if not self.isEnabled():
-            painter.setOpacity(0.42)
-        elif self.isDown():
-            painter.setOpacity(0.78)
+            artwork = self._artwork.scaled(
+                artwork_width,
+                artwork_height,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+
+            artwork_rect = QtCore.QRect(
+                button_rect.center().x()
+                - artwork.width() // 2,
+                button_rect.center().y()
+                - artwork.height() // 2,
+                artwork.width(),
+                artwork.height(),
+            )
+
+            painter.save()
+
+            painter.setClipRect(
+                button_rect
+            )
+
+            if not self.isEnabled():
+                painter.setOpacity(
+                    0.42
+                )
+
+            elif self.isDown():
+                painter.setOpacity(
+                    0.78
+                )
+
+            else:
+                painter.setOpacity(
+                    1.0
+                )
+
+            painter.drawPixmap(
+                artwork_rect,
+                artwork,
+            )
+
+            painter.restore()
+
         else:
-            painter.setOpacity(1.0)
+            painter.setPen(
+                QtGui.QPen(
+                    QtGui.QColor(
+                        "#38506b"
+                    ),
+                    1,
+                )
+            )
 
-        painter.drawPixmap(
-            artwork_rect,
-            artwork,
-        )
+            painter.setBrush(
+                QtGui.QColor(
+                    "#1c2430"
+                )
+            )
 
-        painter.setOpacity(1.0)
+            painter.drawRoundedRect(
+                button_rect,
+                9,
+                9,
+            )
 
         if self.isDown():
+            painter.setPen(
+                Qt.NoPen
+            )
+
             painter.setBrush(
                 QtGui.QColor(
                     0,
@@ -537,42 +730,53 @@ class ArtworkButton(QtWidgets.QPushButton):
                     55,
                 )
             )
-            painter.setPen(Qt.NoPen)
+
             painter.drawRoundedRect(
-                artwork_rect,
-                8,
-                8,
+                button_rect,
+                9,
+                9,
             )
 
         elif self.underMouse():
+            painter.setPen(
+                Qt.NoPen
+            )
+
             painter.setBrush(
                 QtGui.QColor(
                     0,
                     220,
                     255,
-                    24,
+                    28,
                 )
             )
-            painter.setPen(Qt.NoPen)
+
             painter.drawRoundedRect(
-                artwork_rect,
-                8,
-                8,
+                button_rect,
+                9,
+                9,
             )
 
-        text_rect = self.rect()
+        # Explicitly set the painted text font.
+        # Nexus cannot reduce this to its global 11px button font.
+        painter.setFont(
+            self._button_font
+        )
 
-        # Small shadow so the label stays readable over the artwork.
         painter.setPen(
             QtGui.QColor(
                 0,
                 0,
                 0,
-                190,
+                205,
             )
         )
+
         painter.drawText(
-            text_rect.translated(1, 2),
+            self.rect().translated(
+                1,
+                2,
+            ),
             Qt.AlignCenter,
             self.text(),
         )
@@ -583,6 +787,7 @@ class ArtworkButton(QtWidgets.QPushButton):
                 252,
                 255,
             )
+
         else:
             text_color = QtGui.QColor(
                 170,
@@ -590,15 +795,21 @@ class ArtworkButton(QtWidgets.QPushButton):
                 188,
             )
 
-        painter.setPen(text_color)
+        painter.setPen(
+            text_color
+        )
+
         painter.drawText(
-            text_rect,
+            self.rect(),
             Qt.AlignCenter,
             self.text(),
         )
 
         if self.hasFocus():
-            painter.setBrush(Qt.NoBrush)
+            painter.setBrush(
+                Qt.NoBrush
+            )
+
             painter.setPen(
                 QtGui.QPen(
                     QtGui.QColor(
@@ -610,15 +821,11 @@ class ArtworkButton(QtWidgets.QPushButton):
                     2,
                 )
             )
+
             painter.drawRoundedRect(
-                artwork_rect.adjusted(
-                    1,
-                    1,
-                    -1,
-                    -1,
-                ),
-                8,
-                8,
+                button_rect,
+                9,
+                9,
             )
 
 class SoundLibrary(

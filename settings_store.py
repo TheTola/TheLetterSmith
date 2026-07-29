@@ -36,10 +36,10 @@ VALID_CURTAIN_STYLES = {
 
 
 CURTAIN_STYLE_LABELS = {
-    "pure_white": "Automatic — Original White",
-    "average_color": "Automatic — Letter Color",
+    "pure_white": "White Curtain",
+    "average_color": "Normal Curtain",
     "complementary_average_color": (
-        "Automatic — Complementary Color"
+        "Complementary Curtain"
     ),
     "light": "Light Curtain",
     "dark": "Dark Curtain",

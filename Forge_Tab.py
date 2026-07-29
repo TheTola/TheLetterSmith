@@ -40,6 +40,11 @@ from config import (
     validate_required_images,
 )
 from message_html import read_text_normalized
+from settings_store import (
+    CURTAIN_STYLE_LABELS,
+    DEFAULT_SETTINGS,
+    SettingsStore,
+)
 from project_sync import project_fingerprint
 from saved_letters import SavedLetter, SavedLetterCatalog
 from sound_model import (
@@ -1093,6 +1098,7 @@ class ForgeTab(
     )
 
     sync_requested = QtCore.Signal(str)
+    curtain_changed = QtCore.Signal(str)
 
     preview_restart_requested = (
         QtCore.Signal(str)
@@ -1107,6 +1113,10 @@ class ForgeTab(
         self.project_root = Path(
             project_root
         ).resolve()
+
+        self.settings_store = SettingsStore(
+            self.project_root
+        )
 
         self.saved_page_url = ""
 
@@ -1270,7 +1280,72 @@ class ForgeTab(
             0,
         )
 
+        load_row.setSpacing(
+            10
+        )
+
         load_row.addStretch(1)
+
+        # This button is placed directly inside the visible Forge page.
+        # Nexus cannot hide or relocate it.
+        self.settings_btn = (
+            QtWidgets.QToolButton(
+                self
+            )
+        )
+
+        self.settings_btn.setText(
+            "Settings"
+        )
+
+        self.settings_btn.setAccessibleName(
+            "Forge settings"
+        )
+
+        self.settings_btn.setCursor(
+            Qt.PointingHandCursor
+        )
+
+        self.settings_btn.setPopupMode(
+            QtWidgets.QToolButton
+            .ToolButtonPopupMode
+            .InstantPopup
+        )
+
+        self.settings_btn.setMinimumWidth(
+            120
+        )
+
+        self.settings_btn.setFixedHeight(
+            40
+        )
+
+        self.settings_btn.setStyleSheet(
+            "QToolButton {"
+            "background:#0f0f12;"
+            "color:#e6e6e6;"
+            "border:1px solid #00d0ff;"
+            "border-radius:8px;"
+            "padding:6px 12px;"
+            "font:700 11px 'Segoe UI';"
+            "}"
+
+            "QToolButton:hover {"
+            "background:#113945;"
+            "}"
+
+            "QToolButton::menu-indicator {"
+            "image:none;"
+            "}"
+        )
+
+        self.settings_btn.setMenu(
+            self._create_forge_settings_menu()
+        )
+
+        load_row.addWidget(
+            self.settings_btn
+        )
 
         self.load_btn = (
             self._tiny_button(
@@ -1463,6 +1538,231 @@ class ForgeTab(
         )
 
         self._log("Ready.")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Forge settings
+    # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _forge_menu_stylesheet(
+        ) -> str:
+        return """
+            QMenu {
+                background:#0f0f12;
+                color:#e6e6e6;
+                border:1px solid #2b3344;
+                padding:6px;
+            }
+
+            QMenu::item {
+                padding:7px 26px 7px 12px;
+                border-radius:6px;
+            }
+
+            QMenu::item:selected {
+                background:#113945;
+            }
+
+            QMenu::item:checked {
+                color:#00d0ff;
+                font-weight:700;
+            }
+
+            QMenu::separator {
+                height:1px;
+                background:#2b3344;
+                margin:6px;
+            }
+        """
+
+    def _create_forge_settings_menu(
+        self,
+    ) -> QtWidgets.QMenu:
+        menu = QtWidgets.QMenu(
+            self.settings_btn
+        )
+
+        menu.setStyleSheet(
+            self._forge_menu_stylesheet()
+        )
+
+        self.curtain_menu = (
+            menu.addMenu(
+                "Curtain"
+            )
+        )
+
+        self.curtain_menu.setStyleSheet(
+            self._forge_menu_stylesheet()
+        )
+
+        self._curtain_action_group = (
+            QtGui.QActionGroup(
+                self
+            )
+        )
+
+        self._curtain_action_group.setExclusive(
+            True
+        )
+
+        self._curtain_actions: dict[
+            str,
+            QtGui.QAction,
+        ] = {}
+
+        for (
+            style,
+            label,
+        ) in CURTAIN_STYLE_LABELS.items():
+            action = (
+                self.curtain_menu.addAction(
+                    label
+                )
+            )
+
+            action.setCheckable(
+                True
+            )
+
+            action.setData(
+                style
+            )
+
+            self._curtain_action_group.addAction(
+                action
+            )
+
+            action.triggered.connect(
+                lambda _checked=False, selected_style=style:
+                self._set_curtain_style(
+                    selected_style
+                )
+            )
+
+            self._curtain_actions[
+                style
+            ] = action
+
+        menu.aboutToShow.connect(
+            self._sync_curtain_actions
+        )
+
+        self._sync_curtain_actions()
+
+        return menu
+
+    def _current_curtain_style(
+        self,
+    ) -> str:
+        default_style = str(
+            DEFAULT_SETTINGS.get(
+                "curtain_style",
+                "pure_white",
+            )
+        )
+
+        style = str(
+            self.settings_store.get(
+                "curtain_style",
+                default_style,
+            )
+        )
+
+        if style not in CURTAIN_STYLE_LABELS:
+            return default_style
+
+        return style
+
+    def _sync_curtain_actions(
+        self,
+    ) -> None:
+        current_style = (
+            self._current_curtain_style()
+        )
+
+        current_label = (
+            CURTAIN_STYLE_LABELS.get(
+                current_style,
+                "Pure White",
+            )
+        )
+
+        for (
+            style,
+            action,
+        ) in getattr(
+            self,
+            "_curtain_actions",
+            {},
+        ).items():
+            action.setChecked(
+                style == current_style
+            )
+
+        if hasattr(
+            self,
+            "settings_btn",
+        ):
+            self.settings_btn.setToolTip(
+                "Forge settings\n"
+                f"Current curtain: "
+                f"{current_label}"
+            )
+
+    def _set_curtain_style(
+        self,
+        style: str,
+    ) -> None:
+        if style not in CURTAIN_STYLE_LABELS:
+            return
+
+        previous_style = (
+            self._current_curtain_style()
+        )
+
+        if style == previous_style:
+            self._sync_curtain_actions()
+            return
+
+        self.settings_store.update_fields(
+            curtain_style=style
+        )
+
+        self._sync_curtain_actions()
+
+        # Force the generated Forge files to be rebuilt.
+        self.schedule_refresh()
+
+        self.sync_requested.emit(
+            "curtain"
+        )
+
+        self.curtain_changed.emit(
+            style
+        )
+
+        if self._tab_active:
+            QtCore.QTimer.singleShot(
+                0,
+                self._refresh_after_curtain_change,
+            )
+
+    def _refresh_after_curtain_change(
+        self,
+    ) -> None:
+        if not self._tab_active:
+            return
+
+        try:
+            self.ensure_preview_current()
+
+        except Exception as error:
+            self._log(
+                "❌ Curtain update failed: "
+                f"{type(error).__name__}: "
+                f"{error}"
+            )
 
     def _preview_mode_changed(
         self,
@@ -2509,6 +2809,7 @@ class ForgeTab(
         enabled: bool,
     ) -> None:
         buttons = (
+            self.settings_btn,
             self.load_btn,
             self.generate_btn,
             self.seal_btn,
