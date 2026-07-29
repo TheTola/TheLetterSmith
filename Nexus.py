@@ -1528,21 +1528,59 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _show_forge_preview(self) -> None:
         """Show the actual generated viewer, never a static Forge stand-in."""
-        if not self.forge_tab.preview_refresh_pending:
-            self.forge_tab.ensure_preview_current()
-        index = self.forge_tab.current_play_index()
+
+        refresh_pending = bool(
+            getattr(
+                self.forge_tab,
+                "preview_refresh_pending",
+                False,
+            )
+        )
+
+        if not refresh_pending:
+            ensure_current = getattr(
+                self.forge_tab,
+                "ensure_preview_current",
+                None,
+            )
+
+            if callable(ensure_current):
+                ensure_current()
+
+        current_play_index = getattr(
+            self.forge_tab,
+            "current_play_index",
+            None,
+        )
+
+        index = (
+            current_play_index()
+            if callable(current_play_index)
+            else None
+        )
+
         if index is not None:
+            preview_mode = getattr(
+                self.forge_tab,
+                "preview_mode_value",
+                "portrait",
+            )
+
             self._load_forge_preview(
                 str(index),
-                self.forge_tab.preview_mode_value,
+                preview_mode,
             )
+
             return
+
         self._last_pixmap = None
         self._clear_preview()
         self.preview_stack.setCurrentIndex(0)
+
         self.preview_caption.setText(
             "Select Preview Letter to build the interactive viewer."
         )
+
         self.preview_caption.setVisible(True)
 
     def _load_forge_preview(self, index_path: str, mode: str) -> None:

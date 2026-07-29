@@ -21,7 +21,7 @@
   "message_html_file": "message.html",
   "message_image_file": "message.png",
   "music_file": "",
-  "music_volume": 27,
+  "music_volume": 50,
   "output_dir": "converted64",
   "required_slides": [
     "cover.png",
@@ -31,10 +31,10 @@
   ],
   "sound_gif": "sound.gif",
   "sounds_dir": "sounds",
-  "starting_volume": 27,
+  "starting_volume": 50,
   "verbose": false,
-  "recipient_title": "Growth & Ice Cream",
-  "recipient_name": "Ijeoma Athenna Ahananu",
+  "recipient_title": "Lilies & Ice Cream",
+  "recipient_name": "Ijeomma Athenna Ahanonu",
   "prompt_writer_state": {
     "type": "— none —",
     "subject": "----",
@@ -59,17 +59,15 @@
     "generated_prompts": {}
   },
   "published_page_url": "",
-  "message_overlay_preset": "paper",
+  "message_overlay_preset": "white",
   "message_overlay_opacity": 66,
   "recipient_name_locked": true,
   "published_page_url_locked": false,
-  "curtain_style": "average_color",
+  "curtain_style": "pure_white",
   "project_id": "22674ffd-e63c-4daa-ae3f-50c3a12ae397",
   "project_schema_version": 1,
   "forge_preview_mode": "window",
-  "required_features": {
-    "music": false
-  },
+  "required_features": [],
   "github_pages_public_warning_acknowledged": true,
-  "music_muted": false
+  "music_muted": true
 }

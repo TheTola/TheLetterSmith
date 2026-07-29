@@ -1,32 +1,17 @@
 # File: Image_tab.py
 """
-Image tab UI and logic.
+Image-tab UI and logic for Letter Smith.
 
-SOURCE OF TRUTH (pages):
-  gallery/user/pages/
-    cover.png
-    letter.png
-    wall.png
-    back.png
+Canonical image files:
+    gallery/user/pages/cover.png
+    gallery/user/pages/letter.png
+    gallery/user/pages/wall.png
+    gallery/user/pages/back.png
 
-Notes:
-- Slot mapping:
-    1 → cover.png
-    2 → letter.png
-    3 → wall.png   (Letter Background)
-    4 → back.png
-- Clicking an image thumbnail selects or replaces that image.
-- Each card has a Clear button.
-- Hover preview works for all four images.
-- Reset clears the preview immediately.
-
-This file writes only into gallery/user/pages/*.png.
-
-Prompt Writer FAB:
-- Not draggable.
-- Appears only while the Images tab is visible.
-- Positioned in the shared preview region.
-- Prevented from overlapping the image cards.
+The Reset Images and Gallery artwork buttons are deliberately large. They live
+in their own left-aligned horizontal strip below the image cards. On narrower
+windows that strip scrolls horizontally instead of shrinking the buttons or
+allowing them to overlap the cards.
 """
 
 from __future__ import annotations
@@ -35,28 +20,28 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageChops, ImageOps
 
-from PySide6 import QtWidgets, QtGui, QtCore
-from PySide6.QtCore import Signal, QUrl, QSize, QPoint
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import QPoint, QSize, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon
 
-from project_sync import image_fingerprint
 from image_button import ArtworkButton
+from project_sync import image_fingerprint
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Static Floating Action Button
+# Prompt Writer floating button
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class StaticFab(QtWidgets.QToolButton):
     def __init__(
-            self,
-            parent_widget: QtWidgets.QWidget,
-            surface: QtWidgets.QWidget,
+        self,
+        parent_widget: QtWidgets.QWidget,
+        surface: QtWidgets.QWidget,
     ) -> None:
         super().__init__(parent_widget)
-
         self._surface = surface
 
         self.setObjectName("PWriteFab")
@@ -64,7 +49,6 @@ class StaticFab(QtWidgets.QToolButton):
         self.setAutoRaise(True)
         self.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
         self.setFixedSize(200, 200)
-
         self.setStyleSheet(
             "#PWriteFab {"
             "background: transparent;"
@@ -73,10 +57,7 @@ class StaticFab(QtWidgets.QToolButton):
             "}"
         )
 
-    def set_surface(
-            self,
-            surface: QtWidgets.QWidget,
-    ) -> None:
+    def set_surface(self, surface: QtWidgets.QWidget) -> None:
         self._surface = surface
 
     def clamp_to_surface(self) -> None:
@@ -87,38 +68,37 @@ class StaticFab(QtWidgets.QToolButton):
             0,
             self._surface.width() - self.width(),
         )
-
         maximum_y = max(
             0,
             self._surface.height() - self.height(),
         )
 
-        x_position = max(
-            0,
-            min(self.x(), maximum_x),
-        )
-
-        y_position = max(
-            0,
-            min(self.y(), maximum_y),
-        )
-
         self.move(
             QPoint(
-                x_position,
-                y_position,
+                max(
+                    0,
+                    min(
+                        self.x(),
+                        maximum_x,
+                    ),
+                ),
+                max(
+                    0,
+                    min(
+                        self.y(),
+                        maximum_y,
+                    ),
+                ),
             )
         )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Image utilities
+# Image helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _load_image_exif(path: str) -> Image.Image:
-    """
-    Load an image and apply its EXIF orientation.
-    """
     image = Image.open(path)
     image = ImageOps.exif_transpose(image)
 
@@ -132,12 +112,9 @@ def _load_image_exif(path: str) -> Image.Image:
 
 
 def _save_png(
-        image: Image.Image,
-        destination_path: str,
+    image: Image.Image,
+    destination_path: str,
 ) -> None:
-    """
-    Save an image as PNG in the working pages directory.
-    """
     destination = Path(destination_path)
 
     destination.parent.mkdir(
@@ -158,11 +135,184 @@ def _save_png(
     )
 
 
+def _trim_artwork_canvas(
+    button: ArtworkButton,
+) -> None:
+    """
+    Crop the large invisible canvas around an artwork-button PNG.
+
+    These button images contain large transparent or near-background regions.
+    Merely increasing the QPushButton size therefore leaves the visible artwork
+    tiny. This routine identifies meaningful pixels from both alpha and corner
+    color difference, crops the canvas, and replaces the button's pixmap with
+    the cropped version.
+    """
+    if not button.has_artwork:
+        return
+
+    try:
+        with Image.open(
+            button.artwork_path
+        ) as source:
+            rgba = source.convert("RGBA")
+            width, height = rgba.size
+
+            if width <= 0 or height <= 0:
+                return
+
+            alpha_mask = rgba.getchannel(
+                "A"
+            ).point(
+                lambda value: (
+                    255
+                    if value >= 28
+                    else 0
+                )
+            )
+
+            corners = (
+                rgba.getpixel((0, 0)),
+                rgba.getpixel(
+                    (
+                        width - 1,
+                        0,
+                    )
+                ),
+                rgba.getpixel(
+                    (
+                        0,
+                        height - 1,
+                    )
+                ),
+                rgba.getpixel(
+                    (
+                        width - 1,
+                        height - 1,
+                    )
+                ),
+            )
+
+            background_color = tuple(
+                sum(
+                    pixel[channel]
+                    for pixel in corners
+                )
+                // len(corners)
+                for channel in range(4)
+            )
+
+            background = Image.new(
+                "RGBA",
+                rgba.size,
+                background_color,
+            )
+
+            difference = ImageChops.difference(
+                rgba,
+                background,
+            ).convert("L")
+
+            difference_mask = difference.point(
+                lambda value: (
+                    255
+                    if value >= 18
+                    else 0
+                )
+            )
+
+            combined_mask = ImageChops.lighter(
+                alpha_mask,
+                difference_mask,
+            )
+
+            bounds = combined_mask.getbbox()
+
+            if bounds is None:
+                return
+
+            left, top, right, bottom = bounds
+
+            horizontal_padding = max(
+                4,
+                int(
+                    (right - left)
+                    * 0.035
+                ),
+            )
+
+            vertical_padding = max(
+                4,
+                int(
+                    (bottom - top)
+                    * 0.06
+                ),
+            )
+
+            cropped = rgba.crop(
+                (
+                    max(
+                        0,
+                        left - horizontal_padding,
+                    ),
+                    max(
+                        0,
+                        top - vertical_padding,
+                    ),
+                    min(
+                        width,
+                        right + horizontal_padding,
+                    ),
+                    min(
+                        height,
+                        bottom + vertical_padding,
+                    ),
+                )
+            )
+
+            crop_width, crop_height = (
+                cropped.size
+            )
+
+            if (
+                crop_width <= 0
+                or crop_height <= 0
+            ):
+                return
+
+            raw = cropped.tobytes(
+                "raw",
+                "RGBA",
+            )
+
+            image = QtGui.QImage(
+                raw,
+                crop_width,
+                crop_height,
+                crop_width * 4,
+                QtGui.QImage.Format_RGBA8888,
+            ).copy()
+
+            button._artwork = (
+                QtGui.QPixmap.fromImage(
+                    image
+                )
+            )
+
+            button.updateGeometry()
+            button.update()
+
+    except Exception:
+        return
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Image thumbnail
+# Clickable image thumbnail
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _ImageThumbnail(QtWidgets.QLabel):
+
+class _ImageThumbnail(
+    QtWidgets.QLabel
+):
     clicked = Signal()
     file_dropped = Signal(str)
     hovered = Signal()
@@ -175,8 +325,10 @@ class _ImageThumbnail(QtWidgets.QLabel):
     )
 
     def __init__(
-            self,
-            parent: Optional[QtWidgets.QWidget] = None,
+        self,
+        parent: Optional[
+            QtWidgets.QWidget
+        ] = None,
     ) -> None:
         super().__init__(parent)
 
@@ -205,8 +357,13 @@ class _ImageThumbnail(QtWidgets.QLabel):
             QtCore.Qt.PointingHandCursor
         )
 
+        self.setFocusPolicy(
+            QtCore.Qt.StrongFocus
+        )
+
         self.setToolTip(
-            "Click to select an image, or drag an image here."
+            "Click to select an image, "
+            "or drag an image here."
         )
 
         self.setStyleSheet(
@@ -216,39 +373,57 @@ class _ImageThumbnail(QtWidgets.QLabel):
         )
 
     def mousePressEvent(
-            self,
-            event: QtGui.QMouseEvent,
+        self,
+        event: QtGui.QMouseEvent,
     ) -> None:
-        if event.button() == QtCore.Qt.LeftButton:
+        if (
+            event.button()
+            == QtCore.Qt.LeftButton
+        ):
             self.clicked.emit()
             event.accept()
             return
 
         super().mousePressEvent(event)
 
+    def keyPressEvent(
+        self,
+        event: QtGui.QKeyEvent,
+    ) -> None:
+        if event.key() in (
+            QtCore.Qt.Key_Return,
+            QtCore.Qt.Key_Enter,
+            QtCore.Qt.Key_Space,
+        ):
+            self.clicked.emit()
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
+
     def enterEvent(
-            self,
-            event: QtCore.QEvent,
+        self,
+        event: QtCore.QEvent,
     ) -> None:
         self.hovered.emit()
         super().enterEvent(event)
 
     def dragEnterEvent(
-            self,
-            event: QtGui.QDragEnterEvent,
+        self,
+        event: QtGui.QDragEnterEvent,
     ) -> None:
         if not event.mimeData().hasUrls():
             event.ignore()
             return
 
         for url in event.mimeData().urls():
-            if not url.isLocalFile():
-                continue
-
-            path = url.toLocalFile()
-
-            if path.lower().endswith(
+            if (
+                url.isLocalFile()
+                and url.toLocalFile()
+                .lower()
+                .endswith(
                     self.SUPPORTED_EXTENSIONS
+                )
             ):
                 event.acceptProposedAction()
                 return
@@ -256,8 +431,8 @@ class _ImageThumbnail(QtWidgets.QLabel):
         event.ignore()
 
     def dragMoveEvent(
-            self,
-            event: QtGui.QDragMoveEvent,
+        self,
+        event: QtGui.QDragMoveEvent,
     ) -> None:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -265,8 +440,8 @@ class _ImageThumbnail(QtWidgets.QLabel):
             event.ignore()
 
     def dropEvent(
-            self,
-            event: QtGui.QDropEvent,
+        self,
+        event: QtGui.QDropEvent,
     ) -> None:
         for url in event.mimeData().urls():
             if not url.isLocalFile():
@@ -275,7 +450,7 @@ class _ImageThumbnail(QtWidgets.QLabel):
             path = url.toLocalFile()
 
             if path.lower().endswith(
-                    self.SUPPORTED_EXTENSIONS
+                self.SUPPORTED_EXTENSIONS
             ):
                 self.file_dropped.emit(path)
                 event.acceptProposedAction()
@@ -288,25 +463,42 @@ class _ImageThumbnail(QtWidgets.QLabel):
 # Image asset card
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ImageAssetCard(QtWidgets.QFrame):
+
+class ImageAssetCard(
+    QtWidgets.QFrame
+):
     select_requested = Signal(int)
     clear_requested = Signal(int)
     preview_requested = Signal(int)
-    file_dropped = Signal(int, str)
+    file_dropped = Signal(
+        int,
+        str,
+    )
 
     def __init__(
-            self,
-            index: int,
-            title: str,
-            parent: Optional[QtWidgets.QWidget] = None,
+        self,
+        index: int,
+        title: str,
+        parent: Optional[
+            QtWidgets.QWidget
+        ] = None,
     ) -> None:
         super().__init__(parent)
 
         self.index = index
-        self._source_pixmap = QtGui.QPixmap()
 
-        self.setObjectName("ImageAssetCard")
-        self.setProperty("assetState", "missing")
+        self._source_pixmap = (
+            QtGui.QPixmap()
+        )
+
+        self.setObjectName(
+            "ImageAssetCard"
+        )
+
+        self.setProperty(
+            "assetState",
+            "missing",
+        )
 
         self.setFixedWidth(190)
         self.setMinimumHeight(255)
@@ -317,7 +509,9 @@ class ImageAssetCard(QtWidgets.QFrame):
             QtWidgets.QSizePolicy.Preferred,
         )
 
-        root_layout = QtWidgets.QVBoxLayout(self)
+        root_layout = (
+            QtWidgets.QVBoxLayout(self)
+        )
 
         root_layout.setContentsMargins(
             10,
@@ -328,7 +522,9 @@ class ImageAssetCard(QtWidgets.QFrame):
 
         root_layout.setSpacing(7)
 
-        self.title_label = QtWidgets.QLabel(title)
+        self.title_label = (
+            QtWidgets.QLabel(title)
+        )
 
         self.title_label.setAlignment(
             QtCore.Qt.AlignCenter
@@ -348,24 +544,32 @@ class ImageAssetCard(QtWidgets.QFrame):
             self.title_label
         )
 
-        self.thumbnail = _ImageThumbnail(self)
+        self.thumbnail = (
+            _ImageThumbnail(self)
+        )
 
         self.thumbnail.clicked.connect(
-            lambda: self.select_requested.emit(
-                self.index
+            lambda: (
+                self.select_requested.emit(
+                    self.index
+                )
             )
         )
 
         self.thumbnail.hovered.connect(
-            lambda: self.preview_requested.emit(
-                self.index
+            lambda: (
+                self.preview_requested.emit(
+                    self.index
+                )
             )
         )
 
         self.thumbnail.file_dropped.connect(
-            lambda path: self.file_dropped.emit(
-                self.index,
-                path,
+            lambda path: (
+                self.file_dropped.emit(
+                    self.index,
+                    path,
+                )
             )
         )
 
@@ -374,14 +578,21 @@ class ImageAssetCard(QtWidgets.QFrame):
             1,
         )
 
-        button_row = QtWidgets.QHBoxLayout()
-        button_row.setSpacing(8)
-
-        self.clear_btn = QtWidgets.QPushButton(
-            "♲  Clear"
+        button_row = (
+            QtWidgets.QHBoxLayout()
         )
 
-        self.clear_btn.setMinimumHeight(34)
+        button_row.setSpacing(8)
+
+        self.clear_btn = (
+            QtWidgets.QPushButton(
+                "♲  Clear"
+            )
+        )
+
+        self.clear_btn.setMinimumHeight(
+            34
+        )
 
         self.clear_btn.setCursor(
             QtCore.Qt.PointingHandCursor
@@ -406,13 +617,17 @@ class ImageAssetCard(QtWidgets.QFrame):
         )
 
         self.clear_btn.clicked.connect(
-            lambda: self.clear_requested.emit(
-                self.index
+            lambda: (
+                self.clear_requested.emit(
+                    self.index
+                )
             )
         )
 
         button_row.addStretch(1)
-        button_row.addWidget(self.clear_btn)
+        button_row.addWidget(
+            self.clear_btn
+        )
         button_row.addStretch(1)
 
         root_layout.addLayout(
@@ -425,20 +640,23 @@ class ImageAssetCard(QtWidgets.QFrame):
             "border: 1px solid #8c2f36;"
             "border-radius: 8px;"
             "}"
-            "QFrame#ImageAssetCard[assetState='ready'] "
-            "{" "border: 1px solid #00d0ff;""}"
-
-            "QFrame#ImageAssetCard[assetState='warning'] {"
+            "QFrame#ImageAssetCard"
+            "[assetState='ready'] {"
+            "border: 1px solid #00d0ff;"
+            "}"
+            "QFrame#ImageAssetCard"
+            "[assetState='warning'] {"
             "border-color: #c9a227;"
             "}"
-            "QFrame#ImageAssetCard[assetState='missing'] {"
+            "QFrame#ImageAssetCard"
+            "[assetState='missing'] {"
             "border-color: #8c2f36;"
             "}"
         )
 
     def set_asset_state(
-            self,
-            state: str,
+        self,
+        state: str,
     ) -> None:
         self.setProperty(
             "assetState",
@@ -450,22 +668,25 @@ class ImageAssetCard(QtWidgets.QFrame):
         self.update()
 
     def set_pixmap(
-            self,
-            pixmap: QtGui.QPixmap,
+        self,
+        pixmap: QtGui.QPixmap,
     ) -> None:
-        self._source_pixmap = QtGui.QPixmap(
-            pixmap
+        self._source_pixmap = (
+            QtGui.QPixmap(pixmap)
         )
 
         self._rescale()
 
-        if pixmap.isNull():
-            self.set_asset_state("missing")
-        else:
-            self.set_asset_state("ready")
+        self.set_asset_state(
+            "missing"
+            if pixmap.isNull()
+            else "ready"
+        )
 
     def clear_pixmap(self) -> None:
-        self._source_pixmap = QtGui.QPixmap()
+        self._source_pixmap = (
+            QtGui.QPixmap()
+        )
 
         self.thumbnail.clear()
 
@@ -480,7 +701,9 @@ class ImageAssetCard(QtWidgets.QFrame):
             "color: #788594;"
         )
 
-        self.set_asset_state("missing")
+        self.set_asset_state(
+            "missing"
+        )
 
     def _rescale(self) -> None:
         if self._source_pixmap.isNull():
@@ -496,20 +719,25 @@ class ImageAssetCard(QtWidgets.QFrame):
         )
 
         target_size = (
-                self.thumbnail.size()
-                - QtCore.QSize(8, 8)
+            self.thumbnail.size()
+            - QtCore.QSize(
+                8,
+                8,
+            )
         )
 
         if (
-                target_size.width() <= 0
-                or target_size.height() <= 0
+            target_size.width() <= 0
+            or target_size.height() <= 0
         ):
             return
 
-        scaled_pixmap = self._source_pixmap.scaled(
-            target_size,
-            QtCore.Qt.KeepAspectRatio,
-            QtCore.Qt.SmoothTransformation,
+        scaled_pixmap = (
+            self._source_pixmap.scaled(
+                target_size,
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation,
+            )
         )
 
         self.thumbnail.setPixmap(
@@ -517,8 +745,8 @@ class ImageAssetCard(QtWidgets.QFrame):
         )
 
     def resizeEvent(
-            self,
-            event: QtGui.QResizeEvent,
+        self,
+        event: QtGui.QResizeEvent,
     ) -> None:
         super().resizeEvent(event)
         self._rescale()
@@ -528,19 +756,37 @@ class ImageAssetCard(QtWidgets.QFrame):
 # Image tab
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ImageTab(QtWidgets.QWidget):
-    image_selected = Signal(QtGui.QPixmap)
-    hover_preview_image = Signal(QtGui.QPixmap)
+
+class ImageTab(
+    QtWidgets.QWidget
+):
+    image_selected = Signal(
+        QtGui.QPixmap
+    )
+
+    hover_preview_image = Signal(
+        QtGui.QPixmap
+    )
+
     clear_preview = Signal()
+
     images_changed = Signal(str)
 
     FAB_FIXED_X = 55
     FAB_CARD_GAP = 12
 
+    UTILITY_BUTTON_WIDTH = 400
+    UTILITY_BUTTON_HEIGHT = 140
+
+    # Space between Reset Images and Gallery.
+    UTILITY_BUTTON_GAP = 0
+
+    # Space above the buttons.
+    # Smaller numbers move them upward.
+    UTILITY_BUTTON_TOP_GAP = 4
+
     def __init__(self) -> None:
         super().__init__()
-        self._disk_fingerprint = image_fingerprint(self._project_dir())
-        self._tab_active = False
 
         self.labels = {
             1: (
@@ -569,16 +815,23 @@ class ImageTab(QtWidgets.QWidget):
             for index in self.labels
         }
 
-        layout = QtWidgets.QVBoxLayout(self)
-
-        layout.setContentsMargins(
-            20,
-            6,
-            20,
-            12,
+        self._disk_fingerprint = (
+            image_fingerprint(
+                self._project_dir()
+            )
         )
 
-        layout.setSpacing(8)
+        self._tab_active = False
+
+        self._prompt_writer_panel: Optional[
+            QtWidgets.QWidget
+        ] = None
+
+        root = QtWidgets.QVBoxLayout(self)
+
+        root.setContentsMargins(0,0,0,0)
+
+        root.setSpacing(8)
 
         header = QtWidgets.QLabel(
             "Select images for your letter"
@@ -599,25 +852,35 @@ class ImageTab(QtWidgets.QWidget):
             QtCore.Qt.AlignCenter
         )
 
-        layout.addWidget(header)
+        root.addWidget(header)
 
         self.cards: dict[
             int,
             ImageAssetCard,
         ] = {}
 
-        card_row = QtWidgets.QHBoxLayout()
-        card_row.setSpacing(14)
+        cards_layout = (
+            QtWidgets.QHBoxLayout()
+        )
 
-        card_row.addStretch(1)
+        cards_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
+        cards_layout.setSpacing(6)
 
         for index in (
-                1,
-                2,
-                3,
-                4,
+            1,
+            2,
+            3,
+            4,
         ):
-            title, _filename = self.labels[index]
+            title, _filename = (
+                self.labels[index]
+            )
 
             card = ImageAssetCard(
                 index,
@@ -643,18 +906,34 @@ class ImageTab(QtWidgets.QWidget):
 
             self.cards[index] = card
 
-            card_row.addWidget(
+            cards_layout.addWidget(
                 card,
                 0,
                 QtCore.Qt.AlignTop,
             )
 
-        card_row.addStretch(1)
+        centered_cards = (
+            QtWidgets.QHBoxLayout()
+        )
 
-        layout.addLayout(card_row)
+        centered_cards.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
 
-        utility_row = QtWidgets.QHBoxLayout()
-        utility_row.setSpacing(8)
+        centered_cards.addStretch(1)
+
+        centered_cards.addLayout(
+            cards_layout
+        )
+
+        centered_cards.addStretch(1)
+
+        root.addLayout(
+            centered_cards
+        )
 
         self.reset_btn = ArtworkButton(
             "Reset Images",
@@ -671,21 +950,27 @@ class ImageTab(QtWidgets.QWidget):
         )
 
         for button in (
-                self.reset_btn,
-                self.open_btn,
+            self.reset_btn,
+            self.open_btn,
         ):
-            # The supplied artwork contains substantial transparent breathing
-            # room. A 354 x 138 widget is exactly three times the original
-            # 118 x 46 artwork-button footprint and keeps the labels readable.
-            button.setFixedSize(354, 138)
+            _trim_artwork_canvas(
+                button
+            )
+
+            button.setFixedSize(
+                self.UTILITY_BUTTON_WIDTH,
+                self.UTILITY_BUTTON_HEIGHT,
+            )
+
             button.setSizePolicy(
                 QtWidgets.QSizePolicy.Fixed,
                 QtWidgets.QSizePolicy.Fixed,
             )
+
             button.setFont(
                 QtGui.QFont(
                     "Segoe UI Semibold",
-                    14,
+                    18,
                     QtGui.QFont.Weight.Bold,
                 )
             )
@@ -694,41 +979,84 @@ class ImageTab(QtWidgets.QWidget):
                 button.setStyleSheet(
                     "QPushButton {"
                     "background: #171a1f;"
-                    "color: #dfe6ee;"
-                    "border: 1px solid #3b434e;"
-                    "border-radius: 5px;"
-                    "padding: 6px 12px;"
-                    "font-weight: bold;"
+                    "color: #ffffff;"
+                    "border: 2px solid #00b8cf;"
+                    "border-radius: 12px;"
+                    "padding: 12px 20px;"
+                    "font-weight: 800;"
                     "}"
                     "QPushButton:hover {"
-                    "border-color: #00b8cf;"
-                    "color: #ffffff;"
+                    "background: #1c252d;"
+                    "border-color: #00e5ff;"
                     "}"
                     "QPushButton:pressed {"
                     "background: #101318;"
                     "}"
                 )
 
+        self.reset_btn.setAccessibleName(
+            "Reset Images"
+        )
+
+        self.reset_btn.setToolTip(
+            "Clear all four selected "
+            "letter images."
+        )
+
         self.reset_btn.clicked.connect(
             self.reset_images
+        )
+
+        self.open_btn.setAccessibleName(
+            "Gallery"
+        )
+
+        self.open_btn.setToolTip(
+            "Open the working image "
+            "gallery folder."
         )
 
         self.open_btn.clicked.connect(
             self.open_gallery_folder
         )
 
-        utility_row.addWidget(
-            self.reset_btn
+        root.addSpacing(
+            self.UTILITY_BUTTON_TOP_GAP
         )
 
-        utility_row.addWidget(
-            self.open_btn
+        utility_position_row = QtWidgets.QHBoxLayout()
+
+        # First number controls distance from the true left edge.
+        utility_position_row.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
         )
 
-        utility_row.addStretch(1)
+        # Controls the distance between Reset Images and Gallery.
+        utility_position_row.setSpacing(
+            self.UTILITY_BUTTON_GAP
+        )
 
-        layout.addLayout(
-            utility_row
+        utility_position_row.addWidget(
+            self.reset_btn,
+            0,
+            QtCore.Qt.AlignLeft
+            | QtCore.Qt.AlignVCenter,
+        )
+
+        utility_position_row.addWidget(
+            self.open_btn,
+            0,
+            QtCore.Qt.AlignLeft
+            | QtCore.Qt.AlignVCenter,
+        )
+
+        utility_position_row.addStretch(1)
+
+        root.addLayout(
+            utility_position_row
         )
 
         self.status = QtWidgets.QLabel()
@@ -744,51 +1072,52 @@ class ImageTab(QtWidgets.QWidget):
             "color: #8995a3;"
         )
 
-        # Status messages describe recent activity, not permanent state.
-        # Restarting this timer replaces the previous message and resets
-        # how long the newest action remains visible.
-        self._status_clear_timer = QtCore.QTimer(self)
-        self._status_clear_timer.setSingleShot(True)
+        root.addWidget(
+            self.status
+        )
+
+        self._status_clear_timer = (
+            QtCore.QTimer(self)
+        )
+
+        self._status_clear_timer.setSingleShot(
+            True
+        )
+
         self._status_clear_timer.timeout.connect(
             self.status.clear
         )
 
-        self._prompt_writer_panel: Optional[
-            QtWidgets.QWidget
-        ] = None
+        root.addStretch(1)
 
-        layout.addWidget(
-            self.status
+        self._fab_surface: QtWidgets.QWidget = (
+            self
         )
-
-        layout.addStretch(1)
-
-        self._fab_surface: QtWidgets.QWidget = self
 
         self.pwrite_fab = StaticFab(
             self,
             self,
         )
 
-        project_directory = self._project_dir()
-
-        prompt_writer_icon: Optional[QIcon] = None
+        prompt_writer_icon: Optional[
+            QIcon
+        ] = None
 
         for icon_path in (
-                os.path.join(
-                    project_directory,
-                    "gallery",
-                    "app",
-                    "icons",
-                    "Pwrite.png",
-                ),
-                os.path.join(
-                    project_directory,
-                    "gallery",
-                    "app",
-                    "icons",
-                    "pwrite.png",
-                ),
+            os.path.join(
+                self._project_dir(),
+                "gallery",
+                "app",
+                "icons",
+                "Pwrite.png",
+            ),
+            os.path.join(
+                self._project_dir(),
+                "gallery",
+                "app",
+                "icons",
+                "pwrite.png",
+            ),
         ):
             if os.path.exists(icon_path):
                 prompt_writer_icon = QIcon(
@@ -797,8 +1126,8 @@ class ImageTab(QtWidgets.QWidget):
                 break
 
         if (
-                prompt_writer_icon is not None
-                and not prompt_writer_icon.isNull()
+            prompt_writer_icon is not None
+            and not prompt_writer_icon.isNull()
         ):
             self.pwrite_fab.setIcon(
                 prompt_writer_icon
@@ -830,10 +1159,13 @@ class ImageTab(QtWidgets.QWidget):
             self._open_prompt_writer_bridge
         )
 
-        # Start hidden so it cannot flash on another tab during startup.
         self.pwrite_fab.hide()
 
         self.refresh_cards()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Paths and synchronization
+    # ─────────────────────────────────────────────────────────────────────
 
     def _project_dir(self) -> str:
         return os.path.dirname(
@@ -850,8 +1182,8 @@ class ImageTab(QtWidgets.QWidget):
 
     def refresh_cards(self) -> None:
         for index, (
-                _title,
-                filename,
+            _title,
+            filename,
         ) in self.labels.items():
             path = os.path.join(
                 self._user_pages_dir(),
@@ -859,70 +1191,171 @@ class ImageTab(QtWidgets.QWidget):
             )
 
             if os.path.isfile(path):
-                pixmap = QtGui.QPixmap(path)
+                pixmap = QtGui.QPixmap(
+                    path
+                )
 
                 if not pixmap.isNull():
-                    self.image_paths[index] = path
+                    self.image_paths[
+                        index
+                    ] = path
 
-                    self.cards[index].set_pixmap(
+                    self.cards[
+                        index
+                    ].set_pixmap(
                         pixmap
                     )
 
                     continue
 
-            self.image_paths[index] = None
-            self.cards[index].clear_pixmap()
+            self.image_paths[
+                index
+            ] = None
 
-    def sync_from_disk(self, *, force: bool = False) -> bool:
-        """Refresh all image cards and report direct file-system changes."""
+            self.cards[
+                index
+            ].clear_pixmap()
+
+    def sync_from_disk(
+        self,
+        *,
+        force: bool = False,
+    ) -> bool:
         before = self._disk_fingerprint
-        after = image_fingerprint(self._project_dir())
-        changed = force or before != after
+
+        after = image_fingerprint(
+            self._project_dir()
+        )
+
+        changed = (
+            force
+            or before != after
+        )
+
         self.refresh_cards()
-        self._disk_fingerprint = image_fingerprint(self._project_dir())
+
+        self._disk_fingerprint = (
+            image_fingerprint(
+                self._project_dir()
+            )
+        )
+
         if changed:
-            self.images_changed.emit("disk")
+            self.images_changed.emit(
+                "disk"
+            )
+
         return changed
 
-    def sync_to_disk(self) -> None:
-        """Finalize the image fingerprint before another tab opens."""
-        current = image_fingerprint(self._project_dir())
-        if current != self._disk_fingerprint:
-            self._disk_fingerprint = current
-            self.images_changed.emit("saved")
+    def sync_to_disk(self) -> bool:
+        current = image_fingerprint(
+            self._project_dir()
+        )
+
+        changed = (
+            current
+            != self._disk_fingerprint
+        )
+
+        if changed:
+            self._disk_fingerprint = (
+                current
+            )
+
+            self.images_changed.emit(
+                "saved"
+            )
+
         self.refresh_cards()
 
-    def refresh_from_disk(self) -> None:
-        self.sync_from_disk(force=True)
+        return changed
 
-    def focus_asset_slot(self, target: str) -> None:
-        index = {
-            "cover": 1,
-            "letter": 2,
-            "wall": 3,
-            "back": 4,
-        }.get(str(target).strip().casefold())
-        card = self.cards.get(index) if index is not None else None
-        if card is None:
+    def refresh_from_disk(self) -> None:
+        self.sync_from_disk(
+            force=True
+        )
+
+    def activate_for_tab_change(
+        self,
+    ) -> None:
+        if self._tab_active:
             return
-        card.setFocus(QtCore.Qt.OtherFocusReason)
-        card.raise_()
+
+        self._tab_active = True
+        self.sync_from_disk()
+
+    def deactivate_for_tab_change(
+        self,
+    ) -> None:
+        if not self._tab_active:
+            return
+
+        self.sync_to_disk()
+        self._tab_active = False
+
+    def focus_asset_slot(
+        self,
+        target: str,
+    ) -> None:
+        normalized = (
+            str(target or "")
+            .strip()
+            .lower()
+            .replace(
+                "-",
+                "_",
+            )
+        )
+
+        mapping = {
+            "cover": 1,
+            "cover_image": 1,
+            "cover_page": 1,
+            "cover_page_image": 1,
+            "letter": 2,
+            "main": 2,
+            "main_image": 2,
+            "main_letter": 2,
+            "main_letter_image": 2,
+            "wall": 3,
+            "background": 3,
+            "letter_background": 3,
+            "letter_background_image": 3,
+            "back": 4,
+            "backdrop": 4,
+            "final_backdrop": 4,
+            "final_backdrop_image": 4,
+        }
+
+        index = mapping.get(
+            normalized
+        )
+
+        if index is None:
+            return
+
+        card = self.cards[index]
+
+        card.thumbnail.setFocus(
+            QtCore.Qt.OtherFocusReason
+        )
+
+        card.ensurePolished()
 
     # ─────────────────────────────────────────────────────────────────────
     # Prompt Writer positioning
     # ─────────────────────────────────────────────────────────────────────
 
     def _find_preview_surface(
-            self,
-    ) -> Optional[QtWidgets.QWidget]:
-        """
-        Return the shared preview frame owned by the main window.
-        """
+        self,
+    ) -> Optional[
+        QtWidgets.QWidget
+    ]:
         window = self.window()
 
         if not isinstance(
-                window,
-                QtWidgets.QWidget,
+            window,
+            QtWidgets.QWidget,
         ):
             return None
 
@@ -932,25 +1365,25 @@ class ImageTab(QtWidgets.QWidget):
         )
 
     def _cards_top_in_window(
-            self,
-            window: QtWidgets.QWidget,
+        self,
+        window: QtWidgets.QWidget,
     ) -> Optional[int]:
-        """
-        Return the top edge of the image cards in main-window coordinates.
-        """
         card_tops: list[int] = []
 
         for card in self.cards.values():
             if not card.isVisible():
                 continue
 
-            card_position = card.mapTo(
+            position = card.mapTo(
                 window,
-                QPoint(0, 0),
+                QPoint(
+                    0,
+                    0,
+                ),
             )
 
             card_tops.append(
-                card_position.y()
+                position.y()
             )
 
         if not card_tops:
@@ -958,19 +1391,14 @@ class ImageTab(QtWidgets.QWidget):
 
         return min(card_tops)
 
-    def _position_prompt_writer_button(self) -> None:
-        """
-        Position the Prompt Writer button beside the shared preview.
-
-        The button is parented to the main window so it can occupy the preview
-        region above the Image tab content. Its visibility is controlled by
-        ImageTab.showEvent() and ImageTab.hideEvent().
-        """
+    def _position_prompt_writer_button(
+        self,
+    ) -> None:
         window = self.window()
 
         if not isinstance(
-                window,
-                QtWidgets.QWidget,
+            window,
+            QtWidgets.QWidget,
         ):
             self.pwrite_fab.hide()
             return
@@ -979,14 +1407,21 @@ class ImageTab(QtWidgets.QWidget):
             self.pwrite_fab.hide()
             return
 
-        preview_frame = self._find_preview_surface()
+        preview_frame = (
+            self._find_preview_surface()
+        )
 
         if preview_frame is None:
             self.pwrite_fab.hide()
             return
 
-        if self.pwrite_fab.parent() is not window:
-            self.pwrite_fab.setParent(window)
+        if (
+            self.pwrite_fab.parent()
+            is not window
+        ):
+            self.pwrite_fab.setParent(
+                window
+            )
 
         self._fab_surface = window
 
@@ -994,9 +1429,14 @@ class ImageTab(QtWidgets.QWidget):
             window
         )
 
-        preview_position = preview_frame.mapTo(
-            window,
-            QPoint(0, 0),
+        preview_position = (
+            preview_frame.mapTo(
+                window,
+                QPoint(
+                    0,
+                    0,
+                ),
+            )
         )
 
         x_position = max(
@@ -1004,26 +1444,26 @@ class ImageTab(QtWidgets.QWidget):
             self.FAB_FIXED_X,
         )
 
-        # Vertically center the button against the shared preview area.
         y_position = (
-                preview_position.y()
-                + (
-                        preview_frame.height()
-                        - self.pwrite_fab.height()
-                )
-                // 2
+            preview_position.y()
+            + (
+                preview_frame.height()
+                - self.pwrite_fab.height()
+            )
+            // 2
         )
 
-        # The button must never overlap the image cards.
-        cards_top = self._cards_top_in_window(
-            window
+        cards_top = (
+            self._cards_top_in_window(
+                window
+            )
         )
 
         if cards_top is not None:
             maximum_y = (
-                    cards_top
-                    - self.pwrite_fab.height()
-                    - self.FAB_CARD_GAP
+                cards_top
+                - self.pwrite_fab.height()
+                - self.FAB_CARD_GAP
             )
 
             y_position = min(
@@ -1031,15 +1471,13 @@ class ImageTab(QtWidgets.QWidget):
                 maximum_y,
             )
 
-        y_position = max(
-            0,
-            y_position,
-        )
-
         self.pwrite_fab.move(
             QPoint(
                 x_position,
-                y_position,
+                max(
+                    0,
+                    y_position,
+                ),
             )
         )
 
@@ -1048,51 +1486,48 @@ class ImageTab(QtWidgets.QWidget):
         self.pwrite_fab.raise_()
 
     def _schedule_prompt_writer_position(
-            self,
+        self,
     ) -> None:
         QtCore.QTimer.singleShot(
             0,
             self._position_prompt_writer_button,
         )
 
-    def activate_for_tab_change(self) -> None:
-        if self._tab_active:
-            return
-        self._tab_active = True
-        self.sync_from_disk()
-        self._schedule_prompt_writer_position()
-
-    def deactivate_for_tab_change(self) -> None:
-        if not self._tab_active:
-            return
-        self.sync_to_disk()
-        self._tab_active = False
-        if hasattr(self, "pwrite_fab"):
-            self.pwrite_fab.hide()
-
     def showEvent(
-            self,
-            event: QtGui.QShowEvent,
+        self,
+        event: QtGui.QShowEvent,
     ) -> None:
         super().showEvent(event)
+
         self.activate_for_tab_change()
+        self._schedule_prompt_writer_position()
 
     def hideEvent(
-            self,
-            event: QtGui.QHideEvent,
+        self,
+        event: QtGui.QHideEvent,
     ) -> None:
         self.deactivate_for_tab_change()
+
+        if hasattr(
+            self,
+            "pwrite_fab",
+        ):
+            self.pwrite_fab.hide()
+
         super().hideEvent(event)
 
     def resizeEvent(
-            self,
-            event: QtGui.QResizeEvent,
+        self,
+        event: QtGui.QResizeEvent,
     ) -> None:
         super().resizeEvent(event)
 
         if (
-                hasattr(self, "pwrite_fab")
-                and self.isVisible()
+            hasattr(
+                self,
+                "pwrite_fab",
+            )
+            and self.isVisible()
         ):
             self._schedule_prompt_writer_position()
 
@@ -1101,13 +1536,16 @@ class ImageTab(QtWidgets.QWidget):
     # ─────────────────────────────────────────────────────────────────────
 
     def _pick_image_dialog(
-            self,
-            index: int,
+        self,
+        index: int,
     ) -> None:
         path, _selected_filter = (
             QtWidgets.QFileDialog.getOpenFileName(
                 self,
-                f"Select {self.labels[index][0]}",
+                (
+                    f"Select "
+                    f"{self.labels[index][0]}"
+                ),
                 "",
                 (
                     "Images "
@@ -1123,9 +1561,9 @@ class ImageTab(QtWidgets.QWidget):
             )
 
     def _set_image_from_drop(
-            self,
-            index: int,
-            path: str,
+        self,
+        index: int,
+        path: str,
     ) -> None:
         if os.path.isfile(path):
             self.set_image_path(
@@ -1133,15 +1571,31 @@ class ImageTab(QtWidgets.QWidget):
                 path,
             )
 
+    def _commit_image_change(
+        self,
+        reason: str,
+    ) -> None:
+        self._disk_fingerprint = (
+            image_fingerprint(
+                self._project_dir()
+            )
+        )
+
+        self.images_changed.emit(
+            reason
+        )
+
     def set_image_path(
-            self,
-            index: int,
-            source_path: str,
+        self,
+        index: int,
+        source_path: str,
     ) -> None:
         if index not in self.labels:
             return
 
-        _label, filename = self.labels[index]
+        _label, filename = (
+            self.labels[index]
+        )
 
         pages_directory = (
             self._user_pages_dir()
@@ -1152,9 +1606,11 @@ class ImageTab(QtWidgets.QWidget):
             exist_ok=True,
         )
 
-        destination_path = os.path.join(
-            pages_directory,
-            filename,
+        destination_path = (
+            os.path.join(
+                pages_directory,
+                filename,
+            )
         )
 
         try:
@@ -1168,12 +1624,17 @@ class ImageTab(QtWidgets.QWidget):
             )
 
         except Exception as error:
-            self.status.setText(
-                f"Failed to process "
-                f"{filename}: {error}"
+            self._show_temporary_status(
+                (
+                    f"Failed to process "
+                    f"{filename}: {error}"
+                ),
+                5000,
             )
 
-            self.cards[index].set_asset_state(
+            self.cards[
+                index
+            ].set_asset_state(
                 "warning"
             )
 
@@ -1184,21 +1645,26 @@ class ImageTab(QtWidgets.QWidget):
         )
 
         if pixmap.isNull():
-            self.status.setText(
-                f"Invalid image: {filename}"
+            self._show_temporary_status(
+                f"Invalid image: {filename}",
+                5000,
             )
 
-            self.cards[index].set_asset_state(
+            self.cards[
+                index
+            ].set_asset_state(
                 "warning"
             )
 
             return
 
-        self.image_paths[index] = (
-            destination_path
-        )
+        self.image_paths[
+            index
+        ] = destination_path
 
-        self.cards[index].set_pixmap(
+        self.cards[
+            index
+        ].set_pixmap(
             pixmap
         )
 
@@ -1206,18 +1672,24 @@ class ImageTab(QtWidgets.QWidget):
             pixmap
         )
 
-        self.status.setText(
+        self._commit_image_change(
+            "selected"
+        )
+
+        self._show_temporary_status(
             f"{filename} saved."
         )
 
     def clear_image(
-            self,
-            index: int,
+        self,
+        index: int,
     ) -> None:
         if index not in self.labels:
             return
 
-        _label, filename = self.labels[index]
+        _label, filename = (
+            self.labels[index]
+        )
 
         path = os.path.join(
             self._user_pages_dir(),
@@ -1229,26 +1701,35 @@ class ImageTab(QtWidgets.QWidget):
                 os.remove(path)
 
         except OSError as error:
-            self.status.setText(
-                f"Could not clear "
-                f"{filename}: {error}"
+            self._show_temporary_status(
+                (
+                    f"Could not clear "
+                    f"{filename}: {error}"
+                ),
+                5000,
             )
 
             return
 
         self.image_paths[index] = None
 
-        self.cards[index].clear_pixmap()
+        self.cards[
+            index
+        ].clear_pixmap()
 
         self.clear_preview.emit()
 
-        self.status.setText(
+        self._commit_image_change(
+            "cleared"
+        )
+
+        self._show_temporary_status(
             f"{filename} cleared."
         )
 
     def preview_from_gallery(
-            self,
-            index: int,
+        self,
+        index: int,
     ) -> None:
         if index not in self.labels:
             return
@@ -1258,7 +1739,9 @@ class ImageTab(QtWidgets.QWidget):
             self.labels[index][1],
         )
 
-        pixmap = QtGui.QPixmap(path)
+        pixmap = QtGui.QPixmap(
+            path
+        )
 
         if not pixmap.isNull():
             self.hover_preview_image.emit(
@@ -1267,7 +1750,9 @@ class ImageTab(QtWidgets.QWidget):
 
     def reset_images(self) -> None:
         for index in self.labels:
-            _label, filename = self.labels[index]
+            _label, filename = (
+                self.labels[index]
+            )
 
             path = os.path.join(
                 self._user_pages_dir(),
@@ -1281,17 +1766,27 @@ class ImageTab(QtWidgets.QWidget):
             except OSError:
                 pass
 
-            self.image_paths[index] = None
+            self.image_paths[
+                index
+            ] = None
 
-            self.cards[index].clear_pixmap()
+            self.cards[
+                index
+            ].clear_pixmap()
 
         self.clear_preview.emit()
 
-        self.status.setText(
+        self._commit_image_change(
+            "reset"
+        )
+
+        self._show_temporary_status(
             "All images cleared."
         )
 
-    def open_gallery_folder(self) -> None:
+    def open_gallery_folder(
+        self,
+    ) -> None:
         pages_directory = (
             self._user_pages_dir()
         )
@@ -1301,20 +1796,42 @@ class ImageTab(QtWidgets.QWidget):
             exist_ok=True,
         )
 
-        QDesktopServices.openUrl(
-            QUrl.fromLocalFile(
-                pages_directory
+        opened = (
+            QDesktopServices.openUrl(
+                QUrl.fromLocalFile(
+                    pages_directory
+                )
             )
         )
 
+        if opened:
+            self._show_temporary_status(
+                "Image gallery opened."
+            )
+
+        else:
+            self._show_temporary_status(
+                (
+                    "Could not open the "
+                    "image gallery folder."
+                ),
+                5000,
+            )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Temporary status and Prompt Writer bridge
+    # ─────────────────────────────────────────────────────────────────────
+
     def _show_temporary_status(
-            self,
-            message: str,
-            duration_ms: int = 3000,
+        self,
+        message: str,
+        duration_ms: int = 3000,
     ) -> None:
-        """Show the latest action briefly, then clear it."""
         self._status_clear_timer.stop()
-        self.status.setText(message)
+
+        self.status.setText(
+            message
+        )
 
         if duration_ms > 0:
             self._status_clear_timer.start(
@@ -1322,13 +1839,12 @@ class ImageTab(QtWidgets.QWidget):
             )
 
     def _track_prompt_writer_panel(
-            self,
-            panel: object,
+        self,
+        panel: object,
     ) -> None:
-        """Listen for the current Prompt Writer window closing."""
         if not isinstance(
-                panel,
-                QtWidgets.QWidget,
+            panel,
+            QtWidgets.QWidget,
         ):
             return
 
@@ -1348,13 +1864,17 @@ class ImageTab(QtWidgets.QWidget):
             closed_signal.connect(
                 self._on_prompt_writer_closed
             )
-            self._prompt_writer_panel = panel
+
+            self._prompt_writer_panel = (
+                panel
+            )
+
         except Exception:
             pass
 
     @QtCore.Slot()
     def _on_prompt_writer_closed(
-            self,
+        self,
     ) -> None:
         self._prompt_writer_panel = None
 
@@ -1363,7 +1883,7 @@ class ImageTab(QtWidgets.QWidget):
         )
 
     def _open_prompt_writer_bridge(
-            self,
+        self,
     ) -> None:
         window = self.window()
 
@@ -1375,10 +1895,13 @@ class ImageTab(QtWidgets.QWidget):
 
         if not callable(opener):
             self._show_temporary_status(
-                "Prompt Writer opener not found "
-                "on the main window.",
+                (
+                    "Prompt Writer opener "
+                    "not found on the main window."
+                ),
                 5000,
             )
+
             return
 
         existing_panel = getattr(
@@ -1388,20 +1911,25 @@ class ImageTab(QtWidgets.QWidget):
         )
 
         was_visible = (
-                isinstance(
-                    existing_panel,
-                    QtWidgets.QWidget,
-                )
-                and existing_panel.isVisible()
+            isinstance(
+                existing_panel,
+                QtWidgets.QWidget,
+            )
+            and existing_panel.isVisible()
         )
 
         try:
             opener()
+
         except Exception as error:
             self._show_temporary_status(
-                f"Could not open Prompt Writer: {error}",
+                (
+                    f"Could not open "
+                    f"Prompt Writer: {error}"
+                ),
                 5000,
             )
+
             return
 
         panel = getattr(
@@ -1415,7 +1943,25 @@ class ImageTab(QtWidgets.QWidget):
         )
 
         self._show_temporary_status(
-            "Prompt Writer focused."
-            if was_visible
-            else "Prompt Writer opened."
+            (
+                "Prompt Writer focused."
+                if was_visible
+                else "Prompt Writer opened."
+            )
         )
+
+    def shutdown(self) -> None:
+        self._status_clear_timer.stop()
+        self.pwrite_fab.hide()
+
+        try:
+            self.sync_to_disk()
+        except Exception:
+            pass
+
+
+__all__ = [
+    "ImageAssetCard",
+    "ImageTab",
+    "StaticFab",
+]

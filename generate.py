@@ -43,7 +43,6 @@ from pathlib import Path
 from typing import Optional
 
 from Template import TEMPLATE_HTML, TEMPLATE_CSS, TEMPLATE_JS
-from curtain_color import curtain_rgb_for_style, write_tinted_curtain_image
 from sound_model import (
     BUILD_SOUND_MANIFEST_NAME,
     build_sound_manifest,
@@ -159,26 +158,6 @@ def _starting_volume_from_settings(settings: dict) -> int:
     except Exception:
         v = DEFAULT_VOLUME
     return max(0, min(100, v))
-
-
-def _apply_curtain_style(
-    *,
-    settings: dict,
-    pages_src: Path,
-    controls_src: Path,
-    controls_dst: Path,
-) -> None:
-    style = str(settings.get("curtain_style", "pure_white")).strip().casefold()
-    if style in {"pure_white", "white", "blank", "original"}:
-        return
-
-    image_paths = [pages_src / name for name in REQUIRED_SLIDES]
-    rgb = curtain_rgb_for_style(image_paths, style)
-    for filename in ("cleft.png", "cright.png"):
-        source = controls_src / filename
-        target = controls_dst / filename
-        if source.is_file():
-            write_tinted_curtain_image(source, target, rgb)
 
 
 MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
@@ -340,12 +319,6 @@ def generate_play_bundle(
     # Copy pages/controls (required)
     _copy_required_files(pages_src, pages_dst, REQUIRED_SLIDES)
     _copy_required_files(controls_src, controls_dst, CONTROL_FILES)
-    _apply_curtain_style(
-        settings=settings,
-        pages_src=pages_src,
-        controls_src=controls_src,
-        controls_dst=controls_dst,
-    )
 
     # Copy message files (optional)
     if msg_html_src.is_file():
