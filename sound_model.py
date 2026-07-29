@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,20 @@ LIBRARY_FILE_NAME = "library.json"
 PROJECT_SOUND_FILE_NAME = "project_sound.json"
 CURRENT_MANIFEST_NAME = "current.json"
 BUILD_SOUND_MANIFEST_NAME = "lettersmith-sound.json"
+ATOMIC_REPLACE_TIMEOUT_SECONDS = 2.0
+
+
+def _replace_with_retry(source: Path, destination: Path) -> None:
+    """Retry brief Windows sharing violations during atomic replacement."""
+    deadline = time.monotonic() + ATOMIC_REPLACE_TIMEOUT_SECONDS
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
 
 
 def utc_now_text() -> str:
@@ -79,7 +94,7 @@ def atomic_write_json(path: str | Path, payload: dict) -> None:
     tmp = Path(tmp_name)
     try:
         tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, destination)
+        _replace_with_retry(tmp, destination)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -317,7 +332,7 @@ def atomic_copy_file(source: str | Path, destination: str | Path) -> None:
                 write_handle.write(chunk)
             write_handle.flush()
             os.fsync(write_handle.fileno())
-        os.replace(tmp, dst)
+        _replace_with_retry(tmp, dst)
     finally:
         tmp.unlink(missing_ok=True)
 

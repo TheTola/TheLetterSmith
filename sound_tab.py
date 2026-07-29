@@ -5525,15 +5525,43 @@ class SoundTab(QtWidgets.QWidget):
             and track_id
             in self.project_sound
             .ordered_ids()
+            and track_id
+            != self.project_sound
+            .state
+            .selected_track_id
         ):
+            previous_track_id = (
+                self.project_sound
+                .state
+                .selected_track_id
+            )
+
             self.project_sound.state.selected_track_id = (
                 track_id
             )
 
-            save_project_state(
-                self.project_root,
-                self.project_sound.state,
-            )
+            try:
+                save_project_state(
+                    self.project_root,
+                    self.project_sound.state,
+                )
+            except OSError as error:
+                self.project_sound.state.selected_track_id = (
+                    previous_track_id
+                )
+
+                logging.getLogger(
+                    __name__
+                ).warning(
+                    "Could not save the selected sound track: %s",
+                    error,
+                )
+
+                self._show_status(
+                    "The sound selection could not be saved. "
+                    "Please try again.",
+                    persistent=True,
+                )
 
         if track_id:
             path = self.library.path_for(
