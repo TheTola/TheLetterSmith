@@ -417,13 +417,37 @@ class HelpPopover(QFrame):
 
     def set_header_text(self, text: str) -> None:
         self.header.setText(text or "")
-        self.header.adjustSize()
-        self.adjustSize()
+        self.header.updateGeometry()
 
     def set_help_text(self, body_text: str) -> None:
         self.body.setText(body_text or "")
-        self.body.adjustSize()
-        self.adjustSize()
+        self.body.updateGeometry()
+
+    def _resize_for_width(self, width: int) -> None:
+        layout = self.layout()
+        margins = layout.contentsMargins()
+        frame = self.frameWidth() * 2
+        content_width = max(
+            1,
+            int(width) - margins.left() - margins.right() - frame,
+        )
+
+        heights = []
+        for label in (self.header, self.body):
+            height = label.heightForWidth(content_width)
+            if height < 0:
+                height = label.sizeHint().height()
+            label.setFixedSize(content_width, max(1, height))
+            heights.append(max(1, height))
+
+        total_height = (
+            margins.top()
+            + margins.bottom()
+            + frame
+            + sum(heights)
+            + layout.spacing()
+        )
+        self.setFixedSize(int(width), total_height)
 
     def popup_at(self, anchor_global: QPoint, prefer_left: bool, parent: QtWidgets.QWidget, icon_px: int = HELP_ICON_PX):
         """
@@ -433,9 +457,9 @@ class HelpPopover(QFrame):
         If this widget is a top-level (Qt.ToolTip), we must move in GLOBAL coords.
         If it's a child widget, we move in PARENT-LOCAL coords.
         """
-        self.adjustSize()
-        width = min(420, max(320, self.sizeHint().width()))
-        self.resize(width, self.sizeHint().height())
+        ideal_width = self.sizeHint().width()
+        width = min(420, max(320, ideal_width))
+        self._resize_for_width(width)
 
         margin = 8
         is_tooltip = bool(self.windowFlags() & Qt.ToolTip)
