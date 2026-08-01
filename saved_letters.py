@@ -61,6 +61,7 @@ from transactional_io import (
 
 
 METADATA_VERSION = 3
+LAST_ACTIVITY_AT_KEY = "last_activity_at"
 RESTORABLE_SETTING_KEYS = (
     "starting_volume",
     "music_volume",
@@ -120,6 +121,19 @@ def _valid_uuid(value: object) -> str:
         return str(uuid.UUID(str(value)))
     except (ValueError, TypeError, AttributeError):
         return ""
+
+
+def _activity_datetime(metadata: dict[str, Any], path: Path) -> datetime:
+    raw_value = str(metadata.get(LAST_ACTIVITY_AT_KEY, "")).strip()
+    if raw_value:
+        try:
+            parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return datetime.fromtimestamp(parsed.timestamp())
+        except (ValueError, OverflowError, OSError):
+            pass
+    return datetime.fromtimestamp(path.stat().st_mtime)
 
 
 @dataclass(frozen=True)
@@ -446,7 +460,7 @@ class SavedLetterCatalog:
             path=path,
             recipient=recipient,
             title=title,
-            modified_at=datetime.fromtimestamp(path.stat().st_mtime),
+            modified_at=_activity_datetime(metadata, path),
             published_url=normalize_published_page_url(
                 metadata.get("published_page_url", "")
             ),
@@ -1199,8 +1213,28 @@ def update_saved_metadata(
     return metadata
 
 
+def record_saved_letter_activity(
+    play_dir: str | Path,
+    *,
+    when: Optional[datetime] = None,
+) -> str:
+    """Record user-driven Preview, Publish, or public-URL activity."""
+    destination = Path(play_dir).resolve()
+    if not destination.is_dir():
+        raise FileNotFoundError(f"Saved letter does not exist: {destination}")
+    moment = when or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    timestamp = moment.astimezone(timezone.utc).isoformat()
+    metadata = _read_metadata(destination)
+    metadata[LAST_ACTIVITY_AT_KEY] = timestamp
+    atomic_write_json(destination / PLAY_METADATA_FILE, metadata)
+    return timestamp
+
+
 __all__ = [
     "METADATA_VERSION",
+    "LAST_ACTIVITY_AT_KEY",
     "RESTORABLE_SETTING_KEYS",
     "RecipientAssignmentRequired",
     "RestoredProject",
@@ -1208,6 +1242,7 @@ __all__ = [
     "SavedLetterCatalog",
     "SavedLetterDeleteError",
     "SavedLetterRestoreError",
+    "record_saved_letter_activity",
     "SavedLetterRestorer",
     "update_saved_metadata",
 ]
