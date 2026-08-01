@@ -46,6 +46,7 @@ class ArtworkButton(QtWidgets.QPushButton):
         self._artwork_path = button_art_path(project_root, artwork_filename)
         self._artwork = QtGui.QPixmap(str(self._artwork_path))
         self._artwork_fill = False
+        self._artwork_stretch = False
         self._hovered = False
         self.setCursor(QtCore.Qt.PointingHandCursor)
         font = self.font()
@@ -73,6 +74,11 @@ class ArtworkButton(QtWidgets.QPushButton):
     def set_artwork_fill(self, enabled: bool) -> None:
         """Opt into aspect-preserving cover scaling for padded artwork."""
         self._artwork_fill = bool(enabled)
+        self.update()
+
+    def set_artwork_stretch(self, enabled: bool) -> None:
+        """Fit the complete artwork canvas without cropping its edges."""
+        self._artwork_stretch = bool(enabled)
         self.update()
 
     def sizeHint(self) -> QtCore.QSize:  # type: ignore[override]
@@ -106,9 +112,13 @@ class ArtworkButton(QtWidgets.QPushButton):
             content.translate(0, 2)
 
         aspect_mode = (
-            QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding
-            if self._artwork_fill
-            else QtCore.Qt.AspectRatioMode.KeepAspectRatio
+            QtCore.Qt.AspectRatioMode.IgnoreAspectRatio
+            if self._artwork_stretch
+            else (
+                QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding
+                if self._artwork_fill
+                else QtCore.Qt.AspectRatioMode.KeepAspectRatio
+            )
         )
         scaled = self._artwork.scaled(
             content.size(),
@@ -121,7 +131,11 @@ class ArtworkButton(QtWidgets.QPushButton):
             scaled.width(),
             scaled.height(),
         )
-        target = content if self._artwork_fill else pixmap_target
+        target = (
+            content
+            if self._artwork_fill or self._artwork_stretch
+            else pixmap_target
+        )
 
         painter.setOpacity(0.72 if not self.isEnabled() else (1.0 if self._hovered else 0.94))
         if self._artwork_fill:

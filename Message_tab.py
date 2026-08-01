@@ -218,6 +218,7 @@ class DropMessageButton(ArtworkButton):
             QtWidgets.QSizePolicy.Fixed,
         )
         self.set_artwork_fill(True)
+        self.set_artwork_stretch(True)
         self.setAcceptDrops(True)
         self.setAccessibleName("Import")
         self.setToolTip(
@@ -515,6 +516,7 @@ class MessageTab(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Fixed,
         )
         self.edit_btn.set_artwork_fill(True)
+        self.edit_btn.set_artwork_stretch(True)
         self.edit_btn.setFont(QFont("Segoe UI Semibold", 24, QFont.Bold))
         if not self.edit_btn.has_artwork:
             self.edit_btn.setStyleSheet(compact_button_style)
@@ -532,6 +534,7 @@ class MessageTab(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Fixed,
         )
         self.revisions_btn.set_artwork_fill(True)
+        self.revisions_btn.set_artwork_stretch(True)
         self.revisions_btn.setFont(QFont("Segoe UI Semibold", 24, QFont.Bold))
         if not self.revisions_btn.has_artwork:
             self.revisions_btn.setStyleSheet(compact_button_style)
