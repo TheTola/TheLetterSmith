@@ -362,6 +362,7 @@ class ForgeTab(QtWidgets.QWidget):
     letter_loaded = QtCore.Signal(dict)
     preview_requested = QtCore.Signal(str, str)
     preview_files_release_requested = QtCore.Signal()
+    project_files_release_requested = QtCore.Signal()
     preview_visibility_changed = QtCore.Signal(bool)
     published_url_changed = QtCore.Signal(str)
     _settings_refresh_requested = QtCore.Signal()
@@ -963,6 +964,7 @@ class ForgeTab(QtWidgets.QWidget):
             return
 
         previous_identity = self.project_state.identity
+        self._release_project_files_for_restore()
         self.project_state.transition(
             ApplicationState.PROJECT_LOADING
         )
@@ -996,6 +998,7 @@ class ForgeTab(QtWidgets.QWidget):
             self.project_state.transition(
                 ApplicationState.PROJECT_MIGRATING
             )
+        self._release_project_files_for_restore()
         self.project_state.transition(
             ApplicationState.PROJECT_LOADING
         )
@@ -1146,6 +1149,7 @@ class ForgeTab(QtWidgets.QWidget):
                 ApplicationState.RECIPIENT_REQUIRED
             )
             return
+        self._release_project_files_for_restore()
         self.project_state.transition(
             ApplicationState.PROJECT_LOADING
         )
@@ -1160,6 +1164,11 @@ class ForgeTab(QtWidgets.QWidget):
             )
             return
         self._complete_restore(restored)
+
+    def _release_project_files_for_restore(self) -> None:
+        """Release live viewers and media before replacing project folders."""
+        self.preview_files_release_requested.emit()
+        self.project_files_release_requested.emit()
 
     def _complete_restore(self, restored: object) -> None:
         if not isinstance(restored, RestoredProject):

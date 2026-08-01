@@ -1124,6 +1124,9 @@ class Nexus(QtWidgets.QMainWindow):
         self.forge_tab.preview_files_release_requested.connect(
             self._release_forge_preview_files
         )
+        self.forge_tab.project_files_release_requested.connect(
+            self._release_project_files_for_restore
+        )
         self.forge_tab.published_url_changed.connect(
             lambda url: self.message_tab.set_published_page_url(
                 url,
@@ -1195,6 +1198,17 @@ class Nexus(QtWidgets.QMainWindow):
             self.application_stack.setCurrentWidget(self.body)
             self.status("Ready.")
             self.toast("Welcome to Letter Smith")
+            return
+
+        if (
+            state in {
+                ApplicationState.PROJECT_LOADING,
+                ApplicationState.PROJECT_MIGRATING,
+            }
+            and self.application_stack.currentWidget() is self.body
+        ):
+            self.body.setEnabled(False)
+            self.status("Loading saved letter…")
             return
 
         self.body.setEnabled(False)
@@ -1927,6 +1941,14 @@ class Nexus(QtWidgets.QMainWindow):
         self.preview_caption.setVisible(False)
         self.html_preview.stop()
         self.html_preview.setUrl(QUrl("about:blank"))
+
+    def _release_project_files_for_restore(self) -> None:
+        """Release project-owned media handles before an atomic restore."""
+        try:
+            self.sound_tab.deactivate_for_tab_change()
+            self.sound_tab.release_current_file_handle()
+        except Exception:
+            _LOGGER.exception("Sound files could not be released before restore.")
 
     def restart_forge_preview(self, _reason: str = "") -> None:
         """Reset playback so every Forge entry starts at the curtain."""
