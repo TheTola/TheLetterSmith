@@ -21,10 +21,11 @@ from publishing.expiration import (
     PUBLICATION_TTL_DAYS,
     PUBLISHED_AT_KEY,
     PUBLISHED_EXPIRES_AT_KEY,
+    is_publication_expired,
     publication_window,
 )
 from publishing.models import PublishConfiguration, PublishResult
-from settings_store import SettingsStore
+from settings_store import PUBLISHED_PAGE_URL_KEY, SettingsStore
 from transactional_io import PathTransaction, atomic_write_text
 
 
@@ -613,6 +614,106 @@ class GitHubPagesPublisher(Publisher):
                     )
                 ),
                 technical_details=details,
+            )
+
+    def cleanup_expired(
+        self,
+        public_path: str,
+        expires_at: object,
+        *,
+        now: datetime | None = None,
+    ) -> PublishResult:
+        """Remove one verified expired publication from its owning workspace."""
+        public_path = str(public_path).strip()
+        if (
+            not public_path
+            or Path(public_path).name != public_path
+            or public_path in {".", ".."}
+            or not is_publication_expired(expires_at, now=now)
+        ):
+            return PublishResult(
+                False,
+                public_path=public_path,
+                message="The publication is not eligible for cleanup.",
+            )
+        if not self.is_configured():
+            return PublishResult(
+                False,
+                public_path=public_path,
+                message="GitHub Pages publishing is not configured.",
+            )
+
+        settings = self.settings.snapshot()
+        workspace = Path(str(settings[WORKSPACE_KEY])).resolve()
+        branch = str(settings.get(BRANCH_KEY, DEFAULT_BRANCH))
+        letters_root = (workspace / "letters").resolve()
+        destination = letters_root / public_path
+        transaction: PathTransaction | None = None
+        try:
+            if destination.resolve().parent != letters_root:
+                raise ValueError("The publication path escaped the letters directory.")
+            if destination.is_symlink():
+                raise ValueError("Symbolic-link publications cannot be removed safely.")
+            marker_path = destination / PUBLICATION_MARKER
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(marker, dict)
+                or marker.get("public_path") != public_path
+                or not is_publication_expired(marker.get("expires_at"), now=now)
+            ):
+                raise ValueError("The hosted publication marker did not verify expiration.")
+            if not destination.is_dir():
+                raise FileNotFoundError(destination)
+
+            transaction = PathTransaction(
+                destination,
+                staging_suffix=".cleanup-staging",
+                backup_suffix=".cleanup-backup",
+            )
+            transaction.prepare()
+            transaction.commit(replace=False, keep_backup=True)
+            relative = destination.relative_to(workspace).as_posix()
+            self._run(("git", "add", "--all", "--", relative), cwd=workspace)
+            self._run(
+                (
+                    "git",
+                    "commit",
+                    "--only",
+                    "-m",
+                    f"Expire letter publication: {public_path}",
+                    "--",
+                    relative,
+                ),
+                cwd=workspace,
+            )
+            self._run(("git", "push", "origin", branch), cwd=workspace)
+            transaction.finalize()
+            expected_url = github_pages_url(str(settings[REPOSITORY_KEY]), public_path)
+            if settings.get(PUBLISHED_PAGE_URL_KEY, "") == expected_url:
+                self.settings.update_fields(
+                    **{
+                        PUBLISHED_PAGE_URL_KEY: "",
+                        PUBLISHED_AT_KEY: "",
+                        PUBLISHED_EXPIRES_AT_KEY: "",
+                    }
+                )
+            return PublishResult(
+                True,
+                public_path=public_path,
+                message="Expired publication removed.",
+            )
+        except Exception as error:
+            _LOGGER.exception("Expired publication cleanup failed for %s", public_path)
+            if transaction is not None:
+                try:
+                    transaction.rollback()
+                except OSError:
+                    _LOGGER.exception("Expired publication rollback failed for %s", public_path)
+            return PublishResult(
+                False,
+                public_path=public_path,
+                message="The expired publication could not be removed.",
+                technical_details=f"{type(error).__name__}: {error}",
             )
 
     @staticmethod

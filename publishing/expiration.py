@@ -32,6 +32,17 @@ def parse_publication_timestamp(value: object) -> datetime | None:
         return None
 
 
+def is_publication_expiration_malformed(value: object) -> bool:
+    return bool(str(value).strip()) and parse_publication_timestamp(value) is None
+
+
+def publication_expiry_label(value: object) -> str:
+    expiry = parse_publication_timestamp(value)
+    if expiry is None:
+        return ""
+    return f"Expires {expiry.astimezone().strftime('%b %d, %Y at %I:%M %p %Z')}"
+
+
 def publication_window(
     published_at: datetime | None = None,
     *,
@@ -59,6 +70,8 @@ __all__ = [
     "PUBLISHED_AT_KEY",
     "PUBLISHED_EXPIRES_AT_KEY",
     "is_publication_expired",
+    "is_publication_expiration_malformed",
     "parse_publication_timestamp",
+    "publication_expiry_label",
     "publication_window",
 ]
