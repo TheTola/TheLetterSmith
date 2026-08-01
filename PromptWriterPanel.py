@@ -7,6 +7,7 @@ from __future__ import annotations
 import sys
 import hashlib
 import json
+import logging
 import random
 import re
 import uuid
@@ -25,6 +26,7 @@ from window_chrome import StandardTitleBar
 
 
 VISIONARY_URL = "https://chatgpt.com/g/g-68ce5925196c8191a222e24d29323813-the-visionary"
+LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------
@@ -1394,6 +1396,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._generated_prompts: Dict[str, str] = {}
         self._generated_input_signature = ""
         self._generated_output_valid = False
+        self._generation_in_progress = False
         self._reference_images: List[ReferenceImage] = []
         self._references_visible = True
         self._reference_html_encode_failures: List[str] = []
@@ -1658,7 +1661,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             for ref in self._reference_images[:REFERENCE_IMAGE_MAX_COUNT]
         ]
 
-    def _persist_state_now(self) -> None:
+    def _persist_state_now(self) -> bool:
         """Persist Prompt Writer selections + outputs.
 
         Writes to prompt_writer_state.json so other tabs writing settings.json
@@ -1671,8 +1674,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
             temp_path = self._state_path.with_name(f".{self._state_path.name}.tmp")
             temp_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
             temp_path.replace(self._state_path)
+            return True
         except Exception:
-            pass
+            LOGGER.exception("Prompt Writer state persistence failed: %s", self._state_path)
+            return False
 
     def _normalize_persisted_state(self, state: object) -> dict:
         if not isinstance(state, dict):
@@ -2873,73 +2878,104 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def _set_last_focused(self, widget: QtWidgets.QTextEdit):
         self._last_focused_widget = widget
 
+    def _set_generation_busy(self, busy: bool) -> None:
+        self._generation_in_progress = bool(busy)
+        for name in ("btn_generate", "btn_erase", "btn_add_reference"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(not busy)
+        if busy:
+            self.btn_copy.setEnabled(False)
+            for page in self._page_specs:
+                if page.copy_button is not None:
+                    page.copy_button.setEnabled(False)
+        else:
+            self._set_generated_output_valid(self._generated_output_valid)
+
     def _on_generate(self):
+        if self._generation_in_progress:
+            return
         subject = self.cmb_subject.currentText().strip()
         if not subject:
             QtWidgets.QMessageBox.warning(self, "Missing subject", "Please enter a Subject.")
             return
 
-        t = self.cmb_type.currentText()
-        if t == NONE_CHOICE_LABEL:
-            t = None
-        c = self._get_color_choice()
-        guidance = self._collect_guidance()
-        global_extra = self.txt_global.toPlainText().strip()
-        per_extras = {
-            page.key: page.detail_widget.toPlainText().strip()
-            if page.detail_widget is not None
-            else ""
-            for page in self._page_specs
-        }
+        self._set_generation_busy(True)
+        try:
+            t = self.cmb_type.currentText()
+            if t == NONE_CHOICE_LABEL:
+                t = None
+            c = self._get_color_choice()
+            guidance = self._collect_guidance()
+            global_extra = self.txt_global.toPlainText().strip()
+            per_extras = {
+                page.key: page.detail_widget.toPlainText().strip()
+                if page.detail_widget is not None
+                else ""
+                for page in self._page_specs
+            }
 
-        prompts: Dict[str, str] = {}
-        debug_map: Dict[str, dict] = {}
-        per_data_map: Dict[str, dict] = {}
-        shared_prompt_data = self._roll_shared_prompt_data()
+            prompts: Dict[str, str] = {}
+            debug_map: Dict[str, dict] = {}
+            per_data_map: Dict[str, dict] = {}
+            shared_prompt_data = self._roll_shared_prompt_data()
 
-        for page in self._page_specs:
-            per_image_data = dict(shared_prompt_data)
-            per_data_map[page.key] = per_image_data
-            prompt, payload, dbg = assemble_prompt_for_image(
-                subject,
-                per_image_data,
-                page.key,
-                type_choice=t,
-                color_choice=c,
-                guidance=guidance,
-                global_extra=global_extra,
-                image_extra=per_extras.get(page.key, ""),
+            for page in self._page_specs:
+                per_image_data = dict(shared_prompt_data)
+                per_data_map[page.key] = per_image_data
+                prompt, payload, dbg = assemble_prompt_for_image(
+                    subject,
+                    per_image_data,
+                    page.key,
+                    type_choice=t,
+                    color_choice=c,
+                    guidance=guidance,
+                    global_extra=global_extra,
+                    image_extra=per_extras.get(page.key, ""),
+                )
+                prompts[page.key] = prompt
+                per_data_map[page.key]["payload"] = payload
+                debug_map[page.key] = dbg
+
+            self._generated_prompts = dict(prompts)
+            self._generated_input_signature = self._current_prompt_input_signature()
+            self._set_generated_output_valid(True)
+
+            for page in self._page_specs:
+                if page.preview_widget is None:
+                    continue
+                payload = per_data_map.get(page.key, {}).get("payload")
+                if not isinstance(payload, PromptPayload):
+                    continue
+                page.preview_widget.setHtml(render_prompt_html(payload))
+
+            self.prompts_generated.emit(
+                {
+                    page.display_label: prompts[page.key]
+                    for page in self._page_specs
+                    if page.key in prompts
+                },
+                {
+                    page.display_label: debug_map[page.key]
+                    for page in self._page_specs
+                    if page.key in debug_map
+                },
             )
-            prompts[page.key] = prompt
-            per_data_map[page.key]["payload"] = payload
-            debug_map[page.key] = dbg
-
-        self._generated_prompts = dict(prompts)
-        self._generated_input_signature = self._current_prompt_input_signature()
-        self._set_generated_output_valid(True)
-
-        for page in self._page_specs:
-            if page.preview_widget is None:
-                continue
-            payload = per_data_map.get(page.key, {}).get("payload")
-            if not isinstance(payload, PromptPayload):
-                continue
-            html_view = render_prompt_html(payload)
-            page.preview_widget.setHtml(html_view)
-
-        self.prompts_generated.emit(
-            {
-                page.display_label: prompts[page.key]
-                for page in self._page_specs
-                if page.key in prompts
-            },
-            {
-                page.display_label: debug_map[page.key]
-                for page in self._page_specs
-                if page.key in debug_map
-            },
-        )
-        self._persist_state_now()
+            if not self._persist_state_now():
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Prompts generated",
+                    "The prompts were generated, but the latest Prompt Writer state could not be saved.",
+                )
+        except Exception:
+            LOGGER.exception("Prompt Writer generation failed")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Generation failed",
+                "The prompts could not be generated. Your previous generated prompts were kept.",
+            )
+        finally:
+            self._set_generation_busy(False)
 
     def _roll_data_for_image(self) -> dict:
         return self._roll_shared_prompt_data()
