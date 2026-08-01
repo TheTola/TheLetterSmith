@@ -192,6 +192,7 @@ class SavedLetterCatalog:
     def list_entries(self) -> tuple[SavedLetter, ...]:
         entries: list[SavedLetter] = []
         seen: set[Path] = set()
+        seen_project_ids: set[str] = set()
         for root, recovery in (
             (self.play_root, False),
             (self.recovery_root, True),
@@ -204,10 +205,26 @@ class SavedLetterCatalog:
                     path.relative_to(root)
                 except ValueError:
                     continue
-                if path in seen or not self._is_valid_candidate(path):
+                if path in seen:
+                    continue
+                try:
+                    if not self._is_valid_candidate(path):
+                        continue
+                    entry = self._entry(path, recovery=recovery)
+                except Exception:
+                    _LOGGER.warning(
+                        "Skipping unreadable saved-letter candidate: %s",
+                        path,
+                        exc_info=True,
+                    )
                     continue
                 seen.add(path)
-                entries.append(self._entry(path, recovery=recovery))
+                project_id = str(getattr(entry, "project_id", "") or "").strip()
+                if project_id and project_id in seen_project_ids:
+                    continue
+                if project_id:
+                    seen_project_ids.add(project_id)
+                entries.append(entry)
         entries.sort(
             key=lambda entry: (entry.modified_at, entry.title.casefold()),
             reverse=True,
