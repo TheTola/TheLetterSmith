@@ -68,6 +68,34 @@ def atomic_write_json(
     return atomic_write_text(path, payload)
 
 
+def safe_write_json(
+    path: str | Path,
+    value: Mapping[str, Any],
+    *,
+    validator: Optional[Callable[[Mapping[str, Any]], None]] = None,
+    indent: int = 2,
+) -> Path:
+    """Validate JSON from a private staging file before replacing ``path``."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _temporary_path(target)
+    payload = json.dumps(dict(value), indent=indent, ensure_ascii=False) + "\n"
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        parsed = json.loads(temporary.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("validated JSON must contain an object")
+        if validator is not None:
+            validator(parsed)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
 def create_staging_directory(
     parent: str | Path,
     *,
@@ -279,6 +307,7 @@ __all__ = [
     "PathTransaction",
     "atomic_write_bytes",
     "atomic_write_json",
+    "safe_write_json",
     "atomic_write_text",
     "cleanup_abandoned_staging",
     "create_staging_directory",

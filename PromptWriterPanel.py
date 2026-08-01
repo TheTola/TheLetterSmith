@@ -23,6 +23,7 @@ from PySide6.QtWidgets import QGraphicsDropShadowEffect
 
 from app_icon import apply_qt_window_icon, configure_windows_app_identity
 from window_chrome import StandardTitleBar
+from transactional_io import atomic_write_text, safe_write_json
 
 
 VISIONARY_URL = "https://chatgpt.com/g/g-68ce5925196c8191a222e24d29323813-the-visionary"
@@ -39,6 +40,7 @@ PROMPT_WRITER_STATE_VERSION = 5
 PROMPT_LANGUAGE_VERSION = 2
 STATE_PERSIST_DEBOUNCE_MS = 350
 MAX_STATE_TEXT_LENGTH = 24000
+MAX_GENERATED_PROMPT_LENGTH = 24000
 REFERENCE_IMAGE_MAX_COUNT = 3
 REFERENCE_IMAGE_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 REFERENCE_IMAGE_ROLES: Tuple[str, ...] = (
@@ -74,6 +76,12 @@ COL_HEADER_TEXT = "#365be8"  # DARK CATEGORY BLUE, SLIGHTLY BRIGHTER THAN ROYAL 
 MANAGED_LIST_HEADER_ROLE = Qt.UserRole + 41
 NONE_CHOICE_LABEL = "— none —"
 USER_ADDED_HEADER = "User Added"
+HIDDEN_STYLE_DEFAULT = (
+    "Apply no additional style bias beyond the selected Graphics and Illustration style."
+)
+HIDDEN_FRAMING_DEFAULT = (
+    "Use the framing that best serves the composition; do not force a close-up, full-body, or wide-scene view."
+)
 
 COLOR_GROUP_HEADERS: Tuple[str, ...] = (
     "Strange / Interpretive Color Schemes",
@@ -220,21 +228,13 @@ BUILT_IN_CHECK_KEYS: Tuple[str, ...] = (
     "real",
     "paint",
     "minimal",
-    "neutral_style",
-) + tuple(key for key, _, _ in POLICY_DETAIL_OPTION_SPECS) + (
-    "unspecified_framing",
-)
+) + tuple(key for key, _, _ in POLICY_DETAIL_OPTION_SPECS)
 
 EXCLUSIVE_CHECK_GROUPS: Tuple[Tuple[str, ...], ...] = (
     ("black", "white"),
-    ("real", "paint", "minimal", "neutral_style"),
-    ("close_up_focus", "full_body_view", "wide_scene", "unspecified_framing"),
+    ("real", "paint", "minimal"),
+    ("close_up_focus", "full_body_view", "wide_scene"),
 )
-
-EXCLUSIVE_CHECK_DEFAULTS: Dict[Tuple[str, ...], str] = {
-    EXCLUSIVE_CHECK_GROUPS[1]: "neutral_style",
-    EXCLUSIVE_CHECK_GROUPS[2]: "unspecified_framing",
-}
 
 
 def _normalize_exclusive_check_states(checks_raw: object) -> Dict[str, bool]:
@@ -243,10 +243,8 @@ def _normalize_exclusive_check_states(checks_raw: object) -> Dict[str, bool]:
 
     for group in EXCLUSIVE_CHECK_GROUPS:
         selected = next((key for key in group if checks[key]), None)
-        if selected is None:
-            selected = EXCLUSIVE_CHECK_DEFAULTS.get(group)
         for key in group:
-            checks[key] = key == selected
+            checks[key] = selected is not None and key == selected
 
     return checks
 
@@ -311,6 +309,7 @@ class ReferenceImage:
 class ManagedListEntry:
     text: str
     is_header: bool = False
+    is_user: bool = False
 
 
 class HeaderAwareItemDelegate(QtWidgets.QStyledItemDelegate):
@@ -343,12 +342,17 @@ class ListManagerDialog(QtWidgets.QDialog):
         entries: List[ManagedListEntry],
         allow_headers: bool = False,
         auto_user_header: Optional[str] = None,
+        user_owned_only: bool = False,
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self._entries: List[ManagedListEntry] = [ManagedListEntry(entry.text, entry.is_header) for entry in entries]
+        self._entries: List[ManagedListEntry] = [
+            ManagedListEntry(entry.text, entry.is_header, entry.is_user)
+            for entry in entries
+        ]
         self._allow_headers = bool(allow_headers)
         self._auto_user_header = _normalize_text(auto_user_header, strip=True, max_length=120)
+        self._user_owned_only = bool(user_owned_only)
         self.setWindowTitle(f"Manage {title}")
         self.setModal(False)
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
@@ -493,6 +497,22 @@ class ListManagerDialog(QtWidgets.QDialog):
     def _is_selectable_row(self, row: int) -> bool:
         return 0 <= row < len(self._entries) and not self._entries[row].is_header
 
+    def _is_editable_row(self, row: int) -> bool:
+        return self._is_selectable_row(row) and (
+            not self._user_owned_only or self._entries[row].is_user
+        )
+
+    def _duplicate_conflict(self, text: str, *, exclude_row: int = -1) -> Optional[str]:
+        candidate = _managed_entry_key(text)
+        if not candidate:
+            return None
+        for index, entry in enumerate(self._entries):
+            if index == exclude_row or entry.is_header:
+                continue
+            if _managed_entry_key(entry.text) == candidate:
+                return entry.text
+        return None
+
     def _nearest_selectable_row(self, preferred_row: int) -> int:
         if self._is_selectable_row(preferred_row):
             return preferred_row
@@ -577,26 +597,33 @@ class ListManagerDialog(QtWidgets.QDialog):
                 self.entry_edit.clear()
         else:
             self.entry_edit.clear()
+        self._sync_editor_from_selection(self._selected_row())
         self._sync_button_state()
 
     def _sync_editor_from_selection(self, row: int) -> None:
         if self._is_selectable_row(row):
             entry = self._entries[row]
             self.entry_edit.setText(entry.text)
+            self.entry_edit.setReadOnly(self._user_owned_only and not entry.is_user)
         else:
             self.entry_edit.clear()
+            self.entry_edit.setReadOnly(False)
         self._sync_button_state()
 
     def _sync_button_state(self) -> None:
         has_selection = self._is_selectable_row(self._selected_row())
-        self.btn_update.setEnabled(has_selection)
-        self.btn_remove.setEnabled(has_selection)
+        editable = self._is_editable_row(self._selected_row())
+        self.btn_update.setEnabled(editable)
+        self.btn_remove.setEnabled(editable)
 
     def _emit_entries_changed(self) -> None:
-        self.entries_changed.emit([ManagedListEntry(entry.text, entry.is_header) for entry in self._entries])
+        self.entries_changed.emit([
+            ManagedListEntry(entry.text, entry.is_header, entry.is_user)
+            for entry in self._entries
+        ])
 
     def _submit_from_enter(self) -> None:
-        if self._is_selectable_row(self._selected_row()):
+        if self._is_editable_row(self._selected_row()):
             self._update_entry()
         else:
             self._add_entry()
@@ -604,28 +631,45 @@ class ListManagerDialog(QtWidgets.QDialog):
     def _add_entry(self) -> None:
         entry = self._current_form_entry()
         if entry is None:
+            QtWidgets.QMessageBox.warning(self, "Invalid entry", "Enter a non-empty option.")
+            return
+        conflict = self._duplicate_conflict(entry.text)
+        if conflict is not None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Duplicate option",
+                f"That option conflicts with the existing entry: {conflict}",
+            )
             return
         if self._allow_headers and self._auto_user_header:
-            insert_at = self._insert_under_auto_header(ManagedListEntry(entry.text, False))
+            insert_at = self._insert_under_auto_header(ManagedListEntry(entry.text, False, True))
         else:
             row = self._selected_row()
             insert_at = row + 1 if row >= 0 else len(self._entries)
-            self._entries.insert(insert_at, ManagedListEntry(entry.text, False))
+            self._entries.insert(insert_at, ManagedListEntry(entry.text, False, True))
         self._refresh_list(insert_at)
         self._emit_entries_changed()
 
     def _update_entry(self) -> None:
         row = self._selected_row()
         entry = self._current_form_entry()
-        if row < 0 or entry is None:
+        if row < 0 or entry is None or not self._is_editable_row(row):
             return
-        self._entries[row] = entry
+        conflict = self._duplicate_conflict(entry.text, exclude_row=row)
+        if conflict is not None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Duplicate option",
+                f"That option conflicts with the existing entry: {conflict}",
+            )
+            return
+        self._entries[row] = ManagedListEntry(entry.text, False, self._entries[row].is_user)
         self._refresh_list(row)
         self._emit_entries_changed()
 
     def _remove_entry(self) -> None:
         row = self._selected_row()
-        if not self._is_selectable_row(row):
+        if not self._is_editable_row(row):
             return
         del self._entries[row]
         self._cleanup_auto_header()
@@ -764,6 +808,13 @@ def _clean_user_added_entry(value: object) -> str:
     return "".join(out).strip()
 
 
+def _managed_entry_key(value: object) -> str:
+    text = _clean_user_added_entry(value)
+    text = text.replace("\u2018", "'").replace("\u2019", "'").replace("`", "'")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.casefold()
+
+
 def _normalize_guidance_lines(guidance: Optional[List[str]]) -> Tuple[str, ...]:
     return tuple(
         _as_prompt_sentence(line, max_length=400)
@@ -792,6 +843,7 @@ def _clean_header_text(line: str) -> str:
 
 def _parse_managed_list_entries(lines: List[str], *, allow_headers: bool) -> List[ManagedListEntry]:
     entries: List[ManagedListEntry] = []
+    seen: set[tuple[str, bool]] = set()
     for raw_line in lines:
         stripped = _normalize_text(raw_line, strip=True, max_length=300)
         if not stripped:
@@ -800,12 +852,16 @@ def _parse_managed_list_entries(lines: List[str], *, allow_headers: bool) -> Lis
             if not allow_headers:
                 continue
             header_text = _clean_header_text(stripped)
-            if header_text:
+            key = (header_text.casefold(), True)
+            if header_text and key not in seen:
                 entries.append(ManagedListEntry(text=header_text, is_header=True))
+                seen.add(key)
             continue
         item_text = _clean_choice_line(stripped)
-        if item_text:
+        key = (_managed_entry_key(item_text), False)
+        if item_text and key not in seen:
             entries.append(ManagedListEntry(text=item_text, is_header=False))
+            seen.add(key)
     return entries
 
 
@@ -841,6 +897,8 @@ def _parse_color_list_entries(lines: List[str]) -> List[ManagedListEntry]:
     unnamed_index = 0
     user_items: List[ManagedListEntry] = []
 
+    seen_headers: set[str] = set()
+    seen_items: set[str] = set()
     for header, items in groups:
         is_user = bool(header and header.casefold() == USER_ADDED_HEADER.casefold())
         if is_user:
@@ -855,11 +913,22 @@ def _parse_color_list_entries(lines: List[str]) -> List[ManagedListEntry]:
                 else f"Color Group {unnamed_index + 1}"
             )
             unnamed_index += 1
-        entries.append(ManagedListEntry(display_header, True))
-        entries.extend(items)
+        header_key = display_header.casefold()
+        if header_key not in seen_headers:
+            entries.append(ManagedListEntry(display_header, True))
+            seen_headers.add(header_key)
+        for item in items:
+            item_key = _managed_entry_key(item.text)
+            if item_key and item_key not in seen_items:
+                entries.append(ManagedListEntry(item.text, False, False))
+                seen_items.add(item_key)
 
     entries.append(ManagedListEntry(USER_ADDED_HEADER, True))
-    entries.extend(user_items)
+    for item in user_items:
+        item_key = _managed_entry_key(item.text)
+        if item_key and item_key not in seen_items:
+            entries.append(ManagedListEntry(item.text, False, True))
+            seen_items.add(item_key)
     return entries
 
 
@@ -978,45 +1047,25 @@ def _file_signature(path: Path) -> Optional[Tuple[int, int]]:
     return stat.st_mtime_ns, stat.st_size
 
 
-def _candidate_paths_for(name: str) -> List[Path]:
-    candidates: List[Path] = []
-    candidates.append(PROMPTER_ROOT / "Prompter" / "modules" / name)
-    candidates.append(PROMPTER_ROOT / "modules" / name)
-    candidates.append(PROMPTER_ROOT / name)
-    p = PROMPTER_ROOT
-    for _ in range(3):
-        p = p.parent
-        candidates.append(p / "Prompter" / "modules" / name)
-        candidates.append(p / "modules" / name)
-        candidates.append(p / name)
-    cwd = Path.cwd()
-    candidates.append(cwd / "Prompter" / "modules" / name)
-    candidates.append(cwd / "modules" / name)
-    candidates.append(cwd / name)
-
-    seen = set()
-    out: List[Path] = []
-    for c in candidates:
-        try:
-            key = str(c.resolve())
-        except Exception:
-            key = str(c)
-        if key not in seen:
-            seen.add(key)
-            out.append(c)
-    return out
+def _candidate_paths_for(name: str | Path) -> List[Path]:
+    path = Path(name)
+    if not path.is_absolute():
+        path = PROMPTER_ROOT / "Prompter" / "modules" / path.name
+    return [path.resolve()]
 
 
-def _read_list_file(name: str) -> Tuple[List[str], Optional[Path], Optional[Tuple[int, int]]]:
-    for p in _candidate_paths_for(name):
-        try:
-            if p.exists() and p.is_file():
-                with p.open("r", encoding="utf-8-sig") as fh:
-                    lines = [ln.rstrip("\r\n") for ln in fh.readlines()]
-                    return lines, p, _file_signature(p)
-        except Exception:
-            continue
-    return [], None, None
+def _read_list_file(name: str | Path) -> Tuple[List[str], Optional[Path], Optional[Tuple[int, int]]]:
+    p = _candidate_paths_for(name)[0]
+    try:
+        if not p.exists() or not p.is_file():
+            LOGGER.error("Prompt Writer module list is missing: %s", p)
+            return [], None, None
+        with p.open("r", encoding="utf-8-sig") as fh:
+            lines = [ln.rstrip("\r\n") for ln in fh.readlines()]
+            return lines, p, _file_signature(p)
+    except (OSError, UnicodeError) as error:
+        LOGGER.exception("Prompt Writer module list could not be read: %s (%s)", p, error)
+        return [], None, None
 
 
 def _read_list_file_cached(name: str) -> Tuple[List[str], Optional[Path]]:
@@ -1340,8 +1389,33 @@ class ReferenceImageCard(QtWidgets.QFrame):
         _start_file_url_drag(self, self._paths_provider())
 
 
+def empty_prompt_writer_state() -> dict:
+    return {
+        "version": PROMPT_WRITER_STATE_VERSION,
+        "type": "",
+        "subject": "",
+        "color": "",
+        "global": "",
+        **{page.key: "" for page in PAGE_SPECS},
+        "checks": {key: False for key in BUILT_IN_CHECK_KEYS},
+        "generated_prompts": {},
+        "generated_input_signature": "",
+        "reference_images": [],
+    }
+
+
+def reset_prompt_writer_state_file(project_root: str | Path) -> bool:
+    path = Path(project_root).resolve() / "prompt_writer_state.json"
+    try:
+        safe_write_json(path, empty_prompt_writer_state())
+        return True
+    except (OSError, TypeError, ValueError) as error:
+        LOGGER.exception("Prompt Writer reset state save failed: %s (%s)", path, error)
+        return False
+
+
 class PromptWriterPanel(QtWidgets.QWidget):
-    closed = QtCore.Signal()
+    dismissed = QtCore.Signal()
     prompts_generated = QtCore.Signal(dict, dict)  # prompts_map, debug_map
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None, project_root: Optional[str] = None):
@@ -1369,8 +1443,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         self._geom_anim = QtCore.QPropertyAnimation(self, b"geometry", self)
         self._fade_anim = QtCore.QPropertyAnimation(self, b"windowOpacity", self)
+        self._hide_timer = QtCore.QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._finish_close_animation)
+        self._animation_generation = 0
 
-        role_lines, _ = _read_list_file_cached("role.txt")
+        role_lines, _ = _read_list_file_cached(self._default_modules_dir() / "role.txt")
         seeded_role = _clean_choice_line(role_lines[0]) if role_lines and any(l.strip() for l in role_lines) else "Artist"
 
         default_format = (
@@ -1412,6 +1490,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._start_visionary_pulse()
         self._restore_persisted_state()
 
+    def _module_path(self, name: str) -> Path:
+        return self._default_modules_dir() / name
+
     # -----------------------
     # Persistence
     # -----------------------
@@ -1439,7 +1520,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "type": {
                 "title": "Graphics & Illustration",
                 "primary_name": "type.txt",
-                "fallback_name": "type.txt",
                 "allow_none": True,
                 "allow_headers": True,
                 "auto_user_header": USER_ADDED_HEADER,
@@ -1447,7 +1527,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "subject": {
                 "title": "Subject",
                 "primary_name": "topic.txt",
-                "fallback_name": "topic.txt",
                 "allow_none": False,
                 "allow_headers": False,
                 "auto_user_header": None,
@@ -1455,7 +1534,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "color": {
                 "title": "Color Scheme",
                 "primary_name": "color.txt",
-                "fallback_name": "colors.txt",
                 "allow_none": True,
                 "allow_headers": True,
                 "auto_user_header": USER_ADDED_HEADER,
@@ -1472,31 +1550,52 @@ class PromptWriterPanel(QtWidgets.QWidget):
         return combos[key]
 
     def _default_modules_dir(self) -> Path:
-        return self.project_root / "Prompter" / "modules"
+        return (self.project_root / "Prompter" / "modules").resolve()
+
+    def _user_colors_path(self) -> Path:
+        return self._default_modules_dir() / "user_colors.json"
 
     def _resolve_managed_list_path(self, key: str) -> Path:
         config = self._managed_list_config(key)
-        primary_name = config["primary_name"]
-        fallback_name = config["fallback_name"]
-        if key == "color" and self._colors_path_used is not None:
-            return self._colors_path_used
-        _, used_path = _read_list_file_cached(primary_name)
-        if used_path is not None:
-            return used_path
-        if fallback_name != primary_name:
-            _, used_path = _read_list_file_cached(fallback_name)
-            if used_path is not None:
-                return used_path
-        return self._default_modules_dir() / fallback_name
+        return self._default_modules_dir() / config["primary_name"]
+
+    def _load_user_colors(self) -> List[str]:
+        path = self._user_colors_path()
+        legacy_lines, _ = _read_list_file_cached(self._resolve_managed_list_path("color"))
+        legacy_entries = _parse_color_list_entries(legacy_lines)
+        legacy_user = [entry.text for entry in legacy_entries if entry.is_user]
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                values = payload.get("colors", []) if isinstance(payload, dict) else []
+                if not isinstance(values, list):
+                    raise ValueError("colors must be a list")
+                return [text for text in (_clean_user_added_entry(value) for value in values) if text]
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+                LOGGER.exception("User color storage could not be read: %s (%s)", path, error)
+                return legacy_user
+        if legacy_user:
+            try:
+                safe_write_json(path, {"version": 1, "colors": legacy_user})
+                LOGGER.info("Migrated User Added colors to %s", path)
+            except (OSError, ValueError, TypeError) as error:
+                LOGGER.exception("User color migration failed: %s (%s)", path, error)
+            return legacy_user
+        return []
 
     def _read_managed_entries(self, key: str) -> List[ManagedListEntry]:
         config = self._managed_list_config(key)
         path = self._resolve_managed_list_path(key)
-        lines, _ = _read_list_file_cached(path.name)
-        if key == "color" and not lines:
-            lines, _ = _read_list_file_cached("colors.txt")
+        lines, _ = _read_list_file_cached(path)
         if key == "color":
-            return _parse_color_list_entries(lines)
+            builtin_entries = [entry for entry in _parse_color_list_entries(lines) if not entry.is_user]
+            builtin_entries.append(ManagedListEntry(USER_ADDED_HEADER, True))
+            builtin_entries.extend(
+                ManagedListEntry(text, False, True)
+                for text in self._load_user_colors()
+                if _managed_entry_key(text)
+            )
+            return builtin_entries
         return _parse_managed_list_entries(lines, allow_headers=bool(config["allow_headers"]))
 
     def _style_header_item(self, item: Optional[QtGui.QStandardItem]) -> None:
@@ -1558,18 +1657,28 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def _clear_managed_list_cache(self, path: Path) -> None:
         _FILE_CACHE.pop(path.name, None)
-        if path.name in {"color.txt", "colors.txt"}:
-            _FILE_CACHE.pop("color.txt", None)
-            _FILE_CACHE.pop("colors.txt", None)
 
     def _apply_managed_list_changes(self, key: str, entries: List[ManagedListEntry]) -> None:
         config = self._managed_list_config(key)
-        path = self._resolve_managed_list_path(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            _serialize_managed_list_entries(entries, allow_headers=bool(config["allow_headers"])),
-            encoding="utf-8",
-        )
+        if key == "color":
+            path = self._user_colors_path()
+            values: List[str] = []
+            seen: set[str] = set()
+            for entry in entries:
+                if entry.is_header or not entry.is_user:
+                    continue
+                value = _clean_user_added_entry(entry.text)
+                key_value = _managed_entry_key(value)
+                if value and key_value not in seen:
+                    values.append(value)
+                    seen.add(key_value)
+            safe_write_json(path, {"version": 1, "colors": values})
+        else:
+            path = self._resolve_managed_list_path(key)
+            atomic_write_text(
+                path,
+                _serialize_managed_list_entries(entries, allow_headers=bool(config["allow_headers"])),
+            )
         self._clear_managed_list_cache(path)
         self._reload_managed_list(key)
         self._schedule_persist_state(0)
@@ -1587,6 +1696,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             entries=self._read_managed_entries(key),
             allow_headers=bool(config["allow_headers"]),
             auto_user_header=config.get("auto_user_header"),
+            user_owned_only=key == "color",
             parent=self,
         )
         dialog.entries_changed.connect(lambda entries, list_key=key: self._apply_managed_list_changes(list_key, entries))
@@ -1670,13 +1780,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
         try:
             self._persist_timer.stop()
             state = self._capture_state()
-            self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = self._state_path.with_name(f".{self._state_path.name}.tmp")
-            temp_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-            temp_path.replace(self._state_path)
+            safe_write_json(self._state_path, state)
             return True
-        except Exception:
-            LOGGER.exception("Prompt Writer state persistence failed: %s", self._state_path)
+        except (OSError, TypeError, ValueError) as error:
+            LOGGER.exception("Prompt Writer state persistence failed: %s (%s)", self._state_path, error)
             return False
 
     def _normalize_persisted_state(self, state: object) -> dict:
@@ -1741,7 +1848,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             (self.cb_real, "real"),
             (self.cb_paint, "paint"),
             (self.cb_minimal, "minimal"),
-            (self.cb_neutral_style, "neutral_style"),
             (self.cb_forbid, "forbid_text"),
             (self.cb_clean_composition, "clean_composition"),
             (self.cb_strong_focal_point, "strong_focal_point"),
@@ -1751,7 +1857,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             (self.cb_full_body_view, "full_body_view"),
             (self.cb_wide_scene, "wide_scene"),
             (self.cb_simplified_details, "simplified_details"),
-            (self.cb_unspecified_framing, "unspecified_framing"),
         )
 
     def _guidance_checkbox_specs(self) -> Tuple[Tuple[QtWidgets.QCheckBox, str], ...]:
@@ -1780,6 +1885,14 @@ class PromptWriterPanel(QtWidgets.QWidget):
         type_text = self.cmb_type.currentText().strip()
         if type_text == NONE_CHOICE_LABEL:
             type_text = ""
+        selected_style = next(
+            (key for checkbox, key in ((self.cb_real, "real"), (self.cb_paint, "paint"), (self.cb_minimal, "minimal")) if checkbox.isChecked()),
+            "",
+        )
+        selected_framing = next(
+            (key for checkbox, key in ((self.cb_close_up_focus, "close_up_focus"), (self.cb_full_body_view, "full_body_view"), (self.cb_wide_scene, "wide_scene")) if checkbox.isChecked()),
+            "",
+        )
         input_state = {
             "prompt_language_version": PROMPT_LANGUAGE_VERSION,
             "type": type_text,
@@ -1790,6 +1903,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 state_key: bool(checkbox.isChecked())
                 for checkbox, state_key in self._checkbox_state_specs()
             },
+            "hidden_style_default": not bool(selected_style),
+            "hidden_framing_default": not bool(selected_framing),
         }
         input_state.update(
             {
@@ -1815,6 +1930,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 return False
 
         try:
+            type_txt = self.cmb_type.currentText().strip()
+            if type_txt == NONE_CHOICE_LABEL:
+                type_txt = ""
             color_txt = self.cmb_color.currentText().strip()
             if color_txt == NONE_CHOICE_LABEL:
                 color_txt = ""
@@ -1830,7 +1948,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         return {
             "version": PROMPT_WRITER_STATE_VERSION,
-            "type": self.cmb_type.currentText().strip(),
+            "type": type_txt,
             "subject": self.cmb_subject.currentText().strip(),
             "color": color_txt,
             "global": self.txt_global.toPlainText(),
@@ -2151,18 +2269,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.cb_real = GoldenCheckBox("Bias Toward Photorealism")
         self.cb_paint = GoldenCheckBox("Bias Toward Painterly Style")
         self.cb_minimal = GoldenCheckBox("Bias Toward Minimalistic Composition")
-        self.cb_neutral_style = GoldenCheckBox("Neutral / No Extra Style Bias")
         self.cb_simplified_details = GoldenCheckBox("Simplified Details")
-        _set_help(
-            self.cb_neutral_style,
-            "Add no extra style bias beyond the selected Graphics and Illustration choice.",
-        )
         gb_layout.addWidget(self.cb_real, 6, 0)
         gb_layout.addWidget(self.cb_paint, 6, 1)
         gb_layout.addWidget(self.cb_minimal, 7, 0)
-        gb_layout.addWidget(self.cb_neutral_style, 7, 1)
         gb_layout.addWidget(self.cb_simplified_details, 8, 0, 1, 2)
-        self.cb_neutral_style.setChecked(True)
 
         add_helpful_header(9, "Image Safety / Clean Output")
         self.cb_forbid = GoldenCheckBox("No Text in the Image")
@@ -2181,11 +2292,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.cb_close_up_focus = GoldenCheckBox("Close-Up Focus")
         self.cb_full_body_view = GoldenCheckBox("Full Body View")
         self.cb_wide_scene = GoldenCheckBox("Wide Scene")
-        self.cb_unspecified_framing = GoldenCheckBox("Unspecified Framing")
-        _set_help(
-            self.cb_unspecified_framing,
-            "Add no extra close-up, full-body, or wide-scene framing instruction.",
-        )
         _set_help(
             self.cb_wide_scene,
             "Wide Scene means showing more environment inside the same portrait 2048×3072 frame. It does not change the aspect ratio.",
@@ -2196,8 +2302,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         gb_layout.addWidget(self.cb_close_up_focus, 15, 0)
         gb_layout.addWidget(self.cb_full_body_view, 15, 1)
         gb_layout.addWidget(self.cb_wide_scene, 16, 0)
-        gb_layout.addWidget(self.cb_unspecified_framing, 16, 1)
-        self.cb_unspecified_framing.setChecked(True)
 
         left_v.addWidget(self.gb_helpful)
 
@@ -2401,33 +2505,19 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def _exclusive_checkbox_groups(
         self,
-    ) -> Tuple[Tuple[Tuple[QtWidgets.QCheckBox, ...], Optional[QtWidgets.QCheckBox]], ...]:
+    ) -> Tuple[Tuple[QtWidgets.QCheckBox, ...], ...]:
         return (
-            ((self.cb_black, self.cb_white), None),
-            (
-                (self.cb_real, self.cb_paint, self.cb_minimal, self.cb_neutral_style),
-                self.cb_neutral_style,
-            ),
-            (
-                (
-                    self.cb_close_up_focus,
-                    self.cb_full_body_view,
-                    self.cb_wide_scene,
-                    self.cb_unspecified_framing,
-                ),
-                self.cb_unspecified_framing,
-            ),
+            (self.cb_black, self.cb_white),
+            (self.cb_real, self.cb_paint, self.cb_minimal),
+            (self.cb_close_up_focus, self.cb_full_body_view, self.cb_wide_scene),
         )
 
     def _enforce_exclusive_group(
         self,
         checked_box: QtWidgets.QCheckBox,
         group: Tuple[QtWidgets.QCheckBox, ...],
-        fallback: Optional[QtWidgets.QCheckBox] = None,
     ) -> None:
         if not checked_box.isChecked():
-            if fallback is not None and not any(checkbox.isChecked() for checkbox in group):
-                fallback.setChecked(True)
             return
         for other in group:
             if other is checked_box:
@@ -2440,18 +2530,15 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def _wire_exclusive_group(
         self,
         group: Tuple[QtWidgets.QCheckBox, ...],
-        fallback: Optional[QtWidgets.QCheckBox] = None,
     ) -> None:
         for checkbox in group:
             checkbox.stateChanged.connect(
-                lambda *_args, cb=checkbox, grp=group, default=fallback: self._enforce_exclusive_group(
-                    cb, grp, default
-                )
+                lambda *_args, cb=checkbox, grp=group: self._enforce_exclusive_group(cb, grp)
             )
 
     def _normalize_exclusive_controls(self) -> None:
-        for group, fallback in self._exclusive_checkbox_groups():
-            selected = next((checkbox for checkbox in group if checkbox.isChecked()), fallback)
+        for group in self._exclusive_checkbox_groups():
+            selected = next((checkbox for checkbox in group if checkbox.isChecked()), None)
             if selected is None:
                 continue
             for checkbox in group:
@@ -2477,8 +2564,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
             for page in self._page_specs:
                 if page.detail_widget is not None:
                     page.detail_widget.textChanged.connect(self._on_prompt_input_changed)
-            for group, fallback in self._exclusive_checkbox_groups():
-                self._wire_exclusive_group(group, fallback)
+            for group in self._exclusive_checkbox_groups():
+                self._wire_exclusive_group(group)
             for checkbox, _ in self._checkbox_state_specs():
                 checkbox.stateChanged.connect(self._on_prompt_input_changed)
         except Exception:
@@ -2857,12 +2944,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._reload_managed_list("color")
 
     def _collect_guidance(self) -> List[str]:
-        self._normalize_exclusive_controls()
-        return [
+        guidance = [
             phrase
             for checkbox, phrase in self._guidance_checkbox_specs()
             if checkbox.isChecked()
         ]
+        if not any(checkbox.isChecked() for checkbox in (self.cb_real, self.cb_paint, self.cb_minimal)):
+            guidance.append(HIDDEN_STYLE_DEFAULT)
+        if not any(checkbox.isChecked() for checkbox in (self.cb_close_up_focus, self.cb_full_body_view, self.cb_wide_scene)):
+            guidance.append(HIDDEN_FRAMING_DEFAULT)
+        return guidance
 
     def _get_color_choice(self) -> Optional[str]:
         text = self.cmb_color.currentText().strip()
@@ -2891,6 +2982,18 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     page.copy_button.setEnabled(False)
         else:
             self._set_generated_output_valid(self._generated_output_valid)
+
+    def _validate_generated_prompt_set(self, prompts: Dict[str, str]) -> None:
+        expected = {page.key for page in self._page_specs}
+        if set(prompts) != expected:
+            raise ValueError("generation did not produce all four prompts")
+        unresolved = re.compile(r"\{\{[^{}]+\}\}")
+        for key, prompt in prompts.items():
+            text = _normalize_text(prompt, strip=True, max_length=MAX_GENERATED_PROMPT_LENGTH)
+            if not text or len(text) > MAX_GENERATED_PROMPT_LENGTH:
+                raise ValueError(f"generated {key} prompt is empty or too long")
+            if unresolved.search(text):
+                raise ValueError(f"generated {key} prompt contains an unresolved placeholder")
 
     def _on_generate(self):
         if self._generation_in_progress:
@@ -2937,6 +3040,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 per_data_map[page.key]["payload"] = payload
                 debug_map[page.key] = dbg
 
+            self._validate_generated_prompt_set(prompts)
+
             self._generated_prompts = dict(prompts)
             self._generated_input_signature = self._current_prompt_input_signature()
             self._set_generated_output_valid(True)
@@ -2982,16 +3087,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def _roll_shared_prompt_data(self) -> dict:
         data = dict(self._data)
-        role_pick, _ = _pick_random_nonempty_line("role.txt")
+        role_pick, _ = _pick_random_nonempty_line(self._module_path("role.txt"))
         if role_pick:
             data["role"] = role_pick
-        order_pick, _ = _pick_random_order("order.txt")
+        order_pick, _ = _pick_random_order(self._module_path("order.txt"))
         if order_pick:
             data["order"] = order_pick
-        effort_pick, _ = _pick_random_nonempty_line("effort.txt")
+        effort_pick, _ = _pick_random_nonempty_line(self._module_path("effort.txt"))
         if effort_pick:
             data["effort"] = effort_pick
-        format_pick, _ = _pick_random_nonempty_line("format.txt")
+        format_pick, _ = _pick_random_nonempty_line(self._module_path("format.txt"))
         if format_pick:
             data["format"] = format_pick
         return data
@@ -3015,7 +3120,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
         if text:
             QtWidgets.QApplication.clipboard().setText(text)
 
-    def _on_erase_all(self):
+    def reset_prompt_writer_state(self) -> bool:
+        """Clear the live panel and persist one authoritative empty state."""
+        if getattr(self, "_reset_in_progress", False):
+            return False
+        self._reset_in_progress = True
         signal_widgets: List[QtCore.QObject] = [
             self.cmb_subject,
             self.cmb_type,
@@ -3031,7 +3140,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         signal_blockers = [QtCore.QSignalBlocker(widget) for widget in signal_widgets]
         self._persist_timer.stop()
         self._state_persistence_suspended = True
-        reset_completed = False
         try:
             for key in ("type", "subject", "color"):
                 self._reload_managed_list(key)
@@ -3041,25 +3149,57 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self.cmb_color.setCurrentIndex(0)
             for checkbox, _ in self._checkbox_state_specs():
                 checkbox.setChecked(False)
-            self.cb_neutral_style.setChecked(True)
-            self.cb_unspecified_framing.setChecked(True)
 
             self._reference_images = []
             self._references_visible = True
+            self._last_focused_widget = None
             self.txt_global.clear()
             for page in self._page_specs:
                 if page.detail_widget is not None:
                     page.detail_widget.clear()
             self._invalidate_generated_output()
             self._refresh_reference_image_panel()
-            reset_completed = True
+            self.lbl_reference_status.setText("")
+            self.reference_strip.setVisible(False)
+            for dialog in tuple(self._list_manager_dialogs.values()):
+                try:
+                    dialog.entry_edit.clear()
+                    dialog.close()
+                except RuntimeError:
+                    pass
+            self._list_manager_dialogs.clear()
+            self._hide_timer.stop()
+            self._geom_anim.stop()
+            self._fade_anim.stop()
+            self._generation_in_progress = False
+            return self._persist_state_now()
+        except (OSError, RuntimeError, ValueError, TypeError) as error:
+            LOGGER.exception("Prompt Writer reset failed: %s", error)
+            return False
         finally:
             for blocker in signal_blockers:
                 blocker.unblock()
             self._state_persistence_suspended = False
+            self._reset_in_progress = False
 
-        if reset_completed:
-            self._persist_state_now()
+    def _on_erase_all(self):
+        if any(
+            (
+                self.cmb_subject.currentText().strip(),
+                self.txt_global.toPlainText().strip(),
+                self._reference_images,
+                self._generated_prompts,
+            )
+        ):
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Erase all Prompt Writer content?",
+                "This clears the current Prompt Writer content but keeps built-in and user-created options.",
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
+        if not self.reset_prompt_writer_state():
+            QtWidgets.QMessageBox.critical(self, "Prompt Writer reset failed", "Prompt Writer could not be cleared or saved.")
 
     def _toggle_max_restore(self) -> None:
         screen_obj = self.screen() or QtGui.QGuiApplication.primaryScreen()
@@ -3075,8 +3215,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.title_bar.sync_window_state()
 
     def _on_close(self):
-        self._persist_state_now()
-        self.hide()
+        if self._shutdown:
+            return
+        if not self._persist_state_now():
+            QtWidgets.QMessageBox.warning(self, "Prompt Writer", "The current Prompt Writer state could not be saved.")
+        self.dismissed.emit()
+        self.popdown()
 
     def _start_visionary_pulse(self):
         try:
@@ -3113,10 +3257,15 @@ class PromptWriterPanel(QtWidgets.QWidget):
             pass
 
     def popup(self):
-        if self.isVisible():
+        self._hide_timer.stop()
+        self._animation_generation += 1
+        if self._shutdown:
             return
-        self.setWindowOpacity(0.0)
-        self.show(); self.raise_()
+        self._geom_anim.stop()
+        self._fade_anim.stop()
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.show()
+        self.raise_()
         self.title_bar.sync_window_state()
 
         screen_obj = self.screen() or QtGui.QGuiApplication.primaryScreen()
@@ -3127,6 +3276,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
         target = QtCore.QRect(avail.x() + 24, avail.y() + 24, w, h)
         off = QtCore.QRect(target.x() - w, target.y(), w, h)
 
+        current = self.geometry()
+        if self.isVisible() and current.intersects(target):
+            off = current
+        self.setWindowOpacity(0.0 if not self.isVisible() else min(1.0, self.windowOpacity()))
         self.setGeometry(off)
         self._geom_anim.stop(); self._geom_anim.setDuration(260)
         self._geom_anim.setStartValue(off); self._geom_anim.setEndValue(target)
@@ -3135,11 +3288,18 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         self._fade_anim.stop(); self._fade_anim.setDuration(220)
         self._fade_anim.setStartValue(0.0); self._fade_anim.setEndValue(1.0)
+        self._fade_anim.finished.connect(lambda: self.setWindowOpacity(1.0), Qt.SingleShotConnection)
         self._fade_anim.start()
+
+    open_with_anim = popup
 
     def popdown(self):
         if not self.isVisible():
             return
+        self._animation_generation += 1
+        generation = self._animation_generation
+        self._geom_anim.stop()
+        self._fade_anim.stop()
         geom = self.geometry()
         off = QtCore.QRect(geom.x() - geom.width() - 20, geom.y(), geom.width(), geom.height())
         self._geom_anim.stop(); self._geom_anim.setDuration(200)
@@ -3150,7 +3310,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._fade_anim.stop(); self._fade_anim.setDuration(180)
         self._fade_anim.setStartValue(self.windowOpacity()); self._fade_anim.setEndValue(0.0)
         self._fade_anim.start()
-        QtCore.QTimer.singleShot(220, self.hide)
+        self._hide_timer.start(220)
+
+    def _finish_close_animation(self) -> None:
+        if self._shutdown:
+            return
+        self._geom_anim.stop()
+        self._fade_anim.stop()
+        self.setWindowOpacity(0.0)
+        self.hide()
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
     # Frameless move/max
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
@@ -3210,6 +3379,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             visionary_timer.stop()
         self._geom_anim.stop()
         self._fade_anim.stop()
+        self._hide_timer.stop()
 
         for dialog in self.findChildren(QtWidgets.QDialog):
             try:
@@ -3222,10 +3392,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         super().closeEvent(event)
 
     def hide(self):
-        try:
-            super().hide()
-        finally:
-            self.closed.emit()
+        super().hide()
 
 
 if __name__ == "__main__":

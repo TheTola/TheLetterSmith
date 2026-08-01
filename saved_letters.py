@@ -77,6 +77,27 @@ _METADATA_NAMES = (
 _LOGGER = logging.getLogger(__name__)
 
 
+def cleanup_stale_letter_load_workspaces(project_root: str | Path) -> tuple[Path, ...]:
+    """Remove only interrupted Letter Smith load workspaces at startup."""
+    output_root = (Path(project_root).resolve() / "output").resolve()
+    if not output_root.is_dir():
+        return ()
+    removed: list[Path] = []
+    for candidate in output_root.iterdir():
+        if not candidate.name.startswith(".letter-load-") or not candidate.is_dir():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(output_root)
+            if resolved == output_root:
+                continue
+            shutil.rmtree(resolved)
+            removed.append(resolved)
+        except (OSError, ValueError):
+            _LOGGER.exception("Could not clean stale Letter Smith load workspace: %s", candidate)
+    return tuple(removed)
+
+
 def _valid_uuid(value: object) -> str:
     try:
         return str(uuid.UUID(str(value)))
@@ -244,6 +265,7 @@ def _readable_file(path: Path) -> bool:
 class SavedLetterCatalog:
     def __init__(self, project_root: str | Path) -> None:
         self.project_root = Path(project_root).resolve()
+        cleanup_stale_letter_load_workspaces(self.project_root)
         self.play_root = canonical_play_root(self.project_root)
         self.recovery_root = canonical_recovery_root(self.project_root)
         self.play_roots = (
@@ -645,7 +667,12 @@ class SavedLetterRestorer:
                 "The current project was preserved."
             ) from error
         finally:
-            shutil.rmtree(staged_root, ignore_errors=True)
+            try:
+                shutil.rmtree(staged_root)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                _LOGGER.exception("Could not clean Letter Smith load workspace: %s", staged_root)
 
         for transaction in transactions:
             try:

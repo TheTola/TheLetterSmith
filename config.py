@@ -176,11 +176,6 @@ OUTPUT_PLAY_DIR = os.path.join(
     "Play",
 )
 
-OUTPUT_FILE_DIR = os.path.join(
-    OUTPUT_DIR,
-    "File",
-)
-
 WINDOWS_RESERVED_FOLDER_NAMES = {
     "CON",
     "PRN",
@@ -300,10 +295,6 @@ def canonical_output_root(project_root: str | Path) -> Path:
 
 def canonical_play_root(project_root: str | Path) -> Path:
     return (canonical_output_root(project_root) / "Play").resolve()
-
-
-def canonical_file_root(project_root: str | Path) -> Path:
-    return (canonical_output_root(project_root) / "File").resolve()
 
 
 def canonical_recovery_root(project_root: str | Path) -> Path:
@@ -916,7 +907,6 @@ def ensure_output_dirs(
 ) -> None:
     for directory in (
         canonical_play_root(project_root),
-        canonical_file_root(project_root),
     ):
         directory.mkdir(
             parents=True,
@@ -1338,12 +1328,10 @@ __all__ = [
     # Output
     "OUTPUT_DIR",
     "OUTPUT_PLAY_DIR",
-    "OUTPUT_FILE_DIR",
 
     # Helpers
     "canonical_output_root",
     "canonical_play_root",
-    "canonical_file_root",
     "canonical_recovery_root",
     "legacy_play_roots",
     "legacy_recovery_roots",
