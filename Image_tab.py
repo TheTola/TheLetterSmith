@@ -851,10 +851,6 @@ class ImageTab(
 
         self._tab_active = False
 
-        self._prompt_writer_panel: Optional[
-            QtWidgets.QWidget
-        ] = None
-
         root = QtWidgets.QVBoxLayout(self)
 
         root.setContentsMargins(0,0,0,0)
@@ -1968,50 +1964,6 @@ class ImageTab(
                 duration_ms
             )
 
-    def _track_prompt_writer_panel(
-        self,
-        panel: object,
-    ) -> None:
-        if not isinstance(
-            panel,
-            QtWidgets.QWidget,
-        ):
-            return
-
-        if panel is self._prompt_writer_panel:
-            return
-
-        closed_signal = getattr(
-            panel,
-            "closed",
-            None,
-        )
-
-        if closed_signal is None:
-            return
-
-        try:
-            closed_signal.connect(
-                self._on_prompt_writer_closed
-            )
-
-            self._prompt_writer_panel = (
-                panel
-            )
-
-        except Exception:
-            pass
-
-    @QtCore.Slot()
-    def _on_prompt_writer_closed(
-        self,
-    ) -> None:
-        self._prompt_writer_panel = None
-
-        self._show_temporary_status(
-            "Prompt Writer closed."
-        )
-
     def _open_prompt_writer_bridge(
         self,
     ) -> None:
@@ -2061,16 +2013,6 @@ class ImageTab(
             )
 
             return
-
-        panel = getattr(
-            window,
-            "_prompt_writer_win",
-            None,
-        )
-
-        self._track_prompt_writer_panel(
-            panel
-        )
 
         self._show_temporary_status(
             (

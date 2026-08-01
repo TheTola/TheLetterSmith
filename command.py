@@ -32,11 +32,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import shutil
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
@@ -76,6 +77,8 @@ RESET_SETTINGS = {
     "music_file": "",
     "last_audio": "none",
 }
+
+LOGGER = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -845,29 +848,12 @@ def _toast(
     toast.show()
 
 
-def confirm_and_reset(
+def _perform_confirmed_reset(
     parent: Optional[QtWidgets.QWidget] = None,
     *,
     project_root: str | Path | None = None,
     project_state: ProjectStateController | None = None,
 ) -> bool:
-    dialog = _ConfirmDialog(
-        parent
-    )
-
-    if parent is not None:
-        center = parent.mapToGlobal(
-            parent.rect().center()
-        )
-
-        dialog.move(
-            center.x() - dialog.width() // 2,
-            center.y() - dialog.height() // 2,
-        )
-
-    if dialog.exec() != QtWidgets.QDialog.Accepted:
-        return False
-
     previous_identity = (
         project_state.identity
         if project_state is not None
@@ -918,6 +904,55 @@ def confirm_and_reset(
         pass
 
     return True
+
+
+def confirm_and_reset(
+    parent: Optional[QtWidgets.QWidget] = None,
+    *,
+    project_root: str | Path | None = None,
+    project_state: ProjectStateController | None = None,
+    before_reset: Optional[Callable[[], bool]] = None,
+) -> bool:
+    dialog = _ConfirmDialog(
+        parent
+    )
+
+    if parent is not None:
+        center = parent.mapToGlobal(
+            parent.rect().center()
+        )
+
+        dialog.move(
+            center.x() - dialog.width() // 2,
+            center.y() - dialog.height() // 2,
+        )
+
+    if dialog.exec() != QtWidgets.QDialog.Accepted:
+        return False
+
+    if before_reset is not None:
+        try:
+            if not before_reset():
+                QtWidgets.QMessageBox.critical(
+                    parent,
+                    "Command reset failed",
+                    "Prompt Writer could not be reset, so the command was not completed.",
+                )
+                return False
+        except Exception:
+            logging.getLogger(__name__).exception("Command pre-reset hook failed")
+            QtWidgets.QMessageBox.critical(
+                parent,
+                "Command reset failed",
+                "Prompt Writer could not be reset, so the command was not completed.",
+            )
+            return False
+
+    return _perform_confirmed_reset(
+        parent,
+        project_root=project_root,
+        project_state=project_state,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -987,8 +1022,42 @@ class _PressGoLabel(
             self._apply_scale
         )
 
+        self._opacity_effect = QtWidgets.QGraphicsOpacityEffect(
+            self
+        )
+        self._opacity_effect.setOpacity(1.0)
+        self.setGraphicsEffect(
+            self._opacity_effect
+        )
+
+        self._activity_anim = QtCore.QVariantAnimation(
+            self
+        )
+        self._activity_anim.setDuration(900)
+        self._activity_anim.setLoopCount(-1)
+        self._activity_anim.setEasingCurve(
+            QtCore.QEasingCurve.InOutSine
+        )
+        self._activity_anim.setKeyValueAt(0.0, 1.0)
+        self._activity_anim.setKeyValueAt(0.5, 0.72)
+        self._activity_anim.setKeyValueAt(1.0, 1.0)
+        self._activity_anim.valueChanged.connect(
+            self._apply_opacity
+        )
+
+        style = QtWidgets.QApplication.style()
+        self._animations_enabled = bool(
+            style
+            and style.styleHint(
+                QtWidgets.QStyle.SH_Widget_Animate,
+                None,
+                self,
+            )
+        )
+
         self._scale = 1.0
         self._pressed = False
+        self._busy = False
 
     def set_base(
         self,
@@ -1111,6 +1180,10 @@ class _PressGoLabel(
     ) -> None:
         self._scale_anim.stop()
 
+        if not self._animations_enabled:
+            self._apply_scale(1.0)
+            return
+
         self._scale_anim.setDuration(
             int(
                 milliseconds
@@ -1130,6 +1203,35 @@ class _PressGoLabel(
         )
 
         self._scale_anim.start()
+
+    def _apply_opacity(
+        self,
+        value: object,
+    ) -> None:
+        try:
+            opacity = float(value)
+        except (TypeError, ValueError):
+            opacity = 1.0
+        self._opacity_effect.setOpacity(opacity)
+
+    def set_busy(
+        self,
+        busy: bool,
+    ) -> None:
+        self._busy = bool(busy)
+        self._pressed = False
+        self._scale_anim.stop()
+        self._apply_scale(1.0)
+        self._activity_anim.stop()
+
+        if self._busy:
+            if self._animations_enabled:
+                self._activity_anim.start()
+            else:
+                self._opacity_effect.setOpacity(0.78)
+            return
+
+        self._opacity_effect.setOpacity(1.0)
 
     def mousePressEvent(
         self,
@@ -1241,6 +1343,7 @@ class CommandTab(
             project_root
         ).resolve()
         self.project_state = project_state
+        self._reset_in_progress = False
 
         self.setObjectName(
             "CommandTab"
@@ -1314,6 +1417,9 @@ class CommandTab(
             "Wipe the letter"
         )
 
+        self._interaction_state = "idle"
+        self._confirm_dialog: Optional[_ConfirmDialog] = None
+
         self.go_btn.clicked.connect(
             self._do_reset
         )
@@ -1323,11 +1429,111 @@ class CommandTab(
     def _do_reset(
         self,
     ) -> None:
-        confirm_and_reset(
-            self,
-            project_root=self.project_root,
-            project_state=self.project_state,
+        if self._interaction_state != "idle":
+            return
+
+        self._interaction_state = "confirming"
+        self.go_btn.setEnabled(False)
+        self.go_btn.setToolTip(
+            "Confirm or cancel the wipe"
         )
+        self.go_btn.set_busy(True)
+
+        dialog = _ConfirmDialog(
+            self
+        )
+        self._confirm_dialog = dialog
+
+        center = self.mapToGlobal(
+            self.rect().center()
+        )
+        dialog.move(
+            center.x() - dialog.width() // 2,
+            center.y() - dialog.height() // 2,
+        )
+
+        dialog.accepted.connect(
+            self._begin_reset
+        )
+        dialog.rejected.connect(
+            self._cancel_reset
+        )
+        dialog.finished.connect(
+            self._release_confirm_dialog
+        )
+        dialog.open()
+
+    def _begin_reset(
+        self,
+    ) -> None:
+        if self._interaction_state != "confirming":
+            return
+        self._interaction_state = "running"
+        self.go_btn.setToolTip(
+            "Wiping the letter"
+        )
+        QtCore.QTimer.singleShot(
+            0,
+            self._execute_reset,
+        )
+
+    def _execute_reset(
+        self,
+    ) -> None:
+        if self._interaction_state != "running":
+            return
+        try:
+            hook = getattr(self.window(), "reset_prompt_writer_state", None)
+            if callable(hook) and not hook():
+                raise RuntimeError("Prompt Writer reset was not completed")
+            _perform_confirmed_reset(
+                self,
+                project_root=self.project_root,
+                project_state=self.project_state,
+            )
+        except Exception as error:
+            LOGGER.exception(
+                "Command reset failed"
+            )
+            detail = str(error).strip() or type(error).__name__
+            _toast(
+                self,
+                f"Wipe failed: {detail}",
+                msecs=4000,
+            )
+        finally:
+            self._finish_interaction()
+
+    def _cancel_reset(
+        self,
+    ) -> None:
+        if self._interaction_state != "confirming":
+            return
+        _toast(
+            self,
+            "Wipe cancelled.",
+            msecs=900,
+        )
+        self._finish_interaction()
+
+    def _release_confirm_dialog(
+        self,
+        _result: int,
+    ) -> None:
+        dialog = self._confirm_dialog
+        self._confirm_dialog = None
+        if dialog is not None:
+            dialog.deleteLater()
+
+    def _finish_interaction(
+        self,
+    ) -> None:
+        self.go_btn.set_busy(False)
+        self.go_btn.setEnabled(True)
+        self.go_btn.setToolTip(
+            "Wipe the letter"
+        )
+        self._interaction_state = "idle"
 
     def resizeEvent(
         self,

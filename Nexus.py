@@ -2113,6 +2113,24 @@ class Nexus(QtWidgets.QMainWindow):
     # =============================================================================================
     # Prompt Writer opener (used by Image_tab FAB and Ctrl+Alt+P shortcut)
     # =============================================================================================
+    def reset_prompt_writer_state(self) -> bool:
+        """Reset the owned Prompt Writer without constructing it just to clear state."""
+        try:
+            panel = getattr(self, "_prompt_writer_win", None)
+            if isinstance(panel, QtWidgets.QWidget):
+                result = panel.reset_prompt_writer_state()
+            else:
+                from PromptWriterPanel import reset_prompt_writer_state_file
+
+                result = reset_prompt_writer_state_file(self.project_root)
+            if not result:
+                self.status("Prompt Writer reset failed; command was not completed.")
+            return bool(result)
+        except Exception as error:
+            print(f"[PromptWriter] reset failed: {error}")
+            self.status("Prompt Writer reset failed; command was not completed.")
+            return False
+
     def open_prompt_writer(self):
         """
         Open Prompt Writer inline as an overlay panel (if available).
@@ -2123,18 +2141,15 @@ class Nexus(QtWidgets.QMainWindow):
             self.recipient_page.focus_recipient()
             return
         w = getattr(self, "_prompt_writer_win", None)
-        if isinstance(w, QtWidgets.QWidget) and w.isVisible():
+        if isinstance(w, QtWidgets.QWidget):
             try:
-                if hasattr(w, "open_with_anim"):
-                    w.open_with_anim()
-                else:
-                    w.show()
+                w.open_with_anim()
                 w.raise_()
                 w.activateWindow()
                 self.status("Prompt Writer focused.")
                 self.toast("Prompt Writer")
                 return
-            except Exception:
+            except RuntimeError:
                 self._prompt_writer_win = None
 
         # In-process overlay panel
@@ -2142,37 +2157,8 @@ class Nexus(QtWidgets.QMainWindow):
             from PromptWriterPanel import PromptWriterPanel  # local module in project root
             w = PromptWriterPanel(self)                      # parent=self so it overlays inside the main window
             self._prompt_writer_win = w
-
-            # Attempt to preload lists from Prompter/modules/ if present
-            try:
-                mods = Path(self.project_root) / "Prompter" / "modules"
-                topic = mods / "topic.txt"
-                typs  = mods / "type.txt"
-                colr  = mods / "color.txt"
-                if hasattr(w, "ui"):
-                    w.ui.load_lists_from_files(
-                        topic_path=str(topic if topic.exists() else "topic.txt"),
-                        type_path=str(typs if typs.exists() else "type.txt"),
-                        colors_path=str(colr if colr.exists() else "color.txt"),
-                        add_none=True
-                    )
-            except Exception:
-                pass
-
-            try:
-                w.open_with_anim()
-            except Exception:
-                try:
-                    w.setGeometry(w._target_rect())  # type: ignore[attr-defined]
-                except Exception:
-                    w.setGeometry(self.body.geometry())
-                w.show()
-                w.raise_()
-
-            try:
-                w.closed.connect(lambda: setattr(self, "_prompt_writer_win", None))  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            w.destroyed.connect(self._on_prompt_writer_destroyed)
+            w.open_with_anim()
 
             self.status("Prompt Writer opened (inline).")
             self.toast("Prompt Writer")
@@ -2180,20 +2166,11 @@ class Nexus(QtWidgets.QMainWindow):
 
         except Exception as ex:
             print(f"[PromptWriter] In-process load failed: {ex}")
-
-        # Last resort: launch Prompter app
-        try:
-            prompter = Path(self.project_root) / "Prompter" / "prompter.py"
-            if prompter.exists():
-                subprocess.Popen([sys.executable, str(prompter)], close_fds=True)
-                self.status("Prompt Writer launched (Prompter).")
-                self.toast("Prompter launched")
-                return
-        except Exception as ex:
-            print(f"[PromptWriter] Prompter launch failed: {ex}")
-
-        self.status("Γ¥î Prompt Writer could not be opened.")
+        self.status("Prompt Writer could not be opened.")
         self.toast("Prompt Writer unavailable")
+
+    def _on_prompt_writer_destroyed(self, *_args: object) -> None:
+        self._prompt_writer_win = None
 
     # =============================================================================================
     # Help icon support

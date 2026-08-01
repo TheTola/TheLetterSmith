@@ -1,6 +1,6 @@
 {
   "version": 5,
-  "type": "— none —",
+  "type": "",
   "subject": "",
   "color": "",
   "global": "",
@@ -18,7 +18,6 @@
     "real": false,
     "paint": false,
     "minimal": false,
-    "neutral_style": true,
     "forbid_text": false,
     "clean_composition": false,
     "strong_focal_point": false,
@@ -27,8 +26,7 @@
     "close_up_focus": false,
     "full_body_view": false,
     "wide_scene": false,
-    "simplified_details": false,
-    "unspecified_framing": true
+    "simplified_details": false
   },
   "generated_prompts": {},
   "generated_input_signature": "",
