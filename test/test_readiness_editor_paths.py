@@ -13,10 +13,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from Editor import Editor
-from Forge_Tab import ReadinessWindow
+from Forge_Tab import ForgeTab, ReadinessWindow
 from project_paths import ProjectPathError, ProjectPathResolver
 from project_store import ProjectStore
-from readiness import evaluate_readiness
+from readiness import ReadinessResult, evaluate_readiness
 from sound_model import TrackRecord
 from sound_tab import ArchiveDialog
 
@@ -47,6 +47,33 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.app.processEvents()
             self.assertFalse(panel.isVisible())
             panel.shutdown()
+
+    def test_complete_readiness_closes_panel_and_preview_selector_is_bright(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tab = ForgeTab(Path(directory))
+            ready = ReadinessResult(
+                items=(),
+                completion_percentage=100,
+                status="Ready",
+            )
+            tab.readiness_window.show()
+            self.app.processEvents()
+            with mock.patch("Forge_Tab.evaluate_readiness", return_value=ready):
+                tab.refresh_readiness()
+            self.assertFalse(tab.readiness_window.isVisible())
+
+            with mock.patch.object(tab, "refresh_readiness", return_value=ready):
+                tab.show_readiness_window()
+            self.assertFalse(tab.readiness_window.isVisible())
+            self.assertIn("#dffbff", tab.preview_format_label.styleSheet())
+            self.assertGreaterEqual(
+                tab.preview_mode.itemDelegate().sizeHint(
+                    QtWidgets.QStyleOptionViewItem(),
+                    tab.preview_mode.model().index(0, 0),
+                ).height(),
+                48,
+            )
+            tab.close()
 
     def test_duplicate_project_ids_are_reported_and_repaired_without_merging(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

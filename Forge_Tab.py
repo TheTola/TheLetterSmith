@@ -32,6 +32,7 @@ from saved_letters import (
     SavedLetterCatalog,
     SavedLetterDeleteError,
     SavedLetterRestorer,
+    record_saved_letter_activity,
     update_saved_metadata,
 )
 from settings_store import (
@@ -47,6 +48,11 @@ PREVIEW_MODES = (
     ("Landscape", "landscape"),
     ("Window / Browser", "window"),
 )
+PREVIEW_MODE_DESCRIPTIONS = {
+    "portrait": "Tall letter-card presentation",
+    "landscape": "Wide cinematic presentation",
+    "window": "Fit the available browser window",
+}
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -83,6 +89,106 @@ class _TaskWorker(QtCore.QObject):
             )
         finally:
             self.finished.emit()
+
+
+class _PreviewModeDelegate(QtWidgets.QStyledItemDelegate):
+    """Two-line, high-contrast entries for the Preview format menu."""
+
+    def sizeHint(
+        self,
+        option: QtWidgets.QStyleOptionViewItem,
+        index: QtCore.QModelIndex,
+    ) -> QtCore.QSize:
+        del option, index
+        return QtCore.QSize(280, 52)
+
+    def paint(
+        self,
+        painter: QtGui.QPainter,
+        option: QtWidgets.QStyleOptionViewItem,
+        index: QtCore.QModelIndex,
+    ) -> None:
+        painter.save()
+        selected = bool(
+            option.state & QtWidgets.QStyle.State_Selected
+        )
+        hovered = bool(
+            option.state & QtWidgets.QStyle.State_MouseOver
+        )
+        background = (
+            QtGui.QColor("#0fcbe8")
+            if selected
+            else QtGui.QColor("#17303b")
+            if hovered
+            else QtGui.QColor("#0d1a22")
+        )
+        painter.fillRect(option.rect.adjusted(2, 2, -2, -2), background)
+
+        text_color = QtGui.QColor("#061217" if selected else "#f1fdff")
+        detail_color = QtGui.QColor("#163943" if selected else "#9bcbd5")
+        title_font = QtGui.QFont(option.font)
+        title_font.setBold(True)
+        title_font.setPointSizeF(max(9.5, title_font.pointSizeF()))
+        painter.setFont(title_font)
+        painter.setPen(text_color)
+        title_rect = option.rect.adjusted(12, 6, -10, -24)
+        painter.drawText(title_rect, Qt.AlignLeft | Qt.AlignVCenter, str(index.data()))
+
+        detail_font = QtGui.QFont(option.font)
+        detail_font.setPointSizeF(max(8.0, detail_font.pointSizeF() - 1.0))
+        painter.setFont(detail_font)
+        painter.setPen(detail_color)
+        detail_rect = option.rect.adjusted(12, 27, -10, -5)
+        detail = str(index.data(Qt.UserRole + 1) or "")
+        painter.drawText(detail_rect, Qt.AlignLeft | Qt.AlignVCenter, detail)
+        painter.restore()
+
+
+class _PreviewModeCombo(QtWidgets.QComboBox):
+    """Bright selector with a purpose-built popup instead of the native menu."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("PreviewFormatSelector")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumSize(178, 38)
+        self.setMaxVisibleItems(len(PREVIEW_MODES))
+        view = QtWidgets.QListView(self)
+        view.setObjectName("PreviewFormatMenu")
+        view.setMouseTracking(True)
+        view.setSpacing(2)
+        view.setUniformItemSizes(True)
+        view.setMinimumWidth(290)
+        self.setView(view)
+        self.setItemDelegate(_PreviewModeDelegate(self))
+        self._arrow = QtWidgets.QLabel("⌄", self)
+        self._arrow.setObjectName("PreviewFormatArrow")
+        self._arrow.setAlignment(Qt.AlignCenter)
+        self._arrow.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setStyleSheet(
+            "QComboBox#PreviewFormatSelector{"
+            "background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #183747,stop:1 #102631);"
+            "color:#f3fdff;border:1px solid #4fe5ff;border-radius:8px;"
+            "padding:7px 38px 7px 12px;font:600 10pt 'Segoe UI';}"
+            "QComboBox#PreviewFormatSelector:hover{background:#1a4050;border-color:#9af3ff;}"
+            "QComboBox#PreviewFormatSelector:focus{border:2px solid #d0faff;padding:6px 37px 6px 11px;}"
+            "QComboBox#PreviewFormatSelector::drop-down{width:34px;border:none;"
+            "border-left:1px solid rgba(118,230,247,.45);}"
+            "QComboBox#PreviewFormatSelector::down-arrow{image:none;width:0;height:0;}"
+            "QListView#PreviewFormatMenu{background:#0d1a22;color:#f1fdff;"
+            "border:1px solid #4fe5ff;border-radius:8px;padding:4px;outline:0;}"
+            "QLabel#PreviewFormatArrow{color:#bff8ff;background:transparent;"
+            "font:700 15pt 'Segoe UI Symbol';}"
+        )
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        self._arrow.setGeometry(self.width() - 33, 1, 31, self.height() - 2)
+        self._arrow.raise_()
+        super().resizeEvent(event)
+
+    def showPopup(self) -> None:
+        self.view().setMinimumWidth(max(290, self.width()))
+        super().showPopup()
 
 
 class _StatusLabel(QtWidgets.QLabel):
@@ -573,7 +679,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._tab_active = False
         self._pending_scroll_position = (0, 0)
         self._pending_metadata_update: Optional[
-            tuple[Path, ReadinessResult]
+            tuple[Path, ReadinessResult, bool]
         ] = None
 
         self.readiness_window = ReadinessWindow(self.project_root)
@@ -776,23 +882,29 @@ class ForgeTab(QtWidgets.QWidget):
         identity_holder.addStretch(1)
         self._main_layout.addLayout(identity_holder)
 
-        self.preview_format_panel = QtWidgets.QWidget(self)
+        self.preview_format_panel = QtWidgets.QFrame(self)
         self.preview_format_panel.setObjectName("ForgePreviewFormat")
-        self.preview_format_panel.setFixedWidth(232)
+        self.preview_format_panel.setFixedWidth(350)
         self.preview_format_panel.setStyleSheet(
-            "QWidget#ForgePreviewFormat{background:transparent;}"
-            "QComboBox{background:#121b23;color:#e8f9ff;"
-            "border:1px solid #00d2ef;border-radius:6px;padding:6px 8px;}"
-            "QComboBox:focus{border-color:#8defff;}"
+            "QFrame#ForgePreviewFormat{background:rgba(13,31,40,.86);"
+            "border:1px solid #315c69;border-radius:10px;}"
         )
         format_row = QtWidgets.QHBoxLayout(self.preview_format_panel)
-        format_row.setContentsMargins(0, 0, 0, 0)
-        format_row.setSpacing(8)
-        format_row.addWidget(self._muted_label("Preview format"))
-        self.preview_mode = QtWidgets.QComboBox()
-        self.preview_mode.setMinimumWidth(132)
+        format_row.setContentsMargins(12, 7, 10, 7)
+        format_row.setSpacing(12)
+        self.preview_format_label = QtWidgets.QLabel("Preview format")
+        self.preview_format_label.setStyleSheet(
+            "color:#dffbff;font:600 10pt 'Segoe UI';"
+        )
+        format_row.addWidget(self.preview_format_label)
+        self.preview_mode = _PreviewModeCombo()
         for label, mode in PREVIEW_MODES:
             self.preview_mode.addItem(label, mode)
+            self.preview_mode.setItemData(
+                self.preview_mode.count() - 1,
+                PREVIEW_MODE_DESCRIPTIONS[mode],
+                Qt.UserRole + 1,
+            )
         current = self.preview_mode.findData(self._preview_mode)
         self.preview_mode.setCurrentIndex(max(0, current))
         self.preview_mode.currentIndexChanged.connect(
@@ -937,7 +1049,12 @@ class ForgeTab(QtWidgets.QWidget):
             self.readiness_window.hide()
             return
         self._readiness_requested = True
-        self.refresh_readiness()
+        result = self.refresh_readiness()
+        if result.completion_percentage >= 100:
+            self._readiness_requested = False
+            self.readiness_window.hide()
+            self._set_status("Project readiness is complete.")
+            return
         self.readiness_window.user_closed = False
         self.readiness_window.position_near_image_area()
         self.readiness_window.show()
@@ -970,6 +1087,9 @@ class ForgeTab(QtWidgets.QWidget):
         self.readiness_summary.setStyleSheet(
             f"color:{color};font:600 10pt 'Segoe UI';"
         )
+        if result.completion_percentage >= 100:
+            self._readiness_requested = False
+            self.readiness_window.hide()
         self._sync_heading_balance()
         self.preview_btn.setEnabled(not self._busy and result.can_preview)
         self.publish_btn.setEnabled(not self._busy and result.can_publish)
@@ -1126,7 +1246,7 @@ class ForgeTab(QtWidgets.QWidget):
         def task() -> RestoredProject:
             return self.restorer.restore(entry)
 
-        self._start_restore_operation(
+        self._start_restore_operation_deferred(
             activity,
             task,
             self._complete_restore,
@@ -1167,7 +1287,7 @@ class ForgeTab(QtWidgets.QWidget):
             )
             return self.restorer.restore(identified)
 
-        self._start_restore_operation(
+        self._start_restore_operation_deferred(
             activity,
             task,
             self._complete_restore,
@@ -1362,6 +1482,27 @@ class ForgeTab(QtWidgets.QWidget):
             self._finish_restore_activity()
             raise
 
+    def _start_restore_operation_deferred(
+        self,
+        activity: str,
+        task: Callable[[], object],
+        on_success: Callable[[object], None],
+        error_message: str,
+        *,
+        on_failure: Callable[[], None] | None = None,
+    ) -> None:
+        """Start after GUI media/source-detach events have been processed."""
+        QtCore.QTimer.singleShot(
+            0,
+            lambda: self._start_restore_operation(
+                activity,
+                task,
+                on_success,
+                error_message,
+                on_failure=on_failure,
+            ),
+        )
+
     def _complete_restore(self, restored: object) -> None:
         if not isinstance(restored, RestoredProject):
             self._set_status(
@@ -1527,7 +1668,12 @@ class ForgeTab(QtWidgets.QWidget):
             "Preview could not be updated. The previous preview was preserved.",
         )
 
-    def _finish_preview(self, result: object) -> tuple[Path, Path]:
+    def _finish_preview(
+        self,
+        result: object,
+        *,
+        record_activity: bool,
+    ) -> tuple[Path, Path]:
         values = tuple(result)
         play_dir, _rebuilt, readiness = values[:3]
         source_changed = False
@@ -1547,12 +1693,19 @@ class ForgeTab(QtWidgets.QWidget):
             self._preview_refresh_requested = True
         else:
             self.request_preview()
-        self._pending_metadata_update = (Path(play_dir), readiness)
+        self._pending_metadata_update = (
+            Path(play_dir),
+            readiness,
+            record_activity,
+        )
         self._metadata_timer.start(0)
         return self._last_play_dir, index
 
     def _preview_completed(self, result: object) -> None:
-        _play_dir, index = self._finish_preview(result)
+        _play_dir, index = self._finish_preview(
+            result,
+            record_activity=True,
+        )
         opened = index.is_file() and QtGui.QDesktopServices.openUrl(
             QUrl.fromLocalFile(str(index.resolve()))
         )
@@ -1565,7 +1718,10 @@ class ForgeTab(QtWidgets.QWidget):
             )
 
     def _embedded_preview_completed(self, result: object) -> None:
-        _play_dir, index = self._finish_preview(result)
+        _play_dir, index = self._finish_preview(
+            result,
+            record_activity=False,
+        )
         if index.is_file():
             self._set_status("Preview updated.")
 
@@ -1573,7 +1729,12 @@ class ForgeTab(QtWidgets.QWidget):
         pending = self._pending_metadata_update
         self._pending_metadata_update = None
         if pending is not None:
-            self._update_metadata_silently(*pending)
+            play_dir, readiness, record_activity = pending
+            self._update_metadata_silently(
+                play_dir,
+                readiness,
+                record_activity=record_activity,
+            )
 
     def publish_letter(self) -> None:
         if self._busy:
@@ -1625,6 +1786,7 @@ class ForgeTab(QtWidgets.QWidget):
                 self.project_root,
                 readiness,
             )
+            record_saved_letter_activity(play_path)
             publisher = GitHubPagesPublisher(self.project_root)
             if not publisher.is_configured():
                 configured = publisher.configure(None)
@@ -1727,6 +1889,7 @@ class ForgeTab(QtWidgets.QWidget):
         readiness: ReadinessResult,
         *,
         public_path: str = "",
+        record_activity: bool = False,
     ) -> None:
         try:
             update_saved_metadata(
@@ -1735,6 +1898,8 @@ class ForgeTab(QtWidgets.QWidget):
                 readiness,
                 public_path=public_path,
             )
+            if record_activity:
+                record_saved_letter_activity(play_dir)
             self.refresh_saved_letters()
         except Exception:
             _LOGGER.exception(
@@ -1750,9 +1915,22 @@ class ForgeTab(QtWidgets.QWidget):
         return "" if self._published_url_unavailable() else self.saved_page_url
 
     def set_saved_page_url(self, url: str) -> None:
+        previous_url = self.saved_page_url
         self.saved_page_url = normalize_published_page_url(url)
         self._sync_published_url()
         self.refresh_readiness()
+        if self.saved_page_url and self.saved_page_url != previous_url:
+            self._record_current_letter_activity()
+
+    def _record_current_letter_activity(self) -> None:
+        index = self._current_play_index()
+        if index is None:
+            return
+        self._update_metadata_silently(
+            index.parent,
+            self._readiness_result,
+            record_activity=True,
+        )
 
     def _sync_published_url(self) -> None:
         expired = self._published_url_unavailable()
