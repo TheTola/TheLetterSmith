@@ -17,6 +17,7 @@ Thumbs.db
 output/
 dist/
 build/
+.lettersmith-publishing/
 *.bak_*
 # Optional
 hide/

@@ -3,7 +3,7 @@
 # File: Generate.py
 # Purpose:
 #   Build the Play viewer bundle at:
-#     output/Play/<project_id>/
+#     output/Play/<recipient>/<title>/
 #       index.html, styles.css, script.js
 #       gallery/
 #         pages/      (cover/letter/wall/back)
@@ -48,8 +48,7 @@ from urllib.parse import unquote, urlsplit
 
 from Template import TEMPLATE_HTML, TEMPLATE_CSS, TEMPLATE_JS
 from curtain_color import (
-    FALLBACK_CURTAIN_RGB,
-    extract_deep_dominant_color_from_images,
+    curtain_rgb_for_style,
     write_tinted_curtain_image,
 )
 from sound_model import (
@@ -65,9 +64,9 @@ from config import (
     SETTINGS_FILE,
     DEFAULT_VOLUME,
     STARTING_VOLUME,
-    OUTPUT_PLAY_DIR,
     ensure_output_dirs,
     plan_build,
+    resolve_play_bundle_directory,
     validate_required_images,
     validate_controls,
     USER_PAGES_DIR,
@@ -90,13 +89,10 @@ LEGACY_SFX_DIRS = (
     Path("gallery") / "app" / "icons" / "Sounds",
 )
 BUILD_STATE_FILE = "lettersmith-build.json"
-BUILD_SCHEMA_VERSION = 2
+BUILD_SCHEMA_VERSION = 7
 CURTAIN_FILES = {"cleft.png", "cright.png"}
 CURTAIN_ANALYSIS_PAGE_ORDER = (
-    "wall.png",
     "cover.png",
-    "letter.png",
-    "back.png",
 )
 _FINGERPRINT_SETTING_KEYS = (
     "recipient_name",
@@ -432,7 +428,15 @@ def _seed_sfx_into_build(*, project_root: Path, sounds_dst: Path, seed_sfx: bool
 
 def play_bundle_directory(project_root: str | Path) -> Path:
     root = Path(project_root).resolve()
-    return (root / OUTPUT_PLAY_DIR / ensure_project_identity(root)).resolve()
+    settings = SettingsStore(root).snapshot()
+    recipient = _recipient_from_settings(settings)
+    title = _title_from_settings(settings, recipient)
+    return resolve_play_bundle_directory(
+        root,
+        recipient=recipient,
+        title=title,
+        project_id=ensure_project_identity(root),
+    )
 
 
 def _curtain_rgb_for_settings(
@@ -447,16 +451,11 @@ def _curtain_rgb_for_settings(
     )
     if style not in VALID_CURTAIN_STYLES:
         style = str(DEFAULT_SETTINGS["curtain_style"])
-    if style == "pure_white":
-        return FALLBACK_CURTAIN_RGB
     page_paths = [
         project_root / USER_PAGES_DIR / name
         for name in CURTAIN_ANALYSIS_PAGE_ORDER
     ]
-    return extract_deep_dominant_color_from_images(
-        page_paths,
-        hue_shift=0.5 if style == "complementary_average_color" else 0.0,
-    )
+    return curtain_rgb_for_style(page_paths, style)
 
 
 def _hash_file(digest: "hashlib._Hash", root: Path, path: Path) -> None:
@@ -844,7 +843,7 @@ def generate_play_bundle(
     open_in_browser: bool = False,
     seed_sfx: bool = True,
 ) -> Path:
-    """Transactionally replace the stable project-ID Play bundle."""
+    """Transactionally replace the active recipient/title Play bundle."""
     pr = Path(project_root).resolve()
     ensure_output_dirs(pr)
     final_play_dir = play_bundle_directory(pr)

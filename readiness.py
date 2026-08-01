@@ -50,12 +50,20 @@ def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
     pages = root / USER_PAGES_DIR
     message_path = root / MESSAGE_HTML_FILE
     required_features = settings.get(REQUIRED_FEATURES_KEY, {})
-    required_mapping = (
-        required_features if isinstance(required_features, dict) else {}
-    )
-    music_required = bool(
-        required_mapping.get("music", settings.get("music_required", False))
-    )
+    if isinstance(required_features, dict):
+        music_required = bool(
+            required_features.get(
+                "music",
+                settings.get("music_required", False),
+            )
+        )
+    elif isinstance(required_features, (list, tuple, set)):
+        music_required = "music" in {
+            str(feature).strip().lower()
+            for feature in required_features
+        }
+    else:
+        music_required = bool(settings.get("music_required", False))
     try:
         has_music = bool(resolve_project_tracks(root)[1])
     except (OSError, ValueError):

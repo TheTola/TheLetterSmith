@@ -5,7 +5,7 @@
 Nexus ΓÇö main shell for Letter Smith
 Clean placement ΓÇó Robust overlay ΓÇó Sound visualizer ΓÇó Prompt Writer FAB owned by Image_tab
 + Help.gif (idle, plays constantly) swaps to HHelp.gif on hover
-+ Per-tab Help popover header: Γ£¿The Image tabΓ£¿ / Γ£¿The sound tabΓ£¿ / Γ£¿The message tabΓ£¿ / Γ£¿The forge tabΓ£¿
++ Per-tab Help popover header: The Image tab / The sound tab / The message tab / The forge tab
 
 Notes
 - If Qt WebEngine is missing, we exit with a clear tip: pip install PySide6-Addons
@@ -17,6 +17,19 @@ from __future__ import annotations
 import os, sys, subprocess, json
 from pathlib import Path
 from typing import Optional
+
+from settings_store import (
+    CURTAIN_STYLE_LABELS,
+    DEFAULT_SETTINGS,
+    SettingsStore,
+    VALID_CURTAIN_STYLES,
+)
+from project_state import (
+    ApplicationState,
+    ProjectStateController,
+)
+from project_paths import ProjectPathResolver
+from recipient_page import RecipientPage
 
 # ===================================================================================================================================================================================
 # Overlay integration (robust, guarded)
@@ -150,6 +163,56 @@ class TitleBar(QtWidgets.QWidget):
         layout.addStretch()
 
         # ---------------------------------------------------------------------
+        # Viewer settings
+        # ---------------------------------------------------------------------
+
+        self.settings_button = QtWidgets.QToolButton(self)
+        self.settings_button.setText("Settings")
+        self.settings_button.setToolTip("Application settings")
+        self.settings_button.setAccessibleName("Application settings")
+        self.settings_button.setCursor(Qt.PointingHandCursor)
+        self.settings_button.setPopupMode(
+            QtWidgets.QToolButton.InstantPopup
+        )
+        self.settings_button.setFixedHeight(30)
+        self.settings_button.setStyleSheet(
+            "QToolButton{color:#d7f8ff;background:transparent;"
+            "border:1px solid transparent;border-radius:5px;padding:4px 9px;}"
+            "QToolButton:hover,QToolButton::menu-button:hover{"
+            "background:rgba(0,255,255,0.12);border-color:#2f6672;}"
+            "QToolButton::menu-indicator{image:none;}"
+        )
+        self.settings_menu = QtWidgets.QMenu(self.settings_button)
+        self.settings_menu.setStyleSheet(
+            "QMenu{background:#101820;color:#dff9ff;"
+            "border:1px solid #31515f;padding:5px;}"
+            "QMenu::item{padding:7px 26px 7px 10px;border-radius:4px;}"
+            "QMenu::item:selected{background:#18323d;color:#fff;}"
+            "QMenu::indicator:checked{background:#00b8d4;"
+            "border:1px solid #8cf3ff;}"
+        )
+        self.curtain_menu = self.settings_menu.addMenu("Curtains")
+        self._curtain_actions: dict[str, QtGui.QAction] = {}
+        self._curtain_group = QtGui.QActionGroup(self)
+        self._curtain_group.setExclusive(True)
+        for style, label in CURTAIN_STYLE_LABELS.items():
+            action = self.curtain_menu.addAction(label)
+            action.setCheckable(True)
+            action.setData(style)
+            self._curtain_group.addAction(action)
+            action.triggered.connect(
+                lambda _checked=False, value=style: self._set_curtain_style(
+                    value
+                )
+            )
+            self._curtain_actions[style] = action
+        self.settings_menu.aboutToShow.connect(
+            self._sync_curtain_menu
+        )
+        self.settings_button.setMenu(self.settings_menu)
+        layout.addWidget(self.settings_button)
+
+        # ---------------------------------------------------------------------
         # Target Browser
         # ---------------------------------------------------------------------
 
@@ -231,6 +294,33 @@ class TitleBar(QtWidgets.QWidget):
         # the window state outside this button.
         self.parent.installEventFilter(self)
         self._sync_max_restore_button()
+
+    def _sync_curtain_menu(self) -> None:
+        current = str(
+            SettingsStore(self.parent.project_root).get(
+                "curtain_style",
+                DEFAULT_SETTINGS["curtain_style"],
+            )
+        )
+        for style, action in self._curtain_actions.items():
+            action.setChecked(style == current)
+
+    def _set_curtain_style(self, style: str) -> None:
+        if style not in VALID_CURTAIN_STYLES:
+            style = str(DEFAULT_SETTINGS["curtain_style"])
+        SettingsStore(self.parent.project_root).update_fields(
+            curtain_style=style
+        )
+        self._sync_curtain_menu()
+        self.parent.status(
+            f"Curtain style set to {CURTAIN_STYLE_LABELS[style]}."
+        )
+        forge = getattr(self.parent, "forge_tab", None)
+        if forge is None:
+            return
+        forge.schedule_refresh()
+        if forge.isVisible():
+            forge.ensure_preview_current()
 
     def _make_button(
         self,
@@ -513,14 +603,57 @@ class HelpPopover(QFrame):
 # ===================================================================================================================================================================================
 # Nexus Main Window
 # ===================================================================================================================================================================================
+class _ForgePreviewFullscreenWindow(QtWidgets.QWidget):
+    """Top-level surface that fullscreens only the interactive letter preview."""
+
+    exit_requested = QtCore.Signal()
+
+    def __init__(self, owner: QtWidgets.QWidget):
+        super().__init__(
+            owner,
+            QtCore.Qt.Window | QtCore.Qt.FramelessWindowHint,
+        )
+        self.setObjectName("ForgePreviewFullscreenWindow")
+        self.setWindowTitle("Letter Preview")
+        self.setStyleSheet(
+            "QWidget#ForgePreviewFullscreenWindow{background:#0b0c12;}"
+        )
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(0)
+
+        self._escape_shortcut = QtGui.QShortcut(
+            QtGui.QKeySequence(Qt.Key_Escape),
+            self,
+        )
+        self._escape_shortcut.setContext(Qt.WindowShortcut)
+        self._escape_shortcut.activated.connect(self.exit_requested)
+
+    def attach_preview(self, preview: QtWidgets.QWidget) -> None:
+        self._layout.addWidget(preview)
+
+    def detach_preview(self, preview: QtWidgets.QWidget) -> None:
+        self._layout.removeWidget(preview)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self.exit_requested.emit()
+        event.ignore()
+
+
 class Nexus(QtWidgets.QMainWindow):
     def __init__(self, project_root: str | Path):
         super().__init__()
         self.project_root = str(project_root)
+        self.project_state = ProjectStateController(self.project_root)
+        self.project_paths = ProjectPathResolver(self.project_root)
+        initial_project_state = self.project_state.initialize()
+        self._project_tabs_initialized = False
         self._forge_fullscreen_active = False
-        self._forge_fullscreen_was_maximized = False
-        self._forge_fullscreen_geometry: Optional[QtCore.QByteArray] = None
-        self._forge_fullscreen_visibility: dict[QtWidgets.QWidget, bool] = {}
+        self._forge_fullscreen_window: Optional[
+            _ForgePreviewFullscreenWindow
+        ] = None
+        self._shutdown_complete = False
+        self._shutdown_in_progress = False
         self.setObjectName("NexusWindow")
 
         # Frameless + QSS
@@ -786,97 +919,17 @@ class Nexus(QtWidgets.QMainWindow):
         # Feature tabs
         self.page_stack = QtWidgets.QStackedWidget()
         self.page_stack.setObjectName("FeatureStack")
-        try:
-            from Image_tab import ImageTab
-            from sound_tab import SoundTab
-            from Message_tab import MessageTab
-            from Forge_Tab import ForgeTab
-            from command import CommandTab
-        except Exception as ex:
-            raise ImportError(f"Failed to import feature tabs: {ex}")
-
-        self.image_tab   = ImageTab()
-        self.sound_tab   = SoundTab(self.project_root)
-        self.message_tab = MessageTab(self.project_root)
-        self.forge_tab   = ForgeTab(self.project_root)
-        self.command_tab = CommandTab(self.project_root)
-        self.preview_tools_layout.insertWidget(
-            0,
-            self.forge_tab.preview_format_panel,
-            0,
-            Qt.AlignLeft | Qt.AlignVCenter,
-        )
-        self.forge_tab.preview_format_panel.setVisible(False)
-
-        # Feature pages are wrapped in explicit surfaces. This prevents Nexus's
-        # outer gray from bleeding through transparent child widgets. Sound gets
-        # a dark-blue surface; the other tabs retain the normal Nexus surface.
-        self.image_page = self._make_page_surface(
-            "ImagePageSurface",
-            self.image_tab,
-        )
-        self.sound_page = self._make_page_surface(
-            "SoundPageSurface",
-            self.sound_tab,
-        )
-        self.message_page = self._make_page_surface(
-            "MessagePageSurface",
-            self.message_tab,
-        )
-        self.forge_page = self._make_page_surface(
-            "ForgePageSurface",
-            self.forge_tab,
-        )
-        self.command_page = self._make_page_surface(
-            "CommandPageSurface",
-            self.command_tab,
-        )
-
-        for page in (
-            self.image_page,
-            self.sound_page,
-            self.message_page,
-            self.forge_page,
-            self.command_page,
-        ):
-            self.page_stack.addWidget(page)
-
         body_layout.addWidget(self.page_stack)
 
-        self.forge_tab.attach_readiness_window(self)
-        self.forge_tab.project_restored.connect(self._on_project_restored)
-        self.forge_tab.correction_requested.connect(
-            self._route_forge_correction
+        self.recipient_page = RecipientPage(self.main_widget)
+        self.recipient_page.recipient_submitted.connect(
+            self._accept_recipient
         )
-        self.forge_tab.preview_requested.connect(self._load_forge_preview)
-        self.forge_tab.preview_visibility_changed.connect(
-            self._set_forge_preview_visible
-        )
-        self.forge_tab.preview_files_release_requested.connect(
-            self._release_forge_preview_files
-        )
-        self.forge_tab.published_url_changed.connect(
-            lambda url: self.message_tab.set_published_page_url(
-                url,
-                persist=False,
-                announce=False,
-            )
-        )
-        self.message_tab.published_page_url_changed.connect(
-            self.forge_tab.set_saved_page_url
-        )
-        self.image_tab.image_selected.connect(
-            lambda _pixmap: self.forge_tab.schedule_refresh()
-        )
-        self.image_tab.clear_preview.connect(self.forge_tab.schedule_refresh)
-        self.sound_tab.project_sound.changed.connect(
-            self.forge_tab.schedule_refresh
-        )
-        self.message_tab.project_changed.connect(
-            self.forge_tab.schedule_refresh
-        )
-
-        main_layout.addWidget(self.body)
+        self.application_stack = QtWidgets.QStackedWidget(self.main_widget)
+        self.application_stack.setObjectName("ApplicationStack")
+        self.application_stack.addWidget(self.body)
+        self.application_stack.addWidget(self.recipient_page)
+        main_layout.addWidget(self.application_stack)
         self.setCentralWidget(self.main_widget)
 
         # Status bar
@@ -920,7 +973,7 @@ class Nexus(QtWidgets.QMainWindow):
 
         # Optional tab switcher animations. This remains responsible only for
         # ordinary tab-to-tab movement. Command transitions bypass it entirely.
-        self._tabswitch = TabSwitcher(self.page_stack) if TabSwitcher else None
+        self._tabswitch = None
 
         # Command transition state. Fixed body snapshots prevent Command from
         # inheriting movement from page-stack resizing or preview visibility.
@@ -938,35 +991,12 @@ class Nexus(QtWidgets.QMainWindow):
         # Remember last image pixmap for proper re-scaling on resize
         self._last_pixmap: Optional[QPixmap] = None
 
-        # Cross-tab preview wiring
-        self.image_tab.image_selected.connect(self._show_image)
-        self.image_tab.hover_preview_image.connect(self._show_image)
-
-        # ImageTab reset -> clear preview immediately
-        try:
-            self.image_tab.clear_preview.connect(self._on_image_tab_clear_preview)
-        except Exception:
-            pass
-
-        self.message_tab.preview_image.connect(self._show_image)
-        self.message_tab.wall_preview.connect(self._show_image)
-        self.message_tab.text_selected.connect(self._show_html)
-
-
-        # Command: after wipe, hard-clear preview state (redundancy)
-        try:
-            self.command_tab.wiped.connect(self._on_command_wiped)
-        except Exception:
-            pass
-
         # Keep a reference to Prompt Writer window if opened via shortcut
         self._prompt_writer_win: Optional[QtWidgets.QWidget] = None
 
         # Initial sizing & tab
         self.setMinimumSize(1180, 820)
         self.resize(WIN_W, WIN_H)
-        self.tabbar.setCurrentIndex(0)
-        self._tab_changed(0)
 
         # Shortcuts + click effects
         self._install_shortcuts()
@@ -979,12 +1009,196 @@ class Nexus(QtWidgets.QMainWindow):
         self._dbl_filter = _DoubleClickFilter(self)
         self.html_preview.installEventFilter(self._dbl_filter)
 
-        # Initial feedback
-        self.status("Ready.")
-        self.toast("Welcome to Letter Smith")
+        self.project_state.add_listener(self._on_project_state_transition)
+        self._apply_application_state(initial_project_state)
 
         # Diagnostics after event loop starts
         QtCore.QTimer.singleShot(0, self._post_init_diagnostics)
+
+    def _initialize_project_tabs(self) -> None:
+        if self._project_tabs_initialized:
+            return
+        try:
+            from Image_tab import ImageTab
+            from sound_tab import SoundTab
+            from Message_tab import MessageTab
+            from Forge_Tab import ForgeTab
+            from command import CommandTab
+        except Exception as ex:
+            raise ImportError(f"Failed to import feature tabs: {ex}") from ex
+
+        self.image_tab = ImageTab(
+            self.project_root,
+            project_state=self.project_state,
+            project_paths=self.project_paths,
+        )
+        self.sound_tab = SoundTab(
+            self.project_root,
+            project_state=self.project_state,
+            project_paths=self.project_paths,
+        )
+        self.message_tab = MessageTab(
+            self.project_root,
+            project_state=self.project_state,
+            project_paths=self.project_paths,
+        )
+        self.forge_tab = ForgeTab(
+            self.project_root,
+            project_state=self.project_state,
+            project_paths=self.project_paths,
+        )
+        self.command_tab = CommandTab(
+            self.project_root,
+            project_state=self.project_state,
+        )
+
+        self.preview_tools_layout.insertWidget(
+            0,
+            self.forge_tab.preview_format_panel,
+            0,
+            Qt.AlignLeft | Qt.AlignVCenter,
+        )
+        self.forge_tab.preview_format_panel.setVisible(False)
+
+        self.image_page = self._make_page_surface(
+            "ImagePageSurface",
+            self.image_tab,
+        )
+        self.sound_page = self._make_page_surface(
+            "SoundPageSurface",
+            self.sound_tab,
+        )
+        self.message_page = self._make_page_surface(
+            "MessagePageSurface",
+            self.message_tab,
+        )
+        self.forge_page = self._make_page_surface(
+            "ForgePageSurface",
+            self.forge_tab,
+        )
+        self.command_page = self._make_page_surface(
+            "CommandPageSurface",
+            self.command_tab,
+        )
+        for page in (
+            self.image_page,
+            self.sound_page,
+            self.message_page,
+            self.forge_page,
+            self.command_page,
+        ):
+            self.page_stack.addWidget(page)
+
+        self.forge_tab.attach_readiness_window(self)
+        self.forge_tab.project_restored.connect(self._on_project_restored)
+        self.forge_tab.correction_requested.connect(
+            self._route_forge_correction
+        )
+        self.forge_tab.preview_requested.connect(self._load_forge_preview)
+        self.forge_tab.preview_visibility_changed.connect(
+            self._set_forge_preview_visible
+        )
+        self.forge_tab.preview_files_release_requested.connect(
+            self._release_forge_preview_files
+        )
+        self.forge_tab.published_url_changed.connect(
+            lambda url: self.message_tab.set_published_page_url(
+                url,
+                persist=False,
+                announce=False,
+            )
+        )
+        self.message_tab.published_page_url_changed.connect(
+            self.forge_tab.set_saved_page_url
+        )
+        self.image_tab.image_selected.connect(
+            lambda _pixmap: self.forge_tab.schedule_refresh()
+        )
+        self.image_tab.clear_preview.connect(self.forge_tab.schedule_refresh)
+        self.sound_tab.project_sound.changed.connect(
+            self.forge_tab.schedule_refresh
+        )
+        self.message_tab.project_changed.connect(
+            self.forge_tab.schedule_refresh
+        )
+        self.image_tab.image_selected.connect(self._show_image)
+        self.image_tab.hover_preview_image.connect(self._show_image)
+        self.image_tab.clear_preview.connect(
+            self._on_image_tab_clear_preview
+        )
+        self.message_tab.preview_image.connect(self._show_image)
+        self.message_tab.wall_preview.connect(self._show_image)
+        self.message_tab.text_selected.connect(self._show_html)
+        self.command_tab.wiped.connect(self._on_command_wiped)
+
+        self._tabswitch = (
+            TabSwitcher(self.page_stack)
+            if TabSwitcher is not None
+            else None
+        )
+        self._project_tabs_initialized = True
+        self.tabbar.setCurrentIndex(0)
+        self._tab_changed(0)
+
+    def _on_project_state_transition(
+        self,
+        previous: ApplicationState,
+        current: ApplicationState,
+    ) -> None:
+        def apply_transition() -> None:
+            if (
+                current is ApplicationState.RECIPIENT_REQUIRED
+                and previous is not ApplicationState.BOOTING
+            ):
+                self.recipient_page.reset()
+            self._apply_application_state(current)
+
+        QtCore.QTimer.singleShot(0, apply_transition)
+
+    def _apply_application_state(
+        self,
+        state: ApplicationState,
+    ) -> None:
+        ready = (
+            state is ApplicationState.PROJECT_READY
+            and self.project_state.is_project_ready
+        )
+        self.tabbar.setVisible(ready)
+        if ready:
+            self._initialize_project_tabs()
+            self.body.setEnabled(True)
+            self.application_stack.setCurrentWidget(self.body)
+            self.status("Ready.")
+            self.toast("Welcome to Letter Smith")
+            return
+
+        self.body.setEnabled(False)
+        self.application_stack.setCurrentWidget(self.recipient_page)
+        self.recipient_page.focus_recipient()
+        self.status("A recipient is required before editing.")
+
+    def _accept_recipient(
+        self,
+        recipient: str,
+        custom_capitalization: bool,
+    ) -> None:
+        try:
+            forge_tab = getattr(self, "forge_tab", None)
+            if (
+                forge_tab is not None
+                and forge_tab.has_pending_recipient_assignment()
+            ):
+                if forge_tab.assign_pending_recipient(
+                    recipient,
+                    custom_capitalization=custom_capitalization,
+                ):
+                    return
+            self.project_state.establish_project(
+                recipient,
+                custom_capitalization=custom_capitalization,
+            )
+        except (RuntimeError, ValueError, OSError) as error:
+            self.recipient_page.show_error(str(error))
 
     def _make_page_surface(
         self,
@@ -1157,6 +1371,11 @@ class Nexus(QtWidgets.QMainWindow):
         or leaving Command bypasses TabSwitcher and uses a fixed body-snapshot
         fade so no page, preview, or help movement leaks through.
         """
+        if (
+            not self._project_tabs_initialized
+            or not self.project_state.is_project_ready
+        ):
+            return
         if idx < 0 or idx >= self.page_stack.count():
             return
 
@@ -1495,8 +1714,7 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception:
             pass
         try:
-            self._set_forge_preview_visible(False)
-            self.html_preview.setUrl(QUrl("about:blank"))
+            self._release_forge_preview_files()
         except Exception:
             pass
         self._last_pixmap = None
@@ -1640,89 +1858,69 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _on_web_fullscreen_requested(self, request) -> None:
         toggle_on = bool(request.toggleOn())
-        request.accept()
         if toggle_on:
             if self._forge_fullscreen_active:
+                request.accept()
                 return
             self._enter_forge_fullscreen()
+            request.accept()
             return
+        request.accept()
         self._restore_forge_preview_from_fullscreen()
 
     def _enter_forge_fullscreen(self) -> None:
-        self._forge_fullscreen_active = True
-        self._forge_fullscreen_was_maximized = self.isMaximized()
-        self._forge_fullscreen_geometry = self.saveGeometry()
-        chrome = (
-            self.title_bar,
-            self.tabbar,
-            self.preview_caption,
-            self.forge_tab.preview_format_panel,
-            self.help_icon,
-            self.page_stack,
-            self.statusBar(),
-        )
-        self._forge_fullscreen_visibility = {
-            widget: widget.isVisible()
-            for widget in chrome
-        }
-        for widget in chrome:
-            widget.hide()
+        if self._forge_fullscreen_active:
+            return
+        window = self._forge_fullscreen_window
+        if window is None:
+            window = _ForgePreviewFullscreenWindow(self)
+            window.exit_requested.connect(
+                self._request_forge_fullscreen_exit
+            )
+            self._forge_fullscreen_window = window
 
-        body_layout = self.body.layout()
-        if body_layout is not None:
-            body_layout.setContentsMargins(0, 0, 0, 0)
-            body_layout.setSpacing(0)
-        preview_layout = self.preview_frame.layout()
-        if preview_layout is not None:
-            preview_layout.setContentsMargins(0, 0, 0, 0)
-        self.preview_frame.setStyleSheet(
-            "background:#0b0c12;border:none;border-radius:0;"
-        )
-        self.showFullScreen()
-        QtCore.QTimer.singleShot(0, self._fit_forge_fullscreen_preview)
-        QtCore.QTimer.singleShot(
-            80,
-            self._fit_forge_fullscreen_preview,
-        )
+        self._forge_fullscreen_active = True
+        self.preview_stack.removeWidget(self.html_preview)
+        window.attach_preview(self.html_preview)
+        screen = self.screen()
+        if screen is not None:
+            window.setGeometry(screen.geometry())
+        window.showFullScreen()
+        window.raise_()
+        window.activateWindow()
         self.html_preview.setFocus()
 
-    def _fit_forge_fullscreen_preview(self) -> None:
+    def _request_forge_fullscreen_exit(self) -> None:
         if not self._forge_fullscreen_active:
             return
-        self.preview_frame.setFixedSize(
-            max(1, self.body.width()),
-            max(1, self.body.height()),
+        try:
+            self.html_preview.page().runJavaScript(
+                "if (document.fullscreenElement) document.exitFullscreen();"
+            )
+        except RuntimeError:
+            self._restore_forge_preview_from_fullscreen()
+            return
+        QtCore.QTimer.singleShot(
+            250,
+            lambda: (
+                self._restore_forge_preview_from_fullscreen()
+                if self._forge_fullscreen_active
+                else None
+            ),
         )
 
     def _restore_forge_preview_from_fullscreen(self, *_args) -> None:
         if not self._forge_fullscreen_active:
             return
         self._forge_fullscreen_active = False
-        self.preview_frame.setStyleSheet("")
-        preview_layout = self.preview_frame.layout()
-        if preview_layout is not None:
-            preview_layout.setContentsMargins(6, 6, 6, 6)
-        body_layout = self.body.layout()
-        if body_layout is not None:
-            body_layout.setContentsMargins(12, 12, 12, 12)
-            body_layout.setSpacing(10)
-
-        if self._forge_fullscreen_was_maximized:
-            self.showMaximized()
-        else:
-            self.showNormal()
-            if self._forge_fullscreen_geometry is not None:
-                self.restoreGeometry(self._forge_fullscreen_geometry)
-
-        for widget, was_visible in self._forge_fullscreen_visibility.items():
-            widget.setVisible(was_visible)
-        self._forge_fullscreen_visibility.clear()
-        self._forge_fullscreen_geometry = None
+        window = self._forge_fullscreen_window
+        if window is not None:
+            window.hide()
+            window.detach_preview(self.html_preview)
+        if self.preview_stack.indexOf(self.html_preview) < 0:
+            self.preview_stack.addWidget(self.html_preview)
+        self.preview_stack.setCurrentWidget(self.html_preview)
         QtCore.QTimer.singleShot(0, self._update_preview_geometry)
-        QtCore.QTimer.singleShot(
-            0,
-            lambda: self.preview_stack.setCurrentWidget(self.html_preview),
-        )
         self.html_preview.setFocus()
 
     def _read_project_title(self) -> str:
@@ -1744,10 +1942,11 @@ class Nexus(QtWidgets.QMainWindow):
     def _update_preview_geometry(self) -> None:
         """Keep Sound usable in normal windows without changing full-screen layout."""
         if self._forge_fullscreen_active:
-            self._fit_forge_fullscreen_preview()
             return
         window_height = max(1, self.height())
         window_width = max(1, self.width())
+        body_width = max(1, self.body.width() - 24)
+        body_height = max(1, self.body.height() - 24)
         try:
             current_tab = self.tabbar.currentIndex()
         except Exception:
@@ -1761,8 +1960,20 @@ class Nexus(QtWidgets.QMainWindow):
 
         if current_tab == 3:
             mode = getattr(self, "_forge_preview_mode", "portrait")
-            max_h = max(220, int(window_height * 0.34))
-            max_w = max(360, int(window_width * 0.74))
+            max_h = max(
+                1,
+                min(
+                    int(window_height * 0.34),
+                    int(body_height * 0.45),
+                ),
+            )
+            max_w = max(
+                1,
+                min(
+                    int(window_width * 0.74),
+                    body_width,
+                ),
+            )
             if mode == "portrait":
                 h = max_h
                 w = int(h * 0.8)
@@ -1776,8 +1987,8 @@ class Nexus(QtWidgets.QMainWindow):
                 w = max_w
                 h = max_h
             self.preview_frame.setFixedSize(
-                max(240, w + 12),
-                max(180, h + 12),
+                min(body_width, max(1, w + 12)),
+                min(body_height, max(1, h + 12)),
             )
             return
         if sound_in_normal_window:
@@ -1828,25 +2039,54 @@ class Nexus(QtWidgets.QMainWindow):
             self._reposition_help_popover()
         super().moveEvent(event)
 
+    def shutdown(self) -> None:
+        """Release live tab and WebEngine resources exactly once."""
+        if self._shutdown_complete or self._shutdown_in_progress:
+            return
+        self._shutdown_in_progress = True
+        try:
+            self.project_state.remove_listener(
+                self._on_project_state_transition
+            )
+            self.project_state.shutdown()
+            if self._project_tabs_initialized:
+                try:
+                    self._release_forge_preview_files()
+                except Exception:
+                    pass
+                try:
+                    self.forge_tab.deactivate_for_tab_change()
+                    self.forge_tab.set_readiness_context_visible(False)
+                except Exception:
+                    pass
+                try:
+                    self.sound_tab.deactivate_for_tab_change()
+                    self.sound_tab.release_current_file_handle()
+                except Exception:
+                    pass
+                try:
+                    self.message_tab.shutdown()
+                except Exception:
+                    pass
+                try:
+                    self.image_tab.shutdown()
+                except Exception:
+                    pass
+        finally:
+            self._shutdown_complete = True
+            self._shutdown_in_progress = False
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        if not self.forge_tab.shutdown_operations():
+        forge_tab = getattr(self, "forge_tab", None)
+        if (
+            self._project_tabs_initialized
+            and forge_tab is not None
+            and not forge_tab.shutdown_operations()
+        ):
             self.status("Finish the current Forge operation before closing.")
             event.ignore()
             return
-        try:
-            self.message_tab.shutdown()
-        except Exception:
-            pass
-        try:
-            self.forge_tab.deactivate_for_tab_change()
-            self.forge_tab.set_readiness_context_visible(False)
-        except Exception:
-            pass
-        try:
-            self.sound_tab.deactivate_for_tab_change()
-        except Exception:
-            pass
-        self._release_forge_preview_files()
+        self.shutdown()
         super().closeEvent(event)
 
     # =============================================================================================
@@ -1878,6 +2118,10 @@ class Nexus(QtWidgets.QMainWindow):
         Open Prompt Writer inline as an overlay panel (if available).
         The visible launcher button is owned by Image_tab.py; Ctrl+Alt+P also opens it.
         """
+        if not self.project_state.is_project_ready:
+            self.status("Enter a recipient before opening Prompt Writer.")
+            self.recipient_page.focus_recipient()
+            return
         w = getattr(self, "_prompt_writer_win", None)
         if isinstance(w, QtWidgets.QWidget) and w.isVisible():
             try:
@@ -1977,26 +2221,42 @@ class Nexus(QtWidgets.QMainWindow):
     def _refresh_help_text(self, idx: int):
         # Header (per tab)
         if idx == 0:
-            header = "<b>Γ£¿The Image tabΓ£¿</b>"
-            body = ("Here you choose the three pictures that make up your letter. "
-                    "The cover is the front image, the letter is the main picture inside, and the back is the closing image at the end. "
-                    "Each time you select one, it appears in the preview so you can see exactly how it will look in the final letter.")
-        elif idx == 1:
-            header = "<b>Γ£¿The Sound tabΓ£¿</b>"
-            body = ("This tab lets you add background music to your letter. "
-                    "Pick an MP3 file, and it will play while someone reads. "
-                    "If you donΓÇÖt want music, you can leave it empty and the letter will stay silent.")
-        elif idx == 2:
-            header = "<b>Γ£¿The Message tabΓ£¿</b>"
-            body = ("Here is where you load your words. Click Load Message File and select your note ΓÇö "
-                    "it can be a text file, a Word document, or a PDF. "
-                    "The program will bring in up to a thousand words and display them in the preview so you can review the message before finishing.")
-        elif idx == 3:
-            header = "<b>Γ£¿The Forge tabΓ£¿</b>"
+            header = "<b>✨The Images Tab✨</b>"
             body = (
-                "Check readiness, load a saved letter, and select Preview Letter "
-                "to test the complete interactive viewer. Publish Letter creates "
-                "the hosted result, and Open Published Letter opens its saved link."
+                "Here you choose the four images that make up your letter: "
+                "the Cover Page, Main Letter, Letter Background, and Final "
+                "Backdrop. Click an image card to select or replace it, or "
+                "hover over it to view it in the main preview. You can clear "
+                "individual images, reset all four, open the Gallery, or use "
+                "Prompt Writer to create image prompts."
+            )
+        elif idx == 1:
+            header = "<b>✨The Sound Tab✨</b>"
+            body = body = (
+    "Here you can add background music to your letter. Choose a "
+    "song from your computer or Music Archive, or create an optional "
+    "playlist with multiple songs. Use the playback, volume, mute, "
+    "ordering, and removal controls to review your music. Sound is "
+    "optional, so leaving this tab empty will create a silent letter."
+)
+        elif idx == 2:
+            header = "<b>✨The Message Tab✨</b>"
+            body = (
+                "Here you import, write, and refine the message inside your "
+                "letter. Use Import to load an existing message, Edit to change "
+                "its text and formatting, and Revisions to review saved versions. "
+                "The message is limited to 1,000 words and appears in the main "
+                "preview so you can inspect it before completing the letter."
+            )
+        elif idx == 3:
+            header = "<b>✨The Forge Tab✨</b>"
+            body = (
+                "Here you assemble and manage the finished letter. Check readiness "
+                "to find anything that is missing, load an existing saved letter, "
+                "and use Preview Letter to test the complete interactive experience "
+                "locally. Publish Letter creates the online version, Open Letter "
+                "opens the available local or published copy, and Go to Gallery "
+                "opens your collection of published letters."
             )
         else:
             header, body = "", ""
@@ -2037,9 +2297,8 @@ class Nexus(QtWidgets.QMainWindow):
             and isinstance(event, QtGui.QKeyEvent)
             and event.key() == Qt.Key_Escape
         ):
-            web_view.page().runJavaScript(
-                "if (document.fullscreenElement) document.exitFullscreen();"
-            )
+            self._request_forge_fullscreen_exit()
+            return True
 
         if icon is not None and watched is icon:
             t = event.type()
