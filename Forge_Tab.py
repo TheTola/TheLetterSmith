@@ -363,6 +363,7 @@ class ForgeTab(QtWidgets.QWidget):
     preview_requested = QtCore.Signal(str, str)
     preview_files_release_requested = QtCore.Signal()
     project_files_release_requested = QtCore.Signal()
+    restore_activity_changed = QtCore.Signal(bool, str)
     preview_visibility_changed = QtCore.Signal(bool)
     published_url_changed = QtCore.Signal(str)
     _settings_refresh_requested = QtCore.Signal()
@@ -401,6 +402,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._operation_success: Optional[Callable[[object], None]] = None
         self._operation_failure: Optional[Callable[[], None]] = None
         self._operation_error_message = ""
+        self._restore_operation_active = False
         self._selected_saved_letter: Optional[SavedLetter] = None
         self._pending_recipient_entry: Optional[SavedLetter] = None
         self._saved_cards: list[SavedLetterCard] = []
@@ -964,6 +966,8 @@ class ForgeTab(QtWidgets.QWidget):
             return
 
         previous_identity = self.project_state.identity
+        activity = "Loading saved letter…"
+        self._begin_restore_activity(activity)
         self._release_project_files_for_restore()
         self.project_state.transition(
             ApplicationState.PROJECT_LOADING
@@ -972,8 +976,8 @@ class ForgeTab(QtWidgets.QWidget):
         def task() -> RestoredProject:
             return self.restorer.restore(entry)
 
-        self._start_operation(
-            "Loading saved letter…",
+        self._start_restore_operation(
+            activity,
             task,
             self._complete_restore,
             "The selected saved letter could not be restored.",
@@ -998,6 +1002,8 @@ class ForgeTab(QtWidgets.QWidget):
             self.project_state.transition(
                 ApplicationState.PROJECT_MIGRATING
             )
+        activity = "Assigning recipient and loading saved letter…"
+        self._begin_restore_activity(activity)
         self._release_project_files_for_restore()
         self.project_state.transition(
             ApplicationState.PROJECT_LOADING
@@ -1011,8 +1017,8 @@ class ForgeTab(QtWidgets.QWidget):
             )
             return self.restorer.restore(identified)
 
-        self._start_operation(
-            "Assigning recipient and loading saved letter…",
+        self._start_restore_operation(
+            activity,
             task,
             self._complete_restore,
             "The saved letter could not be assigned to that recipient.",
@@ -1149,6 +1155,7 @@ class ForgeTab(QtWidgets.QWidget):
                 ApplicationState.RECIPIENT_REQUIRED
             )
             return
+        self._begin_restore_activity("Loading saved letter…")
         self._release_project_files_for_restore()
         self.project_state.transition(
             ApplicationState.PROJECT_LOADING
@@ -1163,12 +1170,47 @@ class ForgeTab(QtWidgets.QWidget):
                 error=True,
             )
             return
+        finally:
+            self._finish_restore_activity()
         self._complete_restore(restored)
 
     def _release_project_files_for_restore(self) -> None:
         """Release live viewers and media before replacing project folders."""
         self.preview_files_release_requested.emit()
         self.project_files_release_requested.emit()
+
+    def _begin_restore_activity(self, activity: str) -> None:
+        self._restore_operation_active = True
+        self.restore_activity_changed.emit(True, activity)
+
+    def _finish_restore_activity(self) -> None:
+        if not self._restore_operation_active:
+            return
+        self._restore_operation_active = False
+        self.restore_activity_changed.emit(False, "")
+
+    def _start_restore_operation(
+        self,
+        activity: str,
+        task: Callable[[], object],
+        on_success: Callable[[object], None],
+        error_message: str,
+        *,
+        on_failure: Callable[[], None] | None = None,
+    ) -> None:
+        if not self._restore_operation_active:
+            self._begin_restore_activity(activity)
+        try:
+            self._start_operation(
+                activity,
+                task,
+                on_success,
+                error_message,
+                on_failure=on_failure,
+            )
+        except Exception:
+            self._finish_restore_activity()
+            raise
 
     def _complete_restore(self, restored: object) -> None:
         if not isinstance(restored, RestoredProject):
@@ -1701,6 +1743,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._operation_failure = None
         self._busy = False
         self._set_busy(False)
+        self._finish_restore_activity()
         if thread is not None:
             thread.deleteLater()
         if self._preview_refresh_requested:
@@ -1781,6 +1824,7 @@ class ForgeTab(QtWidgets.QWidget):
             self._operation_failure = None
             self._operation_error_message = ""
             self._busy = False
+            self._finish_restore_activity()
         return stopped
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
