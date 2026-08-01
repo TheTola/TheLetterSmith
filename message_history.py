@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import os
 import re
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from transactional_io import atomic_write_text
 
 
 REVISION_FOLDER_NAME = "revisions"
@@ -32,21 +32,8 @@ def revision_directory(message_path: str | Path) -> Path:
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-
-    last_error: Optional[OSError] = None
-    for _ in range(6):
-        try:
-            os.replace(tmp, path)
-            return
-        except OSError as error:
-            last_error = error
-            time.sleep(0.05)
-
-    if last_error is not None:
-        raise last_error
+    """Write a revision atomically with flush, fsync, and temp cleanup."""
+    atomic_write_text(path, content)
 
 
 def _revision_filename(reason: str) -> str:
