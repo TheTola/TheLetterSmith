@@ -45,6 +45,7 @@ class ArtworkButton(QtWidgets.QPushButton):
         super().__init__(text, parent)
         self._artwork_path = button_art_path(project_root, artwork_filename)
         self._artwork = QtGui.QPixmap(str(self._artwork_path))
+        self._artwork_fill = False
         self._hovered = False
         self.setCursor(QtCore.Qt.PointingHandCursor)
         font = self.font()
@@ -68,6 +69,11 @@ class ArtworkButton(QtWidgets.QPushButton):
     @property
     def artwork_path(self) -> Path:
         return self._artwork_path
+
+    def set_artwork_fill(self, enabled: bool) -> None:
+        """Opt into aspect-preserving cover scaling for padded artwork."""
+        self._artwork_fill = bool(enabled)
+        self.update()
 
     def sizeHint(self) -> QtCore.QSize:  # type: ignore[override]
         if not self.has_artwork:
@@ -99,20 +105,32 @@ class ArtworkButton(QtWidgets.QPushButton):
         if self.isDown():
             content.translate(0, 2)
 
+        aspect_mode = (
+            QtCore.Qt.AspectRatioMode.KeepAspectRatioByExpanding
+            if self._artwork_fill
+            else QtCore.Qt.AspectRatioMode.KeepAspectRatio
+        )
         scaled = self._artwork.scaled(
             content.size(),
-            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            aspect_mode,
             QtCore.Qt.TransformationMode.SmoothTransformation,
         )
-        target = QtCore.QRect(
+        pixmap_target = QtCore.QRect(
             content.center().x() - scaled.width() // 2,
             content.center().y() - scaled.height() // 2,
             scaled.width(),
             scaled.height(),
         )
+        target = content if self._artwork_fill else pixmap_target
 
         painter.setOpacity(0.72 if not self.isEnabled() else (1.0 if self._hovered else 0.94))
-        painter.drawPixmap(target, scaled)
+        if self._artwork_fill:
+            painter.save()
+            painter.setClipRect(content)
+            painter.drawPixmap(pixmap_target, scaled)
+            painter.restore()
+        else:
+            painter.drawPixmap(pixmap_target, scaled)
         painter.setOpacity(1.0)
 
         # A restrained shadow keeps labels readable across light and dark art.
