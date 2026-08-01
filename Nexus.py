@@ -14,6 +14,7 @@ Notes
 
 from __future__ import annotations
 
+import math
 import os, sys, subprocess, json
 from pathlib import Path
 from typing import Optional
@@ -102,6 +103,153 @@ class _DoubleClickFilter(QtCore.QObject):
                 self.nexus._on_message_double_click()
                 return True
         return False
+
+
+class _LoadingSpinner(QtWidgets.QWidget):
+    """Small indeterminate spinner rendered without external assets."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._step = 0
+        self.setFixedSize(92, 92)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(55)
+        self._timer.timeout.connect(self._advance)
+
+    def start(self) -> None:
+        self._step = 0
+        self._timer.start()
+        self.update()
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def _advance(self) -> None:
+        self._step = (self._step + 1) % 12
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        del event
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        center = QtCore.QPointF(self.width() / 2, self.height() / 2)
+
+        pulse = 2.0 + 1.5 * (1.0 + math.sin(self._step * math.pi / 6.0))
+        ring = QtGui.QPen(QtGui.QColor(0, 205, 236, 70), pulse)
+        painter.setPen(ring)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(center, 30, 30)
+
+        painter.setPen(Qt.NoPen)
+        for index in range(12):
+            distance = (index - self._step) % 12
+            color = QtGui.QColor(0, 235, 255)
+            color.setAlpha(max(38, 255 - distance * 18))
+            painter.setBrush(color)
+            angle = math.radians(index * 30 - 90)
+            point = QtCore.QPointF(
+                center.x() + math.cos(angle) * 31,
+                center.y() + math.sin(angle) * 31,
+            )
+            radius = 4.7 if distance == 0 else 3.4
+            painter.drawEllipse(point, radius, radius)
+
+
+class _ProjectLoadingOverlay(QtWidgets.QFrame):
+    """Animated input shield shown while a saved project is restored."""
+
+    _BLOCKED_KEYS = {
+        QEvent.KeyPress,
+        QEvent.KeyRelease,
+        QEvent.Shortcut,
+        QEvent.ShortcutOverride,
+    }
+
+    def __init__(self, parent: QtWidgets.QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("ProjectLoadingOverlay")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setStyleSheet(
+            "QFrame#ProjectLoadingOverlay{background:rgba(4,8,12,218);border:none;}"
+            "QFrame#ProjectLoadingPanel{background:#101820;border:1px solid #287080;"
+            "border-radius:12px;}"
+            "QLabel#ProjectLoadingTitle{color:#e9fdff;font:600 15pt 'Segoe UI';}"
+            "QLabel#ProjectLoadingDetail{color:#9fcbd3;font:10pt 'Segoe UI';}"
+        )
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(24, 24, 24, 24)
+        root.addStretch(1)
+
+        panel = QtWidgets.QFrame(self)
+        panel.setObjectName("ProjectLoadingPanel")
+        panel.setMaximumWidth(460)
+        panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel_layout.setContentsMargins(34, 26, 34, 28)
+        panel_layout.setSpacing(10)
+
+        self.spinner = _LoadingSpinner(panel)
+        panel_layout.addWidget(self.spinner, 0, Qt.AlignHCenter)
+        self.title = QtWidgets.QLabel("Loading saved letter…", panel)
+        self.title.setObjectName("ProjectLoadingTitle")
+        self.title.setAlignment(Qt.AlignCenter)
+        self.title.setTextFormat(Qt.PlainText)
+        self.title.setWordWrap(True)
+        panel_layout.addWidget(self.title)
+        self.detail = QtWidgets.QLabel(
+            "Restoring the recipient, images, message, and sound safely.",
+            panel,
+        )
+        self.detail.setObjectName("ProjectLoadingDetail")
+        self.detail.setAlignment(Qt.AlignCenter)
+        self.detail.setTextFormat(Qt.PlainText)
+        self.detail.setWordWrap(True)
+        panel_layout.addWidget(self.detail)
+
+        for child in (panel, self.title, self.detail):
+            child.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        root.addWidget(panel, 0, Qt.AlignHCenter)
+        root.addStretch(1)
+        self.hide()
+
+    def start(self, message: str) -> None:
+        activity = str(message or "Loading saved letter…").strip()
+        self.title.setText(activity)
+        application = QtWidgets.QApplication.instance()
+        if application is not None:
+            application.installEventFilter(self)
+        self.show()
+        self.raise_()
+        self.setFocus(Qt.OtherFocusReason)
+        self.spinner.start()
+
+    def stop(self) -> None:
+        self.spinner.stop()
+        application = QtWidgets.QApplication.instance()
+        if application is not None:
+            application.removeEventFilter(self)
+        self.hide()
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if self.isVisible() and event.type() in self._BLOCKED_KEYS:
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        event.accept()
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        event.accept()
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        event.accept()
 
 
 # =============================================================================
@@ -965,6 +1113,9 @@ class Nexus(QtWidgets.QMainWindow):
         self.application_stack.addWidget(self.recipient_page)
         main_layout.addWidget(self.application_stack)
         self.setCentralWidget(self.main_widget)
+        self._project_loading_overlay = _ProjectLoadingOverlay(
+            self.main_widget
+        )
 
         # Status bar
         self._status = QStatusBar()
@@ -1126,6 +1277,9 @@ class Nexus(QtWidgets.QMainWindow):
         )
         self.forge_tab.project_files_release_requested.connect(
             self._release_project_files_for_restore
+        )
+        self.forge_tab.restore_activity_changed.connect(
+            self._set_restore_activity
         )
         self.forge_tab.published_url_changed.connect(
             lambda url: self.message_tab.set_published_page_url(
@@ -1949,6 +2103,30 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception:
             _LOGGER.exception("Sound files could not be released before restore.")
 
+    @QtCore.Slot(bool, str)
+    def _set_restore_activity(self, active: bool, message: str) -> None:
+        if active:
+            self._position_project_loading_overlay()
+            self._project_loading_overlay.start(message)
+            QtWidgets.QApplication.processEvents(
+                QtCore.QEventLoop.ExcludeUserInputEvents
+                | QtCore.QEventLoop.ExcludeSocketNotifiers
+            )
+            return
+        self._project_loading_overlay.stop()
+
+    def _position_project_loading_overlay(self) -> None:
+        overlay = getattr(self, "_project_loading_overlay", None)
+        if overlay is None:
+            return
+        top = self.title_bar.geometry().bottom() + 1
+        overlay.setGeometry(
+            0,
+            top,
+            self.main_widget.width(),
+            max(0, self.main_widget.height() - top),
+        )
+
     def restart_forge_preview(self, _reason: str = "") -> None:
         """Reset playback so every Forge entry starts at the curtain."""
         self._release_forge_preview_files()
@@ -2106,6 +2284,7 @@ class Nexus(QtWidgets.QMainWindow):
         self._update_preview_geometry()
         self._update_preview_tools_geometry()
         self._position_command_tabbar()
+        self._position_project_loading_overlay()
 
         # Reposition any visible toast
         if self._toast.isVisible():
