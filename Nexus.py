@@ -2114,7 +2114,7 @@ class Nexus(QtWidgets.QMainWindow):
     def _release_project_files_for_restore(self) -> None:
         """Release project-owned media handles before an atomic restore."""
         try:
-            self.sound_tab.release_project_files_for_restore()
+            self.sound_tab.prepare_for_project_restore()
         except Exception:
             _LOGGER.exception("Sound files could not be released before restore.")
 

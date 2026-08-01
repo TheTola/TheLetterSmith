@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import stat
@@ -13,8 +14,31 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 
 DirectoryValidator = Callable[[Path], bool | None]
+_LOGGER = logging.getLogger(__name__)
 _DIRECTORY_REPLACE_TIMEOUT_SECONDS = 2.0
 _PATH_REMOVE_TIMEOUT_SECONDS = 2.0
+_TRANSIENT_RETRY_DELAYS = (0.0, 0.05, 0.1, 0.2, 0.4, 0.8)
+
+
+def _is_transient_windows_error(error: BaseException) -> bool:
+    if isinstance(error, PermissionError):
+        return True
+    return (
+        isinstance(error, OSError)
+        and getattr(error, "winerror", None) in {5, 32}
+    )
+
+
+def _with_transient_retry(operation: Callable[[], Any]) -> Any:
+    for attempt, delay in enumerate(_TRANSIENT_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            return operation()
+        except OSError as error:
+            if not _is_transient_windows_error(error) or attempt == len(_TRANSIENT_RETRY_DELAYS) - 1:
+                raise
+    raise RuntimeError("Transient operation retry exhausted.")
 
 
 def _temporary_path(target: Path) -> Path:
@@ -25,15 +49,7 @@ def _temporary_path(target: Path) -> Path:
 
 def _replace_directory_path(source: Path, destination: Path) -> None:
     """Retry brief Windows sharing violations while viewers release files."""
-    deadline = time.monotonic() + _DIRECTORY_REPLACE_TIMEOUT_SECONDS
-    while True:
-        try:
-            os.replace(source, destination)
-            return
-        except PermissionError:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(0.05)
+    _with_transient_retry(lambda: os.replace(source, destination))
 
 
 def atomic_write_bytes(path: str | Path, value: bytes) -> Path:
@@ -45,9 +61,9 @@ def atomic_write_bytes(path: str | Path, value: bytes) -> Path:
             stream.write(value)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, target)
+        _with_transient_retry(lambda: os.replace(temporary, target))
     finally:
-        temporary.unlink(missing_ok=True)
+        _remove_path(temporary)
     return target
 
 
@@ -92,9 +108,9 @@ def safe_write_json(
             raise ValueError("validated JSON must contain an object")
         if validator is not None:
             validator(parsed)
-        os.replace(temporary, target)
+        _with_transient_retry(lambda: os.replace(temporary, target))
     finally:
-        temporary.unlink(missing_ok=True)
+        _remove_path(temporary)
     return target
 
 
@@ -117,18 +133,13 @@ def _safe_child(parent: Path, child: Path) -> bool:
 
 
 def _remove_path(path: Path) -> None:
-    deadline = time.monotonic() + _PATH_REMOVE_TIMEOUT_SECONDS
-    while True:
-        try:
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path, onexc=_remove_readonly_and_retry)
-            elif path.exists() or path.is_symlink():
-                path.unlink()
-            return
-        except PermissionError:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(0.05)
+    def remove() -> None:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, onexc=_remove_readonly_and_retry)
+        elif path.exists() or path.is_symlink():
+            path.unlink()
+
+    _with_transient_retry(remove)
 
 
 def _remove_readonly_and_retry(
@@ -202,6 +213,48 @@ def cleanup_abandoned_staging(
         _remove_path(candidate)
         removed.append(resolved)
     return tuple(removed)
+
+
+def recover_stale_transactions(
+    destinations: Iterable[str | Path],
+    *,
+    older_than_seconds: float = 24 * 60 * 60,
+    now: Optional[float] = None,
+) -> tuple[Path, ...]:
+    """Conservatively recover abandoned load transactions.
+
+    A backup is restored only when its normal destination is missing. Existing
+    destinations are left untouched; this avoids deleting an unknown user's
+    data merely because a transaction sidecar remains after a crash.
+    """
+    cutoff = (time.time() if now is None else now) - max(0.0, older_than_seconds)
+    recovered: list[Path] = []
+    for raw_destination in destinations:
+        destination = Path(raw_destination).resolve()
+        backup = destination.with_name(destination.name + ".load-backup")
+        if backup.exists():
+            if not destination.exists():
+                try:
+                    _replace_directory_path(backup, destination)
+                    recovered.append(destination)
+                    _LOGGER.info("Recovered abandoned transaction: %s", destination)
+                except OSError:
+                    _LOGGER.exception("Could not recover transaction backup: %s", backup)
+            else:
+                _LOGGER.info("Retained transaction backup because destination is valid: %s", backup)
+
+        pattern = destination.name + ".load-staging.*"
+        for staging in sorted(destination.parent.glob(pattern)):
+            if not staging.exists():
+                continue
+            try:
+                if staging.stat().st_mtime > cutoff:
+                    continue
+                _remove_path(staging)
+                _LOGGER.info("Removed stale transaction staging: %s", staging)
+            except OSError:
+                _LOGGER.exception("Could not remove stale transaction staging: %s", staging)
+    return tuple(recovered)
 
 
 class PathTransaction:
@@ -335,6 +388,7 @@ __all__ = [
     "atomic_write_text",
     "cleanup_abandoned_staging",
     "create_staging_directory",
+    "recover_stale_transactions",
     "replace_directory",
     "validate_directory",
 ]

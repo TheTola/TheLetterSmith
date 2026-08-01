@@ -10,7 +10,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from sound_tab import SoundTab
-from transactional_io import _remove_path
+from transactional_io import _remove_path, recover_stale_transactions
 
 
 class SoundRestoreLockTests(unittest.TestCase):
@@ -50,6 +50,23 @@ class SoundRestoreLockTests(unittest.TestCase):
 
             self.assertGreaterEqual(calls, 2)
             self.assertFalse(target.exists())
+
+    def test_stale_recovery_restores_missing_project_destination_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "pages"
+            backup = root / "pages.load-backup"
+            backup.mkdir()
+            (backup / "letter.png").write_bytes(b"old")
+            staging = root / "pages.load-staging.old"
+            staging.mkdir()
+            os.utime(staging, (0, 0))
+
+            recovered = recover_stale_transactions((destination,), now=100, older_than_seconds=1)
+
+            self.assertEqual(recovered, (destination.resolve(),))
+            self.assertEqual((destination / "letter.png").read_bytes(), b"old")
+            self.assertFalse(staging.exists())
 
 
 if __name__ == "__main__":
