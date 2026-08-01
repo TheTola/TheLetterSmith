@@ -41,6 +41,7 @@ PROMPT_LANGUAGE_VERSION = 2
 STATE_PERSIST_DEBOUNCE_MS = 350
 MAX_STATE_TEXT_LENGTH = 24000
 MAX_GENERATED_PROMPT_LENGTH = 24000
+MAX_MANAGED_LIST_ENTRY_LENGTH = 300
 REFERENCE_IMAGE_MAX_COUNT = 3
 REFERENCE_IMAGE_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 REFERENCE_IMAGE_ROLES: Tuple[str, ...] = (
@@ -239,7 +240,16 @@ EXCLUSIVE_CHECK_GROUPS: Tuple[Tuple[str, ...], ...] = (
 
 def _normalize_exclusive_check_states(checks_raw: object) -> Dict[str, bool]:
     raw = checks_raw if isinstance(checks_raw, dict) else {}
-    checks = {key: bool(raw.get(key, False)) for key in BUILT_IN_CHECK_KEYS}
+    def as_bool(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().casefold() in {"1", "true", "yes", "on"}
+        return False
+
+    checks = {key: as_bool(raw.get(key, False)) for key in BUILT_IN_CHECK_KEYS}
 
     for group in EXCLUSIVE_CHECK_GROUPS:
         selected = next((key for key in group if checks[key]), None)
@@ -830,6 +840,17 @@ def _set_help(widget: QtWidgets.QWidget, text: str) -> None:
     widget.setWhatsThis(help_text)
 
 
+def _normalize_managed_list_line(line: object) -> str:
+    text = _normalize_text(line, strip=True, max_length=0)
+    if len(text) > MAX_MANAGED_LIST_ENTRY_LENGTH:
+        LOGGER.warning(
+            "Prompt Writer module-list entry rejected because it exceeds %d characters",
+            MAX_MANAGED_LIST_ENTRY_LENGTH,
+        )
+        return ""
+    return text
+
+
 def _clean_header_text(line: str) -> str:
     text = _normalize_text(line, strip=True, max_length=300)
     if not text:
@@ -845,7 +866,7 @@ def _parse_managed_list_entries(lines: List[str], *, allow_headers: bool) -> Lis
     entries: List[ManagedListEntry] = []
     seen: set[tuple[str, bool]] = set()
     for raw_line in lines:
-        stripped = _normalize_text(raw_line, strip=True, max_length=300)
+        stripped = _normalize_managed_list_line(raw_line)
         if not stripped:
             continue
         if stripped.startswith("-") or stripped.startswith("•"):
@@ -881,7 +902,7 @@ def _parse_color_list_entries(lines: List[str]) -> List[ManagedListEntry]:
         current_items = []
 
     for raw_line in lines:
-        stripped = _normalize_text(raw_line, strip=True, max_length=300)
+        stripped = _normalize_managed_list_line(raw_line)
         if not stripped:
             flush()
             continue
@@ -935,7 +956,7 @@ def _parse_color_list_entries(lines: List[str]) -> List[ManagedListEntry]:
 def _serialize_managed_list_entries(entries: List[ManagedListEntry], *, allow_headers: bool) -> str:
     lines: List[str] = []
     for entry in entries:
-        text = _normalize_text(entry.text, strip=True, max_length=300)
+        text = _normalize_managed_list_line(entry.text)
         if not text:
             continue
         if allow_headers and entry.is_header:
@@ -1842,7 +1863,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 page.key,
                 generated_raw.get(page.display_label, ""),
             )
-            generated_text = _normalize_text(generated_value)
+            generated_text = _normalize_text(generated_value, max_length=0)
             if generated_text.strip():
                 generated_prompts[page.key] = generated_text
 
@@ -2083,6 +2104,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     and saved_signature
                     and saved_signature == self._current_prompt_input_signature()
                 ):
+                    self._validate_generated_prompt_set(generated_prompts)
                     self._generated_prompts = generated_prompts
                     self._generated_input_signature = saved_signature
                     for page in self._page_specs:
@@ -3043,7 +3065,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             raise ValueError("generation did not produce all four prompts")
         unresolved = re.compile(r"\{\{[^{}]+\}\}")
         for key, prompt in prompts.items():
-            text = _normalize_text(prompt, strip=True, max_length=MAX_GENERATED_PROMPT_LENGTH)
+            text = _normalize_text(prompt, strip=True, max_length=0)
             if not text or len(text) > MAX_GENERATED_PROMPT_LENGTH:
                 raise ValueError(f"generated {key} prompt is empty or too long")
             if unresolved.search(text):

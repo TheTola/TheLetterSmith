@@ -22,9 +22,10 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
+from app_icon import configure_windows_app_identity, resolve_app_icon
 from project_paths import PROJECTS_RELATIVE_PATH
 
 
@@ -264,82 +265,19 @@ def pick_icon(
         "app_icon"
     )
 
-    if (
-        isinstance(
-            override,
-            str,
-        )
-        and override.strip()
-    ):
-        path = Path(
-            override
-        )
-
+    if isinstance(override, str) and override.strip():
+        path = Path(override)
         if not path.is_absolute():
-            path = (
-                root
-                / path
-            ).resolve()
-
-        if path.exists():
-            logging.info(
-                "[Icon] Using "
-                f"(settings override): {path}"
-            )
-
+            path = (root / path).resolve()
+        if path.is_file():
+            logging.info("[Icon] Using (settings override): %s", path)
             return path
+        logging.info("[Icon] Override not found: %s", path)
 
-        logging.info(
-            f"[Icon] Override not found: "
-            f"{path}"
-        )
-
-    candidates: Tuple[
-        Path,
-        ...,
-    ] = (
-        root
-        / "gallery"
-        / "icon"
-        / "ls-icon.ico",
-
-        root
-        / "gallery"
-        / "icon"
-        / "LSmith.ico",
-
-        root
-        / "gallery"
-        / "icons"
-        / "LSmith.ico",
-
-        root
-        / "gallery"
-        / "icons"
-        / "ls-icon.ico",
-
-        root
-        / "gallery"
-        / "app"
-        / "icons"
-        / "folder"
-        / "LSmith.ico",
-
-        root
-        / "gallery"
-        / "app"
-        / "icons"
-        / "folder"
-        / "LSmith.png",
-    )
-
-    for path in candidates:
-        if path.exists():
-            logging.info(
-                f"[Icon] Using: {path}"
-            )
-
-            return path
+    path = resolve_app_icon(root, prefer_png=False)
+    if path is not None:
+        logging.info("[Icon] Using canonical taskbar icon: %s", path)
+        return path
 
     logging.info(
         "[Icon] No icon found "
@@ -557,6 +495,11 @@ def main() -> None:
     )
 
     configure_qt_logging()
+
+    # Windows assigns taskbar buttons to the process AppUserModelID. Set it
+    # before QApplication creates any windows so Letter Smith is not grouped
+    # under the default Python identity.
+    configure_windows_app_identity()
 
     icon = pick_icon(
         root,

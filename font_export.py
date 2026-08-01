@@ -4,7 +4,6 @@ import hashlib
 import os
 import re
 import shutil
-import struct
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -63,7 +62,6 @@ class ResolvedFontFace:
     source_path: Path
     weight: int
     style: str
-    embedding_restricted: bool
 
 
 @dataclass(frozen=True)
@@ -75,8 +73,6 @@ class FontFamilyInspection:
     def status(self) -> str:
         if not self.faces:
             return "Not found"
-        if any(face.embedding_restricted for face in self.faces):
-            return "Embedding restricted"
         return "Ready to embed"
 
 
@@ -216,31 +212,6 @@ def _is_style_suffix_only(display_name: str, family: str) -> bool:
     return bool(tokens) and all(token in FONT_STYLE_TOKENS for token in tokens)
 
 
-def _font_embedding_restricted(path: Path) -> bool:
-    """Read OpenType OS/2.fsType. Bit 1 means restricted-license embedding."""
-    if path.suffix.casefold() not in {".ttf", ".otf"}:
-        return False
-    try:
-        data = path.read_bytes()
-        if len(data) < 12:
-            return False
-        table_count = struct.unpack_from(">H", data, 4)[0]
-        for index in range(table_count):
-            record_offset = 12 + (index * 16)
-            if record_offset + 16 > len(data):
-                return False
-            tag, _, table_offset, table_length = struct.unpack_from(">4sIII", data, record_offset)
-            if tag != b"OS/2":
-                continue
-            if table_length < 10 or table_offset + 10 > len(data):
-                return False
-            fs_type = struct.unpack_from(">H", data, table_offset + 8)[0]
-            return bool(fs_type & 0x0002)
-    except (OSError, struct.error):
-        return False
-    return False
-
-
 def _bundled_font_files(project_root: Path, family: str) -> list[Path]:
     family_key = _font_match_key(family)
     matches: list[Path] = []
@@ -279,7 +250,6 @@ def resolve_font_faces_for_family(project_root: Path, family: str) -> tuple[Reso
                 source_path=source_path,
                 weight=weight,
                 style=style,
-                embedding_restricted=_font_embedding_restricted(source_path),
             )
 
     for path in _bundled_font_files(Path(project_root), family_name):
@@ -337,24 +307,17 @@ def build_embedded_font_payload(
     families = extract_font_families(message_html)
     inspections = [inspect_font_family(Path(project_root), family) for family in families]
     missing = tuple(item.family for item in inspections if not item.faces)
-    restricted = tuple(
-        item.family for item in inspections if any(face.embedding_restricted for face in item.faces)
-    )
     report = {
-        "embedded": tuple(item.family for item in inspections if item.faces and item.family not in restricted),
+        "embedded": tuple(item.family for item in inspections if item.faces),
         "files": (),
         "fallback": missing,
-        "restricted": restricted,
     }
 
-    if missing or restricted:
+    if missing:
         details: list[str] = []
-        if missing:
-            details.append("Font files were not found for: " + ", ".join(missing))
-        if restricted:
-            details.append("The font license marks embedding as restricted for: " + ", ".join(restricted))
+        details.append("Font files were not found for: " + ", ".join(missing))
         details.append(
-            "Choose an embeddable font or place a licensed TTF, OTF, WOFF, or WOFF2 file "
+            "Choose another font or place a TTF, OTF, WOFF, or WOFF2 file "
             "in gallery/user/fonts."
         )
         raise FontExportError("\n".join(details), report)

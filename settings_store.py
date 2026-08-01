@@ -17,6 +17,7 @@ SETTINGS_FILENAME = "settings.json"
 
 REQUIRED_FEATURES_KEY = "required_features"
 PUBLISHED_PAGE_URL_KEY = "published_page_url"
+ACTIVE_PLAY_DIR_KEY = "active_play_dir"
 
 
 DEFAULT_SETTINGS = {
@@ -25,6 +26,7 @@ DEFAULT_SETTINGS = {
     "curtain_style": "pure_white",
     REQUIRED_FEATURES_KEY: [],
     PUBLISHED_PAGE_URL_KEY: "",
+    ACTIVE_PLAY_DIR_KEY: "",
 }
 
 
@@ -657,6 +659,18 @@ class SettingsStore:
             )
         )
 
+        # Active generated-letter directory. Path validation remains with the
+        # owning workflow because the folder may be moved between sessions.
+        active_play_dir = normalized.get(
+            ACTIVE_PLAY_DIR_KEY,
+            DEFAULT_SETTINGS[ACTIVE_PLAY_DIR_KEY],
+        )
+        normalized[ACTIVE_PLAY_DIR_KEY] = (
+            active_play_dir.strip()
+            if isinstance(active_play_dir, str)
+            else ""
+        )
+
         # Curtain style
         style = str(
             normalized.get(
@@ -696,6 +710,7 @@ __all__ = [
     "CURTAIN_STYLE_ALIASES",
     "CURTAIN_STYLE_LABELS",
     "DEFAULT_SETTINGS",
+    "ACTIVE_PLAY_DIR_KEY",
     "PUBLISHED_PAGE_URL_KEY",
     "REQUIRED_FEATURES_KEY",
     "SETTINGS_FILENAME",

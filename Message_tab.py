@@ -65,6 +65,25 @@ from config import (
     MESSAGE_IMAGE_FILE,
 )
 
+
+IDENTITY_LOCK_KEYS = {
+    "title": "recipient_title_locked",
+    "recipient": "recipient_name_locked",
+    "published_url": "published_page_url_locked",
+}
+
+
+class IdentityLineEdit(QtWidgets.QLineEdit):
+    """Line edit that requires a double-click before editing a committed value."""
+
+    double_clicked = Signal()
+
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self.isReadOnly():
+            self.setReadOnly(False)
+            self.double_clicked.emit()
+        super().mouseDoubleClickEvent(event)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,6 +182,7 @@ MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
 MESSAGE_OVERLAY_OPACITY_KEY = "message_overlay_opacity"
 DEFAULT_MESSAGE_OVERLAY_PRESET = "paper"
 DEFAULT_MESSAGE_OVERLAY_OPACITY = 68
+TRANSPARENT_MESSAGE_SURFACE_OPACITY = 18
 MESSAGE_OVERLAY_PRESETS: dict[str, tuple[tuple[int, int, int], str]] = {
     "black": ((0, 0, 0), "#ffffff"),
     "white": ((255, 255, 255), "#221710"),
@@ -199,6 +219,32 @@ def _message_overlay_settings(settings_path: str | os.PathLike) -> tuple[str, in
 
     rgb, ink = MESSAGE_OVERLAY_PRESETS[preset]
     return preset, opacity, rgb, ink
+
+
+def _effective_message_overlay_opacity(
+    preset: str,
+    opacity: int,
+) -> int:
+    if preset == "clear":
+        return TRANSPARENT_MESSAGE_SURFACE_OPACITY
+    return max(0, min(100, int(opacity)))
+
+
+def _soft_blur_message_background(image: QImage) -> QImage:
+    """Blur a render copy without modifying the selected wall asset."""
+    if image.isNull():
+        return image
+    reduced = image.scaled(
+        max(1, image.width() // 18),
+        max(1, image.height() // 18),
+        Qt.IgnoreAspectRatio,
+        Qt.SmoothTransformation,
+    )
+    return reduced.scaled(
+        image.size(),
+        Qt.IgnoreAspectRatio,
+        Qt.SmoothTransformation,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -462,17 +508,30 @@ class MessageTab(QtWidgets.QWidget):
         title_recipient_layout.setVerticalSpacing(7)
         title_recipient_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
 
-        self.title_input = QtWidgets.QLineEdit(self.settings.get("recipient_title", ""))
+        self.title_input = IdentityLineEdit(self.settings.get("recipient_title", ""))
         self.title_input.setPlaceholderText("e.g. Letter Title")
-        self.name_input = QtWidgets.QLineEdit(self.settings.get("recipient_name", ""))
+        self.name_input = IdentityLineEdit(self.settings.get("recipient_name", ""))
         self.name_input.setPlaceholderText("Recipient name")
-        self.url_input = QtWidgets.QLineEdit(
+        self.url_input = IdentityLineEdit(
             str(self.settings.get(PUBLISHED_PAGE_URL_KEY, ""))
         )
         self.url_input.setPlaceholderText("https://your-published-letter-page")
         self.url_input.setToolTip(
             "Save the public page address for this letter. "
             "Forge uses this address for Open Letter."
+        )
+
+        self._configure_identity_field(
+            self.title_input,
+            "title",
+        )
+        self._configure_identity_field(
+            self.name_input,
+            "recipient",
+        )
+        self._configure_identity_field(
+            self.url_input,
+            "published_url",
         )
 
         title_recipient_layout.addRow("Letter Title:", self.title_input)
@@ -599,6 +658,9 @@ class MessageTab(QtWidgets.QWidget):
         self.title_input.setText(str(self.settings.get("recipient_title", "")))
         self.name_input.setText(str(self.settings.get("recipient_name", "")))
         self.url_input.setText(str(self.settings.get(PUBLISHED_PAGE_URL_KEY, "")))
+        self._sync_identity_field_lock(self.title_input, "title")
+        self._sync_identity_field_lock(self.name_input, "recipient")
+        self._sync_identity_field_lock(self.url_input, "published_url")
         (
             self.overlay_preset,
             self.overlay_opacity,
@@ -820,7 +882,7 @@ class MessageTab(QtWidgets.QWidget):
 
         if hasattr(self, "overlay_opacity_label"):
             if is_transparent:
-                self.overlay_opacity_label.setText("Opacity: not used")
+                self.overlay_opacity_label.setText("Blurred glass")
             else:
                 self.overlay_opacity_label.setText(f"Opacity: {int(self.overlay_opacity)}%")
 
@@ -889,6 +951,112 @@ class MessageTab(QtWidgets.QWidget):
     def _load_settings(self) -> None:
         self.settings = self.settings_store.snapshot()
 
+    @staticmethod
+    def _setting_bool(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().casefold() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _configure_identity_field(
+        self,
+        field: IdentityLineEdit,
+        field_name: str,
+    ) -> None:
+        lock_key = IDENTITY_LOCK_KEYS[field_name]
+        field.setReadOnly(
+            self._setting_bool(self.settings.get(lock_key, False))
+            and bool(field.text().strip())
+        )
+        field.double_clicked.connect(
+            lambda field=field, field_name=field_name: self._unlock_identity_field(
+                field,
+                field_name,
+            )
+        )
+        field.returnPressed.connect(
+            lambda field=field, field_name=field_name: self._commit_identity_field(
+                field,
+                field_name,
+            )
+        )
+        self._style_identity_field(field)
+
+    def _sync_identity_field_lock(
+        self,
+        field: IdentityLineEdit,
+        field_name: str,
+    ) -> None:
+        field.setReadOnly(
+            self._setting_bool(
+                self.settings.get(IDENTITY_LOCK_KEYS[field_name], False)
+            )
+            and bool(field.text().strip())
+        )
+        self._style_identity_field(field)
+
+    @staticmethod
+    def _style_identity_field(field: IdentityLineEdit) -> None:
+        if field.isReadOnly():
+            field.setStyleSheet(
+                "QLineEdit{background:#10263b;color:#78b9dd;"
+                "border:1px solid #244b69;border-radius:5px;padding:5px;}"
+                "QLineEdit:focus{border-color:#3d8fba;}"
+                "QLineEdit:selected{background:#1c5275;color:#e8f7ff;}"
+            )
+            field.setToolTip(
+                "Committed. Double-click to edit, then press Enter to commit again."
+            )
+        else:
+            field.setStyleSheet(
+                "QLineEdit{background:#121b23;color:#e8f9ff;"
+                "border:1px solid #38424f;border-radius:5px;padding:5px;}"
+                "QLineEdit:focus{border-color:#00d2ef;}"
+            )
+
+    def _unlock_identity_field(
+        self,
+        field: IdentityLineEdit,
+        field_name: str,
+    ) -> None:
+        field.setReadOnly(False)
+        self.settings[IDENTITY_LOCK_KEYS[field_name]] = False
+        self._style_identity_field(field)
+        field.setFocus(Qt.MouseFocusReason)
+
+    def _commit_identity_field(
+        self,
+        field: IdentityLineEdit,
+        field_name: str,
+    ) -> None:
+        value = field.text().strip()
+        if not value:
+            return
+        if field_name == "published_url" and not _normalize_published_page_url(value):
+            self.status.setText(
+                "Published Page URL must be a valid HTTP or HTTPS address."
+            )
+            return
+        if not self._save_settings():
+            return
+        field.setReadOnly(True)
+        self.settings[IDENTITY_LOCK_KEYS[field_name]] = True
+        if self._persist_settings(announce=False):
+            self._style_identity_field(field)
+
+    def reset_identity_locks(self) -> None:
+        """Clear identity fields and leave all three controls editable."""
+        for field_name, lock_key in IDENTITY_LOCK_KEYS.items():
+            field = {
+                "title": self.title_input,
+                "recipient": self.name_input,
+                "published_url": self.url_input,
+            }[field_name]
+            field.setReadOnly(False)
+            self.settings[lock_key] = False
+            self._style_identity_field(field)
+
     def _persist_settings(self, *, announce: bool) -> bool:
         if not self.project_state.is_project_ready:
             if announce:
@@ -905,6 +1073,7 @@ class MessageTab(QtWidgets.QWidget):
                     PUBLISHED_PAGE_URL_KEY,
                     MESSAGE_OVERLAY_PRESET_KEY,
                     MESSAGE_OVERLAY_OPACITY_KEY,
+                    *IDENTITY_LOCK_KEYS.values(),
                 )
                 if key in self.settings
             }
@@ -918,7 +1087,7 @@ class MessageTab(QtWidgets.QWidget):
         self.project_changed.emit()
         return True
 
-    def _save_settings(self) -> None:
+    def _save_settings(self) -> bool:
         self.settings["recipient_title"] = self.title_input.text().strip()
         self.settings["recipient_name"] = self.name_input.text().strip()
 
@@ -931,12 +1100,14 @@ class MessageTab(QtWidgets.QWidget):
             self.status.setText(
                 "Title and recipient saved. Published Page URL must be a valid HTTP or HTTPS address."
             )
-            return
+            return False
 
         self.settings[PUBLISHED_PAGE_URL_KEY] = normalized_url
         self.url_input.setText(normalized_url)
         if self._persist_settings(announce=True):
             self.published_page_url_changed.emit(normalized_url)
+            return True
+        return False
 
     def set_published_page_url(self, url: str, *, persist: bool = True, announce: bool = True) -> bool:
         raw_url = (url or "").strip()
@@ -1363,6 +1534,10 @@ class MessageTab(QtWidgets.QWidget):
             painter.setRenderHint(QPainter.TextAntialiasing, True)
             painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
 
+            preset, overlay_opacity, overlay_rgb, ink_color = (
+                _message_overlay_settings(self.settings_path)
+            )
+
             # Background wall (SOURCE): gallery/user/pages/wall.png
             wall_path = self._wall_path()
             if wall_path.exists():
@@ -1374,13 +1549,25 @@ class MessageTab(QtWidgets.QWidget):
                         Qt.KeepAspectRatioByExpanding,
                         Qt.SmoothTransformation
                     )
+                    if preset == "clear":
+                        wall_img = _soft_blur_message_background(
+                            wall_img
+                        )
                     painter.drawImage(0, 0, wall_img)
 
             # User-controlled text background overlay.
-            _preset, overlay_opacity, overlay_rgb, ink_color = _message_overlay_settings(self.settings_path)
-            if overlay_opacity > 0:
+            surface_opacity = _effective_message_overlay_opacity(
+                preset,
+                overlay_opacity,
+            )
+            if surface_opacity > 0:
                 r, g, b = overlay_rgb
-                overlay = QtGui.QColor(r, g, b, int(round(255 * (overlay_opacity / 100.0))))
+                overlay = QtGui.QColor(
+                    r,
+                    g,
+                    b,
+                    int(round(255 * (surface_opacity / 100.0))),
+                )
                 painter.fillRect(0, 0, FULL_W, FULL_H, overlay)
 
             # HTML text

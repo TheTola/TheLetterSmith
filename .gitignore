@@ -19,6 +19,8 @@ dist/
 build/
 .lettersmith-publishing/
 *.bak_*
+editor_error.log
+editor_error.previous.log
 # Optional
 hide/
 # Generated user content
