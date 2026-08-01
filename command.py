@@ -1200,6 +1200,27 @@ class _PressGoLabel(
 # ─────────────────────────────────────────────────────────────────────────────
 # Command tab
 # ─────────────────────────────────────────────────────────────────────────────
+def _visible_pixmap_rect(
+    pixmap: QtGui.QPixmap,
+) -> QtCore.QRect:
+    """Return the visible alpha bounds, or the full image when opaque."""
+    if pixmap.isNull():
+        return QtCore.QRect()
+
+    full_rect = pixmap.rect()
+    image = pixmap.toImage()
+    if not image.hasAlphaChannel():
+        return full_rect
+
+    alpha_mask = image.createAlphaMask()
+    bounds = QtGui.QRegion(
+        QtGui.QBitmap.fromImage(alpha_mask)
+    ).boundingRect()
+    if bounds.isEmpty():
+        return full_rect
+    return bounds.intersected(full_rect)
+
+
 class CommandTab(
     QtWidgets.QWidget
 ):
@@ -1258,6 +1279,14 @@ class CommandTab(
             str(
                 self._go_path
             )
+        )
+
+        self._command_visible_rect = _visible_pixmap_rect(
+            self._bg_pix
+        )
+
+        self._go_visible_rect = _visible_pixmap_rect(
+            self._go_pix
         )
 
         self.bg_label = QtWidgets.QLabel(
@@ -1330,19 +1359,7 @@ class CommandTab(
             height,
         )
 
-        if not self._bg_pix.isNull():
-            background = self._bg_pix.scaled(
-                width,
-                height,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
-            )
-
-            self.bg_label.setPixmap(
-                background
-            )
-
-        if self._go_pix.isNull():
+        if self._bg_pix.isNull():
             self.go_btn.set_base(
                 QtCore.QRect(
                     0,
@@ -1355,36 +1372,60 @@ class CommandTab(
 
             return
 
-        target = int(
-            min(
-                width,
-                height,
-            ) * 0.28
-        )
-
-        target = max(
-            140,
-            min(
-                460,
-                target,
-            ),
-        )
-
-        go_base = self._go_pix.scaled(
-            target,
-            target,
+        background = self._bg_pix.scaled(
+            width,
+            height,
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,
         )
 
-        button_width = go_base.width()
-        button_height = go_base.height()
+        self.bg_label.setPixmap(
+            background
+        )
+
+        command_canvas_rect = QtCore.QRect(
+            (width - background.width()) // 2,
+            (height - background.height()) // 2,
+            background.width(),
+            background.height(),
+        )
+
+        command_scale = min(
+            background.width() / self._bg_pix.width(),
+            background.height() / self._bg_pix.height(),
+        )
+
+        command_display_rect = QtCore.QRect(
+            command_canvas_rect.x()
+            + round(self._command_visible_rect.x() * command_scale),
+            command_canvas_rect.y()
+            + round(self._command_visible_rect.y() * command_scale),
+            max(1, round(self._command_visible_rect.width() * command_scale)),
+            max(1, round(self._command_visible_rect.height() * command_scale)),
+        )
+
+        if self._go_pix.isNull() or self._go_visible_rect.isEmpty():
+            self.go_btn.set_base(
+                QtCore.QRect(),
+                self._go_pix,
+            )
+            return
+
+        go_source = self._go_pix.copy(
+            self._go_visible_rect
+        )
+        go_base = go_source.scaled(
+            max(1, round(self._go_visible_rect.width() * command_scale)),
+            max(1, round(self._go_visible_rect.height() * command_scale)),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
 
         base_rect = QtCore.QRect(
-            (width - button_width) // 2,
-            (height - button_height) // 2,
-            button_width,
-            button_height,
+            command_display_rect.center().x() - go_base.width() // 2,
+            command_display_rect.center().y() - go_base.height() // 2,
+            go_base.width(),
+            go_base.height(),
         )
 
         self.go_btn.set_base(
