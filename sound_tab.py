@@ -2872,10 +2872,6 @@ class ArchiveDialog(
             [str],
             bool,
         ],
-        repair_callback: Callable[
-            [],
-            None,
-        ],
         *,
         multi_select: bool,
         parent: Optional[QtWidgets.QWidget] = None,
@@ -2888,9 +2884,6 @@ class ArchiveDialog(
         self.used_ids = used_ids
         self.delete_callback = (
             delete_callback
-        )
-        self.repair_callback = (
-            repair_callback
         )
 
         self.setWindowTitle(
@@ -3010,9 +3003,9 @@ class ArchiveDialog(
             True
         )
 
-        self.table.doubleClicked.connect(
-            lambda _index: self._choose()
-        )
+        self.table.itemSelectionChanged.connect(self._selection_changed)
+        self.table.cellClicked.connect(lambda _row, _column: self._preview())
+        self.table.doubleClicked.connect(lambda _index: self._choose())
 
         root.addWidget(
             self.table,
@@ -3021,24 +3014,12 @@ class ArchiveDialog(
 
         buttons = QtWidgets.QHBoxLayout()
 
-        self.preview_btn = QtWidgets.QPushButton(
-            "Preview"
-        )
-
         self.rename_btn = QtWidgets.QPushButton(
             "Rename Title"
         )
 
         self.delete_btn = QtWidgets.QPushButton(
             "Delete"
-        )
-
-        self.original_btn = QtWidgets.QPushButton(
-            "Show Original"
-        )
-
-        self.repair_btn = QtWidgets.QPushButton(
-            "Repair Archive"
         )
 
         if multi_select:
@@ -3051,14 +3032,6 @@ class ArchiveDialog(
             choose_text
         )
 
-        close_btn = QtWidgets.QPushButton(
-            "Close"
-        )
-
-        buttons.addWidget(
-            self.preview_btn
-        )
-
         buttons.addWidget(
             self.rename_btn
         )
@@ -3067,24 +3040,12 @@ class ArchiveDialog(
             self.delete_btn
         )
 
-        buttons.addWidget(
-            self.original_btn
-        )
-
-        buttons.addWidget(
-            self.repair_btn
-        )
-
         buttons.addStretch(
             1
         )
 
         buttons.addWidget(
             self.choose_btn
-        )
-
-        buttons.addWidget(
-            close_btn
         )
 
         root.addLayout(
@@ -3106,6 +3067,9 @@ class ArchiveDialog(
         self.preview_player.setAudioOutput(
             self.preview_output
         )
+        self.preview_player.errorOccurred.connect(
+            self._preview_failed
+        )
 
         self._previewing_id = ""
 
@@ -3117,10 +3081,6 @@ class ArchiveDialog(
             self.refresh
         )
 
-        self.preview_btn.clicked.connect(
-            self._preview
-        )
-
         self.rename_btn.clicked.connect(
             self._rename
         )
@@ -3129,20 +3089,8 @@ class ArchiveDialog(
             self._delete
         )
 
-        self.original_btn.clicked.connect(
-            self._show_original
-        )
-
-        self.repair_btn.clicked.connect(
-            self._repair
-        )
-
         self.choose_btn.clicked.connect(
             self._choose
-        )
-
-        close_btn.clicked.connect(
-            self.reject
         )
 
         self.library.changed.connect(
@@ -3181,6 +3129,18 @@ class ArchiveDialog(
             }
             """
         )
+
+    def _selection_changed(self) -> None:
+        has_selection = bool(self.selected_ids())
+        for button in (self.rename_btn, self.delete_btn, self.choose_btn):
+            button.setEnabled(has_selection)
+        if has_selection:
+            self._preview()
+
+    def _preview_failed(self, _error: QMediaPlayer.Error, message: str) -> None:
+        self._stop_preview()
+        detail = str(message or "The selected track could not be previewed.").strip()
+        QtWidgets.QMessageBox.warning(self, "Music Preview", detail)
 
     def refresh(
         self,
@@ -3271,6 +3231,7 @@ class ArchiveDialog(
             )
 
         self.table.resizeRowsToContents()
+        self._selection_changed()
 
     def selected_ids(
         self,
@@ -3337,12 +3298,6 @@ class ArchiveDialog(
             and self.preview_player.playbackState()
             == QMediaPlayer.PlayingState
         ):
-            self.preview_player.stop()
-
-            self.preview_btn.setText(
-                "Preview"
-            )
-
             return
 
         path = self.library.path_for(
@@ -3366,10 +3321,6 @@ class ArchiveDialog(
 
         self._previewing_id = (
             track_id
-        )
-
-        self.preview_btn.setText(
-            "Stop Preview"
         )
 
     def _rename(
@@ -3397,56 +3348,17 @@ class ArchiveDialog(
             )
         )
 
-        if (
-            accepted
-            and title.strip()
-        ):
+        if accepted and title.strip():
+            self._stop_preview()
             self.library.rename_display_title(
                 record.track_id,
                 title,
             )
 
-    def _show_original(
-        self,
-    ) -> None:
-        track_ids = self.selected_ids()
-
-        if not track_ids:
-            return
-
-        record = self.library.get(
-            track_ids[0]
-        )
-
-        if (
-            record is None
-            or not record.original_file
-        ):
-            return
-
-        original = (
-            originals_dir(
-                self.library.project_root
-            )
-            / Path(
-                record.original_file
-            ).name
-        )
-
-        if original.is_file():
-            QtGui.QDesktopServices.openUrl(
-                QUrl.fromLocalFile(
-                    str(
-                        original.parent
-                    )
-                )
-            )
-
-    def _repair(
-        self,
-    ) -> None:
-        self.accept()
-        self.repair_callback()
+    def _stop_preview(self) -> None:
+        self.preview_player.stop()
+        self.preview_player.setSource(QUrl())
+        self._previewing_id = ""
 
     def _delete(
         self,
@@ -3456,17 +3368,7 @@ class ArchiveDialog(
         if not track_ids:
             return
 
-        self.preview_player.stop()
-
-        self.preview_player.setSource(
-            QUrl()
-        )
-
-        self._previewing_id = ""
-
-        self.preview_btn.setText(
-            "Preview"
-        )
+        self._stop_preview()
 
         for track_id in track_ids:
             self.delete_callback(
@@ -3479,11 +3381,7 @@ class ArchiveDialog(
         self,
         event: QtGui.QCloseEvent,
     ) -> None:
-        self.preview_player.stop()
-
-        self.preview_player.setSource(
-            QUrl()
-        )
+        self._stop_preview()
 
         super().closeEvent(
             event
@@ -5256,7 +5154,6 @@ class SoundTab(QtWidgets.QWidget):
                     .ordered_ids()
                 ),
             self._delete_archive_track,
-            self._start_archive_repair,
             multi_select=(
                 self.project_sound
                 .state
@@ -5410,6 +5307,16 @@ class SoundTab(QtWidgets.QWidget):
 
         return True
 
+    def repair_music_archive(self) -> None:
+        """Start the single Settings-owned archive repair operation."""
+        self._start_archive_repair()
+
+    def _set_repair_action_enabled(self, enabled: bool) -> None:
+        title_bar = getattr(self.window(), "title_bar", None)
+        action = getattr(title_bar, "repair_music_action", None)
+        if action is not None:
+            action.setEnabled(bool(enabled))
+
     def _start_archive_repair(
         self,
     ) -> None:
@@ -5466,6 +5373,7 @@ class SoundTab(QtWidgets.QWidget):
 
         self._repair_thread = thread
         self._repair_worker = worker
+        self._set_repair_action_enabled(False)
 
         self._set_busy(
             True,
@@ -5519,6 +5427,7 @@ class SoundTab(QtWidgets.QWidget):
     ) -> None:
         self._repair_thread = None
         self._repair_worker = None
+        self._set_repair_action_enabled(True)
 
         self._set_busy(
             False

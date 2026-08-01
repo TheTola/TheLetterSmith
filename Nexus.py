@@ -32,13 +32,9 @@ from project_paths import ProjectPathResolver
 from recipient_page import RecipientPage
 
 # ===================================================================================================================================================================================
-# Overlay integration (robust, guarded)
+# Overlay integration
 # ===================================================================================================================================================================================
-try:
-    from Over_Nexus import install_over_nexus, Config as OverConfig
-except Exception:
-    install_over_nexus = None  # type: ignore
-    OverConfig = None          # type: ignore
+from Over_Nexus import install_over_nexus
 
 # ===================================================================================================================================================================================
 # Qt
@@ -206,6 +202,13 @@ class TitleBar(QtWidgets.QWidget):
                 )
             )
             self._curtain_actions[style] = action
+        self.settings_menu.addSeparator()
+        self.repair_music_action = self.settings_menu.addAction(
+            "Repair Music Archive"
+        )
+        self.repair_music_action.triggered.connect(
+            self._repair_music_archive
+        )
         self.settings_menu.aboutToShow.connect(
             self._sync_curtain_menu
         )
@@ -321,6 +324,13 @@ class TitleBar(QtWidgets.QWidget):
         forge.schedule_refresh()
         if forge.isVisible():
             forge.ensure_preview_current()
+
+    def _repair_music_archive(self) -> None:
+        sound_tab = getattr(self.parent, "sound_tab", None)
+        if sound_tab is None:
+            self.parent.status("Music Archive is not ready.")
+            return
+        sound_tab.repair_music_archive()
 
     def _make_button(
         self,
@@ -974,19 +984,8 @@ class Nexus(QtWidgets.QMainWindow):
         self._fade_timer: Optional[QtCore.QTimer] = None
         self._fade_anim: Optional[QtCore.QPropertyAnimation] = None
 
-        # Overlay installer ΓÇö disables the Over_Nexus Prompt Writer launcher.
-        # The visible Prompt Writer FAB is owned by Image_tab.py.
-        self._over = None
-        if callable(install_over_nexus) and OverConfig is not None:
-            try:
-                self._over = install_over_nexus(
-                    nexus=self,
-                    project_root=self.project_root,
-                    config=OverConfig(show_prompter_launcher=False),
-                )
-            except Exception as ex:
-                self._over = None
-                print(f"[Overlay] WARNING: install_over_nexus failed: {ex}")
+        # Message-tab detail visibility is owned by Over_Nexus.
+        self._over = install_over_nexus(self)
 
 
         # Optional spark overlay
@@ -2238,6 +2237,7 @@ class Nexus(QtWidgets.QMainWindow):
             w = PromptWriterPanel(self)                      # parent=self so it overlays inside the main window
             self._prompt_writer_win = w
             w.destroyed.connect(self._on_prompt_writer_destroyed)
+            w.dismissed.connect(self._on_prompt_writer_dismissed)
             w.open_with_anim()
 
             self.status("Prompt Writer opened (inline).")
@@ -2251,6 +2251,9 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _on_prompt_writer_destroyed(self, *_args: object) -> None:
         self._prompt_writer_win = None
+
+    def _on_prompt_writer_dismissed(self) -> None:
+        self.status("Prompt Writer closed.")
 
     # =============================================================================================
     # Help icon support

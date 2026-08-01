@@ -5,13 +5,10 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
-from urllib.parse import quote, urlencode
-
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
 
 import generate
-from contact_store import Contact, ContactImportError, ContactStore
 from config import MESSAGE_HTML_FILE, ensure_output_dirs
 from message_html import read_text_normalized
 from publishing import GitHubPagesPublisher, PublishResult
@@ -262,21 +259,23 @@ class SavedLetterCard(QtWidgets.QFrame):
         super().keyPressEvent(event)
 
 
-class ReadinessWindow(QtWidgets.QDialog):
+class ReadinessWindow(QtWidgets.QFrame):
     correction_requested = QtCore.Signal(str, str)
 
     def __init__(self, project_root: str | Path, parent=None) -> None:
         super().__init__(parent)
         self.project_root = Path(project_root).resolve()
         self.user_closed = False
-        self._positioned = False
-        self.setWindowTitle("Project Readiness")
-        self.setWindowFlag(Qt.Tool, True)
-        self.setWindowModality(Qt.NonModal)
-        self.setMinimumWidth(280)
-        self.setMaximumWidth(350)
+        self.setObjectName("ProjectReadiness")
+        self.setVisible(False)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Maximum,
+        )
+        self.setMaximumWidth(520)
         self.setStyleSheet(
-            "QDialog{background:#101820;border:1px solid #2e596a;}"
+            "QFrame#ProjectReadiness{background:#101820;border:1px solid #2e596a;"
+            "border-radius:7px;}"
             "QLabel{background:transparent;}"
             "QPushButton{font:500 10pt 'Segoe UI';}"
         )
@@ -350,39 +349,11 @@ class ReadinessWindow(QtWidgets.QDialog):
         self.adjustSize()
 
     def position_near_image_area(self) -> None:
-        if self._positioned:
-            return
-        owner = self.parentWidget()
-        if owner is None:
-            return
-        target = owner.mapToGlobal(QtCore.QPoint(24, 96))
-        tabbar = getattr(owner, "tabbar", None)
-        if isinstance(tabbar, QtWidgets.QTabBar) and tabbar.count():
-            rectangle = tabbar.tabRect(0)
-            target = tabbar.mapToGlobal(
-                QtCore.QPoint(rectangle.left() + 8, rectangle.bottom() + 10)
-            )
-        screen = owner.screen()
-        if screen is not None:
-            available = screen.availableGeometry()
-            target.setX(
-                max(
-                    available.left(),
-                    min(target.x(), available.right() - self.width()),
-                )
-            )
-            target.setY(
-                max(
-                    available.top(),
-                    min(target.y(), available.bottom() - self.height()),
-                )
-            )
-        self.move(target)
-        self._positioned = True
+        """Compatibility no-op; readiness is embedded in the Forge layout."""
 
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+    def shutdown(self) -> None:
+        self.hide()
         self.user_closed = True
-        super().closeEvent(event)
 
 
 class ForgeTab(QtWidgets.QWidget):
@@ -399,7 +370,6 @@ class ForgeTab(QtWidgets.QWidget):
         self,
         project_root: str | Path,
         *,
-        contact_store: Optional[ContactStore] = None,
         project_state: ProjectStateController | None = None,
         project_paths: ProjectPathResolver | None = None,
     ) -> None:
@@ -415,7 +385,6 @@ class ForgeTab(QtWidgets.QWidget):
         self.project_paths = project_paths or ProjectPathResolver(
             self.project_root
         )
-        self.contact_store = contact_store or ContactStore()
         self.catalog = SavedLetterCatalog(self.project_root)
         self.restorer = SavedLetterRestorer(
             self.project_root,
@@ -452,7 +421,7 @@ class ForgeTab(QtWidgets.QWidget):
             tuple[Path, ReadinessResult]
         ] = None
 
-        self.readiness_window = ReadinessWindow(self.project_root, self.window())
+        self.readiness_window = ReadinessWindow(self.project_root, self)
         self.readiness_window.correction_requested.connect(
             self.correction_requested.emit
         )
@@ -494,7 +463,6 @@ class ForgeTab(QtWidgets.QWidget):
         self._metadata_timer.setSingleShot(True)
         self._metadata_timer.timeout.connect(self._run_pending_metadata_update)
 
-        self.refresh_contacts()
         self.refresh_saved_letters()
         self.refresh_project_state()
 
@@ -543,6 +511,12 @@ class ForgeTab(QtWidgets.QWidget):
         readiness_row.addWidget(self.readiness_btn)
         heading_row.addWidget(self._readiness_controls)
         self._main_layout.addLayout(heading_row)
+
+        self._main_layout.addWidget(
+            self.readiness_window,
+            0,
+            Qt.AlignHCenter,
+        )
 
         self.load_saved_btn = self._small_button("Load Letters")
         self.load_saved_btn.setMinimumSize(150, 36)
@@ -696,46 +670,6 @@ class ForgeTab(QtWidgets.QWidget):
         actions.addWidget(self.open_published_btn, 3)
         self._main_layout.addLayout(actions)
 
-        self.share_panel = QtWidgets.QFrame()
-        self.share_panel.setObjectName("ForgeSharePanel")
-        self.share_panel.setMaximumWidth(1510)
-        self.share_panel.setStyleSheet(
-            "QFrame#ForgeSharePanel{background:#101820;"
-            "border:1px solid #253d49;border-radius:7px;}"
-        )
-        share_row = QtWidgets.QHBoxLayout(self.share_panel)
-        share_row.setContentsMargins(10, 7, 10, 7)
-        share_row.setSpacing(8)
-        share_row.addWidget(self._muted_label("Share with"))
-        self.contact_selector = QtWidgets.QComboBox()
-        self.contact_selector.setMinimumWidth(260)
-        self.contact_selector.setSizeAdjustPolicy(
-            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
-        )
-        self.contact_selector.setMinimumContentsLength(24)
-        self.contact_selector.currentIndexChanged.connect(
-            self._contact_selection_changed
-        )
-        share_row.addWidget(self.contact_selector, 1)
-        self.import_contacts_btn = self._small_button("Import Contacts")
-        self.import_contacts_btn.clicked.connect(self.choose_contact_files)
-        share_row.addWidget(self.import_contacts_btn)
-        self.email_btn = self._small_button("Email")
-        self.email_btn.clicked.connect(self.email_published_letter)
-        share_row.addWidget(self.email_btn)
-        self.text_btn = self._small_button("Text")
-        self.text_btn.clicked.connect(self.text_published_letter)
-        share_row.addWidget(self.text_btn)
-        self.messenger_btn = self._small_button("Messenger")
-        self.messenger_btn.clicked.connect(self.message_published_letter)
-        share_row.addWidget(self.messenger_btn)
-        share_holder = QtWidgets.QHBoxLayout()
-        share_holder.setContentsMargins(0, 0, 0, 0)
-        share_holder.addStretch(1)
-        share_holder.addWidget(self.share_panel, 1)
-        share_holder.addStretch(1)
-        self._main_layout.addLayout(share_holder)
-
         self.status = _StatusLabel()
         self.status.setObjectName("ForgeStatus")
         self.status.setWordWrap(True)
@@ -849,17 +783,20 @@ class ForgeTab(QtWidgets.QWidget):
             self.request_preview()
 
     def show_readiness_window(self) -> None:
+        if self.readiness_window.isVisible():
+            self._readiness_requested = False
+            self.readiness_window.hide()
+            return
         self._readiness_requested = True
         self.refresh_readiness()
         self.readiness_window.user_closed = False
         self.readiness_window.show()
-        self.readiness_window.position_near_image_area()
-        self.readiness_window.raise_()
-        self.readiness_window.activateWindow()
 
     def attach_readiness_window(self, owner: QtWidgets.QWidget) -> None:
-        self.readiness_window.setParent(owner, Qt.Tool)
-        self.readiness_window._positioned = False
+        """Keep the compatibility hook without detaching the embedded panel."""
+        if self.readiness_window.parentWidget() is not self:
+            self.readiness_window.setParent(self)
+            self._main_layout.insertWidget(1, self.readiness_window, 0, Qt.AlignHCenter)
 
     def set_readiness_context_visible(self, visible: bool) -> None:
         if not visible:
@@ -868,8 +805,6 @@ class ForgeTab(QtWidgets.QWidget):
         if self._readiness_requested and not self.readiness_window.user_closed:
             self.refresh_readiness()
             self.readiness_window.show()
-            self.readiness_window.position_near_image_area()
-            self.readiness_window.raise_()
 
     def refresh_readiness(self) -> ReadinessResult:
         self._readiness_result = evaluate_readiness(self.project_root)
@@ -931,6 +866,19 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_panel.activateWindow()
         self.saved_scroll.setFocus(Qt.PopupFocusReason)
         QtCore.QTimer.singleShot(0, self._layout_saved_cards)
+
+    def repair_duplicate_project_ids(self) -> tuple[tuple[Path, str], ...]:
+        """Repair independent saved-letter copies while preserving the active path."""
+        snapshot = self.settings.snapshot()
+        context = self.project_paths.context_from_settings(snapshot)
+        repaired = self.project_paths.repair_duplicate_project_ids(
+            active_project_directory=context.project_directory,
+        )
+        if repaired:
+            self.catalog = SavedLetterCatalog(self.project_root)
+            self.refresh_saved_letters()
+            self.refresh_project_state()
+        return repaired
 
     def refresh_saved_letters(self) -> None:
         selected_path = (
@@ -1623,231 +1571,10 @@ class ForgeTab(QtWidgets.QWidget):
         else:
             disabled = "Save a valid HTTP or HTTPS published URL in Message."
             self.open_published_btn.setToolTip(disabled)
-        self._sync_share_controls()
 
     def _published_url_unavailable(self) -> bool:
         expiry = self.settings.get(PUBLISHED_EXPIRES_AT_KEY, "")
         return is_publication_expired(expiry) or is_publication_expiration_malformed(expiry)
-
-    def refresh_contacts(self) -> None:
-        selected = self._selected_contact()
-        selected_id = selected.contact_id if selected is not None else ""
-        blocker = QtCore.QSignalBlocker(self.contact_selector)
-        self.contact_selector.clear()
-        self.contact_selector.addItem("Choose a contact", None)
-        try:
-            contacts = self.contact_store.list_contacts()
-        except ContactImportError:
-            contacts = ()
-            _LOGGER.exception("The Letter Smith contact book could not be read.")
-        for contact in contacts:
-            details = contact.primary_email or contact.primary_phone
-            label = contact.name
-            if details:
-                label = f"{label} — {details}"
-            self.contact_selector.addItem(label, contact)
-            self.contact_selector.setItemData(
-                self.contact_selector.count() - 1,
-                "\n".join(
-                    (
-                        contact.name,
-                        *contact.emails,
-                        *contact.phones,
-                    )
-                ),
-                Qt.ToolTipRole,
-            )
-        if selected_id:
-            for index in range(1, self.contact_selector.count()):
-                contact = self.contact_selector.itemData(index)
-                if (
-                    isinstance(contact, Contact)
-                    and contact.contact_id == selected_id
-                ):
-                    self.contact_selector.setCurrentIndex(index)
-                    break
-        del blocker
-        self._sync_share_controls()
-
-    def choose_contact_files(self) -> None:
-        paths, _selected_filter = QtWidgets.QFileDialog.getOpenFileNames(
-            self,
-            "Import Contacts",
-            "",
-            "Contact files (*.vcf *.vcard *.csv)",
-        )
-        if paths:
-            self.import_contact_files(paths)
-
-    def import_contact_files(self, paths: list[str]) -> None:
-        try:
-            result = self.contact_store.import_files(paths)
-        except ContactImportError as error:
-            self._set_status(str(error), error=True)
-            return
-        except OSError:
-            _LOGGER.exception("Contact import failed.")
-            self._set_status("The contacts could not be saved.", error=True)
-            return
-        self.refresh_contacts()
-        if result.added or result.updated:
-            parts = []
-            if result.added:
-                parts.append(f"{result.added} added")
-            if result.updated:
-                parts.append(f"{result.updated} updated")
-            self._set_status(f"Contacts imported: {', '.join(parts)}.")
-        else:
-            self._set_status("No new contact information was found.")
-
-    def _selected_contact(self) -> Optional[Contact]:
-        if not hasattr(self, "contact_selector"):
-            return None
-        value = self.contact_selector.currentData()
-        return value if isinstance(value, Contact) else None
-
-    def _contact_selection_changed(self, _index: int) -> None:
-        self._sync_share_controls()
-
-    def _sync_share_controls(self) -> None:
-        if not hasattr(self, "email_btn"):
-            return
-        contact = self._selected_contact()
-        has_url = bool(self.saved_page_url) and not self._published_url_unavailable()
-        usable = has_url and not self._busy
-        self.email_btn.setEnabled(
-            usable and bool(contact and contact.primary_email)
-        )
-        self.text_btn.setEnabled(
-            usable and bool(contact and contact.primary_phone)
-        )
-        self.messenger_btn.setEnabled(usable)
-        self.contact_selector.setEnabled(not self._busy)
-        self.import_contacts_btn.setEnabled(not self._busy)
-        if not has_url:
-            disabled = (
-                "This published link is expired or malformed. Publish again."
-                if self._published_url_unavailable()
-                else "Publish the letter or save its public URL first."
-            )
-            self.email_btn.setToolTip(disabled)
-            self.text_btn.setToolTip(disabled)
-            self.messenger_btn.setToolTip(disabled)
-            return
-        self.email_btn.setToolTip(
-            f"Email {contact.primary_email}"
-            if contact and contact.primary_email
-            else "Choose a contact with an email address."
-        )
-        self.text_btn.setToolTip(
-            f"Text {contact.primary_phone}"
-            if contact and contact.primary_phone
-            else "Choose a contact with a phone number."
-        )
-        self.messenger_btn.setToolTip(
-            "Copy the letter message and open Facebook Messenger."
-        )
-
-    def _share_content(self) -> tuple[str, str, str] | None:
-        url = self.refresh_saved_page_url()
-        if not url:
-            self._set_status(
-                "Publish the letter or save its public URL first.",
-                error=True,
-            )
-            return None
-        snapshot = self.settings.snapshot()
-        title = str(snapshot.get("recipient_title", "")).strip()
-        subject = f"A letter for you: {title}" if title else "A letter for you"
-        contact = self._selected_contact()
-        greeting = (
-            f"Hi {contact.name},\n\n"
-            if contact is not None and contact.name != "Unnamed Contact"
-            else ""
-        )
-        body = f"{greeting}I made this letter for you.\n\nOpen it here:\n{url}"
-        return url, subject, body
-
-    def email_published_letter(self) -> None:
-        contact = self._selected_contact()
-        if contact is None or not contact.primary_email:
-            self._set_status(
-                "Choose a contact with an email address.",
-                error=True,
-            )
-            return
-        content = self._share_content()
-        if content is None:
-            return
-        _url, subject, body = content
-        query = urlencode(
-            {"subject": subject, "body": body},
-            quote_via=quote,
-        )
-        address = quote(contact.primary_email, safe="@.+-")
-        mail_url = QUrl.fromEncoded(
-            f"mailto:{address}?{query}".encode("ascii")
-        )
-        if not QtGui.QDesktopServices.openUrl(mail_url):
-            self._set_status(
-                "The email composer could not be opened.",
-                error=True,
-            )
-            return
-        self._set_status("Email composer opened.")
-
-    def text_published_letter(self) -> None:
-        contact = self._selected_contact()
-        if contact is None or not contact.primary_phone:
-            self._set_status(
-                "Choose a contact with a phone number.",
-                error=True,
-            )
-            return
-        content = self._share_content()
-        if content is None:
-            return
-        _url, _subject, body = content
-        phone = quote(
-            "".join(
-                character
-                for character in contact.primary_phone
-                if character.isdigit() or character == "+"
-            ),
-            safe="+",
-        )
-        sms_url = QUrl.fromEncoded(
-            f"sms:{phone}?body={quote(body, safe='')}".encode("ascii")
-        )
-        if not QtGui.QDesktopServices.openUrl(sms_url):
-            self._set_status(
-                "The text-message composer could not be opened.",
-                error=True,
-            )
-            return
-        self._set_status("Text-message composer opened.")
-
-    def message_published_letter(self) -> None:
-        content = self._share_content()
-        if content is None:
-            return
-        _url, _subject, body = content
-        QtWidgets.QApplication.clipboard().setText(body)
-        if not QtGui.QDesktopServices.openUrl(
-            QUrl("https://www.facebook.com/messages/")
-        ):
-            self._set_status(
-                "Message copied, but Messenger could not be opened.",
-                error=True,
-            )
-            return
-        contact = self._selected_contact()
-        target = (
-            f" Find {contact.name}, then paste it."
-            if contact is not None
-            else " Choose a conversation, then paste it."
-        )
-        self._set_status(f"Message copied.{target}")
 
     def open_published_letter(self) -> None:
         url = self.refresh_saved_page_url()
@@ -1978,15 +1705,10 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_delete_toggle.setEnabled(not busy)
         self.preview_mode.setEnabled(not busy)
         self.readiness_btn.setEnabled(not busy)
-        self.contact_selector.setEnabled(not busy)
-        self.import_contacts_btn.setEnabled(not busy)
         if busy:
             self.preview_btn.setEnabled(False)
             self.publish_btn.setEnabled(False)
             self.open_published_btn.setEnabled(False)
-            self.email_btn.setEnabled(False)
-            self.text_btn.setEnabled(False)
-            self.messenger_btn.setEnabled(False)
         else:
             self.refresh_readiness()
             self._sync_published_url()
@@ -2063,5 +1785,5 @@ class ForgeTab(QtWidgets.QWidget):
             return
         self.settings.changed.disconnect(self._on_settings_changed)
         self.saved_panel.close()
-        self.readiness_window.close()
+        self.readiness_window.shutdown()
         super().closeEvent(event)

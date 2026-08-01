@@ -6,7 +6,6 @@ import logging
 import secrets
 import shutil
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -83,38 +82,6 @@ def safe_public_path(recipient: str, title: str, *, token: str | None = None) ->
 def github_pages_url(repository: str, public_path: str) -> str:
     owner, name = repository.split("/", 1)
     return f"https://{owner}.github.io/{name}/letters/{quote(public_path)}/"
-
-
-def email_uri(url: str, *, recipient: str = "") -> str:
-    subject = quote("A letter for you")
-    body = quote(f"I made this for you:\n\n{url}")
-    return f"mailto:{quote(recipient)}?subject={subject}&body={body}"
-
-
-def sms_uri(url: str, *, phone: str = "") -> str:
-    return f"sms:{quote(phone)}?body={quote(url)}"
-
-
-def sms_handler_available() -> bool:
-    if sys.platform == "win32":
-        try:
-            import winreg
-
-            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "sms"):
-                return True
-        except OSError:
-            return False
-    if sys.platform == "darwin":
-        return True
-    if shutil.which("xdg-mime") is None:
-        return False
-    result = subprocess.run(
-        ("xdg-mime", "query", "default", "x-scheme-handler/sms"),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def _directory_digest(directory: Path) -> str:

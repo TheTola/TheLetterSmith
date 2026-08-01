@@ -471,7 +471,7 @@ class MessageTab(QtWidgets.QWidget):
         self.url_input.setPlaceholderText("https://your-published-letter-page")
         self.url_input.setToolTip(
             "Save the public page address for this letter. "
-            "Forge uses this address for Open Letter and sharing."
+            "Forge uses this address for Open Letter."
         )
 
         title_recipient_layout.addRow("Letter Title:", self.title_input)
@@ -1193,16 +1193,6 @@ class MessageTab(QtWidgets.QWidget):
             new_html = self.current_html
 
         if not new_html:
-            return
-
-        try:
-            self.project_save_service.save_message(
-                new_html,
-                workspace_path=self._html_path(),
-                reason="editor-close",
-            )
-        except Exception as error:
-            self.status.setText(f"Could not save message: {error}")
             return
 
         self.current_html = new_html

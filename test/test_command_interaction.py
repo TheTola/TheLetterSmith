@@ -181,6 +181,25 @@ class CommandInteractionTests(unittest.TestCase):
 
         self.assertEqual(wiped, [True])
 
+    def test_confirmed_command_resets_prompt_writer_before_project_reset(self) -> None:
+        order = []
+        self.command_tab.reset_prompt_writer_state = lambda: order.append("prompt") or True
+
+        def project_reset(*args, **kwargs):
+            order.append("project")
+            return True
+
+        with mock.patch.object(
+            command,
+            "_perform_confirmed_reset",
+            side_effect=project_reset,
+        ):
+            self.command_tab._do_reset()
+            self.command_tab._confirm_dialog.accept()
+            self._drain_events()
+
+        self.assertEqual(order, ["prompt", "project"])
+
 
 if __name__ == "__main__":
     unittest.main()

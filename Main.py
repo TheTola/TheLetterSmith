@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
+from project_paths import PROJECTS_RELATIVE_PATH
 
 
 # =============================================================================
@@ -240,6 +241,9 @@ def log_startup(
             False,
         )
     ):
+        logging.info(
+            f"[Projects] {(root / PROJECTS_RELATIVE_PATH).resolve()}"
+        )
         logging.info(
             f"[Args] {' '.join(sys.argv)}"
         )
