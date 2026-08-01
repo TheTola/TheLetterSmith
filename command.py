@@ -41,6 +41,7 @@ from typing import Callable, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
+from command_bar import CommandBarData, build_command_bar_data
 from project_state import ApplicationState, ProjectStateController
 
 __all__ = [
@@ -76,6 +77,10 @@ RESET_SETTINGS = {
     "music_volume": 50,
     "music_file": "",
     "last_audio": "none",
+    "recipient_title_locked": False,
+    "recipient_name_locked": False,
+    "published_page_url_locked": False,
+    "active_play_dir": "",
 }
 
 LOGGER = logging.getLogger(__name__)
@@ -333,6 +338,12 @@ def _clear_message_tab_inputs(
         if message_tab is None:
             return
 
+        if hasattr(message_tab, "reset_identity_locks"):
+            try:
+                message_tab.reset_identity_locks()
+            except Exception:
+                LOGGER.exception("Could not clear Message identity locks during reset")
+
         try:
             if hasattr(
                 message_tab,
@@ -403,6 +414,9 @@ def _clear_message_tab_inputs(
                 settings["recipient_title"] = ""
                 settings["recipient_name"] = ""
                 settings[PUBLISHED_PAGE_URL_KEY] = ""
+                settings["recipient_title_locked"] = False
+                settings["recipient_name_locked"] = False
+                settings["published_page_url_locked"] = False
 
         except Exception:
             pass
@@ -869,6 +883,7 @@ def _perform_confirmed_reset(
     *,
     project_root: str | Path | None = None,
     project_state: ProjectStateController | None = None,
+    announce: bool = True,
 ) -> bool:
     previous_identity = (
         project_state.identity
@@ -901,10 +916,11 @@ def _perform_confirmed_reset(
             )
         raise
 
-    _toast(
-        parent,
-        f"Wiped. ({files} files)",
-    )
+    if announce:
+        _toast(
+            parent,
+            f"Wiped. ({files} files)",
+        )
 
     try:
         if (
@@ -1667,6 +1683,7 @@ class CommandTab(
 
         self._interaction_state = "idle"
         self._confirm_dialog: Optional[_ConfirmDialog] = None
+        self._command_bar_data: Optional[CommandBarData] = None
 
         self.go_btn.clicked.connect(
             self._do_reset
@@ -1678,6 +1695,19 @@ class CommandTab(
         self,
     ) -> None:
         if self._interaction_state != "idle":
+            return
+
+        try:
+            self._command_bar_data = build_command_bar_data(
+                project_root=self.project_root,
+            )
+        except Exception:
+            LOGGER.exception("Could not capture the completed letter for Command Bar")
+            _toast(
+                self,
+                "The completed letter could not be captured.",
+                msecs=3000,
+            )
             return
 
         self._interaction_state = "confirming"
@@ -1740,11 +1770,26 @@ class CommandTab(
             hook = getattr(self.window(), "reset_prompt_writer_state", None)
             if callable(hook) and not hook():
                 raise RuntimeError("Prompt Writer reset was not completed")
-            _perform_confirmed_reset(
+            opener = getattr(
+                self.window(),
+                "open_command_bar_and_close_editor",
+                None,
+            )
+            if not callable(opener):
+                raise RuntimeError("Command Bar integration is unavailable")
+            if not _perform_confirmed_reset(
                 self,
                 project_root=self.project_root,
                 project_state=self.project_state,
-            )
+                announce=False,
+            ):
+                raise RuntimeError("The project reset was not completed")
+            data = self._command_bar_data
+            if data is None:
+                raise RuntimeError("Command Bar data was not captured")
+            if not opener(data):
+                raise RuntimeError("Command Bar could not be opened")
+            self._command_bar_data = None
         except Exception as error:
             LOGGER.exception(
                 "Command reset failed"
@@ -1768,6 +1813,7 @@ class CommandTab(
             "Wipe cancelled.",
             msecs=900,
         )
+        self._command_bar_data = None
         self._finish_interaction()
 
     def _release_confirm_dialog(

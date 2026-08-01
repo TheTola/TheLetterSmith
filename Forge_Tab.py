@@ -36,6 +36,7 @@ from saved_letters import (
     update_saved_metadata,
 )
 from settings_store import (
+    ACTIVE_PLAY_DIR_KEY,
     PUBLISHED_PAGE_URL_KEY,
     SettingsStore,
     normalize_published_page_url,
@@ -1531,6 +1532,19 @@ class ForgeTab(QtWidgets.QWidget):
             and self._last_play_dir.resolve() == deleted
         ):
             self._last_play_dir = None
+        active_value = self.settings.get(ACTIVE_PLAY_DIR_KEY, "")
+        try:
+            active_path = Path(str(active_value)).resolve() if active_value else None
+        except (OSError, RuntimeError, TypeError, ValueError):
+            active_path = None
+        if active_path == deleted:
+            try:
+                self.settings.update_fields({ACTIVE_PLAY_DIR_KEY: ""})
+            except Exception:
+                _LOGGER.exception(
+                    "Could not clear the deleted active letter path: %s",
+                    deleted,
+                )
         if (
             self._selected_saved_letter is not None
             and self._selected_saved_letter.path == entry.path
@@ -1708,7 +1722,8 @@ class ForgeTab(QtWidgets.QWidget):
                 error=True,
             )
             return
-        self._last_play_dir = None
+        self._last_play_dir = Path(restored.play_dir).resolve()
+        self._record_active_play_dir(self._last_play_dir)
         self.project_state.transition(
             ApplicationState.PROJECT_READY,
             identity=restored.identity,
@@ -1839,6 +1854,8 @@ class ForgeTab(QtWidgets.QWidget):
                     message_html=message,
                     force=False,
                 )
+            except generate.FontExportError as error:
+                raise _ForgeOperationError(str(error)) from error
             except PermissionError as error:
                 raise _ForgeOperationError(
                     "The previous preview is still in use. Close any open "
@@ -1885,6 +1902,7 @@ class ForgeTab(QtWidgets.QWidget):
                 or completed_fingerprint != requested_fingerprint
             )
         self._last_play_dir = Path(play_dir)
+        self._record_active_play_dir(self._last_play_dir)
         index = self._last_play_dir / "index.html"
         self._preview_refresh_pending = source_changed
         if source_changed:
@@ -1973,6 +1991,8 @@ class ForgeTab(QtWidgets.QWidget):
                     message_html=message,
                     force=True,
                 )
+            except generate.FontExportError as error:
+                raise _ForgeOperationError(str(error)) from error
             except PermissionError as error:
                 raise _ForgeOperationError(
                     "The previous preview is still in use. Close any open "
@@ -2043,6 +2063,7 @@ class ForgeTab(QtWidgets.QWidget):
                 or completed_fingerprint != requested_fingerprint
             )
         self._last_play_dir = Path(play_dir)
+        self._record_active_play_dir(self._last_play_dir)
         self._preview_refresh_pending = source_changed
         if source_changed:
             self._preview_refresh_requested = True
@@ -2080,6 +2101,20 @@ class ForgeTab(QtWidgets.QWidget):
             public_path=str(getattr(publish_result, "public_path", "")),
         )
         self._set_status("The letter has been sealed.")
+
+    def _record_active_play_dir(self, play_dir: Path) -> None:
+        candidate = Path(play_dir).resolve()
+        if not candidate.is_dir() or not (candidate / "index.html").is_file():
+            return
+        try:
+            self.settings.update_fields(
+                {ACTIVE_PLAY_DIR_KEY: str(candidate)}
+            )
+        except Exception:
+            _LOGGER.exception(
+                "Could not persist the active generated letter path: %s",
+                candidate,
+            )
 
     def _update_metadata_silently(
         self,

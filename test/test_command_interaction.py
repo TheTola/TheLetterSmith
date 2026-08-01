@@ -26,6 +26,7 @@ class CommandInteractionTests(unittest.TestCase):
         self.command_tab = command.CommandTab(
             Path(self.temp_dir.name)
         )
+        self.command_tab.open_command_bar_and_close_editor = lambda _data: True
         self.command_tab.resize(900, 600)
         self.command_tab.show()
         self.app.processEvents()
@@ -100,6 +101,8 @@ class CommandInteractionTests(unittest.TestCase):
 
     def test_failure_is_reported_and_restores_control(self) -> None:
         messages = []
+        opener = mock.Mock(return_value=True)
+        self.command_tab.open_command_bar_and_close_editor = opener
 
         def fail(*args, **kwargs):
             raise OSError("simulated read-only project")
@@ -128,6 +131,7 @@ class CommandInteractionTests(unittest.TestCase):
             messages,
             ["Wipe failed: simulated read-only project"],
         )
+        opener.assert_not_called()
         self.assertEqual(self.command_tab._interaction_state, "idle")
         self.assertTrue(self.command_tab.go_btn.isEnabled())
         self.assertFalse(self.command_tab.go_btn._busy)
@@ -199,6 +203,64 @@ class CommandInteractionTests(unittest.TestCase):
             self._drain_events()
 
         self.assertEqual(order, ["prompt", "project"])
+
+    def test_capture_reset_and_handoff_run_in_order(self) -> None:
+        order = []
+        captured = command.CommandBarData(
+            "Amanda Miller",
+            "Words of Encouragement",
+            Path(self.temp_dir.name) / "output" / "Play" / "letter" / "index.html",
+            "https://example.com/letter",
+        )
+
+        def reset(*args, **kwargs):
+            order.append("reset")
+            return True
+
+        def open_bar(data):
+            order.append("handoff")
+            self.assertIs(data, captured)
+            return True
+
+        self.command_tab.open_command_bar_and_close_editor = open_bar
+        with (
+            mock.patch.object(
+                command,
+                "build_command_bar_data",
+                side_effect=lambda **_kwargs: order.append("capture") or captured,
+            ),
+            mock.patch.object(
+                command,
+                "_perform_confirmed_reset",
+                side_effect=reset,
+            ),
+        ):
+            self.command_tab._do_reset()
+            self.command_tab._confirm_dialog.accept()
+            self._drain_events()
+
+        self.assertEqual(order, ["capture", "reset", "handoff"])
+
+    def test_missing_handoff_does_not_reset(self) -> None:
+        self.command_tab.open_command_bar_and_close_editor = None
+        messages = []
+        with (
+            mock.patch.object(command, "_perform_confirmed_reset") as reset,
+            mock.patch.object(
+                command,
+                "_toast",
+                side_effect=lambda _parent, text, **_kwargs: messages.append(text),
+            ),
+        ):
+            self.command_tab._do_reset()
+            self.command_tab._confirm_dialog.accept()
+            self._drain_events()
+
+        reset.assert_not_called()
+        self.assertEqual(
+            messages,
+            ["Wipe failed: Command Bar integration is unavailable"],
+        )
 
 
 if __name__ == "__main__":

@@ -51,6 +51,7 @@ from curtain_color import (
     curtain_rgb_for_style,
     write_tinted_curtain_image,
 )
+from font_export import FontExportError, build_embedded_font_payload
 from sound_model import (
     BUILD_SOUND_MANIFEST_NAME,
     build_sound_manifest,
@@ -89,7 +90,7 @@ LEGACY_SFX_DIRS = (
     Path("gallery") / "app" / "icons" / "Sounds",
 )
 BUILD_STATE_FILE = "lettersmith-build.json"
-BUILD_SCHEMA_VERSION = 7
+BUILD_SCHEMA_VERSION = 8
 CURTAIN_FILES = {"cleft.png", "cright.png"}
 CURTAIN_ANALYSIS_PAGE_ORDER = (
     "cover.png",
@@ -313,6 +314,8 @@ MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
 MESSAGE_OVERLAY_OPACITY_KEY = "message_overlay_opacity"
 DEFAULT_MESSAGE_OVERLAY_PRESET = "paper"
 DEFAULT_MESSAGE_OVERLAY_OPACITY = 68
+TRANSPARENT_MESSAGE_SURFACE_OPACITY = 0.18
+TRANSPARENT_MESSAGE_BLUR_PX = 14
 MESSAGE_OVERLAY_PRESETS: dict[str, tuple[tuple[int, int, int], str]] = {
     "black": ((0, 0, 0), "#ffffff"),
     "white": ((255, 255, 255), "#221710"),
@@ -336,10 +339,22 @@ def _message_overlay_style_from_settings(settings: dict) -> str:
 
     (r, g, b), ink = MESSAGE_OVERLAY_PRESETS[preset]
     alpha = max(0.0, min(1.0, opacity / 100.0))
+    surface_alpha = (
+        TRANSPARENT_MESSAGE_SURFACE_OPACITY
+        if preset == "clear"
+        else alpha
+    )
+    blur_px = (
+        TRANSPARENT_MESSAGE_BLUR_PX
+        if preset == "clear"
+        else 0
+    )
     texture_alpha = 0.028 * alpha if preset == "paper" else 0.0
     return (
         f"--message-overlay-rgb:{r},{g},{b};"
         f"--message-overlay-opacity:{alpha:.3f};"
+        f"--message-overlay-surface-opacity:{surface_alpha:.3f};"
+        f"--message-overlay-blur:{blur_px}px;"
         f"--message-overlay-texture-opacity:{texture_alpha:.3f};"
         f"--message-ink:{ink};"
         f"--wall-fade-ms:900ms;"
@@ -684,6 +699,37 @@ def validate_play_bundle(directory: str | Path) -> Path:
         or not str(build_state.get("source_fingerprint", "")).strip()
     ):
         raise RuntimeError("The staged build state is invalid.")
+
+    font_report = build_state.get("font_export")
+    if not isinstance(font_report, dict):
+        raise RuntimeError("The staged font export report is missing.")
+    report_fields: dict[str, tuple[str, ...]] = {}
+    for key in ("embedded", "files", "fallback"):
+        values = font_report.get(key)
+        if not isinstance(values, list) or not all(
+            isinstance(value, str) and value.strip()
+            for value in values
+        ):
+            raise RuntimeError("The staged font export report is invalid.")
+        report_fields[key] = tuple(values)
+    if report_fields["fallback"]:
+        raise RuntimeError("The staged bundle contains unresolved fonts.")
+    if report_fields["embedded"] and not report_fields["files"]:
+        raise RuntimeError("The staged bundle is missing its embedded font files.")
+
+    styles = (root / "styles.css").read_text(encoding="utf-8")
+    if report_fields["embedded"] and "@font-face" not in styles:
+        raise RuntimeError("The staged bundle is missing embedded font CSS.")
+    for filename in report_fields["files"]:
+        if (
+            Path(filename).name != filename
+            or not filename.startswith("ls-font-")
+            or not (root / "gallery/fonts" / filename).is_file()
+            or f"gallery/fonts/{filename}" not in styles
+        ):
+            raise RuntimeError(
+                "The staged bundle contains an invalid embedded font reference."
+            )
     return root
 
 
@@ -768,6 +814,12 @@ def build_play_bundle_to(
         pr / "gallery/user/fonts",
     ):
         _copy_directory_files(font_source, bp.play_fonts_dir)
+    font_result = build_embedded_font_payload(
+        pr,
+        embedded_message_html,
+        bp.play_fonts_dir,
+    )
+    embedded_message_html = font_result.html
 
     runtime_music_files: list[str] = []
     for index, record in enumerate(sound_tracks):
@@ -792,7 +844,12 @@ def build_play_bundle_to(
         seed_sfx=seed_sfx,
     )
 
-    _atomic_write_text(bp.play_dir / "styles.css", TEMPLATE_CSS)
+    styles_css = (
+        TEMPLATE_CSS
+        if not font_result.css
+        else f"{font_result.css}\n\n{TEMPLATE_CSS}"
+    )
+    _atomic_write_text(bp.play_dir / "styles.css", styles_css)
     _atomic_write_text(bp.play_dir / "script.js", TEMPLATE_JS)
     playlist_sources = [
         f"gallery/sounds/{name}" for name in runtime_music_files
@@ -828,6 +885,10 @@ def build_play_bundle_to(
                 "schema_version": BUILD_SCHEMA_VERSION,
                 "project_id": project_id,
                 "source_fingerprint": fingerprint,
+                "font_export": {
+                    key: list(values)
+                    for key, values in font_result.report.items()
+                },
             },
             indent=2,
             ensure_ascii=False,

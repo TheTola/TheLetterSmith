@@ -9,7 +9,7 @@ from pathlib import Path
 from config import CONTROL_FILES, REQUIRED_SLIDES
 from recipient_registry import RecipientRegistry
 from saved_letters import SavedLetterCatalog, SavedLetterRestoreError, SavedLetterRestorer
-from settings_store import SettingsStore
+from settings_store import ACTIVE_PLAY_DIR_KEY, SettingsStore
 from sound_model import (
     ProjectSoundState,
     current_music_path,
@@ -91,21 +91,20 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             self._restore(root, bundle)
             self.assertEqual(len(load_library(root)), 4)
 
-    def test_legacy_music_mp3_restores_as_single_track(self) -> None:
+    def test_manifestless_sound_bundle_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundle = self._bundle(root)
+            metadata_path = bundle / "lettersmith-metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["settings"] = {"required_features": {"music": True}}
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
             sounds = bundle / "gallery" / "sounds"
             sounds.mkdir()
-            (sounds / "music.mp3").write_bytes(b"legacy")
+            (sounds / "music.mp3").write_bytes(b"retired-format")
 
-            self._restore(root, bundle)
-
-            state = load_project_state(root)
-            self.assertEqual(state.mode, "single")
-            self.assertTrue(state.single_track_id)
-            self.assertEqual(current_music_path(root).read_bytes(), b"legacy")
-            self.assertEqual(load_library(root)[state.single_track_id].display_title, "music")
+            with self.assertRaises(SavedLetterRestoreError):
+                self._restore(root, bundle)
 
     def test_silent_letter_clears_project_sound_without_deleting_archive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -123,6 +122,19 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             self.assertFalse(load_project_state(root).ordered_track_ids())
             self.assertFalse(current_music_path(root).exists())
             self.assertIn(record.track_id, load_library(root))
+
+    def test_restore_commits_active_play_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+
+            restored = self._restore(root, bundle)
+
+            self.assertEqual(restored.play_dir, bundle.resolve())
+            self.assertEqual(
+                SettingsStore(root).get(ACTIVE_PLAY_DIR_KEY),
+                str(bundle.resolve()),
+            )
 
     def test_failure_restores_active_project_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

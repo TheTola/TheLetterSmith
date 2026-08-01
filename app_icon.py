@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Optional
 
 
-APP_ICON_PNG_REL = Path("gallery/app/icons/folder/LSmith.png")
-APP_ICON_ICO_REL = Path("gallery/app/icons/folder/LSmith.ico")
+APP_ICON_PNG_REL = Path("gallery/app/icons/folder/lsmith.png")
+APP_ICON_ICO_REL = Path("gallery/app/icons/folder/lsmith.ico")
 APP_USER_MODEL_ID = "InfiniWorks.LetterSmith"
 
 

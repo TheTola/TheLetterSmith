@@ -56,6 +56,7 @@ from PySide6.QtGui import (
     QFont,
     QColor,
     QAction,
+    QActionGroup,
     QKeySequence,
     QTextCharFormat,
     QTextCursor,
@@ -96,6 +97,7 @@ from config import (
 from message_format import normalize_ultralinks_in_document
 from project_save import ProjectNotReadyError, ProjectSaveService
 from project_state import ProjectStateController
+from editor_diagnostics import record_editor_failure
 from message_html import (
     is_ultralink_href,
     make_ultralink_href,
@@ -110,6 +112,7 @@ from message_html import (
 TOOLBAR_ICON_SIZE = QSize(16, 16)
 DEFAULT_FONT_SIZE = 16
 FONT_SIZE_MIN, FONT_SIZE_MAX = 1, 100
+FONT_SIZE_STEP = 1
 
 SETTINGS_ORG = "LetterSmith"
 SETTINGS_APP = "Editor"
@@ -530,6 +533,16 @@ class RichTextEdit(QTextEdit):
 # Preview Widget
 # ─────────────────────────────────────────────────────────────────────────────
 
+class FontSizeSpinBox(QSpinBox):
+    """Exact point-size input that ignores incidental page scrolling."""
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        if not self.hasFocus():
+            event.ignore()
+            return
+        super().wheelEvent(event)
+
+
 class PreviewWidget(QtWidgets.QWidget):
     def __init__(
         self,
@@ -669,14 +682,18 @@ class Editor(QDialog):
                 if self.message_path.is_file()
                 else ""
             )
-        except Exception:
+        except Exception as error:
+            self._record_failure("load persisted message", error)
             self._last_persisted_html = ""
         self._initializing = False
 
     def _settings_file_changed(self, path: str) -> None:
         if self._closing:
             return
-        self.refresh_background_from_settings()
+        try:
+            self.refresh_background_from_settings()
+        except Exception as error:
+            self._record_failure("refresh editor settings", error)
         if Path(path).is_file() and path not in self._settings_watcher.files():
             self._settings_watcher.addPath(path)
 
@@ -721,11 +738,13 @@ class Editor(QDialog):
         btn_save.clicked.connect(self._save_only)
 
         btn_close = QPushButton("Close")
+        self.btn_close = btn_close
         btn_close.setAutoDefault(False)
         btn_close.setDefault(False)
         btn_close.clicked.connect(self._request_close)
 
         btn_save_close = QPushButton("Save and Close")
+        self.btn_save_close = btn_save_close
         btn_save_close.setAutoDefault(False)
         btn_save_close.setDefault(False)
         btn_save_close.clicked.connect(self.save_and_close)
@@ -742,6 +761,7 @@ class Editor(QDialog):
         self.editor.cursorPositionChanged.connect(self._sync_current_format)
         self.editor.selectionChanged.connect(self._sync_current_format)
         self._apply_editor_background()
+        self._sync_current_format()
 
     def _editor_background_setting(self) -> tuple[str, str]:
         data = _read_json(self.settings_path)
@@ -778,22 +798,115 @@ class Editor(QDialog):
             key_event = event
             if isinstance(key_event, QtGui.QKeyEvent) and key_event.key() in (Qt.Key_Return, Qt.Key_Enter):
                 if watched in (self.font_size_spin, self.font_size_spin.lineEdit()):
-                    self.set_font_size(self.font_size_spin.value())
+                    self._run_editor_action(
+                        "Change font size",
+                        self._commit_font_size_input,
+                    )
                 else:
-                    self.set_font_family(self.font_combo.currentFont())
+                    self._run_editor_action(
+                        "Change font family",
+                        lambda: self.set_font_family(self.font_combo.currentFont()),
+                    )
                 self.editor.setFocus(Qt.OtherFocusReason)
                 return True
         return super().eventFilter(watched, event)
 
     def _sync_current_format(self) -> None:
         self._sync_format(self.editor.currentCharFormat())
-
+        self._sync_block_actions()
         self.update_word_count()
 
+    def _sync_block_actions(self) -> None:
+        if hasattr(self, "alignment_actions"):
+            alignment = self.editor.textCursor().blockFormat().alignment()
+            for name, action in self.alignment_actions.items():
+                expected = {
+                    "left": Qt.AlignLeft,
+                    "center": Qt.AlignCenter,
+                    "right": Qt.AlignRight,
+                }[name]
+                blocker = QtCore.QSignalBlocker(action)
+                action.setChecked(bool(alignment & expected))
+                del blocker
+        if hasattr(self, "spacing_actions"):
+            selected = self._export_line_spacing
+            for multiplier, action in self.spacing_actions.items():
+                blocker = QtCore.QSignalBlocker(action)
+                action.setChecked(
+                    selected is not None
+                    and abs(float(selected) - multiplier) < 0.001
+                )
+                del blocker
+
+    def _run_editor_action(
+        self,
+        label: str,
+        callback: Callable[[], None],
+    ) -> None:
+        """Contain toolbar failures so one broken action cannot close the editor."""
+        if self._closing:
+            return
+        try:
+            callback()
+        except Exception as error:
+            self._record_failure(f"editor action: {label}", error)
+            QMessageBox.warning(
+                self,
+                "Editor Action Failed",
+                f"{label} could not be completed. Your letter remains open. "
+                "Details were recorded in editor_error.log.",
+            )
+        finally:
+            if not self._closing:
+                try:
+                    self._sync_current_format()
+                except Exception as error:
+                    self._record_failure(
+                        f"synchronize controls after: {label}",
+                        error,
+                    )
+
+    def _record_failure(
+        self,
+        operation: str,
+        error: BaseException,
+    ) -> Optional[Path]:
+        _LOGGER.error(
+            "Editor failure during %s",
+            operation,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        try:
+            return record_editor_failure(self.project_root, operation, error)
+        except Exception:
+            _LOGGER.exception("Could not write editor_error.log")
+            return None
+
+    def _guarded_action(
+        self,
+        label: str,
+        callback: Callable[[], None],
+    ) -> Callable[..., None]:
+        return lambda *_args: self._run_editor_action(label, callback)
+
+    def _font_family_changed(self, font: QFont) -> None:
+        self._run_editor_action(
+            "Change font family",
+            lambda: self.set_font_family(font),
+        )
+
+    def _font_size_changed(self, size: int) -> None:
+        self._run_editor_action(
+            "Change font size",
+            lambda: self.set_font_size(size),
+        )
+
     def _build_toolbar_actions(self) -> None:
-        act_sal = QAction("Salutation", self)
-        act_sal.triggered.connect(self.insert_salutation)
-        self.toolbar.addAction(act_sal)
+        self.act_salutation = QAction("Salutation", self)
+        self.act_salutation.triggered.connect(
+            self._guarded_action("Insert salutation", self.insert_salutation)
+        )
+        self.toolbar.addAction(self.act_salutation)
 
         self.toolbar.addSeparator()
 
@@ -804,25 +917,39 @@ class Editor(QDialog):
         self.btn_format.setAutoRaise(True)
 
         fmt_menu = QMenu(self)
-        a_bold = fmt_menu.addAction("Bold")
-        a_bold.setShortcut(QKeySequence.Bold)
-        a_bold.triggered.connect(self.toggle_bold)
+        self.act_bold = fmt_menu.addAction("Bold")
+        self.act_bold.setCheckable(True)
+        self.act_bold.setShortcut(QKeySequence.Bold)
+        self.act_bold.triggered.connect(
+            self._guarded_action("Bold", self.toggle_bold)
+        )
 
-        a_italic = fmt_menu.addAction("Italic")
-        a_italic.setShortcut(QKeySequence.Italic)
-        a_italic.triggered.connect(self.toggle_italic)
+        self.act_italic = fmt_menu.addAction("Italic")
+        self.act_italic.setCheckable(True)
+        self.act_italic.setShortcut(QKeySequence.Italic)
+        self.act_italic.triggered.connect(
+            self._guarded_action("Italic", self.toggle_italic)
+        )
 
-        a_underline = fmt_menu.addAction("Underline")
-        a_underline.setShortcut(QKeySequence.Underline)
-        a_underline.triggered.connect(self.toggle_underline)
+        self.act_underline = fmt_menu.addAction("Underline")
+        self.act_underline.setCheckable(True)
+        self.act_underline.setShortcut(QKeySequence.Underline)
+        self.act_underline.triggered.connect(
+            self._guarded_action("Underline", self.toggle_underline)
+        )
 
-        a_strike = fmt_menu.addAction("Strike")
-        a_strike.triggered.connect(self.toggle_strikethrough)
+        self.act_strike = fmt_menu.addAction("Strike")
+        self.act_strike.setCheckable(True)
+        self.act_strike.triggered.connect(
+            self._guarded_action("Strikethrough", self.toggle_strikethrough)
+        )
 
         fmt_menu.addSeparator()
 
-        a_clear = fmt_menu.addAction("Clear")
-        a_clear.triggered.connect(self.clear_formatting)
+        self.act_clear_formatting = fmt_menu.addAction("Clear")
+        self.act_clear_formatting.triggered.connect(
+            self._guarded_action("Clear formatting", self.clear_formatting)
+        )
 
         self.btn_format.setMenu(fmt_menu)
         self.toolbar.addWidget(self.btn_format)
@@ -834,8 +961,14 @@ class Editor(QDialog):
         self.btn_lists.setAutoRaise(True)
 
         list_menu = QMenu(self)
-        list_menu.addAction("Bullet list", self.insert_bullet_list)
-        list_menu.addAction("Numbered list", self.insert_number_list)
+        self.act_bullet_list = list_menu.addAction("Bullet list")
+        self.act_bullet_list.triggered.connect(
+            self._guarded_action("Bullet list", self.insert_bullet_list)
+        )
+        self.act_number_list = list_menu.addAction("Numbered list")
+        self.act_number_list.triggered.connect(
+            self._guarded_action("Numbered list", self.insert_number_list)
+        )
 
         self.btn_lists.setMenu(list_menu)
         self.toolbar.addWidget(self.btn_lists)
@@ -847,13 +980,37 @@ class Editor(QDialog):
         self.btn_spacing.setAutoRaise(True)
 
         sp_menu = QMenu(self)
-        sp_menu.addAction("Single (1.0)",  lambda: self.set_line_spacing(1.0))
-        sp_menu.addAction("1.15",          lambda: self.set_line_spacing(1.15))
-        sp_menu.addAction("1.5",           lambda: self.set_line_spacing(1.5))
-        sp_menu.addAction("Double (2.0)",  lambda: self.set_line_spacing(2.0))
+        self.spacing_action_group = QActionGroup(self)
+        self.spacing_action_group.setExclusive(True)
+        self.spacing_actions: dict[float, QAction] = {}
+        for label, multiplier in (
+            ("Single (1.0)", 1.0),
+            ("1.15", 1.15),
+            ("1.5", 1.5),
+            ("Double (2.0)", 2.0),
+        ):
+            action = sp_menu.addAction(label)
+            action.setCheckable(True)
+            self.spacing_action_group.addAction(action)
+            action.triggered.connect(
+                self._guarded_action(
+                    f"Line spacing {multiplier:g}",
+                    lambda value=multiplier: self.set_line_spacing(value),
+                )
+            )
+            self.spacing_actions[multiplier] = action
         sp_menu.addSeparator()
-        sp_menu.addAction("2.5",           lambda: self.set_line_spacing(2.5))
-        sp_menu.addAction("3.0",           lambda: self.set_line_spacing(3.0))
+        for label, multiplier in (("2.5", 2.5), ("3.0", 3.0)):
+            action = sp_menu.addAction(label)
+            action.setCheckable(True)
+            self.spacing_action_group.addAction(action)
+            action.triggered.connect(
+                self._guarded_action(
+                    f"Line spacing {multiplier:g}",
+                    lambda value=multiplier: self.set_line_spacing(value),
+                )
+            )
+            self.spacing_actions[multiplier] = action
 
         self.btn_spacing.setMenu(sp_menu)
         self.toolbar.addWidget(self.btn_spacing)
@@ -861,22 +1018,39 @@ class Editor(QDialog):
         self.toolbar.addSeparator()
 
         # Align dropdown
-        btn_align = QToolButton(self)
-        btn_align.setText("Align")
-        btn_align.setPopupMode(QToolButton.InstantPopup)
-        btn_align.setAutoRaise(True)
+        self.btn_align = QToolButton(self)
+        self.btn_align.setText("Align")
+        self.btn_align.setPopupMode(QToolButton.InstantPopup)
+        self.btn_align.setAutoRaise(True)
 
         menu_align = QMenu(self)
-        menu_align.addAction("Left",   lambda: self.editor.setAlignment(Qt.AlignLeft))
-        menu_align.addAction("Center", lambda: self.editor.setAlignment(Qt.AlignCenter))
-        menu_align.addAction("Right",  lambda: self.editor.setAlignment(Qt.AlignRight))
-        btn_align.setMenu(menu_align)
-        self.toolbar.addWidget(btn_align)
+        self.alignment_action_group = QActionGroup(self)
+        self.alignment_action_group.setExclusive(True)
+        self.alignment_actions: dict[str, QAction] = {}
+        for label, alignment in (
+            ("Left", Qt.AlignLeft),
+            ("Center", Qt.AlignCenter),
+            ("Right", Qt.AlignRight),
+        ):
+            action = menu_align.addAction(label)
+            action.setCheckable(True)
+            self.alignment_action_group.addAction(action)
+            action.triggered.connect(
+                self._guarded_action(
+                    f"Align {label.lower()}",
+                    lambda value=alignment: self.editor.setAlignment(value),
+                )
+            )
+            self.alignment_actions[label.casefold()] = action
+        self.btn_align.setMenu(menu_align)
+        self.toolbar.addWidget(self.btn_align)
 
         # Color
-        act_col = QAction("Color", self)
-        act_col.triggered.connect(self.choose_color)
-        self.toolbar.addAction(act_col)
+        self.act_color = QAction("Color", self)
+        self.act_color.triggered.connect(
+            self._guarded_action("Text color", self.choose_color)
+        )
+        self.toolbar.addAction(self.act_color)
 
         self.btn_links = QToolButton(self)
         self.btn_links.setText("Links")
@@ -886,10 +1060,14 @@ class Editor(QDialog):
         link_menu = QMenu(self)
         self.act_add_edit_link = link_menu.addAction("Add / Edit Link")
         self.act_add_edit_link.setShortcut(QKeySequence("Ctrl+K"))
-        self.act_add_edit_link.triggered.connect(self.add_or_edit_link)
+        self.act_add_edit_link.triggered.connect(
+            self._guarded_action("Add or edit link", self.add_or_edit_link)
+        )
         self.act_remove_link = link_menu.addAction("Remove Link")
         self.act_remove_link.setShortcut(QKeySequence("Ctrl+Shift+K"))
-        self.act_remove_link.triggered.connect(self.remove_link)
+        self.act_remove_link.triggered.connect(
+            self._guarded_action("Remove link", self.remove_link)
+        )
         self.btn_links.setMenu(link_menu)
         self.toolbar.addWidget(self.btn_links)
         self.addAction(self.act_add_edit_link)
@@ -906,12 +1084,20 @@ class Editor(QDialog):
         )
         self.btn_ultralink.setPopupMode(QToolButton.MenuButtonPopup)
         self.btn_ultralink.setMinimumSize(44, 36)
-        self.btn_ultralink.clicked.connect(self.open_ultralink_dialog)
+        self.btn_ultralink.clicked.connect(
+            self._guarded_action("Ultralink", self.open_ultralink_dialog)
+        )
         ultralink_menu = QMenu(self.btn_ultralink)
         color_action = ultralink_menu.addAction(
             "Choose default Ultralink color…"
         )
-        color_action.triggered.connect(self.choose_ultralink_color)
+        self.act_ultralink_color = color_action
+        color_action.triggered.connect(
+            self._guarded_action(
+                "Ultralink color",
+                self.choose_ultralink_color,
+            )
+        )
         self.btn_ultralink.setMenu(ultralink_menu)
         self.toolbar.addWidget(self.btn_ultralink)
         self.editor.cursorPositionChanged.connect(
@@ -924,34 +1110,120 @@ class Editor(QDialog):
         self.toolbar.addSeparator()
 
         # Undo / Redo / Find
-        act_undo = QAction("Undo", self)
-        act_undo.setShortcut(QKeySequence.Undo)
-        act_undo.triggered.connect(self.editor.undo)
-        self.toolbar.addAction(act_undo)
+        self.act_undo = QAction("Undo", self)
+        self.act_undo.setShortcut(QKeySequence.Undo)
+        self.act_undo.triggered.connect(
+            self._guarded_action("Undo", self.editor.undo)
+        )
+        self.act_undo.setEnabled(self.editor.document().isUndoAvailable())
+        self.editor.document().undoAvailable.connect(self.act_undo.setEnabled)
+        self.toolbar.addAction(self.act_undo)
 
-        act_redo = QAction("Redo", self)
-        act_redo.setShortcut(QKeySequence.Redo)
-        act_redo.triggered.connect(self.editor.redo)
-        self.toolbar.addAction(act_redo)
+        self.act_redo = QAction("Redo", self)
+        self.act_redo.setShortcut(QKeySequence.Redo)
+        self.act_redo.triggered.connect(
+            self._guarded_action("Redo", self.editor.redo)
+        )
+        self.act_redo.setEnabled(self.editor.document().isRedoAvailable())
+        self.editor.document().redoAvailable.connect(self.act_redo.setEnabled)
+        self.toolbar.addAction(self.act_redo)
 
-        act_find = QAction("Find", self)
-        act_find.setShortcut(QKeySequence.Find)
-        act_find.triggered.connect(self.open_find_replace)
-        self.toolbar.addAction(act_find)
+        self.act_find = QAction("Find", self)
+        self.act_find.setShortcut(QKeySequence.Find)
+        self.act_find.triggered.connect(
+            self._guarded_action("Find", self.open_find_replace)
+        )
+        self.toolbar.addAction(self.act_find)
 
         self.toolbar.addSeparator()
 
         # Font family + size
         self.font_combo = QFontComboBox()
-        self.font_combo.currentFontChanged.connect(self.set_font_family)
+        self.font_combo.setMinimumWidth(180)
+        self.font_combo.setMaximumWidth(300)
+        self.font_combo.setAccessibleName("Font family")
+        self.font_combo.setToolTip("Choose the font for selected text or new typing")
+        self.font_combo.currentFontChanged.connect(self._font_family_changed)
 
-        self.font_size_spin = QSpinBox()
+        self.font_size_down = QToolButton(self)
+        self.font_size_down.setText("A−")
+        self.font_size_down.setFixedWidth(38)
+        self.font_size_down.setAccessibleName("Decrease font size")
+        self.font_size_down.setToolTip("Decrease font size (Ctrl+[)")
+        self.font_size_down.clicked.connect(
+            self._guarded_action(
+                "Decrease font size",
+                lambda: self.adjust_font_size(-FONT_SIZE_STEP),
+            )
+        )
+
+        self.font_size_spin = FontSizeSpinBox()
         self.font_size_spin.setRange(FONT_SIZE_MIN, FONT_SIZE_MAX)
+        self.font_size_spin.setMinimumWidth(76)
+        self.font_size_spin.setSingleStep(FONT_SIZE_STEP)
         self.font_size_spin.setValue(DEFAULT_FONT_SIZE)
-        self.font_size_spin.valueChanged.connect(self.set_font_size)
+        self.font_size_spin.setSuffix(" pt")
+        self.font_size_spin.setKeyboardTracking(False)
+        self.font_size_spin.setAccelerated(True)
+        self.font_size_spin.setAccessibleName("Font size in points")
+        self.font_size_spin.setToolTip(
+            "Enter an exact point size, use the arrows, or use A− and A+"
+        )
+        self.font_size_spin.valueChanged.connect(self._font_size_changed)
 
-        self.toolbar.addWidget(self.font_combo)
-        self.toolbar.addWidget(self.font_size_spin)
+        self.font_size_up = QToolButton(self)
+        self.font_size_up.setText("A+")
+        self.font_size_up.setFixedWidth(38)
+        self.font_size_up.setAccessibleName("Increase font size")
+        self.font_size_up.setToolTip("Increase font size (Ctrl+])")
+        self.font_size_up.clicked.connect(
+            self._guarded_action(
+                "Increase font size",
+                lambda: self.adjust_font_size(FONT_SIZE_STEP),
+            )
+        )
+
+        self.act_font_size_down = QAction("Decrease font size", self)
+        self.act_font_size_down.setShortcut(QKeySequence("Ctrl+["))
+        self.act_font_size_down.triggered.connect(
+            self._guarded_action(
+                "Decrease font size",
+                lambda: self.adjust_font_size(-FONT_SIZE_STEP),
+            )
+        )
+        self.addAction(self.act_font_size_down)
+
+        self.act_font_size_up = QAction("Increase font size", self)
+        self.act_font_size_up.setShortcut(QKeySequence("Ctrl+]"))
+        self.act_font_size_up.triggered.connect(
+            self._guarded_action(
+                "Increase font size",
+                lambda: self.adjust_font_size(FONT_SIZE_STEP),
+            )
+        )
+        self.addAction(self.act_font_size_up)
+
+        self.font_controls = QtWidgets.QFrame(self)
+        self.font_controls.setObjectName("fontControls")
+        font_layout = QHBoxLayout(self.font_controls)
+        font_layout.setContentsMargins(8, 4, 8, 4)
+        font_layout.setSpacing(6)
+        font_label = QLabel("Font", self.font_controls)
+        font_label.setObjectName("fontControlsLabel")
+        size_label = QLabel("Size", self.font_controls)
+        size_label.setObjectName("fontControlsLabel")
+        font_layout.addWidget(font_label)
+        font_layout.addWidget(self.font_combo, 1)
+        font_layout.addSpacing(8)
+        font_layout.addWidget(size_label)
+        font_layout.addWidget(self.font_size_down)
+        font_layout.addWidget(self.font_size_spin)
+        font_layout.addWidget(self.font_size_up)
+        font_layout.addStretch(2)
+        root_layout = self.layout()
+        if isinstance(root_layout, QVBoxLayout):
+            root_layout.insertWidget(1, self.font_controls)
+        self._sync_font_step_buttons()
 
 
     def _apply_styles(self) -> None:
@@ -968,13 +1240,18 @@ class Editor(QDialog):
             "QMenu{background:#141414;color:#eee;border:1px solid #2a2a2a;}"
             "QToolButton{color:#e6e6e6; padding:4px 8px; border:1px solid #2a2a2a; border-radius:6px; background:#101010;}"
             "QToolButton:hover{border-color:#00d0ff;}"
+            "QFrame#fontControls{background:#161616;border:1px solid #242424;border-radius:6px;}"
+            "QLabel#fontControlsLabel{color:#d7e7ef;font-weight:700;padding:0 2px;}"
             "QCheckBox{color:#ddd;}"
         )
 
     def _restore_geometry(self) -> None:
         geom = self.settings.value(SETTINGS_KEY_GEOMETRY)
         if isinstance(geom, QtCore.QByteArray):
-            self.restoreGeometry(geom)
+            try:
+                self.restoreGeometry(geom)
+            except Exception as error:
+                self._record_failure("restore editor geometry", error)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self._closing:
@@ -1021,10 +1298,10 @@ class Editor(QDialog):
             or not self.project_state.is_project_ready
         ):
             return
-        content = self._prepared_html()
-        if not content or content == self._last_persisted_html:
-            return
         try:
+            content = self._prepared_html()
+            if not content or content == self._last_persisted_html:
+                return
             self.project_save_service.save_message(
                 content,
                 workspace_path=self.message_path,
@@ -1035,18 +1312,19 @@ class Editor(QDialog):
             self.autosaved.emit(content)
         except ProjectNotReadyError:
             return
-        except Exception:
-            # Autosave is deliberately quiet. Manual Save still reports failures.
+        except Exception as error:
+            # Autosave remains quiet in the UI, but the failure is diagnosable.
+            self._record_failure("autosave letter", error)
             return
 
     def _save_document(self) -> bool:
         if self._save_in_progress:
             return False
         self._autosave_timer.stop()
-        content = self._prepared_html()
         self._save_in_progress = True
-        self.btn_save.setEnabled(False)
+        self._set_save_controls_enabled(False)
         try:
+            content = self._prepared_html()
             self.project_save_service.save_message(
                 content,
                 workspace_path=self.message_path,
@@ -1057,17 +1335,31 @@ class Editor(QDialog):
             self.autosaved.emit(content)
             return True
         except Exception as error:
-            _LOGGER.exception("Editor save failed")
+            log_path = self._record_failure("save letter", error)
+            detail = (
+                f"\n\nDetails were recorded in:\n{log_path}"
+                if log_path is not None
+                else ""
+            )
             QMessageBox.critical(
                 self,
                 "Save Error",
-                "Could not save the letter. The Editor remains open and your changes are preserved.",
+                "Could not save the letter. The Editor remains open and your "
+                f"changes are preserved.{detail}",
             )
             return False
         finally:
             self._save_in_progress = False
             if not self._closing:
-                self.btn_save.setEnabled(True)
+                self._set_save_controls_enabled(True)
+
+    def _set_save_controls_enabled(self, enabled: bool) -> None:
+        for button in (
+            getattr(self, "btn_save", None),
+            getattr(self, "btn_save_close", None),
+        ):
+            if button is not None:
+                button.setEnabled(bool(enabled))
 
     def _save_only(self) -> None:
         self._save_document()
@@ -1079,7 +1371,17 @@ class Editor(QDialog):
     def _request_close(self) -> None:
         if self._closing:
             return
-        current = self._prepared_html()
+        try:
+            current = self._prepared_html()
+        except Exception as error:
+            self._record_failure("prepare letter before close", error)
+            QMessageBox.critical(
+                self,
+                "Editor Error",
+                "The Editor could not verify the current letter, so it was kept "
+                "open. Details were recorded in editor_error.log.",
+            )
+            return
         if current == self._last_persisted_html:
             self._finish_close()
             return
@@ -1108,8 +1410,8 @@ class Editor(QDialog):
             watcher.removePaths(watcher.files())
         try:
             self.settings.setValue(SETTINGS_KEY_GEOMETRY, self.saveGeometry())
-        except Exception:
-            _LOGGER.exception("Could not persist Editor geometry")
+        except Exception as error:
+            self._record_failure("persist editor geometry", error)
         super().accept()
 
     def apply_changes(self) -> None:
@@ -1368,6 +1670,7 @@ class Editor(QDialog):
         self.editor.setTextCursor(cursor)
         self._apply_char_format(fmt)
         self._update_link_actions()
+        self._update_ultralink_action()
 
     def remove_link(self) -> None:
         cursor = self._link_target_cursor()
@@ -1380,6 +1683,7 @@ class Editor(QDialog):
         self.editor.setTextCursor(cursor)
         self._apply_char_format(fmt)
         self._update_link_actions()
+        self._update_ultralink_action()
 
     def _ultralink_target_cursor(self) -> Optional[QTextCursor]:
         cursor = QTextCursor(self.editor.textCursor())
@@ -1504,16 +1808,21 @@ class Editor(QDialog):
 
     def _update_ultralink_action(self) -> None:
         cursor = self.editor.textCursor()
-        has_target = (
+        contains_standard_link = (
             cursor.hasSelection()
+            and self._selection_contains_standard_link(cursor)
+        )
+        has_target = (
+            (cursor.hasSelection() and not contains_standard_link)
             or self._ultralink_target_cursor() is not None
         )
-        instruction = (
-            "Add or edit an Ultralink tooltip"
-            if has_target
-            else "Select text to create an Ultralink"
-        )
-        self.btn_ultralink.setEnabled(True)
+        if contains_standard_link:
+            instruction = "Remove the web link before creating an Ultralink"
+        elif has_target:
+            instruction = "Add or edit an Ultralink tooltip"
+        else:
+            instruction = "Select text to create an Ultralink"
+        self.btn_ultralink.setEnabled(has_target)
         self.btn_ultralink.setToolTip(
             f"{instruction}. New color: {self.ultralink_color.name()}"
         )
@@ -1539,6 +1848,13 @@ class Editor(QDialog):
         )
         if target is None:
             QtWidgets.QApplication.beep()
+            return
+        if self._selection_contains_standard_link(target):
+            QMessageBox.information(
+                self,
+                "Ultralink",
+                "Remove the existing web link before applying an Ultralink.",
+            )
             return
 
         existing_message = (
@@ -1772,22 +2088,30 @@ class Editor(QDialog):
     # ──────────────────────────────────────────────────────────────────────
 
     def _apply_char_format(self, fmt: QTextCharFormat) -> None:
-        c = self.editor.textCursor()
-        if c.hasSelection():
-            c.mergeCharFormat(fmt)
+        cursor = QTextCursor(self.editor.textCursor())
+        if not cursor.hasSelection():
             self.editor.mergeCurrentCharFormat(fmt)
-        else:
-            self.editor.mergeCurrentCharFormat(fmt)
-            self.editor.setCurrentCharFormat(self.editor.currentCharFormat())
+            return
+
+        cursor.beginEditBlock()
+        try:
+            cursor.mergeCharFormat(fmt)
+        finally:
+            cursor.endEditBlock()
+        self.editor.setTextCursor(cursor)
 
     def _toggle_weight(self, wt: int) -> None:
-        fmt = self.editor.currentCharFormat()
-        fmt.setFontWeight(QFont.Normal if fmt.fontWeight() == wt else wt)
+        current = self.editor.currentCharFormat()
+        fmt = QTextCharFormat()
+        fmt.setFontWeight(QFont.Normal if current.fontWeight() == wt else wt)
         self._apply_char_format(fmt)
 
     def set_font_family(self, font: QFont) -> None:
+        family = font.family().strip()
+        if not family:
+            return
         fmt = QTextCharFormat()
-        fmt.setFontFamily(font.family())
+        fmt.setFontFamilies([family])
         self._apply_char_format(fmt)
 
     def set_font_size(self, size: int) -> None:
@@ -1798,33 +2122,65 @@ class Editor(QDialog):
         self.font_size_spin.blockSignals(True)
         self.font_size_spin.setValue(size_i)
         self.font_size_spin.blockSignals(False)
+        self._sync_font_step_buttons()
+
+    def _commit_font_size_input(self) -> None:
+        blocker = QtCore.QSignalBlocker(self.font_size_spin)
+        self.font_size_spin.interpretText()
+        size = self.font_size_spin.value()
+        del blocker
+        self.set_font_size(size)
+
+    def adjust_font_size(self, delta: int) -> None:
+        size = int(self.font_size_spin.value()) + int(delta)
+        self.set_font_size(size)
+
+    def _sync_font_step_buttons(self) -> None:
+        if not hasattr(self, "font_size_spin"):
+            return
+        size = int(self.font_size_spin.value())
+        if hasattr(self, "font_size_down"):
+            self.font_size_down.setEnabled(size > FONT_SIZE_MIN)
+        if hasattr(self, "font_size_up"):
+            self.font_size_up.setEnabled(size < FONT_SIZE_MAX)
+        if hasattr(self, "act_font_size_down"):
+            self.act_font_size_down.setEnabled(size > FONT_SIZE_MIN)
+        if hasattr(self, "act_font_size_up"):
+            self.act_font_size_up.setEnabled(size < FONT_SIZE_MAX)
 
     def toggle_bold(self) -> None:
         self._toggle_weight(QFont.Bold)
 
     def toggle_italic(self) -> None:
-        fmt = self.editor.currentCharFormat()
-        fmt.setFontItalic(not fmt.fontItalic())
+        current = self.editor.currentCharFormat()
+        fmt = QTextCharFormat()
+        fmt.setFontItalic(not current.fontItalic())
         self._apply_char_format(fmt)
 
     def toggle_underline(self) -> None:
-        fmt = self.editor.currentCharFormat()
-        fmt.setFontUnderline(not fmt.fontUnderline())
+        current = self.editor.currentCharFormat()
+        fmt = QTextCharFormat()
+        fmt.setFontUnderline(not current.fontUnderline())
         self._apply_char_format(fmt)
 
     def toggle_strikethrough(self) -> None:
-        fmt = self.editor.currentCharFormat()
-        fmt.setFontStrikeOut(not fmt.fontStrikeOut())
+        current = self.editor.currentCharFormat()
+        fmt = QTextCharFormat()
+        fmt.setFontStrikeOut(not current.fontStrikeOut())
         self._apply_char_format(fmt)
 
     def clear_formatting(self) -> None:
-        c = self.editor.textCursor()
-        if c.hasSelection():
-            txt = c.selectedText()
-            c.insertText(txt)
-            self.editor.setTextCursor(c)
-        else:
+        cursor = QTextCursor(self.editor.textCursor())
+        if not cursor.hasSelection():
             self.editor.setCurrentCharFormat(QTextCharFormat())
+            return
+
+        cursor.beginEditBlock()
+        try:
+            cursor.setCharFormat(QTextCharFormat())
+        finally:
+            cursor.endEditBlock()
+        self.editor.setTextCursor(cursor)
 
     def choose_color(self) -> None:
         color = QColorDialog.getColor(self.last_color, parent=self)
@@ -1922,6 +2278,19 @@ class Editor(QDialog):
                 sz = int(round(eff)) if eff and eff > 0 else DEFAULT_FONT_SIZE
 
             self.font_size_spin.setValue(max(FONT_SIZE_MIN, min(FONT_SIZE_MAX, sz)))
+            self._sync_font_step_buttons()
+
+            for action, checked in (
+                (getattr(self, "act_bold", None), fmt.fontWeight() >= QFont.Bold),
+                (getattr(self, "act_italic", None), fmt.fontItalic()),
+                (getattr(self, "act_underline", None), fmt.fontUnderline()),
+                (getattr(self, "act_strike", None), fmt.fontStrikeOut()),
+            ):
+                if action is None:
+                    continue
+                blocker = QtCore.QSignalBlocker(action)
+                action.setChecked(bool(checked))
+                del blocker
         finally:
             self.font_combo.blockSignals(False)
             self.font_size_spin.blockSignals(False)

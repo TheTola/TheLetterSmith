@@ -173,6 +173,29 @@ class PromptWriterHardeningTests(unittest.TestCase):
             [],
         )
 
+    def test_malformed_persisted_generated_output_is_invalidated(self):
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+        self.panel.cmb_subject.setCurrentText("Subject")
+        self.panel._on_generate()
+        state_path = self.project_root / "prompt_writer_state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["generated_prompts"]["cover"] = "{{unresolved}}"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        self.panel.deleteLater()
+        self.app.processEvents()
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+
+        self.assertFalse(self.panel._generated_output_valid)
+        self.assertFalse(self.panel._generated_prompts)
+
+    def test_overlong_module_entries_are_rejected(self):
+        modules = self.project_root / "Prompter" / "modules"
+        (modules / "topic.txt").write_text("a" * 301 + "\nValid Subject\n", encoding="utf-8")
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+        entries = self.panel._read_managed_entries("subject")
+        self.assertEqual([entry.text for entry in entries], ["Valid Subject"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,6 @@ from urllib.parse import unquote, urlsplit
 from config import (
     CONTROL_FILES,
     MESSAGE_HTML_FILE,
-    MUSIC_FILE,
     PLAY_METADATA_FILE,
     REQUIRED_SLIDES,
     USER_MESSAGE_DIR,
@@ -43,7 +42,11 @@ from project_state import (
 )
 from recipient_registry import RecipientRegistry
 from readiness import ReadinessResult
-from settings_store import SettingsStore, normalize_published_page_url
+from settings_store import (
+    ACTIVE_PLAY_DIR_KEY,
+    SettingsStore,
+    normalize_published_page_url,
+)
 from sound_model import (
     BUILD_SOUND_MANIFEST_NAME,
     ProjectSoundState,
@@ -1048,14 +1051,10 @@ class SavedLetterRestorer:
                 raise SavedLetterRestoreError(
                     "The saved sound manifest is invalid."
                 )
-        elif (sounds / MUSIC_FILE).is_file():
-            payload = {"mode": "single"}
-            raw_tracks = [
-                {
-                    "filename": MUSIC_FILE,
-                    "display_title": display_title_from_name(MUSIC_FILE),
-                }
-            ]
+        elif any(sounds.iterdir()):
+            raise SavedLetterRestoreError(
+                "The saved sound manifest is missing."
+            )
         else:
             return {"mode": "single", "tracks": []}, []
 
@@ -1153,6 +1152,7 @@ class SavedLetterRestorer:
         restored["recipient_display_name"] = record.display_name
         restored["recipient_normalized_key"] = record.normalized_key
         restored["recipient_name"] = record.display_name
+        restored[ACTIVE_PLAY_DIR_KEY] = str(play_dir.resolve())
         restored[PROJECT_SCHEMA_KEY] = PROJECT_METADATA_SCHEMA_VERSION
         return restored
 

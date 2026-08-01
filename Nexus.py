@@ -14,11 +14,13 @@ Notes
 
 from __future__ import annotations
 
+import logging
 import math
 import os, sys, subprocess, json
 from pathlib import Path
 from typing import Optional
 
+from app_icon import apply_qt_window_icon, canonical_icon_paths
 from settings_store import (
     CURTAIN_STYLE_LABELS,
     DEFAULT_SETTINGS,
@@ -47,6 +49,8 @@ from PySide6.QtWidgets import (
     QGraphicsOpacityEffect, QStatusBar, QLabel, QVBoxLayout, QHBoxLayout, QDialog,
     QFrame
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 # WebEngine (used for HTML preview)
 try:
@@ -285,6 +289,23 @@ class TitleBar(QtWidgets.QWidget):
         # ---------------------------------------------------------------------
         # Window title
         # ---------------------------------------------------------------------
+
+        app_icon = QtWidgets.QLabel(self)
+        app_icon.setObjectName("AppIcon")
+        app_icon.setFixedSize(30, 30)
+        app_icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        png_path, _ = canonical_icon_paths(self.parent.project_root)
+        pixmap = QPixmap(str(png_path))
+        if not pixmap.isNull():
+            app_icon.setPixmap(
+                pixmap.scaled(
+                    28,
+                    28,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+            )
+            layout.addWidget(app_icon)
 
         title = QtWidgets.QLabel(
             "The Silver-Tongued Lettersmith",
@@ -802,6 +823,12 @@ class Nexus(QtWidgets.QMainWindow):
     def __init__(self, project_root: str | Path):
         super().__init__()
         self.project_root = str(project_root)
+        self.setWindowTitle("Letter Smith")
+        apply_qt_window_icon(self, self.project_root)
+        self._tray_icon: Optional[QtWidgets.QSystemTrayIcon] = None
+        self._tray_menu: Optional[QtWidgets.QMenu] = None
+        self._command_bar: Optional[QtWidgets.QWidget] = None
+        self._setup_system_tray()
         self.project_state = ProjectStateController(self.project_root)
         self.project_paths = ProjectPathResolver(self.project_root)
         initial_project_state = self.project_state.initialize()
@@ -2378,8 +2405,125 @@ class Nexus(QtWidgets.QMainWindow):
                 except Exception:
                     pass
         finally:
+            if self._tray_icon is not None:
+                self._tray_icon.hide()
             self._shutdown_complete = True
             self._shutdown_in_progress = False
+
+    def open_command_bar_and_close_editor(self, data: object) -> bool:
+        """Transfer the completed-letter snapshot to the post-reset controller."""
+        if self._shutdown_complete or self._shutdown_in_progress:
+            return False
+        application = QtWidgets.QApplication.instance()
+        previous_quit_policy: bool | None = None
+        bar = None
+        try:
+            from command_bar import CommandBarData, launch_command_bar
+
+            if not isinstance(data, CommandBarData):
+                raise TypeError("invalid Command Bar data")
+            if application is None:
+                raise RuntimeError("QApplication is unavailable")
+            screen = self.screen()
+            bar = launch_command_bar(
+                data,
+                self.project_root,
+                screen=screen,
+                show=False,
+            )
+            self._command_bar = bar
+            self._release_forge_preview_files()
+            previous_quit_policy = application.quitOnLastWindowClosed()
+            application.setQuitOnLastWindowClosed(False)
+            if not self.close():
+                raise RuntimeError("Letter Smith could not close for the handoff")
+
+            QtCore.QTimer.singleShot(
+                0,
+                lambda: self._show_command_bar_after_close(
+                    bar,
+                    application,
+                    previous_quit_policy,
+                ),
+            )
+            return True
+        except Exception:
+            _LOGGER.exception("Could not transition to the Command Bar")
+            if bar is not None:
+                try:
+                    bar.abort_launch()
+                except Exception:
+                    _LOGGER.exception("Could not dispose the pending Command Bar")
+            self._command_bar = None
+            if application is not None and previous_quit_policy is not None:
+                application.setQuitOnLastWindowClosed(previous_quit_policy)
+            return False
+
+    @staticmethod
+    def _show_command_bar_after_close(
+        bar: object,
+        application: QtWidgets.QApplication,
+        previous_quit_policy: bool,
+    ) -> None:
+        try:
+            bar.present()
+        except Exception:
+            _LOGGER.exception("Could not show the Command Bar after closing Nexus")
+            application.quit()
+        finally:
+            application.setQuitOnLastWindowClosed(previous_quit_policy)
+
+    def _setup_system_tray(self) -> None:
+        """Install one application tray icon owned by Nexus."""
+        if not QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+            _LOGGER.warning("System tray is unavailable; Letter Smith tray actions are disabled.")
+            return
+
+        icon = self.windowIcon()
+        if icon.isNull():
+            png_path, ico_path = canonical_icon_paths(self.project_root)
+            _LOGGER.error(
+                "System tray icon could not load the canonical assets: %s; %s",
+                png_path,
+                ico_path,
+            )
+            return
+
+        tray = QtWidgets.QSystemTrayIcon(icon, self)
+        tray.setToolTip("Letter Smith")
+        menu = QtWidgets.QMenu(self)
+        show_action = menu.addAction("Show Letter Smith")
+        show_action.triggered.connect(self._restore_from_system_tray)
+        prompt_action = menu.addAction("Open Prompt Writer")
+        prompt_action.triggered.connect(self.open_prompt_writer)
+        menu.addSeparator()
+        quit_action = menu.addAction("Quit Letter Smith")
+        quit_action.triggered.connect(self._quit_from_system_tray)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._on_system_tray_activated)
+        tray.show()
+        self._tray_menu = menu
+        self._tray_icon = tray
+
+    def _restore_from_system_tray(self) -> None:
+        if self._shutdown_complete or self._shutdown_in_progress:
+            return
+        self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_system_tray_activated(self, reason: QtWidgets.QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QtWidgets.QSystemTrayIcon.Trigger,
+            QtWidgets.QSystemTrayIcon.DoubleClick,
+        ):
+            self._restore_from_system_tray()
+
+    def _quit_from_system_tray(self) -> None:
+        if self._shutdown_complete or self._shutdown_in_progress:
+            return
+        self.close()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         forge_tab = getattr(self, "forge_tab", None)
