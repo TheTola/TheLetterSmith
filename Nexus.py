@@ -2285,6 +2285,11 @@ class Nexus(QtWidgets.QMainWindow):
         self._update_preview_tools_geometry()
         self._position_command_tabbar()
         self._position_project_loading_overlay()
+        if (
+            getattr(self, "_project_tabs_initialized", False)
+            and self.forge_tab.readiness_window.isVisible()
+        ):
+            self.forge_tab.readiness_window.position_near_image_area()
 
         # Reposition any visible toast
         if self._toast.isVisible():
@@ -2316,6 +2321,11 @@ class Nexus(QtWidgets.QMainWindow):
         # Keep help popover glued to the Help icon while the window moves
         if self.help_pop.isVisible():
             self._reposition_help_popover()
+        if (
+            getattr(self, "_project_tabs_initialized", False)
+            and self.forge_tab.readiness_window.isVisible()
+        ):
+            self.forge_tab.readiness_window.position_near_image_area()
         super().moveEvent(event)
 
     def shutdown(self) -> None:
@@ -2336,6 +2346,7 @@ class Nexus(QtWidgets.QMainWindow):
                 try:
                     self.forge_tab.deactivate_for_tab_change()
                     self.forge_tab.set_readiness_context_visible(False)
+                    self.forge_tab.readiness_window.shutdown()
                 except Exception:
                     pass
                 try:

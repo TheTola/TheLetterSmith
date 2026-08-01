@@ -16,6 +16,7 @@ from Editor import Editor
 from Forge_Tab import ReadinessWindow
 from project_paths import ProjectPathError, ProjectPathResolver
 from project_store import ProjectStore
+from readiness import evaluate_readiness
 from sound_model import TrackRecord
 from sound_tab import ArchiveDialog
 
@@ -25,18 +26,27 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
-    def test_readiness_panel_has_no_title_bar_and_hides_cleanly(self) -> None:
+    def test_readiness_panel_is_frameless_tool_closed_only_by_toggle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             panel = ReadinessWindow(Path(directory))
             self.assertEqual(panel.windowTitle(), "")
+            self.assertTrue(panel.isWindow())
+            self.assertTrue(panel.windowFlags() & QtCore.Qt.Tool)
+            self.assertTrue(panel.windowFlags() & QtCore.Qt.FramelessWindowHint)
+            self.assertGreater(panel.maximumWidth(), 520)
+            panel.refresh(evaluate_readiness(directory))
+            self.assertGreater(panel.height(), panel.minimumHeight())
             self.assertFalse(panel.isVisible())
             panel.show()
+            self.app.processEvents()
+            self.assertTrue(panel.isVisible())
+            panel.close()
             self.app.processEvents()
             self.assertTrue(panel.isVisible())
             panel.hide()
             self.app.processEvents()
             self.assertFalse(panel.isVisible())
-            panel.deleteLater()
+            panel.shutdown()
 
     def test_duplicate_project_ids_are_reported_and_repaired_without_merging(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

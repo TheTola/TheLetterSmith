@@ -263,19 +263,27 @@ class ReadinessWindow(QtWidgets.QFrame):
     correction_requested = QtCore.Signal(str, str)
 
     def __init__(self, project_root: str | Path, parent=None) -> None:
-        super().__init__(parent)
+        super().__init__(
+            parent,
+            Qt.Tool | Qt.FramelessWindowHint,
+        )
         self.project_root = Path(project_root).resolve()
+        self._owner = parent
+        self._allow_close = False
+        self._drag_offset: Optional[QtCore.QPoint] = None
         self.user_closed = False
         self.setObjectName("ProjectReadiness")
-        self.setVisible(False)
+        self.setWindowTitle("")
+        self.setWindowModality(Qt.NonModal)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.setMinimumSize(400, 128)
         self.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding,
-            QtWidgets.QSizePolicy.Maximum,
+            QtWidgets.QSizePolicy.Preferred,
+            QtWidgets.QSizePolicy.Preferred,
         )
-        self.setMaximumWidth(520)
         self.setStyleSheet(
             "QFrame#ProjectReadiness{background:#101820;border:1px solid #2e596a;"
-            "border-radius:7px;}"
+            "border-radius:9px;}"
             "QLabel{background:transparent;}"
             "QPushButton{font:500 10pt 'Segoe UI';}"
         )
@@ -305,7 +313,20 @@ class ReadinessWindow(QtWidgets.QFrame):
         self.items_layout = QtWidgets.QVBoxLayout(self.items)
         self.items_layout.setContentsMargins(0, 0, 0, 0)
         self.items_layout.setSpacing(3)
-        layout.addWidget(self.items)
+        self.items_scroll = QtWidgets.QScrollArea(self)
+        self.items_scroll.setObjectName("ReadinessItemsScroll")
+        self.items_scroll.setWidgetResizable(True)
+        self.items_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.items_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.items_scroll.setStyleSheet(
+            "QScrollArea#ReadinessItemsScroll{background:transparent;border:none;}"
+            "QScrollArea#ReadinessItemsScroll>QWidget>QWidget{background:transparent;}"
+            "QScrollBar:vertical{background:#101820;width:9px;margin:0;}"
+            "QScrollBar::handle:vertical{background:#315a68;border-radius:4px;"
+            "min-height:24px;}"
+        )
+        self.items_scroll.setWidget(self.items)
+        layout.addWidget(self.items_scroll, 1)
 
         self._missing_buttons: dict[str, QtWidgets.QPushButton] = {}
         for item in evaluate_readiness(self.project_root).items:
@@ -345,15 +366,146 @@ class ReadinessWindow(QtWidgets.QFrame):
                 "QPushButton:focus{border:1px solid #00d5f5;}"
             )
 
-        self.items.setVisible(bool(missing))
-        self.adjustSize()
+        self.items_scroll.setVisible(bool(missing))
+        self._resize_to_content()
+        if self.isVisible():
+            self.position_near_image_area()
 
     def position_near_image_area(self) -> None:
-        """Compatibility no-op; readiness is embedded in the Forge layout."""
+        """Anchor the tool below the preview without constraining Forge."""
+        owner = self._owner or self.parentWidget()
+        if owner is None:
+            return
+        preview = getattr(owner, "preview_frame", None)
+        screen = owner.screen() or QtGui.QGuiApplication.primaryScreen()
+        available = (
+            screen.availableGeometry()
+            if screen is not None
+            else QtCore.QRect(0, 0, 1200, 800)
+        )
+        self._resize_to_content(available)
+
+        if isinstance(preview, QtWidgets.QWidget) and preview.isVisible():
+            lower_left = preview.mapToGlobal(
+                QtCore.QPoint(0, preview.height())
+            )
+            lower_right = preview.mapToGlobal(
+                QtCore.QPoint(preview.width(), preview.height())
+            )
+            x = lower_right.x() - self.width()
+            y = lower_left.y() + 10
+        else:
+            origin = owner.mapToGlobal(QtCore.QPoint(18, 72))
+            x = origin.x()
+            y = origin.y()
+
+        x = max(
+            available.left() + 12,
+            min(x, available.right() - self.width() - 11),
+        )
+        space_below = available.bottom() - y - 11
+        if space_below >= self.minimumHeight():
+            self.resize(self.width(), min(self.height(), space_below))
+        else:
+            y = available.bottom() - self.height() - 11
+        y = max(available.top() + 12, y)
+        self.move(x, y)
+
+    def attach_to(self, owner: QtWidgets.QWidget) -> None:
+        was_visible = self.isVisible()
+        if was_visible:
+            self.hide()
+        self._owner = owner
+        self.setParent(
+            owner,
+            Qt.Tool | Qt.FramelessWindowHint,
+        )
+        if was_visible:
+            self.show()
+            self.position_near_image_area()
+
+    def _resize_to_content(
+        self,
+        available: Optional[QtCore.QRect] = None,
+    ) -> None:
+        if available is None:
+            screen = (
+                self._owner.screen()
+                if isinstance(self._owner, QtWidgets.QWidget)
+                else QtGui.QGuiApplication.primaryScreen()
+            )
+            available = (
+                screen.availableGeometry()
+                if screen is not None
+                else QtCore.QRect(0, 0, 1200, 800)
+            )
+        self.layout().activate()
+        self.items_layout.activate()
+        visible_buttons = [
+            button
+            for button in self._missing_buttons.values()
+            if not button.isHidden()
+        ]
+        widest_button = max(
+            (button.sizeHint().width() for button in visible_buttons),
+            default=320,
+        )
+        width = min(
+            max(400, widest_button + 42),
+            min(720, max(400, available.width() - 24)),
+        )
+        item_height = sum(
+            button.sizeHint().height() for button in visible_buttons
+        )
+        if visible_buttons:
+            item_height += self.items_layout.spacing() * (
+                len(visible_buttons) - 1
+            )
+        header_height = max(
+            self.percentage.sizeHint().height(),
+            self.status.sizeHint().height(),
+        )
+        desired_height = 42 + header_height + item_height
+        if visible_buttons:
+            desired_height += 12
+        height = min(
+            max(self.minimumHeight(), desired_height),
+            max(self.minimumHeight(), available.height() - 24),
+        )
+        self.resize(width, height)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self._drag_offset = (
+                event.globalPosition().toPoint()
+                - self.frameGeometry().topLeft()
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if not self._allow_close:
+            event.ignore()
+            return
+        event.accept()
 
     def shutdown(self) -> None:
-        self.hide()
+        self._allow_close = True
         self.user_closed = True
+        self.hide()
+        self.close()
 
 
 class ForgeTab(QtWidgets.QWidget):
@@ -424,7 +576,7 @@ class ForgeTab(QtWidgets.QWidget):
             tuple[Path, ReadinessResult]
         ] = None
 
-        self.readiness_window = ReadinessWindow(self.project_root, self)
+        self.readiness_window = ReadinessWindow(self.project_root)
         self.readiness_window.correction_requested.connect(
             self.correction_requested.emit
         )
@@ -514,12 +666,6 @@ class ForgeTab(QtWidgets.QWidget):
         readiness_row.addWidget(self.readiness_btn)
         heading_row.addWidget(self._readiness_controls)
         self._main_layout.addLayout(heading_row)
-
-        self._main_layout.addWidget(
-            self.readiness_window,
-            0,
-            Qt.AlignHCenter,
-        )
 
         self.load_saved_btn = self._small_button("Load Letters")
         self.load_saved_btn.setMinimumSize(150, 36)
@@ -793,13 +939,14 @@ class ForgeTab(QtWidgets.QWidget):
         self._readiness_requested = True
         self.refresh_readiness()
         self.readiness_window.user_closed = False
+        self.readiness_window.position_near_image_area()
         self.readiness_window.show()
+        self.readiness_window.position_near_image_area()
+        self.readiness_window.raise_()
+        self.readiness_window.activateWindow()
 
     def attach_readiness_window(self, owner: QtWidgets.QWidget) -> None:
-        """Keep the compatibility hook without detaching the embedded panel."""
-        if self.readiness_window.parentWidget() is not self:
-            self.readiness_window.setParent(self)
-            self._main_layout.insertWidget(1, self.readiness_window, 0, Qt.AlignHCenter)
+        self.readiness_window.attach_to(owner)
 
     def set_readiness_context_visible(self, visible: bool) -> None:
         if not visible:
@@ -807,7 +954,10 @@ class ForgeTab(QtWidgets.QWidget):
             return
         if self._readiness_requested and not self.readiness_window.user_closed:
             self.refresh_readiness()
+            self.readiness_window.position_near_image_area()
             self.readiness_window.show()
+            self.readiness_window.position_near_image_area()
+            self.readiness_window.raise_()
 
     def refresh_readiness(self) -> ReadinessResult:
         self._readiness_result = evaluate_readiness(self.project_root)
