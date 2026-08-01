@@ -340,9 +340,11 @@ def _message_overlay_style_from_settings(settings: dict) -> str:
 
     (r, g, b), ink = MESSAGE_OVERLAY_PRESETS[preset]
     alpha = max(0.0, min(1.0, opacity / 100.0))
+    texture_alpha = 0.028 * alpha if preset == "paper" else 0.0
     return (
         f"--message-overlay-rgb:{r},{g},{b};"
         f"--message-overlay-opacity:{alpha:.3f};"
+        f"--message-overlay-texture-opacity:{texture_alpha:.3f};"
         f"--message-ink:{ink};"
         f"--wall-fade-ms:900ms;"
     )
