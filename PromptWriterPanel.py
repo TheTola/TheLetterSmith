@@ -34,6 +34,7 @@ VISIONARY_URL = "https://chatgpt.com/g/g-68ce5925196c8191a222e24d29323813-the-vi
 _FILE_CACHE: Dict[str, Tuple[List[str], Optional[Path], Optional[Tuple[int, int]]]] = {}
 PROMPTER_ROOT = Path(__file__).resolve().parent
 PROMPT_WRITER_STATE_VERSION = 5
+PROMPT_LANGUAGE_VERSION = 2
 STATE_PERSIST_DEBOUNCE_MS = 350
 MAX_STATE_TEXT_LENGTH = 24000
 REFERENCE_IMAGE_MAX_COUNT = 3
@@ -269,28 +270,28 @@ class PromptPayload:
         return page.display_label if page is not None else self.page_key
 
     def first_paragraph(self) -> str:
-        return _join_nonempty(self.role_sentence, self.order_fragment, self.subject_fragment)
+        return _as_prompt_sentence(_join_nonempty(self.role_sentence, self.order_fragment, self.subject_fragment))
 
     def to_plain_text(self) -> str:
         paragraphs: List[str] = []
         if self.first_paragraph():
             paragraphs.append(self.first_paragraph())
         if self.baseline.strip():
-            paragraphs.append(self.baseline.strip())
+            paragraphs.append(_as_prompt_sentence(self.baseline))
         if self.color_choice.strip():
-            paragraphs.append(f"The color scheme is {self.color_choice.strip()}.")
+            paragraphs.append(f"Use the {self.color_choice.strip()} palette.")
         if self.type_choice.strip():
-            paragraphs.append(f"Create in a {self.type_choice.strip()} design & illustration style.")
+            paragraphs.append(f"Use {self.type_choice.strip()} as the visual style.")
         if self.global_extra.strip():
-            paragraphs.append(f"Motifs to add: {self.global_extra.strip()}")
+            paragraphs.append(f"Shared visual direction: {self.global_extra.strip()}")
         if self.image_extra.strip():
-            paragraphs.append(f"Additionally: {self.image_extra.strip()}")
+            paragraphs.append(f"Page-specific direction: {self.image_extra.strip()}")
         if self.effort_line.strip():
-            paragraphs.append(f"When making this image, {self.effort_line.strip()}")
+            paragraphs.append(_format_effort_line(self.effort_line))
         if self.guidance_lines:
             paragraphs.append("Guidance:\n" + "\n".join(f"- {line}" for line in self.guidance_lines))
         if self.format_paragraph.strip():
-            paragraphs.append(self.format_paragraph.strip())
+            paragraphs.append(_as_prompt_sentence(self.format_paragraph))
         return "\n\n".join(part for part in paragraphs if part.strip())
 
 
@@ -656,6 +657,54 @@ def _normalize_text(value: object, *, strip: bool = False, max_length: int = MAX
     return text
 
 
+def _normalize_prompt_fragment(value: object, *, max_length: int = MAX_STATE_TEXT_LENGTH) -> str:
+    """Normalize prompt prose without changing the user's intended wording."""
+    text = _normalize_text(value, strip=True, max_length=max_length)
+    if not text:
+        return ""
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
+    text = "\n".join(lines)
+    text = re.sub(r"[ \t]+([,.;:!?])", r"\1", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _without_terminal_punctuation(value: object, *, max_length: int = MAX_STATE_TEXT_LENGTH) -> str:
+    return re.sub(r"[.!?]+$", "", _normalize_prompt_fragment(value, max_length=max_length)).rstrip()
+
+
+def _as_prompt_sentence(value: object, *, max_length: int = MAX_STATE_TEXT_LENGTH) -> str:
+    text = _without_terminal_punctuation(value, max_length=max_length)
+    return f"{text}." if text else ""
+
+
+def _format_effort_line(value: object) -> str:
+    text = _without_terminal_punctuation(value)
+    text = re.sub(r"^(?:use|apply|prioritize|achieve)\s+", "", text, flags=re.IGNORECASE)
+    return f"Render with {text}." if text else ""
+
+
+def _format_order_fragment(order: object) -> str:
+    if isinstance(order, (list, tuple)):
+        items = [
+            _without_terminal_punctuation(item)
+            for item in order
+            if _normalize_prompt_fragment(item, max_length=300)
+        ]
+    else:
+        items = [_without_terminal_punctuation(order)] if _normalize_prompt_fragment(order, max_length=300) else []
+    items = [item for item in items if item]
+    if not items:
+        return "Create a detailed image of"
+
+    joined = " ".join(items).strip()
+    # Older saved state used keyword-only values instead of an imperative line.
+    if all(item.casefold() in {"composition", "lighting", "mood"} for item in items):
+        return "Compose the image with intentional composition, lighting, and mood for"
+    if not re.match(r"^(create|compose|render|design|produce|illustrate|make|depict|show|generate)\b", joined, re.I):
+        joined = f"Create a detailed image of {joined}"
+    return joined
+
+
 def _normalize_reference_role(value: object) -> str:
     role = _normalize_text(value, strip=True, max_length=80)
     return role if role in REFERENCE_IMAGE_ROLES else DEFAULT_REFERENCE_IMAGE_ROLE
@@ -715,9 +764,9 @@ def _clean_user_added_entry(value: object) -> str:
 
 def _normalize_guidance_lines(guidance: Optional[List[str]]) -> Tuple[str, ...]:
     return tuple(
-        _normalize_text(line, strip=True, max_length=400)
+        _as_prompt_sentence(line, max_length=400)
         for line in (guidance or [])
-        if _normalize_text(line, strip=True, max_length=400)
+        if _normalize_prompt_fragment(line, max_length=400)
     )
 
 
@@ -837,32 +886,32 @@ def render_prompt_html(payload: PromptPayload) -> str:
     if payload.subject_fragment.strip():
         first = (first + " " if first else "") + _span(payload.subject_fragment.strip(), COL_SUBJECT, bold=True)
     if first:
-        parts.append(first)
+        parts.append(first.rstrip(".!?") + ".")
 
     if payload.baseline.strip():
-        parts.append(_html_escape(payload.baseline.strip()))
+        parts.append(_html_escape(_as_prompt_sentence(payload.baseline)))
 
     if payload.color_choice.strip():
-        parts.append("The color scheme is " + _span(payload.color_choice.strip(), COL_SCHEME, bold=True) + ".")
+        parts.append("Use the " + _span(payload.color_choice.strip(), COL_SCHEME, bold=True) + " palette.")
 
     if payload.type_choice.strip():
-        parts.append("Create in a " + _span(payload.type_choice.strip(), COL_TYPE, bold=True) + " design & illustration style.")
+        parts.append("Use " + _span(payload.type_choice.strip(), COL_TYPE, bold=True) + " as the visual style.")
 
     if payload.global_extra.strip():
-        parts.append("Motifs to add: " + _span(payload.global_extra.strip(), COL_GLOBAL))
+        parts.append("Shared visual direction: " + _span(payload.global_extra.strip(), COL_GLOBAL))
 
     if payload.image_extra.strip():
-        parts.append("Additionally: " + _span(payload.image_extra.strip(), col_img))
+        parts.append("Page-specific direction: " + _span(payload.image_extra.strip(), col_img))
 
     if payload.effort_line.strip():
-        parts.append(_html_escape(f"When making this image, {payload.effort_line.strip()}"))
+        parts.append(_html_escape(_format_effort_line(payload.effort_line)))
 
     if payload.guidance_lines:
         g = "<br>".join(_span(f"- {line}", COL_HELPFUL) for line in payload.guidance_lines)
         parts.append(_span("Guidance:", COL_HELPFUL, bold=True) + "<br>" + g)
 
     if payload.format_paragraph.strip():
-        parts.append(_html_escape(payload.format_paragraph.strip()))
+        parts.append(_html_escape(_as_prompt_sentence(payload.format_paragraph)))
 
     return "<br><br>".join(p for p in parts if str(p).strip())
 
@@ -1028,16 +1077,16 @@ def _build_prompt_payload(
     page = _page_spec_for(page_identifier)
     page_key = page.key if page is not None else _normalize_text(page_identifier, strip=True, max_length=80)
     display_label = page.display_label if page is not None else page_key
-    baseline_text = page.baseline if page is not None else ""
+    baseline_text = _normalize_prompt_fragment(page.baseline if page is not None else "")
 
-    role = _normalize_text(data.get("role", "Artist"), strip=True)
+    role = _normalize_prompt_fragment(data.get("role", "Artist"), max_length=500)
     order = data.get("order", [])
-    effort_line = _normalize_text(data.get("effort", ""), strip=True)
-    format_paragraph = _normalize_text(data.get("format", ""), strip=True)
-    type_text = _normalize_text(type_choice or "", strip=True)
-    color_text = _normalize_text(color_choice or "", strip=True)
-    global_text = _normalize_text(global_extra or "", strip=True)
-    image_text = _normalize_text(image_extra or "", strip=True)
+    effort_line = _normalize_prompt_fragment(data.get("effort", ""), max_length=1200)
+    format_paragraph = _normalize_prompt_fragment(data.get("format", ""), max_length=2400)
+    type_text = _normalize_prompt_fragment(type_choice or "", max_length=300)
+    color_text = _normalize_prompt_fragment(color_choice or "", max_length=300)
+    global_text = _normalize_prompt_fragment(global_extra or "")
+    image_text = _normalize_prompt_fragment(image_extra or "")
     guidance_lines = _normalize_guidance_lines(guidance)
 
     dbg = {
@@ -1054,20 +1103,16 @@ def _build_prompt_payload(
         "baseline": baseline_text,
     }
 
-    role_text = role.strip()
-    if role_text and not role_text.endswith("."):
-        role_text = role_text + "."
-    role_sentence = f"You are {role_text}" if role_text else ""
+    role_text = _without_terminal_punctuation(role)
+    role_sentence = f"You are {_as_prompt_sentence(role_text)}" if role_text else ""
 
-    order_core = ""
-    if order:
-        joined = " ".join(item.strip().rstrip(" .") for item in order).strip()
-        if joined:
-            order_core = joined[0].upper() + joined[1:] if len(joined) > 0 else joined
+    order_core = _format_order_fragment(order)
+    if order_core:
+        order_core = order_core[0].upper() + order_core[1:]
 
     subject_core = ""
     if subject:
-        s = _normalize_text(subject, strip=True, max_length=300).rstrip(" .")
+        s = _without_terminal_punctuation(_normalize_text(subject, strip=True, max_length=300))
         if s:
             subject_core = s
 
@@ -1731,6 +1776,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         if type_text == NONE_CHOICE_LABEL:
             type_text = ""
         input_state = {
+            "prompt_language_version": PROMPT_LANGUAGE_VERSION,
             "type": type_text,
             "subject": self.cmb_subject.currentText().strip(),
             "color": self._get_color_choice() or "",
