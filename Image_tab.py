@@ -9,9 +9,8 @@ Canonical image files:
     gallery/user/pages/back.png
 
 The Reset Images and Gallery artwork buttons are deliberately large. They live
-in their own left-aligned horizontal strip below the image cards. On narrower
-windows that strip scrolls horizontally instead of shrinking the buttons or
-allowing them to overlap the cards.
+in their own left-aligned horizontal strip below the image cards, with fixed
+geometry so repainting and hover effects cannot move or overlap them.
 """
 
 from __future__ import annotations
@@ -808,20 +807,14 @@ class ImageTab(
     FAB_FIXED_X = 55
     FAB_CARD_GAP = 12
 
-    UTILITY_BUTTON_WIDTH = 400
+    UTILITY_BUTTON_WIDTH = 150
     UTILITY_BUTTON_HEIGHT = 150
 
-    # Exact position measured from the application window's left edge.
-    # Change this to 10, 15, 20, etc. whenever needed.
-    RESET_BUTTON_WINDOW_X = -130
-
     # Space between Reset Images and Gallery.
-    UTILITY_BUTTON_GAP = -240
+    UTILITY_BUTTON_GAP = 10
 
-    # Vertical adjustment relative to the bottom of the image cards.
-    # Negative values move the buttons upward.
-    # Positive values move them downward.
-    UTILITY_BUTTON_Y_OFFSET = -80
+    # Space above the utility-button row.
+    UTILITY_BUTTON_TOP_GAP = 4
 
     def __init__(
         self,
@@ -1078,15 +1071,46 @@ class ImageTab(
             self.open_gallery_folder
         )
 
-        # Reserve vertical room for the floating buttons.
-        # The buttons themselves are not inside a layout or frame.
-        # Reserve enough room for the buttons without affecting their position.
+        # Keep both utility buttons inside the Image tab's layout so hover
+        # repainting cannot expose a delayed move to overlapping coordinates.
         root.addSpacing(
-            self.UTILITY_BUTTON_HEIGHT
+            self.UTILITY_BUTTON_TOP_GAP
         )
 
-        self.reset_btn.hide()
-        self.open_btn.hide()
+        utility_position_row = (
+            QtWidgets.QHBoxLayout()
+        )
+
+        utility_position_row.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
+        utility_position_row.setSpacing(
+            self.UTILITY_BUTTON_GAP
+        )
+
+        utility_position_row.addWidget(
+            self.reset_btn,
+            0,
+            QtCore.Qt.AlignLeft
+            | QtCore.Qt.AlignVCenter,
+        )
+
+        utility_position_row.addWidget(
+            self.open_btn,
+            0,
+            QtCore.Qt.AlignLeft
+            | QtCore.Qt.AlignVCenter,
+        )
+
+        utility_position_row.addStretch(1)
+
+        root.addLayout(
+            utility_position_row
+        )
 
         self.status = QtWidgets.QLabel()
 
@@ -1370,106 +1394,6 @@ class ImageTab(
         card.ensurePolished()
 
     # ─────────────────────────────────────────────────────────────────────
-    # Utility button positioning
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _position_utility_buttons(
-            self,
-    ) -> None:
-        """
-        Position Reset Images and Gallery directly inside the main window.
-
-        RESET_BUTTON_WINDOW_X is an exact application-window coordinate.
-        Image-tab margins, layouts, frames, and window resizing do not alter it.
-        """
-        window = self.window()
-
-        if not isinstance(
-                window,
-                QtWidgets.QWidget,
-        ):
-            self.reset_btn.hide()
-            self.open_btn.hide()
-            return
-
-        if not self.isVisibleTo(window):
-            self.reset_btn.hide()
-            self.open_btn.hide()
-            return
-
-        visible_cards = [
-            card
-            for card in self.cards.values()
-            if card.isVisible()
-        ]
-
-        if not visible_cards:
-            self.reset_btn.hide()
-            self.open_btn.hide()
-            return
-
-        # Find the lowest edge of the image cards in window coordinates.
-        cards_bottom = max(
-            card.mapTo(
-                window,
-                QPoint(
-                    0,
-                    card.height(),
-                ),
-            ).y()
-            for card in visible_cards
-        )
-
-        button_y = (
-                cards_bottom
-                + self.UTILITY_BUTTON_Y_OFFSET
-        )
-
-        # Move both buttons out of ImageTab and directly onto the window.
-        for button in (
-                self.reset_btn,
-                self.open_btn,
-        ):
-            if button.parent() is not window:
-                button.setParent(window)
-
-            button.setFixedSize(
-                self.UTILITY_BUTTON_WIDTH,
-                self.UTILITY_BUTTON_HEIGHT,
-            )
-
-            _mask_button_to_artwork(
-                button
-            )
-
-        # Exact horizontal position.
-        self.reset_btn.move(
-            self.RESET_BUTTON_WINDOW_X,
-            button_y,
-        )
-
-        self.open_btn.move(
-            self.RESET_BUTTON_WINDOW_X
-            + self.UTILITY_BUTTON_WIDTH
-            + self.UTILITY_BUTTON_GAP,
-            button_y,
-        )
-
-        self.reset_btn.show()
-        self.open_btn.show()
-
-        self.reset_btn.raise_()
-        self.open_btn.raise_()
-
-    def _schedule_utility_button_position(
-            self,
-    ) -> None:
-        QtCore.QTimer.singleShot(
-            0,
-            self._position_utility_buttons,
-        )
-
-    # ─────────────────────────────────────────────────────────────────────
     # Prompt Writer positioning
     # ─────────────────────────────────────────────────────────────────────
 
@@ -1627,7 +1551,6 @@ class ImageTab(
         super().showEvent(event)
 
         self.activate_for_tab_change()
-        self._schedule_utility_button_position()
         self._schedule_prompt_writer_position()
 
     def hideEvent(
@@ -1635,18 +1558,6 @@ class ImageTab(
             event: QtGui.QHideEvent,
     ) -> None:
         self.deactivate_for_tab_change()
-
-        if hasattr(
-                self,
-                "reset_btn",
-        ):
-            self.reset_btn.hide()
-
-        if hasattr(
-                self,
-                "open_btn",
-        ):
-            self.open_btn.hide()
 
         if hasattr(
                 self,
@@ -1664,12 +1575,6 @@ class ImageTab(
 
         if not self.isVisible():
             return
-
-        if hasattr(
-                self,
-                "reset_btn",
-        ):
-            self._schedule_utility_button_position()
 
         if hasattr(
                 self,
