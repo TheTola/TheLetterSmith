@@ -22,7 +22,12 @@ from saved_letters import (
 )
 
 
-def _saved_bundle(root: Path, name: str) -> Path:
+def _saved_bundle(
+    root: Path,
+    name: str,
+    *,
+    recipient: str = "Recipient",
+) -> Path:
     bundle = root / "output" / "Play" / "Recipient" / name
     pages = bundle / "gallery" / "pages"
     message = bundle / "gallery" / "message"
@@ -44,7 +49,7 @@ def _saved_bundle(root: Path, name: str) -> Path:
     (bundle / PLAY_METADATA_FILE).write_text(
         json.dumps(
             {
-                "recipient_name": "Recipient",
+                "recipient_name": recipient,
                 "recipient_title": name,
             }
         ),
@@ -107,6 +112,37 @@ class SavedLetterActivityOrderTests(unittest.TestCase):
                 update.reset_mock()
                 tab.set_saved_page_url("https://example.com/new")
                 update.assert_not_called()
+            tab.close()
+
+    def test_saved_letter_panel_archives_entries_after_latest_fifteen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = datetime.now(timezone.utc)
+            for index in range(18):
+                recipient = "Ada" if index % 2 == 0 else "Grace"
+                bundle = _saved_bundle(
+                    root,
+                    f"Letter {index:02d}",
+                    recipient=recipient,
+                )
+                record_saved_letter_activity(
+                    bundle,
+                    when=now + timedelta(minutes=index),
+                )
+
+            tab = ForgeTab(root)
+            self.assertEqual(len(tab._saved_cards), 15)
+            self.assertFalse(tab.saved_archive.isHidden())
+            self.assertEqual(tab.saved_archive_label.text(), "Archive (3)")
+            self.assertEqual(tab.saved_archive_recipient.count(), 3)
+
+            ada_index = tab.saved_archive_recipient.findText("Ada")
+            tab.saved_archive_recipient.setCurrentIndex(ada_index)
+            archived_titles = [
+                tab.saved_archive_list.item(row).text()
+                for row in range(tab.saved_archive_list.count())
+            ]
+            self.assertEqual(archived_titles, ["Letter 02", "Letter 00"])
             tab.close()
 
 

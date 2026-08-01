@@ -1301,14 +1301,21 @@ class Nexus(QtWidgets.QMainWindow):
         self.message_tab.project_changed.connect(
             self.forge_tab.schedule_refresh
         )
-        self.image_tab.image_selected.connect(self._show_image)
-        self.image_tab.hover_preview_image.connect(self._show_image)
+        self.image_tab.image_selected.connect(
+            lambda pixmap: self._show_image_for_tab(0, pixmap)
+        )
+        self.image_tab.hover_preview_image.connect(
+            lambda pixmap: self._show_image_for_tab(0, pixmap)
+        )
         self.image_tab.clear_preview.connect(
             self._on_image_tab_clear_preview
         )
-        self.message_tab.preview_image.connect(self._show_image)
-        self.message_tab.wall_preview.connect(self._show_image)
-        self.message_tab.text_selected.connect(self._show_html)
+        self.message_tab.preview_image.connect(
+            lambda pixmap: self._show_image_for_tab(2, pixmap)
+        )
+        self.message_tab.wall_preview.connect(
+            lambda pixmap: self._show_image_for_tab(2, pixmap)
+        )
         self.command_tab.wiped.connect(self._on_command_wiped)
 
         self._tabswitch = (
@@ -1898,6 +1905,12 @@ class Nexus(QtWidgets.QMainWindow):
     # =============================================================================================
     # Preview rendering (image/html) + fade behavior
     # =============================================================================================
+    def _show_image_for_tab(self, tab_index: int, pixmap: QPixmap) -> None:
+        """Ignore delayed preview work after its source tab has been left."""
+        if self.tabbar.currentIndex() != tab_index:
+            return
+        self._show_image(pixmap)
+
     def _show_image(self, pixmap: QPixmap):
         if not isinstance(pixmap, QPixmap) or pixmap.isNull():
             return
@@ -2018,6 +2031,8 @@ class Nexus(QtWidgets.QMainWindow):
         self.preview_caption.setVisible(True)
 
     def _load_forge_preview(self, index_path: str, mode: str) -> None:
+        if self.tabbar.currentIndex() != 3:
+            return
         index = Path(index_path)
         if not index.is_file():
             self.status("The playable letter is missing. Preview it again.")
