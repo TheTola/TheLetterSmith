@@ -16,6 +16,7 @@ from saved_letters import (
     _ACTIVE_LETTER_LOAD_WORKSPACES,
     cleanup_stale_letter_load_workspaces,
 )
+from settings_store import SettingsStore, VISIONARY_URL_KEY
 from transactional_io import safe_write_json
 
 
@@ -162,7 +163,41 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.assertTrue(reset_prompt_writer_state_file(self.project_root))
         state = json.loads((self.project_root / "prompt_writer_state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["generated_prompts"], {})
-        self.assertEqual(state["reference_images"], [])
+        self.assertNotIn("reference_images", state)
+
+    def test_reference_image_workflow_is_removed_and_legacy_state_is_ignored(self):
+        (self.project_root / "prompt_writer_state.json").write_text(
+            json.dumps(
+                {
+                    "subject": "Subject",
+                    "reference_images": [
+                        {
+                            "path": "legacy.png",
+                            "filename": "legacy.png",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+
+        self.assertFalse(hasattr(self.panel, "btn_add_reference"))
+        self.assertFalse(hasattr(self.panel, "reference_strip"))
+        self.assertNotIn("reference_images", self.panel._capture_state())
+
+    def test_visionary_uses_configured_location(self):
+        url = "https://example.com/custom-visionary"
+        SettingsStore(self.project_root).update_fields(**{VISIONARY_URL_KEY: url})
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+
+        with mock.patch(
+            "PromptWriterPanel.QDesktopServices.openUrl",
+            return_value=True,
+        ) as open_url:
+            self.panel.btn_visionary.click()
+
+        self.assertEqual(open_url.call_args.args[0].toString(), url)
 
     def test_invalid_user_color_storage_does_not_fallback_to_legacy_file(self):
         modules = self.project_root / "Prompter" / "modules"

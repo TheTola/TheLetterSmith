@@ -4,8 +4,15 @@ Star-Bound Prismatic Explosion
 Sapphire Prismatic Storm
 Violet Prismatic Dream
 
--Themed / Occasion Color Schemes
-Valentines Day: Pink / Red Surprise
+-Themes & Holidays Schemes
+New Year’s Day — Suggested colors: Midnight Black — #0B0D17, Champagne Gold — #D9B45B, Firework Silver — #DDE2E8, Resolution Blue — #244A78, Celebration White — #FFFDF5
+Valentine’s Day — Crimson Romance — Suggested colors: Passion Red — #C9184A, Heart Pink — #FF758F, Rose Blush — #FFB3C1, Chocolate Brown — #5A2A27, Love-Letter Cream — #FFF0E6
+St. Patrick’s Day — Emerald Storm — Suggested colors: Shamrock Green — #138A36, Emerald Green — #006B3C, Leprechaun Gold — #F4C430, Clover White — #F4FFF5, Pub Brown — #5C3A21
+Easter  — Suggested colors: Resurrection White — #FFFDF2, Royal Purple — #6A4C93, Sunrise Gold — #F2C14E, Spring Lavender — #CDB4DB, Garden Green — #8DB580
+Independence Day  — Suggested colors: Liberty Red — #B31942, Union Blue — #0A3161, Star White — #FFFFFF, Firework Gold — #FFCA3A, Night-Sky Navy — #071E3D
+Halloween — Suggested colors: Pumpkin Orange — #F77F00, Witching Black — #111111, Poison Purple — #6A0DAD, Slime Green — #7CB518, Ghost White — #F8F4E3
+Thanksgiving — Suggested colors: Harvest Orange — #D96C06, Cranberry Red — #9B2226, Turkey Brown — #7F4F24, Corn Gold — #E9C46A, Sage Green — #7A8B61, Tablecloth Cream — #FFF3D6
+Christmas — Suggested colors: Holly Red — #B11226, Evergreen — #165B33, Bethlehem Gold — #D4AF37, Snow White — #FFFDF7, Winter Blue — #5C84B1, Fireplace Brown — #6F3B2D
 
 -Basic Single-Color Schemes
 Crimson Crown

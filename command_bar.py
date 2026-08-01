@@ -8,7 +8,7 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
 
-from config import canonical_play_root
+from config import canonical_play_root, legacy_play_roots
 from saved_letters import SavedLetter, SavedLetterCatalog
 from settings_store import (
     ACTIVE_PLAY_DIR_KEY,
@@ -106,6 +106,49 @@ def _valid_preview_dir(value: object) -> Path | None:
     ):
         return candidate
     return None
+
+
+def _valid_preview_path(
+    value: object,
+    project_root: str | Path,
+) -> Path | None:
+    if not value:
+        return None
+    try:
+        source = Path(str(value)).expanduser()
+        if source.is_symlink():
+            return None
+        candidate = source.resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if (
+        candidate.name.casefold() != "index.html"
+        or not candidate.is_file()
+        or candidate.is_symlink()
+    ):
+        return None
+    play_roots = (
+        canonical_play_root(project_root),
+        *legacy_play_roots(project_root),
+    )
+    for play_root in play_roots:
+        try:
+            candidate.relative_to(play_root.resolve())
+            return candidate
+        except ValueError:
+            continue
+    return None
+
+
+def command_bar_has_openable_target(
+    data: CommandBarData,
+    project_root: str | Path,
+) -> bool:
+    """Return whether the controller can open a local or published letter."""
+    return (
+        _valid_preview_path(data.local_preview_path, project_root) is not None
+        or bool(normalize_published_page_url(data.published_url))
+    )
 
 
 def _metadata_value(metadata: dict[str, object], *keys: str) -> str:
@@ -841,16 +884,7 @@ class CommandBarWindow(QtWidgets.QWidget):
         self.close()
 
     def _preview_path(self) -> Path | None:
-        value = self.data.local_preview_path
-        if value is None:
-            return None
-        try:
-            path = Path(value)
-            if path.is_symlink() or not path.is_file():
-                return None
-            return path.resolve(strict=True)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            return None
+        return _valid_preview_path(self.data.local_preview_path, self.project_root)
 
     def _preview_letter(self) -> None:
         path = self._preview_path()
@@ -922,9 +956,15 @@ def launch_command_bar(
     *,
     screen: QtGui.QScreen | None = None,
     show: bool = True,
-) -> CommandBarWindow:
+) -> CommandBarWindow | None:
     """Show one top-level Command Bar without starting another process."""
     global _COMMAND_BAR_INSTANCE
+    if not command_bar_has_openable_target(data, project_root):
+        _LOGGER.info(
+            "Command Bar suppressed because no local preview or published letter is available."
+        )
+        return None
+
     existing = _COMMAND_BAR_INSTANCE
     if existing is not None:
         try:
@@ -961,5 +1001,6 @@ __all__ = [
     "CommandBarData",
     "CommandBarWindow",
     "build_command_bar_data",
+    "command_bar_has_openable_target",
     "launch_command_bar",
 ]

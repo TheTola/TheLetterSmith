@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import sys
+import types
 import unittest
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from Message_tab import IDENTITY_LOCK_KEYS, IdentityLineEdit, MessageTab
+from Nexus import Nexus
 
 
 class IdentityFieldLockingTests(unittest.TestCase):
@@ -65,6 +67,35 @@ class IdentityFieldLockingTests(unittest.TestCase):
             field.fontMetrics().height() + 10,
         )
         field.deleteLater()
+
+    def test_message_preview_reserves_the_message_tabs_minimum_height(self) -> None:
+        preview_frame = QtWidgets.QWidget()
+        body = QtWidgets.QWidget()
+        body.resize(1400, 728)
+        harness = types.SimpleNamespace(
+            _forge_fullscreen_active=False,
+            height=lambda: 820,
+            width=lambda: 1400,
+            body=body,
+            tabbar=types.SimpleNamespace(currentIndex=lambda: 2),
+            message_tab=types.SimpleNamespace(
+                minimumSizeHint=lambda: QtCore.QSize(534, 340)
+            ),
+            help_icon=types.SimpleNamespace(
+                height=lambda: 125,
+                isVisible=lambda: True,
+            ),
+            body_layout=types.SimpleNamespace(spacing=lambda: 10),
+            preview_frame=preview_frame,
+        )
+
+        Nexus._update_preview_geometry(harness)
+
+        available_height = body.height() - 24
+        reserved_height = preview_frame.height() + 340 + 125 + 20
+        self.assertLessEqual(reserved_height, available_height)
+        preview_frame.deleteLater()
+        body.deleteLater()
 
     def test_double_click_clears_the_persisted_lock_for_reediting(self) -> None:
         message = MessageTab.__new__(MessageTab)

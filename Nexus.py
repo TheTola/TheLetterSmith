@@ -2371,6 +2371,34 @@ class Nexus(QtWidgets.QMainWindow):
             and not self.isFullScreen()
         )
 
+        if current_tab == 2:
+            message_tab = getattr(self, "message_tab", None)
+            message_height = 340
+            if message_tab is not None:
+                message_height = max(
+                    message_height,
+                    message_tab.minimumSizeHint().height(),
+                )
+            help_height = self.help_icon.height() if self.help_icon.isVisible() else 0
+            layout_gaps = max(0, self.body_layout.spacing()) * 2
+            available_frame_height = max(
+                120,
+                body_height - message_height - help_height - layout_gaps,
+            )
+            h = max(
+                108,
+                min(
+                    int(window_height * 0.35),
+                    available_frame_height - 12,
+                ),
+            )
+            w = int(h * _PREVIEW_AR)
+            self.preview_frame.setFixedSize(
+                max(160, w + 12),
+                max(120, h + 12),
+            )
+            return
+
         if current_tab == 3:
             mode = getattr(self, "_forge_preview_mode", "portrait")
             max_h = max(
@@ -2525,6 +2553,13 @@ class Nexus(QtWidgets.QMainWindow):
                 screen=screen,
                 show=False,
             )
+            if bar is None:
+                self._command_bar = None
+                self._release_forge_preview_files()
+                if not self.close():
+                    raise RuntimeError("Letter Smith could not close after the reset")
+                application.quit()
+                return True
             self._command_bar = bar
             self._release_forge_preview_files()
             previous_quit_policy = application.quitOnLastWindowClosed()

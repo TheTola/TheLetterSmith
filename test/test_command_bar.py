@@ -16,6 +16,7 @@ from command_bar import (
     CommandBarData,
     CommandBarWindow,
     build_command_bar_data,
+    command_bar_has_openable_target,
     launch_command_bar,
 )
 from config import CONTROL_FILES, PLAY_METADATA_FILE, REQUIRED_SLIDES
@@ -411,6 +412,78 @@ class CommandBarTests(unittest.TestCase):
             self.assertFalse(window.copy_button.isEnabled())
             window.abort_launch()
 
+    def test_openable_target_requires_a_real_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing_preview = root / "missing" / "index.html"
+            preview = root / "output" / "Play" / "letter" / "index.html"
+            preview.parent.mkdir(parents=True)
+            preview.write_text("<html></html>", encoding="utf-8")
+            unrelated_preview = root / "elsewhere" / "index.html"
+            unrelated_preview.parent.mkdir()
+            unrelated_preview.write_text("<html></html>", encoding="utf-8")
+            wrong_file = preview.with_name("notes.txt")
+            wrong_file.write_text("not a preview", encoding="utf-8")
+
+            self.assertFalse(
+                command_bar_has_openable_target(
+                    CommandBarData("Recipient", "Title", None, ""),
+                    root,
+                )
+            )
+            self.assertFalse(
+                command_bar_has_openable_target(
+                    CommandBarData(
+                        "Recipient",
+                        "Title",
+                        missing_preview,
+                        "javascript:alert(1)",
+                    ),
+                    root,
+                )
+            )
+            self.assertFalse(
+                command_bar_has_openable_target(
+                    CommandBarData("Recipient", "Title", unrelated_preview, ""),
+                    root,
+                )
+            )
+            self.assertFalse(
+                command_bar_has_openable_target(
+                    CommandBarData("Recipient", "Title", wrong_file, ""),
+                    root,
+                )
+            )
+            self.assertTrue(
+                command_bar_has_openable_target(
+                    CommandBarData("Recipient", "Title", preview, ""),
+                    root,
+                )
+            )
+            self.assertTrue(
+                command_bar_has_openable_target(
+                    CommandBarData(
+                        "Recipient",
+                        "Title",
+                        None,
+                        "https://example.com/letter",
+                    ),
+                    root,
+                )
+            )
+
+    def test_launch_suppresses_metadata_only_command_bar(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch("command_bar.CommandBarWindow") as window_type:
+                window = launch_command_bar(
+                    CommandBarData("Recipient", "Title", None, ""),
+                    temporary,
+                    show=False,
+                )
+
+            self.assertIsNone(window)
+            window_type.assert_not_called()
+
     def test_active_path_setting_normalizes_non_string_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             settings = SettingsStore(temporary)
@@ -419,13 +492,60 @@ class CommandBarTests(unittest.TestCase):
 
     def test_deferred_launch_reuses_one_controller(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            data = CommandBarData("Recipient", "Title", None, "")
+            data = CommandBarData(
+                "Recipient",
+                "Title",
+                None,
+                "https://example.com/letter",
+            )
             first = launch_command_bar(data, temporary, show=False)
             second = launch_command_bar(data, temporary, show=False)
             self.assertIs(first, second)
+            self.assertIsNotNone(first)
             self.assertFalse(first.isVisible())
             first.abort_launch()
             self.app.processEvents()
+
+    def test_nexus_closes_without_presenting_metadata_only_bar(self) -> None:
+        from Nexus import Nexus
+
+        events = []
+
+        class FakeNexus:
+            _shutdown_complete = False
+            _shutdown_in_progress = False
+            _command_bar = None
+            project_root = Path(".").resolve()
+
+            @staticmethod
+            def screen():
+                return None
+
+            @staticmethod
+            def _release_forge_preview_files() -> None:
+                events.append("release")
+
+            @staticmethod
+            def close() -> bool:
+                events.append("close")
+                return True
+
+        with (
+            mock.patch("command_bar.launch_command_bar", return_value=None),
+            mock.patch.object(QtCore.QTimer, "singleShot") as single_shot,
+            mock.patch.object(QtWidgets.QApplication, "quit") as quit_app,
+        ):
+            self.assertTrue(
+                Nexus.open_command_bar_and_close_editor(
+                    FakeNexus(),
+                    CommandBarData("Recipient", "Title", None, ""),
+                )
+            )
+
+        self.assertEqual(events, ["release", "close"])
+        self.assertIsNone(FakeNexus._command_bar)
+        single_shot.assert_not_called()
+        quit_app.assert_called_once_with()
 
     def test_nexus_closes_before_presenting_command_bar(self) -> None:
         from Nexus import Nexus
