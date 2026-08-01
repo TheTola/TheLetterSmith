@@ -47,6 +47,9 @@ from settings_store import SettingsStore, normalize_published_page_url
 from sound_model import (
     BUILD_SOUND_MANIFEST_NAME,
     ProjectSoundState,
+    current_manifest_path,
+    current_music_path,
+    display_title_from_name,
     import_runtime_track,
     load_library,
     resolve_project_tracks,
@@ -55,8 +58,10 @@ from sound_model import (
 )
 from transactional_io import (
     PathTransaction,
+    atomic_write_bytes,
     atomic_write_json,
     create_staging_directory,
+    recover_stale_transactions,
 )
 
 
@@ -81,6 +86,23 @@ _LOGGER = logging.getLogger(__name__)
 _ACTIVE_LETTER_LOAD_WORKSPACES: set[Path] = set()
 
 
+@dataclass(frozen=True)
+class _FileSnapshot:
+    path: Path
+    data: Optional[bytes]
+
+    @classmethod
+    def capture(cls, path: str | Path) -> "_FileSnapshot":
+        target = Path(path).resolve()
+        return cls(target, target.read_bytes() if target.is_file() else None)
+
+    def restore(self) -> None:
+        if self.data is None:
+            self.path.unlink(missing_ok=True)
+            return
+        atomic_write_bytes(self.path, self.data)
+
+
 def _remove_readonly_and_retry(function, path: str, error: BaseException) -> None:
     """Clear a copied Windows read-only attribute before retrying removal."""
     if not isinstance(error, PermissionError):
@@ -95,7 +117,14 @@ def _remove_tree(path: str | Path) -> None:
 
 def cleanup_stale_letter_load_workspaces(project_root: str | Path) -> tuple[Path, ...]:
     """Remove only interrupted Letter Smith load workspaces at startup."""
-    output_root = (Path(project_root).resolve() / "output").resolve()
+    root = Path(project_root).resolve()
+    recover_stale_transactions(
+        (
+            root / USER_PAGES_DIR,
+            root / USER_MESSAGE_DIR,
+        )
+    )
+    output_root = (root / "output").resolve()
     if not output_root.is_dir():
         return ()
     removed: list[Path] = []
@@ -593,27 +622,30 @@ class SavedLetterRestorer:
             backup_suffix=".load-backup",
             unique_staging=True,
         )
-        sounds_tx = PathTransaction(
-            self.project_root / USER_SOUNDS_DIR,
-            staging_suffix=".load-staging",
-            backup_suffix=".load-backup",
-            unique_staging=True,
-        )
-        transactions = (pages_tx, message_tx, sounds_tx)
+        transactions = (pages_tx, message_tx)
         committed: list[PathTransaction] = []
         settings_committed = False
+        sound_snapshots = tuple(
+            _FileSnapshot.capture(path)
+            for path in (
+                current_music_path(self.project_root),
+                current_manifest_path(self.project_root),
+                self.project_root / USER_SOUNDS_DIR / "appssong" / "project_sound.json",
+            )
+        )
 
         try:
             staged_pages = staged_root / USER_PAGES_DIR
             staged_message = staged_root / USER_MESSAGE_DIR
-            staged_sounds = staged_root / USER_SOUNDS_DIR
             shutil.copytree(pages, staged_pages)
             shutil.copytree(message, staged_message)
-            live_sounds = self.project_root / USER_SOUNDS_DIR
-            if live_sounds.is_dir():
-                shutil.copytree(live_sounds, staged_sounds)
-            else:
-                staged_sounds.mkdir(parents=True, exist_ok=True)
+
+            shutil.copytree(staged_pages, pages_tx.prepare())
+            shutil.copytree(staged_message, message_tx.prepare())
+
+            for transaction in transactions:
+                transaction.commit(keep_backup=True)
+                committed.append(transaction)
 
             imported_ids: list[str] = []
             for track in sound_tracks:
@@ -621,11 +653,14 @@ class SavedLetterRestorer:
                 if source is None:
                     continue
                 record = import_runtime_track(
-                    staged_root,
+                    self.project_root,
                     source,
                     display_title=track["display_title"],
                     original_name=track["original_name"],
-                    content_hash=track["content_hash"],
+                    # The manifest hash is metadata, not an identity assertion.
+                    # Re-hash the source so same-name/different-content files
+                    # cannot overwrite or alias one another.
+                    content_hash="",
                     duration_seconds=track["duration_seconds"],
                 )
                 imported_ids.append(record.track_id)
@@ -633,6 +668,7 @@ class SavedLetterRestorer:
             mode = (
                 "playlist"
                 if str(sound_payload.get("mode", "single")) == "playlist"
+                and imported_ids
                 else "single"
             )
             state = ProjectSoundState(
@@ -646,22 +682,15 @@ class SavedLetterRestorer:
                 playlist_expanded=True,
                 selected_track_id=imported_ids[0] if imported_ids else "",
             )
-            save_project_state(staged_root, state)
+            save_project_state(self.project_root, state)
             sync_current_compatibility(
-                staged_root,
+                self.project_root,
                 state,
-                load_library(staged_root),
+                load_library(self.project_root),
             )
 
-            shutil.copytree(staged_pages, pages_tx.prepare())
-            shutil.copytree(staged_message, message_tx.prepare())
-            shutil.copytree(staged_sounds, sounds_tx.prepare())
-
-            for transaction in transactions:
-                transaction.commit(keep_backup=True)
-                committed.append(transaction)
-            settings_committed = True
             self.settings.replace_snapshot(restored_settings)
+            settings_committed = True
             self._verify_committed_state()
         except Exception as error:
             _LOGGER.exception(
@@ -684,6 +713,11 @@ class SavedLetterRestorer:
                         "Could not clean staging for %s",
                         transaction.final_path,
                     )
+            for snapshot in sound_snapshots:
+                try:
+                    snapshot.restore()
+                except Exception:
+                    _LOGGER.exception("Could not restore previous sound state: %s", snapshot.path)
             if settings_committed:
                 try:
                     self.settings.replace_snapshot(settings_before)
@@ -1019,7 +1053,7 @@ class SavedLetterRestorer:
             raw_tracks = [
                 {
                     "filename": MUSIC_FILE,
-                    "display_title": "Music",
+                    "display_title": display_title_from_name(MUSIC_FILE),
                 }
             ]
         else:
@@ -1061,7 +1095,9 @@ class SavedLetterRestorer:
                     "filename": filename,
                     "display_title": str(
                         raw.get("display_title", "")
-                    ).strip(),
+                    ).strip() or display_title_from_name(
+                        str(raw.get("original_name", "") or filename)
+                    ),
                     "original_name": str(
                         raw.get("original_name", filename)
                     ).strip(),
@@ -1084,12 +1120,20 @@ class SavedLetterRestorer:
             for key in RESTORABLE_SETTING_KEYS:
                 if key in stored_settings:
                     restored[key] = stored_settings[key]
-        restored["recipient_name"] = str(
-            metadata.get("recipient_name") or entry.recipient
-        ).strip()
-        restored["recipient_title"] = str(
-            metadata.get("recipient_title") or entry.title
-        ).strip()
+        recipient = str(metadata.get("recipient_name") or "").strip()
+        if not recipient:
+            recipient = str(entry.recipient or "").strip()
+        if not recipient and play_dir.parent not in set(self.allowed_roots):
+            recipient = play_dir.parent.name.replace("_", " ").replace("-", " ").strip()
+        title = str(metadata.get("recipient_title") or "").strip()
+        if not title:
+            title = str(entry.title or "").strip()
+        if not title:
+            title = SavedLetterCatalog._html_title(play_dir / "index.html")
+        if not title:
+            title = play_dir.name.replace("_", " ").replace("-", " ").strip()
+        restored["recipient_name"] = recipient
+        restored["recipient_title"] = title
         restored["published_page_url"] = normalize_published_page_url(
             metadata.get("published_page_url", "")
         )

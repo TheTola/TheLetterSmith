@@ -1481,6 +1481,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._colors_path_used: Optional[Path] = None
         self._last_focused_widget: Optional[QtWidgets.QTextEdit] = None
         self._list_manager_dialogs: Dict[str, ListManagerDialog] = {}
+        self._list_save_in_progress = False
 
         self._build_ui()
         self._apply_styles()
@@ -1561,9 +1562,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def _load_user_colors(self) -> List[str]:
         path = self._user_colors_path()
-        legacy_lines, _ = _read_list_file_cached(self._resolve_managed_list_path("color"))
-        legacy_entries = _parse_color_list_entries(legacy_lines)
-        legacy_user = [entry.text for entry in legacy_entries if entry.is_user]
+        legacy_path = self._resolve_managed_list_path("color")
 
         def normalize(values: object) -> List[str]:
             if not isinstance(values, list):
@@ -1587,11 +1586,21 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 return normalize(values)
             except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
                 LOGGER.exception("User color storage could not be read: %s (%s)", path, error)
-                return normalize(legacy_user)
+                return []
+        legacy_lines, _ = _read_list_file_cached(legacy_path)
+        legacy_entries = _parse_color_list_entries(legacy_lines)
+        legacy_user = normalize([entry.text for entry in legacy_entries if entry.is_user])
         if legacy_user:
             try:
-                legacy_user = normalize(legacy_user)
+                builtin_entries = [entry for entry in legacy_entries if not entry.is_user]
+                migrated_text = _serialize_managed_list_entries(builtin_entries, allow_headers=True)
+                verified_entries = _parse_color_list_entries(migrated_text.splitlines())
+                if any(entry.is_user for entry in verified_entries):
+                    raise ValueError("legacy User Added entries remain in migrated color data")
                 safe_write_json(path, {"version": 1, "colors": legacy_user})
+                atomic_write_text(legacy_path, migrated_text)
+                _FILE_CACHE.pop(legacy_path, None)
+                _FILE_CACHE.pop(legacy_path.name, None)
                 LOGGER.info("Migrated User Added colors to %s", path)
             except (OSError, ValueError, TypeError) as error:
                 LOGGER.exception("User color migration failed: %s (%s)", path, error)
@@ -1675,29 +1684,42 @@ class PromptWriterPanel(QtWidgets.QWidget):
         _FILE_CACHE.pop(path.name, None)
 
     def _apply_managed_list_changes(self, key: str, entries: List[ManagedListEntry]) -> None:
+        if self._list_save_in_progress:
+            LOGGER.warning("Prompt Writer list save ignored while another save is active: %s", key)
+            return
+        self._list_save_in_progress = True
         config = self._managed_list_config(key)
-        if key == "color":
-            path = self._user_colors_path()
-            values: List[str] = []
-            seen: set[str] = set()
-            for entry in entries:
-                if entry.is_header or not entry.is_user:
-                    continue
-                value = _clean_user_added_entry(entry.text)
-                key_value = _managed_entry_key(value)
-                if value and key_value not in seen:
-                    values.append(value)
-                    seen.add(key_value)
-            safe_write_json(path, {"version": 1, "colors": values})
-        else:
-            path = self._resolve_managed_list_path(key)
-            atomic_write_text(
-                path,
-                _serialize_managed_list_entries(entries, allow_headers=bool(config["allow_headers"])),
+        path = self._user_colors_path() if key == "color" else self._resolve_managed_list_path(key)
+        try:
+            if key == "color":
+                values: List[str] = []
+                seen: set[str] = set()
+                for entry in entries:
+                    if entry.is_header or not entry.is_user:
+                        continue
+                    value = _clean_user_added_entry(entry.text)
+                    key_value = _managed_entry_key(value)
+                    if value and key_value not in seen:
+                        values.append(value)
+                        seen.add(key_value)
+                safe_write_json(path, {"version": 1, "colors": values})
+            else:
+                atomic_write_text(
+                    path,
+                    _serialize_managed_list_entries(entries, allow_headers=bool(config["allow_headers"])),
+                )
+            self._clear_managed_list_cache(path)
+            self._reload_managed_list(key)
+            self._schedule_persist_state(0)
+        except (OSError, UnicodeError, ValueError, TypeError) as error:
+            LOGGER.exception("Prompt Writer list save failed: %s (%s)", path, error)
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Save failed",
+                f"Could not save {config['title']} to:\n{path}\n\n{error}",
             )
-        self._clear_managed_list_cache(path)
-        self._reload_managed_list(key)
-        self._schedule_persist_state(0)
+        finally:
+            self._list_save_in_progress = False
 
     def _open_list_manager(self, key: str) -> None:
         existing = self._list_manager_dialogs.get(key)

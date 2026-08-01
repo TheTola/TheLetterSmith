@@ -5888,8 +5888,28 @@ class SoundTab(QtWidgets.QWidget):
                 QUrl()
             )
 
-    def release_project_files_for_restore(self) -> None:
-        """Stop all Sound-owned work before replacing the project folders."""
+        for dialog in self.findChildren(ArchiveDialog):
+            try:
+                dialog._stop_preview()
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "Could not release archive preview player.",
+                    exc_info=True,
+                )
+
+        preview = getattr(self, "_preview", None)
+        if preview is not None:
+            try:
+                preview.set_audio_file("")
+                preview.set_analysis_payload(None)
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "Could not release sound preview state.",
+                    exc_info=True,
+                )
+
+    def prepare_for_project_restore(self) -> None:
+        """Detach every Sound-owned reader before restoring project state."""
         self.deactivate_for_tab_change()
         self._stop_background_threads()
 
@@ -5898,6 +5918,10 @@ class SoundTab(QtWidgets.QWidget):
             self._analysis_key = ""
 
         self.release_current_file_handle()
+
+    def release_project_files_for_restore(self) -> None:
+        """Backward-compatible alias for the restore lifecycle hook."""
+        self.prepare_for_project_restore()
 
     def reset_project_sound(self) -> None:
         """

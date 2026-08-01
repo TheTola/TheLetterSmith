@@ -82,6 +82,10 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.assertFalse(self.panel._generated_output_valid)
         after = [entry.text for entry in self.panel._read_managed_entries("color") if entry.is_user]
         self.assertEqual(before, after)
+        self.assertNotIn(
+            "Legacy User Color",
+            (self.project_root / "Prompter" / "modules" / "color.txt").read_text(encoding="utf-8"),
+        )
         saved = json.loads((self.project_root / "prompt_writer_state.json").read_text(encoding="utf-8"))
         self.assertFalse(saved["checks"].get("real"))
         self.assertNotIn("neutral_style", saved["checks"])
@@ -159,6 +163,15 @@ class PromptWriterHardeningTests(unittest.TestCase):
         state = json.loads((self.project_root / "prompt_writer_state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["generated_prompts"], {})
         self.assertEqual(state["reference_images"], [])
+
+    def test_invalid_user_color_storage_does_not_fallback_to_legacy_file(self):
+        modules = self.project_root / "Prompter" / "modules"
+        (modules / "user_colors.json").write_text("not json", encoding="utf-8")
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+        self.assertEqual(
+            [entry.text for entry in self.panel._read_managed_entries("color") if entry.is_user],
+            [],
+        )
 
 
 if __name__ == "__main__":

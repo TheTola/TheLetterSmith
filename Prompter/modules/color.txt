@@ -46,8 +46,3 @@ Sapphire, Crimson, & Gold
 Indigo, Emerald, & Vermilion
 Violet, Chartreuse, & Azure
 Teal, Orange, & Royal Purple
-
--User Added
-Turquoise, Gold, Deep Violet, Kintsugi
-Turquoise, Black, Gold, Kintsugi
-Natural Colors
