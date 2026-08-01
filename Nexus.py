@@ -746,6 +746,24 @@ class Nexus(QtWidgets.QMainWindow):
                 color:#e0f7f7;
             }
 
+            QTabBar#MainTabBar[commandOverlay="true"] {
+                background:transparent;
+            }
+            QTabBar#MainTabBar[commandOverlay="true"]::tab {
+                background:transparent;
+                border:none;
+                color:transparent;
+            }
+            QTabBar#MainTabBar[commandOverlay="true"]::tab:selected {
+                border:none;
+                color:transparent;
+            }
+            QTabBar#MainTabBar[commandOverlay="true"]::tab:hover {
+                background:rgba(11,12,16,0.82);
+                color:#e0fdfd;
+                border-bottom:2px solid #00b2b2;
+            }
+
             QStatusBar {
                 background:#1e1e1e;
                 color:#d0d0d0;
@@ -765,6 +783,7 @@ class Nexus(QtWidgets.QMainWindow):
         main_layout = QtWidgets.QVBoxLayout(self.main_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
+        self.main_layout = main_layout
 
         # Title bar
         self.title_bar = TitleBar(self)
@@ -776,8 +795,12 @@ class Nexus(QtWidgets.QMainWindow):
         for name in ("Images", "Sound", "Message", "Forge", "Command"):
             self.tabbar.addTab(name)
         self.tabbar.setDrawBase(False)
+        self.tabbar.setMouseTracking(True)
+        self.tabbar.setAttribute(Qt.WA_Hover, True)
         self.tabbar.currentChanged.connect(self._tab_changed)
         main_layout.addWidget(self.tabbar)
+        self._command_immersive = False
+        self._command_status_was_visible = True
 
         # Body
         self.body = QtWidgets.QWidget()
@@ -786,6 +809,7 @@ class Nexus(QtWidgets.QMainWindow):
         body_layout = QtWidgets.QVBoxLayout(self.body)
         body_layout.setContentsMargins(12, 12, 12, 12)
         body_layout.setSpacing(10)
+        self.body_layout = body_layout
 
         # Preview frame (centered)
         self.preview_frame = QtWidgets.QWidget()
@@ -1163,6 +1187,8 @@ class Nexus(QtWidgets.QMainWindow):
             state is ApplicationState.PROJECT_READY
             and self.project_state.is_project_ready
         )
+        if not ready and self._command_immersive:
+            self._set_command_immersive(False)
         self.tabbar.setVisible(ready)
         if ready:
             self._initialize_project_tabs()
@@ -1390,6 +1416,58 @@ class Nexus(QtWidgets.QMainWindow):
 
         self._apply_tab_state(idx, animate_page=(old_idx != idx))
 
+    def _set_command_immersive(self, active: bool) -> None:
+        """Let Command cover all app content while retaining hover navigation."""
+        active = bool(active)
+        if self._command_immersive == active:
+            if active:
+                self._position_command_tabbar()
+            return
+
+        self._command_immersive = active
+        if active:
+            self._command_status_was_visible = self.statusBar().isVisible()
+            self.statusBar().hide()
+            self.main_layout.removeWidget(self.tabbar)
+            self.body_layout.setContentsMargins(0, 0, 0, 0)
+            self.body_layout.setSpacing(0)
+            self.tabbar.setProperty("commandOverlay", True)
+            self._refresh_tabbar_style()
+            self.main_layout.invalidate()
+            self.main_layout.activate()
+            self._position_command_tabbar()
+            return
+
+        self.tabbar.setProperty("commandOverlay", False)
+        self._refresh_tabbar_style()
+        self.main_layout.insertWidget(1, self.tabbar)
+        self.body_layout.setContentsMargins(12, 12, 12, 12)
+        self.body_layout.setSpacing(10)
+        if self._command_status_was_visible:
+            self.statusBar().show()
+        self.main_layout.invalidate()
+        self.main_layout.activate()
+
+    def _refresh_tabbar_style(self) -> None:
+        style = self.tabbar.style()
+        style.unpolish(self.tabbar)
+        style.polish(self.tabbar)
+        self.tabbar.update()
+
+    def _position_command_tabbar(self) -> None:
+        if not self._command_immersive:
+            return
+        height = max(1, self.tabbar.sizeHint().height())
+        content_top = self.application_stack.geometry().top()
+        self.tabbar.setGeometry(
+            0,
+            content_top,
+            self.main_widget.width(),
+            height,
+        )
+        self.tabbar.show()
+        self.tabbar.raise_()
+
     def _apply_tab_state(self, idx: int, *, animate_page: bool) -> None:
         """Apply the complete settled UI state for one tab."""
         old_idx = self.page_stack.currentIndex()
@@ -1418,6 +1496,7 @@ class Nexus(QtWidgets.QMainWindow):
         self.preview_caption.setVisible(False)
         self.preview_frame.setVisible(idx != 4)
         self.forge_tab.preview_format_panel.setVisible(idx == 3)
+        self._set_command_immersive(idx == 4)
         self._update_preview_tools_geometry()
 
         if animate_page and self._tabswitch is not None:
@@ -2006,6 +2085,7 @@ class Nexus(QtWidgets.QMainWindow):
     def resizeEvent(self, event):
         self._update_preview_geometry()
         self._update_preview_tools_geometry()
+        self._position_command_tabbar()
 
         # Reposition any visible toast
         if self._toast.isVisible():
