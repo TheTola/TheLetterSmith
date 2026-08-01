@@ -47,10 +47,12 @@ from message_history import (
     delete_revision,
     list_revisions,
     restore_revision,
-    write_message_with_revision,
 )
 from message_format import normalize_ultralinks_in_document
 from message_html import is_lettersmith_message_html
+from project_paths import ProjectPathResolver
+from project_save import ProjectNotReadyError, ProjectSaveService
+from project_state import ProjectStateController
 from settings_store import (
     SettingsStore,
     normalize_published_page_url,
@@ -386,11 +388,26 @@ class MessageTab(QtWidgets.QWidget):
     published_page_url_changed = Signal(str)
     project_changed = Signal()
 
-    def __init__(self, project_root: str) -> None:
+    def __init__(
+        self,
+        project_root: str,
+        *,
+        project_state: ProjectStateController | None = None,
+        project_paths: ProjectPathResolver | None = None,
+    ) -> None:
         super().__init__()
         self.project_root = project_root
         self.settings_path = os.path.join(project_root, SETTINGS_FILE)
         self.settings_store = SettingsStore(project_root)
+        self.project_state = project_state
+        if self.project_state is None:
+            self.project_state = ProjectStateController(project_root)
+            self.project_state.initialize()
+        self.project_save_service = ProjectSaveService(
+            project_root,
+            self.project_state,
+            resolver=project_paths,
+        )
 
         # Compatibility cache; disk remains authoritative.
         self.current_html: str = ""
@@ -604,12 +621,44 @@ class MessageTab(QtWidgets.QWidget):
 
     def sync_to_disk(self) -> bool:
         """Persist Message metadata and finish render state before tab exit."""
-        before = self._capture_sync_state()
+        before = dict(
+            getattr(
+                self,
+                "_sync_state",
+                {},
+            )
+        )
+        disk_state = self._capture_sync_state()
+        render_changed = any(
+            before.get(key)
+            != disk_state.get(key)
+            for key in (
+                "html",
+                "wall",
+                "settings",
+            )
+        )
         self._save_settings()
         self._refresh_message_from_disk()
+        if self.current_html.strip():
+            try:
+                self.project_save_service.save_message(
+                    self.current_html,
+                    workspace_path=self._html_path(),
+                    reason="message-tab-exit",
+                )
+            except ProjectNotReadyError:
+                pass
         self._ensure_wall_exists()
-        if self.current_html.strip() and not self._png_path().is_file():
+        if (
+            self.current_html.strip()
+            and (
+                render_changed
+                or not self._png_path().is_file()
+            )
+        ):
             self._generate_image(self.current_html)
+            self._sync_project_render_assets()
         self._ensure_message_exists()
         self._sync_state = self._capture_sync_state()
         changed = before != self._sync_state
@@ -808,11 +857,23 @@ class MessageTab(QtWidgets.QWidget):
             return False
 
         self.current_html = restored
+        try:
+            self.project_save_service.save_message(
+                restored,
+                workspace_path=self._html_path(),
+                reason="revision-restore",
+            )
+        except Exception as error:
+            self.status.setText(
+                f"Could not save restored revision: {error}"
+            )
+            return False
         self._content_has_intentional_formatting = True
         self.text_selected.emit(restored)
         self._update_message_summary(restored)
         self._ensure_wall_exists()
         self._generate_image(restored)
+        self._sync_project_render_assets()
         self._emit_best_preview()
         self.status.setText("Revision restored.")
         self._sync_state = self._capture_sync_state()
@@ -826,6 +887,12 @@ class MessageTab(QtWidgets.QWidget):
         self.settings = self.settings_store.snapshot()
 
     def _persist_settings(self, *, announce: bool) -> bool:
+        if not self.project_state.is_project_ready:
+            if announce:
+                self.status.setText(
+                    "A recipient is required before saving."
+                )
+            return False
         try:
             fields = {
                 key: self.settings[key]
@@ -902,6 +969,31 @@ class MessageTab(QtWidgets.QWidget):
     def _wall_path(self) -> Path:
         # SOURCE OF TRUTH: gallery/user/pages/wall.png
         return Path(self.project_root) / USER_PAGES_DIR / "wall.png"
+
+    def _sync_project_render_assets(self) -> None:
+        if not self.project_state.is_project_ready:
+            return
+        for source, relative in (
+            (
+                self._png_path(),
+                Path("message") / "message.png",
+            ),
+            (
+                self._wall_path(),
+                Path("pages") / "wall.png",
+            ),
+        ):
+            if not source.is_file():
+                continue
+            try:
+                self.project_save_service.copy_workspace_file(
+                    source,
+                    relative,
+                )
+            except Exception as error:
+                self.status.setText(
+                    f"Could not save project artwork: {error}"
+                )
 
     def _default_message_bg_path(self) -> Path:
         # DEFAULT FALLBACK: gallery/app/pages/Dmessage.png
@@ -1053,6 +1145,11 @@ class MessageTab(QtWidgets.QWidget):
     # Editor
     # ──────────────────────────────────────────────────────────────────
     def open_editor(self) -> None:
+        if not self.project_state.is_project_ready:
+            self.status.setText(
+                "A recipient is required before editing."
+            )
+            return
         html_path = self._html_path()
         if html_path.is_file():
             try:
@@ -1099,7 +1196,11 @@ class MessageTab(QtWidgets.QWidget):
             return
 
         try:
-            write_message_with_revision(self._html_path(), new_html, reason="editor-close")
+            self.project_save_service.save_message(
+                new_html,
+                workspace_path=self._html_path(),
+                reason="editor-close",
+            )
         except Exception as error:
             self.status.setText(f"Could not save message: {error}")
             return
@@ -1110,6 +1211,7 @@ class MessageTab(QtWidgets.QWidget):
         self._ensure_wall_exists()
         self.text_selected.emit(new_html)
         self._generate_image(new_html)
+        self._sync_project_render_assets()
         self._emit_best_preview()
         self.status.setText("Message saved.")
         self.project_changed.emit()
@@ -1212,7 +1314,11 @@ class MessageTab(QtWidgets.QWidget):
         html = imported_html if preserve_formatting else _normalize_imported_message_html(imported_html)
 
         try:
-            write_message_with_revision(self._html_path(), html, reason="import")
+            self.project_save_service.save_message(
+                html,
+                workspace_path=self._html_path(),
+                reason="import",
+            )
             self.current_html = html
             self._content_has_intentional_formatting = preserve_formatting
             self.edit_btn.setEnabled(True)
@@ -1225,6 +1331,7 @@ class MessageTab(QtWidgets.QWidget):
         self._update_message_summary(html)
         self._ensure_wall_exists()
         self._generate_image(html)
+        self._sync_project_render_assets()
         self._emit_best_preview()
         self.project_changed.emit()
 
@@ -1317,6 +1424,9 @@ class MessageTab(QtWidgets.QWidget):
     def shutdown(self) -> None:
         self._overlay_render_timer.stop()
         try:
-            self.sync_to_disk()
+            if self._tab_active:
+                self.deactivate_for_tab_change()
+            else:
+                self.sync_from_disk()
         except Exception:
             pass

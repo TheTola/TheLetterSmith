@@ -21,8 +21,25 @@ from config import (
     USER_MESSAGE_DIR,
     USER_PAGES_DIR,
     USER_SOUNDS_DIR,
+    canonical_play_root,
+    canonical_recovery_root,
+    legacy_play_roots,
+    legacy_recovery_roots,
 )
-from project_state import ensure_project_identity
+from project_paths import (
+    PROJECT_METADATA_SCHEMA_VERSION,
+    ProjectContext,
+    ProjectPathResolver,
+)
+from project_state import (
+    PROJECT_SCHEMA_KEY,
+    RECIPIENT_DISPLAY_NAME_KEY,
+    RECIPIENT_ID_KEY,
+    RECIPIENT_NORMALIZED_KEY,
+    ProjectIdentity,
+    ensure_project_identity,
+)
+from recipient_registry import RecipientRegistry
 from readiness import ReadinessResult
 from settings_store import SettingsStore, normalize_published_page_url
 from sound_model import (
@@ -60,6 +77,13 @@ _METADATA_NAMES = (
 _LOGGER = logging.getLogger(__name__)
 
 
+def _valid_uuid(value: object) -> str:
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError):
+        return ""
+
+
 @dataclass(frozen=True)
 class SavedLetter:
     path: Path
@@ -68,25 +92,51 @@ class SavedLetter:
     modified_at: datetime
     published_url: str
     cover_path: Optional[Path]
+    recipient_id: str = ""
+    project_id: str = ""
     recovery: bool = False
 
     @property
     def published(self) -> bool:
         return bool(self.published_url)
 
+    @property
+    def needs_recipient_assignment(self) -> bool:
+        return (
+            not self.recipient_id
+            and (
+                not self.recipient
+                or self.recipient.casefold() == "unknown recipient"
+            )
+        )
+
 
 @dataclass(frozen=True)
 class RestoredProject:
     play_dir: Path
     project_id: str
+    recipient_id: str
     recipient: str
+    recipient_normalized_key: str
     title: str
     published_url: str
+
+    @property
+    def identity(self) -> ProjectIdentity:
+        return ProjectIdentity(
+            recipient_id=self.recipient_id,
+            recipient_display_name=self.recipient,
+            recipient_normalized_key=self.recipient_normalized_key,
+            project_id=self.project_id,
+        )
 
     def as_payload(self) -> dict[str, str]:
         return {
             "play_dir": str(self.play_dir),
             "project_id": self.project_id,
+            "recipient_id": self.recipient_id,
+            "recipient_display_name": self.recipient,
+            "recipient_normalized_key": self.recipient_normalized_key,
             "recipient_name": self.recipient,
             "recipient_title": self.title,
             "published_page_url": self.published_url,
@@ -95,6 +145,14 @@ class RestoredProject:
 
 class SavedLetterRestoreError(RuntimeError):
     pass
+
+
+class RecipientAssignmentRequired(SavedLetterRestoreError):
+    def __init__(self, entry: SavedLetter) -> None:
+        super().__init__(
+            "This saved letter needs a recipient before it can be loaded."
+        )
+        self.entry = entry
 
 
 class SavedLetterDeleteError(RuntimeError):
@@ -186,16 +244,28 @@ def _readable_file(path: Path) -> bool:
 class SavedLetterCatalog:
     def __init__(self, project_root: str | Path) -> None:
         self.project_root = Path(project_root).resolve()
-        self.play_root = (self.project_root / "output" / "Play").resolve()
-        self.recovery_root = (self.project_root / "output" / "Recovery").resolve()
+        self.play_root = canonical_play_root(self.project_root)
+        self.recovery_root = canonical_recovery_root(self.project_root)
+        self.play_roots = (
+            self.play_root,
+            *legacy_play_roots(self.project_root),
+        )
+        self.recovery_roots = (
+            self.recovery_root,
+            *legacy_recovery_roots(self.project_root),
+        )
+        self.managed_roots = (
+            *self.play_roots,
+            *self.recovery_roots,
+        )
 
     def list_entries(self) -> tuple[SavedLetter, ...]:
         entries: list[SavedLetter] = []
         seen: set[Path] = set()
         seen_project_ids: set[str] = set()
         for root, recovery in (
-            (self.play_root, False),
-            (self.recovery_root, True),
+            *((root, False) for root in self.play_roots),
+            *((root, True) for root in self.recovery_roots),
         ):
             if not root.is_dir():
                 continue
@@ -219,11 +289,10 @@ class SavedLetterCatalog:
                     )
                     continue
                 seen.add(path)
-                project_id = str(getattr(entry, "project_id", "") or "").strip()
-                if project_id and project_id in seen_project_ids:
+                if entry.project_id and entry.project_id in seen_project_ids:
                     continue
-                if project_id:
-                    seen_project_ids.add(project_id)
+                if entry.project_id:
+                    seen_project_ids.add(entry.project_id)
                 entries.append(entry)
         entries.sort(
             key=lambda entry: (entry.modified_at, entry.title.casefold()),
@@ -255,7 +324,7 @@ class SavedLetterCatalog:
             ) from error
 
         allowed_root: Optional[Path] = None
-        for root in (self.play_root, self.recovery_root):
+        for root in self.managed_roots:
             try:
                 relative = target.relative_to(root)
             except ValueError:
@@ -326,10 +395,7 @@ class SavedLetterCatalog:
         if not title:
             title = self._html_title(path / "index.html") or "Untitled Letter"
         if not recipient:
-            parent_is_category = path.parent in {
-                self.play_root,
-                self.recovery_root,
-            }
+            parent_is_category = path.parent in set(self.managed_roots)
             recipient = (
                 "Unknown Recipient"
                 if parent_is_category
@@ -351,6 +417,8 @@ class SavedLetterCatalog:
                 metadata.get("published_page_url", "")
             ),
             cover_path=cover,
+            recipient_id=_valid_uuid(metadata.get("recipient_id")),
+            project_id=_valid_uuid(metadata.get("project_id")),
             recovery=recovery,
         )
 
@@ -381,16 +449,34 @@ class SavedLetterCatalog:
 class SavedLetterRestorer:
     """Validate, stage, and atomically restore editable project-owned state."""
 
-    def __init__(self, project_root: str | Path) -> None:
+    def __init__(
+        self,
+        project_root: str | Path,
+        *,
+        resolver: ProjectPathResolver | None = None,
+    ) -> None:
         self.project_root = Path(project_root).resolve()
         self.settings = SettingsStore(self.project_root)
+        self.resolver = resolver or ProjectPathResolver(
+            self.project_root
+        )
+        self.registry = RecipientRegistry(self.project_root)
         self.allowed_roots = (
-            (self.project_root / "output" / "Play").resolve(),
-            (self.project_root / "output" / "Recovery").resolve(),
+            canonical_play_root(self.project_root),
+            *legacy_play_roots(self.project_root),
+            canonical_recovery_root(self.project_root),
+            *legacy_recovery_roots(self.project_root),
         )
 
     def restore(self, entry: SavedLetter) -> RestoredProject:
-        play_dir = self._validated_play_directory(entry.path)
+        entry = self.ensure_entry_identity(entry)
+        resolved = self.resolver.resolve_project_directory(
+            entry.project_id,
+            recipient_id=entry.recipient_id,
+        )
+        play_dir = self._validated_play_directory(
+            resolved or entry.path
+        )
         pages = _runtime_directory(
             play_dir,
             "gallery/pages",
@@ -572,11 +658,132 @@ class SavedLetterRestorer:
         return RestoredProject(
             play_dir=play_dir,
             project_id=str(restored_settings["project_id"]),
+            recipient_id=str(restored_settings["recipient_id"]),
             recipient=str(restored_settings.get("recipient_name", "")),
+            recipient_normalized_key=str(
+                restored_settings.get(
+                    "recipient_normalized_key",
+                    "",
+                )
+            ),
             title=str(restored_settings.get("recipient_title", "")),
             published_url=str(
                 restored_settings.get("published_page_url", "")
             ),
+        )
+
+    def ensure_entry_identity(
+        self,
+        entry: SavedLetter,
+    ) -> SavedLetter:
+        if entry.recipient_id and entry.project_id:
+            recipient = self.registry.find_by_id(entry.recipient_id)
+            if recipient is None:
+                raise RecipientAssignmentRequired(entry)
+            return entry
+        if entry.needs_recipient_assignment:
+            raise RecipientAssignmentRequired(entry)
+        return self.assign_recipient(
+            entry,
+            entry.recipient,
+            custom_capitalization=True,
+        )
+
+    def assign_recipient(
+        self,
+        entry: SavedLetter,
+        recipient_name: str,
+        *,
+        custom_capitalization: bool = False,
+    ) -> SavedLetter:
+        source = self._validated_play_directory(entry.path)
+        metadata = _read_metadata(source)
+        record = self.registry.get_or_create(
+            recipient_name,
+            custom_capitalization=custom_capitalization,
+            recipient_id=entry.recipient_id or None,
+        )
+        project_id = (
+            entry.project_id
+            or _valid_uuid(metadata.get("project_id"))
+            or str(uuid.uuid4())
+        )
+        title = str(
+            metadata.get("recipient_title")
+            or metadata.get("letter_title")
+            or entry.title
+            or "Untitled Letter"
+        ).strip()
+        context = self.resolver.context_from_settings(
+            {
+                "recipient_id": record.recipient_id,
+                "recipient_display_name": record.display_name,
+                "recipient_normalized_key": record.normalized_key,
+                "recipient_name": record.display_name,
+                "project_id": project_id,
+                "recipient_title": title,
+            }
+        )
+        recipient_directory = self.resolver.resolve_recipient_directory(
+            record.recipient_id
+        )
+        try:
+            source.relative_to(recipient_directory)
+            destination = source
+        except ValueError:
+            destination = context.project_directory
+
+        identity_metadata = dict(metadata)
+        identity_metadata.update(
+            {
+                "schema_version": METADATA_VERSION,
+                "project_schema_version": (
+                    PROJECT_METADATA_SCHEMA_VERSION
+                ),
+                "project_id": project_id,
+                "recipient_id": record.recipient_id,
+                "recipient_display_name": record.display_name,
+                "recipient_normalized_key": record.normalized_key,
+                "recipient_name": record.display_name,
+                "letter_title": title,
+                "recipient_title": title,
+            }
+        )
+
+        if destination == source:
+            atomic_write_json(
+                destination / PLAY_METADATA_FILE,
+                identity_metadata,
+            )
+        else:
+            transaction = PathTransaction(
+                destination,
+                staging_suffix=".identity-staging",
+                backup_suffix=".identity-backup",
+                unique_staging=True,
+            )
+            staging = transaction.prepare()
+            try:
+                shutil.copytree(source, staging)
+                atomic_write_json(
+                    staging / PLAY_METADATA_FILE,
+                    identity_metadata,
+                )
+                if not SavedLetterCatalog._is_valid_candidate(staging):
+                    raise SavedLetterRestoreError(
+                        "The identified saved-letter copy failed validation."
+                    )
+                transaction.commit(keep_backup=True)
+                transaction.finalize()
+            except Exception:
+                transaction.abort()
+                raise
+
+        return SavedLetterCatalog(
+            self.project_root
+        )._entry(
+            destination,
+            recovery=False,
         )
 
     def _validated_play_directory(self, source: Path) -> Path:
@@ -790,8 +997,8 @@ class SavedLetterRestorer:
             )
         return payload, tracks
 
-    @staticmethod
     def _prepare_settings(
+        self,
         metadata: dict[str, Any],
         entry: SavedLetter,
         play_dir: Path,
@@ -812,12 +1019,23 @@ class SavedLetterRestorer:
         restored["published_page_url"] = normalize_published_page_url(
             metadata.get("published_page_url", "")
         )
-        raw_project_id = metadata.get("project_id", play_dir.name)
-        try:
-            restored["project_id"] = str(uuid.UUID(str(raw_project_id)))
-        except (ValueError, TypeError, AttributeError):
-            restored["project_id"] = str(uuid.uuid4())
-        restored["project_schema_version"] = 1
+        project_id = (
+            _valid_uuid(metadata.get("project_id"))
+            or entry.project_id
+        )
+        recipient_id = (
+            _valid_uuid(metadata.get("recipient_id"))
+            or entry.recipient_id
+        )
+        record = self.registry.find_by_id(recipient_id)
+        if not project_id or record is None:
+            raise RecipientAssignmentRequired(entry)
+        restored["project_id"] = project_id
+        restored["recipient_id"] = record.recipient_id
+        restored["recipient_display_name"] = record.display_name
+        restored["recipient_normalized_key"] = record.normalized_key
+        restored["recipient_name"] = record.display_name
+        restored[PROJECT_SCHEMA_KEY] = PROJECT_METADATA_SCHEMA_VERSION
         return restored
 
     def _verify_committed_state(self) -> None:
@@ -855,8 +1073,20 @@ def update_saved_metadata(
             "schema_version": METADATA_VERSION,
             "source_version": METADATA_VERSION,
             "project_id": ensure_project_identity(root),
+            "project_schema_version": PROJECT_METADATA_SCHEMA_VERSION,
+            "recipient_id": str(
+                settings.get("recipient_id", "")
+            ).strip(),
+            "recipient_display_name": str(
+                settings.get("recipient_display_name")
+                or settings.get("recipient_name", "")
+            ).strip(),
+            "recipient_normalized_key": str(
+                settings.get("recipient_normalized_key", "")
+            ).strip(),
             "recipient_name": str(
-                settings.get("recipient_name", "")
+                settings.get("recipient_display_name")
+                or settings.get("recipient_name", "")
             ).strip(),
             "recipient_title": str(
                 settings.get("recipient_title", "")
@@ -912,6 +1142,7 @@ def update_saved_metadata(
 __all__ = [
     "METADATA_VERSION",
     "RESTORABLE_SETTING_KEYS",
+    "RecipientAssignmentRequired",
     "RestoredProject",
     "SavedLetter",
     "SavedLetterCatalog",

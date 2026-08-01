@@ -47,7 +47,7 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QSize, QSettings, QMimeData
@@ -92,8 +92,9 @@ from config import (
     USER_PAGES_DIR,
     MESSAGE_HTML_FILE,
 )
-from message_history import write_message_with_revision
 from message_format import normalize_ultralinks_in_document
+from project_save import ProjectNotReadyError, ProjectSaveService
+from project_state import ProjectStateController
 from message_html import (
     is_ultralink_href,
     make_ultralink_href,
@@ -322,6 +323,7 @@ class UltralinkDialog(QDialog):
         message: str = "",
         *,
         allow_remove: bool = False,
+        apply_all_text: str = "",
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -333,6 +335,29 @@ class UltralinkDialog(QDialog):
         self.message_edit.setPlainText(message or "")
         self.message_edit.setPlaceholderText("Text shown when the reader hovers")
         self.message_edit.setMinimumSize(360, 130)
+
+        occurrence_text = re.sub(
+            r"\s+",
+            " ",
+            apply_all_text,
+        ).strip()
+        display_text = (
+            occurrence_text
+            if len(occurrence_text) <= 48
+            else f"{occurrence_text[:45]}…"
+        )
+        self.apply_all_checkbox = QCheckBox(
+            (
+                f'Apply to every whole occurrence of “{display_text}”'
+                if display_text
+                else "Apply to every occurrence"
+            ),
+            self,
+        )
+        self.apply_all_checkbox.setVisible(bool(display_text))
+        self.apply_all_checkbox.setToolTip(
+            "Matches capitalization-insensitively. Existing web links are preserved."
+        )
 
         buttons = QDialogButtonBox(self)
         buttons.addButton("Save", QDialogButtonBox.AcceptRole)
@@ -348,17 +373,22 @@ class UltralinkDialog(QDialog):
 
         root = QVBoxLayout(self)
         root.addWidget(self.message_edit)
+        root.addWidget(self.apply_all_checkbox)
         root.addWidget(buttons)
 
         self.setStyleSheet(
             "QDialog{background:#141414;border:1px solid #00d0ff;border-radius:8px;}"
             "QPlainTextEdit{background:#0f0f0f;color:#eee;border:1px solid #2a2a2a;border-radius:6px;padding:8px;}"
+            "QCheckBox{color:#ddd;padding:4px 2px;}"
             "QPushButton{background:#232323;color:#fff;border:1px solid #00d0ff;border-radius:4px;padding:6px 12px;}"
             "QPushButton:hover{background:#00d0ff;color:#111;}"
         )
 
     def message_text(self) -> str:
         return self.message_edit.toPlainText().strip()
+
+    def apply_to_all_occurrences(self) -> bool:
+        return self.apply_all_checkbox.isChecked()
 
     def _save(self) -> None:
         if not self.message_text():
@@ -523,6 +553,7 @@ class PreviewWidget(QtWidgets.QWidget):
 
         doc = QtGui.QTextDocument()
         doc.setHtml(self._editor.toHtml())
+        normalize_ultralinks_in_document(doc)
 
         margin = 16
         doc.setTextWidth(max(1, w - margin * 2))
@@ -557,19 +588,49 @@ class Editor(QDialog):
         self.message_path = (self.project_root / MESSAGE_HTML_FILE).resolve()
         self.message_path.parent.mkdir(parents=True, exist_ok=True)
         self.settings_path = (self.project_root / SETTINGS_FILE).resolve()
+        self.project_state = getattr(parent, "project_state", None)
+        if self.project_state is None:
+            self.project_state = ProjectStateController(self.project_root)
+            self.project_state.initialize()
+        self.project_save_service = getattr(
+            parent,
+            "project_save_service",
+            None,
+        ) or ProjectSaveService(
+            self.project_root,
+            self.project_state,
+        )
 
         self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
         s = _read_json(self.settings_path)
-        self.recipient_name = (s.get("recipient_name") or "Friend").strip() or "Friend"
+        self.recipient_name = (
+            self.project_state.identity.recipient_display_name
+            or str(s.get("recipient_name") or "").strip()
+        )
 
         saved = self.settings.value(SETTINGS_KEY_COLOR, QColor("#eeeeee"))
         self.last_color = saved if isinstance(saved, QColor) else QColor("#eeeeee")
+        saved_ultralink = self.settings.value(
+            SETTINGS_KEY_ULTRALINK_COLOR,
+            DEFAULT_ULTRALINK_COLOR,
+        )
+        ultralink_color = (
+            QColor(saved_ultralink)
+            if isinstance(saved_ultralink, QColor)
+            else QColor(str(saved_ultralink))
+        )
+        self.ultralink_color = (
+            ultralink_color
+            if ultralink_color.isValid()
+            else QColor(DEFAULT_ULTRALINK_COLOR)
+        )
 
         self.message_html = message_html or ""
         self._apply_message_defaults = bool(apply_defaults)
         self._initializing = True
         self._last_persisted_html = ""
+        self._find_dialog: Optional[FindReplaceDialog] = None
 
         # Tracks the most recent spacing selection (used to force identical browser output).
         self._export_line_spacing: Optional[float] = 2.0 if self._apply_message_defaults else None
@@ -609,6 +670,7 @@ class Editor(QDialog):
         self.editor = RichTextEdit(self.project_root)
         self.editor.document().setDefaultFont(QFont("Papyrus", DEFAULT_FONT_SIZE))
         self.editor.setHtml(self.message_html)
+        normalize_ultralinks_in_document(self.editor.document())
         self.preview = self.editor
         main_layout.addWidget(self.editor, 1)
 
@@ -748,6 +810,29 @@ class Editor(QDialog):
         self.editor.selectionChanged.connect(self._update_link_actions)
         self._update_link_actions()
 
+        self.btn_ultralink = QToolButton(self)
+        self.btn_ultralink.setObjectName("ultralinkButton")
+        self.btn_ultralink.setText("U")
+        self.btn_ultralink.setToolTip(
+            "Add or edit an Ultralink tooltip on selected text"
+        )
+        self.btn_ultralink.setPopupMode(QToolButton.MenuButtonPopup)
+        self.btn_ultralink.setMinimumSize(44, 36)
+        self.btn_ultralink.clicked.connect(self.open_ultralink_dialog)
+        ultralink_menu = QMenu(self.btn_ultralink)
+        color_action = ultralink_menu.addAction(
+            "Choose default Ultralink color…"
+        )
+        color_action.triggered.connect(self.choose_ultralink_color)
+        self.btn_ultralink.setMenu(ultralink_menu)
+        self.toolbar.addWidget(self.btn_ultralink)
+        self.editor.cursorPositionChanged.connect(
+            self._update_ultralink_action
+        )
+        self.editor.selectionChanged.connect(self._update_ultralink_action)
+        self._update_ultralink_button_style()
+        self._update_ultralink_action()
+
         self.toolbar.addSeparator()
 
         # Undo / Redo / Find
@@ -822,25 +907,45 @@ class Editor(QDialog):
         return self._prepared_html()
 
     def _prepared_html(self) -> str:
+        normalize_ultralinks_in_document(self.editor.document())
         content = self.editor.toHtml()
         content = self._inject_export_line_spacing_wrapper(content)
         return mark_lettersmith_message_html(content)
 
+    def _sync_message_assets(self) -> None:
+        self.project_save_service.copy_workspace_tree(
+            self.project_root / GALLERY_DIR / ASSET_SUBDIR,
+            Path(GALLERY_DIR) / ASSET_SUBDIR,
+        )
+
     def _schedule_autosave(self) -> None:
-        if self._initializing:
+        if (
+            self._initializing
+            or not self.project_state.is_project_ready
+        ):
             return
         self._autosave_timer.start()
 
     def _autosave_now(self) -> None:
-        if self._initializing:
+        if (
+            self._initializing
+            or not self.project_state.is_project_ready
+        ):
             return
         content = self._prepared_html()
         if not content or content == self._last_persisted_html:
             return
         try:
-            write_message_with_revision(self.message_path, content, reason="autosave")
+            self.project_save_service.save_message(
+                content,
+                workspace_path=self.message_path,
+                reason="autosave",
+            )
+            self._sync_message_assets()
             self._last_persisted_html = content
             self.autosaved.emit(content)
+        except ProjectNotReadyError:
+            return
         except Exception:
             # Autosave is deliberately quiet. Manual Save still reports failures.
             return
@@ -850,7 +955,12 @@ class Editor(QDialog):
         self._autosave_timer.stop()
         content = self._prepared_html()
         try:
-            write_message_with_revision(self.message_path, content, reason="manual-save")
+            self.project_save_service.save_message(
+                content,
+                workspace_path=self.message_path,
+                reason="manual-save",
+            )
+            self._sync_message_assets()
             self._last_persisted_html = content
             self.autosaved.emit(content)
             self.accept()
@@ -975,7 +1085,13 @@ class Editor(QDialog):
         self.editor.setTextCursor(cursor)
 
     def open_find_replace(self) -> None:
-        FindReplaceDialog(self).exec()
+        if self._find_dialog is None:
+            self._find_dialog = FindReplaceDialog(self)
+        self._find_dialog.show()
+        self._find_dialog.raise_()
+        self._find_dialog.activateWindow()
+        self._find_dialog.find_input.setFocus(Qt.OtherFocusReason)
+        self._find_dialog.find_input.selectAll()
 
     def _anchor_cursor_at_position(self, position: int) -> Optional[QTextCursor]:
         """Return the complete link at a document position, if one exists."""
@@ -1032,7 +1148,8 @@ class Editor(QDialog):
 
         anchor_cursor = self._anchor_cursor_at_position(cursor.position())
         if anchor_cursor is not None:
-            return anchor_cursor
+            href = anchor_cursor.charFormat().anchorHref()
+            return None if is_ultralink_href(href) else anchor_cursor
 
         cursor.select(QTextCursor.WordUnderCursor)
         return cursor if cursor.hasSelection() else None
@@ -1041,11 +1158,13 @@ class Editor(QDialog):
         cursor = self.editor.textCursor()
         anchor_cursor = self._anchor_cursor_at_position(cursor.position())
         if anchor_cursor is not None:
-            return anchor_cursor.charFormat().anchorHref()
+            href = anchor_cursor.charFormat().anchorHref()
+            return "" if is_ultralink_href(href) else href
 
         if not cursor.hasSelection():
             fmt = self.editor.currentCharFormat()
-            return fmt.anchorHref() if fmt.isAnchor() else ""
+            href = fmt.anchorHref() if fmt.isAnchor() else ""
+            return "" if is_ultralink_href(href) else href
 
         hrefs: set[str] = set()
         document = self.editor.document()
@@ -1055,8 +1174,9 @@ class Editor(QDialog):
             probe.setPosition(position)
             probe.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor)
             fmt = probe.charFormat()
-            if fmt.isAnchor() and fmt.anchorHref():
-                hrefs.add(fmt.anchorHref())
+            href = fmt.anchorHref() if fmt.isAnchor() else ""
+            if href and not is_ultralink_href(href):
+                hrefs.add(href)
             position += 1
         return next(iter(hrefs)) if len(hrefs) == 1 else ""
 
@@ -1111,6 +1231,392 @@ class Editor(QDialog):
         self.editor.setTextCursor(cursor)
         self._apply_char_format(fmt)
         self._update_link_actions()
+
+    def _ultralink_target_cursor(self) -> Optional[QTextCursor]:
+        cursor = QTextCursor(self.editor.textCursor())
+        if not cursor.hasSelection():
+            anchor = self._anchor_cursor_at_position(cursor.position())
+            if (
+                anchor is not None
+                and is_ultralink_href(anchor.charFormat().anchorHref())
+            ):
+                return anchor
+            return None
+
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        matches: dict[tuple[int, int], QTextCursor] = {}
+        document = self.editor.document()
+        block = document.findBlock(start)
+        while block.isValid() and block.position() < end:
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    fragment_start = fragment.position()
+                    fragment_end = fragment_start + fragment.length()
+                    if fragment_start < end and fragment_end > start:
+                        fmt = fragment.charFormat()
+                        if (
+                            fmt.isAnchor()
+                            and is_ultralink_href(fmt.anchorHref())
+                        ):
+                            anchor = self._anchor_cursor_at_position(
+                                fragment_start
+                            )
+                            if anchor is not None:
+                                key = (
+                                    anchor.selectionStart(),
+                                    anchor.selectionEnd(),
+                                )
+                                matches[key] = anchor
+                iterator += 1
+            block = block.next()
+        return next(iter(matches.values())) if len(matches) == 1 else None
+
+    def _transform_cursor_formats(
+        self,
+        cursor: QTextCursor,
+        transform: Callable[[QTextCharFormat], None],
+    ) -> None:
+        self._transform_cursors_formats(
+            [cursor],
+            transform,
+            restore_cursor=cursor,
+        )
+
+    def _transform_cursors_formats(
+        self,
+        cursors: list[QTextCursor],
+        transform: Callable[[QTextCharFormat], None],
+        *,
+        restore_cursor: Optional[QTextCursor] = None,
+    ) -> None:
+        ranges = [
+            (cursor.selectionStart(), cursor.selectionEnd())
+            for cursor in cursors
+            if cursor.selectionStart() < cursor.selectionEnd()
+        ]
+        if not ranges:
+            return
+
+        document = self.editor.document()
+        spans: list[tuple[int, int, QTextCharFormat]] = []
+        for start, end in ranges:
+            block = document.findBlock(start)
+            while block.isValid() and block.position() < end:
+                iterator = block.begin()
+                while not iterator.atEnd():
+                    fragment = iterator.fragment()
+                    if fragment.isValid():
+                        fragment_start = fragment.position()
+                        fragment_end = fragment_start + fragment.length()
+                        selected_start = max(start, fragment_start)
+                        selected_end = min(end, fragment_end)
+                        if selected_start < selected_end:
+                            spans.append(
+                                (
+                                    selected_start,
+                                    selected_end,
+                                    QTextCharFormat(fragment.charFormat()),
+                                )
+                            )
+                    iterator += 1
+                block = block.next()
+
+        work = QTextCursor(document)
+        work.beginEditBlock()
+        try:
+            for selected_start, selected_end, char_format in spans:
+                transform(char_format)
+                work.setPosition(selected_start)
+                work.setPosition(selected_end, QTextCursor.KeepAnchor)
+                work.setCharFormat(char_format)
+        finally:
+            work.endEditBlock()
+
+        if restore_cursor is not None:
+            restored = QTextCursor(document)
+            restored.setPosition(restore_cursor.selectionStart())
+            restored.setPosition(
+                restore_cursor.selectionEnd(),
+                QTextCursor.KeepAnchor,
+            )
+            self.editor.setTextCursor(restored)
+
+    def _update_ultralink_button_style(self) -> None:
+        color = self.ultralink_color.name()
+        self.btn_ultralink.setStyleSheet(
+            "QToolButton#ultralinkButton{"
+            f"color:{color};font-size:20px;font-weight:700;"
+            "padding:2px 10px;border:1px solid #2a2a2a;border-radius:6px;"
+            "background:#101010;}"
+            "QToolButton#ultralinkButton:hover{border-color:#00d0ff;}"
+        )
+
+    def _update_ultralink_action(self) -> None:
+        cursor = self.editor.textCursor()
+        has_target = (
+            cursor.hasSelection()
+            or self._ultralink_target_cursor() is not None
+        )
+        instruction = (
+            "Add or edit an Ultralink tooltip"
+            if has_target
+            else "Select text to create an Ultralink"
+        )
+        self.btn_ultralink.setEnabled(True)
+        self.btn_ultralink.setToolTip(
+            f"{instruction}. New color: {self.ultralink_color.name()}"
+        )
+
+    def choose_ultralink_color(self) -> None:
+        color = QColorDialog.getColor(
+            self.ultralink_color,
+            self,
+            "Default Ultralink Color",
+        )
+        if not color.isValid():
+            return
+        self.ultralink_color = color
+        self.settings.setValue(SETTINGS_KEY_ULTRALINK_COLOR, color)
+        self._update_ultralink_button_style()
+        self._update_ultralink_action()
+
+    def open_ultralink_dialog(self) -> None:
+        editor_cursor = QTextCursor(self.editor.textCursor())
+        existing_cursor = self._ultralink_target_cursor()
+        target = existing_cursor or (
+            editor_cursor if editor_cursor.hasSelection() else None
+        )
+        if target is None:
+            QtWidgets.QApplication.beep()
+            return
+
+        existing_message = (
+            ultralink_message_from_href(
+                existing_cursor.charFormat().anchorHref()
+            )
+            if existing_cursor is not None
+            else None
+        )
+        occurrence_text = target.selectedText()
+        can_apply_to_all = (
+            occurrence_text
+            if (
+                occurrence_text
+                and occurrence_text == occurrence_text.strip()
+                and "\u2029" not in occurrence_text
+            )
+            else ""
+        )
+        dialog = UltralinkDialog(
+            existing_message or "",
+            allow_remove=existing_message is not None,
+            apply_all_text=can_apply_to_all,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        if dialog.remove_requested:
+            self.remove_ultralink(target)
+            return
+        if dialog.apply_to_all_occurrences():
+            color = self.ultralink_color
+            if existing_cursor is not None:
+                brush = existing_cursor.charFormat().foreground()
+                if (
+                    brush.style() != Qt.BrushStyle.NoBrush
+                    and brush.color().isValid()
+                ):
+                    color = brush.color()
+            applied, skipped = self.apply_ultralink_to_all_occurrences(
+                can_apply_to_all,
+                dialog.message_text(),
+                color=color,
+                restore_cursor=target,
+            )
+            status = f"Applied Ultralink to {applied} occurrence"
+            status += "" if applied == 1 else "s"
+            if skipped:
+                status += f"; preserved {skipped} existing web link"
+                status += "" if skipped == 1 else "s"
+            status += "."
+            QtWidgets.QToolTip.showText(
+                self.btn_ultralink.mapToGlobal(
+                    QtCore.QPoint(0, self.btn_ultralink.height())
+                ),
+                status,
+                self.btn_ultralink,
+            )
+            return
+        self.apply_ultralink(
+            target,
+            dialog.message_text(),
+            apply_default_color=existing_message is None,
+        )
+
+    def apply_ultralink(
+        self,
+        cursor: QTextCursor,
+        message: str,
+        *,
+        apply_default_color: bool,
+    ) -> None:
+        href = make_ultralink_href(message)
+        color = self.ultralink_color if apply_default_color else None
+        self._transform_cursor_formats(
+            cursor,
+            self._ultralink_format_transform(href, color),
+        )
+        self._update_link_actions()
+        self._update_ultralink_action()
+
+    def apply_ultralink_to_all_occurrences(
+        self,
+        text: str,
+        message: str,
+        *,
+        color: Optional[QColor] = None,
+        restore_cursor: Optional[QTextCursor] = None,
+    ) -> tuple[int, int]:
+        matches, skipped = self._matching_ultralink_occurrences(text)
+        if not matches:
+            return 0, skipped
+
+        href = make_ultralink_href(message)
+        self._transform_cursors_formats(
+            matches,
+            self._ultralink_format_transform(
+                href,
+                color or self.ultralink_color,
+            ),
+            restore_cursor=restore_cursor or matches[0],
+        )
+        self._update_link_actions()
+        self._update_ultralink_action()
+        return len(matches), skipped
+
+    def _matching_ultralink_occurrences(
+        self,
+        text: str,
+    ) -> tuple[list[QTextCursor], int]:
+        search_text = text.strip()
+        if not search_text or "\u2029" in search_text:
+            return [], 0
+
+        document = self.editor.document()
+        plain_text = document.toPlainText()
+        matches: list[QTextCursor] = []
+        skipped = 0
+        search_cursor = QTextCursor(document)
+        search_cursor.movePosition(QTextCursor.Start)
+
+        while True:
+            found = document.find(search_text, search_cursor)
+            if found.isNull():
+                break
+
+            start = found.selectionStart()
+            end = found.selectionEnd()
+            if self._is_whole_text_occurrence(
+                plain_text,
+                start,
+                end,
+                search_text,
+            ):
+                if self._selection_contains_standard_link(found):
+                    skipped += 1
+                else:
+                    matches.append(QTextCursor(found))
+
+            next_position = max(end, search_cursor.position() + 1)
+            search_cursor.setPosition(next_position)
+
+        return matches, skipped
+
+    @staticmethod
+    def _is_whole_text_occurrence(
+        plain_text: str,
+        start: int,
+        end: int,
+        search_text: str,
+    ) -> bool:
+        def is_word_character(value: str) -> bool:
+            return value.isalnum() or value == "_"
+
+        if (
+            search_text
+            and is_word_character(search_text[0])
+            and start > 0
+            and is_word_character(plain_text[start - 1])
+        ):
+            return False
+        if (
+            search_text
+            and is_word_character(search_text[-1])
+            and end < len(plain_text)
+            and is_word_character(plain_text[end])
+        ):
+            return False
+        return True
+
+    def _selection_contains_standard_link(
+        self,
+        cursor: QTextCursor,
+    ) -> bool:
+        document = self.editor.document()
+        for position in range(
+            cursor.selectionStart(),
+            cursor.selectionEnd(),
+        ):
+            probe = QTextCursor(document)
+            probe.setPosition(position)
+            probe.movePosition(
+                QTextCursor.NextCharacter,
+                QTextCursor.KeepAnchor,
+            )
+            char_format = probe.charFormat()
+            href = (
+                char_format.anchorHref()
+                if char_format.isAnchor()
+                else ""
+            )
+            if href and not is_ultralink_href(href):
+                return True
+        return False
+
+    @staticmethod
+    def _ultralink_format_transform(
+        href: str,
+        color: Optional[QColor],
+    ) -> Callable[[QTextCharFormat], None]:
+        def transform(char_format: QTextCharFormat) -> None:
+            char_format.setAnchor(True)
+            char_format.setAnchorHref(href)
+            char_format.setFontItalic(True)
+            char_format.setFontUnderline(False)
+            char_format.setUnderlineStyle(
+                QTextCharFormat.UnderlineStyle.NoUnderline
+            )
+            if color is not None:
+                char_format.setForeground(color)
+
+        return transform
+
+    def remove_ultralink(self, cursor: QTextCursor) -> None:
+        def transform(char_format: QTextCharFormat) -> None:
+            char_format.setAnchor(False)
+            char_format.setAnchorHref("")
+            char_format.setFontItalic(False)
+            char_format.setFontUnderline(False)
+            char_format.setUnderlineStyle(
+                QTextCharFormat.UnderlineStyle.NoUnderline
+            )
+            char_format.clearForeground()
+
+        self._transform_cursor_formats(cursor, transform)
+        self._update_link_actions()
+        self._update_ultralink_action()
 
     # ──────────────────────────────────────────────────────────────────────
     # Formatting

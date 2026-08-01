@@ -40,6 +40,7 @@ from typing import Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
+from project_state import ApplicationState, ProjectStateController
 
 __all__ = [
     "CommandTab",
@@ -59,7 +60,6 @@ try:
         USER_MESSAGE_DIR,
         USER_SOUNDS_DIR,
         MUSIC_FILE,
-        OUTPUT_PLAY_DIR,
     )
 except Exception:
     SETTINGS_FILE = "settings.json"
@@ -68,7 +68,14 @@ except Exception:
     USER_MESSAGE_DIR = "gallery/user/message"
     USER_SOUNDS_DIR = "gallery/user/sounds"
     MUSIC_FILE = "music.mp3"
-    OUTPUT_PLAY_DIR = os.path.join("output", "Play")
+
+
+RESET_SETTINGS = {
+    "starting_volume": 50,
+    "music_volume": 50,
+    "music_file": "",
+    "last_audio": "none",
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -141,40 +148,6 @@ def _safe_delete_file(
         pass
 
     return 0
-
-
-def _read_settings(
-    path: Path,
-) -> dict:
-    try:
-        if path.exists():
-            return json.loads(
-                path.read_text(
-                    encoding="utf-8",
-                )
-            )
-
-    except Exception:
-        pass
-
-    return {}
-
-
-def _write_settings(
-    path: Path,
-    data: dict,
-) -> None:
-    try:
-        path.write_text(
-            json.dumps(
-                data,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-    except Exception:
-        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -431,45 +404,8 @@ def _clear_message_tab_inputs(
         except Exception:
             pass
 
-        try:
-            if hasattr(
-                message_tab,
-                "_save_settings",
-            ):
-                message_tab._save_settings()
-
-        except Exception:
-            pass
-
     except Exception:
         pass
-
-
-def _reset_settings_on_disk(
-    root: Path,
-) -> None:
-    settings_path = (
-        root / SETTINGS_FILE
-    ).resolve()
-
-    data = _read_settings(
-        settings_path
-    )
-
-    data["recipient_name"] = ""
-    data["recipient_title"] = ""
-    data[PUBLISHED_PAGE_URL_KEY] = ""
-
-    data["starting_volume"] = 50
-    data["music_volume"] = 50
-
-    data["music_file"] = ""
-    data["last_audio"] = "none"
-
-    _write_settings(
-        settings_path,
-        data,
-    )
 
 
 def _reset_project_sound_state(
@@ -563,9 +499,15 @@ def _delete_music_and_manifest(
 # ─────────────────────────────────────────────────────────────────────────────
 def reset_everything(
     *,
+    project_root: str | Path | None = None,
     parent: Optional[QtWidgets.QWidget] = None,
+    project_state: ProjectStateController | None = None,
 ) -> Tuple[int, int]:
-    root = app_root()
+    root = (
+        Path(project_root).resolve()
+        if project_root is not None
+        else app_root()
+    )
 
     pages_dir = (
         root / USER_PAGES_DIR
@@ -573,10 +515,6 @@ def reset_everything(
 
     message_dir = (
         root / USER_MESSAGE_DIR
-    ).resolve()
-
-    play_dir = (
-        root / OUTPUT_PLAY_DIR
     ).resolve()
 
     pages_dir.mkdir(
@@ -615,14 +553,6 @@ def reset_everything(
     total_files += files
     total_dirs += directories
 
-    if play_dir.is_dir():
-        files, directories = _safe_clear_dir_contents(
-            play_dir
-        )
-
-        total_files += files
-        total_dirs += directories
-
     # Remove active generated music and compatibility manifest.
     total_files += _delete_music_and_manifest(
         root
@@ -630,11 +560,6 @@ def reset_everything(
 
     # Clear the selected track or playlist.
     _reset_project_sound_state(
-        root
-    )
-
-    # Reset settings.json.
-    _reset_settings_on_disk(
         root
     )
 
@@ -646,6 +571,11 @@ def reset_everything(
     # Clear the live Sound tab immediately.
     _force_soundtab_no_audio(
         window
+    )
+
+    controller = project_state or ProjectStateController(root)
+    controller.begin_new_project(
+        additional_settings=RESET_SETTINGS
     )
 
     return total_files, total_dirs
@@ -917,6 +847,9 @@ def _toast(
 
 def confirm_and_reset(
     parent: Optional[QtWidgets.QWidget] = None,
+    *,
+    project_root: str | Path | None = None,
+    project_state: ProjectStateController | None = None,
 ) -> bool:
     dialog = _ConfirmDialog(
         parent
@@ -935,9 +868,36 @@ def confirm_and_reset(
     if dialog.exec() != QtWidgets.QDialog.Accepted:
         return False
 
-    files, _directories = reset_everything(
-        parent=parent
+    previous_identity = (
+        project_state.identity
+        if project_state is not None
+        else None
     )
+    if (
+        project_state is not None
+        and project_state.state is not ApplicationState.PROJECT_CLEARING
+    ):
+        project_state.transition(
+            ApplicationState.PROJECT_CLEARING
+        )
+    try:
+        files, _directories = reset_everything(
+            project_root=project_root,
+            parent=parent,
+            project_state=project_state,
+        )
+    except Exception:
+        if (
+            project_state is not None
+            and previous_identity is not None
+            and previous_identity.is_valid
+            and project_state.state is ApplicationState.PROJECT_CLEARING
+        ):
+            project_state.transition(
+                ApplicationState.PROJECT_READY,
+                identity=previous_identity,
+            )
+        raise
 
     _toast(
         parent,
@@ -1249,6 +1209,8 @@ class CommandTab(
         self,
         project_root: Path,
         parent: Optional[QtWidgets.QWidget] = None,
+        *,
+        project_state: ProjectStateController | None = None,
     ):
         super().__init__(
             parent
@@ -1257,6 +1219,7 @@ class CommandTab(
         self.project_root = Path(
             project_root
         ).resolve()
+        self.project_state = project_state
 
         self.setObjectName(
             "CommandTab"
@@ -1332,7 +1295,9 @@ class CommandTab(
         self,
     ) -> None:
         confirm_and_reset(
-            self
+            self,
+            project_root=self.project_root,
+            project_state=self.project_state,
         )
 
     def resizeEvent(

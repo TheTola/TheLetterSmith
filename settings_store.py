@@ -376,6 +376,58 @@ class SettingsStore:
             self._settings
         )
 
+    def replace_snapshot(
+        self,
+        settings: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically replace the complete project settings snapshot."""
+        lock = self._lock_for(
+            self.path
+        )
+
+        with lock:
+            before, _invalid = (
+                self._read_unlocked()
+            )
+
+            before = self._normalize(
+                before
+            )
+
+            replacement = self._normalize(
+                settings
+            )
+
+            self._write_unlocked(
+                replacement
+            )
+
+            self._settings = replacement
+
+        changed_keys = tuple(
+            sorted(
+                key
+                for key in (
+                    set(before)
+                    | set(replacement)
+                )
+                if (
+                    before.get(key)
+                    != replacement.get(key)
+                )
+            )
+        )
+
+        if changed_keys:
+            self.changed.emit(
+                self._settings,
+                changed_keys,
+            )
+
+        return dict(
+            self._settings
+        )
+
     def _read_unlocked(
         self,
     ) -> tuple[

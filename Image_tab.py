@@ -27,6 +27,9 @@ from PySide6.QtCore import QPoint, QSize, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon
 
 from image_button import ArtworkButton
+from project_paths import ProjectPathResolver
+from project_save import ProjectSaveService
+from project_state import ProjectStateController
 from project_sync import image_fingerprint
 
 
@@ -790,8 +793,28 @@ class ImageTab(
     # Positive values move them downward.
     UTILITY_BUTTON_Y_OFFSET = -80
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        project_root: str | Path | None = None,
+        *,
+        project_state: ProjectStateController | None = None,
+        project_paths: ProjectPathResolver | None = None,
+    ) -> None:
         super().__init__()
+        self.project_root = Path(
+            project_root or Path(__file__).resolve().parent
+        ).resolve()
+        self.project_state = project_state
+        if self.project_state is None:
+            self.project_state = ProjectStateController(
+                self.project_root
+            )
+            self.project_state.initialize()
+        self.project_save_service = ProjectSaveService(
+            self.project_root,
+            self.project_state,
+            resolver=project_paths,
+        )
 
         self.labels = {
             1: (
@@ -1144,9 +1167,7 @@ class ImageTab(
     # ─────────────────────────────────────────────────────────────────────
 
     def _project_dir(self) -> str:
-        return os.path.dirname(
-            os.path.abspath(__file__)
-        )
+        return str(self.project_root)
 
     def _user_pages_dir(self) -> str:
         return os.path.join(
@@ -1683,6 +1704,12 @@ class ImageTab(
     ) -> None:
         if index not in self.labels:
             return
+        if not self.project_state.is_project_ready:
+            self._show_temporary_status(
+                "A recipient is required before saving images.",
+                5000,
+            )
+            return
 
         _label, filename = (
             self.labels[index]
@@ -1712,6 +1739,10 @@ class ImageTab(
             _save_png(
                 image,
                 destination_path,
+            )
+            self.project_save_service.copy_workspace_file(
+                destination_path,
+                Path("pages") / filename,
             )
 
         except Exception as error:
@@ -1790,6 +1821,10 @@ class ImageTab(
         try:
             if os.path.isfile(path):
                 os.remove(path)
+            if self.project_state.is_project_ready:
+                self.project_save_service.delete_project_file(
+                    Path("pages") / filename
+                )
 
         except OSError as error:
             self._show_temporary_status(
@@ -1853,6 +1888,10 @@ class ImageTab(
             try:
                 if os.path.isfile(path):
                     os.remove(path)
+                if self.project_state.is_project_ready:
+                    self.project_save_service.delete_project_file(
+                        Path("pages") / filename
+                    )
 
             except OSError:
                 pass

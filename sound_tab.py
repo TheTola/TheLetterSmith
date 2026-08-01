@@ -30,6 +30,9 @@ from config import (
     STARTING_VOLUME,
     USER_SOUNDS_DIR,
 )
+from project_paths import ProjectPathResolver
+from project_save import ProjectSaveService
+from project_state import ProjectStateController
 
 from sound_model import (
     ProjectSoundState,
@@ -45,6 +48,7 @@ from sound_model import (
     load_project_state,
     originals_dir,
     processed_dir,
+    project_sound_path,
     resolve_track_path,
     safe_filename,
     save_library,
@@ -3626,12 +3630,26 @@ class SoundTab(QtWidgets.QWidget):
     def __init__(
         self,
         project_root: str | Path,
+        *,
+        project_state: ProjectStateController | None = None,
+        project_paths: ProjectPathResolver | None = None,
     ) -> None:
         super().__init__()
 
         self.project_root = Path(
             project_root
         ).resolve()
+        self.project_state = project_state
+        if self.project_state is None:
+            self.project_state = ProjectStateController(
+                self.project_root
+            )
+            self.project_state.initialize()
+        self.project_save_service = ProjectSaveService(
+            self.project_root,
+            self.project_state,
+            resolver=project_paths,
+        )
 
         self.library = SoundLibrary(
             self.project_root,
@@ -3695,6 +3713,12 @@ class SoundTab(QtWidgets.QWidget):
         self._status_timer.timeout.connect(
             lambda:
                 self.status.setText("")
+        )
+
+        self._playback_pulse_timer = QtCore.QTimer(self)
+        self._playback_pulse_timer.setInterval(520)
+        self._playback_pulse_timer.timeout.connect(
+            self._pulse_playback_button
         )
 
         self._init_analysis()
@@ -3906,6 +3930,20 @@ class SoundTab(QtWidgets.QWidget):
 
         self.play_btn = QtWidgets.QToolButton()
 
+        self.play_btn.setObjectName(
+            "soundPlayButton"
+        )
+
+        self.play_btn.setProperty(
+            "playing",
+            False,
+        )
+
+        self.play_btn.setProperty(
+            "pulse",
+            False,
+        )
+
         self.play_btn.setText(
             "▶"
         )
@@ -3976,6 +4014,16 @@ class SoundTab(QtWidgets.QWidget):
             QToolButton:hover {
                 border-color: #00c8ff;
                 background: #233447;
+            }
+
+            QToolButton#soundPlayButton[playing="true"] {
+                color: #9bfffb;
+                border-color: #00c8ff;
+            }
+
+            QToolButton#soundPlayButton[playing="true"][pulse="true"] {
+                background: #294858;
+                border-color: #d8ffff;
             }
             """
         )
@@ -4438,6 +4486,10 @@ class SoundTab(QtWidgets.QWidget):
                 )
         )
 
+        self.player.playbackChanged.connect(
+            self._on_playback_changed
+        )
+
         self.player.positionChanged.connect(
             self._on_position_changed
         )
@@ -4468,6 +4520,34 @@ class SoundTab(QtWidgets.QWidget):
         self.project_sound.changed.connect(
             self._project_state_changed
         )
+
+    def _on_playback_changed(
+        self,
+        playing: bool,
+    ) -> None:
+        playing = bool(playing)
+        self.play_btn.setProperty("playing", playing)
+        self.play_btn.setProperty("pulse", False)
+        if playing:
+            self._playback_pulse_timer.start()
+        else:
+            self._playback_pulse_timer.stop()
+        self._polish_playback_button()
+
+    def _pulse_playback_button(self) -> None:
+        if not self.play_btn.property("playing"):
+            self._playback_pulse_timer.stop()
+            return
+        self.play_btn.setProperty(
+            "pulse",
+            not bool(self.play_btn.property("pulse")),
+        )
+        self._polish_playback_button()
+
+    def _polish_playback_button(self) -> None:
+        self.play_btn.style().unpolish(self.play_btn)
+        self.play_btn.style().polish(self.play_btn)
+        self.play_btn.update()
 
     def _load_volume(
         self,
@@ -4555,6 +4635,7 @@ class SoundTab(QtWidgets.QWidget):
         )
 
     def _project_state_changed(self) -> None:
+        self._sync_project_sound_autosave()
         self._reload_player_queue()
         self._refresh_ui()
 
@@ -4562,6 +4643,23 @@ class SoundTab(QtWidgets.QWidget):
         self.sound_state_changed.emit(
             "project-sound-changed"
         )
+
+    def _sync_project_sound_autosave(self) -> None:
+        if not self.project_state.is_project_ready:
+            return
+        source = project_sound_path(self.project_root)
+        if not source.is_file():
+            return
+        try:
+            self.project_save_service.copy_workspace_file(
+                source,
+                Path("sounds") / "project_sound.json",
+            )
+        except Exception as error:
+            logging.getLogger(__name__).warning(
+                "Could not autosave project sound state: %s",
+                error,
+            )
 
     def _reload_player_queue(
         self,
@@ -5474,6 +5572,7 @@ class SoundTab(QtWidgets.QWidget):
             self.project_root,
             self.project_sound.state,
         )
+        self._sync_project_sound_autosave()
 
         self._refresh_playlist()
 
@@ -5545,6 +5644,7 @@ class SoundTab(QtWidgets.QWidget):
                     self.project_root,
                     self.project_sound.state,
                 )
+                self._sync_project_sound_autosave()
             except OSError as error:
                 self.project_sound.state.selected_track_id = (
                     previous_track_id

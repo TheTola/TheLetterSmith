@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import logging
 import hashlib
 import json
+import logging
 import secrets
 import shutil
 import subprocess
@@ -117,22 +117,31 @@ def sms_handler_available() -> bool:
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
-
 def _directory_digest(directory: Path) -> str:
     root = Path(directory).resolve()
     digest = hashlib.sha256()
     files = sorted(
-        (candidate for candidate in root.rglob("*") if candidate.is_file()),
-        key=lambda candidate: candidate.relative_to(root).as_posix(),
+        (
+            candidate
+            for candidate in root.rglob("*")
+            if candidate.is_file()
+        ),
+        key=lambda candidate: (
+            candidate.relative_to(root).as_posix()
+        ),
     )
     for path in files:
         if path.is_symlink():
-            raise ValueError("Published letter bundles cannot contain symbolic links.")
+            raise ValueError(
+                "Published letter bundles cannot contain symbolic links."
+            )
         relative = path.relative_to(root).as_posix()
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         with path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
+            while chunk := stream.read(
+                1024 * 1024
+            ):
                 digest.update(chunk)
         digest.update(b"\0")
     return digest.hexdigest()
@@ -148,7 +157,9 @@ def _publication_marker(
     return json.dumps(
         {
             "schema_version": 1,
-            "build_sha256": _directory_digest(build),
+            "build_sha256": (
+                _directory_digest(build)
+            ),
             "published_at": published_at.isoformat(),
             "public_path": public_path,
             "expires_at": expires_at.isoformat(),
@@ -504,33 +515,107 @@ class GitHubPagesPublisher(Publisher):
             staging = transaction.prepare()
             transaction_prepared = True
             shutil.copytree(build, staging)
-            index = staging / "index.html"
             marker = _publication_marker(
                 build,
                 public_path,
                 published_at=published_at,
                 expires_at=expires_at,
             )
-            atomic_write_text(staging / PUBLICATION_MARKER, marker)
+            atomic_write_text(
+                staging / PUBLICATION_MARKER,
+                marker,
+            )
+            index = staging / "index.html"
             if not index.is_file():
                 raise RuntimeError("The staged letter has no index.html.")
             transaction.commit(keep_backup=True)
             relative = destination.relative_to(workspace).as_posix()
             self._run(("git", "add", "--", relative), cwd=workspace)
-            self._run(
+            staged = self._run(
                 (
                     "git",
-                    "commit",
-                    "-m",
-                    f"Publish letter: {metadata.get('recipient_name', '')} — "
-                    f"{metadata.get('recipient_title', '')}",
+                    "diff",
+                    "--cached",
+                    "--quiet",
+                    "--",
+                    relative,
                 ),
                 cwd=workspace,
+                check=False,
             )
-            self._run(("git", "push", "origin", branch), cwd=workspace)
-            pushed = True
             url = github_pages_url(repository, public_path)
-            if not self.poller(url, 120.0, 2.0):
+            if staged.returncode not in {0, 1}:
+                raise RuntimeError(
+                    "Git could not inspect the staged publication."
+                )
+            if staged.returncode == 1:
+                self._run(
+                    (
+                        "git",
+                        "commit",
+                        "--only",
+                        "-m",
+                        f"Publish letter: {metadata.get('recipient_name', '')} — "
+                        f"{metadata.get('recipient_title', '')}",
+                        "--",
+                        relative,
+                    ),
+                    cwd=workspace,
+                )
+                local_head = self._run(
+                    ("git", "rev-parse", "HEAD"),
+                    cwd=workspace,
+                ).stdout.strip()
+                if not local_head:
+                    raise RuntimeError(
+                        "The publication commit could not be identified."
+                    )
+                self._run(
+                    (
+                        "git",
+                        "push",
+                        "origin",
+                        branch,
+                    ),
+                    cwd=workspace,
+                )
+                pushed = True
+                remote = self._run(
+                    (
+                        "git",
+                        "ls-remote",
+                        "--heads",
+                        "origin",
+                        f"refs/heads/{branch}",
+                    ),
+                    cwd=workspace,
+                ).stdout.strip()
+                remote_head = (
+                    remote.split(None, 1)[0]
+                    if remote
+                    else ""
+                )
+                if remote_head != local_head:
+                    raise RuntimeError(
+                        "The pushed Git revision could not be confirmed."
+                    )
+            marker_url = (
+                f"{url}{quote(PUBLICATION_MARKER)}"
+            )
+            if self.poller == self.poll_url:
+                confirmed = self.poll_url_content(
+                    marker_url,
+                    marker.encode("ascii"),
+                    120.0,
+                    2.0,
+                )
+            else:
+                confirmed = self.poller(
+                    url,
+                    120.0,
+                    2.0,
+                )
+            if not confirmed:
                 raise TimeoutError("The published URL did not become available in time.")
             try:
                 transaction.finalize()
@@ -648,7 +733,6 @@ class GitHubPagesPublisher(Publisher):
         branch = str(settings.get(BRANCH_KEY, DEFAULT_BRANCH))
         letters_root = (workspace / "letters").resolve()
         destination = letters_root / public_path
-        transaction: PathTransaction | None = None
         try:
             if destination.resolve().parent != letters_root:
                 raise ValueError("The publication path escaped the letters directory.")
@@ -697,18 +781,13 @@ class GitHubPagesPublisher(Publisher):
                         PUBLISHED_EXPIRES_AT_KEY: "",
                     }
                 )
-            return PublishResult(
-                True,
-                public_path=public_path,
-                message="Expired publication removed.",
-            )
+            return PublishResult(True, public_path=public_path, message="Expired publication removed.")
         except Exception as error:
             _LOGGER.exception("Expired publication cleanup failed for %s", public_path)
-            if transaction is not None:
-                try:
-                    transaction.rollback()
-                except OSError:
-                    _LOGGER.exception("Expired publication rollback failed for %s", public_path)
+            try:
+                transaction.rollback()
+            except (NameError, UnboundLocalError, OSError):
+                pass
             return PublishResult(
                 False,
                 public_path=public_path,
@@ -726,6 +805,51 @@ class GitHubPagesPublisher(Publisher):
                     if 200 <= int(response.status) < 400:
                         return True
             except (urllib.error.URLError, TimeoutError, OSError):
+                pass
+            time.sleep(interval)
+        return False
+
+    @staticmethod
+    def poll_url_content(
+        url: str,
+        expected: bytes,
+        timeout: float,
+        interval: float,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        attempt = 0
+        while time.monotonic() < deadline:
+            attempt += 1
+            separator = "&" if "?" in url else "?"
+            request_url = (
+                f"{url}{separator}"
+                f"lettersmith_verify={attempt}"
+            )
+            try:
+                request = urllib.request.Request(
+                    request_url,
+                    method="GET",
+                )
+                with urllib.request.urlopen(
+                    request,
+                    timeout=min(
+                        10.0,
+                        interval + 5.0,
+                    ),
+                ) as response:
+                    if (
+                        200
+                        <= int(response.status)
+                        < 400
+                        and response.read()
+                        == expected
+                    ):
+                        return True
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+            ):
                 pass
             time.sleep(interval)
         return False

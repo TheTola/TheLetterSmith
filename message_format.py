@@ -121,6 +121,12 @@ def normalize_ultralinks_in_document(document: QTextDocument) -> int:
                 if (
                     char_format.isAnchor()
                     and is_ultralink_href(char_format.anchorHref())
+                    and (
+                        not char_format.fontItalic()
+                        or char_format.fontUnderline()
+                        or char_format.underlineStyle()
+                        != QTextCharFormat.UnderlineStyle.NoUnderline
+                    )
                 ):
                     spans.append(
                         (
@@ -131,6 +137,9 @@ def normalize_ultralinks_in_document(document: QTextDocument) -> int:
                     )
             iterator += 1
         block = block.next()
+
+    if not spans:
+        return 0
 
     work = QTextCursor(document)
     work.beginEditBlock()
