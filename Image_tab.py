@@ -308,6 +308,36 @@ def _trim_artwork_canvas(
         return
 
 
+def _mask_button_to_artwork(
+    button: ArtworkButton,
+) -> None:
+    """Keep transparent artwork margins from blocking nearby buttons."""
+    if not button.has_artwork:
+        button.clearMask()
+        return
+
+    content = button.rect().adjusted(
+        2,
+        2,
+        -2,
+        -2,
+    )
+    scaled = button._artwork.scaled(
+        content.size(),
+        QtCore.Qt.KeepAspectRatio,
+        QtCore.Qt.SmoothTransformation,
+    )
+    target = QtCore.QRect(
+        content.center().x()
+        - scaled.width() // 2,
+        content.center().y()
+        - scaled.height() // 2,
+        scaled.width(),
+        scaled.height(),
+    )
+    button.setMask(QtGui.QRegion(target))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Clickable image thumbnail
 # ─────────────────────────────────────────────────────────────────────────────
@@ -986,6 +1016,10 @@ class ImageTab(
                 self.UTILITY_BUTTON_HEIGHT,
             )
 
+            _mask_button_to_artwork(
+                button
+            )
+
             button.setSizePolicy(
                 QtWidgets.QSizePolicy.Fixed,
                 QtWidgets.QSizePolicy.Fixed,
@@ -1402,6 +1436,10 @@ class ImageTab(
             button.setFixedSize(
                 self.UTILITY_BUTTON_WIDTH,
                 self.UTILITY_BUTTON_HEIGHT,
+            )
+
+            _mask_button_to_artwork(
+                button
             )
 
         # Exact horizontal position.

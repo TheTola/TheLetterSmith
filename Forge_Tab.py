@@ -53,6 +53,7 @@ PREVIEW_MODE_DESCRIPTIONS = {
     "landscape": "Wide cinematic presentation",
     "window": "Fit the available browser window",
 }
+RECENT_SAVED_LETTER_LIMIT = 15
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -664,6 +665,8 @@ class ForgeTab(QtWidgets.QWidget):
         self._selected_saved_letter: Optional[SavedLetter] = None
         self._pending_recipient_entry: Optional[SavedLetter] = None
         self._saved_cards: list[SavedLetterCard] = []
+        self._archived_entries: list[SavedLetter] = []
+        self._archive_groups: dict[str, tuple[SavedLetter, ...]] = {}
         self._saved_delete_mode = False
         self._project_fingerprint = _forge_source_fingerprint(self.project_root)
         self._source_revision = 0
@@ -854,6 +857,81 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_cards_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
         self.saved_scroll.setWidget(self.saved_cards_widget)
         saved_layout.addWidget(self.saved_scroll, 1)
+
+        self.saved_archive = QtWidgets.QFrame()
+        self.saved_archive.setObjectName("SavedLettersArchive")
+        self.saved_archive.setStyleSheet(
+            "QFrame#SavedLettersArchive{background:#0d151c;"
+            "border:1px solid #294653;border-radius:7px;}"
+            "QLabel{color:#bfeaf3;background:transparent;}"
+        )
+        archive_layout = QtWidgets.QVBoxLayout(self.saved_archive)
+        archive_layout.setContentsMargins(8, 7, 8, 8)
+        archive_layout.setSpacing(6)
+        archive_header = QtWidgets.QHBoxLayout()
+        archive_header.setContentsMargins(0, 0, 0, 0)
+        self.saved_archive_label = QtWidgets.QLabel("Archive")
+        self.saved_archive_label.setStyleSheet(
+            "font:600 10pt 'Segoe UI';color:#dff9ff;"
+        )
+        archive_header.addWidget(self.saved_archive_label)
+        self.saved_archive_recipient = QtWidgets.QComboBox()
+        self.saved_archive_recipient.setAccessibleName(
+            "Archived-letter recipient"
+        )
+        self.saved_archive_recipient.setMinimumWidth(230)
+        self.saved_archive_recipient.setStyleSheet(
+            "QComboBox{background:#13222c;color:#eafcff;"
+            "border:1px solid #356072;border-radius:6px;padding:5px 9px;}"
+            "QComboBox:hover{border-color:#00cce8;}"
+            "QComboBox QAbstractItemView{background:#101b23;color:#eafcff;"
+            "selection-background-color:#17485a;border:1px solid #356072;}"
+        )
+        self.saved_archive_recipient.currentIndexChanged.connect(
+            self._show_archived_recipient
+        )
+        archive_header.addWidget(self.saved_archive_recipient, 1)
+        archive_layout.addLayout(archive_header)
+
+        self.saved_archive_list = QtWidgets.QListWidget()
+        self.saved_archive_list.setObjectName("SavedLettersArchiveList")
+        self.saved_archive_list.setIconSize(QtCore.QSize(38, 48))
+        self.saved_archive_list.setMaximumHeight(164)
+        self.saved_archive_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff
+        )
+        self.saved_archive_list.setStyleSheet(
+            "QListWidget#SavedLettersArchiveList{background:#091116;"
+            "color:#edfaff;border:1px solid #223e4a;border-radius:5px;"
+            "font:600 9pt 'Segoe UI';outline:none;}"
+            "QListWidget#SavedLettersArchiveList::item{padding:4px 7px;}"
+            "QListWidget#SavedLettersArchiveList::item:selected{"
+            "background:#17485a;color:#ffffff;}"
+        )
+        self.saved_archive_list.itemSelectionChanged.connect(
+            self._select_archived_letter
+        )
+        self.saved_archive_list.itemActivated.connect(
+            self._activate_archived_letter
+        )
+        archive_layout.addWidget(self.saved_archive_list)
+
+        self.saved_archive_delete = QtWidgets.QPushButton(
+            "Delete selected archived letter"
+        )
+        self.saved_archive_delete.setCursor(Qt.PointingHandCursor)
+        self.saved_archive_delete.setStyleSheet(
+            "QPushButton{background:#25191d;color:#ffb2b2;"
+            "border:1px solid #65434a;border-radius:5px;padding:5px 10px;}"
+            "QPushButton:hover{background:#702f38;color:#fff;}"
+        )
+        self.saved_archive_delete.clicked.connect(
+            self._delete_selected_archived_letter
+        )
+        self.saved_archive_delete.hide()
+        archive_layout.addWidget(self.saved_archive_delete)
+        self.saved_archive.hide()
+        saved_layout.addWidget(self.saved_archive)
 
         self.identity_panel = QtWidgets.QFrame()
         self.identity_panel.setObjectName("ForgeIdentity")
@@ -1162,6 +1240,8 @@ class ForgeTab(QtWidgets.QWidget):
         horizontal = self.saved_scroll.horizontalScrollBar().value()
         vertical = self.saved_scroll.verticalScrollBar().value()
         entries = self.catalog.list_entries()
+        recent_entries = entries[:RECENT_SAVED_LETTER_LIMIT]
+        archived_entries = entries[RECENT_SAVED_LETTER_LIMIT:]
         for card in self._saved_cards:
             card.hide()
             self.saved_cards_layout.removeWidget(card)
@@ -1169,7 +1249,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._saved_cards = []
         self._selected_saved_letter = None
 
-        for entry in entries:
+        for entry in recent_entries:
             card = SavedLetterCard(entry, self.saved_cards_widget)
             card.setEnabled(not self._busy)
             card.set_delete_mode(self._saved_delete_mode)
@@ -1181,6 +1261,7 @@ class ForgeTab(QtWidgets.QWidget):
                 card.set_selected(True)
             self._saved_cards.append(card)
 
+        self._refresh_saved_archive(archived_entries, selected_path)
         self._layout_saved_cards()
         self._watch_saved_letter_paths(entries)
         self._pending_scroll_position = (horizontal, vertical)
@@ -1216,6 +1297,123 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_delete_toggle.setAccessibleName(accessible)
         for card in self._saved_cards:
             card.set_delete_mode(self._saved_delete_mode)
+        self.saved_archive_delete.setVisible(
+            self._saved_delete_mode
+            and self.saved_archive_list.currentItem() is not None
+        )
+
+    def _refresh_saved_archive(
+        self,
+        entries: tuple[SavedLetter, ...],
+        selected_path: str,
+    ) -> None:
+        selected_recipient = self.saved_archive_recipient.currentText()
+        groups: dict[str, list[SavedLetter]] = {}
+        display_names: dict[str, str] = {}
+        selected_group = ""
+        for entry in entries:
+            recipient = " ".join(entry.recipient.split()) or "Unknown recipient"
+            key = recipient.casefold()
+            groups.setdefault(key, []).append(entry)
+            display_names.setdefault(key, recipient)
+            if str(entry.path) == selected_path:
+                selected_group = key
+
+        self._archive_groups = {
+            key: tuple(group)
+            for key, group in groups.items()
+        }
+        self.saved_archive_recipient.blockSignals(True)
+        self.saved_archive_recipient.clear()
+        self.saved_archive_recipient.addItem("Choose recipient…", "")
+        for key in groups:
+            self.saved_archive_recipient.addItem(display_names[key], key)
+        target_key = selected_group
+        if not target_key and selected_recipient:
+            previous = self.saved_archive_recipient.findText(
+                selected_recipient,
+                Qt.MatchFixedString,
+            )
+            if previous >= 0:
+                target_key = str(
+                    self.saved_archive_recipient.itemData(previous) or ""
+                )
+        target_index = self.saved_archive_recipient.findData(target_key)
+        self.saved_archive_recipient.setCurrentIndex(max(0, target_index))
+        self.saved_archive_recipient.blockSignals(False)
+        self.saved_archive_label.setText(f"Archive ({len(entries)})")
+        self.saved_archive.setVisible(bool(entries))
+        self._show_archived_recipient(
+            self.saved_archive_recipient.currentIndex(),
+            selected_path=selected_path,
+        )
+
+    def _show_archived_recipient(
+        self,
+        index: int,
+        *,
+        selected_path: str = "",
+    ) -> None:
+        key = str(self.saved_archive_recipient.itemData(index) or "")
+        self._archived_entries = list(self._archive_groups.get(key, ()))
+        self.saved_archive_list.clear()
+        selected_row = -1
+        for row, entry in enumerate(self._archived_entries):
+            item = QtWidgets.QListWidgetItem(entry.title)
+            item.setToolTip(
+                f"{entry.title}\n{entry.path}\nDouble-click or press Enter to load."
+            )
+            item.setSizeHint(QtCore.QSize(0, 56))
+            if entry.cover_path is not None:
+                cover = QtGui.QPixmap(str(entry.cover_path))
+                if not cover.isNull():
+                    item.setIcon(
+                        QtGui.QIcon(
+                            cover.scaled(
+                                38,
+                                48,
+                                Qt.KeepAspectRatio,
+                                Qt.SmoothTransformation,
+                            )
+                        )
+                    )
+            self.saved_archive_list.addItem(item)
+            if str(entry.path) == selected_path:
+                selected_row = row
+                self._selected_saved_letter = entry
+        self.saved_archive_list.setVisible(bool(self._archived_entries))
+        if selected_row >= 0:
+            self.saved_archive_list.setCurrentRow(selected_row)
+        self.saved_archive_delete.setVisible(
+            self._saved_delete_mode and selected_row >= 0
+        )
+
+    def _selected_archived_entry(self) -> Optional[SavedLetter]:
+        row = self.saved_archive_list.currentRow()
+        if 0 <= row < len(self._archived_entries):
+            return self._archived_entries[row]
+        return None
+
+    def _select_archived_letter(self) -> None:
+        entry = self._selected_archived_entry()
+        if entry is None:
+            self.saved_archive_delete.hide()
+            return
+        self._select_saved_letter(entry)
+        self.saved_archive_delete.setVisible(self._saved_delete_mode)
+
+    def _activate_archived_letter(
+        self,
+        _item: QtWidgets.QListWidgetItem,
+    ) -> None:
+        entry = self._selected_archived_entry()
+        if entry is not None:
+            self._activate_saved_letter(entry)
+
+    def _delete_selected_archived_letter(self) -> None:
+        entry = self._selected_archived_entry()
+        if entry is not None:
+            self._delete_saved_letter(entry)
 
     def load_selected_letter(self) -> None:
         entry = self._selected_saved_letter
@@ -2081,6 +2279,9 @@ class ForgeTab(QtWidgets.QWidget):
     def _set_busy(self, busy: bool) -> None:
         for card in self._saved_cards:
             card.setEnabled(not busy)
+        self.saved_archive_recipient.setEnabled(not busy)
+        self.saved_archive_list.setEnabled(not busy)
+        self.saved_archive_delete.setEnabled(not busy)
         self.load_saved_btn.setEnabled(not busy)
         self.saved_delete_toggle.setEnabled(not busy)
         self.preview_mode.setEnabled(not busy)

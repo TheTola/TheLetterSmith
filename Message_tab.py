@@ -210,9 +210,9 @@ class DropMessageButton(ArtworkButton):
 
     def __init__(self, project_root: str | Path, label: str = "Import") -> None:
         super().__init__(label, project_root, "EButton.png")
-        self.setFont(QFont("Segoe UI Semibold", 12, QFont.Bold))
-        self.setMinimumWidth(198)
-        self.setFixedHeight(82)
+        self.setFont(QFont("Segoe UI Semibold", 24, QFont.Bold))
+        self.setMinimumWidth(158)
+        self.setFixedHeight(66)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Fixed,
@@ -489,11 +489,11 @@ class MessageTab(QtWidgets.QWidget):
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setHorizontalSpacing(10)
         actions.setVerticalSpacing(8)
-        actions.setColumnStretch(0, 1)
-        actions.setColumnStretch(1, 1)
-        actions.setColumnStretch(2, 1)
-        actions.setColumnStretch(3, 1)
-        actions.setColumnStretch(4, 1)
+        actions.setColumnStretch(0, 13)
+        actions.setColumnStretch(1, 8)
+        actions.setColumnStretch(2, 8)
+        actions.setColumnStretch(3, 8)
+        actions.setColumnStretch(4, 13)
 
         compact_button_style = (
             "QPushButton{min-height:40px;padding:0 16px;background:#171b20;color:#e4ebf4;"
@@ -508,14 +508,14 @@ class MessageTab(QtWidgets.QWidget):
         actions.addWidget(self.btn, 0, 1)
 
         self.edit_btn = ArtworkButton("Edit", self.project_root, "ROButton.png", self)
-        self.edit_btn.setMinimumWidth(198)
-        self.edit_btn.setFixedHeight(82)
+        self.edit_btn.setMinimumWidth(158)
+        self.edit_btn.setFixedHeight(66)
         self.edit_btn.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Fixed,
         )
         self.edit_btn.set_artwork_fill(True)
-        self.edit_btn.setFont(QFont("Segoe UI Semibold", 12, QFont.Bold))
+        self.edit_btn.setFont(QFont("Segoe UI Semibold", 24, QFont.Bold))
         if not self.edit_btn.has_artwork:
             self.edit_btn.setStyleSheet(compact_button_style)
         self.edit_btn.setToolTip("Open the rich-text editor for the current message.")
@@ -525,14 +525,14 @@ class MessageTab(QtWidgets.QWidget):
         actions.addWidget(self.edit_btn, 0, 2)
 
         self.revisions_btn = ArtworkButton("Revisions", self.project_root, "RButton.png", self)
-        self.revisions_btn.setMinimumWidth(198)
-        self.revisions_btn.setFixedHeight(82)
+        self.revisions_btn.setMinimumWidth(158)
+        self.revisions_btn.setFixedHeight(66)
         self.revisions_btn.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Fixed,
         )
         self.revisions_btn.set_artwork_fill(True)
-        self.revisions_btn.setFont(QFont("Segoe UI Semibold", 12, QFont.Bold))
+        self.revisions_btn.setFont(QFont("Segoe UI Semibold", 24, QFont.Bold))
         if not self.revisions_btn.has_artwork:
             self.revisions_btn.setStyleSheet(compact_button_style)
         self.revisions_btn.setToolTip("Open autosaved message versions and restore an earlier version.")
