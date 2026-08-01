@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import secrets
 import shutil
 import subprocess
@@ -8,11 +10,19 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Sequence
 from urllib.parse import quote
 
 from publishing.base import Publisher
+from publishing.expiration import (
+    PUBLICATION_CLEANUP_POLICY,
+    PUBLICATION_TTL_DAYS,
+    PUBLISHED_AT_KEY,
+    PUBLISHED_EXPIRES_AT_KEY,
+    publication_window,
+)
 from publishing.models import PublishConfiguration, PublishResult
 from settings_store import SettingsStore
 from transactional_io import PathTransaction, atomic_write_text
@@ -24,6 +34,7 @@ BRANCH_KEY = "github_pages_branch"
 PUBLIC_WARNING_KEY = "github_pages_public_warning_acknowledged"
 DEFAULT_REPOSITORY = "letter-smith-publishing"
 DEFAULT_BRANCH = "main"
+PUBLICATION_MARKER = "lettersmith-publication.json"
 _LOGGER = logging.getLogger(__name__)
 
 PAGES_WORKFLOW = """name: Deploy Letter Smith pages
@@ -103,6 +114,50 @@ def sms_handler_available() -> bool:
         text=True,
     )
     return result.returncode == 0 and bool(result.stdout.strip())
+
+
+
+def _directory_digest(directory: Path) -> str:
+    root = Path(directory).resolve()
+    digest = hashlib.sha256()
+    files = sorted(
+        (candidate for candidate in root.rglob("*") if candidate.is_file()),
+        key=lambda candidate: candidate.relative_to(root).as_posix(),
+    )
+    for path in files:
+        if path.is_symlink():
+            raise ValueError("Published letter bundles cannot contain symbolic links.")
+        relative = path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _publication_marker(
+    build: Path,
+    public_path: str,
+    *,
+    published_at: datetime,
+    expires_at: datetime,
+) -> str:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "build_sha256": _directory_digest(build),
+            "published_at": published_at.isoformat(),
+            "public_path": public_path,
+            "expires_at": expires_at.isoformat(),
+            "expires_after_days": PUBLICATION_TTL_DAYS,
+            "cleanup_policy": PUBLICATION_CLEANUP_POLICY,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 class GitHubPagesPublisher(Publisher):
@@ -428,6 +483,7 @@ class GitHubPagesPublisher(Publisher):
             str(metadata.get("recipient_name", "")),
             str(metadata.get("recipient_title", "")),
         )
+        published_at, expires_at = publication_window()
         destination = workspace / "letters" / public_path
         transaction = PathTransaction(destination, staging_suffix=".publish-staging")
         start_head = ""
@@ -448,6 +504,13 @@ class GitHubPagesPublisher(Publisher):
             transaction_prepared = True
             shutil.copytree(build, staging)
             index = staging / "index.html"
+            marker = _publication_marker(
+                build,
+                public_path,
+                published_at=published_at,
+                expires_at=expires_at,
+            )
+            atomic_write_text(staging / PUBLICATION_MARKER, marker)
             if not index.is_file():
                 raise RuntimeError("The staged letter has no index.html.")
             transaction.commit(keep_backup=True)
@@ -475,6 +538,12 @@ class GitHubPagesPublisher(Publisher):
                     "Published letter cleanup failed for %s",
                     destination,
                 )
+            self.settings.update_fields(
+                **{
+                    PUBLISHED_AT_KEY: published_at.isoformat(),
+                    PUBLISHED_EXPIRES_AT_KEY: expires_at.isoformat(),
+                }
+            )
             return PublishResult(True, url, public_path, "Published.")
         except Exception as error:
             cleanup_errors: list[str] = []
