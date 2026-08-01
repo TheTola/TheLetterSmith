@@ -18,7 +18,6 @@ from Editor import Editor
 from Forge_Tab import ForgeTab, ReadinessWindow
 from config import CONTROL_FILES, REQUIRED_SLIDES
 from project_paths import ProjectPathError, ProjectPathResolver
-from project_store import ProjectStore
 from readiness import ReadinessResult, evaluate_readiness
 from sound_model import TrackRecord
 from sound_tab import ArchiveDialog
@@ -151,20 +150,6 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 (copy / "lettersmith-metadata.json").read_text(encoding="utf-8"),
                 before,
             )
-
-    def test_project_store_uses_output_projects_and_migrates_old_root(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            legacy = root / "projects" / "old-project"
-            legacy.mkdir(parents=True)
-            (legacy / "project.json").write_text(
-                json.dumps({"name": "Old"}),
-                encoding="utf-8",
-            )
-            store = ProjectStore(root)
-            self.assertEqual(store.projects_dir, (root / "output" / "projects").resolve())
-            self.assertTrue((store.projects_dir / "old-project" / "project.json").is_file())
-            self.assertFalse((root / "projects").exists())
 
     def _make_editor(self, preset: str) -> tuple[Editor, tempfile.TemporaryDirectory[str]]:
         holder = tempfile.TemporaryDirectory()

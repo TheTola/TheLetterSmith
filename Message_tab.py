@@ -491,7 +491,7 @@ class MessageTab(QtWidgets.QWidget):
         )
         shell = QtWidgets.QVBoxLayout(self.message_content_shell)
         shell.setContentsMargins(0, 0, 0, 0)
-        shell.setSpacing(10)
+        shell.setSpacing(5)
 
         header = QtWidgets.QLabel("Your Letter’s Message")
         header.setFont(QFont("Papyrus", 14))
@@ -505,7 +505,7 @@ class MessageTab(QtWidgets.QWidget):
         title_recipient_layout = QtWidgets.QFormLayout(self.title_recipient_container)
         title_recipient_layout.setContentsMargins(0, 0, 0, 0)
         title_recipient_layout.setHorizontalSpacing(10)
-        title_recipient_layout.setVerticalSpacing(7)
+        title_recipient_layout.setVerticalSpacing(12)
         title_recipient_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
 
         self.title_input = IdentityLineEdit(self.settings.get("recipient_title", ""))
@@ -1014,6 +1014,7 @@ class MessageTab(QtWidgets.QWidget):
                 "border:1px solid #38424f;border-radius:5px;padding:5px;}"
                 "QLineEdit:focus{border-color:#00d2ef;}"
             )
+        field.setMinimumHeight(field.sizeHint().height())
 
     def _unlock_identity_field(
         self,

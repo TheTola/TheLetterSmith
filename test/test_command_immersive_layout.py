@@ -99,6 +99,92 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
             )
             window.close()
 
+    def test_forge_preview_is_unloaded_before_directory_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            preview = root / "preview"
+            preview.mkdir()
+            index = preview / "index.html"
+            index.write_text(
+                "<!doctype html><html><body>preview</body></html>",
+                encoding="utf-8",
+            )
+            window = Nexus(root)
+            window._initialize_project_tabs()
+            try:
+                loaded = False
+                load_loop = QtCore.QEventLoop()
+                load_timeout = QtCore.QTimer()
+                load_timeout.setSingleShot(True)
+                load_timeout.timeout.connect(load_loop.quit)
+
+                def finish_load(ok: bool) -> None:
+                    nonlocal loaded
+                    loaded = bool(ok)
+                    load_loop.quit()
+
+                window.html_preview.loadFinished.connect(finish_load)
+                window.html_preview.setUrl(
+                    QtCore.QUrl.fromLocalFile(str(index))
+                )
+                load_timeout.start(3000)
+                load_loop.exec()
+                window.html_preview.loadFinished.disconnect(finish_load)
+                self.assertTrue(loaded)
+
+                window.forge_tab._busy = True
+                window._show_forge_preview()
+                self.assertEqual(
+                    window.preview_caption.text(),
+                    "Preparing interactive preview…",
+                )
+                self.assertEqual(window.preview_stack.currentIndex(), 0)
+                window.forge_tab._busy = False
+
+                window._release_forge_preview_files()
+                self.assertEqual(
+                    window.html_preview.url(),
+                    QtCore.QUrl("about:blank"),
+                )
+                backup = root / "preview.build-backup"
+                os.replace(preview, backup)
+                self.assertTrue(backup.is_dir())
+            finally:
+                window.shutdown()
+                window.close()
+                self.app.processEvents()
+
+    def test_forge_fullscreen_keeps_web_preview_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window = Nexus(temp_dir)
+            window._initialize_project_tabs()
+            try:
+                window.resize(1200, 820)
+                window.application_stack.setCurrentWidget(window.body)
+                window.preview_stack.setCurrentWidget(window.html_preview)
+                window.show()
+                self.app.processEvents()
+                self.assertTrue(window.html_preview.isVisible())
+
+                window._enter_forge_fullscreen()
+                self.app.processEvents()
+
+                fullscreen = window._forge_fullscreen_window
+                self.assertIsNotNone(fullscreen)
+                self.assertTrue(fullscreen.isFullScreen())
+                self.assertIs(window.html_preview.parentWidget(), fullscreen)
+                self.assertTrue(window.html_preview.isVisible())
+                self.assertFalse(window.html_preview.size().isEmpty())
+
+                window._restore_forge_preview_from_fullscreen()
+                self.app.processEvents()
+                self.assertIs(window.html_preview.parentWidget(), window.preview_stack)
+                self.assertTrue(window.html_preview.isVisible())
+            finally:
+                window.shutdown()
+                window.close()
+                self.app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()

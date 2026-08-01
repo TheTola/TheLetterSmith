@@ -21,6 +21,64 @@ _LOGGER = logging.getLogger(__name__)
 _COMMAND_BAR_INSTANCE: Optional["CommandBarWindow"] = None
 
 
+def _gif_image_rects(path: Path) -> tuple[QtCore.QSize, tuple[QtCore.QRect, ...]]:
+    """Return the logical canvas and each GIF frame's encoded update rectangle."""
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        _LOGGER.warning("Unable to inspect GIF frame geometry %s: %s", path, exc)
+        return QtCore.QSize(), ()
+    if len(data) < 13 or data[:6] not in (b"GIF87a", b"GIF89a"):
+        return QtCore.QSize(), ()
+
+    canvas = QtCore.QSize(
+        int.from_bytes(data[6:8], "little"),
+        int.from_bytes(data[8:10], "little"),
+    )
+    cursor = 13
+    packed = data[10]
+    if packed & 0x80:
+        cursor += 3 * (1 << ((packed & 0x07) + 1))
+
+    def skip_sub_blocks(position: int) -> int:
+        while position < len(data):
+            size = data[position]
+            position += 1
+            if size == 0:
+                return position
+            position += size
+        return len(data)
+
+    rectangles: list[QtCore.QRect] = []
+    while cursor < len(data):
+        marker = data[cursor]
+        cursor += 1
+        if marker == 0x3B:
+            break
+        if marker == 0x21:
+            if cursor >= len(data):
+                break
+            cursor = skip_sub_blocks(cursor + 1)
+            continue
+        if marker != 0x2C or cursor + 9 > len(data):
+            return canvas, ()
+
+        left = int.from_bytes(data[cursor : cursor + 2], "little")
+        top = int.from_bytes(data[cursor + 2 : cursor + 4], "little")
+        width = int.from_bytes(data[cursor + 4 : cursor + 6], "little")
+        height = int.from_bytes(data[cursor + 6 : cursor + 8], "little")
+        image_packed = data[cursor + 8]
+        cursor += 9
+        rectangles.append(QtCore.QRect(left, top, width, height))
+        if image_packed & 0x80:
+            cursor += 3 * (1 << ((image_packed & 0x07) + 1))
+        if cursor >= len(data):
+            return canvas, ()
+        cursor = skip_sub_blocks(cursor + 1)
+
+    return canvas, tuple(rectangles)
+
+
 @dataclass(frozen=True)
 class CommandBarData:
     recipient_name: str
@@ -216,10 +274,33 @@ class _ElidingLabel(QtWidgets.QLabel):
         super().resizeEvent(event)
 
 
+class _CompactRestoreLabel(QtWidgets.QLabel):
+    clicked = QtCore.Signal()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.rect().contains(event.position().toPoint())
+        ):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class CommandBarWindow(QtWidgets.QWidget):
     TARGET_HEIGHT = 76
     MIN_WIDTH = 420
     MAX_WIDTH = 560
+    SCAN_INTERVAL_MS = 15_000
+    COMPACT_HEIGHT = 100
+    COMPACT_MARGIN = 16
 
     def __init__(
         self,
@@ -248,6 +329,22 @@ class CommandBarWindow(QtWidgets.QWidget):
         self._copy_icon: QtGui.QIcon | None = None
         self._copy_text = ""
         self._movie: QtGui.QMovie | None = None
+        self._compact_movie: QtGui.QMovie | None = None
+        self._compact_mode = False
+        self._compact_size = QtCore.QSize(self.COMPACT_HEIGHT, self.COMPACT_HEIGHT)
+        self._expanded_position: QtCore.QPoint | None = None
+        self._scan_movie: QtGui.QMovie | None = None
+        self._scan_frame_rects: tuple[QtCore.QRect, ...] = ()
+        self._scan_active = False
+        self._scan_timer = QtCore.QTimer(self)
+        self._scan_timer.setInterval(self.SCAN_INTERVAL_MS)
+        self._scan_timer.timeout.connect(self._start_scan_overlay)
+        self._scan_initial_timer = QtCore.QTimer(self)
+        self._scan_initial_timer.setSingleShot(True)
+        self._scan_initial_timer.timeout.connect(self._start_scan_overlay)
+        self._scan_stop_timer = QtCore.QTimer(self)
+        self._scan_stop_timer.setSingleShot(True)
+        self._scan_stop_timer.timeout.connect(self._finish_scan_overlay)
         self._background_native_size = QtCore.QSize()
         self._static_background = QtGui.QPixmap()
         self._background_mode = "fallback"
@@ -257,10 +354,6 @@ class CommandBarWindow(QtWidgets.QWidget):
         self.setObjectName("CommandBarWindow")
         self.setWindowTitle("Letter Smith Command Bar")
 
-        self._background = QtWidgets.QLabel(self)
-        self._background.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._background.setScaledContents(False)
-
         self._surface = _DragRegion(self, self)
         self._surface.setObjectName("CommandBarSurface")
         self._surface.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -268,7 +361,37 @@ class CommandBarWindow(QtWidgets.QWidget):
             "QFrame#CommandBarSurface{background:transparent;border:none;}"
         )
 
+        self._background = QtWidgets.QLabel(self._surface)
+        self._background.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+            True,
+        )
+        self._background.setScaledContents(False)
+
+        self._scan_overlay = QtWidgets.QLabel(self._background)
+        self._scan_overlay.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+            True,
+        )
+        self._scan_overlay.setScaledContents(False)
+        self._scan_overlay.hide()
+
+        self._compact_label = _CompactRestoreLabel(self)
+        self._compact_label.setFixedSize(self._compact_size)
+        self._compact_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._compact_label.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground,
+            True,
+        )
+        self._compact_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._compact_label.setToolTip("Restore Command Bar")
+        self._compact_label.setAccessibleName("Restore Command Bar")
+        self._compact_label.clicked.connect(self._restore_expanded_mode)
+        self._compact_label.hide()
+
         self._build_background()
+        self._build_scan_overlay()
+        self._build_compact_icon()
         self._build_controls()
         self._set_size_from_background()
         self._position_on_screen()
@@ -276,6 +399,18 @@ class CommandBarWindow(QtWidgets.QWidget):
     @property
     def movie(self) -> QtGui.QMovie | None:
         return self._movie
+
+    @property
+    def scan_movie(self) -> QtGui.QMovie | None:
+        return self._scan_movie
+
+    @property
+    def compact_movie(self) -> QtGui.QMovie | None:
+        return self._compact_movie
+
+    @property
+    def is_compact(self) -> bool:
+        return self._compact_mode
 
     def _build_background(self) -> None:
         icons_dir = self.project_root / "gallery" / "app" / "icons"
@@ -301,6 +436,52 @@ class CommandBarWindow(QtWidgets.QWidget):
             return
         _LOGGER.info("Command Bar decorative background is unavailable: %s", gif_path)
         self._surface.set_fallback_background(True)
+
+    def _build_scan_overlay(self) -> None:
+        scan_path = (
+            self.project_root / "gallery" / "app" / "icons" / "scanned.gif"
+        )
+        if not scan_path.is_file():
+            return
+        movie = QtGui.QMovie(str(scan_path))
+        if not movie.isValid():
+            _LOGGER.warning("Command Bar scan GIF is invalid: %s", scan_path)
+            return
+        movie.setCacheMode(QtGui.QMovie.CacheMode.CacheAll)
+        movie.frameChanged.connect(self._update_scan_frame)
+        movie.finished.connect(self._finish_scan_overlay)
+        _canvas, self._scan_frame_rects = _gif_image_rects(scan_path)
+        self._scan_movie = movie
+
+    def _build_compact_icon(self) -> None:
+        icon_path = self.project_root / "gallery" / "app" / "icons" / "com.gif"
+        if not icon_path.is_file():
+            return
+        movie = QtGui.QMovie(str(icon_path))
+        if not movie.isValid():
+            _LOGGER.warning("Command Bar compact GIF is invalid: %s", icon_path)
+            return
+        if movie.jumpToFrame(0):
+            native_size = movie.currentPixmap().size()
+            if native_size.isValid() and native_size.height() > 0:
+                compact_width = max(
+                    1,
+                    round(
+                        self.COMPACT_HEIGHT
+                        * native_size.width()
+                        / native_size.height()
+                    ),
+                )
+                self._compact_size = QtCore.QSize(
+                    compact_width,
+                    self.COMPACT_HEIGHT,
+                )
+                self._compact_label.setFixedSize(self._compact_size)
+        movie.setScaledSize(self._compact_size)
+        movie.frameChanged.connect(self._update_compact_frame)
+        self._compact_movie = movie
+        if movie.jumpToFrame(0):
+            self._update_compact_frame()
 
     def _build_controls(self) -> None:
         layout = QtWidgets.QHBoxLayout(self._surface)
@@ -345,7 +526,7 @@ class CommandBarWindow(QtWidgets.QWidget):
         self._copy_icon = self.copy_button.icon()
         self._copy_text = self.copy_button.text()
         self.minimize_button = self._make_button(
-            "minimize.png", "—", "Minimize", "Minimize", self.showMinimized
+            "minimize.png", "—", "Minimize", "Minimize", self._enter_compact_mode
         )
         self.close_button = self._make_button(
             "close.png", "×", "Close", "Close", self.close
@@ -377,6 +558,12 @@ class CommandBarWindow(QtWidgets.QWidget):
                 tooltip,
                 "This letter does not have a published link.",
             )
+        self._set_button_available(
+            self.minimize_button,
+            self._compact_movie is not None,
+            "Minimize",
+            "Compact icon is unavailable.",
+        )
 
     def _make_button(
         self,
@@ -438,6 +625,16 @@ class CommandBarWindow(QtWidgets.QWidget):
         y = geometry.bottom() - self.height() - 38
         self.move_within_screen(QtCore.QPoint(x, y), screen=screen)
 
+    def _position_compact_icon(self, screen: QtGui.QScreen | None = None) -> None:
+        target_screen = screen or self.screen() or self._screen_hint
+        target_screen = target_screen or QtGui.QGuiApplication.primaryScreen()
+        if target_screen is None:
+            return
+        geometry = target_screen.availableGeometry()
+        x = geometry.right() - self._compact_size.width() + 1 - self.COMPACT_MARGIN
+        y = geometry.bottom() - self._compact_size.height() + 1 - self.COMPACT_MARGIN
+        self.move_within_screen(QtCore.QPoint(x, y), screen=target_screen)
+
     def move_within_screen(
         self,
         requested: QtCore.QPoint,
@@ -473,8 +670,126 @@ class CommandBarWindow(QtWidgets.QWidget):
         self._background.setGeometry(self.rect())
         self._background.lower()
 
+    def _update_compact_frame(self, _frame: int = 0) -> None:
+        if self._compact_movie is None:
+            return
+        frame = self._compact_movie.currentPixmap()
+        if not frame.isNull():
+            self._compact_label.setPixmap(frame)
+
+    def _enter_compact_mode(self) -> None:
+        if self._compact_mode or self._compact_movie is None:
+            return
+        current_screen = QtGui.QGuiApplication.screenAt(
+            self.frameGeometry().center()
+        )
+        current_screen = current_screen or self.screen() or self._screen_hint
+        self._expanded_position = self.frameGeometry().topLeft()
+        self._scan_initial_timer.stop()
+        self._scan_timer.stop()
+        self._finish_scan_overlay()
+        if self._movie is not None:
+            self._movie.stop()
+        self._compact_mode = True
+        self._surface.hide()
+        self.setFixedSize(self._compact_size)
+        self._compact_label.setGeometry(self.rect())
+        self._compact_label.show()
+        self._compact_movie.start()
+        self._update_compact_frame()
+        self._position_compact_icon(current_screen)
+        self.raise_()
+
+    def _restore_expanded_mode(self) -> None:
+        if not self._compact_mode:
+            return
+        if self._compact_movie is not None:
+            self._compact_movie.stop()
+        self._compact_label.hide()
+        self._compact_mode = False
+        self._set_size_from_background()
+        self._surface.setGeometry(self.rect())
+        self._surface.show()
+        if self._movie is not None:
+            self._movie.start()
+            self._update_movie_frame()
+        if self._scan_movie is not None:
+            self._scan_timer.start()
+            self._scan_initial_timer.start(0)
+        if self._expanded_position is not None:
+            target_screen = QtGui.QGuiApplication.screenAt(self._expanded_position)
+            self.move_within_screen(
+                self._expanded_position,
+                screen=target_screen or self.screen() or self._screen_hint,
+            )
+        else:
+            self._position_on_screen()
+        self.raise_()
+        self.activateWindow()
+
+    def _start_scan_overlay(self) -> None:
+        if (
+            self._scan_movie is None
+            or self._scan_active
+            or self._compact_mode
+            or not self.isVisible()
+            or self.isMinimized()
+        ):
+            return
+        self._scan_stop_timer.stop()
+        self._scan_movie.stop()
+        self._scan_active = True
+        if not self._scan_movie.jumpToFrame(0):
+            self._finish_scan_overlay()
+            return
+        self._scan_overlay.show()
+        self._update_scan_frame(0)
+        self._scan_movie.start()
+
+    def _update_scan_frame(self, frame_number: int = 0) -> None:
+        if self._scan_movie is None:
+            return
+        frame = self._scan_movie.currentPixmap()
+        if not frame.isNull():
+            if 0 <= frame_number < len(self._scan_frame_rects):
+                update_rect = self._scan_frame_rects[frame_number].intersected(
+                    frame.rect()
+                )
+                if update_rect.isValid():
+                    isolated = QtGui.QPixmap(frame.size())
+                    isolated.fill(Qt.GlobalColor.transparent)
+                    painter = QtGui.QPainter(isolated)
+                    painter.drawPixmap(update_rect, frame, update_rect)
+                    painter.end()
+                    frame = isolated
+            self._scan_overlay.setPixmap(
+                frame.scaled(
+                    self.size(),
+                    Qt.KeepAspectRatioByExpanding,
+                    Qt.SmoothTransformation,
+                )
+            )
+        self._scan_overlay.setGeometry(self._background.rect())
+        if self._scan_active:
+            self._scan_overlay.show()
+            frame_count = self._scan_movie.frameCount()
+            if frame_count > 0 and frame_number >= frame_count - 1:
+                self._scan_stop_timer.start(
+                    max(1, self._scan_movie.nextFrameDelay())
+                )
+
+    def _finish_scan_overlay(self) -> None:
+        self._scan_stop_timer.stop()
+        if self._scan_movie is not None:
+            self._scan_movie.stop()
+        self._scan_active = False
+        self._scan_overlay.hide()
+        self._scan_overlay.clear()
+
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         super().paintEvent(event)
+        if self._compact_mode:
+            return
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
         painter.setBrush(QtGui.QColor(0, 0, 0, 255))
@@ -483,26 +798,40 @@ class CommandBarWindow(QtWidgets.QWidget):
         painter.drawRoundedRect(surface, 14.0, 14.0)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
-        self._background.setGeometry(self.rect())
+        self._surface.setGeometry(self.rect())
+        self._compact_label.setGeometry(self.rect())
+        self._background.setGeometry(self._surface.rect())
+        self._scan_overlay.setGeometry(self._background.rect())
         if self._movie is None and not self._static_background.isNull():
             self._background.setPixmap(
                 self._static_background.scaled(
                     self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
                 )
             )
-        self._surface.setGeometry(self.rect())
-        self._surface.raise_()
+        self._background.lower()
         super().resizeEvent(event)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         self._closing = False
-        self._position_on_screen()
-        if self._movie is not None:
-            self._movie.start()
-            self._update_movie_frame()
+        if self._compact_mode:
+            self._position_compact_icon()
+            if self._compact_movie is not None:
+                self._compact_movie.start()
+                self._update_compact_frame()
+        else:
+            self._position_on_screen()
+            if self._movie is not None:
+                self._movie.start()
+                self._update_movie_frame()
+            if self._scan_movie is not None:
+                self._scan_timer.start()
+                self._scan_initial_timer.start(0)
         super().showEvent(event)
 
     def present(self) -> None:
+        if self._compact_mode:
+            self._restore_expanded_mode()
+            return
         self.show()
         self.raise_()
         self.activateWindow()
@@ -571,6 +900,14 @@ class CommandBarWindow(QtWidgets.QWidget):
             return
         self._closing = True
         self._copy_timer.stop()
+        self._scan_initial_timer.stop()
+        self._scan_timer.stop()
+        self._finish_scan_overlay()
+        if self._compact_movie is not None:
+            self._compact_movie.stop()
+            self._compact_movie.setFileName("")
+        if self._scan_movie is not None:
+            self._scan_movie.setFileName("")
         if self._movie is not None:
             self._movie.stop()
             self._movie.setFileName("")

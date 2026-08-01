@@ -3067,6 +3067,9 @@ class ArchiveDialog(
         self.preview_player.setAudioOutput(
             self.preview_output
         )
+        self.preview_player.setLoops(
+            QMediaPlayer.Loops.Infinite
+        )
         self.preview_player.errorOccurred.connect(
             self._preview_failed
         )
@@ -3074,11 +3077,11 @@ class ArchiveDialog(
         self._previewing_id = ""
 
         self.search.textChanged.connect(
-            self.refresh
+            lambda _text: self._refresh_after_filter_change()
         )
 
         self.sort.currentIndexChanged.connect(
-            self.refresh
+            lambda _index: self._refresh_after_filter_change()
         )
 
         self.rename_btn.clicked.connect(
@@ -3136,6 +3139,10 @@ class ArchiveDialog(
             button.setEnabled(has_selection)
         if has_selection:
             self._preview()
+
+    def _refresh_after_filter_change(self) -> None:
+        self._stop_preview()
+        self.refresh()
 
     def _preview_failed(self, _error: QMediaPlayer.Error, message: str) -> None:
         self._stop_preview()
@@ -3277,6 +3284,7 @@ class ArchiveDialog(
         track_ids = self.selected_ids()
 
         if track_ids:
+            self._stop_preview()
             self.tracksChosen.emit(
                 track_ids
             )
@@ -3300,14 +3308,15 @@ class ArchiveDialog(
         ):
             return
 
+        if self._previewing_id != track_id:
+            self._stop_preview()
+
         path = self.library.path_for(
             track_id
         )
 
         if path is None:
             return
-
-        self.preview_player.stop()
 
         self.preview_player.setSource(
             QUrl.fromLocalFile(

@@ -10,11 +10,9 @@ import json
 import logging
 import random
 import re
-import uuid
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Callable
+from typing import List, Optional, Tuple, Dict
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QEasingCurve, QUrl
@@ -22,11 +20,15 @@ from PySide6.QtGui import QDesktopServices, QColor
 from PySide6.QtWidgets import QGraphicsDropShadowEffect
 
 from app_icon import apply_qt_window_icon, configure_windows_app_identity
+from settings_store import (
+    DEFAULT_VISIONARY_URL,
+    SettingsStore,
+    VISIONARY_URL_KEY,
+)
 from window_chrome import StandardTitleBar
 from transactional_io import atomic_write_text, safe_write_json
 
 
-VISIONARY_URL = "https://chatgpt.com/g/g-68ce5925196c8191a222e24d29323813-the-visionary"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -42,18 +44,6 @@ STATE_PERSIST_DEBOUNCE_MS = 350
 MAX_STATE_TEXT_LENGTH = 24000
 MAX_GENERATED_PROMPT_LENGTH = 24000
 MAX_MANAGED_LIST_ENTRY_LENGTH = 300
-REFERENCE_IMAGE_MAX_COUNT = 3
-REFERENCE_IMAGE_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
-REFERENCE_IMAGE_ROLES: Tuple[str, ...] = (
-    "Person Reference",
-    "Style Reference",
-    "Outfit Reference",
-    "Location Reference",
-    "Mood Reference",
-    "Object Reference",
-    "Other Reference",
-)
-DEFAULT_REFERENCE_IMAGE_ROLE = "Person Reference"
 
 
 # =========================
@@ -303,16 +293,6 @@ class PromptPayload:
         if self.format_paragraph.strip():
             paragraphs.append(_as_prompt_sentence(self.format_paragraph))
         return "\n\n".join(part for part in paragraphs if part.strip())
-
-
-@dataclass(frozen=True)
-class ReferenceImage:
-    id: str
-    path: str
-    filename: str
-    role: str = DEFAULT_REFERENCE_IMAGE_ROLE
-    added_at: str = ""
-    notes: str = ""
 
 
 @dataclass(frozen=True)
@@ -759,23 +739,6 @@ def _format_order_fragment(order: object) -> str:
     if not re.match(r"^(create|compose|render|design|produce|illustrate|make|depict|show|generate)\b", joined, re.I):
         joined = f"Create a detailed image of {joined}"
     return joined
-
-
-def _normalize_reference_role(value: object) -> str:
-    role = _normalize_text(value, strip=True, max_length=80)
-    return role if role in REFERENCE_IMAGE_ROLES else DEFAULT_REFERENCE_IMAGE_ROLE
-
-
-def _reference_image_extension(path_or_name: object) -> str:
-    text = _normalize_text(path_or_name, strip=True, max_length=1024)
-    return Path(text).suffix.lower() if text else ""
-
-
-def _reference_image_exists(ref: ReferenceImage) -> bool:
-    try:
-        return bool(ref.path) and Path(ref.path).exists()
-    except Exception:
-        return False
 
 
 def _clean_user_added_entry(value: object) -> str:
@@ -1241,175 +1204,6 @@ class FocusablePlainTextEdit(QtWidgets.QTextEdit):
         self.focused.emit()
 
 
-def _start_file_url_drag(source: QtWidgets.QWidget, paths: List[Path]) -> bool:
-    valid_paths = [Path(path) for path in paths if Path(path).exists() and Path(path).is_file()]
-    if not valid_paths:
-        return False
-
-    mime_data = QtCore.QMimeData()
-    mime_data.setUrls([QUrl.fromLocalFile(str(path)) for path in valid_paths])
-    drag = QtGui.QDrag(source)
-    drag.setMimeData(mime_data)
-    drag.exec(Qt.CopyAction)
-    return True
-
-
-def _mime_local_paths(mime_data: QtCore.QMimeData) -> List[Path]:
-    paths: List[Path] = []
-    try:
-        for url in mime_data.urls():
-            if url.isLocalFile():
-                paths.append(Path(url.toLocalFile()))
-    except Exception:
-        pass
-    return paths
-
-
-def _has_reference_image_path(paths: List[Path]) -> bool:
-    for path in paths:
-        try:
-            if Path(path).suffix.lower() in REFERENCE_IMAGE_ALLOWED_EXTENSIONS:
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _refresh_drop_style(widget: QtWidgets.QWidget) -> None:
-    try:
-        widget.style().unpolish(widget)
-        widget.style().polish(widget)
-        widget.update()
-    except Exception:
-        pass
-
-
-class ReferenceDropButton(QtWidgets.QPushButton):
-    paths_dropped = QtCore.Signal(list)
-
-    def __init__(self, text: str, parent: Optional[QtWidgets.QWidget] = None) -> None:
-        super().__init__(text, parent)
-        self.setAcceptDrops(True)
-        self.setProperty("referenceDropActive", False)
-
-    def _set_drop_active(self, active: bool) -> None:
-        self.setProperty("referenceDropActive", bool(active))
-        _refresh_drop_style(self)
-
-    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
-        paths = _mime_local_paths(event.mimeData())
-        if paths:
-            self._set_drop_active(_has_reference_image_path(paths))
-            event.acceptProposedAction()
-            return
-        event.ignore()
-
-    def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
-        paths = _mime_local_paths(event.mimeData())
-        if paths:
-            event.acceptProposedAction()
-            return
-        event.ignore()
-
-    def dragLeaveEvent(self, event: QtGui.QDragLeaveEvent) -> None:
-        self._set_drop_active(False)
-        super().dragLeaveEvent(event)
-
-    def dropEvent(self, event: QtGui.QDropEvent) -> None:
-        self._set_drop_active(False)
-        paths = _mime_local_paths(event.mimeData())
-        if paths:
-            self.paths_dropped.emit(paths)
-            event.acceptProposedAction()
-            return
-        event.ignore()
-
-
-class ReferenceImagesDropArea(QtWidgets.QFrame):
-    paths_dropped = QtCore.Signal(list)
-
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-        self.setProperty("referenceDropActive", False)
-
-    def _set_drop_active(self, active: bool) -> None:
-        self.setProperty("referenceDropActive", bool(active))
-        _refresh_drop_style(self)
-
-    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
-        paths = _mime_local_paths(event.mimeData())
-        if paths:
-            self._set_drop_active(_has_reference_image_path(paths))
-            event.acceptProposedAction()
-            return
-        event.ignore()
-
-    def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
-        paths = _mime_local_paths(event.mimeData())
-        if paths:
-            event.acceptProposedAction()
-            return
-        event.ignore()
-
-    def dragLeaveEvent(self, event: QtGui.QDragLeaveEvent) -> None:
-        self._set_drop_active(False)
-        super().dragLeaveEvent(event)
-
-    def dropEvent(self, event: QtGui.QDropEvent) -> None:
-        self._set_drop_active(False)
-        paths = _mime_local_paths(event.mimeData())
-        if paths:
-            self.paths_dropped.emit(paths)
-            event.acceptProposedAction()
-            return
-        event.ignore()
-
-
-class ReferenceImageCard(QtWidgets.QFrame):
-    copy_requested = QtCore.Signal(object)
-
-    def __init__(
-        self,
-        paths_provider: Callable[[], List[Path]],
-        parent: Optional[QtWidgets.QWidget] = None,
-    ) -> None:
-        super().__init__(parent)
-        self._paths_provider = paths_provider
-        self._drag_start_pos: Optional[QtCore.QPoint] = None
-        self.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.customContextMenuRequested.connect(self._show_copy_menu)
-
-    def _show_copy_menu(self, pos: QtCore.QPoint) -> None:
-        self._show_copy_menu_at(self.mapToGlobal(pos))
-
-    def _show_copy_menu_at(self, global_pos: QtCore.QPoint) -> None:
-        paths = self._paths_provider()
-        if not paths:
-            return
-        menu = QtWidgets.QMenu(self)
-        copy_action = menu.addAction("Copy")
-        copy_action.triggered.connect(lambda: self.copy_requested.emit(paths[0]))
-        menu.exec(global_pos)
-
-    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        if event.button() == Qt.LeftButton:
-            self._drag_start_pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
-        if not (event.buttons() & Qt.LeftButton) or self._drag_start_pos is None:
-            super().mouseMoveEvent(event)
-            return
-
-        current_pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
-        if (current_pos - self._drag_start_pos).manhattanLength() < QtWidgets.QApplication.startDragDistance():
-            super().mouseMoveEvent(event)
-            return
-
-        _start_file_url_drag(self, self._paths_provider())
-
-
 def empty_prompt_writer_state() -> dict:
     return {
         "version": PROMPT_WRITER_STATE_VERSION,
@@ -1421,7 +1215,6 @@ def empty_prompt_writer_state() -> dict:
         "checks": {key: False for key in BUILT_IN_CHECK_KEYS},
         "generated_prompts": {},
         "generated_input_signature": "",
-        "reference_images": [],
     }
 
 
@@ -1496,9 +1289,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._generated_input_signature = ""
         self._generated_output_valid = False
         self._generation_in_progress = False
-        self._reference_images: List[ReferenceImage] = []
-        self._references_visible = True
-        self._reference_html_encode_failures: List[str] = []
         self._colors_path_used: Optional[Path] = None
         self._last_focused_widget: Optional[QtWidgets.QTextEdit] = None
         self._list_manager_dialogs: Dict[str, ListManagerDialog] = {}
@@ -1778,58 +1568,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         except (RuntimeError, TypeError, ValueError) as error:
             LOGGER.exception("Prompt Writer persistence scheduling failed: %s", error)
 
-    def _normalize_reference_images(self, value: object) -> List[ReferenceImage]:
-        if not isinstance(value, list):
-            return []
-
-        refs: List[ReferenceImage] = []
-        for raw in value:
-            if len(refs) >= REFERENCE_IMAGE_MAX_COUNT:
-                break
-            if not isinstance(raw, dict):
-                continue
-
-            raw_path = _normalize_text(raw.get("path", ""), strip=True, max_length=4096)
-            filename = _normalize_text(raw.get("filename", ""), strip=True, max_length=300)
-            if not filename and raw_path:
-                filename = Path(raw_path).name
-            if not raw_path and filename:
-                raw_path = filename
-            if not raw_path and not filename:
-                continue
-
-            ext = _reference_image_extension(filename or raw_path)
-            if ext not in REFERENCE_IMAGE_ALLOWED_EXTENSIONS:
-                continue
-
-            ref_id = _normalize_text(raw.get("id", ""), strip=True, max_length=120) or str(uuid.uuid4())
-            added_at = _normalize_text(raw.get("added_at", ""), strip=True, max_length=80)
-            notes = _normalize_text(raw.get("notes", ""), strip=True, max_length=500)
-            refs.append(
-                ReferenceImage(
-                    id=ref_id,
-                    path=raw_path,
-                    filename=filename or Path(raw_path).name,
-                    role=_normalize_reference_role(raw.get("role", DEFAULT_REFERENCE_IMAGE_ROLE)),
-                    added_at=added_at,
-                    notes=notes,
-                )
-            )
-        return refs
-
-    def _reference_images_to_state(self) -> List[dict]:
-        return [
-            {
-                "id": ref.id,
-                "path": ref.path,
-                "filename": ref.filename,
-                "role": ref.role,
-                "added_at": ref.added_at,
-                "notes": ref.notes,
-            }
-            for ref in self._reference_images[:REFERENCE_IMAGE_MAX_COUNT]
-        ]
-
     def _persist_state_now(self) -> bool:
         """Persist Prompt Writer selections + outputs.
 
@@ -1867,8 +1605,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             if generated_text.strip():
                 generated_prompts[page.key] = generated_text
 
-        reference_images = self._normalize_reference_images(state.get("reference_images", []))
-
         return {
             "version": PROMPT_WRITER_STATE_VERSION,
             "type": _normalize_text(state.get("type", ""), strip=True, max_length=300),
@@ -1883,17 +1619,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 strip=True,
                 max_length=64,
             ),
-            "reference_images": [
-                {
-                    "id": ref.id,
-                    "path": ref.path,
-                    "filename": ref.filename,
-                    "role": ref.role,
-                    "added_at": ref.added_at,
-                    "notes": ref.notes,
-                }
-                for ref in reference_images
-            ],
         }
 
     def _checkbox_state_specs(self) -> Tuple[Tuple[QtWidgets.QCheckBox, str], ...]:
@@ -2026,7 +1751,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 if self._generated_output_valid
                 else ""
             ),
-            "reference_images": self._reference_images_to_state(),
         }
 
     def _restore_persisted_state(self) -> None:
@@ -2118,11 +1842,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 LOGGER.exception("Prompt Writer generated-output restoration failed: %s", error)
                 self._invalidate_generated_output()
 
-            try:
-                self._reference_images = self._normalize_reference_images(state.get("reference_images", []))
-                self._refresh_reference_image_panel()
-            except (RuntimeError, TypeError, ValueError) as error:
-                LOGGER.exception("Prompt Writer reference restoration failed: %s", error)
         except (OSError, RuntimeError, TypeError, ValueError, UnicodeError) as error:
             LOGGER.exception("Prompt Writer state restoration failed for %s: %s", self._state_path, error)
 
@@ -2158,13 +1877,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.btn_generate = QtWidgets.QPushButton("Generate")
         self.btn_copy = QtWidgets.QPushButton("Copy All")
         self.btn_copy.setEnabled(False)
-        self.btn_add_reference = ReferenceDropButton("Add Reference Image")
         self.btn_erase = QtWidgets.QPushButton("Erase All")
-        for b in (self.btn_generate, self.btn_copy, self.btn_add_reference, self.btn_erase):
+        for b in (self.btn_generate, self.btn_copy, self.btn_erase):
             b.setFixedHeight(28)
         header.addWidget(self.btn_generate)
         header.addWidget(self.btn_copy)
-        header.addWidget(self.btn_add_reference)
         header.addWidget(self.btn_erase)
 
         self.lbl_visionary_prefix = QtWidgets.QLabel("For best results, use")
@@ -2192,7 +1909,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._visionary_effect.setOffset(0, 0)
         self._visionary_effect.setColor(QColor("#2d6bff"))
         self.btn_visionary.setGraphicsEffect(self._visionary_effect)
-        self.btn_visionary.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(VISIONARY_URL)))
+        self.btn_visionary.clicked.connect(self._open_visionary)
         _set_help(
             self.btn_visionary,
             "Open The Visionary for deeper prompt guidance and refinement ideas.",
@@ -2414,37 +2131,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         right_v = QtWidgets.QVBoxLayout(); right_v.setSpacing(8)
         main_h.addLayout(right_v, 1)
 
-        self.reference_strip = QtWidgets.QFrame()
-        self.reference_strip.setObjectName("reference_strip")
-        reference_v = QtWidgets.QVBoxLayout(self.reference_strip)
-        reference_v.setContentsMargins(8, 8, 8, 8)
-        reference_v.setSpacing(6)
-
-        reference_header = QtWidgets.QHBoxLayout()
-        self.lbl_reference_title = QtWidgets.QLabel("Reference Images")
-        self.lbl_reference_title.setStyleSheet("font-weight:900; color:#ffffff;")
-        reference_header.addWidget(self.lbl_reference_title)
-        reference_header.addStretch(1)
-        self.lbl_reference_status = QtWidgets.QLabel("")
-        self.lbl_reference_status.setStyleSheet("color:#cfd3da;")
-        reference_header.addWidget(self.lbl_reference_status)
-        self.btn_toggle_references = QtWidgets.QPushButton("Hide")
-        self.btn_toggle_references.setFixedHeight(24)
-        self.btn_toggle_references.clicked.connect(self._toggle_reference_images_visible)
-        reference_header.addWidget(self.btn_toggle_references)
-        reference_v.addLayout(reference_header)
-
-        self.reference_preview_widget = ReferenceImagesDropArea()
-        reference_preview_layout = QtWidgets.QVBoxLayout(self.reference_preview_widget)
-        reference_preview_layout.setContentsMargins(0, 0, 0, 0)
-        reference_preview_layout.setSpacing(0)
-        self.reference_cards_layout = QtWidgets.QHBoxLayout()
-        self.reference_cards_layout.setSpacing(8)
-        reference_preview_layout.addLayout(self.reference_cards_layout)
-        reference_v.addWidget(self.reference_preview_widget)
-        self.reference_strip.setVisible(False)
-        right_v.addWidget(self.reference_strip)
-
         self._preview_scroll = QtWidgets.QScrollArea(); self._preview_scroll.setWidgetResizable(True)
         self._preview_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         preview_container = QtWidgets.QWidget()
@@ -2507,20 +2193,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 padding: 0;
                 margin-top: 0;
             }
-            QFrame#reference_strip {
-                border: 1px solid #232834;
-                border-radius: 6px;
-                background: rgba(7, 9, 13, 0.42);
-            }
-            QFrame#reference_card {
-                border: 1px solid #313543;
-                border-radius: 6px;
-                background: rgba(12, 15, 22, 0.72);
-            }
-            QPushButton[referenceDropActive="true"], QFrame[referenceDropActive="true"] {
-                border-color: #ffd60a;
-                background: rgba(255, 214, 10, 0.12);
-            }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 0px;
@@ -2563,6 +2235,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
             }
             """ + CHECKBOX_QSS
         )
+
+    def _open_visionary(self) -> None:
+        url = str(
+            SettingsStore(self.project_root).get(
+                VISIONARY_URL_KEY,
+                DEFAULT_VISIONARY_URL,
+            )
+        ).strip() or DEFAULT_VISIONARY_URL
+        if not QDesktopServices.openUrl(QUrl(url)):
+            LOGGER.warning("Could not open The Visionary at %s", url)
 
 
     def _exclusive_checkbox_groups(
@@ -2613,9 +2295,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def _connect_signals(self):
         self.btn_generate.clicked.connect(self._on_generate)
         self.btn_copy.clicked.connect(self._copy_all_prompts)
-        self.btn_add_reference.clicked.connect(lambda: self.add_reference_image())
-        self.btn_add_reference.paths_dropped.connect(self._add_reference_image_paths)
-        self.reference_preview_widget.paths_dropped.connect(self._add_reference_image_paths)
         self.btn_erase.clicked.connect(self._on_erase_all)
 
         try:
@@ -2663,323 +2342,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._invalidate_generated_output()
         self._schedule_persist_state()
 
-    def _clear_reference_cards(self) -> None:
-        try:
-            while self.reference_cards_layout.count():
-                item = self.reference_cards_layout.takeAt(0)
-                widget = item.widget()
-                if widget is not None:
-                    widget.deleteLater()
-        except Exception:
-            pass
-
-    def _refresh_reference_image_panel(self) -> None:
-        self._refresh_reference_images_ui()
-
-    def _refresh_reference_images_ui(self) -> None:
-        self._clear_reference_cards()
-        count = len(self._reference_images)
-        try:
-            self.reference_strip.setVisible(count > 0)
-            self.lbl_reference_status.setText(f"{count}/{REFERENCE_IMAGE_MAX_COUNT}")
-            self.reference_preview_widget.setVisible(count > 0 and self._references_visible)
-            self.btn_toggle_references.setText("Hide" if self._references_visible else "Show")
-        except Exception:
-            pass
-        if count <= 0:
-            return
-
-        for index, ref in enumerate(self._reference_images):
-            exists = _reference_image_exists(ref)
-            card = ReferenceImageCard(
-                lambda path=ref.path: [Path(path)] if Path(path).exists() and Path(path).is_file() else []
-            )
-            card.copy_requested.connect(self._copy_reference_image_to_clipboard)
-            card.setObjectName("reference_card")
-            card_layout = QtWidgets.QVBoxLayout(card)
-            card_layout.setContentsMargins(6, 6, 6, 6)
-            card_layout.setSpacing(6)
-
-            thumb_frame = QtWidgets.QFrame()
-            thumb_frame.setObjectName("reference_thumb_frame")
-            thumb_layout = QtWidgets.QGridLayout(thumb_frame)
-            thumb_layout.setContentsMargins(0, 0, 0, 0)
-            thumb_layout.setSpacing(0)
-
-            thumb = QtWidgets.QLabel()
-            thumb.setFixedSize(104, 78)
-            thumb.setAlignment(Qt.AlignCenter)
-            thumb.setStyleSheet("border:1px solid #313543; border-radius:4px; color:#cfd3da;")
-            if exists:
-                pix = QtGui.QPixmap(ref.path)
-                if pix.isNull():
-                    thumb.setText("Preview\nUnavailable")
-                else:
-                    thumb.setPixmap(pix.scaled(104, 78, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            else:
-                thumb.setText("Missing\nReference")
-            thumb_layout.addWidget(thumb, 0, 0)
-
-            x_btn = QtWidgets.QPushButton("X")
-            x_btn.setFixedSize(20, 20)
-            x_btn.setToolTip("X")
-            x_btn.setStyleSheet(
-                "QPushButton { padding:0; font-weight:900; border-radius:10px; "
-                "background:#1f2430; color:#ffffff; border:1px solid #596174; }"
-                "QPushButton:hover { background:#3b4458; border-color:#8a94aa; }"
-            )
-            x_btn.clicked.connect(lambda _checked=False, row=index: self._remove_reference_image(row))
-            thumb_layout.addWidget(x_btn, 0, 0, alignment=Qt.AlignTop | Qt.AlignRight)
-            card_layout.addWidget(thumb_frame)
-
-            filename = ref.filename or Path(ref.path).name or "reference image"
-            display_name = filename if exists else f"Missing Reference \u2014 {filename}"
-            name_label = QtWidgets.QLabel(display_name)
-            name_label.setWordWrap(True)
-            name_label.setMinimumWidth(104)
-            name_label.setMaximumWidth(132)
-            name_label.setStyleSheet("font-weight:700; color:#e8e8ea;")
-            card_layout.addWidget(name_label)
-            for menu_widget in (thumb_frame, thumb, name_label):
-                menu_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-                menu_widget.customContextMenuRequested.connect(
-                    lambda pos, source=menu_widget, image_card=card: image_card._show_copy_menu_at(
-                        source.mapToGlobal(pos)
-                    )
-                )
-            self.reference_cards_layout.addWidget(card)
-
-        self.reference_cards_layout.addStretch(1)
-
-    def _toggle_reference_images_visible(self) -> None:
-        self._references_visible = not self._references_visible
-        try:
-            self.reference_preview_widget.setVisible(self._references_visible and bool(self._reference_images))
-            self.btn_toggle_references.setText("Hide" if self._references_visible else "Show")
-        except Exception:
-            pass
-
-    def _copy_reference_image_to_clipboard(self, path: object) -> bool:
-        try:
-            image_path = Path(path).expanduser().resolve()
-        except Exception:
-            self._set_reference_status("Missing Reference")
-            return False
-
-        if not image_path.exists() or not image_path.is_file():
-            self._set_reference_status("Missing Reference")
-            return False
-
-        mime_data = QtCore.QMimeData()
-        mime_data.setUrls([QUrl.fromLocalFile(str(image_path))])
-
-        image = QtGui.QImage(str(image_path))
-        if not image.isNull():
-            mime_data.setImageData(image)
-
-        QtWidgets.QApplication.clipboard().setMimeData(mime_data)
-        self._set_reference_status("Image copied.")
-        return True
-
-    def _set_reference_status(self, message: str) -> None:
-        try:
-            self.reference_strip.setVisible(True)
-            self.lbl_reference_status.setText(message)
-        except Exception:
-            pass
-
-    def _is_valid_reference_image_path(self, path: Path) -> bool:
-        try:
-            image_path = Path(path).expanduser()
-            return (
-                image_path.exists()
-                and image_path.is_file()
-                and image_path.suffix.lower() in REFERENCE_IMAGE_ALLOWED_EXTENSIONS
-            )
-        except Exception:
-            return False
-
-    def _reference_path_key(self, path: Path) -> str:
-        try:
-            return str(path.resolve()).casefold()
-        except Exception:
-            return str(path).casefold()
-
-    def _reference_image_already_added(self, path: Path) -> bool:
-        key = self._reference_path_key(path)
-        for ref in self._reference_images:
-            try:
-                if self._reference_path_key(Path(ref.path)) == key:
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _add_reference_image_paths(self, paths: List[Path]) -> None:
-        added = 0
-        invalid_seen = False
-        duplicate_seen = False
-        limit_seen = False
-
-        for raw_path in paths:
-            if len(self._reference_images) >= REFERENCE_IMAGE_MAX_COUNT:
-                limit_seen = True
-                break
-
-            try:
-                image_path = Path(raw_path).expanduser()
-            except Exception:
-                invalid_seen = True
-                continue
-
-            if not self._is_valid_reference_image_path(image_path):
-                invalid_seen = True
-                continue
-
-            image_path = image_path.resolve()
-            if self._reference_image_already_added(image_path):
-                duplicate_seen = True
-                continue
-
-            self._reference_images.append(
-                ReferenceImage(
-                    id=str(uuid.uuid4()),
-                    path=str(image_path),
-                    filename=image_path.name,
-                    role=DEFAULT_REFERENCE_IMAGE_ROLE,
-                    added_at=datetime.now(timezone.utc).isoformat(),
-                    notes="",
-                )
-            )
-            added += 1
-
-        if added:
-            self._refresh_reference_images_ui()
-            self._schedule_persist_state(0)
-
-        if limit_seen:
-            self._set_reference_status("Reference image limit reached.")
-        elif invalid_seen and not added:
-            self._set_reference_status("Drop image files only.")
-        elif duplicate_seen and not added:
-            self._set_reference_status("Reference image already added.")
-        elif added:
-            self.lbl_reference_status.setText(f"{len(self._reference_images)}/{REFERENCE_IMAGE_MAX_COUNT}")
-
-    def add_reference_image(self, path: Optional[str] = None) -> bool:
-        if len(self._reference_images) >= REFERENCE_IMAGE_MAX_COUNT:
-            self._set_reference_status("Reference image limit reached.")
-            return False
-
-        if not isinstance(path, (str, Path)) or not str(path).strip():
-            start_dir = str(self.project_root)
-            try:
-                if self._reference_images:
-                    last_dir = Path(self._reference_images[-1].path).parent
-                    if last_dir.exists():
-                        start_dir = str(last_dir)
-            except Exception:
-                pass
-            selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-                self,
-                "Add Reference Image",
-                start_dir,
-                "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)",
-            )
-            path = selected
-
-        if not path:
-            return False
-
-        before = len(self._reference_images)
-        self._add_reference_image_paths([Path(str(path))])
-        return len(self._reference_images) > before
-
-    def remove_reference_image(self, reference_id: str) -> bool:
-        return self._remove_reference_image(reference_id)
-
-    def _remove_reference_image(self, path_or_index: object) -> bool:
-        remove_index = -1
-        if isinstance(path_or_index, int):
-            remove_index = path_or_index
-        elif isinstance(path_or_index, Path):
-            key = self._reference_path_key(path_or_index)
-            remove_index = next(
-                (idx for idx, ref in enumerate(self._reference_images) if self._reference_path_key(Path(ref.path)) == key),
-                -1,
-            )
-        else:
-            text = _normalize_text(path_or_index, strip=True, max_length=4096)
-            text_path_key = ""
-            if text:
-                try:
-                    text_path_key = self._reference_path_key(Path(text))
-                except Exception:
-                    text_path_key = text.casefold()
-            remove_index = next(
-                (
-                    idx
-                    for idx, ref in enumerate(self._reference_images)
-                    if ref.id == text or self._reference_path_key(Path(ref.path)) == text_path_key
-                ),
-                -1,
-            )
-
-        if remove_index < 0 or remove_index >= len(self._reference_images):
-            return False
-
-        del self._reference_images[remove_index]
-        self._refresh_reference_images_ui()
-        self._schedule_persist_state(0)
-        return True
-
-    def reorder_reference_image(self, reference_id: str, direction: object) -> bool:
-        if isinstance(direction, str):
-            direction = -1 if direction.lower() == "left" else 1 if direction.lower() == "right" else 0
-        try:
-            step = int(direction)
-        except Exception:
-            step = 0
-        step = -1 if step < 0 else 1 if step > 0 else 0
-        if step == 0:
-            return False
-
-        current_index = next((idx for idx, ref in enumerate(self._reference_images) if ref.id == reference_id), -1)
-        new_index = current_index + step
-        if current_index < 0 or new_index < 0 or new_index >= len(self._reference_images):
-            return False
-
-        self._reference_images[current_index], self._reference_images[new_index] = (
-            self._reference_images[new_index],
-            self._reference_images[current_index],
-        )
-        self._refresh_reference_image_panel()
-        self._schedule_persist_state(0)
-        return True
-
-    def build_reference_image_copy_block(self) -> str:
-        refs = self._reference_images[:REFERENCE_IMAGE_MAX_COUNT]
-        if not refs:
-            return "REFERENCE IMAGES:\nNo reference images attached."
-
-        dash = "\u2014"
-        lines = [
-            "REFERENCE IMAGES:",
-            "Attach the following reference image(s) before using the prompt:",
-        ]
-        for index, ref in enumerate(refs, start=1):
-            filename = ref.filename or Path(ref.path).name or "reference image"
-            missing = " [missing file]" if not _reference_image_exists(ref) else ""
-            lines.append(f"{index}. {_normalize_reference_role(ref.role)} {dash} {filename}{missing}")
-
-        lines.extend(
-            [
-                "",
-                "Use these reference image(s) as visual guidance. Preserve the identity, facial structure, body type, hairstyle, outfit cues, color palette, pose language, and mood where relevant. Do not copy unwanted background clutter unless the prompt specifically asks for it.",
-            ]
-        )
-        return "\n".join(lines)
-
     def _build_copy_all_text(self) -> str:
         if not self._generated_output_valid:
             return ""
@@ -2995,9 +2357,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 else f"--- {page.display_label} ---\n\n"
             )
         return "\n\n".join(parts).strip()
-
-    def copy_all_with_references(self) -> str:
-        return self._build_copy_all_text()
 
     def _copy_all_prompts_text(self) -> str:
         all_text = self._build_copy_all_text()
@@ -3047,7 +2406,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def _set_generation_busy(self, busy: bool) -> None:
         self._generation_in_progress = bool(busy)
-        for name in ("btn_generate", "btn_erase", "btn_add_reference"):
+        for name in ("btn_generate", "btn_erase"):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.setEnabled(not busy)
@@ -3234,17 +2593,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
             for checkbox, _ in self._checkbox_state_specs():
                 checkbox.setChecked(False)
 
-            self._reference_images = []
-            self._references_visible = True
             self._last_focused_widget = None
             self.txt_global.clear()
             for page in self._page_specs:
                 if page.detail_widget is not None:
                     page.detail_widget.clear()
             self._invalidate_generated_output()
-            self._refresh_reference_image_panel()
-            self.lbl_reference_status.setText("")
-            self.reference_strip.setVisible(False)
             for dialog in tuple(self._list_manager_dialogs.values()):
                 try:
                     dialog.entry_edit.clear()
@@ -3271,7 +2625,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             (
                 self.cmb_subject.currentText().strip(),
                 self.txt_global.toPlainText().strip(),
-                self._reference_images,
                 self._generated_prompts,
             )
         ):

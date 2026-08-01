@@ -54,6 +54,18 @@ class IdentityFieldLockingTests(unittest.TestCase):
         self.assertIn("#78b9dd", field.styleSheet())
         field.deleteLater()
 
+    def test_styled_identity_field_preserves_its_text_height(self) -> None:
+        field = IdentityLineEdit("The Silver Lettersmith")
+
+        MessageTab._style_identity_field(field)
+
+        self.assertGreaterEqual(field.minimumHeight(), field.sizeHint().height())
+        self.assertGreaterEqual(
+            field.minimumHeight(),
+            field.fontMetrics().height() + 10,
+        )
+        field.deleteLater()
+
     def test_double_click_clears_the_persisted_lock_for_reediting(self) -> None:
         message = MessageTab.__new__(MessageTab)
         message.settings = {"recipient_title_locked": True}

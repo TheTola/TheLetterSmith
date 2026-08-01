@@ -18,6 +18,10 @@ SETTINGS_FILENAME = "settings.json"
 REQUIRED_FEATURES_KEY = "required_features"
 PUBLISHED_PAGE_URL_KEY = "published_page_url"
 ACTIVE_PLAY_DIR_KEY = "active_play_dir"
+VISIONARY_URL_KEY = "visionary_url"
+DEFAULT_VISIONARY_URL = (
+    "https://chatgpt.com/g/g-68ce5925196c8191a222e24d29323813-the-visionary"
+)
 
 
 DEFAULT_SETTINGS = {
@@ -27,6 +31,7 @@ DEFAULT_SETTINGS = {
     REQUIRED_FEATURES_KEY: [],
     PUBLISHED_PAGE_URL_KEY: "",
     ACTIVE_PLAY_DIR_KEY: "",
+    VISIONARY_URL_KEY: DEFAULT_VISIONARY_URL,
 }
 
 
@@ -671,6 +676,18 @@ class SettingsStore:
             else ""
         )
 
+        # Prompt Writer companion URL.
+        visionary_url = normalize_published_page_url(
+            normalized.get(
+                VISIONARY_URL_KEY,
+                DEFAULT_VISIONARY_URL,
+            )
+        )
+        normalized[VISIONARY_URL_KEY] = (
+            visionary_url
+            or DEFAULT_VISIONARY_URL
+        )
+
         # Curtain style
         style = str(
             normalized.get(
@@ -710,9 +727,11 @@ __all__ = [
     "CURTAIN_STYLE_ALIASES",
     "CURTAIN_STYLE_LABELS",
     "DEFAULT_SETTINGS",
+    "DEFAULT_VISIONARY_URL",
     "ACTIVE_PLAY_DIR_KEY",
     "PUBLISHED_PAGE_URL_KEY",
     "REQUIRED_FEATURES_KEY",
+    "VISIONARY_URL_KEY",
     "SETTINGS_FILENAME",
     "SettingsChanged",
     "SettingsStore",

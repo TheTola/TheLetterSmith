@@ -10,7 +10,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
 from command_bar import (
     CommandBarData,
@@ -106,6 +106,9 @@ class CommandBarTests(unittest.TestCase):
             )
             window = CommandBarWindow(data, temporary)
             self.assertIsNone(window.movie)
+            self.assertIsNone(window.scan_movie)
+            self.assertIsNone(window.compact_movie)
+            self.assertFalse(window.minimize_button.isEnabled())
             self.assertFalse(window.preview_button.isEnabled())
             self.assertFalse(window.open_button.isEnabled())
             self.assertFalse(window.copy_button.isEnabled())
@@ -203,6 +206,131 @@ class CommandBarTests(unittest.TestCase):
                 window.abort_launch()
             self.assertEqual(movie.state(), QtGui.QMovie.MovieState.NotRunning)
             self.assertEqual(movie.fileName(), "")
+
+    def test_scanned_gif_starts_on_show_and_repeats_every_15_seconds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            icons = root / "gallery" / "app" / "icons"
+            icons.mkdir(parents=True)
+            animated_gif = bytes.fromhex(
+                "47494638396101000100800000000000ffffff"
+                "21ff0b4e45545343415045322e300301000000"
+                "21f904000a0000002c0000000001000100000202440100"
+                "21f904000a0000002c00000000010001000002024c01003b"
+            )
+            icons.joinpath("bloodsnow.gif").write_bytes(animated_gif)
+            icons.joinpath("scanned.gif").write_bytes(animated_gif)
+            window = CommandBarWindow(
+                CommandBarData("Recipient", "Title", None, ""),
+                root,
+            )
+            scan_movie = window.scan_movie
+            self.assertIsNotNone(scan_movie)
+            self.assertEqual(window._scan_timer.interval(), 15_000)
+            self.assertEqual(len(window._scan_frame_rects), scan_movie.frameCount())
+            self.assertIs(window._scan_overlay.parent(), window._background)
+            self.assertFalse(window._scan_overlay.isVisible())
+            try:
+                window.show()
+                self.app.processEvents()
+                self.assertTrue(window._scan_timer.isActive())
+                self.assertTrue(window._scan_overlay.isVisible())
+                self.assertEqual(
+                    scan_movie.state(),
+                    QtGui.QMovie.MovieState.Running,
+                )
+                window._finish_scan_overlay()
+                self.assertFalse(window._scan_overlay.isVisible())
+                self.assertEqual(
+                    scan_movie.state(),
+                    QtGui.QMovie.MovieState.NotRunning,
+                )
+                window._scan_timer.timeout.emit()
+                self.app.processEvents()
+                self.assertTrue(window._scan_overlay.isVisible())
+                self.assertEqual(
+                    scan_movie.state(),
+                    QtGui.QMovie.MovieState.Running,
+                )
+            finally:
+                window.abort_launch()
+            self.assertFalse(window._scan_timer.isActive())
+            self.assertEqual(scan_movie.fileName(), "")
+
+    def test_minimize_preserves_tall_com_gif_aspect_ratio(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            icons = root / "gallery" / "app" / "icons"
+            icons.mkdir(parents=True)
+            animated_gif = bytes.fromhex(
+                "47494638396102000300810000000000ff0000000000000000"
+                "21ff0b4e45545343415045322e300301000000"
+                "21f904090a0000002c0000000002000300000808000100082010404000"
+                "21f904090a0000002c00000100010001008100000000ff00000000000000"
+                "080400030404003b"
+            )
+            for name in ("bloodsnow.gif", "scanned.gif", "com.gif"):
+                icons.joinpath(name).write_bytes(animated_gif)
+            window = CommandBarWindow(
+                CommandBarData("Recipient", "Title", None, ""),
+                root,
+            )
+            compact_movie = window.compact_movie
+            background_movie = window.movie
+            self.assertIsNotNone(compact_movie)
+            self.assertIsNotNone(background_movie)
+            try:
+                window.show()
+                self.app.processEvents()
+                expanded_size = window.size()
+                expanded_position = window.frameGeometry().topLeft()
+                self.assertTrue(window._scan_timer.isActive())
+
+                window.minimize_button.click()
+                self.app.processEvents()
+
+                self.assertTrue(window.is_compact)
+                self.assertEqual(window.size(), QtCore.QSize(67, 100))
+                self.assertFalse(window.isMinimized())
+                self.assertFalse(window._surface.isVisible())
+                self.assertTrue(window._compact_label.isVisible())
+                self.assertEqual(
+                    window.grab().toImage().pixelColor(0, 0).alpha(),
+                    0,
+                )
+                self.assertFalse(window._scan_timer.isActive())
+                self.assertEqual(
+                    background_movie.state(),
+                    QtGui.QMovie.MovieState.NotRunning,
+                )
+                self.assertEqual(
+                    compact_movie.state(),
+                    QtGui.QMovie.MovieState.Running,
+                )
+
+                QtTest.QTest.mouseClick(
+                    window._compact_label,
+                    QtCore.Qt.MouseButton.LeftButton,
+                )
+                self.app.processEvents()
+
+                self.assertFalse(window.is_compact)
+                self.assertEqual(window.size(), expanded_size)
+                self.assertEqual(window.frameGeometry().topLeft(), expanded_position)
+                self.assertTrue(window._surface.isVisible())
+                self.assertFalse(window._compact_label.isVisible())
+                self.assertTrue(window._scan_timer.isActive())
+                self.assertEqual(
+                    background_movie.state(),
+                    QtGui.QMovie.MovieState.Running,
+                )
+                self.assertEqual(
+                    compact_movie.state(),
+                    QtGui.QMovie.MovieState.NotRunning,
+                )
+            finally:
+                window.abort_launch()
+            self.assertEqual(compact_movie.fileName(), "")
 
     def test_long_text_is_elided_and_keeps_full_tooltip(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

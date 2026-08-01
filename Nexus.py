@@ -24,8 +24,11 @@ from app_icon import apply_qt_window_icon, canonical_icon_paths
 from settings_store import (
     CURTAIN_STYLE_LABELS,
     DEFAULT_SETTINGS,
+    DEFAULT_VISIONARY_URL,
     SettingsStore,
     VALID_CURTAIN_STYLES,
+    VISIONARY_URL_KEY,
+    normalize_published_page_url,
 )
 from project_state import (
     ApplicationState,
@@ -371,6 +374,12 @@ class TitleBar(QtWidgets.QWidget):
                 )
             )
             self._curtain_actions[style] = action
+        self.visionary_location_action = self.settings_menu.addAction(
+            "Visionary Location…"
+        )
+        self.visionary_location_action.triggered.connect(
+            self._edit_visionary_location
+        )
         self.settings_menu.addSeparator()
         self.repair_music_action = self.settings_menu.addAction(
             "Repair Music Archive"
@@ -493,6 +502,37 @@ class TitleBar(QtWidgets.QWidget):
         forge.schedule_refresh()
         if forge.isVisible():
             forge.ensure_preview_current()
+
+    def _edit_visionary_location(self) -> None:
+        settings = SettingsStore(self.parent.project_root)
+        current = str(
+            settings.get(
+                VISIONARY_URL_KEY,
+                DEFAULT_VISIONARY_URL,
+            )
+        )
+        entered, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            "Visionary Location",
+            "URL:",
+            QtWidgets.QLineEdit.Normal,
+            current,
+        )
+        if not accepted:
+            return
+
+        candidate = QUrl.fromUserInput(entered.strip()).toString()
+        visionary_url = normalize_published_page_url(candidate)
+        if not visionary_url:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Invalid Visionary Location",
+                "Enter a valid http:// or https:// URL.",
+            )
+            return
+
+        settings.update_fields(**{VISIONARY_URL_KEY: visionary_url})
+        self.parent.status("Visionary location updated.")
 
     def _repair_music_archive(self) -> None:
         sound_tab = getattr(self.parent, "sound_tab", None)
@@ -810,6 +850,8 @@ class _ForgePreviewFullscreenWindow(QtWidgets.QWidget):
 
     def attach_preview(self, preview: QtWidgets.QWidget) -> None:
         self._layout.addWidget(preview)
+        preview.show()
+        self._layout.activate()
 
     def detach_preview(self, preview: QtWidgets.QWidget) -> None:
         self._layout.removeWidget(preview)
@@ -2031,6 +2073,9 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _show_forge_preview(self) -> None:
         """Show the actual generated viewer, never a static Forge stand-in."""
+        if self.forge_tab.operation_in_progress:
+            self._show_forge_preview_pending()
+            return
         try:
             self.forge_tab.ensure_preview_current()
         except Exception as ex:
@@ -2040,6 +2085,9 @@ class Nexus(QtWidgets.QMainWindow):
             )
             self.preview_caption.setVisible(True)
             self.status(f"Forge preview could not be rebuilt: {ex}")
+            return
+        if self.forge_tab.operation_in_progress:
+            self._show_forge_preview_pending()
             return
 
         index = self.forge_tab.current_play_index()
@@ -2055,6 +2103,13 @@ class Nexus(QtWidgets.QMainWindow):
         self.preview_caption.setText(
             "Select Preview Letter to build the interactive viewer."
         )
+        self.preview_caption.setVisible(True)
+
+    def _show_forge_preview_pending(self) -> None:
+        self._last_pixmap = None
+        self._clear_preview()
+        self.preview_stack.setCurrentIndex(0)
+        self.preview_caption.setText("Preparing interactive preview…")
         self.preview_caption.setVisible(True)
 
     def _load_forge_preview(self, index_path: str, mode: str) -> None:
@@ -2134,9 +2189,46 @@ class Nexus(QtWidgets.QMainWindow):
             pass
         if self.preview_stack.currentWidget() is self.html_preview:
             self.preview_stack.setCurrentIndex(0)
-        self.preview_caption.setVisible(False)
+        if self.tabbar.currentIndex() == 3:
+            self.preview_caption.setText("Preparing interactive preview…")
+            self.preview_caption.setVisible(True)
+        else:
+            self.preview_caption.setVisible(False)
+        previous_url = self.html_preview.url()
         self.html_preview.stop()
-        self.html_preview.setUrl(QUrl("about:blank"))
+        blank_url = QUrl("about:blank")
+        if not previous_url.isLocalFile():
+            self.html_preview.setUrl(blank_url)
+            return
+
+        unload_loop = QtCore.QEventLoop()
+        unload_timeout = QtCore.QTimer()
+        unload_timeout.setSingleShot(True)
+        unloaded = False
+
+        def finish_unload(ok: bool) -> None:
+            nonlocal unloaded
+            if ok and self.html_preview.url() == blank_url:
+                unloaded = True
+                unload_loop.quit()
+
+        self.html_preview.loadFinished.connect(finish_unload)
+        unload_timeout.timeout.connect(unload_loop.quit)
+        try:
+            self.html_preview.setUrl(blank_url)
+            unload_timeout.start(1500)
+            unload_loop.exec(QtCore.QEventLoop.ExcludeUserInputEvents)
+        finally:
+            unload_timeout.stop()
+            try:
+                self.html_preview.loadFinished.disconnect(finish_unload)
+            except (RuntimeError, TypeError):
+                pass
+        if not unloaded:
+            _LOGGER.warning(
+                "Timed out waiting for the embedded Forge preview to release %s",
+                previous_url.toLocalFile(),
+            )
 
     def _release_project_files_for_restore(self) -> None:
         """Release project-owned media handles before an atomic restore."""
@@ -2181,8 +2273,8 @@ class Nexus(QtWidgets.QMainWindow):
             if self._forge_fullscreen_active:
                 request.accept()
                 return
-            self._enter_forge_fullscreen()
             request.accept()
+            QtCore.QTimer.singleShot(0, self._enter_forge_fullscreen)
             return
         request.accept()
         self._restore_forge_preview_from_fullscreen()
@@ -2205,6 +2297,8 @@ class Nexus(QtWidgets.QMainWindow):
         if screen is not None:
             window.setGeometry(screen.geometry())
         window.showFullScreen()
+        self.html_preview.show()
+        window.layout().activate()
         window.raise_()
         window.activateWindow()
         self.html_preview.setFocus()

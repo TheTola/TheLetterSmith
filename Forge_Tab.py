@@ -1790,6 +1790,10 @@ class ForgeTab(QtWidgets.QWidget):
     def preview_refresh_pending(self) -> bool:
         return self._preview_refresh_pending
 
+    @property
+    def operation_in_progress(self) -> bool:
+        return self._busy
+
     def request_preview(self) -> None:
         index = self.current_play_index()
         if index is not None:
