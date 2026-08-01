@@ -8,7 +8,7 @@ TARGET — Folder Structure Extractor (Save-first, Futuristic UI, Standalone)
 What this tool is for
 - Generate a clean, paste-friendly representation of a folder’s structure so you can:
   1) comprehend a project layout quickly, and/or
-  2) save/share it (including pasting into ChatGPT later).
+  2) save or export it for later use.
 
 Key behaviors
 - SAVE-FIRST. Results popup buttons: Save → Open → Cancel (no Save As).

@@ -42,6 +42,7 @@ into the saved HTML body.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -117,6 +118,14 @@ SETTINGS_KEY_GEOMETRY = "windowGeometry"
 SETTINGS_KEY_ULTRALINK_COLOR = "ultralinkColor"
 DEFAULT_ULTRALINK_COLOR = QColor("#ffd84d")
 ASSET_SUBDIR = "message_assets"  # under gallery/
+MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
+MESSAGE_OVERLAY_PRESETS = {
+    "black": ("#000000", "#ffffff"),
+    "white": ("#ffffff", "#221710"),
+    "paper": ("#f5ebd2", "#221710"),
+    "clear": ("transparent", "#eeeeee"),
+}
+_LOGGER = logging.getLogger(__name__)
 
 
 def _ensure_dir(p: Path) -> None:
@@ -631,6 +640,9 @@ class Editor(QDialog):
         self._initializing = True
         self._last_persisted_html = ""
         self._find_dialog: Optional[FindReplaceDialog] = None
+        self._closing = False
+        self._save_in_progress = False
+        self._discard_changes = False
 
         # Tracks the most recent spacing selection (used to force identical browser output).
         self._export_line_spacing: Optional[float] = 2.0 if self._apply_message_defaults else None
@@ -647,6 +659,10 @@ class Editor(QDialog):
         self._apply_styles()
         self._restore_geometry()
         self._build_ui(preview_pixmap)
+        self._settings_watcher = QtCore.QFileSystemWatcher(self)
+        if self.settings_path.is_file():
+            self._settings_watcher.addPath(str(self.settings_path))
+        self._settings_watcher.fileChanged.connect(self._settings_file_changed)
         try:
             self._last_persisted_html = (
                 self.message_path.read_text(encoding="utf-8")
@@ -656,6 +672,13 @@ class Editor(QDialog):
         except Exception:
             self._last_persisted_html = ""
         self._initializing = False
+
+    def _settings_file_changed(self, path: str) -> None:
+        if self._closing:
+            return
+        self.refresh_background_from_settings()
+        if Path(path).is_file() and path not in self._settings_watcher.files():
+            self._settings_watcher.addPath(path)
 
     def _build_ui(self, preview_pixmap: Optional[QPixmap]) -> None:
         main_layout = QVBoxLayout(self)
@@ -668,6 +691,7 @@ class Editor(QDialog):
         main_layout.addWidget(self.toolbar)
 
         self.editor = RichTextEdit(self.project_root)
+        self.editor.setObjectName("EditorTextArea")
         self.editor.document().setDefaultFont(QFont("Papyrus", DEFAULT_FONT_SIZE))
         self.editor.setHtml(self.message_html)
         normalize_ultralinks_in_document(self.editor.document())
@@ -690,15 +714,79 @@ class Editor(QDialog):
         hb.addStretch()
 
         btn_save = QPushButton("Save")
+        self.btn_save = btn_save
         btn_save.setShortcut(QKeySequence.Save)
-        btn_save.clicked.connect(self.apply_changes)
+        btn_save.setAutoDefault(False)
+        btn_save.setDefault(False)
+        btn_save.clicked.connect(self._save_only)
 
         btn_close = QPushButton("Close")
-        btn_close.clicked.connect(self.apply_changes)
+        btn_close.setAutoDefault(False)
+        btn_close.setDefault(False)
+        btn_close.clicked.connect(self._request_close)
+
+        btn_save_close = QPushButton("Save and Close")
+        btn_save_close.setAutoDefault(False)
+        btn_save_close.setDefault(False)
+        btn_save_close.clicked.connect(self.save_and_close)
 
         hb.addWidget(btn_save)
         hb.addWidget(btn_close)
+        hb.addWidget(btn_save_close)
         main_layout.addLayout(hb)
+
+        for control in (self.font_combo, self.font_size_spin):
+            control.installEventFilter(self)
+            if control.lineEdit() is not None:
+                control.lineEdit().installEventFilter(self)
+        self.editor.cursorPositionChanged.connect(self._sync_current_format)
+        self.editor.selectionChanged.connect(self._sync_current_format)
+        self._apply_editor_background()
+
+    def _editor_background_setting(self) -> tuple[str, str]:
+        data = _read_json(self.settings_path)
+        preset = str(data.get(MESSAGE_OVERLAY_PRESET_KEY, "paper")).strip().lower()
+        return MESSAGE_OVERLAY_PRESETS.get(preset, MESSAGE_OVERLAY_PRESETS["paper"])
+
+    def _apply_editor_background(self) -> None:
+        background, foreground = self._editor_background_setting()
+        self.editor.setStyleSheet(
+            "QTextEdit#EditorTextArea{"
+            f"background-color:{background};color:{foreground};"
+            "border:1px solid #70512c;border-radius:6px;padding:8px;"
+            "selection-background-color:#c9a86a;"
+            f"selection-color:{foreground};}}"
+        )
+        self.editor.setAttribute(Qt.WA_TranslucentBackground, background == "transparent")
+        self.editor.viewport().setAttribute(
+            Qt.WA_TranslucentBackground,
+            background == "transparent",
+        )
+        self.editor.viewport().update()
+
+    def refresh_background_from_settings(self) -> None:
+        self._apply_editor_background()
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        format_inputs = (
+            self.font_combo,
+            self.font_size_spin,
+            self.font_combo.lineEdit(),
+            self.font_size_spin.lineEdit(),
+        )
+        if watched in format_inputs and event.type() == QtCore.QEvent.KeyPress:
+            key_event = event
+            if isinstance(key_event, QtGui.QKeyEvent) and key_event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                if watched in (self.font_size_spin, self.font_size_spin.lineEdit()):
+                    self.set_font_size(self.font_size_spin.value())
+                else:
+                    self.set_font_family(self.font_combo.currentFont())
+                self.editor.setFocus(Qt.OtherFocusReason)
+                return True
+        return super().eventFilter(watched, event)
+
+    def _sync_current_format(self) -> None:
+        self._sync_format(self.editor.currentCharFormat())
 
         self.update_word_count()
 
@@ -870,7 +958,7 @@ class Editor(QDialog):
         self.setStyleSheet(
             "QDialog{background:#121212;}"
             "QToolBar{background:#161616;border:1px solid #242424;border-radius:6px;margin:2px;padding:2px;}"
-            "QTextEdit{background:#f5ebd2;color:#221710;border:1px solid #70512c;border-radius:6px;padding:8px;selection-background-color:#c9a86a;selection-color:#221710;}"
+            "QTextEdit#EditorTextArea{border:1px solid #70512c;border-radius:6px;padding:8px;selection-background-color:#c9a86a;}"
             "QLabel{color:#bbb;}"
             "QSplitter::handle{background:#1e1e1e;}"
             "QPushButton{background:#1d1d1d;color:#fff;border:1px solid #00d0ff;border-radius:6px;padding:6px 12px;}"
@@ -889,21 +977,22 @@ class Editor(QDialog):
             self.restoreGeometry(geom)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        try:
-            self.settings.setValue(SETTINGS_KEY_GEOMETRY, self.saveGeometry())
-        except Exception:
-            pass
-        try:
-            self._autosave_now()
-        except Exception:
-            pass
-        super().closeEvent(event)
+        if self._closing:
+            event.accept()
+            return
+        event.ignore()
+        self._request_close()
+
+    def reject(self) -> None:
+        self._request_close()
 
     # ──────────────────────────────────────────────────────────────────────
     # Public API + autosave
     # ──────────────────────────────────────────────────────────────────────
 
     def get_edited_html(self) -> str:
+        if self._discard_changes:
+            return self._last_persisted_html or self.message_html
         return self._prepared_html()
 
     def _prepared_html(self) -> str:
@@ -950,10 +1039,13 @@ class Editor(QDialog):
             # Autosave is deliberately quiet. Manual Save still reports failures.
             return
 
-    def apply_changes(self) -> None:
-        """Save immediately, create a revision, and close the editor."""
+    def _save_document(self) -> bool:
+        if self._save_in_progress:
+            return False
         self._autosave_timer.stop()
         content = self._prepared_html()
+        self._save_in_progress = True
+        self.btn_save.setEnabled(False)
         try:
             self.project_save_service.save_message(
                 content,
@@ -963,9 +1055,66 @@ class Editor(QDialog):
             self._sync_message_assets()
             self._last_persisted_html = content
             self.autosaved.emit(content)
-            self.accept()
-        except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"Could not save:\n{type(e).__name__}: {e}")
+            return True
+        except Exception as error:
+            _LOGGER.exception("Editor save failed")
+            QMessageBox.critical(
+                self,
+                "Save Error",
+                "Could not save the letter. The Editor remains open and your changes are preserved.",
+            )
+            return False
+        finally:
+            self._save_in_progress = False
+            if not self._closing:
+                self.btn_save.setEnabled(True)
+
+    def _save_only(self) -> None:
+        self._save_document()
+
+    def save_and_close(self) -> None:
+        if self._save_document():
+            self._finish_close()
+
+    def _request_close(self) -> None:
+        if self._closing:
+            return
+        current = self._prepared_html()
+        if current == self._last_persisted_html:
+            self._finish_close()
+            return
+        choice = QMessageBox.question(
+            self,
+            "Unsaved Changes",
+            "Save changes before closing the Editor?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+        if choice == QMessageBox.Save:
+            self.save_and_close()
+        elif choice == QMessageBox.Discard:
+            self._discard_changes = True
+            self._finish_close()
+
+    def _finish_close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        self._autosave_timer.stop()
+        if self._find_dialog is not None:
+            self._find_dialog.hide()
+        watcher = getattr(self, "_settings_watcher", None)
+        if watcher is not None:
+            watcher.removePaths(watcher.files())
+        try:
+            self.settings.setValue(SETTINGS_KEY_GEOMETRY, self.saveGeometry())
+        except Exception:
+            _LOGGER.exception("Could not persist Editor geometry")
+        super().accept()
+
+    def apply_changes(self) -> None:
+        """Compatibility entry point for callers that mean Save and Close."""
+        self.save_and_close()
 
     def _inject_export_line_spacing_wrapper(self, html: str) -> str:
         if not html:
@@ -1643,13 +1792,12 @@ class Editor(QDialog):
 
     def set_font_size(self, size: int) -> None:
         size_i = int(max(FONT_SIZE_MIN, min(FONT_SIZE_MAX, size)))
-        try:
-            self.editor.setFontPointSize(float(size_i))
-        except Exception:
-            pass
         fmt = QTextCharFormat()
         fmt.setFontPointSize(float(size_i))
         self._apply_char_format(fmt)
+        self.font_size_spin.blockSignals(True)
+        self.font_size_spin.setValue(size_i)
+        self.font_size_spin.blockSignals(False)
 
     def toggle_bold(self) -> None:
         self._toggle_weight(QFont.Bold)

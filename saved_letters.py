@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
+import stat
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -75,6 +77,19 @@ _METADATA_NAMES = (
     "metadata.json",
 )
 _LOGGER = logging.getLogger(__name__)
+_ACTIVE_LETTER_LOAD_WORKSPACES: set[Path] = set()
+
+
+def _remove_readonly_and_retry(function, path: str, error: BaseException) -> None:
+    """Clear a copied Windows read-only attribute before retrying removal."""
+    if not isinstance(error, PermissionError):
+        raise error
+    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    function(path)
+
+
+def _remove_tree(path: str | Path) -> None:
+    shutil.rmtree(path, onexc=_remove_readonly_and_retry)
 
 
 def cleanup_stale_letter_load_workspaces(project_root: str | Path) -> tuple[Path, ...]:
@@ -91,7 +106,9 @@ def cleanup_stale_letter_load_workspaces(project_root: str | Path) -> tuple[Path
             resolved.relative_to(output_root)
             if resolved == output_root:
                 continue
-            shutil.rmtree(resolved)
+            if resolved in _ACTIVE_LETTER_LOAD_WORKSPACES:
+                continue
+            _remove_tree(resolved)
             removed.append(resolved)
         except (OSError, ValueError):
             _LOGGER.exception("Could not clean stale Letter Smith load workspace: %s", candidate)
@@ -284,7 +301,6 @@ class SavedLetterCatalog:
     def list_entries(self) -> tuple[SavedLetter, ...]:
         entries: list[SavedLetter] = []
         seen: set[Path] = set()
-        seen_project_ids: set[str] = set()
         for root, recovery in (
             *((root, False) for root in self.play_roots),
             *((root, True) for root in self.recovery_roots),
@@ -311,10 +327,6 @@ class SavedLetterCatalog:
                     )
                     continue
                 seen.add(path)
-                if entry.project_id and entry.project_id in seen_project_ids:
-                    continue
-                if entry.project_id:
-                    seen_project_ids.add(entry.project_id)
                 entries.append(entry)
         entries.sort(
             key=lambda entry: (entry.modified_at, entry.title.casefold()),
@@ -554,6 +566,7 @@ class SavedLetterRestorer:
             self.project_root / "output",
             prefix=".letter-load-",
         )
+        _ACTIVE_LETTER_LOAD_WORKSPACES.add(staged_root)
         pages_tx = PathTransaction(
             self.project_root / USER_PAGES_DIR,
             staging_suffix=".load-staging",
@@ -668,11 +681,13 @@ class SavedLetterRestorer:
             ) from error
         finally:
             try:
-                shutil.rmtree(staged_root)
+                _remove_tree(staged_root)
             except FileNotFoundError:
                 pass
             except OSError:
                 _LOGGER.exception("Could not clean Letter Smith load workspace: %s", staged_root)
+            finally:
+                _ACTIVE_LETTER_LOAD_WORKSPACES.discard(staged_root)
 
         for transaction in transactions:
             try:
@@ -705,9 +720,15 @@ class SavedLetterRestorer:
     ) -> SavedLetter:
         if entry.recipient_id and entry.project_id:
             recipient = self.registry.find_by_id(entry.recipient_id)
-            if recipient is None:
-                raise RecipientAssignmentRequired(entry)
-            return entry
+            if recipient is not None:
+                return entry
+            if entry.recipient:
+                return self.assign_recipient(
+                    entry,
+                    entry.recipient,
+                    custom_capitalization=True,
+                )
+            raise RecipientAssignmentRequired(entry)
         if entry.needs_recipient_assignment:
             raise RecipientAssignmentRequired(entry)
         return self.assign_recipient(
@@ -735,6 +756,18 @@ class SavedLetterRestorer:
             or _valid_uuid(metadata.get("project_id"))
             or str(uuid.uuid4())
         )
+        existing_project_paths = self.resolver.find_project_directories(
+            project_id,
+            recipient_id=record.recipient_id,
+        )
+        if not any(path == source.resolve() for path in existing_project_paths):
+            if existing_project_paths:
+                _LOGGER.info(
+                    "Assigning a new project ID to imported copy %s; existing ID paths: %s",
+                    source,
+                    "; ".join(str(path) for path in existing_project_paths),
+                )
+                project_id = str(uuid.uuid4())
         title = str(
             metadata.get("recipient_title")
             or metadata.get("letter_title")

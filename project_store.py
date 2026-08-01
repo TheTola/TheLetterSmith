@@ -10,13 +10,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 from config import MESSAGE_HTML_FILE, MUSIC_FILE, USER_MESSAGE_DIR, USER_PAGES_DIR, USER_SOUNDS_DIR
-from message_history import MessageHistory
+from message_history import snapshot_current
+from project_paths import PROJECTS_RELATIVE_PATH
 from playlist import PLAYLIST_PATH
 from settings_store import SettingsStore
 from transactional_io import PathTransaction
 
 
-PROJECTS_DIR = "projects"
+PROJECTS_DIR = PROJECTS_RELATIVE_PATH
 PROJECT_MANIFEST = "project.json"
 ACTIVE_PROJECT_KEY = "active_project"
 RECENT_PROJECTS_KEY = "recent_projects"
@@ -59,13 +60,34 @@ class ProjectSummary:
 
 
 class ProjectStore:
-    """Durable projects backed by the existing canonical workspace."""
+    """Durable editable projects in ``output/projects``.
+
+    ``output/Play`` remains generated/published preview output; temporary
+    staging directories are created by ``PathTransaction`` and are not projects.
+    """
 
     def __init__(self, project_root: str | Path) -> None:
         self.project_root = Path(project_root).resolve()
-        self.projects_dir = self.project_root / PROJECTS_DIR
+        self.projects_dir = (self.project_root / PROJECTS_DIR).resolve()
+        self._migrate_legacy_projects()
         self.projects_dir.mkdir(parents=True, exist_ok=True)
         self.settings = SettingsStore(self.project_root)
+
+    def _migrate_legacy_projects(self) -> None:
+        """Move old root/projects data once, without overwriting canonical data."""
+        legacy = (self.project_root / "projects").resolve()
+        if legacy == self.projects_dir or not legacy.is_dir():
+            return
+        self.projects_dir.mkdir(parents=True, exist_ok=True)
+        for child in tuple(legacy.iterdir()):
+            target = self.projects_dir / child.name
+            if target.exists():
+                continue
+            shutil.move(str(child), str(target))
+        try:
+            legacy.rmdir()
+        except OSError:
+            pass
 
     @property
     def active_project_id(self) -> str:
@@ -199,13 +221,19 @@ class ProjectStore:
                 playlist_staging.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_playlist, playlist_staging)
 
-            history = MessageHistory(self.project_root)
-            current_revision = history.snapshot_current_if_changed()
+            current_revision = snapshot_current(
+                self.project_root / MESSAGE_HTML_FILE,
+                reason="project-switch",
+            )
             if current_revision is not None:
-                history.copy_revision_to_message_directory(
-                    current_revision,
-                    message_tx.staging_path,
+                revision_target = (
+                    message_tx.staging_path
+                    / "revisions"
+                    / "message"
+                    / current_revision.name
                 )
+                revision_target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(current_revision, revision_target)
             pages_tx.commit(keep_backup=True)
             committed.append(pages_tx)
             message_tx.commit(keep_backup=True)

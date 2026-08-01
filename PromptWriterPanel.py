@@ -1564,23 +1564,38 @@ class PromptWriterPanel(QtWidgets.QWidget):
         legacy_lines, _ = _read_list_file_cached(self._resolve_managed_list_path("color"))
         legacy_entries = _parse_color_list_entries(legacy_lines)
         legacy_user = [entry.text for entry in legacy_entries if entry.is_user]
+
+        def normalize(values: object) -> List[str]:
+            if not isinstance(values, list):
+                return []
+            normalized: List[str] = []
+            seen: set[str] = set()
+            for value in values:
+                text = _clean_user_added_entry(value)
+                key = _managed_entry_key(text)
+                if text and key not in seen:
+                    normalized.append(text)
+                    seen.add(key)
+            return normalized
+
         if path.exists():
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 values = payload.get("colors", []) if isinstance(payload, dict) else []
                 if not isinstance(values, list):
                     raise ValueError("colors must be a list")
-                return [text for text in (_clean_user_added_entry(value) for value in values) if text]
+                return normalize(values)
             except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
                 LOGGER.exception("User color storage could not be read: %s (%s)", path, error)
-                return legacy_user
+                return normalize(legacy_user)
         if legacy_user:
             try:
+                legacy_user = normalize(legacy_user)
                 safe_write_json(path, {"version": 1, "colors": legacy_user})
                 LOGGER.info("Migrated User Added colors to %s", path)
             except (OSError, ValueError, TypeError) as error:
                 LOGGER.exception("User color migration failed: %s (%s)", path, error)
-            return legacy_user
+            return normalize(legacy_user)
         return []
 
     def _read_managed_entries(self, key: str) -> List[ManagedListEntry]:
@@ -1656,6 +1671,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._colors_path_used = self._resolve_managed_list_path("color")
 
     def _clear_managed_list_cache(self, path: Path) -> None:
+        _FILE_CACHE.pop(path, None)
         _FILE_CACHE.pop(path.name, None)
 
     def _apply_managed_list_changes(self, key: str, entries: List[ManagedListEntry]) -> None:
@@ -1716,8 +1732,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 return
             delay = STATE_PERSIST_DEBOUNCE_MS if delay_ms is None else max(0, int(delay_ms))
             self._persist_timer.start(delay)
-        except Exception:
-            pass
+        except (RuntimeError, TypeError, ValueError) as error:
+            LOGGER.exception("Prompt Writer persistence scheduling failed: %s", error)
 
     def _normalize_reference_images(self, value: object) -> List[ReferenceImage]:
         if not isinstance(value, list):
@@ -1982,7 +1998,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
             try:
                 if self._state_path.exists():
                     state = json.loads(self._state_path.read_text(encoding="utf-8"))
-            except Exception:
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                LOGGER.exception("Prompt Writer state could not be read: %s (%s)", self._state_path, error)
                 state = None
 
             state = self._normalize_persisted_state(state)
@@ -1996,16 +2013,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     self.cmb_type.setCurrentText(t)
                 else:
                     self.cmb_type.setCurrentIndex(0)
-            except Exception:
-                pass
+            except (RuntimeError, TypeError, ValueError) as error:
+                LOGGER.exception("Prompt Writer type selection restoration failed: %s", error)
             try:
                 s = str(state.get("subject", "")).strip()
                 if s:
                     self.cmb_subject.setCurrentText(s)
                 else:
                     self.cmb_subject.setCurrentIndex(-1)
-            except Exception:
-                pass
+            except (RuntimeError, TypeError, ValueError) as error:
+                LOGGER.exception("Prompt Writer subject selection restoration failed: %s", error)
             try:
                 c = str(state.get("color", "")).strip()
                 if c:
@@ -2014,8 +2031,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
                         self.cmb_color.setCurrentIndex(idx)
                 else:
                     self.cmb_color.setCurrentIndex(0)
-            except Exception:
-                pass
+            except (RuntimeError, TypeError, ValueError) as error:
+                LOGGER.exception("Prompt Writer color selection restoration failed: %s", error)
 
             # Text
             try:
@@ -2023,8 +2040,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 for page in self._page_specs:
                     if page.detail_widget is not None:
                         page.detail_widget.setPlainText(str(state.get(page.key, "") or ""))
-            except Exception:
-                pass
+            except (RuntimeError, TypeError, ValueError) as error:
+                LOGGER.exception("Prompt Writer text restoration failed: %s", error)
 
             # Checkboxes
             checks = state.get("checks", {})
@@ -2032,8 +2049,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 for checkbox, state_key in self._checkbox_state_specs():
                     try:
                         checkbox.setChecked(bool(checks.get(state_key, False)))
-                    except Exception:
-                        pass
+                    except (RuntimeError, TypeError, ValueError) as error:
+                        LOGGER.exception("Prompt Writer checkbox restoration failed for %s: %s", state_key, error)
 
             # Generated previews
             try:
@@ -2053,16 +2070,17 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     self._set_generated_output_valid(True)
                 else:
                     self._invalidate_generated_output()
-            except Exception:
+            except (RuntimeError, TypeError, ValueError, UnicodeError) as error:
+                LOGGER.exception("Prompt Writer generated-output restoration failed: %s", error)
                 self._invalidate_generated_output()
 
             try:
                 self._reference_images = self._normalize_reference_images(state.get("reference_images", []))
                 self._refresh_reference_image_panel()
-            except Exception:
-                pass
-        except Exception:
-            pass
+            except (RuntimeError, TypeError, ValueError) as error:
+                LOGGER.exception("Prompt Writer reference restoration failed: %s", error)
+        except (OSError, RuntimeError, TypeError, ValueError, UnicodeError) as error:
+            LOGGER.exception("Prompt Writer state restoration failed for %s: %s", self._state_path, error)
 
     # -----------------------
     # UI
@@ -2568,11 +2586,19 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 self._wire_exclusive_group(group)
             for checkbox, _ in self._checkbox_state_specs():
                 checkbox.stateChanged.connect(self._on_prompt_input_changed)
-        except Exception:
-            pass
+        except (RuntimeError, TypeError, ValueError) as error:
+            LOGGER.exception("Prompt Writer signal wiring failed: %s", error)
 
     def _set_generated_output_valid(self, valid: bool) -> None:
-        self._generated_output_valid = bool(valid and self._generated_prompts)
+        signature_matches = bool(
+            self._generated_input_signature
+            and self._generated_input_signature == self._current_prompt_input_signature()
+        )
+        all_pages_present = all(
+            bool(self._generated_prompts.get(page.key, "").strip())
+            for page in self._page_specs
+        )
+        self._generated_output_valid = bool(valid and signature_matches and all_pages_present)
         self.btn_copy.setEnabled(self._generated_output_valid)
         for page in self._page_specs:
             if page.copy_button is not None:
@@ -2936,8 +2962,14 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         try:
             QtWidgets.QApplication.clipboard().setText(all_text)
-        except Exception:
-            pass
+        except (RuntimeError, OSError) as error:
+            LOGGER.exception("Prompt Writer Copy All failed: %s", error)
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Copy failed",
+                "The generated prompts could not be copied to the clipboard.",
+            )
+            return ""
         return all_text
 
     def _load_colors_into_combo(self):
@@ -3118,7 +3150,15 @@ class PromptWriterPanel(QtWidgets.QWidget):
             if panel_page.preview_widget is not None:
                 text = panel_page.preview_widget.toPlainText().strip()
         if text:
-            QtWidgets.QApplication.clipboard().setText(text)
+            try:
+                QtWidgets.QApplication.clipboard().setText(text)
+            except (RuntimeError, OSError) as error:
+                LOGGER.exception("Prompt Writer copy failed for %s: %s", panel_page.key, error)
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Copy failed",
+                    "The prompt could not be copied to the clipboard.",
+                )
 
     def reset_prompt_writer_state(self) -> bool:
         """Clear the live panel and persist one authoritative empty state."""
