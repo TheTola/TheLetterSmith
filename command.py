@@ -640,8 +640,8 @@ class _ConfirmDialog(
                 border-radius: 14px;
             }
 
-            QLabel {
-                color: #e6e6e6;
+            QLabel#question {
+                color: #ff4d4f;
                 font-size: 13px;
                 font-weight: 700;
             }
@@ -662,10 +662,19 @@ class _ConfirmDialog(
 
             QPushButton#danger {
                 border-color: rgba(255, 77, 79, 0.55);
+                color: #ff4d4f;
             }
 
             QPushButton#danger:hover {
                 border-color: rgba(255, 77, 79, 1.0);
+            }
+
+            QPushButton#cancel {
+                color: #00e5ff;
+            }
+
+            QPushButton#cancel:hover {
+                border-color: rgba(0, 229, 255, 0.9);
             }
             """
         )
@@ -688,6 +697,9 @@ class _ConfirmDialog(
         label = QtWidgets.QLabel(
             "Are you sure? This will erase everything."
         )
+        label.setObjectName(
+            "question"
+        )
 
         label.setWordWrap(
             True
@@ -705,6 +717,10 @@ class _ConfirmDialog(
 
         yes_button = QtWidgets.QPushButton(
             "Yes"
+        )
+
+        no_button.setObjectName(
+            "cancel"
         )
 
         yes_button.setObjectName(
@@ -962,6 +978,8 @@ class _PressGoLabel(
     QtWidgets.QLabel
 ):
     clicked = QtCore.Signal()
+    HOLD_DURATION_MS = 3000
+    BURST_DURATION_MS = 280
 
     def __init__(
         self,
@@ -1007,6 +1025,9 @@ class _PressGoLabel(
         self._pix_base: Optional[
             QtGui.QPixmap
         ] = None
+        self._pix_gray: Optional[
+            QtGui.QPixmap
+        ] = None
 
         self._scale_anim = (
             QtCore.QVariantAnimation(
@@ -1020,6 +1041,27 @@ class _PressGoLabel(
 
         self._scale_anim.valueChanged.connect(
             self._apply_scale
+        )
+
+        self._hold_timer = QtCore.QTimer(
+            self
+        )
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.timeout.connect(
+            self._complete_hold
+        )
+
+        self._burst_anim = QtCore.QVariantAnimation(
+            self
+        )
+        self._burst_anim.setEasingCurve(
+            QtCore.QEasingCurve.OutCubic
+        )
+        self._burst_anim.valueChanged.connect(
+            self._apply_scale
+        )
+        self._burst_anim.finished.connect(
+            self._emit_held
         )
 
         self._opacity_effect = QtWidgets.QGraphicsOpacityEffect(
@@ -1056,8 +1098,10 @@ class _PressGoLabel(
         )
 
         self._scale = 1.0
-        self._pressed = False
         self._busy = False
+        self._holding = False
+        self._hold_completed = False
+        self._use_gray = False
 
     def set_base(
         self,
@@ -1069,9 +1113,42 @@ class _PressGoLabel(
         )
 
         self._pix_base = pixmap
+        self._pix_gray = self._make_gray_pixmap(
+            pixmap
+        )
 
         self._set_scaled_geometry_and_pixmap(
-            1.0
+            self._scale
+        )
+
+    @staticmethod
+    def _make_gray_pixmap(
+        pixmap: QtGui.QPixmap,
+    ) -> QtGui.QPixmap:
+        if pixmap.isNull():
+            return QtGui.QPixmap()
+        source = pixmap.toImage().convertToFormat(
+            QtGui.QImage.Format_ARGB32_Premultiplied
+        )
+        gray = source.convertToFormat(
+            QtGui.QImage.Format_Grayscale8
+        ).convertToFormat(
+            QtGui.QImage.Format_ARGB32_Premultiplied
+        )
+        painter = QtGui.QPainter(
+            gray
+        )
+        painter.setCompositionMode(
+            QtGui.QPainter.CompositionMode_DestinationIn
+        )
+        painter.drawImage(
+            0,
+            0,
+            source,
+        )
+        painter.end()
+        return QtGui.QPixmap.fromImage(
+            gray
         )
 
     def _set_scaled_geometry_and_pixmap(
@@ -1114,36 +1191,16 @@ class _PressGoLabel(
             ),
         )
 
-        center_x = (
-            self._base_rect.x()
-            + base_width / 2
+        source = (
+            self._pix_gray
+            if self._use_gray and self._pix_gray is not None
+            else self._pix_base
         )
-
-        center_y = (
-            self._base_rect.y()
-            + base_height / 2
-        )
-
-        pixmap = self._pix_base.scaled(
+        pixmap = source.scaled(
             new_width,
             new_height,
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,
-        )
-
-        width = pixmap.width()
-        height = pixmap.height()
-
-        x = int(
-            round(
-                center_x - width / 2
-            )
-        )
-
-        y = int(
-            round(
-                center_y - height / 2
-            )
         )
 
         self.setPixmap(
@@ -1151,10 +1208,7 @@ class _PressGoLabel(
         )
 
         self.setGeometry(
-            x,
-            y,
-            width,
-            height,
+            self._base_rect
         )
 
     def _apply_scale(
@@ -1218,33 +1272,115 @@ class _PressGoLabel(
         self,
         busy: bool,
     ) -> None:
+        self.cancel_hold(
+            animate=False
+        )
         self._busy = bool(busy)
-        self._pressed = False
-        self._scale_anim.stop()
+        self._use_gray = self._busy
         self._apply_scale(1.0)
-        self._activity_anim.stop()
 
         if self._busy:
-            if self._animations_enabled:
-                self._activity_anim.start()
-            else:
-                self._opacity_effect.setOpacity(0.78)
+            self._start_blink()
             return
 
+        self._stop_blink()
+
+    def _start_blink(self) -> None:
+        self._activity_anim.stop()
+        if self._animations_enabled:
+            self._activity_anim.start()
+        else:
+            self._opacity_effect.setOpacity(0.78)
+
+    def _stop_blink(self) -> None:
+        self._activity_anim.stop()
         self._opacity_effect.setOpacity(1.0)
+
+    def _start_hold(self) -> None:
+        if self._busy or self._holding or self._hold_completed:
+            return
+        self.cancel_hold(
+            animate=False
+        )
+        self._holding = True
+        self._use_gray = True
+        self._apply_scale(1.0)
+        self._start_blink()
+        self._hold_timer.start(
+            int(self.HOLD_DURATION_MS)
+        )
+
+        if self._animations_enabled:
+            self._scale_anim.stop()
+            self._scale_anim.setEasingCurve(
+                QtCore.QEasingCurve.Linear
+            )
+            self._scale_anim.setDuration(
+                int(self.HOLD_DURATION_MS)
+            )
+            self._scale_anim.setStartValue(1.0)
+            self._scale_anim.setEndValue(0.38)
+            self._scale_anim.start()
+
+    def cancel_hold(
+        self,
+        *,
+        animate: bool = True,
+    ) -> None:
+        self._hold_timer.stop()
+        self._scale_anim.stop()
+        self._burst_anim.stop()
+        self._holding = False
+        self._hold_completed = False
+        self._use_gray = False
+        self._stop_blink()
+        if animate and self._animations_enabled:
+            self._animate_to(
+                1.0,
+                160,
+            )
+        else:
+            self._apply_scale(1.0)
+
+    def _complete_hold(self) -> None:
+        if not self._holding:
+            return
+        self._scale_anim.stop()
+        self._holding = False
+        self._hold_completed = True
+        self._use_gray = False
+        self._stop_blink()
+
+        if not self._animations_enabled:
+            self._emit_held()
+            return
+
+        start_scale = max(
+            0.38,
+            min(1.0, self._scale),
+        )
+        self._burst_anim.stop()
+        self._burst_anim.setDuration(
+            int(self.BURST_DURATION_MS)
+        )
+        self._burst_anim.setStartValue(start_scale)
+        self._burst_anim.setKeyValueAt(0.68, 1.24)
+        self._burst_anim.setEndValue(1.0)
+        self._burst_anim.start()
+
+    def _emit_held(self) -> None:
+        if not self._hold_completed:
+            return
+        self._hold_completed = False
+        self._apply_scale(1.0)
+        self.clicked.emit()
 
     def mousePressEvent(
         self,
         event: QtGui.QMouseEvent,
     ) -> None:
         if event.button() == Qt.LeftButton:
-            self._pressed = True
-
-            self._animate_to(
-                0.92,
-                85,
-            )
-
+            self._start_hold()
             event.accept()
             return
 
@@ -1256,25 +1392,9 @@ class _PressGoLabel(
         self,
         event: QtGui.QMouseEvent,
     ) -> None:
-        if (
-            self._pressed
-            and event.button() == Qt.LeftButton
-        ):
-            self._pressed = False
-
-            self._animate_to(
-                1.0,
-                110,
-            )
-
-            if self.rect().contains(
-                event.position().toPoint()
-            ):
-                QtCore.QTimer.singleShot(
-                    0,
-                    self.clicked.emit,
-                )
-
+        if event.button() == Qt.LeftButton:
+            if self._holding:
+                self.cancel_hold()
             event.accept()
             return
 
@@ -1286,15 +1406,22 @@ class _PressGoLabel(
         self,
         event: QtCore.QEvent,
     ) -> None:
-        if self._pressed:
-            self._pressed = False
-
-            self._animate_to(
-                1.0,
-                110,
-            )
+        if self._holding:
+            self.cancel_hold()
 
         super().leaveEvent(
+            event
+        )
+
+    def hideEvent(
+        self,
+        event: QtGui.QHideEvent,
+    ) -> None:
+        if self._holding or self._hold_completed:
+            self.cancel_hold(
+                animate=False
+            )
+        super().hideEvent(
             event
         )
 
@@ -1302,6 +1429,134 @@ class _PressGoLabel(
 # ─────────────────────────────────────────────────────────────────────────────
 # Command tab
 # ─────────────────────────────────────────────────────────────────────────────
+class _ShockwaveWidget(
+    QtWidgets.QWidget
+):
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget,
+    ) -> None:
+        super().__init__(
+            parent
+        )
+        self.setAttribute(
+            Qt.WA_TransparentForMouseEvents,
+            True,
+        )
+        self.setAttribute(
+            Qt.WA_TranslucentBackground,
+            True,
+        )
+        self._progress = 0.0
+        self._animation = QtCore.QVariantAnimation(
+            self
+        )
+        self._animation.setDuration(520)
+        self._animation.setStartValue(0.0)
+        self._animation.setEndValue(1.0)
+        self._animation.setEasingCurve(
+            QtCore.QEasingCurve.OutCubic
+        )
+        self._animation.valueChanged.connect(
+            self._set_progress
+        )
+        self._animation.finished.connect(
+            self.deleteLater
+        )
+
+    def start(
+        self,
+        *,
+        animate: bool,
+    ) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            self.deleteLater()
+            return
+        self.setGeometry(
+            parent.rect()
+        )
+        self.show()
+        self.raise_()
+        if animate:
+            self._animation.start()
+            return
+        self._progress = 0.72
+        self.update()
+        QtCore.QTimer.singleShot(
+            180,
+            self.deleteLater,
+        )
+
+    def _set_progress(
+        self,
+        value: object,
+    ) -> None:
+        self._progress = float(value)
+        self.update()
+
+    def paintEvent(
+        self,
+        _event: QtGui.QPaintEvent,
+    ) -> None:
+        painter = QtGui.QPainter(
+            self
+        )
+        painter.setRenderHint(
+            QtGui.QPainter.Antialiasing,
+            True,
+        )
+        progress = max(
+            0.0,
+            min(1.0, self._progress),
+        )
+        shortest = min(
+            self.width(),
+            self.height(),
+        )
+        radius = shortest * (
+            0.08 + 0.55 * progress
+        )
+        alpha = max(
+            0,
+            round(235 * (1.0 - progress)),
+        )
+        pen = QtGui.QPen(
+            QtGui.QColor(255, 55, 60, alpha),
+            max(2.0, 9.0 * (1.0 - progress)),
+        )
+        painter.setPen(
+            pen
+        )
+        painter.setBrush(
+            Qt.NoBrush
+        )
+        center = QtCore.QPointF(
+            self.rect().center()
+        )
+        painter.drawEllipse(
+            center,
+            radius,
+            radius,
+        )
+        if progress > 0.18:
+            pen.setColor(
+                QtGui.QColor(255, 160, 160, alpha // 2)
+            )
+            pen.setWidthF(
+                max(1.0, pen.widthF() * 0.5)
+            )
+            painter.setPen(
+                pen
+            )
+            inner_radius = radius * 0.78
+            painter.drawEllipse(
+                center,
+                inner_radius,
+                inner_radius,
+            )
+
+
 def _cover_pixmap(
     pixmap: QtGui.QPixmap,
     display_size: QtCore.QSize,
@@ -1407,7 +1662,7 @@ class CommandTab(
         )
 
         self.go_btn.setToolTip(
-            "Wipe the letter"
+            "Hold Go for 3 seconds to wipe the letter"
         )
 
         self._interaction_state = "idle"
@@ -1453,6 +1708,12 @@ class CommandTab(
         )
         dialog.finished.connect(
             self._release_confirm_dialog
+        )
+        shockwave = _ShockwaveWidget(
+            self
+        )
+        shockwave.start(
+            animate=self.go_btn._animations_enabled
         )
         dialog.open()
 
@@ -1524,7 +1785,7 @@ class CommandTab(
         self.go_btn.set_busy(False)
         self.go_btn.setEnabled(True)
         self.go_btn.setToolTip(
-            "Wipe the letter"
+            "Hold Go for 3 seconds to wipe the letter"
         )
         self._interaction_state = "idle"
 
