@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -13,6 +14,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 DirectoryValidator = Callable[[Path], bool | None]
 _DIRECTORY_REPLACE_TIMEOUT_SECONDS = 2.0
+_PATH_REMOVE_TIMEOUT_SECONDS = 2.0
 
 
 def _temporary_path(target: Path) -> Path:
@@ -115,10 +117,32 @@ def _safe_child(parent: Path, child: Path) -> bool:
 
 
 def _remove_path(path: Path) -> None:
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
-    elif path.exists() or path.is_symlink():
-        path.unlink()
+    deadline = time.monotonic() + _PATH_REMOVE_TIMEOUT_SECONDS
+    while True:
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path, onexc=_remove_readonly_and_retry)
+            elif path.exists() or path.is_symlink():
+                path.unlink()
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def _remove_readonly_and_retry(
+    function: Callable[..., Any],
+    path: str,
+    error: BaseException,
+) -> None:
+    if not isinstance(error, PermissionError):
+        raise error
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    except OSError:
+        pass
+    function(path)
 
 
 def validate_directory(

@@ -5888,6 +5888,17 @@ class SoundTab(QtWidgets.QWidget):
                 QUrl()
             )
 
+    def release_project_files_for_restore(self) -> None:
+        """Stop all Sound-owned work before replacing the project folders."""
+        self.deactivate_for_tab_change()
+        self._stop_background_threads()
+
+        if self._analysis is not None:
+            self._analysis.shutdown()
+            self._analysis_key = ""
+
+        self.release_current_file_handle()
+
     def reset_project_sound(self) -> None:
         """
         Clear the live Sound-tab assignment after Command erases the project.
