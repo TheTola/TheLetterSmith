@@ -59,8 +59,8 @@
     "generated_prompts": {}
   },
   "published_page_url": "",
-  "message_overlay_preset": "black",
-  "message_overlay_opacity": 93,
+  "message_overlay_preset": "paper",
+  "message_overlay_opacity": 68,
   "recipient_name_locked": true,
   "published_page_url_locked": false,
   "curtain_style": "average_color",
