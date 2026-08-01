@@ -384,6 +384,15 @@ class RichTextEdit(QTextEdit):
         self.setAcceptDrops(True)
         self.viewport().setMouseTracking(True)
 
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        super().paintEvent(event)
+        painter = QtGui.QPainter(self.viewport())
+        painter.setPen(QColor(112, 81, 44, 10))
+        for y in range(18, self.viewport().height(), 29):
+            for x in range(17 + (y % 23), self.viewport().width(), 23):
+                painter.drawPoint(x, y)
+        painter.end()
+
     def viewportEvent(self, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.ToolTip:
             href = self.anchorAt(event.pos())
@@ -776,7 +785,7 @@ class Editor(QDialog):
         self.setStyleSheet(
             "QDialog{background:#121212;}"
             "QToolBar{background:#161616;border:1px solid #242424;border-radius:6px;margin:2px;padding:2px;}"
-            "QTextEdit{background:#0f0f0f;color:#eee;border:1px solid #222;border-radius:6px;padding:8px;}"
+            "QTextEdit{background:#f5ebd2;color:#221710;border:1px solid #70512c;border-radius:6px;padding:8px;selection-background-color:#c9a86a;selection-color:#221710;}"
             "QLabel{color:#bbb;}"
             "QSplitter::handle{background:#1e1e1e;}"
             "QPushButton{background:#1d1d1d;color:#fff;border:1px solid #00d0ff;border-radius:6px;padding:6px 12px;}"
