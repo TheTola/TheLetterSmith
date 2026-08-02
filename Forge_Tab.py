@@ -50,9 +50,9 @@ PREVIEW_MODES = (
     ("Window / Browser", "window"),
 )
 PREVIEW_MODE_DESCRIPTIONS = {
-    "portrait": "Tall letter-card presentation",
-    "landscape": "Wide cinematic presentation",
-    "window": "Fit the available browser window",
+    "portrait": " ",
+    "landscape": " ",
+    "window": "",
 }
 RECENT_SAVED_LETTER_LIMIT = 15
 _LOGGER = logging.getLogger(__name__)
