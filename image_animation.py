@@ -161,6 +161,7 @@ def install_image_asset(
                 "frame_count": gif_info.frame_count,
                 "embedded_play_count": gif_info.embedded_play_count,
             },
+            "source_fingerprint": _source_fingerprint(gif_path),
         }
     else:
         _write_static_png(source, png_path)
@@ -210,15 +211,7 @@ def clear_slot_asset(pages_directory: str | Path, slot: str) -> None:
 
 def load_image_manifest(pages_directory: str | Path) -> dict[str, Any]:
     pages = Path(pages_directory)
-    raw_slots: Mapping[str, Any] = {}
-    path = pages / IMAGE_MANIFEST_NAME
-    if path.is_file() and not path.is_symlink():
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            payload = {}
-        if isinstance(payload, dict) and isinstance(payload.get("slots"), dict):
-            raw_slots = payload["slots"]
+    raw_slots = _read_manifest_slots(pages)
 
     slots: dict[str, dict[str, Any]] = {}
     for slot, definition in SLOT_DEFINITIONS.items():
@@ -279,6 +272,74 @@ def load_image_manifest(pages_directory: str | Path) -> dict[str, Any]:
     }
 
 
+def reconcile_external_image_assets(
+    pages_directory: str | Path,
+) -> bool:
+    """Adopt GIFs copied directly into the canonical pages directory."""
+    pages = Path(pages_directory)
+    raw_slots = _read_manifest_slots(pages)
+    manifest = load_image_manifest(pages)
+    changed = False
+
+    for slot, definition in SLOT_DEFINITIONS.items():
+        basename = str(definition["basename"])
+        gif_path = pages / f"{basename}.gif"
+        if not gif_path.is_file() or gif_path.is_symlink():
+            continue
+
+        png_path = pages / f"{basename}.png"
+        raw_record = raw_slots.get(slot)
+        raw_record = raw_record if isinstance(raw_record, dict) else {}
+        fingerprint = _source_fingerprint(gif_path)
+        already_current = (
+            raw_record.get("asset_type") == "animated_gif"
+            and raw_record.get("source_fingerprint") == fingerprint
+            and png_path.is_file()
+        )
+        if already_current:
+            continue
+
+        try:
+            info = inspect_gif(gif_path)
+            if info.frame_count > 1:
+                _write_first_frame_png(gif_path, png_path)
+                settings = (
+                    normalize_gif_settings(raw_record.get("settings"))
+                    if raw_record.get("asset_type") == "animated_gif"
+                    else default_gif_settings()
+                )
+                manifest["slots"][slot] = {
+                    "asset_type": "animated_gif",
+                    "is_animated_gif": True,
+                    "source_file": gif_path.name,
+                    "preview_file": png_path.name,
+                    "settings": settings,
+                    "gif": {
+                        "frame_count": info.frame_count,
+                        "embedded_play_count": info.embedded_play_count,
+                    },
+                    "source_fingerprint": fingerprint,
+                }
+            else:
+                _write_static_png(gif_path, png_path)
+                gif_path.unlink()
+                manifest["slots"][slot] = {
+                    "asset_type": "static",
+                    "is_animated_gif": False,
+                    "source_file": png_path.name,
+                    "preview_file": png_path.name,
+                }
+        except (OSError, ValueError):
+            continue
+
+        _remove_slot_frames(pages, slot)
+        changed = True
+
+    if changed:
+        write_image_manifest(pages, manifest)
+    return changed
+
+
 def write_image_manifest(
     pages_directory: str | Path,
     manifest: Mapping[str, Any],
@@ -300,6 +361,7 @@ def build_runtime_image_assets(
     source_pages = Path(source_pages_directory)
     destination_pages = Path(destination_pages_directory)
     destination_pages.mkdir(parents=True, exist_ok=True)
+    reconcile_external_image_assets(source_pages)
     source_manifest = load_image_manifest(source_pages)
     runtime_slots: dict[str, dict[str, Any]] = {}
     page_sources: dict[str, str] = {}
@@ -500,6 +562,26 @@ def _write_first_frame_png(source: Path, destination: Path) -> None:
         atomic_write_bytes(destination, _png_bytes(image.convert("RGBA")))
 
 
+def _read_manifest_slots(pages: Path) -> Mapping[str, Any]:
+    path = pages / IMAGE_MANIFEST_NAME
+    if not path.is_file() or path.is_symlink():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    slots = payload.get("slots") if isinstance(payload, dict) else None
+    return slots if isinstance(slots, dict) else {}
+
+
+def _source_fingerprint(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
 def _extract_gif_frames(
     source: Path,
     destination: Path,
@@ -549,6 +631,7 @@ __all__ = [
     "install_image_asset",
     "load_image_manifest",
     "normalize_gif_settings",
+    "reconcile_external_image_assets",
     "update_slot_gif_settings",
     "validate_runtime_image_manifest",
     "write_image_manifest",

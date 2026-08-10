@@ -977,6 +977,9 @@ def validate_required_images(
         Path(project_root)
         / USER_PAGES_DIR
     )
+    from image_animation import reconcile_external_image_assets
+
+    reconcile_external_image_assets(base)
 
     return [
         filename

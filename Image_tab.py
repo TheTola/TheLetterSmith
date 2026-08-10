@@ -38,6 +38,7 @@ from image_animation import (
     install_image_asset,
     load_image_manifest,
     normalize_gif_settings,
+    reconcile_external_image_assets,
     update_slot_gif_settings,
 )
 from project_paths import ProjectPathResolver
@@ -1489,6 +1490,9 @@ class ImageTab(
         )
 
     def refresh_cards(self) -> None:
+        reconcile_external_image_assets(
+            self._user_pages_dir()
+        )
         manifest = load_image_manifest(
             self._user_pages_dir()
         )

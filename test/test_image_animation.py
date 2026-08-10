@@ -16,6 +16,7 @@ from image_animation import (
     inspect_gif,
     install_image_asset,
     load_image_manifest,
+    reconcile_external_image_assets,
     update_slot_gif_settings,
     validate_runtime_image_manifest,
 )
@@ -92,6 +93,37 @@ class ImageAnimationTests(unittest.TestCase):
             record = install_image_asset(root / "pages", "letter", single)
             self.assertEqual(record["asset_type"], "static")
             self.assertFalse((root / "pages" / "letter.gif").exists())
+
+    def test_direct_gif_replacement_repairs_static_manifest_and_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pages = Path(directory) / "pages"
+            pages.mkdir()
+            self._write_png(pages / "cover.png", "black")
+            install_image_asset(pages, "cover", pages / "cover.png")
+            (pages / "cover.png").unlink()
+            self._write_gif(pages / "cover.gif")
+
+            self.assertTrue(reconcile_external_image_assets(pages))
+
+            record = load_image_manifest(pages)["slots"]["cover"]
+            self.assertEqual(record["asset_type"], "animated_gif")
+            self.assertEqual(record["gif"]["frame_count"], 3)
+            self.assertTrue((pages / "cover.png").is_file())
+            self.assertFalse(reconcile_external_image_assets(pages))
+
+    def test_direct_single_frame_gif_is_normalized_to_static_png(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pages = Path(directory) / "pages"
+            pages.mkdir()
+            gif_path = pages / "letter.gif"
+            Image.new("RGB", (8, 8), "purple").save(gif_path, format="GIF")
+
+            self.assertTrue(reconcile_external_image_assets(pages))
+
+            record = load_image_manifest(pages)["slots"]["letter"]
+            self.assertEqual(record["asset_type"], "static")
+            self.assertTrue((pages / "letter.png").is_file())
+            self.assertFalse(gif_path.exists())
 
     def test_generated_gallery_controls_frames_and_survives_export(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
