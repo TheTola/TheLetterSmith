@@ -647,6 +647,7 @@ class ImageAssetCard(
             "Settings for this image"
         )
         self.settings_btn.setEnabled(False)
+        self.settings_btn.setVisible(False)
         self.settings_btn.setStyleSheet(
             self.clear_btn.styleSheet()
         )
@@ -717,9 +718,8 @@ class ImageAssetCard(
             else "ready"
         )
 
-        self.settings_btn.setEnabled(
-            not pixmap.isNull()
-        )
+        self.settings_btn.setEnabled(False)
+        self.settings_btn.setVisible(False)
 
     def set_asset_path(
         self,
@@ -756,6 +756,7 @@ class ImageAssetCard(
         )
         self.thumbnail.setMovie(movie)
         movie.jumpToFrame(0)
+        self.settings_btn.setVisible(True)
         self.settings_btn.setEnabled(True)
         self.settings_btn.setToolTip(
             "Animation settings for this GIF"
@@ -787,6 +788,7 @@ class ImageAssetCard(
             "missing"
         )
         self.settings_btn.setEnabled(False)
+        self.settings_btn.setVisible(False)
         self.settings_btn.setToolTip(
             "Select an image before opening settings"
         )
