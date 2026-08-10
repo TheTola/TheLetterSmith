@@ -120,6 +120,14 @@ SETTINGS_KEY_COLOR = "textColor"
 SETTINGS_KEY_GEOMETRY = "windowGeometry"
 SETTINGS_KEY_ULTRALINK_COLOR = "ultralinkColor"
 DEFAULT_ULTRALINK_COLOR = QColor("#ffd84d")
+MIXED_TEXT_COLOR_INDICATOR = (
+    QColor("#ff0000"),
+    QColor("#ff7f00"),
+    QColor("#ffd700"),
+    QColor("#00a651"),
+    QColor("#0066ff"),
+    QColor("#8f00ff"),
+)
 ASSET_SUBDIR = "message_assets"  # under gallery/
 MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
 MESSAGE_OVERLAY_PRESETS = {
@@ -334,73 +342,45 @@ class UltralinkDialog(QDialog):
         self,
         message: str = "",
         *,
-        allow_remove: bool = False,
-        apply_all_text: str = "",
+        selection_text: str = "",
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Ultralink")
+        self.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
         self.setModal(True)
-        self.remove_requested = False
+
+        word_count = len(re.findall(r"\S+", selection_text.strip()))
+        selection_reference = "this word" if word_count == 1 else "these words"
+        self.instruction_label = QLabel(
+            "Ultra Link: Whatever you type here is shown when the user "
+            f"hovers over {selection_reference}.",
+            self,
+        )
+        self.instruction_label.setWordWrap(True)
 
         self.message_edit = QPlainTextEdit(self)
         self.message_edit.setPlainText(message or "")
-        self.message_edit.setPlaceholderText("Text shown when the reader hovers")
+        self.message_edit.setPlaceholderText("Enter the Ultra Link hover text")
         self.message_edit.setMinimumSize(360, 130)
 
-        occurrence_text = re.sub(
-            r"\s+",
-            " ",
-            apply_all_text,
-        ).strip()
-        display_text = (
-            occurrence_text
-            if len(occurrence_text) <= 48
-            else f"{occurrence_text[:45]}…"
-        )
-        self.apply_all_checkbox = QCheckBox(
-            (
-                f'Apply to every whole occurrence of “{display_text}”'
-                if display_text
-                else "Apply to every occurrence"
-            ),
-            self,
-        )
-        self.apply_all_checkbox.setVisible(bool(display_text))
-        self.apply_all_checkbox.setToolTip(
-            "Matches capitalization-insensitively. Existing web links are preserved."
-        )
-
-        buttons = QDialogButtonBox(self)
-        buttons.addButton("Save", QDialogButtonBox.AcceptRole)
-        buttons.addButton("Cancel", QDialogButtonBox.RejectRole)
-        if allow_remove:
-            remove_button = buttons.addButton(
-                "Remove Ultralink",
-                QDialogButtonBox.DestructiveRole,
-            )
-            remove_button.clicked.connect(self._remove)
-        buttons.accepted.connect(self._save)
-        buttons.rejected.connect(self.reject)
+        self.save_button = QPushButton("Save", self)
+        self.save_button.clicked.connect(self._save)
 
         root = QVBoxLayout(self)
+        root.addWidget(self.instruction_label)
         root.addWidget(self.message_edit)
-        root.addWidget(self.apply_all_checkbox)
-        root.addWidget(buttons)
+        root.addWidget(self.save_button, 0, Qt.AlignRight)
 
         self.setStyleSheet(
             "QDialog{background:#141414;border:1px solid #00d0ff;border-radius:8px;}"
+            "QLabel{color:#ddd;}"
             "QPlainTextEdit{background:#0f0f0f;color:#eee;border:1px solid #2a2a2a;border-radius:6px;padding:8px;}"
-            "QCheckBox{color:#ddd;padding:4px 2px;}"
             "QPushButton{background:#232323;color:#fff;border:1px solid #00d0ff;border-radius:4px;padding:6px 12px;}"
             "QPushButton:hover{background:#00d0ff;color:#111;}"
         )
 
     def message_text(self) -> str:
         return self.message_edit.toPlainText().strip()
-
-    def apply_to_all_occurrences(self) -> bool:
-        return self.apply_all_checkbox.isChecked()
 
     def _save(self) -> None:
         if not self.message_text():
@@ -409,9 +389,35 @@ class UltralinkDialog(QDialog):
             return
         self.accept()
 
-    def _remove(self) -> None:
-        self.remove_requested = True
-        self.accept()
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        application = QtWidgets.QApplication.instance()
+        if application is not None:
+            application.installEventFilter(self)
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        application = QtWidgets.QApplication.instance()
+        if application is not None:
+            application.removeEventFilter(self)
+        super().hideEvent(event)
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if (
+            self.isVisible()
+            and event.type() == QtCore.QEvent.MouseButtonPress
+            and isinstance(watched, QtWidgets.QWidget)
+            and not self._contains_popup_widget(watched)
+        ):
+            self.reject()
+        return super().eventFilter(watched, event)
+
+    def _contains_popup_widget(self, widget: QtWidgets.QWidget) -> bool:
+        current: Optional[QtWidgets.QWidget] = widget
+        while current is not None:
+            if current is self:
+                return True
+            current = current.parentWidget()
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -952,7 +958,6 @@ class Editor(QDialog):
         )
 
         self.btn_format.setMenu(fmt_menu)
-        self.toolbar.addWidget(self.btn_format)
 
         # Lists dropdown
         self.btn_lists = QToolButton(self)
@@ -971,7 +976,6 @@ class Editor(QDialog):
         )
 
         self.btn_lists.setMenu(list_menu)
-        self.toolbar.addWidget(self.btn_lists)
 
         # Spacing dropdown (browser-matching export)
         self.btn_spacing = QToolButton(self)
@@ -1013,9 +1017,6 @@ class Editor(QDialog):
             self.spacing_actions[multiplier] = action
 
         self.btn_spacing.setMenu(sp_menu)
-        self.toolbar.addWidget(self.btn_spacing)
-
-        self.toolbar.addSeparator()
 
         # Align dropdown
         self.btn_align = QToolButton(self)
@@ -1043,14 +1044,27 @@ class Editor(QDialog):
             )
             self.alignment_actions[label.casefold()] = action
         self.btn_align.setMenu(menu_align)
-        self.toolbar.addWidget(self.btn_align)
 
         # Color
         self.act_color = QAction("Color", self)
         self.act_color.triggered.connect(
             self._guarded_action("Text color", self.choose_color)
         )
-        self.toolbar.addAction(self.act_color)
+        color_button_host = QtWidgets.QWidget(self)
+        color_button_layout = QHBoxLayout(color_button_host)
+        color_button_layout.setContentsMargins(0, 0, 0, 0)
+        color_button_layout.setSpacing(0)
+        self.btn_color = QToolButton(color_button_host)
+        self.btn_color.setObjectName("textColorButton")
+        self.btn_color.setAccessibleName("Text color")
+        self.btn_color.setAutoRaise(True)
+        self.btn_color.setFixedSize(96, 38)
+        self.btn_color.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.btn_color.clicked.connect(self.act_color.trigger)
+        color_button_layout.addWidget(self.btn_color)
+        self._active_text_color = QColor(self.last_color)
+        self._text_color_indicator_mixed = False
+        self._update_text_color_indicator(self._active_text_color)
 
         self.btn_links = QToolButton(self)
         self.btn_links.setText("Links")
@@ -1076,30 +1090,35 @@ class Editor(QDialog):
         self.editor.selectionChanged.connect(self._update_link_actions)
         self._update_link_actions()
 
+        self.toolbar.addSeparator()
+
         self.btn_ultralink = QToolButton(self)
         self.btn_ultralink.setObjectName("ultralinkButton")
         self.btn_ultralink.setText("U")
         self.btn_ultralink.setToolTip(
-            "Add or edit an Ultralink tooltip on selected text"
+            "Add or edit an Ultra Link tooltip on selected text"
         )
-        self.btn_ultralink.setPopupMode(QToolButton.MenuButtonPopup)
         self.btn_ultralink.setMinimumSize(44, 36)
         self.btn_ultralink.clicked.connect(
             self._guarded_action("Ultralink", self.open_ultralink_dialog)
         )
-        ultralink_menu = QMenu(self.btn_ultralink)
-        color_action = ultralink_menu.addAction(
-            "Choose default Ultralink color…"
+        self.toolbar.addWidget(self.btn_ultralink)
+
+        self.btn_ultralink_color = QToolButton(self)
+        self.btn_ultralink_color.setObjectName("ultralinkColorButton")
+        self.btn_ultralink_color.setText("")
+        self.btn_ultralink_color.setAccessibleName("Default Ultra Link Color")
+        self.btn_ultralink_color.setToolTip(
+            "Choose the application-wide default Ultra Link color"
         )
-        self.act_ultralink_color = color_action
-        color_action.triggered.connect(
+        self.btn_ultralink_color.setFixedSize(30, 30)
+        self.btn_ultralink_color.clicked.connect(
             self._guarded_action(
-                "Ultralink color",
+                "Ultra Link color",
                 self.choose_ultralink_color,
             )
         )
-        self.btn_ultralink.setMenu(ultralink_menu)
-        self.toolbar.addWidget(self.btn_ultralink)
+        self.toolbar.addWidget(self.btn_ultralink_color)
         self.editor.cursorPositionChanged.connect(
             self._update_ultralink_action
         )
@@ -1128,14 +1147,14 @@ class Editor(QDialog):
         self.editor.document().redoAvailable.connect(self.act_redo.setEnabled)
         self.toolbar.addAction(self.act_redo)
 
+        self.toolbar.addSeparator()
+
         self.act_find = QAction("Find", self)
         self.act_find.setShortcut(QKeySequence.Find)
         self.act_find.triggered.connect(
             self._guarded_action("Find", self.open_find_replace)
         )
         self.toolbar.addAction(self.act_find)
-
-        self.toolbar.addSeparator()
 
         # Font family + size
         self.font_combo = QFontComboBox()
@@ -1145,21 +1164,9 @@ class Editor(QDialog):
         self.font_combo.setToolTip("Choose the font for selected text or new typing")
         self.font_combo.currentFontChanged.connect(self._font_family_changed)
 
-        self.font_size_down = QToolButton(self)
-        self.font_size_down.setText("A−")
-        self.font_size_down.setFixedWidth(38)
-        self.font_size_down.setAccessibleName("Decrease font size")
-        self.font_size_down.setToolTip("Decrease font size (Ctrl+[)")
-        self.font_size_down.clicked.connect(
-            self._guarded_action(
-                "Decrease font size",
-                lambda: self.adjust_font_size(-FONT_SIZE_STEP),
-            )
-        )
-
         self.font_size_spin = FontSizeSpinBox()
         self.font_size_spin.setRange(FONT_SIZE_MIN, FONT_SIZE_MAX)
-        self.font_size_spin.setMinimumWidth(76)
+        self.font_size_spin.setMinimumSize(92, 34)
         self.font_size_spin.setSingleStep(FONT_SIZE_STEP)
         self.font_size_spin.setValue(DEFAULT_FONT_SIZE)
         self.font_size_spin.setSuffix(" pt")
@@ -1167,21 +1174,13 @@ class Editor(QDialog):
         self.font_size_spin.setAccelerated(True)
         self.font_size_spin.setAccessibleName("Font size in points")
         self.font_size_spin.setToolTip(
-            "Enter an exact point size, use the arrows, or use A− and A+"
+            "Enter an exact point size or use the up and down arrows"
+        )
+        self.font_size_spin.setStyleSheet(
+            "QSpinBox{padding-right:26px;}"
+            "QSpinBox::up-button,QSpinBox::down-button{width:24px;}"
         )
         self.font_size_spin.valueChanged.connect(self._font_size_changed)
-
-        self.font_size_up = QToolButton(self)
-        self.font_size_up.setText("A+")
-        self.font_size_up.setFixedWidth(38)
-        self.font_size_up.setAccessibleName("Increase font size")
-        self.font_size_up.setToolTip("Increase font size (Ctrl+])")
-        self.font_size_up.clicked.connect(
-            self._guarded_action(
-                "Increase font size",
-                lambda: self.adjust_font_size(FONT_SIZE_STEP),
-            )
-        )
 
         self.act_font_size_down = QAction("Decrease font size", self)
         self.act_font_size_down.setShortcut(QKeySequence("Ctrl+["))
@@ -1216,20 +1215,36 @@ class Editor(QDialog):
         font_layout.addWidget(self.font_combo, 1)
         font_layout.addSpacing(8)
         font_layout.addWidget(size_label)
-        font_layout.addWidget(self.font_size_down)
         font_layout.addWidget(self.font_size_spin)
-        font_layout.addWidget(self.font_size_up)
-        font_layout.addStretch(2)
+
+        character_separator = QtWidgets.QFrame(self.font_controls)
+        character_separator.setObjectName("fontControlsSeparator")
+        character_separator.setFrameShape(QtWidgets.QFrame.VLine)
+        character_separator.setFrameShadow(QtWidgets.QFrame.Plain)
+        font_layout.addWidget(character_separator)
+        font_layout.addWidget(self.btn_format)
+        font_layout.addWidget(color_button_host)
+
+        paragraph_separator = QtWidgets.QFrame(self.font_controls)
+        paragraph_separator.setObjectName("fontControlsSeparator")
+        paragraph_separator.setFrameShape(QtWidgets.QFrame.VLine)
+        paragraph_separator.setFrameShadow(QtWidgets.QFrame.Plain)
+        font_layout.addWidget(paragraph_separator)
+        font_layout.addWidget(self.btn_align)
+        font_layout.addWidget(self.btn_lists)
+        font_layout.addWidget(self.btn_spacing)
+        font_layout.addStretch(1)
         root_layout = self.layout()
         if isinstance(root_layout, QVBoxLayout):
             root_layout.insertWidget(1, self.font_controls)
-        self._sync_font_step_buttons()
+        self._sync_font_size_actions()
 
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
             "QDialog{background:#121212;}"
             "QToolBar{background:#161616;border:1px solid #242424;border-radius:6px;margin:2px;padding:2px;}"
+            "QToolBar::separator{background:#454545;width:1px;margin:7px 6px;}"
             "QTextEdit#EditorTextArea{border:1px solid #70512c;border-radius:6px;padding:8px;selection-background-color:#c9a86a;}"
             "QLabel{color:#bbb;}"
             "QSplitter::handle{background:#1e1e1e;}"
@@ -1242,6 +1257,7 @@ class Editor(QDialog):
             "QToolButton:hover{border-color:#00d0ff;}"
             "QFrame#fontControls{background:#161616;border:1px solid #242424;border-radius:6px;}"
             "QLabel#fontControlsLabel{color:#d7e7ef;font-weight:700;padding:0 2px;}"
+            "QFrame#fontControlsSeparator{color:#454545;}"
             "QCheckBox{color:#ddd;}"
         )
 
@@ -1524,16 +1540,25 @@ class Editor(QDialog):
     # ──────────────────────────────────────────────────────────────────────
 
     def insert_salutation(self) -> None:
+        active_cursor = self.editor.textCursor()
+        active_char_format = QTextCharFormat(self.editor.currentCharFormat())
+        active_block_format = QTextBlockFormat(active_cursor.blockFormat())
+
         cursor = self.editor.textCursor()
         cursor.movePosition(QTextCursor.Start)
 
         fmt = QTextCharFormat()
-        fmt.setFontFamily("Papyrus")
-        fmt.setFontPointSize(48.0)
+        fmt.setFontFamilies(["Papyrus"])
+        fmt.setFontPointSize(50.0)
 
-        cursor.insertText(f"Dear {self.recipient_name},", fmt)
-        cursor.insertBlock()
+        cursor.beginEditBlock()
+        try:
+            cursor.insertText(f"Dear {self.recipient_name},", fmt)
+            cursor.insertBlock(active_block_format, active_char_format)
+        finally:
+            cursor.endEditBlock()
         self.editor.setTextCursor(cursor)
+        self.editor.setCurrentCharFormat(active_char_format)
 
     def open_find_replace(self) -> None:
         if self._find_dialog is None:
@@ -1805,6 +1830,12 @@ class Editor(QDialog):
             "background:#101010;}"
             "QToolButton#ultralinkButton:hover{border-color:#00d0ff;}"
         )
+        self.btn_ultralink_color.setStyleSheet(
+            "QToolButton#ultralinkColorButton{"
+            f"background:{color};"
+            "border:2px solid #e6e6e6;border-radius:5px;padding:0;}"
+            "QToolButton#ultralinkColorButton:hover{border-color:#00d0ff;}"
+        )
 
     def _update_ultralink_action(self) -> None:
         cursor = self.editor.textCursor()
@@ -1817,11 +1848,11 @@ class Editor(QDialog):
             or self._ultralink_target_cursor() is not None
         )
         if contains_standard_link:
-            instruction = "Remove the web link before creating an Ultralink"
+            instruction = "Remove the web link before creating an Ultra Link"
         elif has_target:
-            instruction = "Add or edit an Ultralink tooltip"
+            instruction = "Add or edit an Ultra Link tooltip"
         else:
-            instruction = "Select text to create an Ultralink"
+            instruction = "Select text to create an Ultra Link"
         self.btn_ultralink.setEnabled(has_target)
         self.btn_ultralink.setToolTip(
             f"{instruction}. New color: {self.ultralink_color.name()}"
@@ -1831,12 +1862,16 @@ class Editor(QDialog):
         color = QColorDialog.getColor(
             self.ultralink_color,
             self,
-            "Default Ultralink Color",
+            "Default Ultra Link Color Picker",
         )
         if not color.isValid():
             return
+        self._persist_ultralink_color(color)
+
+    def _persist_ultralink_color(self, color: QColor) -> None:
         self.ultralink_color = color
         self.settings.setValue(SETTINGS_KEY_ULTRALINK_COLOR, color)
+        self.settings.sync()
         self._update_ultralink_button_style()
         self._update_ultralink_action()
 
@@ -1852,8 +1887,8 @@ class Editor(QDialog):
         if self._selection_contains_standard_link(target):
             QMessageBox.information(
                 self,
-                "Ultralink",
-                "Remove the existing web link before applying an Ultralink.",
+                "Ultra Link",
+                "Remove the existing web link before applying an Ultra Link.",
             )
             return
 
@@ -1865,59 +1900,54 @@ class Editor(QDialog):
             else None
         )
         occurrence_text = target.selectedText()
-        can_apply_to_all = (
-            occurrence_text
-            if (
-                occurrence_text
-                and occurrence_text == occurrence_text.strip()
-                and "\u2029" not in occurrence_text
-            )
-            else ""
-        )
         dialog = UltralinkDialog(
             existing_message or "",
-            allow_remove=existing_message is not None,
-            apply_all_text=can_apply_to_all,
+            selection_text=occurrence_text,
             parent=self,
+        )
+        dialog.adjustSize()
+        dialog.move(
+            self.btn_ultralink.mapToGlobal(
+                QtCore.QPoint(0, self.btn_ultralink.height())
+            )
         )
         if dialog.exec() != QDialog.Accepted:
             return
-        if dialog.remove_requested:
-            self.remove_ultralink(target)
-            return
-        if dialog.apply_to_all_occurrences():
-            color = self.ultralink_color
-            if existing_cursor is not None:
-                brush = existing_cursor.charFormat().foreground()
-                if (
-                    brush.style() != Qt.BrushStyle.NoBrush
-                    and brush.color().isValid()
-                ):
-                    color = brush.color()
-            applied, skipped = self.apply_ultralink_to_all_occurrences(
-                can_apply_to_all,
-                dialog.message_text(),
-                color=color,
-                restore_cursor=target,
-            )
-            status = f"Applied Ultralink to {applied} occurrence"
-            status += "" if applied == 1 else "s"
-            if skipped:
-                status += f"; preserved {skipped} existing web link"
-                status += "" if skipped == 1 else "s"
-            status += "."
-            QtWidgets.QToolTip.showText(
-                self.btn_ultralink.mapToGlobal(
-                    QtCore.QPoint(0, self.btn_ultralink.height())
-                ),
-                status,
-                self.btn_ultralink,
-            )
-            return
-        self.apply_ultralink(
-            target,
+        applied_color = self.ultralink_color
+        if existing_cursor is not None:
+            brush = existing_cursor.charFormat().foreground()
+            if (
+                brush.style() != Qt.BrushStyle.NoBrush
+                and brush.color().isValid()
+            ):
+                applied_color = brush.color()
+
+        applied, skipped = self.apply_ultralink_to_all_occurrences(
+            occurrence_text,
             dialog.message_text(),
-            apply_default_color=existing_message is None,
+            color=applied_color,
+            restore_cursor=target,
+        )
+        if not applied:
+            self.apply_ultralink(
+                target,
+                dialog.message_text(),
+                apply_default_color=existing_message is None,
+            )
+            applied = 1
+
+        status = f"Applied Ultra Link to {applied} occurrence"
+        status += "" if applied == 1 else "s"
+        if skipped:
+            status += f"; preserved {skipped} existing web link"
+            status += "" if skipped == 1 else "s"
+        status += "."
+        QtWidgets.QToolTip.showText(
+            self.btn_ultralink.mapToGlobal(
+                QtCore.QPoint(0, self.btn_ultralink.height())
+            ),
+            status,
+            self.btn_ultralink,
         )
 
     def apply_ultralink(
@@ -2122,7 +2152,7 @@ class Editor(QDialog):
         self.font_size_spin.blockSignals(True)
         self.font_size_spin.setValue(size_i)
         self.font_size_spin.blockSignals(False)
-        self._sync_font_step_buttons()
+        self._sync_font_size_actions()
 
     def _commit_font_size_input(self) -> None:
         blocker = QtCore.QSignalBlocker(self.font_size_spin)
@@ -2135,14 +2165,10 @@ class Editor(QDialog):
         size = int(self.font_size_spin.value()) + int(delta)
         self.set_font_size(size)
 
-    def _sync_font_step_buttons(self) -> None:
+    def _sync_font_size_actions(self) -> None:
         if not hasattr(self, "font_size_spin"):
             return
         size = int(self.font_size_spin.value())
-        if hasattr(self, "font_size_down"):
-            self.font_size_down.setEnabled(size > FONT_SIZE_MIN)
-        if hasattr(self, "font_size_up"):
-            self.font_size_up.setEnabled(size < FONT_SIZE_MAX)
         if hasattr(self, "act_font_size_down"):
             self.act_font_size_down.setEnabled(size > FONT_SIZE_MIN)
         if hasattr(self, "act_font_size_up"):
@@ -2183,10 +2209,12 @@ class Editor(QDialog):
         self.editor.setTextCursor(cursor)
 
     def choose_color(self) -> None:
-        color = QColorDialog.getColor(self.last_color, parent=self)
+        initial_color = getattr(self, "_active_text_color", self.last_color)
+        color = QColorDialog.getColor(initial_color, parent=self)
         if not color.isValid():
             return
         self.last_color = color
+        self._active_text_color = QColor(color)
         try:
             self.settings.setValue(SETTINGS_KEY_COLOR, color)
         except Exception:
@@ -2195,6 +2223,103 @@ class Editor(QDialog):
         fmt = QTextCharFormat()
         fmt.setForeground(color)
         self._apply_char_format(fmt)
+        self._sync_text_color_indicator(self.editor.currentCharFormat())
+
+    @staticmethod
+    def _format_foreground_color(
+        fmt: QTextCharFormat,
+        fallback: QColor,
+    ) -> QColor:
+        brush = fmt.foreground()
+        if (
+            brush.style() != Qt.BrushStyle.NoBrush
+            and brush.color().isValid()
+        ):
+            return QColor(brush.color())
+        return QColor(fallback)
+
+    def _selected_text_colors(self, cursor: QTextCursor) -> tuple[QColor, ...]:
+        colors: dict[int, QColor] = {}
+        default_text_color = self.editor.palette().color(
+            QtGui.QPalette.ColorRole.Text
+        )
+        if not default_text_color.isValid():
+            default_text_color = QColor(self.last_color)
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        block = self.editor.document().findBlock(start)
+        while block.isValid() and block.position() < end:
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid():
+                    fragment_start = fragment.position()
+                    fragment_end = fragment_start + fragment.length()
+                    if fragment_start < end and fragment_end > start:
+                        color = self._format_foreground_color(
+                            fragment.charFormat(),
+                            default_text_color,
+                        )
+                        colors[color.rgba()] = color
+                iterator += 1
+            block = block.next()
+        return tuple(colors.values())
+
+    def _sync_text_color_indicator(self, fmt: QTextCharFormat) -> None:
+        if not hasattr(self, "btn_color"):
+            return
+        cursor = self.editor.textCursor()
+        colors = self._selected_text_colors(cursor) if cursor.hasSelection() else ()
+        if len(colors) > 1:
+            self._update_text_color_indicator(mixed=True)
+            return
+        color = (
+            colors[0]
+            if colors
+            else self._format_foreground_color(fmt, self.last_color)
+        )
+        self._active_text_color = QColor(color)
+        self._update_text_color_indicator(color)
+
+    def _update_text_color_indicator(
+        self,
+        color: Optional[QColor] = None,
+        *,
+        mixed: bool = False,
+    ) -> None:
+        label = "COLORS" if mixed else "Color"
+        colors = (
+            MIXED_TEXT_COLOR_INDICATOR
+            if mixed
+            else (QColor(color or self.last_color),) * len(label)
+        )
+        font = QFont(self.btn_color.font())
+        font.setBold(True)
+        font.setPixelSize(16)
+        metrics = QtGui.QFontMetrics(font)
+        widths = tuple(metrics.horizontalAdvance(character) for character in label)
+        pixmap = QPixmap(sum(widths) + 10, max(28, metrics.height() + 6))
+        pixmap.fill(Qt.transparent)
+        painter = QtGui.QPainter(pixmap)
+        painter.setFont(font)
+        x = (pixmap.width() - sum(widths)) / 2.0
+        baseline = (pixmap.height() + metrics.ascent() - metrics.descent()) / 2.0
+        for character, character_color, width in zip(label, colors, widths):
+            painter.setPen(character_color)
+            painter.drawText(QtCore.QPointF(x, baseline), character)
+            x += width
+        painter.end()
+
+        self._text_color_indicator_mixed = mixed
+        self._text_color_indicator_colors = tuple(
+            character_color.name() for character_color in colors
+        )
+        self.btn_color.setIcon(QtGui.QIcon(pixmap))
+        self.btn_color.setIconSize(pixmap.size())
+        self.btn_color.setToolTip(
+            "Mixed text colors; choose one text color"
+            if mixed
+            else f"Text color: {colors[0].name()}"
+        )
 
     def insert_bullet_list(self) -> None:
         c = self.editor.textCursor()
@@ -2278,7 +2403,7 @@ class Editor(QDialog):
                 sz = int(round(eff)) if eff and eff > 0 else DEFAULT_FONT_SIZE
 
             self.font_size_spin.setValue(max(FONT_SIZE_MIN, min(FONT_SIZE_MAX, sz)))
-            self._sync_font_step_buttons()
+            self._sync_font_size_actions()
 
             for action, checked in (
                 (getattr(self, "act_bold", None), fmt.fontWeight() >= QFont.Bold),
@@ -2291,6 +2416,7 @@ class Editor(QDialog):
                 blocker = QtCore.QSignalBlocker(action)
                 action.setChecked(bool(checked))
                 del blocker
+            self._sync_text_color_indicator(fmt)
         finally:
             self.font_combo.blockSignals(False)
             self.font_size_spin.blockSignals(False)

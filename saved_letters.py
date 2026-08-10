@@ -51,6 +51,7 @@ from sound_model import (
     current_manifest_path,
     current_music_path,
     display_title_from_name,
+    hash_file,
     import_runtime_track,
     load_library,
     resolve_project_tracks,
@@ -300,11 +301,51 @@ def _saved_prompt_writer_state(
     if configured_path or current_format:
         raise SavedLetterRestoreError("The saved Prompt Writer state is missing.")
 
+    return _empty_prompt_writer_state()
+
+
+def _backfill_legacy_prompt_writer_state(
+    play_dir: Path,
+    metadata: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
+    editable_assets = metadata.get("editable_assets", {})
+    configured_path = (
+        editable_assets.get("prompt_writer_state", "")
+        if isinstance(editable_assets, dict)
+        else ""
+    )
+    if _runtime_file(
+        play_dir,
+        configured_path,
+        PROMPT_WRITER_STATE_FILE,
+    ) is not None:
+        return
+
+    source_version = metadata.get(
+        "source_version",
+        metadata.get("schema_version", 0),
+    )
+    try:
+        current_format = int(source_version) >= METADATA_VERSION
+    except (TypeError, ValueError):
+        current_format = False
+    if configured_path or current_format:
+        return
+
+    try:
+        atomic_write_json(play_dir / PROMPT_WRITER_STATE_FILE, state)
+    except OSError:
+        _LOGGER.warning(
+            "Could not save default Prompt Writer state for legacy letter %s.",
+            play_dir,
+            exc_info=True,
+        )
+        return
     _LOGGER.info(
-        "Saved letter %s has no Prompt Writer state; using legacy defaults.",
+        "Saved default Prompt Writer state for legacy letter %s.",
         play_dir,
     )
-    return _empty_prompt_writer_state()
 
 
 def _runtime_directory(
@@ -366,6 +407,111 @@ def _runtime_file(
     return None
 
 
+def _legacy_optional_sound_payload(sounds: Path) -> dict[str, Any]:
+    try:
+        music_files = sorted(
+            (
+                path
+                for path in sounds.iterdir()
+                if re.fullmatch(
+                    r"music(?:-\d+)?\.mp3",
+                    path.name,
+                    re.IGNORECASE,
+                )
+                and path.is_file()
+                and not path.is_symlink()
+                and _readable_file(path)
+            ),
+            key=lambda path: (
+                0 if path.name.casefold() == "music.mp3" else 1,
+                path.name.casefold(),
+            ),
+        )
+        tracks = [
+            {
+                "filename": path.name,
+                "display_title": display_title_from_name(path.name).capitalize(),
+                "duration_seconds": 0.0,
+                "content_hash": hash_file(path),
+                "original_name": path.name,
+            }
+            for path in music_files
+        ]
+    except OSError as error:
+        raise SavedLetterRestoreError(
+            "The legacy saved music is unreadable."
+        ) from error
+    return {
+        "version": 2,
+        "mode": "playlist" if len(tracks) > 1 else "single",
+        "crossfade_ms": 1000 if len(tracks) > 1 else 0,
+        "tracks": tracks,
+    }
+
+
+def _legacy_optional_sound_migration_allowed(
+    metadata: dict[str, Any],
+) -> bool:
+    editable_assets = metadata.get("editable_assets", {})
+    configured_manifest = (
+        editable_assets.get("sound_manifest", "")
+        if isinstance(editable_assets, dict)
+        else ""
+    )
+    source_version = metadata.get(
+        "source_version",
+        metadata.get("schema_version", 0),
+    )
+    try:
+        current_format = int(source_version) >= METADATA_VERSION
+    except (TypeError, ValueError):
+        current_format = False
+    stored_settings = metadata.get("settings", {})
+    required_features = (
+        stored_settings.get("required_features", {})
+        if isinstance(stored_settings, dict)
+        else {}
+    )
+    music_required = bool(
+        required_features.get("music", False)
+        if isinstance(required_features, dict)
+        else False
+    )
+    return not configured_manifest and not current_format and not music_required
+
+
+def _backfill_legacy_optional_sound_manifest(
+    play_dir: Path,
+    metadata: dict[str, Any],
+) -> None:
+    if not _legacy_optional_sound_migration_allowed(metadata):
+        return
+    sounds = _runtime_directory(
+        play_dir,
+        "gallery/sounds",
+        "gallery/user/sounds",
+    )
+    if sounds is None:
+        return
+    manifest = sounds / BUILD_SOUND_MANIFEST_NAME
+    if manifest.exists() or manifest.is_symlink():
+        return
+    try:
+        payload = _legacy_optional_sound_payload(sounds)
+        atomic_write_json(manifest, payload)
+    except (OSError, SavedLetterRestoreError):
+        _LOGGER.warning(
+            "Could not save the legacy optional-sound manifest for %s.",
+            play_dir,
+            exc_info=True,
+        )
+        return
+    _LOGGER.info(
+        "Saved the legacy optional-sound manifest for %s.",
+        play_dir,
+    )
+
+
 def _readable_file(path: Path) -> bool:
     try:
         with path.open("rb") as stream:
@@ -386,6 +532,7 @@ class SavedLetterCatalog:
     def list_entries(self) -> tuple[SavedLetter, ...]:
         entries: list[SavedLetter] = []
         seen: set[Path] = set()
+        validator = SavedLetterRestorer(self.project_root)
         for root, recovery in (
             (self.play_root, False),
             (self.recovery_root, True),
@@ -403,10 +550,11 @@ class SavedLetterCatalog:
                 try:
                     if not self._is_valid_candidate(path):
                         continue
+                    validator._validated_saved_letter_content(path)
                     entry = self._entry(path, recovery=recovery)
                 except Exception:
                     _LOGGER.warning(
-                        "Skipping unreadable saved-letter candidate: %s",
+                        "Skipping unloadable saved-letter candidate: %s",
                         path,
                         exc_info=True,
                     )
@@ -499,12 +647,20 @@ class SavedLetterCatalog:
             and message
             and controls
             and all(
-                (pages / name).is_file()
+                not (pages / name).is_symlink()
+                and (pages / name).is_file()
+                and _readable_file(pages / name)
                 for name in REQUIRED_SLIDES
-                if name != "cover.png"
             )
-            and all((controls / name).is_file() for name in CONTROL_FILES)
+            and all(
+                not (controls / name).is_symlink()
+                and (controls / name).is_file()
+                and _readable_file(controls / name)
+                for name in CONTROL_FILES
+            )
+            and not (message / "message.html").is_symlink()
             and (message / "message.html").is_file()
+            and _readable_file(message / "message.html")
         )
 
     def _entry(self, path: Path, *, recovery: bool = False) -> SavedLetter:
@@ -586,58 +742,27 @@ class SavedLetterRestorer:
         )
 
     def restore(self, entry: SavedLetter) -> RestoredProject:
+        legacy_source = self._validated_play_directory(entry.path)
+        _backfill_legacy_optional_sound_manifest(
+            legacy_source,
+            _read_metadata(legacy_source),
+        )
         entry = self.ensure_entry_identity(entry)
-        resolved = self.resolver.resolve_project_directory(
-            entry.project_id,
-            recipient_id=entry.recipient_id,
-        )
-        play_dir = self._validated_play_directory(
-            resolved or entry.path
-        )
-        pages = _runtime_directory(
+        # The selected catalog path is authoritative. ProjectPathResolver owns
+        # write-only autosaves and must never supply a restoration source.
+        (
             play_dir,
-            "gallery/pages",
-            "gallery/user/pages",
+            pages,
+            message,
+            sounds,
+            metadata,
+            prompt_writer_state,
+            sound_payload,
+            sound_tracks,
+        ) = self._validated_saved_letter_content(
+            entry.path,
+            report_optional_sound_error=True,
         )
-        message = _runtime_directory(
-            play_dir,
-            "gallery/message",
-            "gallery/user/message",
-        )
-        sounds = _runtime_directory(
-            play_dir,
-            "gallery/sounds",
-            "gallery/user/sounds",
-        )
-        if pages is None or message is None:
-            raise SavedLetterRestoreError(
-                "The selected saved letter is missing editable content."
-            )
-        self._validate_pages(pages)
-        self._validate_message(play_dir, message)
-        metadata = _read_metadata(play_dir)
-        prompt_writer_state = _saved_prompt_writer_state(play_dir, metadata)
-        try:
-            sound_payload, sound_tracks = self._validate_sound(sounds)
-        except SavedLetterRestoreError:
-            stored_settings = metadata.get("settings", {})
-            required_features = (
-                stored_settings.get("required_features", {})
-                if isinstance(stored_settings, dict)
-                else {}
-            )
-            music_required = bool(
-                required_features.get("music", False)
-                if isinstance(required_features, dict)
-                else False
-            )
-            if music_required:
-                raise
-            _LOGGER.warning(
-                "Ignoring invalid optional sound data while restoring %s",
-                play_dir,
-            )
-            sound_payload, sound_tracks = {"mode": "single", "tracks": []}, []
         settings_before = self.settings.snapshot()
         restored_settings = self._prepare_settings(
             metadata,
@@ -791,6 +916,11 @@ class SavedLetterRestorer:
                     "Could not clean restoration backup for %s",
                     transaction.final_path,
                 )
+        _backfill_legacy_prompt_writer_state(
+            play_dir,
+            metadata,
+            prompt_writer_state,
+        )
         return RestoredProject(
             play_dir=play_dir,
             project_id=str(restored_settings["project_id"]),
@@ -850,24 +980,12 @@ class SavedLetterRestorer:
             or _valid_uuid(metadata.get("project_id"))
             or str(uuid.uuid4())
         )
-        existing_project_paths = self.resolver.find_project_directories(
-            project_id,
-            recipient_id=record.recipient_id,
-        )
-        if not any(path == source.resolve() for path in existing_project_paths):
-            if existing_project_paths:
-                _LOGGER.info(
-                    "Assigning a new project ID to imported copy %s; existing ID paths: %s",
-                    source,
-                    "; ".join(str(path) for path in existing_project_paths),
-                )
-                project_id = str(uuid.uuid4())
         title = str(
             metadata.get("recipient_title")
             or entry.title
             or "Untitled Letter"
         ).strip()
-        context = self.resolver.context_from_settings(
+        self.resolver.context_from_settings(
             {
                 "recipient_id": record.recipient_id,
                 "recipient_display_name": record.display_name,
@@ -877,15 +995,7 @@ class SavedLetterRestorer:
                 "recipient_title": title,
             }
         )
-        recipient_directory = self.resolver.resolve_recipient_directory(
-            record.recipient_id
-        )
-        try:
-            source.relative_to(recipient_directory)
-            destination = source
-        except ValueError:
-            destination = context.project_directory
-
+        prompt_writer_state = _saved_prompt_writer_state(source, metadata)
         identity_metadata = dict(metadata)
         identity_metadata.update(
             {
@@ -902,39 +1012,35 @@ class SavedLetterRestorer:
             }
         )
 
-        if destination == source:
+        transaction = PathTransaction(
+            source,
+            staging_suffix=".identity-staging",
+            backup_suffix=".identity-backup",
+            unique_staging=True,
+        )
+        staging = transaction.prepare()
+        try:
+            shutil.copytree(source, staging)
             atomic_write_json(
-                destination / PLAY_METADATA_FILE,
+                staging / PLAY_METADATA_FILE,
                 identity_metadata,
             )
-        else:
-            transaction = PathTransaction(
-                destination,
-                staging_suffix=".identity-staging",
-                backup_suffix=".identity-backup",
-                unique_staging=True,
+            atomic_write_json(
+                staging / PROMPT_WRITER_STATE_FILE,
+                prompt_writer_state,
             )
-            staging = transaction.prepare()
-            try:
-                shutil.copytree(source, staging)
-                atomic_write_json(
-                    staging / PLAY_METADATA_FILE,
-                    identity_metadata,
-                )
-                if not SavedLetterCatalog._is_valid_candidate(staging):
-                    raise SavedLetterRestoreError(
-                        "The identified saved-letter copy failed validation."
-                    )
-                transaction.commit(keep_backup=True)
-                transaction.finalize()
-            except Exception:
-                transaction.abort()
-                raise
+            self._validated_saved_letter_content(staging)
+            transaction.commit(keep_backup=True)
+            transaction.finalize()
+        except Exception:
+            transaction.abort()
+            raise
 
         return SavedLetterCatalog(
             self.project_root
         )._entry(
-            destination,
+            source,
+            recovery=entry.recovery,
         )
 
     def _validated_play_directory(self, source: Path) -> Path:
@@ -992,6 +1098,84 @@ class SavedLetterRestorer:
                 "The selected saved letter has an incomplete viewer."
             )
         return resolved
+
+    def _validated_saved_letter_content(
+        self,
+        source: Path,
+        *,
+        report_optional_sound_error: bool = False,
+    ) -> tuple[
+        Path,
+        Path,
+        Path,
+        Optional[Path],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        list[dict[str, Any]],
+    ]:
+        play_dir = self._validated_play_directory(source)
+        pages = _runtime_directory(
+            play_dir,
+            "gallery/pages",
+            "gallery/user/pages",
+        )
+        message = _runtime_directory(
+            play_dir,
+            "gallery/message",
+            "gallery/user/message",
+        )
+        sounds = _runtime_directory(
+            play_dir,
+            "gallery/sounds",
+            "gallery/user/sounds",
+        )
+        if pages is None or message is None:
+            raise SavedLetterRestoreError(
+                "The selected saved letter is missing editable content."
+            )
+        self._validate_pages(pages)
+        self._validate_message(play_dir, message)
+        metadata = _read_metadata(play_dir)
+        prompt_writer_state = _saved_prompt_writer_state(play_dir, metadata)
+        legacy_optional_sound = _legacy_optional_sound_migration_allowed(
+            metadata
+        )
+        try:
+            sound_payload, sound_tracks = self._validate_sound(
+                sounds,
+                allow_legacy_optional=legacy_optional_sound,
+            )
+        except SavedLetterRestoreError:
+            stored_settings = metadata.get("settings", {})
+            required_features = (
+                stored_settings.get("required_features", {})
+                if isinstance(stored_settings, dict)
+                else {}
+            )
+            music_required = bool(
+                required_features.get("music", False)
+                if isinstance(required_features, dict)
+                else False
+            )
+            if music_required:
+                raise
+            if report_optional_sound_error:
+                _LOGGER.warning(
+                    "Ignoring invalid optional sound data while restoring %s",
+                    play_dir,
+                )
+            sound_payload, sound_tracks = {"mode": "single", "tracks": []}, []
+        return (
+            play_dir,
+            pages,
+            message,
+            sounds,
+            metadata,
+            prompt_writer_state,
+            sound_payload,
+            sound_tracks,
+        )
 
     @staticmethod
     def _validate_pages(pages: Path) -> None:
@@ -1071,6 +1255,8 @@ class SavedLetterRestorer:
     @staticmethod
     def _validate_sound(
         sounds: Optional[Path],
+        *,
+        allow_legacy_optional: bool = False,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         if sounds is None:
             return {"mode": "single", "tracks": []}, []
@@ -1091,6 +1277,9 @@ class SavedLetterRestorer:
                 raise SavedLetterRestoreError(
                     "The saved sound manifest is invalid."
                 )
+        elif allow_legacy_optional:
+            payload = _legacy_optional_sound_payload(sounds)
+            raw_tracks = payload["tracks"]
         elif any(sounds.iterdir()):
             raise SavedLetterRestoreError(
                 "The saved sound manifest is missing."

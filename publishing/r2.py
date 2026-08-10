@@ -16,6 +16,13 @@ from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from publishing.base import Publisher
+from publishing.cloudflare_oauth import (
+    CloudflareAuthorization,
+    CloudflareOAuthClientConfigurationStore,
+    CloudflareOAuthError,
+    CloudflareOAuthSession,
+    CloudflareOAuthTokenStore,
+)
 from publishing.credentials import R2CredentialStore, R2Credentials
 from publishing.expiration import (
     PUBLICATION_TTL_DAYS,
@@ -24,6 +31,7 @@ from publishing.expiration import (
     publication_window,
 )
 from publishing.models import PublishConfiguration, PublishResult
+from publishing.r2_rest import CloudflareR2RestClient
 from settings_store import PUBLISHED_PAGE_URL_KEY, SettingsStore
 
 
@@ -47,6 +55,10 @@ LAST_OBJECT_COUNT_KEY = "r2_last_object_count"
 LAST_USAGE_AT_KEY = "r2_last_usage_at"
 CURRENT_PUBLIC_PATH_KEY = "r2_current_public_path"
 PUBLIC_WARNING_KEY = "r2_public_warning_acknowledged"
+AUTHENTICATION_MODE_KEY = "r2_authentication_mode"
+
+AUTHENTICATION_MODE_MANUAL = "manual"
+AUTHENTICATION_MODE_OAUTH = "oauth"
 
 DEFAULT_BUCKET = "letter-smith-publishing"
 FREE_TIER_LIMIT_BYTES = 10_000_000_000
@@ -264,12 +276,26 @@ def _error_identity(error: BaseException) -> tuple[str, object, str]:
 def _classify_error(error: BaseException, operation: str) -> R2OperationError:
     if isinstance(error, R2OperationError):
         return error
+    if isinstance(error, CloudflareOAuthError):
+        return R2OperationError(
+            error.code,
+            error.user_message,
+            error.technical_details,
+        )
     provider_code, status, request_id = _error_identity(error)
     normalized = provider_code.casefold()
     technical = (
         f"operation={operation}; type={type(error).__name__}; "
         f"provider_code={provider_code}; http_status={status}; request_id={request_id}"
     )
+    if operation == "oauth_configure" and normalized == "10042":
+        return R2OperationError(
+            "r2_activation",
+            "Cloudflare login is connected, but R2 is not enabled for this account. "
+            "Open Cloudflare R2, complete its activation once, then reopen this "
+            "window so Letter Smith can finish automatically.",
+            technical,
+        )
     if normalized in {
         "accessdenied",
         "invalidaccesskeyid",
@@ -279,7 +305,15 @@ def _classify_error(error: BaseException, operation: str) -> R2OperationError:
     } or status in {401, 403}:
         return R2OperationError(
             "authentication",
-            "Cloudflare rejected the R2 credentials. Open R2 Storage and reconnect the account.",
+            "Cloudflare rejected the saved R2 authorization. Open R2 Storage and reconnect the account.",
+            technical,
+        )
+    if operation == "oauth_configure" and status == 400:
+        return R2OperationError(
+            "r2_activation",
+            "Cloudflare login is connected, but R2 could not be activated "
+            "automatically. Open Cloudflare R2, complete any setup request, then "
+            "reopen this window so Letter Smith can finish automatically.",
             technical,
         )
     if normalized in {"nosuchbucket", "404"} or status == 404:
@@ -292,6 +326,12 @@ def _classify_error(error: BaseException, operation: str) -> R2OperationError:
         return R2OperationError(
             "rate_limit",
             "Cloudflare is temporarily limiting requests. Wait briefly and try again.",
+            technical,
+        )
+    if normalized in {"entitytoolarge", "413"} or status == 413:
+        return R2OperationError(
+            "object_too_large",
+            "One letter file is larger than Cloudflare's 300 MB OAuth upload limit. Reduce that file before publishing.",
             technical,
         )
     if "timeout" in normalized or "connection" in normalized or "endpoint" in normalized:
@@ -314,12 +354,20 @@ class R2Publisher(Publisher):
         *,
         credential_store: R2CredentialStore | None = None,
         client_factory: Callable[[R2Configuration, R2Credentials], Any] | None = None,
+        oauth_token_store: CloudflareOAuthTokenStore | None = None,
+        oauth_configuration_store: CloudflareOAuthClientConfigurationStore | None = None,
+        oauth_client_factory: Callable[[str, CloudflareOAuthSession], Any] | None = None,
         public_checker: Callable[[str, bytes], bool] | None = None,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         self.settings = SettingsStore(self.project_root)
         self.credential_store = credential_store or R2CredentialStore()
         self.client_factory = client_factory or _boto3_client
+        self.oauth_token_store = oauth_token_store or CloudflareOAuthTokenStore()
+        self.oauth_configuration_store = (
+            oauth_configuration_store or CloudflareOAuthClientConfigurationStore()
+        )
+        self.oauth_client_factory = oauth_client_factory or CloudflareR2RestClient
         self.public_checker = public_checker or _confirm_public_marker
 
     def configuration(self) -> R2Configuration | None:
@@ -335,12 +383,22 @@ class R2Publisher(Publisher):
             return None
 
     def is_configured(self) -> bool:
-        return self.configuration() is not None and self.credential_store.load() is not None
+        return self.configuration() is not None and bool(self.authentication_mode())
+
+    def authentication_mode(self) -> str:
+        requested = str(self.settings.get(AUTHENTICATION_MODE_KEY, "")).strip()
+        if requested == AUTHENTICATION_MODE_OAUTH and self.oauth_token_store.load() is not None:
+            return AUTHENTICATION_MODE_OAUTH
+        if self.credential_store.load() is not None:
+            return AUTHENTICATION_MODE_MANUAL
+        if self.oauth_token_store.load() is not None:
+            return AUTHENTICATION_MODE_OAUTH
+        return ""
 
     def configure(self, parent=None) -> PublishConfiguration:
         del parent
         configuration = self.configuration()
-        if configuration is None or self.credential_store.load() is None:
+        if configuration is None or not self.authentication_mode():
             return PublishConfiguration(
                 False,
                 message="Open R2 Storage and connect a Cloudflare account before publishing.",
@@ -357,13 +415,133 @@ class R2Publisher(Publisher):
         credentials: R2Credentials | None = None,
     ):
         active_configuration = configuration or self.configuration()
-        active_credentials = credentials or self.credential_store.load()
-        if active_configuration is None or active_credentials is None:
+        if active_configuration is None:
             raise R2OperationError(
                 "not_configured",
                 "Open R2 Storage and connect a Cloudflare account before publishing.",
             )
-        return self.client_factory(active_configuration, active_credentials)
+        mode = self.authentication_mode()
+        if credentials is not None or mode == AUTHENTICATION_MODE_MANUAL:
+            active_credentials = credentials or self.credential_store.load()
+            if active_credentials is None:
+                raise R2OperationError(
+                    "not_configured",
+                    "Open R2 Storage and connect a Cloudflare account before publishing.",
+                )
+            return self.client_factory(active_configuration, active_credentials)
+        if mode == AUTHENTICATION_MODE_OAUTH:
+            oauth_configuration = self.oauth_configuration_store.load()
+            if oauth_configuration is None or self.oauth_token_store.load() is None:
+                raise R2OperationError(
+                    "oauth_setup",
+                    "Cloudflare login is not configured for this Letter Smith installation.",
+                )
+            session = CloudflareOAuthSession(
+                oauth_configuration,
+                self.oauth_token_store,
+            )
+            return self.oauth_client_factory(active_configuration.account_id, session)
+        raise R2OperationError(
+            "not_configured",
+            "Open R2 Storage and connect a Cloudflare account before publishing.",
+        )
+
+    def authorize_oauth(
+        self,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+        reuse_saved: bool = False,
+    ) -> CloudflareAuthorization:
+        oauth_configuration = self.oauth_configuration_store.load()
+        if oauth_configuration is None:
+            raise R2OperationError(
+                "oauth_setup",
+                "Cloudflare login needs a Letter Smith OAuth Client ID before it can connect.",
+            )
+        session = CloudflareOAuthSession(
+            oauth_configuration,
+            self.oauth_token_store,
+        )
+        try:
+            if reuse_saved and self.oauth_token_store.load() is not None:
+                return CloudflareAuthorization(session.accounts())
+            return session.authorize(cancelled=cancelled)
+        except CloudflareOAuthError as error:
+            raise R2OperationError(
+                error.code,
+                error.user_message,
+                error.technical_details,
+            ) from error
+
+    def has_saved_oauth_authorization(self) -> bool:
+        return (
+            self.oauth_configuration_store.load() is not None
+            and self.oauth_token_store.load() is not None
+        )
+
+    def connect_oauth_account(
+        self,
+        account_id: str,
+        *,
+        bucket: str = DEFAULT_BUCKET,
+    ) -> R2StorageSnapshot:
+        account_id = str(account_id).strip()
+        bucket = str(bucket).strip().lower()
+        if not _ACCOUNT_ID_PATTERN.fullmatch(account_id):
+            raise R2OperationError(
+                "account_invalid",
+                "Cloudflare returned an invalid account identifier.",
+            )
+        if (
+            not _BUCKET_PATTERN.fullmatch(bucket)
+            or ".." in bucket
+            or ".-" in bucket
+            or "-." in bucket
+            or _looks_like_ip_address(bucket)
+        ):
+            raise R2OperationError("bucket_invalid", "The R2 bucket name is invalid.")
+        oauth_configuration = self.oauth_configuration_store.load()
+        if oauth_configuration is None or self.oauth_token_store.load() is None:
+            raise R2OperationError(
+                "oauth_setup",
+                "Connect Cloudflare again before setting up R2 storage.",
+            )
+        session = CloudflareOAuthSession(oauth_configuration, self.oauth_token_store)
+        client = self.oauth_client_factory(account_id, session)
+        try:
+            try:
+                client.head_bucket(Bucket=bucket)
+            except Exception as error:
+                provider_code, status, _request_id = _error_identity(error)
+                if provider_code.casefold() in {"nosuchbucket", "404", "10006"} or status == 404:
+                    client.create_bucket(Bucket=bucket)
+                else:
+                    raise
+            public_base_url = str(client.enable_public_domain(bucket)).strip()
+            configuration = R2Configuration(
+                account_id=account_id,
+                bucket=bucket,
+                public_base_url=public_base_url,
+                limit_bytes=FREE_TIER_LIMIT_BYTES,
+            ).validated()
+            self._install_lifecycle(client, configuration)
+            snapshot = self._storage_snapshot(client, configuration)
+        except Exception as error:
+            raise _classify_error(error, "oauth_configure") from error
+
+        self.credential_store.clear()
+        self.settings.update_fields(
+            {
+                PUBLISHING_PROVIDER_KEY: PROVIDER_ID,
+                AUTHENTICATION_MODE_KEY: AUTHENTICATION_MODE_OAUTH,
+                ACCOUNT_ID_KEY: configuration.account_id,
+                BUCKET_KEY: configuration.bucket,
+                PUBLIC_BASE_URL_KEY: configuration.public_base_url,
+                FREE_TIER_LIMIT_KEY: configuration.limit_bytes,
+            }
+        )
+        self._persist_snapshot(snapshot)
+        return snapshot
 
     def save_configuration(
         self,
@@ -393,9 +571,11 @@ class R2Publisher(Publisher):
             raise _classify_error(error, "configure") from error
 
         self.credential_store.save(valid_credentials)
+        self.oauth_token_store.clear()
         self.settings.update_fields(
             {
                 PUBLISHING_PROVIDER_KEY: PROVIDER_ID,
+                AUTHENTICATION_MODE_KEY: AUTHENTICATION_MODE_MANUAL,
                 ACCOUNT_ID_KEY: valid_configuration.account_id,
                 BUCKET_KEY: valid_configuration.bucket,
                 PUBLIC_BASE_URL_KEY: valid_configuration.public_base_url,
@@ -441,8 +621,10 @@ class R2Publisher(Publisher):
 
     def disconnect(self) -> None:
         self.credential_store.clear()
+        self.oauth_token_store.clear()
         self.settings.update_fields(
             {
+                AUTHENTICATION_MODE_KEY: "",
                 ACCOUNT_ID_KEY: "",
                 BUCKET_KEY: "",
                 PUBLIC_BASE_URL_KEY: "",
@@ -563,7 +745,7 @@ class R2Publisher(Publisher):
 
     def publish(self, build_dir: Path, metadata: dict) -> PublishResult:
         configuration = self.configuration()
-        if configuration is None or self.credential_store.load() is None:
+        if configuration is None or not self.authentication_mode():
             return PublishResult(
                 False,
                 message="Open R2 Storage and connect a Cloudflare account before publishing.",
@@ -781,6 +963,9 @@ def _format_bytes(value: int) -> str:
 
 __all__ = [
     "ACCOUNT_ID_KEY",
+    "AUTHENTICATION_MODE_KEY",
+    "AUTHENTICATION_MODE_MANUAL",
+    "AUTHENTICATION_MODE_OAUTH",
     "BUCKET_KEY",
     "CURRENT_PUBLIC_PATH_KEY",
     "DEFAULT_BUCKET",

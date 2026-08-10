@@ -12,6 +12,11 @@ import generate
 from config import MESSAGE_HTML_FILE, ensure_output_dirs
 from message_html import read_text_normalized
 from publishing import GitHubPagesPublisher, PublishResult, R2OperationError, R2Publisher
+from publishing.cloudflare_oauth import (
+    CloudflareAuthorization,
+    CloudflareOAuthClientConfiguration,
+    CloudflareOAuthClientConfigurationStore,
+)
 from publishing.credentials import R2Credentials
 from publishing.expiration import (
     PUBLISHED_EXPIRES_AT_KEY,
@@ -713,11 +718,14 @@ class ForgeTab(QtWidgets.QWidget):
         self._init_ui()
 
         self.r2_storage_dialog = R2StorageDialog(self)
+        self.r2_storage_dialog.oauth_connect_requested.connect(
+            self._connect_r2_oauth
+        )
+        self.r2_storage_dialog.oauth_setup_requested.connect(
+            self._configure_r2_oauth_client
+        )
         self.r2_storage_dialog.save_requested.connect(
             self._save_r2_configuration
-        )
-        self.r2_storage_dialog.refresh_requested.connect(
-            self._refresh_r2_storage
         )
         self.r2_storage_dialog.delete_requested.connect(
             self._delete_r2_publication
@@ -1194,9 +1202,12 @@ class ForgeTab(QtWidgets.QWidget):
 
     def show_r2_storage(self) -> None:
         publisher = R2Publisher(self.project_root)
+        is_configured = publisher.is_configured()
+        has_saved_oauth = publisher.has_saved_oauth_authorization()
         self.r2_storage_dialog.set_configuration(
             publisher.configuration(),
-            has_credentials=publisher.credential_store.load() is not None,
+            has_credentials=is_configured,
+            authentication_mode=publisher.authentication_mode(),
         )
         owner = self.window()
         self.r2_storage_dialog.show()
@@ -1206,22 +1217,27 @@ class ForgeTab(QtWidgets.QWidget):
         self.r2_storage_dialog.move(frame.topLeft())
         self.r2_storage_dialog.raise_()
         self.r2_storage_dialog.activateWindow()
-        if publisher.is_configured() and not self._busy:
+        if is_configured and not self._busy:
             self._refresh_r2_storage()
-        elif not publisher.is_configured():
+        elif has_saved_oauth and not self._busy:
+            self.r2_storage_dialog.show_message(
+                "Cloudflare login found. Checking R2 storage now…"
+            )
+            QtCore.QTimer.singleShot(0, self._connect_r2_oauth)
+        elif not is_configured:
             self.r2_storage_dialog.show_error(
-                "Enter the account, bucket, public URL, and R2 API keys, then select Save and Test Connection."
+                "Select Connect Cloudflare. Manual R2 API keys remain available under Advanced manual setup."
             )
 
     def _start_r2_operation(
         self,
         activity: str,
-        task: Callable[[], R2StorageSnapshot],
+        task: Callable[[], object],
         on_success: Callable[[object], None],
     ) -> None:
         failure: dict[str, str] = {}
 
-        def wrapped() -> R2StorageSnapshot:
+        def wrapped() -> object:
             try:
                 return task()
             except R2OperationError as error:
@@ -1247,6 +1263,91 @@ class ForgeTab(QtWidgets.QWidget):
             "The R2 operation could not be completed. Open Error Log for details.",
             on_failure=failed,
         )
+
+    def _connect_r2_oauth(self) -> None:
+        if self._busy:
+            return
+        configuration_store = CloudflareOAuthClientConfigurationStore()
+        if configuration_store.load() is None:
+            if not self._configure_r2_oauth_client():
+                return
+        publisher = R2Publisher(self.project_root)
+        reuse_saved = publisher.has_saved_oauth_authorization()
+        self._start_r2_operation(
+            (
+                "Checking the saved Cloudflare login…"
+                if reuse_saved
+                else "Waiting for Cloudflare authorization in the browser…"
+            ),
+            lambda: publisher.authorize_oauth(
+                cancelled=lambda: QtCore.QThread.currentThread().isInterruptionRequested(),
+                reuse_saved=reuse_saved,
+            ),
+            self._r2_oauth_authorized,
+        )
+
+    def _configure_r2_oauth_client(self) -> bool:
+        if self._busy:
+            return False
+        store = CloudflareOAuthClientConfigurationStore()
+        current = store.load()
+        client_id = self.r2_storage_dialog.request_oauth_client_id(
+            current.client_id if current is not None else ""
+        )
+        if not client_id:
+            return False
+        try:
+            store.save(CloudflareOAuthClientConfiguration(client_id=client_id))
+        except (OSError, ValueError) as error:
+            self.r2_storage_dialog.show_error(str(error))
+            return False
+        self.r2_storage_dialog.show_message(
+            "OAuth app settings saved. Select Connect Cloudflare to sign in."
+        )
+        return True
+
+    def _r2_oauth_authorized(self, result: object) -> None:
+        if not isinstance(result, CloudflareAuthorization):
+            raise TypeError("Cloudflare returned an invalid authorization result.")
+        accounts = result.accounts
+        if not accounts:
+            raise TypeError("Cloudflare did not return an authorized account.")
+        self.r2_storage_dialog.show_message(
+            "Cloudflare login received. Checking R2 storage…"
+        )
+        self._set_status("Cloudflare login received. Checking R2 storage…")
+        account = accounts[0]
+        if len(accounts) > 1:
+            labels = [
+                f"{item.name or 'Cloudflare account'} — {item.account_id[-8:]}"
+                for item in accounts
+            ]
+            selected, accepted = QtWidgets.QInputDialog.getItem(
+                self.r2_storage_dialog,
+                "Choose Cloudflare Account",
+                "Use this Cloudflare account:",
+                labels,
+                0,
+                False,
+            )
+            if not accepted:
+                R2Publisher(self.project_root).oauth_token_store.clear()
+                self.r2_storage_dialog.show_error("Cloudflare connection was canceled.")
+                return
+            account = accounts[labels.index(selected)]
+
+        def finish_connection() -> None:
+            if self._busy:
+                QtCore.QTimer.singleShot(50, finish_connection)
+                return
+            publisher = R2Publisher(self.project_root)
+            self._start_r2_operation(
+                "Creating the Letter Smith R2 storage…",
+                lambda: publisher.connect_oauth_account(account.account_id),
+                self._r2_configuration_saved,
+            )
+
+        QtCore.QTimer.singleShot(50, finish_connection)
 
     def _save_r2_configuration(
         self,
@@ -1276,6 +1377,7 @@ class ForgeTab(QtWidgets.QWidget):
         self.r2_storage_dialog.set_configuration(
             publisher.configuration(),
             has_credentials=True,
+            authentication_mode=publisher.authentication_mode(),
         )
         self.r2_storage_dialog.update_snapshot(snapshot)
         self._sync_publishing_controls()
@@ -1325,7 +1427,11 @@ class ForgeTab(QtWidgets.QWidget):
         if self._busy:
             return
         R2Publisher(self.project_root).disconnect()
-        self.r2_storage_dialog.set_configuration(None, has_credentials=False)
+        self.r2_storage_dialog.set_configuration(
+            None,
+            has_credentials=False,
+            authentication_mode="",
+        )
         self.r2_storage_dialog.show_error(
             "R2 was disconnected from this computer. Existing hosted letters were not deleted."
         )
@@ -1477,12 +1583,12 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_scroll.setFocus(Qt.PopupFocusReason)
         QtCore.QTimer.singleShot(0, self._layout_saved_cards)
 
-    def repair_duplicate_project_ids(self) -> tuple[tuple[Path, str], ...]:
-        """Repair independent saved-letter copies while preserving the active path."""
+    def repair_duplicate_autosave_ids(self) -> tuple[tuple[Path, str], ...]:
+        """Repair independent autosave copies while preserving the active path."""
         snapshot = self.settings.snapshot()
         context = self.project_paths.context_from_settings(snapshot)
-        repaired = self.project_paths.repair_duplicate_project_ids(
-            active_project_directory=context.project_directory,
+        repaired = self.project_paths.repair_duplicate_autosave_ids(
+            active_autosave_directory=context.autosave_directory,
         )
         if repaired:
             self.catalog = SavedLetterCatalog(self.project_root)

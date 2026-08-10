@@ -27,7 +27,7 @@ from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from app_icon import configure_windows_app_identity, resolve_app_icon
-from project_paths import PROJECTS_RELATIVE_PATH
+from project_paths import AUTOSAVE_RELATIVE_PATH
 
 
 # =============================================================================
@@ -277,7 +277,7 @@ def log_startup(
         )
     ):
         logging.info(
-            f"[Projects] {(root / PROJECTS_RELATIVE_PATH).resolve()}"
+            f"[Autosave] {(root / AUTOSAVE_RELATIVE_PATH).resolve()}"
         )
         logging.info(
             f"[Args] {' '.join(sys.argv)}"

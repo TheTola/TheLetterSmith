@@ -23,6 +23,7 @@ from image_animation import (
     validate_runtime_image_manifest,
 )
 from portable_export import create_single_html
+from settings_store import SettingsStore
 
 
 class ImageAnimationTests(unittest.TestCase):
@@ -174,6 +175,12 @@ class ImageAnimationTests(unittest.TestCase):
 
             for filename in CONTROL_FILES:
                 self._write_png(controls / filename)
+            SettingsStore(root).update_fields(
+                {
+                    "recipient_name": "Amanda Miller",
+                    "recipient_title": "Perfection's Path",
+                }
+            )
 
             play = generate.generate_play_bundle(
                 str(root),
@@ -186,6 +193,7 @@ class ImageAnimationTests(unittest.TestCase):
             )
             index = (play / "index.html").read_text(encoding="utf-8")
             script = (play / "script.js").read_text(encoding="utf-8")
+            styles = (play / "styles.css").read_text(encoding="utf-8")
 
             for slot, settings in expected_settings.items():
                 record = runtime_manifest["slots"][slot]
@@ -198,6 +206,22 @@ class ImageAnimationTests(unittest.TestCase):
                 self.assertEqual(record["gif"]["durations_ms"], [80, 120, 160])
 
             self.assertNotIn("{{IMAGE_ANIMATIONS_JSON}}", index)
+            self.assertNotIn("{{TITLE_BANNER_RGB}}", index)
+            self.assertNotIn("{{TITLE_BANNER_TEXT_RGB}}", index)
+            self.assertIn('id="title-banner"', index)
+            self.assertIn("Perfection&#x27;s Path", index)
+            self.assertIn("#title-banner.is-showing", styles)
+            self.assertIn(
+                "const titleBannerDelayMs = prefersReducedMotion ? 80 : 500;",
+                script,
+            )
+            self.assertIn(
+                "const titleBannerHoldMs = 3500;",
+                script,
+            )
+            self.assertIn("beginBtn.classList.add('is-dismissed')", script)
+            self.assertIn("dismissTitleBanner();\n    flipTo(target);", script)
+            self.assertIn("pointer-events:none", styles)
             self.assertIn('"playback_mode": "ping_pong"', index)
             self.assertIn("playImageReverse", script)
             self.assertIn("completed animation stays on its last displayed frame", script)

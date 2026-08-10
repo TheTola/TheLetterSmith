@@ -329,7 +329,19 @@ def _read_play_metadata(play_dir: Path) -> dict:
 
 def _bundle_project_id(play_dir: Path) -> str:
     metadata = _read_play_metadata(play_dir)
-    return _valid_project_uuid(metadata.get("project_id"))
+    metadata_id = _valid_project_uuid(metadata.get("project_id"))
+    if metadata_id:
+        return metadata_id
+    build_state = play_dir / "lettersmith-build.json"
+    if not build_state.is_file() or build_state.is_symlink():
+        return ""
+    try:
+        payload = json.loads(build_state.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return _valid_project_uuid(payload.get("project_id"))
 
 
 def _is_play_bundle(play_dir: Path) -> bool:
@@ -498,14 +510,7 @@ def _bundle_case_matches(
     )
     return bool(
         relative.parts[0] == recipient_name
-        and (
-            relative.parts[1] == title_name
-            or re.fullmatch(
-                rf"{re.escape(title_name)} \([2-9][0-9]*\)",
-                relative.parts[1],
-            )
-            is not None
-        )
+        and relative.parts[1] == title_name
     )
 
 
@@ -526,35 +531,27 @@ def _available_named_play_directory(
         if existing_recipient is not None and existing_recipient.is_dir()
         else play_root / recipient_name
     )
-    candidate_number = 1
-    while True:
-        candidate_name = (
-            title_name
-            if candidate_number == 1
-            else safe_folder_name(
-                f"{title_name} ({candidate_number})",
-                "Untitled Letter",
-            )
-        )
-        existing = _casefold_child(recipient_dir, candidate_name)
-        candidate = (
-            existing
-            if existing is not None
-            else recipient_dir / candidate_name
-        ).resolve()
-        if not _is_relative_to(candidate, play_root):
-            raise ValueError("The saved-letter path escapes the Play root.")
-        if source is not None and candidate == source:
-            return candidate
-        if existing is None:
-            return candidate
-        if (
-            allow_existing_project
-            and project_id
-            and _bundle_project_id(candidate) == project_id
-        ):
-            return candidate
-        candidate_number += 1
+    existing = _casefold_child(recipient_dir, title_name)
+    candidate = (
+        existing
+        if existing is not None
+        else recipient_dir / title_name
+    ).resolve()
+    if not _is_relative_to(candidate, play_root):
+        raise ValueError("The saved-letter path escapes the Play root.")
+    if source is not None and candidate == source:
+        return candidate
+    if existing is None:
+        return candidate
+    if (
+        allow_existing_project
+        and project_id
+        and _bundle_project_id(candidate) == project_id
+    ):
+        return candidate
+    raise FileExistsError(
+        f"{recipient_name} already has a letter titled {title_name!r}."
+    )
 
 
 def _write_migrated_metadata(

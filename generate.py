@@ -95,7 +95,7 @@ LEGACY_SFX_DIRS = (
     Path("gallery") / "app" / "icons" / "Sounds",
 )
 BUILD_STATE_FILE = "lettersmith-build.json"
-BUILD_SCHEMA_VERSION = 10
+BUILD_SCHEMA_VERSION = 11
 CURTAIN_FILES = {"cleft.png", "cright.png"}
 CURTAIN_ANALYSIS_PAGE_ORDER = (
     "cover.png",
@@ -371,6 +371,8 @@ def _validate_template_placeholders() -> None:
     """
     required = (
         "{{TITLE}}",
+        "{{TITLE_BANNER_RGB}}",
+        "{{TITLE_BANNER_TEXT_RGB}}",
         "{{MESSAGE_HTML}}",
         "{{INITIAL_VOLUME}}",
         "{{MESSAGE_OVERLAY_STYLE}}",
@@ -477,6 +479,26 @@ def _curtain_rgb_for_settings(
         for name in CURTAIN_ANALYSIS_PAGE_ORDER
     ]
     return curtain_rgb_for_style(page_paths, style)
+
+
+def _title_banner_rgbs_for_settings(
+    project_root: Path,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    page_paths = [
+        project_root / USER_PAGES_DIR / name
+        for name in CURTAIN_ANALYSIS_PAGE_ORDER
+    ]
+    return (
+        curtain_rgb_for_style(page_paths, "average_color"),
+        curtain_rgb_for_style(
+            page_paths,
+            "complementary_average_color",
+        ),
+    )
+
+
+def _rgb_css_value(rgb: tuple[int, int, int]) -> str:
+    return ",".join(str(channel) for channel in rgb)
 
 
 def _hash_file(digest: "hashlib._Hash", root: Path, path: Path) -> None:
@@ -797,6 +819,9 @@ def build_play_bundle_to(
     settings = SettingsStore(pr).snapshot()
     recipient = _recipient_from_settings(settings)
     title = _title_from_settings(settings, recipient)
+    title_banner_rgb, title_banner_text_rgb = (
+        _title_banner_rgbs_for_settings(pr)
+    )
     starting_vol = _starting_volume_from_settings(settings)
     project_id = ensure_project_identity(pr)
     bp = plan_build(
@@ -877,6 +902,14 @@ def build_play_bundle_to(
     html = (
         TEMPLATE_HTML
         .replace("{{TITLE}}", _html.escape(title, quote=True))
+        .replace(
+            "{{TITLE_BANNER_RGB}}",
+            _rgb_css_value(title_banner_rgb),
+        )
+        .replace(
+            "{{TITLE_BANNER_TEXT_RGB}}",
+            _rgb_css_value(title_banner_text_rgb),
+        )
         .replace("{{MESSAGE_HTML}}", embedded_message_html)
         .replace("{{INITIAL_VOLUME}}", str(starting_vol))
         .replace(

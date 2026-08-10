@@ -26,6 +26,13 @@ TEMPLATE_HTML = r"""
     <img id="curtain-right" src="gallery/controls/cright.png" alt="" aria-hidden="true" decoding="async" fetchpriority="high">
     <button id="begin-button" type="button">Tap to Begin</button>
   </div>
+  <div
+    id="title-banner"
+    aria-hidden="true"
+    style="--title-banner-rgb:{{TITLE_BANNER_RGB}};--title-banner-text-rgb:{{TITLE_BANNER_TEXT_RGB}}"
+  >
+    <span>{{TITLE}}</span>
+  </div>
 
   <button
     id="fullscreen-button"
@@ -212,10 +219,20 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 #curtain-overlay.curtain-fallback #curtain-left,#curtain-overlay.curtain-fallback #curtain-right{display:none}
 #begin-button{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);min-width:min(80vw,280px);padding:14px 30px;border:1px solid rgba(155,255,251,.42);border-radius:var(--pill-radius);background:linear-gradient(180deg,rgba(15,24,38,.88),rgba(6,10,18,.72));color:var(--text-main);font-size:clamp(22px,3.2vw,42px);font-weight:700;letter-spacing:.02em;cursor:pointer;z-index:10001;animation:pulse 2s infinite;box-shadow:var(--hud-shadow),0 0 0 1px rgba(0,255,255,.14)}
 #curtain-overlay:not(.is-visible) #begin-button{opacity:0}
+#begin-button.is-dismissed{animation:none;opacity:0;visibility:hidden;transition:opacity 160ms ease-out,visibility 0s linear 160ms}
 #begin-button:hover{background:linear-gradient(180deg,rgba(20,31,48,.94),rgba(8,12,20,.84))}
+#title-banner{position:absolute;top:50%;left:50%;z-index:10002;width:min(82vw,760px);min-height:clamp(92px,16vw,150px);padding:clamp(22px,4vw,38px) clamp(52px,8vw,94px);display:flex;align-items:center;justify-content:center;visibility:hidden;opacity:0;pointer-events:none;transform:translate(-50%,-50%) scale(.92);background-color:rgb(var(--title-banner-rgb));color:rgb(var(--title-banner-text-rgb));border:3px double rgba(var(--title-banner-text-rgb),.88);clip-path:polygon(0 18%,7% 18%,7% 0,93% 0,93% 18%,100% 18%,96% 50%,100% 82%,93% 82%,93% 100%,7% 100%,7% 82%,0 82%,4% 50%);box-shadow:0 20px 52px rgba(0,0,0,.48),inset 0 0 0 2px rgba(255,255,255,.18),inset 0 0 30px rgba(0,0,0,.18);filter:drop-shadow(0 7px 12px rgba(0,0,0,.38));will-change:opacity,transform}
+#title-banner::before,#title-banner::after{content:"";position:absolute;top:50%;width:clamp(30px,7vw,76px);height:2px;background:linear-gradient(90deg,transparent,rgba(var(--title-banner-text-rgb),.96),transparent);box-shadow:0 -7px 0 -1px rgba(var(--title-banner-text-rgb),.58),0 7px 0 -1px rgba(var(--title-banner-text-rgb),.58);filter:drop-shadow(0 1px 1px rgba(0,0,0,.72))}
+#title-banner::before{left:clamp(14px,3vw,30px)}
+#title-banner::after{right:clamp(14px,3vw,30px)}
+#title-banner span{position:relative;max-width:100%;font-family:var(--font-letter);font-size:clamp(28px,5vw,72px);font-weight:700;font-style:italic;line-height:1.08;letter-spacing:.025em;text-align:center;overflow-wrap:anywhere;text-shadow:0 1px 0 rgba(255,255,255,.34),0 4px 9px rgba(0,0,0,.72);-webkit-text-stroke:clamp(1px,.12vw,2px) rgba(0,0,0,.68);paint-order:stroke fill}
+#title-banner.is-showing{visibility:visible;animation:titleBannerFadeIn 280ms cubic-bezier(.18,.82,.2,1) forwards}
+#title-banner.is-hiding{visibility:visible;animation:titleBannerFadeOut 360ms ease-in forwards}
 @keyframes curtainIntroFadeIn{from{opacity:0}to{opacity:1}}
 @keyframes curtainPanelFadeIn{from{opacity:0}to{opacity:1}}
 @keyframes pulse{0%,100%{opacity:.68;transform:translate(-50%,-50%) scale(1)}50%{opacity:1;transform:translate(-50%,-50%) scale(1.04)}}
+@keyframes titleBannerFadeIn{from{opacity:0;transform:translate(-50%,-50%) scale(.92)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
+@keyframes titleBannerFadeOut{from{opacity:1;transform:translate(-50%,-50%) scale(1)}to{opacity:0;transform:translate(-50%,-50%) scale(1.035)}}
 @keyframes curtainLeftOut{from{transform:translateX(0)}to{transform:translateX(-100vw)}}
 @keyframes curtainRightOut{from{transform:translateX(0)}to{transform:translateX(100vw)}}
 
@@ -301,7 +318,7 @@ body.stage-ready #volume-control{opacity:1;visibility:visible;pointer-events:aut
 @media (max-width: 640px){:root{--nav-offset:4px;--nav-size:34px;--nav-pad:4px;--icon-size:34px;--close-size:38px;--corner-offset:12px;--control-rail:50px;--bottom-control-rail:60px;--page-side-rail:50px}#prev,#next{top:50%}#volume-control{left:var(--corner-offset);right:auto;bottom:calc(5px + env(safe-area-inset-bottom));padding:4px;transform:none}body.stage-ready #volume-control{transform:none}#viewer-actions{top:10px;left:10px}#viewer-actions-left{gap:5px}#viewer-actions .viewer-action,#fullscreen-button{height:32px;padding:0 8px;font-size:10px}#fullscreen-button{top:10px;right:10px}#open-text{left:auto;right:var(--corner-offset);bottom:calc(5px + env(safe-area-inset-bottom));transform:none}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - var(--control-rail) - var(--bottom-control-rail))}#volume-control.slider-open #volume-slider{width:min(28vw,64px)}}
 @media (max-width: 220px){:root{--page-side-rail:58px}#viewer-actions .viewer-action,#fullscreen-button{width:34px;padding:0;font-size:0}#restart-button::before{content:"Γå╗";font-size:18px}#mute-button::before{content:"≡ƒöç";font-size:15px}#mute-button[aria-pressed="true"]::before{content:"≡ƒöè"}#fullscreen-button::before{content:"Γ¢╢";font-size:17px}}
 @media (max-height: 420px){:root{--nav-offset:4px;--nav-size:34px;--nav-pad:4px;--icon-size:32px;--close-size:34px;--corner-offset:8px;--control-rail:48px;--bottom-control-rail:52px;--page-side-rail:50px;--wall-gap:10px;--wall-frame-pad:8px;--wall-block-pad:14px;--wall-inline-pad:12px}#viewer-actions{top:8px;left:8px}#viewer-actions-left{gap:5px}#viewer-actions .viewer-action,#fullscreen-button{height:30px;padding:0 8px;font-size:10px}#fullscreen-button{top:8px;right:8px}#volume-control{bottom:6px;padding:3px}#open-text{bottom:6px}.text-wall-content{font-size:15px;line-height:1.45}}
-@media (prefers-reduced-motion: reduce){*,*::before,*::after{scroll-behavior:auto !important}#slideshow,#volume-control,#open-text,#close-text,.text-wall,#volume-slider{transition:none}#begin-button{animation:none}#curtain-overlay.is-visible,#curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{scroll-behavior:auto !important}#slideshow,#volume-control,#open-text,#close-text,.text-wall,#volume-slider{transition:none}#begin-button{animation:none}#curtain-overlay.is-visible,#curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right,#title-banner.is-showing,#title-banner.is-hiding{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
 """
 
 TEMPLATE_JS = r"""
@@ -310,6 +327,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const cLeft     = document.getElementById('curtain-left');
   const cRight    = document.getElementById('curtain-right');
   const beginBtn  = document.getElementById('begin-button');
+  const titleBanner = document.getElementById('title-banner');
 
   const slides    = Array.from(document.querySelectorAll('.slide'));
   const prevBtn   = document.getElementById('prev');
@@ -337,6 +355,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const curtainIntroRevealMs = prefersReducedMotion ? 80 : 520;
   const curtainFallbackOpenMs = prefersReducedMotion ? 140 : 2600;
   const curtainCleanupPadMs = prefersReducedMotion ? 20 : 0;
+  const titleBannerDelayMs = prefersReducedMotion ? 80 : 500;
+  const titleBannerFadeInMs = prefersReducedMotion ? 10 : 280;
+  const titleBannerHoldMs = 3500;
+  const titleBannerFadeOutMs = prefersReducedMotion ? 10 : 360;
   const glissSafetyPadMs = prefersReducedMotion ? 120 : 450;
   const musicFadeMs = prefersReducedMotion ? 120 : 900;
   const wallRevealDelayMs = prefersReducedMotion ? 80 : 2200;
@@ -354,6 +376,10 @@ document.addEventListener('DOMContentLoaded', () => {
   let slider = null;
   let stageReady = false;
   let introStarted = false;
+  let titleBannerStarted = false;
+  let titleBannerRevealTimer = null;
+  let titleBannerAutoDismissTimer = null;
+  let titleBannerCleanupTimer = null;
   let deferredWarmStarted = false;
   let flipping = false;
   let musicPlaylistIndex = 0;
@@ -966,7 +992,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function go(delta){
     if (!started || introControlsLocked || wallRevealLocked || flipping) return;
-    flipTo(idx + delta);
+    const target = clamp(idx + delta, 0, TOTAL - 1);
+    if (target === idx) return;
+    dismissTitleBanner();
+    flipTo(target);
   }
 
   function ensureSlider(){
@@ -1132,6 +1161,43 @@ document.addEventListener('DOMContentLoaded', () => {
     }, openMs + curtainCleanupPadMs);
     return openMs;
   }
+  function runTitleBanner(){
+    if (titleBannerStarted) return;
+    titleBannerStarted = true;
+    titleBannerRevealTimer = setTimeout(() => {
+      titleBannerRevealTimer = null;
+      beginBtn.classList.add('is-dismissed');
+      titleBanner.setAttribute('aria-hidden', 'false');
+      titleBanner.classList.add('is-showing');
+      titleBannerAutoDismissTimer = setTimeout(() => {
+        titleBannerAutoDismissTimer = null;
+        dismissTitleBanner();
+      }, titleBannerFadeInMs + titleBannerHoldMs);
+    }, titleBannerDelayMs);
+  }
+  function dismissTitleBanner(){
+    if (titleBannerRevealTimer !== null){
+      clearTimeout(titleBannerRevealTimer);
+      titleBannerRevealTimer = null;
+    }
+    if (titleBannerAutoDismissTimer !== null){
+      clearTimeout(titleBannerAutoDismissTimer);
+      titleBannerAutoDismissTimer = null;
+    }
+    if (titleBannerCleanupTimer !== null){
+      clearTimeout(titleBannerCleanupTimer);
+      titleBannerCleanupTimer = null;
+    }
+    beginBtn.classList.add('is-dismissed');
+    titleBanner.classList.remove('is-showing');
+    if (titleBanner.getAttribute('aria-hidden') === 'true') return;
+    titleBanner.classList.add('is-hiding');
+    titleBannerCleanupTimer = setTimeout(() => {
+      titleBannerCleanupTimer = null;
+      titleBanner.classList.remove('is-hiding');
+      titleBanner.setAttribute('aria-hidden', 'true');
+    }, titleBannerFadeOutMs);
+  }
   function openCurtain(){
     if (started) return;
     started = true;
@@ -1140,8 +1206,8 @@ document.addEventListener('DOMContentLoaded', () => {
     revealStage();
     activateImageAnimation(idx);
     beginBtn.disabled = true;
-    beginBtn.style.opacity = '0';
     beginBtn.style.pointerEvents = 'none';
+    runTitleBanner();
 
     let musicStarted = false;
     let glissDone = false;

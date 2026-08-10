@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 from config import CONTROL_FILES, REQUIRED_SLIDES
 from recipient_registry import RecipientRegistry
@@ -98,7 +99,7 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             self._restore(root, bundle)
             self.assertEqual(len(load_library(root)), 4)
 
-    def test_manifestless_sound_bundle_is_rejected(self) -> None:
+    def test_manifestless_required_sound_bundle_is_not_listed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundle = self._bundle(root)
@@ -110,8 +111,35 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             sounds.mkdir()
             (sounds / "music.mp3").write_bytes(b"retired-format")
 
-            with self.assertRaises(SavedLetterRestoreError):
-                self._restore(root, bundle)
+            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+
+    def test_manifestless_optional_music_is_migrated_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            sounds = bundle / "gallery" / "sounds"
+            sounds.mkdir()
+            (sounds / "flip1.mp3").write_bytes(b"page turn")
+            (sounds / "music.mp3").write_bytes(b"legacy music")
+            manifest = sounds / "lettersmith-sound.json"
+
+            self.assertEqual(len(SavedLetterCatalog(root).list_entries()), 1)
+            self.assertFalse(manifest.exists())
+
+            self._restore(root, bundle)
+
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(payload["mode"], "single")
+            self.assertEqual(
+                [track["filename"] for track in payload["tracks"]],
+                ["music.mp3"],
+            )
+            self.assertEqual(current_music_path(root).read_bytes(), b"legacy music")
+            modified_at = manifest.stat().st_mtime_ns
+
+            self._restore(root, bundle)
+
+            self.assertEqual(manifest.stat().st_mtime_ns, modified_at)
 
     def test_silent_letter_clears_project_sound_without_deleting_archive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -142,6 +170,54 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 SettingsStore(root).get(ACTIVE_PLAY_DIR_KEY),
                 str(bundle.resolve()),
             )
+
+    def test_restore_uses_listed_bundle_when_project_snapshot_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            metadata = json.loads(
+                (bundle / "lettersmith-metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            project = (
+                root
+                / "output"
+                / "projects"
+                / metadata["recipient_name"]
+                / metadata["recipient_title"]
+            )
+            project.mkdir(parents=True)
+            (project / "lettersmith-metadata.json").write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+
+            catalog = SavedLetterCatalog(root)
+            entry = catalog.list_entries()[0]
+            restorer = SavedLetterRestorer(root)
+            with mock.patch.object(
+                restorer.resolver,
+                "resolve_autosave_directory",
+                side_effect=AssertionError(
+                    "Load Letters must not consult autosave storage."
+                ),
+            ):
+                restored = restorer.restore(entry)
+
+            self.assertEqual(restored.play_dir, bundle.resolve())
+            self.assertEqual(
+                {managed_root.name for managed_root in catalog.managed_roots},
+                {"Play", "Recovery"},
+            )
+
+    def test_catalog_omits_bundle_that_restorer_cannot_load(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            (bundle / "gallery" / "pages" / "cover.png").unlink()
+
+            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
 
     def test_prompt_writer_workspace_round_trips_without_loss(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -243,6 +319,14 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             )
             self.assertEqual(restored["subject"], "")
             self.assertEqual(restored["generated_prompts"], {})
+            self.assertEqual(
+                json.loads(
+                    (bundle / PROMPT_WRITER_STATE_FILE).read_text(
+                        encoding="utf-8"
+                    )
+                ),
+                restored,
+            )
 
     def test_recovery_letter_is_listed_and_loadable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

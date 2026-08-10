@@ -8,7 +8,10 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
 
 from publishing.credentials import R2Credentials
+from publishing.cloudflare_oauth import DEFAULT_REDIRECT_URI
 from publishing.r2 import (
+    AUTHENTICATION_MODE_MANUAL,
+    AUTHENTICATION_MODE_OAUTH,
     DEFAULT_BUCKET,
     FREE_TIER_LIMIT_BYTES,
     R2Configuration,
@@ -19,8 +22,9 @@ from publishing.expiration import publication_expiry_label
 
 
 class R2StorageDialog(QtWidgets.QDialog):
+    oauth_connect_requested = QtCore.Signal()
+    oauth_setup_requested = QtCore.Signal()
     save_requested = QtCore.Signal(object, object)
-    refresh_requested = QtCore.Signal()
     delete_requested = QtCore.Signal(str)
     disconnect_requested = QtCore.Signal()
 
@@ -36,6 +40,7 @@ class R2StorageDialog(QtWidgets.QDialog):
         self.setAttribute(Qt.WA_DeleteOnClose, False)
         self._has_credentials = False
         self._busy = False
+        self._manual_collapsed_height = self.height()
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -72,26 +77,66 @@ class R2StorageDialog(QtWidgets.QDialog):
         layout.addWidget(explanation)
 
         connection = QtWidgets.QGroupBox("Connection")
-        form = QtWidgets.QFormLayout(connection)
+        connection_layout = QtWidgets.QVBoxLayout(connection)
+        connection_layout.setContentsMargins(12, 15, 12, 12)
+        connection_layout.setSpacing(8)
+        oauth_row = QtWidgets.QHBoxLayout()
+        self.oauth_connect_btn = QtWidgets.QPushButton("Connect Cloudflare")
+        self.oauth_connect_btn.clicked.connect(self.oauth_connect_requested.emit)
+        self.connection_status = QtWidgets.QLabel("Not connected")
+        self.connection_status.setStyleSheet("color:#9fc4ce;font:600 9.5pt 'Segoe UI';")
+        self.disconnect_btn = QtWidgets.QPushButton("Disconnect")
+        self.disconnect_btn.clicked.connect(self._confirm_disconnect)
+        oauth_row.addWidget(self.oauth_connect_btn)
+        oauth_row.addWidget(self.connection_status)
+        oauth_row.addStretch(1)
+        oauth_row.addWidget(self.disconnect_btn)
+        connection_layout.addLayout(oauth_row)
+        oauth_note = QtWidgets.QLabel(
+            "Cloudflare opens in your browser. Letter Smith never receives your password."
+        )
+        oauth_note.setWordWrap(True)
+        oauth_note.setStyleSheet("color:#86aeb9;font:8.5pt 'Segoe UI';")
+        connection_layout.addWidget(oauth_note)
+
+        self.advanced_toggle = QtWidgets.QToolButton()
+        self.advanced_toggle.setText("Advanced manual setup")
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setChecked(False)
+        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.advanced_toggle.setArrowType(Qt.RightArrow)
+        connection_layout.addWidget(self.advanced_toggle, 0, Qt.AlignLeft)
+
+        self.manual_panel = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(self.manual_panel)
         form.setContentsMargins(12, 15, 12, 12)
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(8)
+        manual_note = QtWidgets.QLabel(
+            "Use this only with manually created R2 API keys. The Account ID "
+            "is not the OAuth Client ID."
+        )
+        manual_note.setWordWrap(True)
+        manual_note.setStyleSheet("color:#f0c674;font:8.5pt 'Segoe UI';")
+        form.addRow(manual_note)
         self.account_id = QtWidgets.QLineEdit()
         self.account_id.setPlaceholderText("32-character Cloudflare account ID")
         self.bucket = QtWidgets.QLineEdit(DEFAULT_BUCKET)
         self.public_url = QtWidgets.QLineEdit()
-        self.public_url.setPlaceholderText("https://your-public-bucket-domain")
+        self.public_url.setPlaceholderText("Public r2.dev URL or custom domain")
         self.access_key = QtWidgets.QLineEdit()
-        self.access_key.setPlaceholderText("R2 Access Key ID")
+        self.access_key.setPlaceholderText("Access Key ID from the R2 API token")
         self.secret_key = QtWidgets.QLineEdit()
         self.secret_key.setEchoMode(QtWidgets.QLineEdit.Password)
-        self.secret_key.setPlaceholderText("R2 Secret Access Key")
-        form.addRow("Account ID", self.account_id)
-        form.addRow("Bucket", self.bucket)
-        form.addRow("Public URL", self.public_url)
+        self.secret_key.setPlaceholderText("Secret Access Key from the R2 API token")
+        form.addRow("Cloudflare Account ID", self.account_id)
+        form.addRow("R2 Bucket Name", self.bucket)
+        form.addRow("Public Bucket URL", self.public_url)
         form.addRow("Access Key ID", self.access_key)
         form.addRow("Secret Access Key", self.secret_key)
         connection_actions = QtWidgets.QHBoxLayout()
+        self.oauth_setup_btn = QtWidgets.QPushButton("OAuth App Setup")
+        self.oauth_setup_btn.clicked.connect(self.oauth_setup_requested.emit)
         self.cloudflare_btn = QtWidgets.QPushButton("Open Cloudflare R2")
         self.cloudflare_btn.clicked.connect(
             lambda: QtGui.QDesktopServices.openUrl(
@@ -104,13 +149,13 @@ class R2StorageDialog(QtWidgets.QDialog):
             "font:600 9.5pt 'Segoe UI';}QPushButton:hover{background:#4268c6;}"
         )
         self.save_btn.clicked.connect(self._submit_configuration)
-        self.disconnect_btn = QtWidgets.QPushButton("Disconnect")
-        self.disconnect_btn.clicked.connect(self._confirm_disconnect)
-        connection_actions.addWidget(self.cloudflare_btn)
+        connection_actions.addWidget(self.oauth_setup_btn)
         connection_actions.addStretch(1)
-        connection_actions.addWidget(self.disconnect_btn)
         connection_actions.addWidget(self.save_btn)
         form.addRow(connection_actions)
+        self.manual_panel.hide()
+        self.advanced_toggle.toggled.connect(self._toggle_manual_setup)
+        connection_layout.addWidget(self.manual_panel)
         layout.addWidget(connection)
 
         usage = QtWidgets.QGroupBox("Free-tier usage")
@@ -144,11 +189,9 @@ class R2StorageDialog(QtWidgets.QDialog):
         account_note.setStyleSheet("color:#86aeb9;font:8.5pt 'Segoe UI';")
         usage_layout.addWidget(account_note)
         usage_actions = QtWidgets.QHBoxLayout()
-        self.refresh_btn = QtWidgets.QPushButton("Refresh Usage")
-        self.refresh_btn.clicked.connect(self.refresh_requested.emit)
         self.open_log_btn = QtWidgets.QPushButton("Open Error Log")
         self.open_log_btn.clicked.connect(self._open_error_log)
-        usage_actions.addWidget(self.refresh_btn)
+        usage_actions.addWidget(self.cloudflare_btn)
         usage_actions.addWidget(self.open_log_btn)
         usage_actions.addStretch(1)
         usage_layout.addLayout(usage_actions)
@@ -191,12 +234,14 @@ class R2StorageDialog(QtWidgets.QDialog):
         close_button.clicked.connect(self.hide)
         close_row.addWidget(close_button)
         layout.addLayout(close_row)
+        self._update_connection_buttons()
 
     def set_configuration(
         self,
         configuration: R2Configuration | None,
         *,
         has_credentials: bool,
+        authentication_mode: str = "",
     ) -> None:
         self._has_credentials = bool(has_credentials)
         if configuration is not None:
@@ -214,7 +259,135 @@ class R2StorageDialog(QtWidgets.QDialog):
         )
         self.access_key.setPlaceholderText(placeholder)
         self.secret_key.setPlaceholderText(placeholder)
-        self.disconnect_btn.setEnabled(self._has_credentials and not self._busy)
+        if authentication_mode == AUTHENTICATION_MODE_OAUTH:
+            if self._has_credentials:
+                self.connection_status.setText("Cloudflare R2 connected")
+                color = "#74d6a5"
+            else:
+                self.connection_status.setText("Cloudflare login received; finishing R2 setup")
+                color = "#f0c674"
+            self.connection_status.setStyleSheet(
+                f"color:{color};font:600 9.5pt 'Segoe UI';"
+            )
+            self.advanced_toggle.setChecked(False)
+        elif authentication_mode == AUTHENTICATION_MODE_MANUAL:
+            self.connection_status.setText("Connected with manual API keys")
+            self.connection_status.setStyleSheet("color:#74d6a5;font:600 9.5pt 'Segoe UI';")
+        else:
+            self.connection_status.setText("Not connected")
+            self.connection_status.setStyleSheet("color:#9fc4ce;font:600 9.5pt 'Segoe UI';")
+        self._update_connection_buttons()
+
+    def _update_connection_buttons(self) -> None:
+        connected = self._has_credentials
+        self.oauth_connect_btn.setEnabled(not self._busy and not connected)
+        self.disconnect_btn.setEnabled(not self._busy and connected)
+        if connected:
+            self.oauth_connect_btn.setStyleSheet(
+                "QPushButton{background:#26343a;color:#7c8c92;border:1px solid #384b53;"
+                "font:600 10pt 'Segoe UI';padding:9px 16px;}"
+            )
+            self.disconnect_btn.setStyleSheet(
+                "QPushButton{background:#8f2f3d;color:white;border:1px solid #cf6272;}"
+                "QPushButton:hover{background:#b13a4b;border-color:#ef8796;}"
+                "QPushButton:disabled{background:#26343a;color:#7c8c92;"
+                "border-color:#384b53;}"
+            )
+        else:
+            self.oauth_connect_btn.setStyleSheet(
+                "QPushButton{background:#3153a8;color:white;border:1px solid #6f8ee1;"
+                "font:600 10pt 'Segoe UI';padding:9px 16px;}"
+                "QPushButton:hover{background:#4268c6;}"
+                "QPushButton:disabled{background:#26343a;color:#7c8c92;"
+                "border-color:#384b53;}"
+            )
+            self.disconnect_btn.setStyleSheet(
+                "QPushButton{background:#26343a;color:#7c8c92;border:1px solid #384b53;}"
+            )
+
+    def _toggle_manual_setup(self, expanded: bool) -> None:
+        expanded = bool(expanded)
+        if expanded:
+            self._manual_collapsed_height = self.height()
+            panel_height = max(
+                self.manual_panel.sizeHint().height(),
+                self.manual_panel.minimumSizeHint().height(),
+            )
+            self.manual_panel.setMinimumHeight(panel_height)
+            self.manual_panel.show()
+            if self.layout() is not None:
+                self.layout().activate()
+            target_height = max(self.height(), self.minimumSizeHint().height())
+            self.resize(self.width(), target_height)
+            screen = self.screen() or QtWidgets.QApplication.primaryScreen()
+            if screen is not None:
+                available = screen.availableGeometry()
+                frame = self.frameGeometry()
+                x = min(max(frame.x(), available.left()), available.right() - frame.width() + 1)
+                y = min(max(frame.y(), available.top()), available.bottom() - frame.height() + 1)
+                self.move(x, y)
+        else:
+            self.manual_panel.hide()
+            self.manual_panel.setMinimumHeight(0)
+            self.resize(
+                self.width(),
+                max(self.minimumHeight(), self._manual_collapsed_height),
+            )
+        self.advanced_toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+
+    def request_oauth_client_id(self, current_client_id: str = "") -> str:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Set Up Cloudflare Login")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(620)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        instructions = QtWidgets.QLabel(
+            "Create one Cloudflare OAuth client for Letter Smith using these settings:\n\n"
+            "Client Name: Choose your own name\n"
+            "Response Type: Code\n"
+            "Grant Type: Authorization Code and Refresh Token\n"
+            "Token Authentication Method: None (PKCE)\n"
+            f"Redirect (Callback) URL: {DEFAULT_REDIRECT_URI}\n"
+            "Use that exact callback on every computer; 127.0.0.1 means the "
+            "current user's own computer.\n"
+            "Client URL: https://github.com/TheTola/TheLetterSmith\n"
+            "Advanced options: No changes\n\n"
+            "Select Continue. On the next Select permission scopes screen, add "
+            "these two permissions:\n\n"
+            "Account and Billing\n"
+            "Account Settings: Read\n\n"
+            "Developer Platform\n"
+            "Workers R2 Storage: Edit (not Read)\n\n"
+            "After creating the client, paste its public Client ID below."
+        )
+        instructions.setWordWrap(True)
+        instructions.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(instructions)
+        client_id = QtWidgets.QLineEdit()
+        client_id.setPlaceholderText("Cloudflare OAuth Client ID")
+        client_id.setText(str(current_client_id).strip())
+        client_id.selectAll()
+        layout.addWidget(client_id)
+        actions = QtWidgets.QHBoxLayout()
+        open_button = QtWidgets.QPushButton("Open Cloudflare OAuth Clients")
+        open_button.clicked.connect(
+            lambda: QtGui.QDesktopServices.openUrl(
+                QUrl("https://dash.cloudflare.com/?to=/:account/oauth-clients")
+            )
+        )
+        cancel_button = QtWidgets.QPushButton("Cancel")
+        cancel_button.clicked.connect(dialog.reject)
+        save_button = QtWidgets.QPushButton("Save and Connect")
+        save_button.setDefault(True)
+        save_button.clicked.connect(dialog.accept)
+        actions.addWidget(open_button)
+        actions.addStretch(1)
+        actions.addWidget(cancel_button)
+        actions.addWidget(save_button)
+        layout.addLayout(actions)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return ""
+        return client_id.text().strip()
 
     def _submit_configuration(self) -> None:
         try:
@@ -297,6 +470,8 @@ class R2StorageDialog(QtWidgets.QDialog):
     def set_busy(self, busy: bool, activity: str = "") -> None:
         self._busy = bool(busy)
         for widget in (
+            self.oauth_setup_btn,
+            self.advanced_toggle,
             self.account_id,
             self.bucket,
             self.public_url,
@@ -304,12 +479,11 @@ class R2StorageDialog(QtWidgets.QDialog):
             self.secret_key,
             self.cloudflare_btn,
             self.save_btn,
-            self.refresh_btn,
             self.delete_btn,
             self.publications,
         ):
             widget.setEnabled(not busy)
-        self.disconnect_btn.setEnabled(not busy and self._has_credentials)
+        self._update_connection_buttons()
         if activity:
             self.activity.setText(activity)
             self.activity.setStyleSheet("color:#9fc4ce;")
@@ -319,6 +493,11 @@ class R2StorageDialog(QtWidgets.QDialog):
         self.activity.setStyleSheet("color:#ff9a9a;")
         if technical_details:
             self.activity.setToolTip(technical_details)
+
+    def show_message(self, message: str) -> None:
+        self.activity.setText(message)
+        self.activity.setStyleSheet("color:#9fc4ce;")
+        self.activity.setToolTip("")
 
     def _confirm_delete(self) -> None:
         item = self.publications.currentItem()
