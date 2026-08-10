@@ -35,6 +35,7 @@ from project_state import (
     ProjectStateController,
 )
 from project_paths import ProjectPathResolver
+from project_save import ProjectNotReadyError, ProjectSaveService
 from recipient_page import RecipientPage
 
 # ===================================================================================================================================================================================
@@ -882,6 +883,11 @@ class Nexus(QtWidgets.QMainWindow):
         self._setup_system_tray()
         self.project_state = ProjectStateController(self.project_root)
         self.project_paths = ProjectPathResolver(self.project_root)
+        self.project_save_service = ProjectSaveService(
+            self.project_root,
+            self.project_state,
+            resolver=self.project_paths,
+        )
         initial_project_state = self.project_state.initialize()
         self._project_tabs_initialized = False
         self._forge_fullscreen_active = False
@@ -1734,6 +1740,7 @@ class Nexus(QtWidgets.QMainWindow):
     def _apply_tab_state(self, idx: int, *, animate_page: bool) -> None:
         """Apply the complete settled UI state for one tab."""
         old_idx = self.page_stack.currentIndex()
+        autosave_note = ""
         if old_idx != idx:
             if old_idx == 2:
                 try:
@@ -1753,6 +1760,9 @@ class Nexus(QtWidgets.QMainWindow):
                 pass
             self._detach_sound_preview()
 
+        if old_idx != idx:
+            autosave_note = self._autosave_project_on_tab_switch()
+
         self._last_pixmap = None
         self._clear_preview()
         self.preview_stack.setCurrentIndex(0)
@@ -1769,7 +1779,10 @@ class Nexus(QtWidgets.QMainWindow):
             self.page_stack.setCurrentIndex(idx)
 
         tab_name = self.tabbar.tabText(idx)
-        self.status(f"Switched to: {tab_name}")
+        status_message = f"Switched to: {tab_name}"
+        if autosave_note:
+            status_message = f"{status_message}. {autosave_note}"
+        self.status(status_message)
         self._set_forge_preview_visible(idx == 3)
         self.forge_tab.set_readiness_context_visible(
             idx in {0, 1, 2, 3}
@@ -1813,6 +1826,21 @@ class Nexus(QtWidgets.QMainWindow):
                 self._reposition_help_popover()
 
         QtCore.QTimer.singleShot(0, self._update_preview_geometry)
+
+    def _autosave_project_on_tab_switch(self) -> str:
+        eligibility = self.project_save_service.save_eligibility()
+        if not eligibility.can_save:
+            return f"Project not saved: {eligibility.blocked_reason}"
+        try:
+            self.project_save_service.save_workspace_snapshot(
+                reason="tab-switch",
+            )
+        except ProjectNotReadyError as error:
+            return f"Project not saved: {error}"
+        except Exception as error:
+            _LOGGER.exception("Project tab-switch autosave failed: %s", error)
+            return f"Project autosave failed: {error}"
+        return "Project autosaved."
 
     def _update_preview_tools_geometry(self) -> None:
         forge_visible = self.tabbar.currentIndex() == 3

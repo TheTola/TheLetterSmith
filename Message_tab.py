@@ -450,10 +450,11 @@ class MessageTab(QtWidgets.QWidget):
         if self.project_state is None:
             self.project_state = ProjectStateController(project_root)
             self.project_state.initialize()
+        self.project_paths = project_paths or ProjectPathResolver(project_root)
         self.project_save_service = ProjectSaveService(
             project_root,
             self.project_state,
-            resolver=project_paths,
+            resolver=self.project_paths,
         )
 
         # Compatibility cache; disk remains authoritative.
@@ -1090,16 +1091,48 @@ class MessageTab(QtWidgets.QWidget):
 
     def _save_settings(self) -> bool:
         recipient = self.name_input.text().strip()
+        title = self.title_input.text().strip()
         current_recipient = (
             self.project_state.identity.recipient_display_name
         )
+        current_title = str(
+            self.settings.get("recipient_title", "")
+        ).strip()
         if not recipient:
             self.name_input.setText(current_recipient)
             self.status.setText("Recipient is required.")
             return False
+        try:
+            matching_recipient = (
+                self.project_state.recipient_registry.find_matching_recipient(
+                    recipient
+                )
+            )
+            if matching_recipient is not None and title:
+                conflict = self.project_paths.find_title_conflict(
+                    matching_recipient.recipient_id,
+                    title,
+                    project_id=self.project_state.identity.project_id,
+                )
+                if conflict is not None:
+                    self.name_input.setText(current_recipient)
+                    self.title_input.setText(current_title)
+                    self.status.setText(
+                        f"{matching_recipient.display_name} already has a "
+                        f"letter titled {title!r}. "
+                        "Enter a different letter title."
+                    )
+                    return False
+        except Exception as error:
+            self.name_input.setText(current_recipient)
+            self.title_input.setText(current_title)
+            self.status.setText(
+                f"Recipient and letter title could not be checked: {error}"
+            )
+            return False
         if recipient != current_recipient:
             try:
-                identity = self.project_state.rename_recipient(recipient)
+                identity = self.project_state.change_recipient(recipient)
             except Exception as error:
                 self.name_input.setText(current_recipient)
                 self.status.setText(
@@ -1110,7 +1143,7 @@ class MessageTab(QtWidgets.QWidget):
             self.name_input.setText(recipient)
             self.settings.update(identity.as_settings())
 
-        self.settings["recipient_title"] = self.title_input.text().strip()
+        self.settings["recipient_title"] = title
         self.settings["recipient_name"] = recipient
 
         raw_url = self.url_input.text().strip()

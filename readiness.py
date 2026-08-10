@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from config import MESSAGE_HTML_FILE, USER_PAGES_DIR
+from config import MESSAGE_HTML_FILE, REQUIRED_SLIDES, USER_PAGES_DIR
 from message_format import message_plain_text
 from message_html import read_text_normalized
+from project_paths import ProjectPathError, ProjectPathResolver
 from settings_store import (
     REQUIRED_FEATURES_KEY,
     SettingsStore,
@@ -44,11 +45,102 @@ class ReadinessResult:
         return self.can_preview
 
 
+@dataclass(frozen=True)
+class ProjectSaveEligibility:
+    completed_tabs: tuple[str, ...]
+    recipient_ready: bool
+    title_ready: bool
+    title_detail: str
+
+    @property
+    def can_save(self) -> bool:
+        return (
+            self.recipient_ready
+            and self.title_ready
+            and len(self.completed_tabs) >= 2
+        )
+
+    @property
+    def blocked_reason(self) -> str:
+        if not self.recipient_ready:
+            return "Add the recipient before saving the project."
+        if not self.title_ready:
+            return self.title_detail
+        return (
+            "Complete at least two tabs before saving the project: "
+            "Images, Sound, or Message."
+        )
+
+
+def _message_is_complete(root: Path) -> bool:
+    message_path = root / MESSAGE_HTML_FILE
+    try:
+        return message_path.is_file() and bool(
+            message_plain_text(read_text_normalized(message_path)).strip()
+        )
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
+def _sound_is_complete(root: Path) -> bool:
+    try:
+        return bool(resolve_project_tracks(root)[1])
+    except (OSError, ValueError):
+        return False
+
+
+def _title_readiness(
+    root: Path,
+    settings: dict,
+) -> tuple[bool, str]:
+    title = str(settings.get("recipient_title", "")).strip()
+    if not title:
+        return False, "Add the letter title in Message."
+    try:
+        conflict = ProjectPathResolver(root).find_title_conflict(
+            settings.get("recipient_id"),
+            title,
+            project_id=settings.get("project_id"),
+        )
+    except ProjectPathError:
+        conflict = None
+    if conflict is not None:
+        return (
+            False,
+            "This recipient already has a letter with that title. "
+            "Enter a different letter title.",
+        )
+    return True, "Letter title is ready."
+
+
+def evaluate_project_save_eligibility(
+    project_root: str | Path,
+) -> ProjectSaveEligibility:
+    root = Path(project_root).resolve()
+    settings = SettingsStore(root).snapshot()
+    pages = root / USER_PAGES_DIR
+    completed_tabs: list[str] = []
+    if all((pages / name).is_file() for name in REQUIRED_SLIDES):
+        completed_tabs.append("images")
+    if _sound_is_complete(root):
+        completed_tabs.append("sound")
+    if _message_is_complete(root):
+        completed_tabs.append("message")
+    title_ready, title_detail = _title_readiness(root, settings)
+    return ProjectSaveEligibility(
+        completed_tabs=tuple(completed_tabs),
+        recipient_ready=bool(
+            str(settings.get("recipient_name", "")).strip()
+        ),
+        title_ready=title_ready,
+        title_detail=title_detail,
+    )
+
+
 def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
     root = Path(project_root).resolve()
     settings = SettingsStore(root).snapshot()
     pages = root / USER_PAGES_DIR
-    message_path = root / MESSAGE_HTML_FILE
     required_features = settings.get(REQUIRED_FEATURES_KEY, {})
     if isinstance(required_features, dict):
         music_required = bool(
@@ -64,17 +156,9 @@ def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
         }
     else:
         music_required = bool(settings.get("music_required", False))
-    try:
-        has_music = bool(resolve_project_tracks(root)[1])
-    except (OSError, ValueError):
-        has_music = False
-
-    try:
-        has_message = message_path.is_file() and bool(
-            message_plain_text(read_text_normalized(message_path)).strip()
-        )
-    except (OSError, UnicodeError, ValueError):
-        has_message = False
+    has_music = _sound_is_complete(root)
+    has_message = _message_is_complete(root)
+    title_ready, title_detail = _title_readiness(root, settings)
 
     definitions = (
         (
@@ -89,9 +173,9 @@ def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
         (
             "title",
             "Letter Title",
-            bool(str(settings.get("recipient_title", "")).strip()),
+            title_ready,
             True,
-            "Add the letter title in Message.",
+            title_detail,
             "message",
             "title",
         ),

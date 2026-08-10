@@ -167,6 +167,16 @@ class ProjectPathResolver:
         if record is None:
             raise ProjectPathError("Active recipient is not registered.")
         title = _safe_title(settings.get("recipient_title"))
+        conflict = self.find_title_conflict(
+            identity.recipient_id,
+            title,
+            project_id=identity.project_id,
+        )
+        if conflict is not None:
+            raise ProjectPathError(
+                f"{record.display_name} already has a letter titled "
+                f"{title!r}. Enter a different letter title."
+            )
         existing_matches = self.find_project_directories(
             identity.project_id,
             recipient_id=identity.recipient_id,
@@ -203,6 +213,44 @@ class ProjectPathResolver:
             ),
             project_directory=project_directory,
         )
+
+    def find_title_conflict(
+        self,
+        recipient_id: object,
+        title: object,
+        *,
+        project_id: object,
+    ) -> Path | None:
+        """Find another project using this recipient/title combination."""
+        stable_project_id = _valid_uuid(project_id)
+        if not stable_project_id:
+            raise ProjectPathError("Project ID must be a UUID.")
+        recipient_directory = self.resolve_recipient_directory(recipient_id)
+        if not recipient_directory.is_dir():
+            return None
+        requested_title = _safe_title(title).casefold()
+        for directory in sorted(recipient_directory.iterdir()):
+            if not directory.is_dir():
+                continue
+            metadata_path = directory / PROJECT_METADATA_FILE
+            if not metadata_path.is_file():
+                continue
+            try:
+                metadata = self._read_metadata(metadata_path)
+            except ProjectPathError:
+                continue
+            candidate_project_id = _valid_uuid(metadata.get("project_id"))
+            if (
+                not candidate_project_id
+                or candidate_project_id == stable_project_id
+            ):
+                continue
+            candidate_title = _safe_title(
+                metadata.get("recipient_title") or directory.name
+            ).casefold()
+            if candidate_title == requested_title:
+                return directory.resolve()
+        return None
 
     def ensure_project_storage(
         self,

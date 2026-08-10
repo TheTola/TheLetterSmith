@@ -18,8 +18,20 @@ from Editor import Editor
 from Forge_Tab import ForgeTab, ReadinessWindow
 from config import CONTROL_FILES, REQUIRED_SLIDES
 from project_paths import ProjectPathError, ProjectPathResolver
-from readiness import ReadinessResult, evaluate_readiness
-from sound_model import TrackRecord
+from project_save import ProjectSaveService
+from project_state import ProjectStateController
+from readiness import (
+    ReadinessResult,
+    evaluate_project_save_eligibility,
+    evaluate_readiness,
+)
+from settings_store import SettingsStore
+from sound_model import (
+    ProjectSoundState,
+    TrackRecord,
+    import_runtime_track,
+    save_project_state,
+)
 from sound_tab import ArchiveDialog
 
 
@@ -149,6 +161,186 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 (copy / "lettersmith-metadata.json").read_text(encoding="utf-8"),
                 before,
             )
+
+    def test_same_recipient_requires_a_unique_letter_title(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = ProjectStateController(root)
+            state.initialize()
+            identity = state.establish_project(
+                "Amanda Miller",
+                custom_capitalization=True,
+            )
+            resolver = ProjectPathResolver(root)
+            recipient_dir = resolver.resolve_recipient_directory(
+                identity.recipient_id
+            )
+            existing = recipient_dir / "Morning Joy"
+            existing.mkdir(parents=True)
+            (existing / "lettersmith-metadata.json").write_text(
+                json.dumps(
+                    {
+                        "project_id": str(uuid.uuid4()),
+                        "recipient_id": identity.recipient_id,
+                        "recipient_name": "Amanda Miller",
+                        "recipient_title": "Morning Joy",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            settings = {
+                **identity.as_settings(),
+                "recipient_title": "Morning Joy",
+            }
+
+            self.assertEqual(
+                resolver.find_title_conflict(
+                    identity.recipient_id,
+                    "Morning Joy",
+                    project_id=identity.project_id,
+                ),
+                existing.resolve(),
+            )
+            with self.assertRaisesRegex(
+                ProjectPathError,
+                "different letter title",
+            ):
+                resolver.context_from_settings(settings)
+            SettingsStore(root).update_fields(
+                {"recipient_title": "Morning Joy"}
+            )
+            title_item = next(
+                item
+                for item in evaluate_readiness(root).items
+                if item.key == "title"
+            )
+            self.assertFalse(title_item.ready)
+            self.assertIn("different letter title", title_item.detail)
+
+    def test_project_save_requires_two_completed_tabs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = ProjectStateController(root)
+            state.initialize()
+            state.establish_project(
+                "Amanda Miller",
+                custom_capitalization=True,
+            )
+            SettingsStore(root).update_fields(
+                {"recipient_title": "Morning Joy"}
+            )
+            pages = root / "gallery" / "user" / "pages"
+            pages.mkdir(parents=True)
+            for name in REQUIRED_SLIDES:
+                (pages / name).write_bytes(name.encode("ascii"))
+
+            resolver = ProjectPathResolver(root)
+            service = ProjectSaveService(
+                root,
+                state,
+                resolver=resolver,
+            )
+            eligibility = evaluate_project_save_eligibility(root)
+            self.assertEqual(eligibility.completed_tabs, ("images",))
+            self.assertFalse(eligibility.can_save)
+            context = resolver.context_from_settings(
+                SettingsStore(root).snapshot()
+            )
+            service.copy_workspace_file(
+                pages / "cover.png",
+                Path("pages") / "cover.png",
+            )
+            self.assertFalse(context.project_directory.exists())
+
+            message = root / "gallery" / "user" / "message" / "message.html"
+            message.parent.mkdir(parents=True)
+            message.write_text("<p>Good morning.</p>", encoding="utf-8")
+            eligibility = evaluate_project_save_eligibility(root)
+            self.assertEqual(
+                eligibility.completed_tabs,
+                ("images", "message"),
+            )
+            self.assertTrue(eligibility.can_save)
+
+            saved = service.save_workspace_snapshot(reason="tab-switch")
+
+            self.assertEqual(saved, context.project_directory)
+            self.assertTrue((saved / "pages" / "cover.png").is_file())
+            self.assertEqual(
+                (saved / "message" / "message.html").read_text(
+                    encoding="utf-8"
+                ),
+                "<p>Good morning.</p>",
+            )
+            metadata = json.loads(
+                (saved / "lettersmith-metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                metadata["completed_tabs"],
+                ["images", "message"],
+            )
+            self.assertEqual(metadata["autosave_reason"], "tab-switch")
+
+    def test_each_two_tab_combination_is_save_eligible(self) -> None:
+        combinations = (
+            ("images", "sound"),
+            ("images", "message"),
+            ("sound", "message"),
+        )
+        for completed in combinations:
+            with self.subTest(completed=completed):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    state = ProjectStateController(root)
+                    state.initialize()
+                    state.establish_project(
+                        "Amanda Miller",
+                        custom_capitalization=True,
+                    )
+                    SettingsStore(root).update_fields(
+                        {"recipient_title": "A Unique Title"}
+                    )
+                    if "images" in completed:
+                        pages = root / "gallery" / "user" / "pages"
+                        pages.mkdir(parents=True)
+                        for name in REQUIRED_SLIDES:
+                            (pages / name).write_bytes(b"image")
+                    if "message" in completed:
+                        message = (
+                            root
+                            / "gallery"
+                            / "user"
+                            / "message"
+                            / "message.html"
+                        )
+                        message.parent.mkdir(parents=True)
+                        message.write_text("<p>Letter</p>", encoding="utf-8")
+                    if "sound" in completed:
+                        source = root / "song.mp3"
+                        source.write_bytes(b"sound")
+                        record = import_runtime_track(
+                            root,
+                            source,
+                            display_title="Song",
+                        )
+                        save_project_state(
+                            root,
+                            ProjectSoundState(
+                                mode="single",
+                                single_track_id=record.track_id,
+                                selected_track_id=record.track_id,
+                            ),
+                        )
+
+                    eligibility = evaluate_project_save_eligibility(root)
+
+                    self.assertEqual(
+                        eligibility.completed_tabs,
+                        completed,
+                    )
+                    self.assertTrue(eligibility.can_save)
 
     def _make_editor(self, preset: str) -> tuple[Editor, tempfile.TemporaryDirectory[str]]:
         holder = tempfile.TemporaryDirectory()

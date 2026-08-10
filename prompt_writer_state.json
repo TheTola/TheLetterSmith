@@ -1,23 +1,23 @@
 {
-  "version": 5,
-  "type": "",
-  "subject": "",
-  "color": "",
-  "global": "",
-  "cover": "",
-  "letter": "",
-  "wall": "",
-  "back": "",
+  "version": 6,
+  "type": "Anime Style Illustration",
+  "subject": "Excitement",
+  "color": "Ruby Star Child",
+  "global": "aaaa",
+  "cover": "ccccccccccccccccccccc",
+  "letter": "llllllllllllllllllllllllllllllllllllllllllll",
+  "wall": "wwwwwwwwwwwwwwwwww",
+  "back": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "checks": {
     "black": false,
     "white": false,
-    "frame": false,
+    "frame": true,
     "vignette": false,
     "polaroid": false,
     "cardshadow": false,
     "real": false,
     "paint": false,
-    "minimal": false,
+    "minimal": true,
     "forbid_text": false,
     "clean_composition": false,
     "strong_focal_point": false,
@@ -28,6 +28,19 @@
     "wide_scene": false,
     "simplified_details": false
   },
-  "generated_prompts": {},
-  "generated_input_signature": ""
+  "resolved_instructions": {
+    "role": "a senior art director skilled in building unified four-page visual experiences with consistent subjects, environments, proportions, materials, and artistic treatment",
+    "subject_lead_in": [
+      "Create a composition featuring"
+    ],
+    "effort": "use maximum visual fidelity, physically coherent construction, correct anatomy and object geometry, deliberate composition, and clearly defined materials and textures.",
+    "format": "Render a portrait image at exactly 2048×3072 pixels. Maintain safe edge spacing, keep all important content fully visible, prevent critical cropping, and ensure all text is legible, complete, and free of unintended symbols."
+  },
+  "generated_prompts": {
+    "cover": "You are a senior art director skilled in building unified four-page visual experiences with consistent subjects, environments, proportions, materials, and artistic treatment. Create a composition featuring Excitement.\n\nThe Cover Page is a bold, decorative opening image that captures attention and sets the tone.\n\nUse the Ruby Star Child palette.\n\nUse Anime Style Illustration as the visual style.\n\nShared visual direction: aaaa\n\nPage-specific direction: ccccccccccccccccccccc\n\nRender with maximum visual fidelity, physically coherent construction, correct anatomy and object geometry, deliberate composition, and clearly defined materials and textures.\n\nGuidance:\n- add a decorative frame around the image.\n- bias toward minimalistic composition.\n- Use the framing that best serves the composition; do not force a close-up, full-body, or wide-scene view.\n\nRender a portrait image at exactly 2048×3072 pixels. Maintain safe edge spacing, keep all important content fully visible, prevent critical cropping, and ensure all text is legible, complete, and free of unintended symbols.",
+    "letter": "You are a senior art director skilled in building unified four-page visual experiences with consistent subjects, environments, proportions, materials, and artistic treatment. Create a composition featuring Excitement.\n\nThe Letter Page is a subtle, elegant backdrop that frames the main written message without distraction.\n\nUse the Ruby Star Child palette.\n\nUse Anime Style Illustration as the visual style.\n\nShared visual direction: aaaa\n\nPage-specific direction: llllllllllllllllllllllllllllllllllllllllllll\n\nRender with maximum visual fidelity, physically coherent construction, correct anatomy and object geometry, deliberate composition, and clearly defined materials and textures.\n\nGuidance:\n- add a decorative frame around the image.\n- bias toward minimalistic composition.\n- Use the framing that best serves the composition; do not force a close-up, full-body, or wide-scene view.\n\nRender a portrait image at exactly 2048×3072 pixels. Maintain safe edge spacing, keep all important content fully visible, prevent critical cropping, and ensure all text is legible, complete, and free of unintended symbols.",
+    "wall": "You are a senior art director skilled in building unified four-page visual experiences with consistent subjects, environments, proportions, materials, and artistic treatment. Create a composition featuring Excitement.\n\nThe Wall Page is a calm, minimalist background designed to support large blocks of text.\n\nUse the Ruby Star Child palette.\n\nUse Anime Style Illustration as the visual style.\n\nShared visual direction: aaaa\n\nPage-specific direction: wwwwwwwwwwwwwwwwww\n\nRender with maximum visual fidelity, physically coherent construction, correct anatomy and object geometry, deliberate composition, and clearly defined materials and textures.\n\nGuidance:\n- add a decorative frame around the image.\n- bias toward minimalistic composition.\n- Use the framing that best serves the composition; do not force a close-up, full-body, or wide-scene view.\n\nRender a portrait image at exactly 2048×3072 pixels. Maintain safe edge spacing, keep all important content fully visible, prevent critical cropping, and ensure all text is legible, complete, and free of unintended symbols.",
+    "back": "You are a senior art director skilled in building unified four-page visual experiences with consistent subjects, environments, proportions, materials, and artistic treatment. Create a composition featuring Excitement.\n\nThe Back Page is a simple, graceful closing image that echoes the cover while providing a sense of finality.\n\nUse the Ruby Star Child palette.\n\nUse Anime Style Illustration as the visual style.\n\nShared visual direction: aaaa\n\nPage-specific direction: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\nRender with maximum visual fidelity, physically coherent construction, correct anatomy and object geometry, deliberate composition, and clearly defined materials and textures.\n\nGuidance:\n- add a decorative frame around the image.\n- bias toward minimalistic composition.\n- Use the framing that best serves the composition; do not force a close-up, full-body, or wide-scene view.\n\nRender a portrait image at exactly 2048×3072 pixels. Maintain safe edge spacing, keep all important content fully visible, prevent critical cropping, and ensure all text is legible, complete, and free of unintended symbols."
+  },
+  "generated_input_signature": "b6b6d802b9ea2fd3bdeb2b7bfa1e7b038d8abcb4fd04a42fcab64d02fd576527"
 }

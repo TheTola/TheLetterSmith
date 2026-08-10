@@ -5,11 +5,13 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from Message_tab import IDENTITY_LOCK_KEYS, IdentityLineEdit, MessageTab
 from Nexus import Nexus
+from project_paths import ProjectPathResolver
 from project_state import ProjectStateController, load_project_settings
 
 
@@ -117,6 +119,10 @@ class IdentityFieldLockingTests(unittest.TestCase):
             root = Path(directory)
             project_state = ProjectStateController(root)
             project_state.initialize()
+            existing = project_state.recipient_registry.get_or_create(
+                "Amanda Miller",
+                custom_capitalization=True,
+            )
             original = project_state.establish_project(
                 "Original Recipient",
                 custom_capitalization=True,
@@ -128,6 +134,7 @@ class IdentityFieldLockingTests(unittest.TestCase):
                 name_input=IdentityLineEdit("Changed RECIPIENT"),
                 url_input=IdentityLineEdit(""),
                 status=QtWidgets.QLabel(),
+                project_paths=ProjectPathResolver(root),
                 _persist_settings=lambda *, announce: False,
             )
 
@@ -135,7 +142,7 @@ class IdentityFieldLockingTests(unittest.TestCase):
 
             identity = project_state.identity
             reloaded = load_project_settings(root)
-            self.assertEqual(identity.recipient_id, original.recipient_id)
+            self.assertNotEqual(identity.recipient_id, original.recipient_id)
             self.assertEqual(identity.project_id, original.project_id)
             self.assertEqual(
                 identity.recipient_display_name,
@@ -149,10 +156,68 @@ class IdentityFieldLockingTests(unittest.TestCase):
                 reloaded["recipient_display_name"],
                 "Changed RECIPIENT",
             )
+            self.assertEqual(
+                project_state.recipient_registry.find_by_id(
+                    original.recipient_id
+                ).display_name,
+                "Original Recipient",
+            )
+
+            message.name_input.setText("Amanda Miller")
+            MessageTab._save_settings(message)
+
+            identity = project_state.identity
+            reloaded = load_project_settings(root)
+            self.assertEqual(identity.recipient_id, existing.recipient_id)
+            self.assertEqual(identity.project_id, original.project_id)
+            self.assertEqual(
+                reloaded["recipient_name"],
+                "Amanda Miller",
+            )
+            self.assertEqual(
+                reloaded["recipient_display_name"],
+                "Amanda Miller",
+            )
             message.title_input.deleteLater()
             message.name_input.deleteLater()
             message.url_input.deleteLater()
             message.status.deleteLater()
+
+    def test_tab_switch_autosave_uses_the_central_project_snapshot(self) -> None:
+        service = mock.Mock()
+        service.save_eligibility.return_value = types.SimpleNamespace(
+            can_save=True,
+            blocked_reason="",
+        )
+        harness = types.SimpleNamespace(project_save_service=service)
+
+        note = Nexus._autosave_project_on_tab_switch(harness)
+
+        service.save_workspace_snapshot.assert_called_once_with(
+            reason="tab-switch"
+        )
+        self.assertEqual(note, "Project autosaved.")
+
+    def test_message_tab_keeps_its_project_path_resolver(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_state = ProjectStateController(root)
+            project_state.initialize()
+            project_state.establish_project(
+                "Recipient",
+                custom_capitalization=True,
+            )
+            project_paths = ProjectPathResolver(root)
+
+            message = MessageTab(
+                str(root),
+                project_state=project_state,
+                project_paths=project_paths,
+            )
+
+            self.assertIs(message.project_paths, project_paths)
+            message.deleteLater()
+            self.app.processEvents()
 
 
 if __name__ == "__main__":
