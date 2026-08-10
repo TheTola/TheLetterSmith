@@ -34,6 +34,7 @@ BRANCH_KEY = "github_pages_branch"
 PUBLIC_WARNING_KEY = "github_pages_public_warning_acknowledged"
 DEFAULT_REPOSITORY = "letter-smith-publishing"
 DEFAULT_BRANCH = "main"
+WORKSPACES_DIRECTORY = ".lettersmith-publishing-workspaces"
 PUBLICATION_MARKER = "lettersmith-publication.json"
 _LOGGER = logging.getLogger(__name__)
 
@@ -192,7 +193,11 @@ class GitHubPagesPublisher(Publisher):
             and all(
                 part
                 and part not in {".", ".."}
-                and not any(character.isspace() for character in part)
+                and all(
+                    character.isalnum()
+                    or character in {"-", "_", "."}
+                    for character in part
+                )
                 for part in parts
             )
         )
@@ -227,6 +232,65 @@ class GitHubPagesPublisher(Publisher):
             result.stdout,
             repository,
         )
+
+    def _repository_workspace(self, repository: str) -> Path:
+        if not self._repository_is_valid(repository):
+            raise ValueError("The GitHub repository is invalid.")
+        owner, name = repository.strip().split("/", 1)
+        return (
+            self.project_root
+            / WORKSPACES_DIRECTORY
+            / f"{owner}--{name}"
+        ).resolve()
+
+    def _select_workspace(
+        self,
+        settings: dict,
+        repository: str,
+    ) -> Path:
+        workspace_value = str(settings.get(WORKSPACE_KEY, "")).strip()
+        if workspace_value:
+            configured = Path(workspace_value).expanduser().resolve()
+            if (
+                (configured / ".git").is_dir()
+                and self._workspace_has_expected_origin(configured, repository)
+            ):
+                return configured
+        return self._repository_workspace(repository)
+
+    def _ensure_default_branch(self, workspace: Path) -> None:
+        head = self._run(
+            ("git", "rev-parse", "--verify", "HEAD"),
+            cwd=workspace,
+            check=False,
+        )
+        if head.returncode != 0:
+            self._run(
+                ("git", "symbolic-ref", "HEAD", f"refs/heads/{DEFAULT_BRANCH}"),
+                cwd=workspace,
+            )
+            return
+        current = self._run(
+            ("git", "branch", "--show-current"),
+            cwd=workspace,
+        ).stdout.strip()
+        if current == DEFAULT_BRANCH:
+            return
+        local_branch = self._run(
+            (
+                "git",
+                "show-ref",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{DEFAULT_BRANCH}",
+            ),
+            cwd=workspace,
+            check=False,
+        )
+        if local_branch.returncode == 0:
+            self._run(("git", "checkout", DEFAULT_BRANCH), cwd=workspace)
+        else:
+            self._run(("git", "checkout", "-b", DEFAULT_BRANCH), cwd=workspace)
 
     def is_configured(self) -> bool:
         try:
@@ -327,12 +391,7 @@ class GitHubPagesPublisher(Publisher):
                         message="Could not create the publishing repository.",
                     )
 
-            workspace_value = str(settings.get(WORKSPACE_KEY, "")).strip()
-            workspace = (
-                Path(workspace_value).expanduser().resolve()
-                if workspace_value
-                else (self.project_root / ".lettersmith-publishing").resolve()
-            )
+            workspace = self._select_workspace(settings, repository)
             if not (workspace / ".git").is_dir():
                 if workspace.exists() and any(workspace.iterdir()):
                     return PublishConfiguration(
@@ -367,6 +426,7 @@ class GitHubPagesPublisher(Publisher):
                     ),
                 )
 
+            self._ensure_default_branch(workspace)
             self._install_pages_files(workspace)
             self._run(
                 (

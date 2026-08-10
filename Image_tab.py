@@ -727,6 +727,8 @@ class ImageAssetCard(
         path: str,
         *,
         animated_gif: bool,
+        preview_path: str | None = None,
+        animate_gif: bool = True,
     ) -> None:
         if not animated_gif:
             self.set_pixmap(
@@ -737,16 +739,25 @@ class ImageAssetCard(
             )
             return
 
+        animation_path = preview_path or path
+        if not animate_gif:
+            preview = QtGui.QPixmap(animation_path)
+            self.set_pixmap(preview)
+            if preview.isNull():
+                return
+            self.settings_btn.setVisible(True)
+            self.settings_btn.setEnabled(True)
+            self.settings_btn.setToolTip(
+                "Animation settings for this GIF"
+            )
+            return
+
         self._stop_movie()
         self._source_pixmap = QtGui.QPixmap()
-        movie = QtGui.QMovie(path)
-        movie.setCacheMode(
-            QtGui.QMovie.CacheAll
-        )
+        movie = QtGui.QMovie(animation_path)
+        movie.setCacheMode(QtGui.QMovie.CacheNone)
         if not movie.isValid():
-            self.set_pixmap(
-                QtGui.QPixmap(path)
-            )
+            self.set_pixmap(QtGui.QPixmap(animation_path))
             return
         self._movie = movie
         self.thumbnail.setText("")
@@ -1519,6 +1530,10 @@ class ImageTab(
                 if animated_gif
                 else preview_path
             )
+            thumbnail_path = os.path.join(
+                self._user_pages_dir(),
+                str(record.get("thumbnail_file", filename)),
+            )
 
             if (
                 os.path.isfile(preview_path)
@@ -1528,6 +1543,8 @@ class ImageTab(
                 self.cards[index].set_asset_path(
                     asset_path,
                     animated_gif=animated_gif,
+                    preview_path=thumbnail_path,
+                    animate_gif=self._tab_active,
                 )
                 continue
 
@@ -1614,6 +1631,8 @@ class ImageTab(
             return
 
         self.sync_to_disk()
+        for card in self.cards.values():
+            card.release_asset_handle()
         self._tab_active = False
 
     def focus_asset_slot(
@@ -1962,10 +1981,19 @@ class ImageTab(
                     Path(pages_directory) / source_filename,
                     Path("pages") / source_filename,
                 )
-            else:
-                self.project_save_service.delete_project_file(
-                    Path("pages") / f"{slot}.gif"
+                thumbnail_filename = str(record["thumbnail_file"])
+                self.project_save_service.copy_workspace_file(
+                    Path(pages_directory) / thumbnail_filename,
+                    Path("pages") / thumbnail_filename,
                 )
+            else:
+                for obsolete_filename in (
+                    f"{slot}.gif",
+                    f"{slot}.thumbnail.gif",
+                ):
+                    self.project_save_service.delete_project_file(
+                        Path("pages") / obsolete_filename
+                    )
             self.project_save_service.copy_workspace_file(
                 Path(pages_directory) / IMAGE_MANIFEST_NAME,
                 Path("pages") / IMAGE_MANIFEST_NAME,
@@ -2020,6 +2048,10 @@ class ImageTab(
             animated_gif=(
                 record["asset_type"]
                 == "animated_gif"
+            ),
+            preview_path=str(
+                Path(pages_directory)
+                / str(record.get("thumbnail_file", filename))
             ),
         )
 
@@ -2109,6 +2141,7 @@ class ImageTab(
                 for project_filename in (
                     filename,
                     f"{slot}.gif",
+                    f"{slot}.thumbnail.gif",
                 ):
                     self.project_save_service.delete_project_file(
                         Path("pages") / project_filename
@@ -2185,6 +2218,7 @@ class ImageTab(
                     for project_filename in (
                         filename,
                         f"{slot}.gif",
+                        f"{slot}.thumbnail.gif",
                     ):
                         self.project_save_service.delete_project_file(
                             Path("pages") / project_filename

@@ -11,14 +11,31 @@ from PySide6.QtCore import Qt, QUrl
 import generate
 from config import MESSAGE_HTML_FILE, ensure_output_dirs
 from message_html import read_text_normalized
-from publishing import GitHubPagesPublisher, PublishResult
+from publishing import GitHubPagesPublisher, PublishResult, R2OperationError, R2Publisher
+from publishing.credentials import R2Credentials
 from publishing.expiration import (
     PUBLISHED_EXPIRES_AT_KEY,
     is_publication_expiration_malformed,
     is_publication_expired,
     publication_expiry_label,
 )
-from publishing.github_pages import PUBLIC_WARNING_KEY
+from publishing.github_pages import (
+    PUBLIC_WARNING_KEY as GITHUB_PUBLIC_WARNING_KEY,
+    REPOSITORY_KEY as GITHUB_REPOSITORY_KEY,
+)
+from publishing.r2 import (
+    LAST_OBJECT_COUNT_KEY as R2_LAST_OBJECT_COUNT_KEY,
+    LAST_USAGE_AT_KEY as R2_LAST_USAGE_AT_KEY,
+    LAST_USED_BYTES_KEY as R2_LAST_USED_BYTES_KEY,
+    PROVIDER_ID as R2_PROVIDER_ID,
+    PROVIDER_LABEL as R2_PROVIDER_LABEL,
+    PUBLIC_WARNING_KEY as R2_PUBLIC_WARNING_KEY,
+    PUBLISHING_PROVIDER_KEY,
+    R2Configuration,
+    R2StorageSnapshot,
+    _format_bytes,
+)
+from publishing.r2_ui import R2StorageDialog
 from readiness import ReadinessResult, evaluate_readiness
 from project_paths import ProjectPathResolver
 from project_state import (
@@ -55,6 +72,8 @@ PREVIEW_MODE_DESCRIPTIONS = {
     "window": "",
 }
 RECENT_SAVED_LETTER_LIMIT = 15
+GITHUB_PROVIDER_ID = "github_pages"
+GITHUB_PROVIDER_LABEL = "GitHub Pages"
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -653,6 +672,7 @@ class ForgeTab(QtWidgets.QWidget):
             resolver=self.project_paths,
         )
         self.saved_page_url = ""
+        self._publishing_provider = self._saved_publishing_provider()
         self._last_play_dir: Optional[Path] = None
         self._preview_mode = self._saved_preview_mode()
         self._readiness_result = evaluate_readiness(self.project_root)
@@ -691,6 +711,20 @@ class ForgeTab(QtWidgets.QWidget):
             self.correction_requested.emit
         )
         self._init_ui()
+
+        self.r2_storage_dialog = R2StorageDialog(self)
+        self.r2_storage_dialog.save_requested.connect(
+            self._save_r2_configuration
+        )
+        self.r2_storage_dialog.refresh_requested.connect(
+            self._refresh_r2_storage
+        )
+        self.r2_storage_dialog.delete_requested.connect(
+            self._delete_r2_publication
+        )
+        self.r2_storage_dialog.disconnect_requested.connect(
+            self._disconnect_r2
+        )
 
         self._card_layout_timer = QtCore.QTimer(self)
         self._card_layout_timer.setSingleShot(True)
@@ -735,6 +769,16 @@ class ForgeTab(QtWidgets.QWidget):
         value = str(self.settings.get(PREVIEW_MODE_KEY, "portrait")).strip()
         valid = {mode for _label, mode in PREVIEW_MODES}
         return value if value in valid else "portrait"
+
+    def _saved_publishing_provider(self) -> str:
+        value = str(
+            self.settings.get(PUBLISHING_PROVIDER_KEY, "")
+        ).strip()
+        if value in {R2_PROVIDER_ID, GITHUB_PROVIDER_ID}:
+            return value
+        if str(self.settings.get(GITHUB_REPOSITORY_KEY, "")).strip():
+            return GITHUB_PROVIDER_ID
+        return R2_PROVIDER_ID
 
     def _init_ui(self) -> None:
         self.setObjectName("ForgeWorkflow")
@@ -991,6 +1035,34 @@ class ForgeTab(QtWidgets.QWidget):
         )
         format_row.addWidget(self.preview_mode)
 
+        publishing_row = QtWidgets.QHBoxLayout()
+        publishing_row.setContentsMargins(0, 0, 0, 0)
+        publishing_row.setSpacing(9)
+        publishing_row.addWidget(self._muted_label("Online hosting"))
+        self.publishing_provider = QtWidgets.QComboBox()
+        self.publishing_provider.setMinimumWidth(170)
+        self.publishing_provider.addItem(R2_PROVIDER_LABEL, R2_PROVIDER_ID)
+        self.publishing_provider.addItem(GITHUB_PROVIDER_LABEL, GITHUB_PROVIDER_ID)
+        provider_index = self.publishing_provider.findData(
+            self._publishing_provider
+        )
+        self.publishing_provider.setCurrentIndex(max(0, provider_index))
+        self.publishing_provider.currentIndexChanged.connect(
+            self._publishing_provider_changed
+        )
+        publishing_row.addWidget(self.publishing_provider)
+        self.r2_usage_summary = QtWidgets.QLabel()
+        self.r2_usage_summary.setStyleSheet(
+            "color:#9fcbd5;font:600 9pt 'Segoe UI';"
+        )
+        publishing_row.addWidget(self.r2_usage_summary)
+        publishing_row.addStretch(1)
+        self.r2_storage_btn = self._small_button("R2 Storage")
+        self.r2_storage_btn.clicked.connect(self.show_r2_storage)
+        publishing_row.addWidget(self.r2_storage_btn)
+        self._main_layout.addLayout(publishing_row)
+        self._sync_publishing_controls()
+
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(10)
         self.preview_btn = self._action_button(
@@ -1085,6 +1157,180 @@ class ForgeTab(QtWidgets.QWidget):
         _keys: tuple[str, ...],
     ) -> None:
         self._settings_refresh_requested.emit()
+
+    def _publishing_provider_changed(self) -> None:
+        provider = str(self.publishing_provider.currentData() or "")
+        if provider not in {R2_PROVIDER_ID, GITHUB_PROVIDER_ID}:
+            return
+        self._publishing_provider = provider
+        self.settings.update_fields({PUBLISHING_PROVIDER_KEY: provider})
+        self._sync_publishing_controls()
+        if provider == R2_PROVIDER_ID and not R2Publisher(
+            self.project_root
+        ).is_configured():
+            self._set_status(
+                "Cloudflare R2 selected. Open R2 Storage to connect this user's account."
+            )
+
+    def _sync_publishing_controls(self) -> None:
+        is_r2 = self._publishing_provider == R2_PROVIDER_ID
+        self.r2_usage_summary.setVisible(is_r2)
+        self.r2_storage_btn.setVisible(is_r2)
+        if not is_r2:
+            return
+        try:
+            used = max(0, int(self.settings.get(R2_LAST_USED_BYTES_KEY, 0)))
+            objects = max(0, int(self.settings.get(R2_LAST_OBJECT_COUNT_KEY, 0)))
+        except (TypeError, ValueError):
+            used = 0
+            objects = 0
+        measured = str(self.settings.get(R2_LAST_USAGE_AT_KEY, "")).strip()
+        if measured:
+            self.r2_usage_summary.setText(
+                f"{_format_bytes(used)} used · {objects} objects"
+            )
+        else:
+            self.r2_usage_summary.setText("Usage not measured")
+
+    def show_r2_storage(self) -> None:
+        publisher = R2Publisher(self.project_root)
+        self.r2_storage_dialog.set_configuration(
+            publisher.configuration(),
+            has_credentials=publisher.credential_store.load() is not None,
+        )
+        owner = self.window()
+        self.r2_storage_dialog.show()
+        center = owner.mapToGlobal(owner.rect().center())
+        frame = self.r2_storage_dialog.frameGeometry()
+        frame.moveCenter(center)
+        self.r2_storage_dialog.move(frame.topLeft())
+        self.r2_storage_dialog.raise_()
+        self.r2_storage_dialog.activateWindow()
+        if publisher.is_configured() and not self._busy:
+            self._refresh_r2_storage()
+        elif not publisher.is_configured():
+            self.r2_storage_dialog.show_error(
+                "Enter the account, bucket, public URL, and R2 API keys, then select Save and Test Connection."
+            )
+
+    def _start_r2_operation(
+        self,
+        activity: str,
+        task: Callable[[], R2StorageSnapshot],
+        on_success: Callable[[object], None],
+    ) -> None:
+        failure: dict[str, str] = {}
+
+        def wrapped() -> R2StorageSnapshot:
+            try:
+                return task()
+            except R2OperationError as error:
+                failure["message"] = error.user_message
+                failure["technical"] = error.technical_details
+                _LOGGER.error(
+                    "R2 operation failed: code=%s details=%s",
+                    error.code,
+                    error.technical_details,
+                )
+                raise _ForgeOperationError(error.user_message) from error
+
+        def failed() -> None:
+            self.r2_storage_dialog.show_error(
+                failure.get("message", "The R2 operation could not be completed."),
+                failure.get("technical", ""),
+            )
+
+        self._start_operation(
+            activity,
+            wrapped,
+            on_success,
+            "The R2 operation could not be completed. Open Error Log for details.",
+            on_failure=failed,
+        )
+
+    def _save_r2_configuration(
+        self,
+        configuration: R2Configuration,
+        credentials: R2Credentials | None,
+    ) -> None:
+        if self._busy:
+            return
+        publisher = R2Publisher(self.project_root)
+        self._start_r2_operation(
+            "Connecting Cloudflare R2…",
+            lambda: publisher.save_configuration(configuration, credentials),
+            self._r2_configuration_saved,
+        )
+
+    def _r2_configuration_saved(self, result: object) -> None:
+        snapshot = result
+        if not isinstance(snapshot, R2StorageSnapshot):
+            raise TypeError("R2 configuration returned an invalid storage snapshot.")
+        self._publishing_provider = R2_PROVIDER_ID
+        blocker = QtCore.QSignalBlocker(self.publishing_provider)
+        self.publishing_provider.setCurrentIndex(
+            self.publishing_provider.findData(R2_PROVIDER_ID)
+        )
+        del blocker
+        publisher = R2Publisher(self.project_root)
+        self.r2_storage_dialog.set_configuration(
+            publisher.configuration(),
+            has_credentials=True,
+        )
+        self.r2_storage_dialog.update_snapshot(snapshot)
+        self._sync_publishing_controls()
+        self._set_status("Cloudflare R2 is connected and 30-day expiration is active.")
+
+    def _refresh_r2_storage(self) -> None:
+        if self._busy:
+            return
+        publisher = R2Publisher(self.project_root)
+        if not publisher.is_configured():
+            self.r2_storage_dialog.show_error(
+                "Connect a Cloudflare R2 account before refreshing usage."
+            )
+            return
+        self._start_r2_operation(
+            "Refreshing R2 storage…",
+            publisher.storage_snapshot,
+            self._r2_storage_refreshed,
+        )
+
+    def _r2_storage_refreshed(self, result: object) -> None:
+        snapshot = result
+        if not isinstance(snapshot, R2StorageSnapshot):
+            raise TypeError("R2 returned an invalid storage snapshot.")
+        self.r2_storage_dialog.update_snapshot(snapshot)
+        self._sync_publishing_controls()
+        self._set_status("R2 storage usage refreshed.")
+
+    def _delete_r2_publication(self, public_path: str) -> None:
+        if self._busy:
+            return
+        publisher = R2Publisher(self.project_root)
+        self._start_r2_operation(
+            "Deleting hosted letter…",
+            lambda: publisher.delete_publication(public_path),
+            self._r2_publication_deleted,
+        )
+
+    def _r2_publication_deleted(self, result: object) -> None:
+        self._r2_storage_refreshed(result)
+        url = self.refresh_saved_page_url()
+        self.published_url_changed.emit(url)
+        self.refresh_saved_letters()
+        self._set_status("The hosted letter was deleted and its storage was released.")
+
+    def _disconnect_r2(self) -> None:
+        if self._busy:
+            return
+        R2Publisher(self.project_root).disconnect()
+        self.r2_storage_dialog.set_configuration(None, has_credentials=False)
+        self.r2_storage_dialog.show_error(
+            "R2 was disconnected from this computer. Existing hosted letters were not deleted."
+        )
+        self._sync_publishing_controls()
+        self._set_status("Cloudflare R2 disconnected.")
 
     def _refresh_source_fingerprint(self) -> bool:
         current = _forge_source_fingerprint(self.project_root)

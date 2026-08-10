@@ -19,3 +19,4 @@ class PublishResult:
     public_path: str = ""
     message: str = ""
     technical_details: str = ""
+    error_code: str = ""

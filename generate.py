@@ -95,7 +95,7 @@ LEGACY_SFX_DIRS = (
     Path("gallery") / "app" / "icons" / "Sounds",
 )
 BUILD_STATE_FILE = "lettersmith-build.json"
-BUILD_SCHEMA_VERSION = 9
+BUILD_SCHEMA_VERSION = 10
 CURTAIN_FILES = {"cleft.png", "cright.png"}
 CURTAIN_ANALYSIS_PAGE_ORDER = (
     "cover.png",

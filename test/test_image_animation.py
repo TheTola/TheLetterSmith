@@ -5,11 +5,13 @@ from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from PIL import Image
 
 from config import CONTROL_FILES
 import generate
+import image_animation
 from image_animation import (
     IMAGE_MANIFEST_NAME,
     build_runtime_image_assets,
@@ -30,9 +32,10 @@ class ImageAnimationTests(unittest.TestCase):
         *,
         durations: tuple[int, ...] = (80, 120, 160),
         loop: int | None = 0,
+        size: tuple[int, int] = (12, 9),
     ) -> None:
         frames = [
-            Image.new("RGBA", (12, 9), color)
+            Image.new("RGBA", size, color)
             for color in ("red", "green", "blue")[: len(durations)]
         ]
         options = {
@@ -229,6 +232,71 @@ class ImageAnimationTests(unittest.TestCase):
                 "gallery/pages/cover.png",
             )
             self.assertTrue((destination / IMAGE_MANIFEST_NAME).is_file())
+
+    def test_default_gif_playback_uses_native_file_without_extracted_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            gif = root / "source.gif"
+            self._write_gif(gif)
+            for slot in ("cover", "letter", "wall", "back"):
+                install_image_asset(source, slot, gif)
+
+            runtime = build_runtime_image_assets(source, destination)
+            manifest = validate_runtime_image_manifest(destination)
+
+            self.assertFalse((destination / "gif_frames").exists())
+            self.assertEqual(
+                runtime.page_sources["cover"],
+                "gallery/pages/cover.png",
+            )
+            self.assertEqual(
+                runtime.animations["0"]["source"],
+                "gallery/pages/cover.gif",
+            )
+            for record in manifest["slots"].values():
+                self.assertEqual(record["gif"]["render_mode"], "native_gif")
+                self.assertNotIn("frames", record["gif"])
+
+    def test_large_gif_is_normalized_for_viewer_and_thumbnail_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "large.gif"
+            pages = root / "pages"
+            self._write_gif(
+                source,
+                durations=(80, 120),
+                size=(2100, 1050),
+            )
+
+            with mock.patch(
+                "image_animation._normalize_animated_gif",
+                wraps=image_animation._normalize_animated_gif,
+            ) as normalize:
+                record = install_image_asset(pages, "cover", source)
+                reused = install_image_asset(pages, "letter", source)
+
+            self.assertEqual(normalize.call_count, 1)
+            self.assertEqual(
+                (pages / "cover.gif").read_bytes(),
+                (pages / "letter.gif").read_bytes(),
+            )
+            self.assertEqual(
+                record["import_source_sha256"],
+                reused["import_source_sha256"],
+            )
+
+            with Image.open(pages / "cover.gif") as processed:
+                self.assertEqual(processed.size, (2048, 1024))
+                self.assertEqual(processed.n_frames, 2)
+            with Image.open(pages / "cover.png") as preview:
+                self.assertEqual(preview.size, (2048, 1024))
+            with Image.open(pages / "cover.thumbnail.gif") as thumbnail:
+                self.assertEqual(thumbnail.size, (384, 192))
+                self.assertEqual(thumbnail.n_frames, 2)
+            self.assertEqual(record["processing"]["max_dimension"], 2048)
+            self.assertEqual(record["thumbnail_file"], "cover.thumbnail.gif")
 
 
 if __name__ == "__main__":

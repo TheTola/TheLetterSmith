@@ -589,9 +589,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function imageAnimationConfig(slideIndex){
     const config = IMAGE_ANIMATIONS[String(slideIndex)];
-    return config && Array.isArray(config.frames) && config.frames.length > 1
-      ? config
-      : null;
+    if (!config) return null;
+    if (config.render_mode === 'native_gif'){
+      return config.source && config.preview_source ? config : null;
+    }
+    return Array.isArray(config.frames) && config.frames.length > 1 ? config : null;
   }
 
   function cancelImageAnimation(slideIndex){
@@ -599,6 +601,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!state) return;
     state.cancelled = true;
     if (state.timer !== null) clearTimeout(state.timer);
+    if (state.config.render_mode === 'native_gif' && state.config.preview_source){
+      state.image.src = state.config.preview_source;
+    }
     state.timer = null;
     imageAnimationStates.delete(slideIndex);
   }
@@ -682,7 +687,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!config) return;
     cancelImageAnimation(slideIndex);
     const image = slideImageEl(slides[slideIndex]);
-    if (image && config.frames[0]) image.src = config.frames[0];
+    if (!image) return;
+    if (config.render_mode === 'native_gif') image.src = config.preview_source;
+    else if (config.frames[0]) image.src = config.frames[0];
   }
 
   function activateImageAnimation(slideIndex){
@@ -700,6 +707,10 @@ document.addEventListener('DOMContentLoaded', () => {
       totalForwardPlays: effectiveImagePlayCount(config),
     };
     imageAnimationStates.set(slideIndex, state);
+    if (config.render_mode === 'native_gif'){
+      image.src = config.source;
+      return;
+    }
     showImageAnimationFrame(state, 0);
     scheduleImageAnimation(
       state,

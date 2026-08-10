@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 import traceback
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
@@ -153,7 +154,7 @@ def setup_logging(
     settings: dict,
 ) -> None:
     """
-    Configure console logging.
+    Configure console logging and a bounded diagnostic file.
     """
     debug = bool(
         settings.get(
@@ -168,14 +169,47 @@ def setup_logging(
         else logging.INFO
     )
 
+    handlers: list[logging.Handler] = [
+        logging.StreamHandler(
+            sys.stdout
+        )
+    ]
+    local_app_data = str(
+        os.environ.get(
+            "LOCALAPPDATA",
+            "",
+        )
+    ).strip()
+    if local_app_data:
+        try:
+            log_directory = (
+                Path(local_app_data)
+                / "LetterSmith"
+                / "logs"
+            )
+            log_directory.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            file_handler = RotatingFileHandler(
+                log_directory / "lettersmith.log",
+                maxBytes=2 * 1024 * 1024,
+                backupCount=3,
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s %(levelname)s %(name)s %(message)s"
+                )
+            )
+            handlers.append(file_handler)
+        except OSError:
+            pass
+
     logging.basicConfig(
         level=level,
         format="%(message)s",
-        handlers=[
-            logging.StreamHandler(
-                sys.stdout
-            )
-        ],
+        handlers=handlers,
         force=True,
     )
 
