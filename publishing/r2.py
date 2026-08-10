@@ -6,6 +6,9 @@ import logging
 import mimetypes
 import re
 import secrets
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -230,6 +233,22 @@ def _boto3_client(configuration: R2Configuration, credentials: R2Credentials):
     )
 
 
+def _confirm_public_marker(url: str, expected: bytes) -> bool:
+    request = urllib.request.Request(
+        url,
+        headers={"Cache-Control": "no-cache", "User-Agent": "LetterSmith/1"},
+    )
+    for attempt in range(3):
+        if attempt:
+            time.sleep(1.0)
+        try:
+            with urllib.request.urlopen(request, timeout=15.0) as response:
+                return response.status == 200 and response.read() == expected
+        except (OSError, urllib.error.URLError):
+            continue
+    return False
+
+
 def _error_identity(error: BaseException) -> tuple[str, object, str]:
     response = getattr(error, "response", None)
     if not isinstance(response, Mapping):
@@ -295,11 +314,13 @@ class R2Publisher(Publisher):
         *,
         credential_store: R2CredentialStore | None = None,
         client_factory: Callable[[R2Configuration, R2Credentials], Any] | None = None,
+        public_checker: Callable[[str, bytes], bool] | None = None,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         self.settings = SettingsStore(self.project_root)
         self.credential_store = credential_store or R2CredentialStore()
         self.client_factory = client_factory or _boto3_client
+        self.public_checker = public_checker or _confirm_public_marker
 
     def configuration(self) -> R2Configuration | None:
         settings = self.settings.snapshot()
@@ -613,15 +634,16 @@ class R2Publisher(Publisher):
                 "bundle_bytes": bundle_size,
             }
             marker_key = f"{prefix}{PUBLICATION_MARKER}"
+            marker_bytes = json.dumps(
+                marker,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
             client.put_object(
                 Bucket=configuration.bucket,
                 Key=marker_key,
-                Body=json.dumps(
-                    marker,
-                    ensure_ascii=True,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8"),
+                Body=marker_bytes,
                 ContentType="application/json",
                 CacheControl="no-cache, no-store, must-revalidate",
                 StorageClass="STANDARD",
@@ -629,6 +651,14 @@ class R2Publisher(Publisher):
             uploaded_keys.append(marker_key)
             client.head_object(Bucket=configuration.bucket, Key=marker_key)
             url = f"{configuration.public_base_url}/{quote(PUBLICATION_PREFIX)}{quote(public_path)}/"
+            marker_url = f"{url}{quote(PUBLICATION_MARKER)}"
+            if not self.public_checker(marker_url, marker_bytes):
+                raise R2OperationError(
+                    "public_access",
+                    "The files reached R2, but the public URL could not be verified. "
+                    "Enable public bucket access or correct the Public URL in R2 Storage.",
+                    f"public_marker_url={marker_url}",
+                )
 
             if previous_public_path and previous_public_path != public_path:
                 try:

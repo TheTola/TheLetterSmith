@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6 import QtWidgets
+
+from Forge_Tab import ForgeTab
 from publishing.credentials import R2CredentialStore, R2Credentials
 from publishing.r2 import (
     CURRENT_PUBLIC_PATH_KEY,
@@ -13,7 +19,10 @@ from publishing.r2 import (
     R2Configuration,
     R2OperationError,
     R2Publisher,
+    R2StorageSnapshot,
 )
+from publishing.r2_ui import R2StorageDialog
+from settings_store import SettingsStore
 
 
 class _FakeClientError(RuntimeError):
@@ -153,6 +162,7 @@ class R2PublishingTests(unittest.TestCase):
                 root,
                 credential_store=self._store(root),
                 client_factory=lambda _configuration, _credentials: client,
+                public_checker=lambda _url, _expected: True,
             )
             snapshot = publisher.save_configuration(
                 self._configuration(),
@@ -175,6 +185,7 @@ class R2PublishingTests(unittest.TestCase):
                 root,
                 credential_store=self._store(root),
                 client_factory=lambda _configuration, _credentials: client,
+                public_checker=lambda _url, _expected: True,
             )
             publisher.save_configuration(
                 self._configuration(),
@@ -212,6 +223,7 @@ class R2PublishingTests(unittest.TestCase):
                 root,
                 credential_store=self._store(root),
                 client_factory=lambda _configuration, _credentials: client,
+                public_checker=lambda _url, _expected: True,
             )
             publisher.save_configuration(
                 self._configuration(limit=20),
@@ -225,6 +237,29 @@ class R2PublishingTests(unittest.TestCase):
             self.assertEqual(result.error_code, "storage_limit")
             self.assertFalse(client.objects)
 
+    def test_unverified_public_url_rolls_back_uploaded_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = _FakeR2Client()
+            publisher = R2Publisher(
+                root,
+                credential_store=self._store(root),
+                client_factory=lambda _configuration, _credentials: client,
+                public_checker=lambda _url, _expected: False,
+            )
+            publisher.save_configuration(
+                self._configuration(),
+                R2Credentials("access", "secret"),
+            )
+            result = publisher.publish(
+                self._build(root),
+                {"recipient_name": "Ada", "recipient_title": "Private"},
+            )
+            self.assertFalse(result.success)
+            self.assertEqual(result.error_code, "public_access")
+            self.assertIn("public URL", result.message)
+            self.assertFalse(client.objects)
+
     def test_manual_delete_releases_objects_and_current_url(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -233,6 +268,7 @@ class R2PublishingTests(unittest.TestCase):
                 root,
                 credential_store=self._store(root),
                 client_factory=lambda _configuration, _credentials: client,
+                public_checker=lambda _url, _expected: True,
             )
             publisher.save_configuration(
                 self._configuration(),
@@ -260,6 +296,7 @@ class R2PublishingTests(unittest.TestCase):
                 root,
                 credential_store=self._store(root),
                 client_factory=lambda _configuration, _credentials: DeniedClient(),
+                public_checker=lambda _url, _expected: True,
             )
             with self.assertRaises(R2OperationError) as raised:
                 publisher.save_configuration(
@@ -268,6 +305,43 @@ class R2PublishingTests(unittest.TestCase):
                 )
             self.assertEqual(raised.exception.code, "authentication")
             self.assertIn("reconnect", raised.exception.user_message.casefold())
+
+
+class R2StorageUiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_storage_dialog_displays_usage_and_hosted_letters(self) -> None:
+        dialog = R2StorageDialog()
+        snapshot = R2StorageSnapshot(
+            used_bytes=8_500_000_000,
+            limit_bytes=10_000_000_000,
+            object_count=12,
+            publications=(),
+            measured_at="2026-08-10T12:00:00+00:00",
+        )
+        dialog.update_snapshot(snapshot)
+        self.assertEqual(dialog.usage_bar.value(), 850)
+        self.assertIn("8.5 GB", dialog.usage_label.text())
+        self.assertIn("85%", dialog.usage_warning.text())
+        dialog.close()
+
+    def test_forge_defaults_new_install_to_r2_but_preserves_existing_github(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            forge = ForgeTab(root)
+            self.assertEqual(forge.publishing_provider.currentData(), "cloudflare_r2")
+            forge.close()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            SettingsStore(root).update_fields(
+                {"github_pages_repository": "owner/letter-smith-publishing"}
+            )
+            forge = ForgeTab(root)
+            self.assertEqual(forge.publishing_provider.currentData(), "github_pages")
+            forge.close()
 
 
 if __name__ == "__main__":

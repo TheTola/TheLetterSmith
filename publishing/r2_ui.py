@@ -135,6 +135,14 @@ class R2StorageDialog(QtWidgets.QDialog):
         )
         self.usage_warning.setWordWrap(True)
         usage_layout.addWidget(self.usage_warning)
+        account_note = QtWidgets.QLabel(
+            "This meter covers the dedicated Letter Smith bucket. Cloudflare's "
+            "10 GB free allowance is shared across every R2 bucket in the account; "
+            "use Open Cloudflare R2 to review the account total."
+        )
+        account_note.setWordWrap(True)
+        account_note.setStyleSheet("color:#86aeb9;font:8.5pt 'Segoe UI';")
+        usage_layout.addWidget(account_note)
         usage_actions = QtWidgets.QHBoxLayout()
         self.refresh_btn = QtWidgets.QPushButton("Refresh Usage")
         self.refresh_btn.clicked.connect(self.refresh_requested.emit)
@@ -345,8 +353,8 @@ class R2StorageDialog(QtWidgets.QDialog):
             self.show_error("The Windows application-data folder is unavailable.")
             return
         log_path = Path(local_app_data) / "LetterSmith" / "logs" / "lettersmith.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         target = log_path if log_path.exists() else log_path.parent
-        target.parent.mkdir(parents=True, exist_ok=True)
         if not QtGui.QDesktopServices.openUrl(QUrl.fromLocalFile(str(target.resolve()))):
             self.show_error("The error-log location could not be opened.")
 

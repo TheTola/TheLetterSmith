@@ -1348,6 +1348,18 @@ class ForgeTab(QtWidgets.QWidget):
     def refresh_project_state(self) -> None:
         self._refresh_source_fingerprint()
         snapshot = self.settings.snapshot()
+        publishing_provider = self._saved_publishing_provider()
+        if publishing_provider != self._publishing_provider:
+            self._publishing_provider = publishing_provider
+            blocker = QtCore.QSignalBlocker(self.publishing_provider)
+            self.publishing_provider.setCurrentIndex(
+                max(
+                    0,
+                    self.publishing_provider.findData(publishing_provider),
+                )
+            )
+            del blocker
+        self._sync_publishing_controls()
         preview_mode = self._saved_preview_mode()
         preview_mode_changed = preview_mode != self._preview_mode
         self._preview_mode = preview_mode
@@ -2226,19 +2238,42 @@ class ForgeTab(QtWidgets.QWidget):
         readiness = self._required_gate(for_publish=True)
         if readiness is None:
             return
-        if not bool(self.settings.get(PUBLIC_WARNING_KEY, False)):
+        provider_id = self._publishing_provider
+        if provider_id == R2_PROVIDER_ID and not R2Publisher(
+            self.project_root
+        ).is_configured():
+            self._set_status(
+                "Connect Cloudflare R2 before publishing.",
+                error=True,
+            )
+            self.show_r2_storage()
+            return
+        warning_key = (
+            R2_PUBLIC_WARNING_KEY
+            if provider_id == R2_PROVIDER_ID
+            else GITHUB_PUBLIC_WARNING_KEY
+        )
+        warning_text = (
+            "Publishing uploads this letter to the connected user's public "
+            "Cloudflare R2 bucket. It will expire automatically after 30 days. Continue?"
+            if provider_id == R2_PROVIDER_ID
+            else (
+                "Publishing may create or update a public GitHub Pages "
+                "repository using GitHub CLI. Continue?"
+            )
+        )
+        if not bool(self.settings.get(warning_key, False)):
             answer = QtWidgets.QMessageBox.question(
                 self,
                 "Publish Letter",
-                "Publishing may create or update a public GitHub Pages "
-                "repository using GitHub CLI. Continue?",
+                warning_text,
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
                 QtWidgets.QMessageBox.Cancel,
             )
             if answer != QtWidgets.QMessageBox.Yes:
                 self._set_status("Publishing canceled.")
                 return
-            self.settings.update_fields({PUBLIC_WARNING_KEY: True})
+            self.settings.update_fields({warning_key: True})
 
         if not self._flush_prompt_writer_state():
             return
@@ -2276,13 +2311,17 @@ class ForgeTab(QtWidgets.QWidget):
                 readiness,
             )
             record_saved_letter_activity(play_path)
-            publisher = GitHubPagesPublisher(self.project_root)
+            publisher = (
+                R2Publisher(self.project_root)
+                if provider_id == R2_PROVIDER_ID
+                else GitHubPagesPublisher(self.project_root)
+            )
             if not publisher.is_configured():
                 configured = publisher.configure(None)
                 if not configured.configured:
                     configuration_message = (
-                        "Publishing requires GitHub CLI or a configured Git "
-                        "remote. The local letter was generated successfully."
+                        "Online publishing is not configured. "
+                        "The local letter was generated successfully."
                     )
                     if configured.message:
                         configuration_message = (
@@ -2350,6 +2389,7 @@ class ForgeTab(QtWidgets.QWidget):
                 or "Publishing failed. The local build was preserved.",
                 error=True,
             )
+            self._show_publish_failure(publish_result)
             return
         url = normalize_published_page_url(
             getattr(publish_result, "url", "")
@@ -2371,7 +2411,53 @@ class ForgeTab(QtWidgets.QWidget):
             published_readiness,
             public_path=str(getattr(publish_result, "public_path", "")),
         )
+        self._sync_publishing_controls()
         self._set_status("The letter has been sealed.")
+
+    def _show_publish_failure(self, publish_result: object) -> None:
+        message = (
+            str(getattr(publish_result, "message", "")).strip()
+            or "Publishing failed. The local letter was preserved."
+        )
+        error_code = str(getattr(publish_result, "error_code", "")).strip()
+        details = str(getattr(publish_result, "technical_details", "")).strip()
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setIcon(QtWidgets.QMessageBox.Warning)
+        dialog.setWindowTitle("Letter Was Not Published")
+        dialog.setText(message)
+        if error_code == "storage_limit":
+            dialog.setInformativeText(
+                "Open R2 Storage to delete hosted letters, wait for automatic "
+                "expiration, or keep using the local saved letter."
+            )
+            storage_button = dialog.addButton(
+                "Open R2 Storage",
+                QtWidgets.QMessageBox.ActionRole,
+            )
+        elif error_code in {
+            "authentication",
+            "bucket_missing",
+            "not_configured",
+            "public_access",
+        }:
+            dialog.setInformativeText(
+                "Open R2 Storage to check the Cloudflare connection and retry."
+            )
+            storage_button = dialog.addButton(
+                "Open R2 Storage",
+                QtWidgets.QMessageBox.ActionRole,
+            )
+        else:
+            storage_button = None
+            dialog.setInformativeText(
+                "The generated local letter was preserved. You can retry publishing."
+            )
+        dialog.addButton(QtWidgets.QMessageBox.Close)
+        if details:
+            dialog.setDetailedText(details)
+        dialog.exec()
+        if storage_button is not None and dialog.clickedButton() is storage_button:
+            self.show_r2_storage()
 
     def _record_active_play_dir(self, play_dir: Path) -> None:
         candidate = Path(play_dir).resolve()
@@ -2594,6 +2680,13 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_delete_toggle.setEnabled(not busy)
         self.preview_mode.setEnabled(not busy)
         self.readiness_btn.setEnabled(not busy)
+        self.publishing_provider.setEnabled(not busy)
+        self.r2_storage_btn.setEnabled(not busy)
+        if hasattr(self, "r2_storage_dialog"):
+            self.r2_storage_dialog.set_busy(
+                busy,
+                self.status.text() if busy else "",
+            )
         if busy:
             self.preview_btn.setEnabled(False)
             self.publish_btn.setEnabled(False)
@@ -2636,6 +2729,7 @@ class ForgeTab(QtWidgets.QWidget):
             return
         self._tab_active = False
         self.saved_panel.hide()
+        self.r2_storage_dialog.hide()
         self.preview_visibility_changed.emit(False)
         self.preview_files_release_requested.emit()
 
@@ -2675,5 +2769,6 @@ class ForgeTab(QtWidgets.QWidget):
             return
         self.settings.changed.disconnect(self._on_settings_changed)
         self.saved_panel.close()
+        self.r2_storage_dialog.close()
         self.readiness_window.shutdown()
         super().closeEvent(event)
