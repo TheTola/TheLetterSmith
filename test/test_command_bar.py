@@ -37,7 +37,6 @@ class CommandBarTests(unittest.TestCase):
         title: str,
         published_url: str,
         activity: str,
-        metadata_name: str = PLAY_METADATA_FILE,
     ) -> Path:
         play_dir = root / "output" / "Play" / folder
         pages = play_dir / "gallery" / "pages"
@@ -53,7 +52,7 @@ class CommandBarTests(unittest.TestCase):
         (play_dir / "index.html").write_text("<html></html>", encoding="utf-8")
         (play_dir / "styles.css").write_text("body{}", encoding="utf-8")
         (play_dir / "script.js").write_text("", encoding="utf-8")
-        (play_dir / metadata_name).write_text(
+        (play_dir / PLAY_METADATA_FILE).write_text(
             json.dumps(
                 {
                     "recipient_name": recipient,
@@ -96,6 +95,33 @@ class CommandBarTests(unittest.TestCase):
         self.assertEqual(data.recipient_title, "A Letter")
         self.assertEqual(data.published_url, "https://example.com/letter")
         self.assertTrue(data.local_preview_path is not None)
+
+    def test_obsolete_metadata_filename_is_not_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = self._write_saved_letter(
+                root,
+                "stored-bundle",
+                recipient="Amanda Miller",
+                title="Words of Encouragement",
+                published_url="https://example.com/obsolete",
+                activity="2029-01-01T00:00:00+00:00",
+            )
+            metadata = bundle / PLAY_METADATA_FILE
+            obsolete_metadata = bundle / "metadata.json"
+            obsolete_metadata.write_bytes(metadata.read_bytes())
+            metadata.unlink()
+            SettingsStore(root).update_fields(
+                {
+                    "recipient_name": "Amanda Miller",
+                    "recipient_title": "Words of Encouragement",
+                }
+            )
+
+            data = build_command_bar_data(root)
+
+        self.assertIsNone(data.local_preview_path)
+        self.assertEqual(data.published_url, "")
 
     def test_missing_decorative_assets_do_not_block_controller(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -158,7 +184,6 @@ class CommandBarTests(unittest.TestCase):
                 title="Words of Encouragement",
                 published_url="https://example.com/new",
                 activity="2029-01-01T00:00:00+00:00",
-                metadata_name="metadata.json",
             )
             outside = root / "outside"
             outside.mkdir()
@@ -178,6 +203,40 @@ class CommandBarTests(unittest.TestCase):
             newest_match.resolve() / "index.html",
         )
         self.assertEqual(data.published_url, "https://example.com/new")
+
+    def test_fallback_does_not_open_recovery_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = self._write_saved_letter(
+                root,
+                "active",
+                recipient="Amanda Miller",
+                title="Words of Encouragement",
+                published_url="https://example.com/active",
+                activity="2028-01-01T00:00:00+00:00",
+            )
+            recovery_source = self._write_saved_letter(
+                root,
+                "recovery-copy",
+                recipient="Amanda Miller",
+                title="Words of Encouragement",
+                published_url="https://example.com/recovery",
+                activity="2029-01-01T00:00:00+00:00",
+            )
+            recovery = root / "output" / "Recovery" / "recovery-copy"
+            recovery.parent.mkdir(parents=True)
+            recovery_source.replace(recovery)
+            SettingsStore(root).update_fields(
+                {
+                    "recipient_name": "Amanda Miller",
+                    "recipient_title": "Words of Encouragement",
+                }
+            )
+
+            data = build_command_bar_data(root)
+
+        self.assertEqual(data.local_preview_path, active.resolve() / "index.html")
+        self.assertEqual(data.published_url, "https://example.com/active")
 
     def test_valid_gif_uses_native_aspect_ratio(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -419,6 +478,11 @@ class CommandBarTests(unittest.TestCase):
             preview = root / "output" / "Play" / "letter" / "index.html"
             preview.parent.mkdir(parents=True)
             preview.write_text("<html></html>", encoding="utf-8")
+            obsolete_preview = (
+                root / "output" / "output" / "Play" / "letter" / "index.html"
+            )
+            obsolete_preview.parent.mkdir(parents=True)
+            obsolete_preview.write_text("<html></html>", encoding="utf-8")
             unrelated_preview = root / "elsewhere" / "index.html"
             unrelated_preview.parent.mkdir()
             unrelated_preview.write_text("<html></html>", encoding="utf-8")
@@ -445,6 +509,12 @@ class CommandBarTests(unittest.TestCase):
             self.assertFalse(
                 command_bar_has_openable_target(
                     CommandBarData("Recipient", "Title", unrelated_preview, ""),
+                    root,
+                )
+            )
+            self.assertFalse(
+                command_bar_has_openable_target(
+                    CommandBarData("Recipient", "Title", obsolete_preview, ""),
                     root,
                 )
             )

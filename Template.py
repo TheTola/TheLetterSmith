@@ -126,6 +126,7 @@ TEMPLATE_HTML = r"""
     const INITIAL_VOLUME = {{INITIAL_VOLUME}};
     const MUSIC_PLAYLIST = {{MUSIC_PLAYLIST_JSON}};
     const MUSIC_CROSSFADE_MS = {{MUSIC_CROSSFADE_MS}};
+    const IMAGE_ANIMATIONS = {{IMAGE_ANIMATIONS_JSON}};
   </script>
 
   <script src="script.js"></script>
@@ -345,6 +346,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let started = false;
   let introControlsLocked = false;
   let idx = 0;
+  const imageAnimationStates = new Map();
   let wallClosedByUser = false;
   let wallRevealLocked = false;
   let wallRevealTimer = null;
@@ -373,6 +375,11 @@ document.addEventListener('DOMContentLoaded', () => {
     { as: 'image', href: 'gallery/controls/showmessageicon.png' },
     ...((Array.isArray(MUSIC_PLAYLIST) ? MUSIC_PLAYLIST : []).map((href) => ({ as: 'audio', href, type: 'audio/mpeg' }))),
     ...flipPool.map((href) => ({ as: 'audio', href, type: 'audio/mpeg' })),
+    ...Object.values(IMAGE_ANIMATIONS).flatMap((config) => (
+      Array.isArray(config.frames)
+        ? config.frames.map((href) => ({ as: 'image', href }))
+        : []
+    )),
   ];
 
   function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
@@ -580,6 +587,127 @@ document.addEventListener('DOMContentLoaded', () => {
     return Promise.race([assetWait, timeoutWait]);
   }
 
+  function imageAnimationConfig(slideIndex){
+    const config = IMAGE_ANIMATIONS[String(slideIndex)];
+    return config && Array.isArray(config.frames) && config.frames.length > 1
+      ? config
+      : null;
+  }
+
+  function cancelImageAnimation(slideIndex){
+    const state = imageAnimationStates.get(slideIndex);
+    if (!state) return;
+    state.cancelled = true;
+    if (state.timer !== null) clearTimeout(state.timer);
+    state.timer = null;
+    imageAnimationStates.delete(slideIndex);
+  }
+
+  function showImageAnimationFrame(state, frameIndex){
+    if (state.cancelled) return;
+    const source = state.config.frames[frameIndex];
+    if (source) state.image.src = source;
+  }
+
+  function imageFrameDuration(state, frameIndex){
+    const value = Number(state.config.durations_ms?.[frameIndex]);
+    return Number.isFinite(value) && value > 0 ? value : 100;
+  }
+
+  function scheduleImageAnimation(state, delayMs, callback){
+    if (state.cancelled) return;
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      if (!state.cancelled) callback();
+    }, Math.max(0, Number(delayMs) || 0));
+  }
+
+  function configuredImagePlayCount(config){
+    if (config.play_count === 'forever') return Infinity;
+    const value = Number.parseInt(String(config.play_count), 10);
+    return Number.isFinite(value) && value > 0 ? value : 1;
+  }
+
+  function effectiveImagePlayCount(config){
+    const configured = configuredImagePlayCount(config);
+    if (config.playback_mode !== 'original') return configured;
+    const embedded = config.embedded_play_count === 'forever'
+      ? Infinity
+      : Math.max(1, Number.parseInt(String(config.embedded_play_count), 10) || 1);
+    if (configured === Infinity) return embedded;
+    return embedded === Infinity ? configured : Math.min(configured, embedded);
+  }
+
+  function playImageForward(state, frameIndex){
+    const lastFrame = state.config.frames.length - 1;
+    showImageAnimationFrame(state, frameIndex);
+    scheduleImageAnimation(state, imageFrameDuration(state, frameIndex), () => {
+      if (frameIndex < lastFrame){
+        playImageForward(state, frameIndex + 1);
+        return;
+      }
+      state.completedForwardPlays += 1;
+      if (state.completedForwardPlays >= state.totalForwardPlays){
+        // Hard rule: a completed animation stays on its last displayed frame.
+        showImageAnimationFrame(state, lastFrame);
+        return;
+      }
+      scheduleImageAnimation(state, state.config.loop_pause_ms, () => {
+        if (state.config.playback_mode === 'ping_pong'){
+          playImageReverse(state, lastFrame - 1);
+        } else {
+          playImageForward(state, 0);
+        }
+      });
+    });
+  }
+
+  function playImageReverse(state, frameIndex){
+    showImageAnimationFrame(state, frameIndex);
+    scheduleImageAnimation(state, imageFrameDuration(state, frameIndex), () => {
+      if (frameIndex > 0){
+        playImageReverse(state, frameIndex - 1);
+        return;
+      }
+      scheduleImageAnimation(
+        state,
+        state.config.loop_pause_ms,
+        () => playImageForward(state, 0),
+      );
+    });
+  }
+
+  function prepareImageAnimation(slideIndex){
+    const config = imageAnimationConfig(slideIndex);
+    if (!config) return;
+    cancelImageAnimation(slideIndex);
+    const image = slideImageEl(slides[slideIndex]);
+    if (image && config.frames[0]) image.src = config.frames[0];
+  }
+
+  function activateImageAnimation(slideIndex){
+    const config = imageAnimationConfig(slideIndex);
+    if (!config) return;
+    cancelImageAnimation(slideIndex);
+    const image = slideImageEl(slides[slideIndex]);
+    if (!image) return;
+    const state = {
+      cancelled: false,
+      timer: null,
+      image,
+      config,
+      completedForwardPlays: 0,
+      totalForwardPlays: effectiveImagePlayCount(config),
+    };
+    imageAnimationStates.set(slideIndex, state);
+    showImageAnimationFrame(state, 0);
+    scheduleImageAnimation(
+      state,
+      config.start_delay_ms,
+      () => playImageForward(state, 0),
+    );
+  }
+
   function revealStage(){
     if (stageReady) return;
     stageReady = true;
@@ -703,6 +831,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     clearWallRevealTimers();
     wallRevealLocked = false;
+    cancelImageAnimation(idx);
+    prepareImageAnimation(target);
     idx = target;
     slides.forEach((s, i) => {
       s.classList.toggle('active', i === idx);
@@ -713,6 +843,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (opts.playSound !== false) playFlip();
     syncButtons();
     syncWallUI();
+    if (started) activateImageAnimation(idx);
   }
 
   function activeSlide(){ return slides[idx]; }
@@ -779,6 +910,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const goingNext = target > idx;
     const currentSlide = slides[idx];
     const targetSlide = slides[target];
+    prepareImageAnimation(target);
     placeTurn(rect);
     sheetFront.classList.remove('hidden');
     sheetFront.classList.add('visible');
@@ -995,6 +1127,7 @@ document.addEventListener('DOMContentLoaded', () => {
     introControlsLocked = true;
     syncButtons();
     revealStage();
+    activateImageAnimation(idx);
     beginBtn.disabled = true;
     beginBtn.style.opacity = '0';
     beginBtn.style.pointerEvents = 'none';

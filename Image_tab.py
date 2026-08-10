@@ -2,11 +2,14 @@
 """
 Image-tab UI and logic for Letter Smith.
 
-Canonical image files:
+Canonical preview files:
     gallery/user/pages/cover.png
     gallery/user/pages/letter.png
     gallery/user/pages/wall.png
     gallery/user/pages/back.png
+
+Animated selections also retain their original ``<slot>.gif`` source and
+per-image playback settings in ``lettersmith-images.json``.
 
 The Reset Images and Gallery artwork buttons are deliberately large. They live
 in their own left-aligned horizontal strip below the image cards, with fixed
@@ -19,13 +22,24 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image, ImageChops, ImageOps
+from PIL import Image, ImageChops
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPoint, QSize, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon
 
 from image_button import ArtworkButton
+from image_animation import (
+    FOREVER,
+    IMAGE_MANIFEST_NAME,
+    INDEX_TO_SLOT,
+    MAX_PLAY_COUNT,
+    clear_slot_asset,
+    install_image_asset,
+    load_image_manifest,
+    normalize_gif_settings,
+    update_slot_gif_settings,
+)
 from project_paths import ProjectPathResolver
 from project_save import ProjectSaveService
 from project_state import ProjectStateController
@@ -98,43 +112,6 @@ class StaticFab(QtWidgets.QToolButton):
 # ─────────────────────────────────────────────────────────────────────────────
 # Image helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-def _load_image_exif(path: str) -> Image.Image:
-    image = Image.open(path)
-    image = ImageOps.exif_transpose(image)
-
-    if image.mode not in ("RGB", "RGBA"):
-        try:
-            image = image.convert("RGBA")
-        except Exception:
-            image = image.convert("RGB")
-
-    return image
-
-
-def _save_png(
-    image: Image.Image,
-    destination_path: str,
-) -> None:
-    destination = Path(destination_path)
-
-    destination.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    output_mode = (
-        "RGBA"
-        if image.mode == "RGBA"
-        else "RGB"
-    )
-
-    image.convert(output_mode).save(
-        destination,
-        format="PNG",
-        optimize=True,
-    )
 
 
 def _trim_artwork_canvas(
@@ -354,6 +331,7 @@ class _ImageThumbnail(
         ".jpg",
         ".jpeg",
         ".bmp",
+        ".gif",
     )
 
     def __init__(
@@ -501,6 +479,7 @@ class ImageAssetCard(
 ):
     select_requested = Signal(int)
     clear_requested = Signal(int)
+    settings_requested = Signal(int)
     preview_requested = Signal(int)
     file_dropped = Signal(
         int,
@@ -522,6 +501,7 @@ class ImageAssetCard(
         self._source_pixmap = (
             QtGui.QPixmap()
         )
+        self._movie: QtGui.QMovie | None = None
 
         self.setObjectName(
             "ImageAssetCard"
@@ -656,11 +636,32 @@ class ImageAssetCard(
             )
         )
 
-        button_row.addStretch(1)
+        self.settings_btn = QtWidgets.QPushButton(
+            "Settings"
+        )
+        self.settings_btn.setMinimumHeight(34)
+        self.settings_btn.setCursor(
+            QtCore.Qt.PointingHandCursor
+        )
+        self.settings_btn.setToolTip(
+            "Settings for this image"
+        )
+        self.settings_btn.setEnabled(False)
+        self.settings_btn.setStyleSheet(
+            self.clear_btn.styleSheet()
+        )
+        self.settings_btn.clicked.connect(
+            lambda: self.settings_requested.emit(
+                self.index
+            )
+        )
+
+        button_row.addWidget(
+            self.settings_btn
+        )
         button_row.addWidget(
             self.clear_btn
         )
-        button_row.addStretch(1)
 
         root_layout.addLayout(
             button_row
@@ -703,6 +704,7 @@ class ImageAssetCard(
         self,
         pixmap: QtGui.QPixmap,
     ) -> None:
+        self._stop_movie()
         self._source_pixmap = (
             QtGui.QPixmap(pixmap)
         )
@@ -715,7 +717,55 @@ class ImageAssetCard(
             else "ready"
         )
 
+        self.settings_btn.setEnabled(
+            not pixmap.isNull()
+        )
+
+    def set_asset_path(
+        self,
+        path: str,
+        *,
+        animated_gif: bool,
+    ) -> None:
+        if not animated_gif:
+            self.set_pixmap(
+                QtGui.QPixmap(path)
+            )
+            self.settings_btn.setToolTip(
+                "Static image settings"
+            )
+            return
+
+        self._stop_movie()
+        self._source_pixmap = QtGui.QPixmap()
+        movie = QtGui.QMovie(path)
+        movie.setCacheMode(
+            QtGui.QMovie.CacheAll
+        )
+        if not movie.isValid():
+            self.set_pixmap(
+                QtGui.QPixmap(path)
+            )
+            return
+        self._movie = movie
+        self.thumbnail.setText("")
+        self.thumbnail.setStyleSheet(
+            "background: #101317;"
+            "border: 1px solid #2d3540;"
+            "border-radius: 6px;"
+        )
+        self.thumbnail.setMovie(movie)
+        movie.jumpToFrame(0)
+        self.settings_btn.setEnabled(True)
+        self.settings_btn.setToolTip(
+            "Animation settings for this GIF"
+        )
+        self.set_asset_state("ready")
+        self._rescale()
+        movie.start()
+
     def clear_pixmap(self) -> None:
+        self._stop_movie()
         self._source_pixmap = (
             QtGui.QPixmap()
         )
@@ -736,8 +786,34 @@ class ImageAssetCard(
         self.set_asset_state(
             "missing"
         )
+        self.settings_btn.setEnabled(False)
+        self.settings_btn.setToolTip(
+            "Select an image before opening settings"
+        )
 
     def _rescale(self) -> None:
+        if self._movie is not None:
+            target_size = (
+                self.thumbnail.size()
+                - QtCore.QSize(8, 8)
+            )
+            if (
+                target_size.width() > 0
+                and target_size.height() > 0
+            ):
+                current = self._movie.currentPixmap()
+                source_size = current.size()
+                if source_size.isEmpty():
+                    source_size = self._movie.currentImage().size()
+                if not source_size.isEmpty():
+                    self._movie.setScaledSize(
+                        source_size.scaled(
+                            target_size,
+                            QtCore.Qt.KeepAspectRatio,
+                        )
+                    )
+            return
+
         if self._source_pixmap.isNull():
             self.clear_pixmap()
             return
@@ -776,6 +852,18 @@ class ImageAssetCard(
             scaled_pixmap
         )
 
+    def _stop_movie(self) -> None:
+        if self._movie is None:
+            return
+        self._movie.stop()
+        self.thumbnail.setMovie(None)
+        self._movie.setFileName("")
+        self._movie.deleteLater()
+        self._movie = None
+
+    def release_asset_handle(self) -> None:
+        self._stop_movie()
+
     def resizeEvent(
         self,
         event: QtGui.QResizeEvent,
@@ -787,6 +875,168 @@ class ImageAssetCard(
 # ─────────────────────────────────────────────────────────────────────────────
 # Image tab
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+class ImageSettingsDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        title: str,
+        *,
+        animated_gif: bool,
+        settings: dict[str, object] | None = None,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"{title} Settings")
+        self.setModal(True)
+        self.setMinimumWidth(410)
+
+        root = QtWidgets.QVBoxLayout(self)
+        heading = QtWidgets.QLabel(
+            "Animated GIF" if animated_gif else "Static image"
+        )
+        heading.setStyleSheet(
+            "color:#00d0ff;font:700 14px 'Segoe UI';"
+        )
+        root.addWidget(heading)
+
+        if not animated_gif:
+            message = QtWidgets.QLabel(
+                "This image has no animation settings."
+            )
+            message.setWordWrap(True)
+            root.addWidget(message)
+            buttons = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.Close
+            )
+            buttons.rejected.connect(self.reject)
+            root.addWidget(buttons)
+            return
+
+        normalized = normalize_gif_settings(settings)
+        form = QtWidgets.QFormLayout()
+        form.setFieldGrowthPolicy(
+            QtWidgets.QFormLayout.AllNonFixedFieldsGrow
+        )
+
+        self.playback_mode = QtWidgets.QComboBox()
+        self.playback_mode.addItem("Original", "original")
+        self.playback_mode.addItem("Loop", "loop")
+        self.playback_mode.addItem("Ping-Pong", "ping_pong")
+        self.playback_mode.setCurrentIndex(
+            max(
+                0,
+                self.playback_mode.findData(
+                    normalized["playback_mode"]
+                ),
+            )
+        )
+        form.addRow("Playback Mode", self.playback_mode)
+
+        count_row = QtWidgets.QWidget()
+        count_layout = QtWidgets.QHBoxLayout(count_row)
+        count_layout.setContentsMargins(0, 0, 0, 0)
+        count_layout.setSpacing(8)
+        self.play_count = QtWidgets.QComboBox()
+        self.play_count.addItem("Once", 1)
+        self.play_count.addItem("2 times", 2)
+        self.play_count.addItem("3 times", 3)
+        self.play_count.addItem("Custom number", "custom")
+        self.play_count.addItem("Forever", FOREVER)
+        self.custom_count = QtWidgets.QSpinBox()
+        self.custom_count.setRange(1, MAX_PLAY_COUNT)
+        self.custom_count.setValue(4)
+        stored_count = normalized["play_count"]
+        if stored_count in (1, 2, 3, FOREVER):
+            count_index = self.play_count.findData(stored_count)
+        else:
+            count_index = self.play_count.findData("custom")
+            self.custom_count.setValue(int(stored_count))
+        self.play_count.setCurrentIndex(max(0, count_index))
+        count_layout.addWidget(self.play_count, 1)
+        count_layout.addWidget(self.custom_count)
+        form.addRow("Play Count", count_row)
+
+        self.start_delay = self._seconds_control(
+            int(normalized["start_delay_ms"])
+        )
+        form.addRow("Start Delay", self.start_delay)
+        self.loop_pause = self._seconds_control(
+            int(normalized["loop_pause_ms"])
+        )
+        form.addRow("Loop Pause / End Hold", self.loop_pause)
+        root.addLayout(form)
+
+        self.mode_help = QtWidgets.QLabel()
+        self.mode_help.setWordWrap(True)
+        self.mode_help.setStyleSheet("color:#aebbc8;")
+        root.addWidget(self.mode_help)
+        self.playback_mode.currentIndexChanged.connect(
+            self._update_mode_help
+        )
+        self.play_count.currentIndexChanged.connect(
+            self._sync_custom_count
+        )
+        self._sync_custom_count()
+        self._update_mode_help()
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save
+            | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    @staticmethod
+    def _seconds_control(milliseconds: int) -> QtWidgets.QDoubleSpinBox:
+        control = QtWidgets.QDoubleSpinBox()
+        control.setRange(0.0, 86_400.0)
+        control.setDecimals(3)
+        control.setSingleStep(0.25)
+        control.setSuffix(" seconds")
+        control.setValue(milliseconds / 1000.0)
+        return control
+
+    def _sync_custom_count(self) -> None:
+        self.custom_count.setVisible(
+            self.play_count.currentData() == "custom"
+        )
+
+    def _update_mode_help(self) -> None:
+        descriptions = {
+            "original": (
+                "Uses the GIF's embedded loop behavior. Forever leaves that "
+                "behavior authoritative; a finite Play Count caps it."
+            ),
+            "loop": (
+                "Plays forward from beginning to end for the selected count."
+            ),
+            "ping_pong": (
+                "Plays forward, then displays the frames in reverse before "
+                "the next forward play."
+            ),
+        }
+        self.mode_help.setText(
+            descriptions[str(self.playback_mode.currentData())]
+        )
+
+    def gif_settings(self) -> dict[str, object]:
+        play_count = self.play_count.currentData()
+        if play_count == "custom":
+            play_count = self.custom_count.value()
+        return normalize_gif_settings(
+            {
+                "playback_mode": self.playback_mode.currentData(),
+                "play_count": play_count,
+                "start_delay_ms": round(
+                    self.start_delay.value() * 1000
+                ),
+                "loop_pause_ms": round(
+                    self.loop_pause.value() * 1000
+                ),
+            }
+        )
 
 
 class ImageTab(
@@ -803,6 +1053,7 @@ class ImageTab(
     clear_preview = Signal()
 
     images_changed = Signal(str)
+    animation_settings_changed = Signal(int)
 
     FAB_FIXED_X = 55
     FAB_CARD_GAP = 12
@@ -941,6 +1192,10 @@ class ImageTab(
 
             card.clear_requested.connect(
                 self.clear_image
+            )
+
+            card.settings_requested.connect(
+                self.open_image_settings
             )
 
             card.preview_requested.connect(
@@ -1232,32 +1487,43 @@ class ImageTab(
         )
 
     def refresh_cards(self) -> None:
+        manifest = load_image_manifest(
+            self._user_pages_dir()
+        )
         for index, (
             _title,
             filename,
         ) in self.labels.items():
-            path = os.path.join(
+            preview_path = os.path.join(
                 self._user_pages_dir(),
                 filename,
             )
-
-            if os.path.isfile(path):
-                pixmap = QtGui.QPixmap(
-                    path
+            slot = INDEX_TO_SLOT[index]
+            record = manifest["slots"].get(slot, {})
+            animated_gif = (
+                isinstance(record, dict)
+                and record.get("asset_type")
+                == "animated_gif"
+            )
+            asset_path = (
+                os.path.join(
+                    self._user_pages_dir(),
+                    f"{slot}.gif",
                 )
+                if animated_gif
+                else preview_path
+            )
 
-                if not pixmap.isNull():
-                    self.image_paths[
-                        index
-                    ] = path
-
-                    self.cards[
-                        index
-                    ].set_pixmap(
-                        pixmap
-                    )
-
-                    continue
+            if (
+                os.path.isfile(preview_path)
+                and os.path.isfile(asset_path)
+            ):
+                self.image_paths[index] = asset_path
+                self.cards[index].set_asset_path(
+                    asset_path,
+                    animated_gif=animated_gif,
+                )
+                continue
 
             self.image_paths[
                 index
@@ -1600,7 +1866,7 @@ class ImageTab(
                 "",
                 (
                     "Images "
-                    "(*.png *.jpg *.jpeg *.bmp)"
+                    "(*.png *.jpg *.jpeg *.bmp *.gif)"
                 ),
             )
         )
@@ -1653,6 +1919,7 @@ class ImageTab(
         _label, filename = (
             self.labels[index]
         )
+        slot = INDEX_TO_SLOT[index]
 
         pages_directory = (
             self._user_pages_dir()
@@ -1671,17 +1938,31 @@ class ImageTab(
         )
 
         try:
-            image = _load_image_exif(
-                source_path
-            )
-
-            _save_png(
-                image,
-                destination_path,
+            self.cards[index].release_asset_handle()
+            record = install_image_asset(
+                pages_directory,
+                slot,
+                source_path,
             )
             self.project_save_service.copy_workspace_file(
                 destination_path,
                 Path("pages") / filename,
+            )
+            source_filename = str(
+                record["source_file"]
+            )
+            if record["asset_type"] == "animated_gif":
+                self.project_save_service.copy_workspace_file(
+                    Path(pages_directory) / source_filename,
+                    Path("pages") / source_filename,
+                )
+            else:
+                self.project_save_service.delete_project_file(
+                    Path("pages") / f"{slot}.gif"
+                )
+            self.project_save_service.copy_workspace_file(
+                Path(pages_directory) / IMAGE_MANIFEST_NAME,
+                Path("pages") / IMAGE_MANIFEST_NAME,
             )
 
         except Exception as error:
@@ -1721,12 +2002,19 @@ class ImageTab(
 
         self.image_paths[
             index
-        ] = destination_path
+        ] = str(
+            Path(pages_directory)
+            / str(record["source_file"])
+        )
 
         self.cards[
             index
-        ].set_pixmap(
-            pixmap
+        ].set_asset_path(
+            self.image_paths[index] or destination_path,
+            animated_gif=(
+                record["asset_type"]
+                == "animated_gif"
+            ),
         )
 
         self.image_selected.emit(
@@ -1738,7 +2026,58 @@ class ImageTab(
         )
 
         self._show_temporary_status(
-            f"{filename} saved."
+            f"{record['source_file']} saved."
+        )
+
+    def open_image_settings(
+        self,
+        index: int,
+    ) -> None:
+        if index not in self.labels:
+            return
+        slot = INDEX_TO_SLOT[index]
+        manifest = load_image_manifest(
+            self._user_pages_dir()
+        )
+        record = manifest["slots"].get(slot)
+        if not isinstance(record, dict):
+            return
+        animated_gif = (
+            record.get("asset_type")
+            == "animated_gif"
+        )
+        dialog = ImageSettingsDialog(
+            self.labels[index][0],
+            animated_gif=animated_gif,
+            settings=record.get("settings"),
+            parent=self,
+        )
+        if not animated_gif:
+            dialog.exec()
+            return
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        try:
+            update_slot_gif_settings(
+                self._user_pages_dir(),
+                slot,
+                dialog.gif_settings(),
+            )
+            self.project_save_service.copy_workspace_file(
+                Path(self._user_pages_dir())
+                / IMAGE_MANIFEST_NAME,
+                Path("pages") / IMAGE_MANIFEST_NAME,
+            )
+        except Exception as error:
+            self._show_temporary_status(
+                f"Could not save {slot} GIF settings: {error}",
+                5000,
+            )
+            return
+        self._commit_image_change("settings")
+        self.animation_settings_changed.emit(index)
+        self._show_temporary_status(
+            f"{self.labels[index][0]} settings saved."
         )
 
     def clear_image(
@@ -1752,17 +2091,26 @@ class ImageTab(
             self.labels[index]
         )
 
-        path = os.path.join(
-            self._user_pages_dir(),
-            filename,
-        )
+        slot = INDEX_TO_SLOT[index]
 
         try:
-            if os.path.isfile(path):
-                os.remove(path)
+            self.cards[index].release_asset_handle()
+            clear_slot_asset(
+                self._user_pages_dir(),
+                slot,
+            )
             if self.project_state.is_project_ready:
-                self.project_save_service.delete_project_file(
-                    Path("pages") / filename
+                for project_filename in (
+                    filename,
+                    f"{slot}.gif",
+                ):
+                    self.project_save_service.delete_project_file(
+                        Path("pages") / project_filename
+                    )
+                self.project_save_service.copy_workspace_file(
+                    Path(self._user_pages_dir())
+                    / IMAGE_MANIFEST_NAME,
+                    Path("pages") / IMAGE_MANIFEST_NAME,
                 )
 
         except OSError as error:
@@ -1819,18 +2167,22 @@ class ImageTab(
                 self.labels[index]
             )
 
-            path = os.path.join(
-                self._user_pages_dir(),
-                filename,
-            )
+            slot = INDEX_TO_SLOT[index]
 
             try:
-                if os.path.isfile(path):
-                    os.remove(path)
+                self.cards[index].release_asset_handle()
+                clear_slot_asset(
+                    self._user_pages_dir(),
+                    slot,
+                )
                 if self.project_state.is_project_ready:
-                    self.project_save_service.delete_project_file(
-                        Path("pages") / filename
-                    )
+                    for project_filename in (
+                        filename,
+                        f"{slot}.gif",
+                    ):
+                        self.project_save_service.delete_project_file(
+                            Path("pages") / project_filename
+                        )
 
             except OSError:
                 pass
@@ -1842,6 +2194,16 @@ class ImageTab(
             self.cards[
                 index
             ].clear_pixmap()
+
+        if self.project_state.is_project_ready:
+            try:
+                self.project_save_service.copy_workspace_file(
+                    Path(self._user_pages_dir())
+                    / IMAGE_MANIFEST_NAME,
+                    Path("pages") / IMAGE_MANIFEST_NAME,
+                )
+            except OSError:
+                pass
 
         self.clear_preview.emit()
 
@@ -1968,11 +2330,16 @@ class ImageTab(
     def shutdown(self) -> None:
         self._status_clear_timer.stop()
         self.pwrite_fab.hide()
+        self.prepare_for_project_restore()
 
         try:
             self.sync_to_disk()
         except Exception:
             pass
+
+    def prepare_for_project_restore(self) -> None:
+        for card in self.cards.values():
+            card.release_asset_handle()
 
 
 __all__ = [

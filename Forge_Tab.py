@@ -1819,6 +1819,22 @@ class ForgeTab(QtWidgets.QWidget):
             self._set_status(f"{missing[0].label} is required.", error=True)
         return None
 
+    def _flush_prompt_writer_state(self) -> bool:
+        hook = getattr(self.window(), "flush_prompt_writer_state", None)
+        if not callable(hook):
+            return True
+        try:
+            saved = bool(hook())
+        except Exception:
+            _LOGGER.exception("Prompt Writer state could not be flushed before saving.")
+            saved = False
+        if not saved:
+            self._set_status(
+                "Prompt Writer state could not be saved. The letter was not updated.",
+                error=True,
+            )
+        return saved
+
     def preview_letter(self) -> None:
         self._prepare_preview(open_in_browser=True)
 
@@ -1837,6 +1853,8 @@ class ForgeTab(QtWidgets.QWidget):
             return
         readiness = self._required_gate()
         if readiness is None:
+            return
+        if not self._flush_prompt_writer_state():
             return
         ensure_output_dirs(self.project_root)
         try:
@@ -1975,6 +1993,9 @@ class ForgeTab(QtWidgets.QWidget):
                 self._set_status("Publishing canceled.")
                 return
             self.settings.update_fields({PUBLIC_WARNING_KEY: True})
+
+        if not self._flush_prompt_writer_state():
+            return
 
         try:
             message = read_text_normalized(
@@ -2128,6 +2149,8 @@ class ForgeTab(QtWidgets.QWidget):
         public_path: str = "",
         record_activity: bool = False,
     ) -> None:
+        if not self._flush_prompt_writer_state():
+            return
         try:
             update_saved_metadata(
                 play_dir,

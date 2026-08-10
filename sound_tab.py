@@ -39,7 +39,6 @@ from sound_model import (
     TrackRecord,
     analysis_dir,
     atomic_write_json,
-    current_manifest_path,
     current_music_path,
     display_title_from_name,
     ensure_sound_dirs,
@@ -53,6 +52,7 @@ from sound_model import (
     safe_filename,
     save_library,
     save_project_state,
+    sync_current_compatibility,
     utc_now_text,
 )
 
@@ -1313,7 +1313,11 @@ class ProjectSound(
             self.state,
         )
 
-        self._sync_compatibility_files()
+        sync_current_compatibility(
+            self.project_root,
+            self.state,
+            self.library.records,
+        )
         self.changed.emit()
 
     def reconcile_missing_files(
@@ -1338,126 +1342,13 @@ class ProjectSound(
             self.state,
         )
 
-        self._sync_compatibility_files()
+        sync_current_compatibility(
+            self.project_root,
+            self.state,
+            self.library.records,
+        )
 
         return True
-
-    def _sync_compatibility_files(
-        self,
-    ) -> None:
-        track_id = (
-            self.state
-            .selected_track_id
-        )
-
-        if (
-            track_id
-            not in self.state
-            .ordered_track_ids()
-        ):
-            ordered = (
-                self.state
-                .ordered_track_ids()
-            )
-
-            if ordered:
-                track_id = ordered[0]
-
-            else:
-                track_id = ""
-
-            self.state.selected_track_id = (
-                track_id
-            )
-
-        music_path = current_music_path(
-            self.project_root
-        )
-
-        manifest = current_manifest_path(
-            self.project_root
-        )
-
-        if track_id:
-            source = self.library.path_for(
-                track_id
-            )
-
-        else:
-            source = None
-
-        if source is None:
-            music_path.unlink(
-                missing_ok=True
-            )
-
-            manifest.unlink(
-                missing_ok=True
-            )
-
-            return
-
-        record = self.library.get(
-            track_id
-        )
-
-        if record is None:
-            return
-
-        try:
-            if manifest.is_file():
-                current = json.loads(
-                    manifest.read_text(
-                        encoding="utf-8",
-                    )
-                )
-
-            else:
-                current = {}
-
-        except (
-            OSError,
-            json.JSONDecodeError,
-        ):
-            current = {}
-
-        try:
-            music_matches = (
-                music_path.is_file()
-                and current.get(
-                    "track_id"
-                )
-                == track_id
-                and music_path.stat().st_size
-                == source.stat().st_size
-            )
-
-            if not music_matches:
-                _atomic_copy(
-                    source,
-                    music_path,
-                )
-
-            atomic_write_json(
-                manifest,
-                {
-                    "current_rel": (
-                        f"{USER_SOUNDS_DIR}/"
-                        "appssong/processed/"
-                        f"{record.processed_file}"
-                    ),
-                    "track_id": track_id,
-                    "link_mode": "copy",
-                },
-            )
-
-        except OSError as error:
-            logging.getLogger(
-                __name__
-            ).warning(
-                "Could not update compatibility music.mp3: %s",
-                error,
-            )
 
     def set_single(
         self,
@@ -5927,10 +5818,6 @@ class SoundTab(QtWidgets.QWidget):
             self._analysis_key = ""
 
         self.release_current_file_handle()
-
-    def release_project_files_for_restore(self) -> None:
-        """Backward-compatible alias for the restore lifecycle hook."""
-        self.prepare_for_project_restore()
 
     def reset_project_sound(self) -> None:
         """

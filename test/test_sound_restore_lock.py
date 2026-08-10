@@ -22,7 +22,7 @@ class SoundRestoreLockTests(unittest.TestCase):
         sound_tab._stop_background_threads = mock.Mock()
         sound_tab.release_current_file_handle = mock.Mock()
 
-        SoundTab.release_project_files_for_restore(sound_tab)
+        SoundTab.prepare_for_project_restore(sound_tab)
 
         sound_tab.deactivate_for_tab_change.assert_called_once_with()
         sound_tab._stop_background_threads.assert_called_once_with()

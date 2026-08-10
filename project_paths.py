@@ -166,10 +166,7 @@ class ProjectPathResolver:
         record = self.registry.find_by_id(identity.recipient_id)
         if record is None:
             raise ProjectPathError("Active recipient is not registered.")
-        title = _safe_title(
-            settings.get("recipient_title")
-            or settings.get("letter_title")
-        )
+        title = _safe_title(settings.get("recipient_title"))
         existing_matches = self.find_project_directories(
             identity.project_id,
             recipient_id=identity.recipient_id,
@@ -250,7 +247,6 @@ class ProjectPathResolver:
                         context.recipient_normalized_key
                     ),
                     "recipient_name": context.recipient_display_name,
-                    "letter_title": context.letter_title,
                     "recipient_title": context.letter_title,
                 }
             )
@@ -300,7 +296,7 @@ class ProjectPathResolver:
                     raise ValueError("rewritten project metadata has an invalid project ID")
                 if any(
                     value.get(key) != metadata.get(key)
-                    for key in ("recipient_id", "recipient_name", "recipient_title", "letter_title")
+                    for key in ("recipient_id", "recipient_name", "recipient_title")
                 ):
                     raise ValueError("project metadata changed outside project_id")
 

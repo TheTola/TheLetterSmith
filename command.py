@@ -37,7 +37,7 @@ import os
 import sys
 import shutil
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Mapping, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
@@ -48,6 +48,7 @@ __all__ = [
     "CommandTab",
     "confirm_and_reset",
     "reset_everything",
+    "start_new_project",
 ]
 
 
@@ -81,6 +82,13 @@ RESET_SETTINGS = {
     "recipient_name_locked": False,
     "published_page_url_locked": False,
     "active_play_dir": "",
+    "prompt_writer_state": {},
+}
+
+NEW_PROJECT_SETTINGS = {
+    key: value
+    for key, value in RESET_SETTINGS.items()
+    if key not in {"starting_volume", "music_volume"}
 }
 
 LOGGER = logging.getLogger(__name__)
@@ -245,6 +253,25 @@ def _hard_stop_sound_system(
                 except Exception:
                     pass
 
+    except Exception:
+        pass
+
+
+def _release_image_system(
+    win: Optional[QtWidgets.QWidget],
+) -> None:
+    """Release animated image handles before active page files are cleared."""
+    if win is None:
+        return
+    try:
+        image_tab = getattr(win, "image_tab", None)
+        release = getattr(
+            image_tab,
+            "prepare_for_project_restore",
+            None,
+        )
+        if callable(release):
+            release()
     except Exception:
         pass
 
@@ -519,6 +546,7 @@ def reset_everything(
     project_root: str | Path | None = None,
     parent: Optional[QtWidgets.QWidget] = None,
     project_state: ProjectStateController | None = None,
+    settings_updates: Mapping[str, object] | None = None,
 ) -> Tuple[int, int]:
     root = (
         Path(project_root).resolve()
@@ -553,6 +581,9 @@ def reset_everything(
 
     # Stop all active audio before deleting files.
     _hard_stop_sound_system(
+        window
+    )
+    _release_image_system(
         window
     )
 
@@ -592,7 +623,11 @@ def reset_everything(
 
     controller = project_state or ProjectStateController(root)
     controller.begin_new_project(
-        additional_settings=RESET_SETTINGS
+        additional_settings=(
+            RESET_SETTINGS
+            if settings_updates is None
+            else settings_updates
+        )
     )
 
     return total_files, total_dirs
@@ -884,6 +919,7 @@ def _perform_confirmed_reset(
     project_root: str | Path | None = None,
     project_state: ProjectStateController | None = None,
     announce: bool = True,
+    settings_updates: Mapping[str, object] | None = None,
 ) -> bool:
     previous_identity = (
         project_state.identity
@@ -902,6 +938,7 @@ def _perform_confirmed_reset(
             project_root=project_root,
             parent=parent,
             project_state=project_state,
+            settings_updates=settings_updates,
         )
     except Exception:
         if (
@@ -936,6 +973,22 @@ def _perform_confirmed_reset(
         pass
 
     return True
+
+
+def start_new_project(
+    parent: Optional[QtWidgets.QWidget] = None,
+    *,
+    project_root: str | Path | None = None,
+    project_state: ProjectStateController | None = None,
+) -> bool:
+    """Clear only active-project data while preserving application preferences."""
+    return _perform_confirmed_reset(
+        parent,
+        project_root=project_root,
+        project_state=project_state,
+        announce=False,
+        settings_updates=NEW_PROJECT_SETTINGS,
+    )
 
 
 def confirm_and_reset(

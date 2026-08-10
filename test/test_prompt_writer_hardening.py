@@ -224,6 +224,64 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.assertFalse(self.panel._generated_output_valid)
         self.assertFalse(self.panel._generated_prompts)
 
+    def test_complete_workspace_restores_historical_values_and_exact_prompts(self):
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+        for combo, value in (
+            (self.panel.cmb_type, "Retired Etching"),
+            (self.panel.cmb_subject, "GO and Genesis Prime"),
+            (self.panel.cmb_color, "Archived Copper Palette"),
+        ):
+            combo.addItem(value)
+            combo.setCurrentIndex(combo.count() - 1)
+        self.panel.txt_global.setPlainText("Shared visual direction")
+        for page in self.panel._page_specs:
+            page.detail_widget.setPlainText(f"Exact {page.key} direction")
+        self.panel.cb_black.setChecked(True)
+        self.panel.cb_cinematic_framing.setChecked(True)
+        resolved = {
+            "role": "Historical master illustrator",
+            "order": ["preserve the named subject", "then compose the scene"],
+            "effort": "Historical exact effort instruction",
+            "format": "Historical exact format instruction",
+        }
+        with mock.patch.object(
+            self.panel,
+            "_roll_shared_prompt_data",
+            return_value=resolved,
+        ):
+            self.panel._on_generate()
+
+        exact_cover = self.panel._generated_prompts["cover"] + "\r\nExact saved suffix."
+        self.panel._generated_prompts["cover"] = exact_cover
+        expected_prompts = dict(self.panel._generated_prompts)
+        expected_resolved = {
+            "role": resolved["role"],
+            "subject_lead_in": resolved["order"],
+            "effort": resolved["effort"],
+            "format": resolved["format"],
+        }
+        self.assertTrue(self.panel.persist_project_state())
+
+        self.panel.deleteLater()
+        self.app.processEvents()
+        with mock.patch.object(
+            PromptWriterPanel,
+            "_roll_shared_prompt_data",
+            side_effect=AssertionError("load must not generate prompts"),
+        ):
+            self.panel = PromptWriterPanel(project_root=str(self.project_root))
+
+        self.assertEqual(self.panel.cmb_type.currentText(), "Retired Etching")
+        self.assertEqual(self.panel.cmb_subject.currentText(), "GO and Genesis Prime")
+        self.assertEqual(self.panel.cmb_color.currentText(), "Archived Copper Palette")
+        self.assertEqual(self.panel.txt_global.toPlainText(), "Shared visual direction")
+        self.assertTrue(self.panel.cb_black.isChecked())
+        self.assertTrue(self.panel.cb_cinematic_framing.isChecked())
+        self.assertEqual(self.panel._resolved_instructions, expected_resolved)
+        self.assertEqual(self.panel._generated_prompts, expected_prompts)
+        self.assertEqual(self.panel._generated_prompts["cover"], exact_cover)
+        self.assertTrue(self.panel._generated_output_valid)
+
     def test_overlong_module_entries_are_rejected(self):
         modules = self.project_root / "Prompter" / "modules"
         (modules / "topic.txt").write_text("a" * 301 + "\nValid Subject\n", encoding="utf-8")

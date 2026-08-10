@@ -129,9 +129,6 @@ MAX_AUDIO_MB = 15
 
 USER_AUDIO_ARCHIVE_DIR = f"{USER_SOUNDS_DIR}/appssong"
 
-# Compatibility aliases used by different Sound tab versions.
-USER_AUDIO_LIBRARY_DIR = USER_AUDIO_ARCHIVE_DIR
-
 USER_AUDIO_ORIGINALS_DIR = f"{USER_AUDIO_ARCHIVE_DIR}/originals"
 USER_AUDIO_PROCESSED_DIR = f"{USER_AUDIO_ARCHIVE_DIR}/processed"
 USER_AUDIO_ANALYSIS_DIR = f"{USER_AUDIO_ARCHIVE_DIR}/analysis"
@@ -139,9 +136,6 @@ USER_AUDIO_ANALYSIS_DIR = f"{USER_AUDIO_ARCHIVE_DIR}/analysis"
 USER_AUDIO_CURRENT_MANIFEST = (
     f"{USER_AUDIO_ARCHIVE_DIR}/current.json"
 )
-
-USER_AUDIO_CURRENT_MANIFEST_FILE = USER_AUDIO_CURRENT_MANIFEST
-USER_AUDIO_MANIFEST_FILE = USER_AUDIO_CURRENT_MANIFEST
 
 USER_AUDIO_PLAYLIST_FILE = (
     f"{USER_AUDIO_ARCHIVE_DIR}/playlist.json"
@@ -184,15 +178,6 @@ WINDOWS_RESERVED_FOLDER_NAMES = {
     *(f"COM{index}" for index in range(1, 10)),
     *(f"LPT{index}" for index in range(1, 10)),
 }
-
-_PLAY_METADATA_CANDIDATES = (
-    PLAY_METADATA_FILE,
-    "play_metadata.json",
-    "recovery_metadata.json",
-    "metadata.json",
-)
-_BUILD_STATE_FILE = "lettersmith-build.json"
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Settings loading
@@ -301,21 +286,6 @@ def canonical_recovery_root(project_root: str | Path) -> Path:
     return (canonical_output_root(project_root) / "Recovery").resolve()
 
 
-def legacy_play_roots(project_root: str | Path) -> tuple[Path, ...]:
-    """Return recognized duplicated Play roots without creating them."""
-    canonical = canonical_play_root(project_root)
-    nested = (canonical_output_root(project_root) / OUTPUT_DIR / "Play").resolve()
-    return () if nested == canonical else (nested,)
-
-
-def legacy_recovery_roots(project_root: str | Path) -> tuple[Path, ...]:
-    canonical = canonical_recovery_root(project_root)
-    nested = (
-        canonical_output_root(project_root) / OUTPUT_DIR / "Recovery"
-    ).resolve()
-    return () if nested == canonical else (nested,)
-
-
 def safe_folder_name(
     text: object,
     fallback: str,
@@ -345,35 +315,21 @@ def _valid_project_uuid(value: object) -> str:
 
 
 def _read_play_metadata(play_dir: Path) -> dict:
-    for name in _PLAY_METADATA_CANDIDATES:
-        path = play_dir / name
-        if not path.is_file() or path.is_symlink():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
-        if isinstance(payload, dict):
-            return payload
+    path = play_dir / PLAY_METADATA_FILE
+    if not path.is_file() or path.is_symlink():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if isinstance(payload, dict):
+        return payload
     return {}
 
 
 def _bundle_project_id(play_dir: Path) -> str:
     metadata = _read_play_metadata(play_dir)
-    project_id = _valid_project_uuid(metadata.get("project_id"))
-    if project_id:
-        return project_id
-    state_path = play_dir / _BUILD_STATE_FILE
-    if state_path.is_file() and not state_path.is_symlink():
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            state = {}
-        if isinstance(state, dict):
-            project_id = _valid_project_uuid(state.get("project_id"))
-            if project_id:
-                return project_id
-    return _valid_project_uuid(play_dir.name)
+    return _valid_project_uuid(metadata.get("project_id"))
 
 
 def _is_play_bundle(play_dir: Path) -> bool:
@@ -412,50 +368,6 @@ def _iter_play_bundles(root: Path) -> tuple[Path, ...]:
             bundles,
             key=lambda path: str(path).casefold(),
         )
-    )
-
-
-def _html_bundle_title(play_dir: Path) -> str:
-    try:
-        html = (play_dir / "index.html").read_text(
-            encoding="utf-8",
-            errors="replace",
-        )
-    except OSError:
-        return ""
-    match = re.search(r"<title>\s*(.*?)\s*</title>", html, re.I | re.S)
-    return (
-        unescape(re.sub(r"\s+", " ", match.group(1))).strip()
-        if match
-        else ""
-    )
-
-
-def _humanize_folder_name(value: str) -> str:
-    return re.sub(
-        r"\s+",
-        " ",
-        re.sub(r"[-_]+", " ", value),
-    ).strip().title()
-
-
-def _bundle_display_names(
-    play_dir: Path,
-    source_root: Path,
-    metadata: dict,
-) -> tuple[str, str]:
-    relative = play_dir.relative_to(source_root)
-    recipient = str(metadata.get("recipient_name") or "").strip()
-    title = str(metadata.get("recipient_title") or "").strip()
-    if not recipient and len(relative.parts) >= 2:
-        recipient = _humanize_folder_name(relative.parts[-2])
-    if not title:
-        if not _valid_project_uuid(relative.parts[-1]):
-            title = _humanize_folder_name(relative.parts[-1])
-        title = title or _html_bundle_title(play_dir)
-    return (
-        recipient or "Unknown Recipient",
-        title or "Untitled Letter",
     )
 
 
@@ -683,31 +595,25 @@ def migrate_play_bundle(
     if ".." in original.parts or original.is_symlink():
         raise ValueError("Saved-letter path traversal and links are not allowed.")
     source_path = original.resolve(strict=True)
-    allowed_roots = (
-        canonical_play_root(project_root),
-        *legacy_play_roots(project_root),
-    )
-    source_root = next(
-        (
-            root
-            for root in allowed_roots
-            if source_path != root
-            and _is_relative_to(source_path, root)
-        ),
-        None,
-    )
-    if source_root is None or not _is_play_bundle(source_path):
+    play_root = canonical_play_root(project_root)
+    if (
+        source_path == play_root
+        or not _is_relative_to(source_path, play_root)
+        or not _is_play_bundle(source_path)
+    ):
         raise ValueError("The source is not a managed Play bundle.")
     source_stat = source_path.stat()
     metadata = _read_play_metadata(source_path)
     stable_id = (
         _valid_project_uuid(project_id)
         or _bundle_project_id(source_path)
-        or str(uuid.uuid4())
     )
+    if not stable_id:
+        raise ValueError(
+            "The saved-letter metadata must contain a valid project_id."
+        )
     recipient_name = str(recipient or "").strip() or "Unknown Recipient"
     title_name = str(title or "").strip() or "Untitled Letter"
-    play_root = canonical_play_root(project_root)
     play_root.mkdir(parents=True, exist_ok=True)
     destination = _available_named_play_directory(
         play_root,
@@ -747,88 +653,6 @@ def migrate_play_bundle(
     return PlayBundleMigration(source_path, destination, stable_id)
 
 
-def migrate_legacy_play_bundles(
-    project_root: str | Path,
-    *,
-    strict: bool = False,
-) -> tuple[PlayBundleMigration, ...]:
-    """Normalize every saved bundle into the canonical visible layout."""
-    canonical = canonical_play_root(project_root)
-    sources: list[tuple[Path, Path]] = []
-    for bundle in _iter_play_bundles(canonical):
-        metadata = _read_play_metadata(bundle)
-        recipient, title = _bundle_display_names(
-            bundle,
-            canonical,
-            metadata,
-        )
-        relative = bundle.relative_to(canonical)
-        expected_recipient = safe_folder_name(
-            recipient,
-            "Unknown Recipient",
-        )
-        expected_title = safe_folder_name(
-            title,
-            "Untitled Letter",
-        )
-        title_matches = (
-            len(relative.parts) == 2
-            and (
-                relative.parts[1] == expected_title
-                or re.fullmatch(
-                    rf"{re.escape(expected_title)} \([2-9][0-9]*\)",
-                    relative.parts[1],
-                )
-                is not None
-            )
-        )
-        metadata_is_complete = bool(
-            _valid_project_uuid(metadata.get("project_id"))
-            and str(metadata.get("recipient_name") or "").strip()
-            and str(metadata.get("recipient_title") or "").strip()
-        )
-        if (
-            len(relative.parts) != 2
-            or relative.parts[0] != expected_recipient
-            or not title_matches
-            or not metadata_is_complete
-        ):
-            sources.append((bundle, canonical))
-    for legacy_root in legacy_play_roots(project_root):
-        sources.extend(
-            (bundle, legacy_root)
-            for bundle in _iter_play_bundles(legacy_root)
-        )
-
-    migrations: list[PlayBundleMigration] = []
-    seen: set[Path] = set()
-    for source, source_root in sources:
-        if source in seen or not source.exists():
-            continue
-        seen.add(source)
-        metadata = _read_play_metadata(source)
-        recipient, title = _bundle_display_names(
-            source,
-            source_root,
-            metadata,
-        )
-        try:
-            migrations.append(
-                migrate_play_bundle(
-                    project_root,
-                    source,
-                    recipient=recipient,
-                    title=title,
-                    project_id=_bundle_project_id(source),
-                    allow_existing_project=False,
-                )
-            )
-        except (OSError, ValueError):
-            if strict:
-                raise
-    return tuple(migrations)
-
-
 def resolve_play_bundle_directory(
     project_root: str | Path,
     *,
@@ -844,11 +668,11 @@ def resolve_play_bundle_directory(
     play_root = canonical_play_root(project_root)
     play_root.mkdir(parents=True, exist_ok=True)
 
-    candidates: list[Path] = []
-    for root in (play_root, *legacy_play_roots(project_root)):
-        for bundle in _iter_play_bundles(root):
-            if _bundle_project_id(bundle) == stable_id:
-                candidates.append(bundle)
+    candidates = [
+        bundle
+        for bundle in _iter_play_bundles(play_root)
+        if _bundle_project_id(bundle) == stable_id
+    ]
     candidates.sort(
         key=lambda path: (
             _is_relative_to(path, play_root),
@@ -1304,13 +1128,10 @@ __all__ = [
 
     # User audio archive
     "USER_AUDIO_ARCHIVE_DIR",
-    "USER_AUDIO_LIBRARY_DIR",
     "USER_AUDIO_ORIGINALS_DIR",
     "USER_AUDIO_PROCESSED_DIR",
     "USER_AUDIO_ANALYSIS_DIR",
     "USER_AUDIO_CURRENT_MANIFEST",
-    "USER_AUDIO_CURRENT_MANIFEST_FILE",
-    "USER_AUDIO_MANIFEST_FILE",
     "USER_AUDIO_PLAYLIST_FILE",
 
     # Curtain styles
@@ -1333,11 +1154,8 @@ __all__ = [
     "canonical_output_root",
     "canonical_play_root",
     "canonical_recovery_root",
-    "legacy_play_roots",
-    "legacy_recovery_roots",
     "safe_folder_name",
     "migrate_play_bundle",
-    "migrate_legacy_play_bundles",
     "resolve_play_bundle_directory",
     "PlayBundleMigration",
     "ensure_output_dirs",

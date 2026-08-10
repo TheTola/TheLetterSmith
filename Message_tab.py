@@ -1089,8 +1089,29 @@ class MessageTab(QtWidgets.QWidget):
         return True
 
     def _save_settings(self) -> bool:
+        recipient = self.name_input.text().strip()
+        current_recipient = (
+            self.project_state.identity.recipient_display_name
+        )
+        if not recipient:
+            self.name_input.setText(current_recipient)
+            self.status.setText("Recipient is required.")
+            return False
+        if recipient != current_recipient:
+            try:
+                identity = self.project_state.rename_recipient(recipient)
+            except Exception as error:
+                self.name_input.setText(current_recipient)
+                self.status.setText(
+                    f"Recipient could not be changed: {error}"
+                )
+                return False
+            recipient = identity.recipient_display_name
+            self.name_input.setText(recipient)
+            self.settings.update(identity.as_settings())
+
         self.settings["recipient_title"] = self.title_input.text().strip()
-        self.settings["recipient_name"] = self.name_input.text().strip()
+        self.settings["recipient_name"] = recipient
 
         raw_url = self.url_input.text().strip()
         normalized_url = _normalize_published_page_url(raw_url)

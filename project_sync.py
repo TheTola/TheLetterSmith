@@ -12,9 +12,6 @@ from pathlib import Path
 from typing import Iterable
 
 _SAMPLE_SIZE = 64 * 1024
-_IMAGE_NAMES = ("cover.png", "letter.png", "wall.png", "back.png")
-
-
 def _sampled_file_digest(path: Path) -> str:
     """Return a stable, inexpensive digest for one file.
 
@@ -74,7 +71,7 @@ def file_fingerprint(path: str | Path) -> str:
 def image_fingerprint(project_root: str | Path) -> str:
     root = Path(project_root).resolve()
     pages = root / "gallery" / "user" / "pages"
-    return _paths_digest(root, (pages / name for name in _IMAGE_NAMES))
+    return _paths_digest(root, _files_under(pages))
 
 
 def message_fingerprint(project_root: str | Path) -> str:

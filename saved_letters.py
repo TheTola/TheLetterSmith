@@ -24,8 +24,6 @@ from config import (
     USER_SOUNDS_DIR,
     canonical_play_root,
     canonical_recovery_root,
-    legacy_play_roots,
-    legacy_recovery_roots,
 )
 from project_paths import (
     PROJECT_METADATA_SCHEMA_VERSION,
@@ -68,8 +66,9 @@ from transactional_io import (
 )
 
 
-METADATA_VERSION = 3
+METADATA_VERSION = 4
 LAST_ACTIVITY_AT_KEY = "last_activity_at"
+PROMPT_WRITER_STATE_FILE = "prompt_writer_state.json"
 RESTORABLE_SETTING_KEYS = (
     "starting_volume",
     "music_volume",
@@ -78,12 +77,6 @@ RESTORABLE_SETTING_KEYS = (
     "message_overlay_opacity",
     "required_features",
     "forge_preview_mode",
-)
-_METADATA_NAMES = (
-    PLAY_METADATA_FILE,
-    "play_metadata.json",
-    "recovery_metadata.json",
-    "metadata.json",
 )
 _LOGGER = logging.getLogger(__name__)
 _ACTIVE_LETTER_LOAD_WORKSPACES: set[Path] = set()
@@ -244,17 +237,74 @@ class SavedLetterDeleteError(RuntimeError):
 
 
 def _read_metadata(path: Path) -> dict[str, Any]:
-    for name in _METADATA_NAMES:
-        candidate = path / name
-        if not candidate.is_file() or candidate.is_symlink():
-            continue
-        try:
-            value = json.loads(candidate.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
-        if isinstance(value, dict):
-            return value
+    candidate = path / PLAY_METADATA_FILE
+    if not candidate.is_file() or candidate.is_symlink():
+        return {}
+    try:
+        value = json.loads(candidate.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if isinstance(value, dict):
+        return value
     return {}
+
+
+def _empty_prompt_writer_state() -> dict[str, Any]:
+    # Import lazily so saved-letter catalog operations do not initialize the
+    # Prompt Writer UI module.
+    from PromptWriterPanel import empty_prompt_writer_state
+
+    return empty_prompt_writer_state()
+
+
+def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SavedLetterRestoreError(f"The {label} is unreadable.") from error
+    if not isinstance(value, dict):
+        raise SavedLetterRestoreError(f"The {label} is invalid.")
+    return value
+
+
+def _active_prompt_writer_state(project_root: Path) -> dict[str, Any]:
+    state_path = project_root / PROMPT_WRITER_STATE_FILE
+    if not state_path.is_file():
+        return _empty_prompt_writer_state()
+    return _read_json_object(state_path, label="active Prompt Writer state")
+
+
+def _saved_prompt_writer_state(
+    play_dir: Path,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    editable_assets = metadata.get("editable_assets", {})
+    configured_path = (
+        editable_assets.get("prompt_writer_state", "")
+        if isinstance(editable_assets, dict)
+        else ""
+    )
+    state_path = _runtime_file(
+        play_dir,
+        configured_path,
+        PROMPT_WRITER_STATE_FILE,
+    )
+    if state_path is not None:
+        return _read_json_object(state_path, label="saved Prompt Writer state")
+
+    source_version = metadata.get("source_version", metadata.get("schema_version", 0))
+    try:
+        current_format = int(source_version) >= METADATA_VERSION
+    except (TypeError, ValueError):
+        current_format = False
+    if configured_path or current_format:
+        raise SavedLetterRestoreError("The saved Prompt Writer state is missing.")
+
+    _LOGGER.info(
+        "Saved letter %s has no Prompt Writer state; using legacy defaults.",
+        play_dir,
+    )
+    return _empty_prompt_writer_state()
 
 
 def _runtime_directory(
@@ -331,25 +381,14 @@ class SavedLetterCatalog:
         cleanup_stale_letter_load_workspaces(self.project_root)
         self.play_root = canonical_play_root(self.project_root)
         self.recovery_root = canonical_recovery_root(self.project_root)
-        self.play_roots = (
-            self.play_root,
-            *legacy_play_roots(self.project_root),
-        )
-        self.recovery_roots = (
-            self.recovery_root,
-            *legacy_recovery_roots(self.project_root),
-        )
-        self.managed_roots = (
-            *self.play_roots,
-            *self.recovery_roots,
-        )
+        self.managed_roots = (self.play_root, self.recovery_root)
 
     def list_entries(self) -> tuple[SavedLetter, ...]:
         entries: list[SavedLetter] = []
         seen: set[Path] = set()
         for root, recovery in (
-            *((root, False) for root in self.play_roots),
-            *((root, True) for root in self.recovery_roots),
+            (self.play_root, False),
+            (self.recovery_root, True),
         ):
             if not root.is_dir():
                 continue
@@ -468,7 +507,7 @@ class SavedLetterCatalog:
             and (message / "message.html").is_file()
         )
 
-    def _entry(self, path: Path, *, recovery: bool) -> SavedLetter:
+    def _entry(self, path: Path, *, recovery: bool = False) -> SavedLetter:
         metadata = _read_metadata(path)
         recipient = self._display_text(metadata.get("recipient_name"))
         title = self._display_text(metadata.get("recipient_title"))
@@ -543,9 +582,7 @@ class SavedLetterRestorer:
         self.registry = RecipientRegistry(self.project_root)
         self.allowed_roots = (
             canonical_play_root(self.project_root),
-            *legacy_play_roots(self.project_root),
             canonical_recovery_root(self.project_root),
-            *legacy_recovery_roots(self.project_root),
         )
 
     def restore(self, entry: SavedLetter) -> RestoredProject:
@@ -579,6 +616,7 @@ class SavedLetterRestorer:
         self._validate_pages(pages)
         self._validate_message(play_dir, message)
         metadata = _read_metadata(play_dir)
+        prompt_writer_state = _saved_prompt_writer_state(play_dir, metadata)
         try:
             sound_payload, sound_tracks = self._validate_sound(sounds)
         except SavedLetterRestoreError:
@@ -628,12 +666,13 @@ class SavedLetterRestorer:
         transactions = (pages_tx, message_tx)
         committed: list[PathTransaction] = []
         settings_committed = False
-        sound_snapshots = tuple(
+        file_snapshots = tuple(
             _FileSnapshot.capture(path)
             for path in (
                 current_music_path(self.project_root),
                 current_manifest_path(self.project_root),
                 self.project_root / USER_SOUNDS_DIR / "appssong" / "project_sound.json",
+                self.project_root / PROMPT_WRITER_STATE_FILE,
             )
         )
 
@@ -691,6 +730,10 @@ class SavedLetterRestorer:
                 state,
                 load_library(self.project_root),
             )
+            atomic_write_json(
+                self.project_root / PROMPT_WRITER_STATE_FILE,
+                prompt_writer_state,
+            )
 
             self.settings.replace_snapshot(restored_settings)
             settings_committed = True
@@ -716,11 +759,11 @@ class SavedLetterRestorer:
                         "Could not clean staging for %s",
                         transaction.final_path,
                     )
-            for snapshot in sound_snapshots:
+            for snapshot in file_snapshots:
                 try:
                     snapshot.restore()
                 except Exception:
-                    _LOGGER.exception("Could not restore previous sound state: %s", snapshot.path)
+                    _LOGGER.exception("Could not restore previous project file: %s", snapshot.path)
             if settings_committed:
                 try:
                     self.settings.replace_snapshot(settings_before)
@@ -821,7 +864,6 @@ class SavedLetterRestorer:
                 project_id = str(uuid.uuid4())
         title = str(
             metadata.get("recipient_title")
-            or metadata.get("letter_title")
             or entry.title
             or "Untitled Letter"
         ).strip()
@@ -856,7 +898,6 @@ class SavedLetterRestorer:
                 "recipient_display_name": record.display_name,
                 "recipient_normalized_key": record.normalized_key,
                 "recipient_name": record.display_name,
-                "letter_title": title,
                 "recipient_title": title,
             }
         )
@@ -894,7 +935,6 @@ class SavedLetterRestorer:
             self.project_root
         )._entry(
             destination,
-            recovery=False,
         )
 
     def _validated_play_directory(self, source: Path) -> Path:
@@ -1165,6 +1205,10 @@ class SavedLetterRestorer:
             encoding="utf-8"
         ).strip():
             raise RuntimeError("Restored message verification failed.")
+        _read_json_object(
+            self.project_root / PROMPT_WRITER_STATE_FILE,
+            label="restored Prompt Writer state",
+        )
         resolve_project_tracks(self.project_root)
 
 
@@ -1181,6 +1225,11 @@ def update_saved_metadata(
     metadata = _read_metadata(destination)
     settings = SettingsStore(root).snapshot()
     sound_state, sound_tracks = resolve_project_tracks(root)
+    prompt_writer_state = _active_prompt_writer_state(root)
+    atomic_write_json(
+        destination / PROMPT_WRITER_STATE_FILE,
+        prompt_writer_state,
+    )
     restorable_settings = {
         key: settings[key]
         for key in RESTORABLE_SETTING_KEYS
@@ -1223,6 +1272,7 @@ def update_saved_metadata(
                 "sound_manifest": (
                     f"gallery/sounds/{BUILD_SOUND_MANIFEST_NAME}"
                 ),
+                "prompt_writer_state": PROMPT_WRITER_STATE_FILE,
             },
             "sound": {
                 "mode": sound_state.mode,
@@ -1279,6 +1329,7 @@ def record_saved_letter_activity(
 __all__ = [
     "METADATA_VERSION",
     "LAST_ACTIVITY_AT_KEY",
+    "PROMPT_WRITER_STATE_FILE",
     "RESTORABLE_SETTING_KEYS",
     "RecipientAssignmentRequired",
     "RestoredProject",

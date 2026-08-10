@@ -52,6 +52,11 @@ from curtain_color import (
     write_tinted_curtain_image,
 )
 from font_export import FontExportError, build_embedded_font_payload
+from image_animation import (
+    IMAGE_MANIFEST_NAME,
+    build_runtime_image_assets,
+    validate_runtime_image_manifest,
+)
 from sound_model import (
     BUILD_SOUND_MANIFEST_NAME,
     build_sound_manifest,
@@ -90,7 +95,7 @@ LEGACY_SFX_DIRS = (
     Path("gallery") / "app" / "icons" / "Sounds",
 )
 BUILD_STATE_FILE = "lettersmith-build.json"
-BUILD_SCHEMA_VERSION = 8
+BUILD_SCHEMA_VERSION = 9
 CURTAIN_FILES = {"cleft.png", "cright.png"}
 CURTAIN_ANALYSIS_PAGE_ORDER = (
     "cover.png",
@@ -148,14 +153,6 @@ def _atomic_copy_file(src: Path, dst: Path) -> None:
         os.replace(tmp, destination)
     finally:
         tmp.unlink(missing_ok=True)
-
-
-def _copy_required_files(src_dir: Path, dst_dir: Path, names: list[str]) -> None:
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    for name in names:
-        s = src_dir / name
-        d = dst_dir / name
-        _atomic_copy_file(s, d)
 
 
 def _copy_control_files(
@@ -372,7 +369,16 @@ def _validate_template_placeholders() -> None:
     """
     Fail fast if Template.py changes and placeholders drift.
     """
-    required = ("{{TITLE}}", "{{MESSAGE_HTML}}", "{{INITIAL_VOLUME}}", "{{MESSAGE_OVERLAY_STYLE}}", "{{MUSIC_PLAYLIST_JSON}}", "{{MUSIC_CROSSFADE_MS}}", "{{MUSIC_PRELOAD_HTML}}")
+    required = (
+        "{{TITLE}}",
+        "{{MESSAGE_HTML}}",
+        "{{INITIAL_VOLUME}}",
+        "{{MESSAGE_OVERLAY_STYLE}}",
+        "{{MUSIC_PLAYLIST_JSON}}",
+        "{{MUSIC_CROSSFADE_MS}}",
+        "{{MUSIC_PRELOAD_HTML}}",
+        "{{IMAGE_ANIMATIONS_JSON}}",
+    )
     missing = [k for k in required if k not in TEMPLATE_HTML]
     if missing:
         raise TemplateDriftError(
@@ -613,6 +619,7 @@ def validate_play_bundle(directory: str | Path) -> Path:
         root / "styles.css",
         root / "script.js",
         *(root / "gallery/pages" / name for name in REQUIRED_SLIDES),
+        root / "gallery/pages" / IMAGE_MANIFEST_NAME,
         *(root / "gallery/controls" / name for name in CONTROL_FILES),
         root / "gallery/message/message.html",
         root / "gallery/sounds" / BUILD_SOUND_MANIFEST_NAME,
@@ -649,6 +656,10 @@ def validate_play_bundle(directory: str | Path) -> Path:
         sound_manifest.get("tracks", []), list
     ):
         raise RuntimeError("The staged sound manifest is invalid.")
+    try:
+        validate_runtime_image_manifest(root / "gallery/pages")
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
     for raw_track in sound_manifest.get("tracks", []):
         if not isinstance(raw_track, dict):
             raise RuntimeError("The staged sound manifest is invalid.")
@@ -799,7 +810,10 @@ def build_play_bundle_to(
     pages_src = pr / USER_PAGES_DIR
     controls_src = pr / USER_CONTROLS_DIR
     message_src = pr / USER_MESSAGE_DIR
-    _copy_required_files(pages_src, bp.play_pages_dir, REQUIRED_SLIDES)
+    runtime_images = build_runtime_image_assets(
+        pages_src,
+        bp.play_pages_dir,
+    )
     _copy_control_files(
         controls_src,
         bp.play_controls_dir,
@@ -875,7 +889,16 @@ def build_play_bundle_to(
             str(int(sound_manifest.get("crossfade_ms", 0))),
         )
         .replace("{{MUSIC_PRELOAD_HTML}}", preload_html)
+        .replace(
+            "{{IMAGE_ANIMATIONS_JSON}}",
+            json.dumps(runtime_images.animations, ensure_ascii=False),
+        )
     )
+    for slot, source in runtime_images.page_sources.items():
+        html = html.replace(
+            f"gallery/pages/{slot}.png",
+            source,
+        )
     _atomic_write_text(bp.play_dir / "index.html", html)
     fingerprint = source_fingerprint or build_source_fingerprint(pr)
     _atomic_write_text(

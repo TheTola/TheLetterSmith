@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from Message_tab import IDENTITY_LOCK_KEYS, IdentityLineEdit, MessageTab
 from Nexus import Nexus
+from project_state import ProjectStateController, load_project_settings
 
 
 class IdentityFieldLockingTests(unittest.TestCase):
@@ -108,6 +111,48 @@ class IdentityFieldLockingTests(unittest.TestCase):
         self.assertFalse(message.settings["recipient_title_locked"])
         self.assertFalse(field.isReadOnly())
         field.deleteLater()
+
+    def test_recipient_edit_updates_canonical_project_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_state = ProjectStateController(root)
+            project_state.initialize()
+            original = project_state.establish_project(
+                "Original Recipient",
+                custom_capitalization=True,
+            )
+            message = types.SimpleNamespace(
+                project_state=project_state,
+                settings={},
+                title_input=IdentityLineEdit("Letter Title"),
+                name_input=IdentityLineEdit("Changed RECIPIENT"),
+                url_input=IdentityLineEdit(""),
+                status=QtWidgets.QLabel(),
+                _persist_settings=lambda *, announce: False,
+            )
+
+            MessageTab._save_settings(message)
+
+            identity = project_state.identity
+            reloaded = load_project_settings(root)
+            self.assertEqual(identity.recipient_id, original.recipient_id)
+            self.assertEqual(identity.project_id, original.project_id)
+            self.assertEqual(
+                identity.recipient_display_name,
+                "Changed RECIPIENT",
+            )
+            self.assertEqual(
+                reloaded["recipient_name"],
+                "Changed RECIPIENT",
+            )
+            self.assertEqual(
+                reloaded["recipient_display_name"],
+                "Changed RECIPIENT",
+            )
+            message.title_input.deleteLater()
+            message.name_input.deleteLater()
+            message.url_input.deleteLater()
+            message.status.deleteLater()
 
 
 if __name__ == "__main__":

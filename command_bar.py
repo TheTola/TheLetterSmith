@@ -8,7 +8,7 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
 
-from config import canonical_play_root, legacy_play_roots
+from config import canonical_play_root
 from saved_letters import SavedLetter, SavedLetterCatalog
 from settings_store import (
     ACTIVE_PLAY_DIR_KEY,
@@ -127,17 +127,11 @@ def _valid_preview_path(
         or candidate.is_symlink()
     ):
         return None
-    play_roots = (
-        canonical_play_root(project_root),
-        *legacy_play_roots(project_root),
-    )
-    for play_root in play_roots:
-        try:
-            candidate.relative_to(play_root.resolve())
-            return candidate
-        except ValueError:
-            continue
-    return None
+    try:
+        candidate.relative_to(canonical_play_root(project_root).resolve())
+    except ValueError:
+        return None
+    return candidate
 
 
 def command_bar_has_openable_target(
@@ -219,7 +213,6 @@ def build_command_bar_data(
     title = _metadata_value(
         metadata,
         "recipient_title",
-        "title",
     ) or (matching_entry.title if matching_entry else "") or settings_title
     published_url = normalize_published_page_url(
         _metadata_value(metadata, "published_page_url")

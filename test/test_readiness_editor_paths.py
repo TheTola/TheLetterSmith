@@ -95,7 +95,6 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                             "recipient_id": recipient.recipient_id,
                             "recipient_name": recipient.display_name,
                             "recipient_title": title,
-                            "letter_title": title,
                         },
                         ensure_ascii=False,
                     ),

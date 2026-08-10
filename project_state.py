@@ -7,7 +7,8 @@ is generated once, remains internal metadata, and persists across folder renames
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from threading import RLock
@@ -376,6 +377,53 @@ class ProjectStateController:
         identity = require_project_identity(updated)
         self.transition(ApplicationState.PROJECT_READY, identity=identity)
         return identity
+
+    def rename_recipient(
+        self,
+        recipient_display_name: str,
+    ) -> ProjectIdentity:
+        """Rename the active recipient without changing project ownership."""
+        identity = self.require_ready()
+        name = RecipientName.from_raw(
+            recipient_display_name,
+            custom_capitalization=True,
+        )
+        current_record = self.recipient_registry.find_by_id(
+            identity.recipient_id
+        )
+        if current_record is None:
+            raise RuntimeError("Active recipient is not registered.")
+        if (
+            current_record.display_name == name.display_name
+            and current_record.normalized_key == name.normalized_key
+        ):
+            return identity
+
+        renamed_record = replace(
+            current_record,
+            display_name=name.display_name,
+            normalized_key=name.normalized_key,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self.recipient_registry.replace_record(renamed_record)
+        try:
+            updated = SettingsStore(self.project_root).update_fields(
+                {
+                    RECIPIENT_DISPLAY_NAME_KEY: renamed_record.display_name,
+                    RECIPIENT_NORMALIZED_KEY: renamed_record.normalized_key,
+                    LEGACY_RECIPIENT_NAME_KEY: renamed_record.display_name,
+                }
+            )
+            renamed_identity = require_project_identity(updated)
+        except Exception:
+            self.recipient_registry.replace_record(current_record)
+            raise
+
+        self.transition(
+            ApplicationState.PROJECT_READY,
+            identity=renamed_identity,
+        )
+        return renamed_identity
 
     def begin_new_project(
         self,

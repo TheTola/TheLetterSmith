@@ -262,6 +262,96 @@ class CommandInteractionTests(unittest.TestCase):
             ["Wipe failed: Command Bar integration is unavailable"],
         )
 
+    def test_new_project_preserves_libraries_saved_letters_and_preferences(self) -> None:
+        from project_state import ProjectStateController
+        from settings_store import SettingsStore
+
+        root = Path(self.temp_dir.name) / "new-project"
+        active_page = root / "gallery" / "user" / "pages" / "cover.png"
+        active_message = root / "gallery" / "user" / "message" / "message.html"
+        active_page.parent.mkdir(parents=True)
+        active_message.parent.mkdir(parents=True)
+        active_page.write_bytes(b"active page")
+        active_message.write_text("<p>active message</p>", encoding="utf-8")
+
+        protected_files = (
+            root / "output" / "Play" / "Saved" / "Letter" / "index.html",
+            root / "output" / "Recovery" / "Backup" / "index.html",
+            root / "Prompter" / "modules" / "role.txt",
+            root / "Prompter" / "modules" / "user_colors.json",
+            root / "gallery" / "user" / "sounds" / "appssong" / "library.json",
+        )
+        for path in protected_files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("protected", encoding="utf-8")
+
+        settings = SettingsStore(root)
+        settings.update_fields(
+            {
+                "starting_volume": 21,
+                "music_volume": 34,
+                "curtain_style": "average_color",
+                "prompt_writer_state": {"subject": "legacy active state"},
+            }
+        )
+        controller = ProjectStateController(root)
+        controller.initialize()
+        controller.establish_project("Amanda Miller")
+
+        self.assertTrue(
+            command.start_new_project(
+                project_root=root,
+                project_state=controller,
+            )
+        )
+
+        self.assertFalse(active_page.exists())
+        self.assertFalse(active_message.exists())
+        for path in protected_files:
+            self.assertTrue(path.is_file(), path)
+        current = settings.snapshot()
+        self.assertEqual(current["starting_volume"], 21)
+        self.assertEqual(current["music_volume"], 34)
+        self.assertEqual(current["curtain_style"], "average_color")
+        self.assertEqual(current["prompt_writer_state"], {})
+        self.assertEqual(current["recipient_name"], "")
+
+    def test_settings_menu_exposes_new_project_and_normal_exit(self) -> None:
+        from Nexus import TitleBar
+
+        class Host(QtWidgets.QMainWindow):
+            def __init__(self, project_root: Path):
+                super().__init__()
+                self.project_root = str(project_root)
+                self.new_project_calls = 0
+                self.close_events = 0
+
+            def start_new_project(self) -> None:
+                self.new_project_calls += 1
+
+            def open_target_browser(self) -> None:
+                pass
+
+            def status(self, _message: str) -> None:
+                pass
+
+            def closeEvent(self, event) -> None:
+                self.close_events += 1
+                event.accept()
+
+        host = Host(Path(self.temp_dir.name))
+        title_bar = TitleBar(host)
+        actions = {action.text(): action for action in title_bar.settings_menu.actions()}
+
+        self.assertIn("New Project", actions)
+        self.assertIn("Exit", actions)
+        actions["New Project"].trigger()
+        self.assertEqual(host.new_project_calls, 1)
+        host.show()
+        actions["Exit"].trigger()
+        self.app.processEvents()
+        self.assertEqual(host.close_events, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

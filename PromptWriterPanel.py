@@ -38,7 +38,7 @@ LOGGER = logging.getLogger(__name__)
 
 _FILE_CACHE: Dict[str, Tuple[List[str], Optional[Path], Optional[Tuple[int, int]]]] = {}
 PROMPTER_ROOT = Path(__file__).resolve().parent
-PROMPT_WRITER_STATE_VERSION = 5
+PROMPT_WRITER_STATE_VERSION = 6
 PROMPT_LANGUAGE_VERSION = 2
 STATE_PERSIST_DEBOUNCE_MS = 350
 MAX_STATE_TEXT_LENGTH = 24000
@@ -1213,6 +1213,7 @@ def empty_prompt_writer_state() -> dict:
         "global": "",
         **{page.key: "" for page in PAGE_SPECS},
         "checks": {key: False for key in BUILT_IN_CHECK_KEYS},
+        "resolved_instructions": {},
         "generated_prompts": {},
         "generated_input_signature": "",
     }
@@ -1286,6 +1287,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         self._page_specs = [replace(page) for page in PAGE_SPECS]
         self._generated_prompts: Dict[str, str] = {}
+        self._resolved_instructions: Dict[str, object] = {}
         self._generated_input_signature = ""
         self._generated_output_valid = False
         self._generation_in_progress = False
@@ -1300,7 +1302,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         self._load_colors_into_combo()
         self._start_visionary_pulse()
-        self._restore_persisted_state()
+        self.reload_project_state()
 
     def _module_path(self, name: str) -> Path:
         return self._default_modules_dir() / name
@@ -1472,12 +1474,31 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     combo.setCurrentIndex(restored_index)
                 elif is_editable:
                     combo.setEditText(current_text)
-                elif allow_none:
-                    combo.setCurrentIndex(0)
+                else:
+                    # Keep a project-local historical selection available even
+                    # when the permanent source library no longer contains it.
+                    combo.addItem(current_text)
+                    combo.setCurrentIndex(combo.count() - 1)
             elif allow_none and combo.count() > 0:
                 combo.setCurrentIndex(0)
         finally:
             combo.blockSignals(signals_were_blocked)
+
+    @staticmethod
+    def _restore_combo_value(
+        combo: QtWidgets.QComboBox,
+        value: str,
+        *,
+        empty_index: int,
+    ) -> None:
+        if not value:
+            combo.setCurrentIndex(empty_index)
+            return
+        index = combo.findText(value)
+        if index < 0:
+            combo.addItem(value)
+            index = combo.count() - 1
+        combo.setCurrentIndex(index)
 
     def _reload_managed_list(self, key: str) -> None:
         config = self._managed_list_config(key)
@@ -1583,6 +1604,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
             LOGGER.exception("Prompt Writer state persistence failed: %s (%s)", self._state_path, error)
             return False
 
+    def persist_project_state(self) -> bool:
+        """Flush the current project-owned Prompt Writer workspace to disk."""
+        return self._persist_state_now()
+
     def _normalize_persisted_state(self, state: object) -> dict:
         if not isinstance(state, dict):
             return {}
@@ -1601,9 +1626,21 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 page.key,
                 generated_raw.get(page.display_label, ""),
             )
-            generated_text = _normalize_text(generated_value, max_length=0)
+            generated_text = generated_value if isinstance(generated_value, str) else ""
             if generated_text.strip():
                 generated_prompts[page.key] = generated_text
+
+        resolved_raw = state.get("resolved_instructions", {})
+        resolved_instructions: Dict[str, object] = {}
+        if isinstance(resolved_raw, dict):
+            for key in ("role", "subject_lead_in", "effort", "format"):
+                value = resolved_raw.get(key)
+                if isinstance(value, str):
+                    resolved_instructions[key] = value
+                elif key == "subject_lead_in" and isinstance(value, list):
+                    resolved_instructions[key] = [
+                        item for item in value if isinstance(item, str)
+                    ]
 
         return {
             "version": PROMPT_WRITER_STATE_VERSION,
@@ -1613,6 +1650,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "global": _normalize_text(state.get("global", "")),
             **page_details,
             "checks": _normalize_exclusive_check_states(checks_raw),
+            "resolved_instructions": resolved_instructions,
             "generated_prompts": generated_prompts,
             "generated_input_signature": _normalize_text(
                 state.get("generated_input_signature", ""),
@@ -1741,6 +1779,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 state_key: _cb(checkbox)
                 for checkbox, state_key in self._checkbox_state_specs()
             },
+            "resolved_instructions": dict(self._resolved_instructions),
             "generated_prompts": {
                 image_name: prompt
                 for image_name, prompt in self._generated_prompts.items()
@@ -1753,7 +1792,32 @@ class PromptWriterPanel(QtWidgets.QWidget):
             ),
         }
 
-    def _restore_persisted_state(self) -> None:
+    def reload_project_state(self) -> bool:
+        """Replace the live workspace with the active project's saved state."""
+        widgets: List[QtCore.QObject] = [
+            self.cmb_subject,
+            self.cmb_type,
+            self.cmb_color,
+            self.txt_global,
+            *(
+                page.detail_widget
+                for page in self._page_specs
+                if page.detail_widget is not None
+            ),
+            *(checkbox for checkbox, _ in self._checkbox_state_specs()),
+        ]
+        blockers = [QtCore.QSignalBlocker(widget) for widget in widgets]
+        previous_suspension = self._state_persistence_suspended
+        self._persist_timer.stop()
+        self._state_persistence_suspended = True
+        try:
+            return self._restore_persisted_state()
+        finally:
+            for blocker in blockers:
+                blocker.unblock()
+            self._state_persistence_suspended = previous_suspension
+
+    def _restore_persisted_state(self) -> bool:
         """Load persisted Prompt Writer state.
 
         Source of truth:
@@ -1771,33 +1835,22 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
             state = self._normalize_persisted_state(state)
             if not state:
-                return
+                return True
 
             # Selects
             try:
                 t = str(state.get("type", "")).strip()
-                if t:
-                    self.cmb_type.setCurrentText(t)
-                else:
-                    self.cmb_type.setCurrentIndex(0)
+                self._restore_combo_value(self.cmb_type, t, empty_index=0)
             except (RuntimeError, TypeError, ValueError) as error:
                 LOGGER.exception("Prompt Writer type selection restoration failed: %s", error)
             try:
                 s = str(state.get("subject", "")).strip()
-                if s:
-                    self.cmb_subject.setCurrentText(s)
-                else:
-                    self.cmb_subject.setCurrentIndex(-1)
+                self._restore_combo_value(self.cmb_subject, s, empty_index=-1)
             except (RuntimeError, TypeError, ValueError) as error:
                 LOGGER.exception("Prompt Writer subject selection restoration failed: %s", error)
             try:
                 c = str(state.get("color", "")).strip()
-                if c:
-                    idx = self.cmb_color.findText(c)
-                    if idx >= 0:
-                        self.cmb_color.setCurrentIndex(idx)
-                else:
-                    self.cmb_color.setCurrentIndex(0)
+                self._restore_combo_value(self.cmb_color, c, empty_index=0)
             except (RuntimeError, TypeError, ValueError) as error:
                 LOGGER.exception("Prompt Writer color selection restoration failed: %s", error)
 
@@ -1822,15 +1875,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
             # Generated previews
             try:
                 generated_prompts = dict(state.get("generated_prompts", {}))
-                saved_signature = str(state.get("generated_input_signature", "")).strip()
-                if (
-                    generated_prompts
-                    and saved_signature
-                    and saved_signature == self._current_prompt_input_signature()
-                ):
+                if generated_prompts:
                     self._validate_generated_prompt_set(generated_prompts)
                     self._generated_prompts = generated_prompts
-                    self._generated_input_signature = saved_signature
+                    self._resolved_instructions = dict(
+                        state.get("resolved_instructions", {})
+                    )
+                    # Exact saved prompts remain authoritative across prompt
+                    # language and library revisions. The current signature is
+                    # used only to invalidate them after a live control change.
+                    self._generated_input_signature = self._current_prompt_input_signature()
                     for page in self._page_specs:
                         txt = self._generated_prompts.get(page.key, "")
                         if page.preview_widget is not None and txt.strip():
@@ -1844,6 +1898,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         except (OSError, RuntimeError, TypeError, ValueError, UnicodeError) as error:
             LOGGER.exception("Prompt Writer state restoration failed for %s: %s", self._state_path, error)
+            return False
+        return True
 
     # -----------------------
     # UI
@@ -2332,6 +2388,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def _invalidate_generated_output(self) -> None:
         self._generated_prompts = {}
+        self._resolved_instructions = {}
         self._generated_input_signature = ""
         for page in self._page_specs:
             if page.preview_widget is not None:
@@ -2478,6 +2535,17 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._validate_generated_prompt_set(prompts)
 
             self._generated_prompts = dict(prompts)
+            subject_lead_in = shared_prompt_data.get("order", [])
+            if isinstance(subject_lead_in, (list, tuple)):
+                subject_lead_in = list(subject_lead_in)
+            elif not isinstance(subject_lead_in, str):
+                subject_lead_in = ""
+            self._resolved_instructions = {
+                "role": str(shared_prompt_data.get("role", "")),
+                "subject_lead_in": subject_lead_in,
+                "effort": str(shared_prompt_data.get("effort", "")),
+                "format": str(shared_prompt_data.get("format", "")),
+            }
             self._generated_input_signature = self._current_prompt_input_signature()
             self._set_generated_output_valid(True)
 

@@ -8,7 +8,14 @@ from pathlib import Path
 
 from config import CONTROL_FILES, REQUIRED_SLIDES
 from recipient_registry import RecipientRegistry
-from saved_letters import SavedLetterCatalog, SavedLetterRestoreError, SavedLetterRestorer
+from readiness import ReadinessResult
+from saved_letters import (
+    PROMPT_WRITER_STATE_FILE,
+    SavedLetterCatalog,
+    SavedLetterRestoreError,
+    SavedLetterRestorer,
+    update_saved_metadata,
+)
 from settings_store import ACTIVE_PLAY_DIR_KEY, SettingsStore
 from sound_model import (
     ProjectSoundState,
@@ -136,6 +143,130 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 str(bundle.resolve()),
             )
 
+    def test_prompt_writer_workspace_round_trips_without_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            metadata_path = bundle / "lettersmith-metadata.json"
+            original_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            record = RecipientRegistry(root).find_by_id(original_metadata["recipient_id"])
+            self.assertIsNotNone(record)
+            SettingsStore(root).update_fields(
+                {
+                    "project_id": original_metadata["project_id"],
+                    "recipient_id": record.recipient_id,
+                    "recipient_display_name": record.display_name,
+                    "recipient_normalized_key": record.normalized_key,
+                    "recipient_name": record.display_name,
+                    "recipient_title": original_metadata["recipient_title"],
+                }
+            )
+            prompt_state = {
+                "version": 6,
+                "type": "Historical Illustration",
+                "subject": "GO and Genesis Prime",
+                "color": "Historical Palette",
+                "global": "Shared direction",
+                "cover": "Cover direction",
+                "letter": "Letter direction",
+                "wall": "Wall direction",
+                "back": "Back direction",
+                "checks": {"black": True, "wide_scene": True},
+                "resolved_instructions": {
+                    "role": "Exact role",
+                    "subject_lead_in": ["Exact", "subject lead-in"],
+                    "effort": "Exact effort",
+                    "format": "Exact format",
+                },
+                "generated_prompts": {
+                    "cover": "Cover exact\r\nsecond line",
+                    "letter": "Letter exact",
+                    "wall": "Wall exact",
+                    "back": "Back exact",
+                },
+                "generated_input_signature": "historical-signature",
+            }
+            (root / PROMPT_WRITER_STATE_FILE).write_text(
+                json.dumps(prompt_state, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            update_saved_metadata(
+                bundle,
+                root,
+                ReadinessResult((), 100, "Ready"),
+            )
+
+            saved_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                saved_metadata["editable_assets"]["prompt_writer_state"],
+                PROMPT_WRITER_STATE_FILE,
+            )
+            self.assertEqual(
+                json.loads((bundle / PROMPT_WRITER_STATE_FILE).read_text(encoding="utf-8")),
+                prompt_state,
+            )
+
+            (root / PROMPT_WRITER_STATE_FILE).write_text(
+                json.dumps({"subject": "Different active project"}),
+                encoding="utf-8",
+            )
+            self._restore(root, bundle)
+            self.assertEqual(
+                json.loads((root / PROMPT_WRITER_STATE_FILE).read_text(encoding="utf-8")),
+                prompt_state,
+            )
+            self._restore(root, bundle)
+            self.assertEqual(
+                json.loads((root / PROMPT_WRITER_STATE_FILE).read_text(encoding="utf-8")),
+                prompt_state,
+            )
+
+    def test_legacy_letter_without_prompt_writer_state_loads_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            (root / PROMPT_WRITER_STATE_FILE).write_text(
+                json.dumps(
+                    {
+                        "subject": "Current project",
+                        "generated_prompts": {"cover": "must not leak"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self._restore(root, bundle)
+
+            restored = json.loads(
+                (root / PROMPT_WRITER_STATE_FILE).read_text(encoding="utf-8")
+            )
+            self.assertEqual(restored["subject"], "")
+            self.assertEqual(restored["generated_prompts"], {})
+
+    def test_recovery_letter_is_listed_and_loadable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            recovery = (
+                root
+                / "output"
+                / "Recovery"
+                / bundle.parent.name
+                / bundle.name
+            )
+            recovery.parent.mkdir(parents=True)
+            bundle.replace(recovery)
+
+            entries = SavedLetterCatalog(root).list_entries()
+
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].path, recovery.resolve())
+            self.assertTrue(entries[0].recovery)
+            restored = SavedLetterRestorer(root).restore(entries[0])
+            self.assertEqual(restored.play_dir, recovery.resolve())
+            self.assertTrue(recovery.is_dir())
+
     def test_failure_restores_active_project_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -155,6 +286,9 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             sync_current_compatibility(root, active_state, load_library(root))
             settings.update_fields({"recipient_name": "Amanda", "recipient_title": "Current"})
             old_settings = settings.snapshot()
+            prompt_state_path = root / PROMPT_WRITER_STATE_FILE
+            prompt_state_path.write_bytes(b'{"subject": "Current prompt"}\n')
+            old_prompt_state = prompt_state_path.read_bytes()
             bundle = self._bundle(root)
             sounds = bundle / "gallery" / "sounds"
             sounds.mkdir()
@@ -172,6 +306,7 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             self.assertEqual(current_music_path(root).read_bytes(), b"current")
             self.assertEqual(load_project_state(root).single_track_id, record.track_id)
             self.assertTrue(project_sound_path(root).exists())
+            self.assertEqual(prompt_state_path.read_bytes(), old_prompt_state)
 
 
 if __name__ == "__main__":

@@ -387,6 +387,15 @@ class TitleBar(QtWidgets.QWidget):
         self.repair_music_action.triggered.connect(
             self._repair_music_archive
         )
+        self.settings_menu.addSeparator()
+        self.new_project_action = self.settings_menu.addAction(
+            "New Project"
+        )
+        self.new_project_action.triggered.connect(
+            self.parent.start_new_project
+        )
+        self.exit_action = self.settings_menu.addAction("Exit")
+        self.exit_action.triggered.connect(self.parent.close)
         self.settings_menu.aboutToShow.connect(
             self._sync_curtain_menu
         )
@@ -1363,6 +1372,9 @@ class Nexus(QtWidgets.QMainWindow):
         self.image_tab.image_selected.connect(
             lambda _pixmap: self.forge_tab.schedule_refresh()
         )
+        self.image_tab.animation_settings_changed.connect(
+            lambda _index: self.forge_tab.schedule_refresh()
+        )
         self.image_tab.clear_preview.connect(self.forge_tab.schedule_refresh)
         self.sound_tab.project_sound.changed.connect(
             self.forge_tab.schedule_refresh
@@ -1573,6 +1585,14 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _on_project_restored(self, _payload: Optional[dict] = None) -> None:
         """Coordinate public refresh contracts after an atomic restore."""
+        panel = getattr(self, "_prompt_writer_win", None)
+        if isinstance(panel, QtWidgets.QWidget):
+            try:
+                if not panel.reload_project_state():
+                    self.status("Prompt Writer could not refresh the loaded project.")
+            except Exception as error:
+                _LOGGER.exception("Prompt Writer could not refresh after restore: %s", error)
+                self.status("Prompt Writer could not refresh the loaded project.")
         refreshers = (
             ("Images", self.image_tab.refresh_from_disk),
             ("Message", self.message_tab.refresh_from_disk),
@@ -2233,6 +2253,10 @@ class Nexus(QtWidgets.QMainWindow):
     def _release_project_files_for_restore(self) -> None:
         """Release project-owned media handles before an atomic restore."""
         try:
+            self.image_tab.prepare_for_project_restore()
+        except Exception:
+            _LOGGER.exception("Image files could not be released before restore.")
+        try:
             self.sound_tab.prepare_for_project_restore()
         except Exception:
             _LOGGER.exception("Sound files could not be released before restore.")
@@ -2532,6 +2556,54 @@ class Nexus(QtWidgets.QMainWindow):
             self._shutdown_complete = True
             self._shutdown_in_progress = False
 
+    def start_new_project(self) -> None:
+        """Confirm and clear only the currently active editable project."""
+        if self._shutdown_complete or self._shutdown_in_progress:
+            return
+        forge_tab = getattr(self, "forge_tab", None)
+        if forge_tab is not None and forge_tab.operation_in_progress:
+            self.status("Finish the current Forge operation before starting a new project.")
+            return
+        if self.project_state.is_project_ready:
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Start New Project",
+                "Discard the current active project and start a new one? "
+                "Saved letters, backups, Prompt Writer libraries, palettes, "
+                "and application preferences will be kept.",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Cancel,
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                self.status("New project canceled.")
+                return
+        if not self.reset_prompt_writer_state():
+            QtWidgets.QMessageBox.critical(
+                self,
+                "New Project",
+                "Prompt Writer state could not be cleared. The current project was kept.",
+            )
+            return
+        try:
+            from command import start_new_project
+
+            completed = start_new_project(
+                self,
+                project_root=self.project_root,
+                project_state=self.project_state,
+            )
+        except Exception as error:
+            _LOGGER.exception("New Project failed: %s", error)
+            QtWidgets.QMessageBox.critical(
+                self,
+                "New Project",
+                f"The active project could not be cleared: {error}",
+            )
+            return
+        if completed:
+            self._on_command_wiped()
+            self.status("New project ready. Enter a recipient to begin.")
+
     def open_command_bar_and_close_editor(self, data: object) -> bool:
         """Transfer the completed-letter snapshot to the post-reset controller."""
         if self._shutdown_complete or self._shutdown_in_progress:
@@ -2707,6 +2779,18 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception as error:
             print(f"[PromptWriter] reset failed: {error}")
             self.status("Prompt Writer reset failed; command was not completed.")
+            return False
+
+    def flush_prompt_writer_state(self) -> bool:
+        """Persist live Prompt Writer edits before saving the active letter."""
+        panel = getattr(self, "_prompt_writer_win", None)
+        if not isinstance(panel, QtWidgets.QWidget):
+            return True
+        try:
+            return bool(panel.persist_project_state())
+        except Exception as error:
+            _LOGGER.exception("Prompt Writer state flush failed: %s", error)
+            self.status("Prompt Writer state could not be saved.")
             return False
 
     def open_prompt_writer(self):
