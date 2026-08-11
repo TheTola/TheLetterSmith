@@ -63,7 +63,11 @@ COL_BACK = "#ff9f0a"       # BACK / AMBER
 
 COL_CHECK = "#005dff"
 COL_CHECK_MARK = "#ffd60a"
-COL_HEADER_TEXT = "#365be8"  # DARK CATEGORY BLUE, SLIGHTLY BRIGHTER THAN ROYAL BLUE
+COL_HEADER_TEXT = "#72c8c8"
+UI_ACCENT = "#00b2b2"
+UI_ACCENT_SOFT = "#263535"
+UI_TEXT_PRIMARY = "#edf7fb"
+UI_TEXT_SECONDARY = "#93a7b3"
 MANAGED_LIST_HEADER_ROLE = Qt.UserRole + 41
 NONE_CHOICE_LABEL = "— none —"
 USER_ADDED_HEADER = "User Added"
@@ -322,6 +326,84 @@ class HeaderAwareItemDelegate(QtWidgets.QStyledItemDelegate):
         super().paint(painter, option, index)
 
 
+class ClickThroughNotice(QtWidgets.QLabel):
+    """Frameless notice that observes clicks without intercepting them."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        flags = (
+            Qt.ToolTip
+            | Qt.FramelessWindowHint
+            | Qt.WindowDoesNotAcceptFocus
+            | Qt.WindowTransparentForInput
+        )
+        super().__init__(parent, flags)
+        self.setObjectName("clickThroughNotice")
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAlignment(Qt.AlignCenter)
+        self.setWordWrap(True)
+        self.setMargin(10)
+        self.setStyleSheet(
+            "QLabel#clickThroughNotice {"
+            "background: #101820;"
+            "color: #dff7ff;"
+            "border: 1px solid #35c8e6;"
+            "border-radius: 8px;"
+            "font-weight: 700;"
+            "}"
+        )
+        self._filter_installed = False
+
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.applicationStateChanged.connect(self._on_application_state_changed)
+
+    def show_message(self, text: str, *, anchor: QtWidgets.QWidget) -> None:
+        self.setText(text)
+        width = min(360, max(240, self.fontMetrics().horizontalAdvance(text) + 28))
+        self.setFixedWidth(width)
+        self.adjustSize()
+
+        anchor_top = anchor.mapToGlobal(QtCore.QPoint(0, 0))
+        anchor_center = anchor.mapToGlobal(anchor.rect().center())
+        screen = anchor.screen() or QtGui.QGuiApplication.screenAt(anchor_center)
+        available = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1280, 720)
+        x = anchor_center.x() - (self.width() // 2)
+        y = anchor_top.y() - self.height() - 8
+        if y < available.top():
+            y = anchor_top.y() + anchor.height() + 8
+        x = max(available.left(), min(x, available.right() - self.width() + 1))
+        y = max(available.top(), min(y, available.bottom() - self.height() + 1))
+        self.move(x, y)
+
+        app = QtWidgets.QApplication.instance()
+        if app is not None and not self._filter_installed:
+            app.installEventFilter(self)
+            self._filter_installed = True
+        self.show()
+        self.raise_()
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if self.isVisible() and event.type() in (
+            QtCore.QEvent.MouseButtonPress,
+            QtCore.QEvent.MouseButtonDblClick,
+        ):
+            self.hide()
+        return False
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        app = QtWidgets.QApplication.instance()
+        if app is not None and self._filter_installed:
+            app.removeEventFilter(self)
+            self._filter_installed = False
+        super().hideEvent(event)
+
+    def _on_application_state_changed(self, state: Qt.ApplicationState) -> None:
+        if state != Qt.ApplicationActive:
+            self.hide()
+
+
 class ListManagerDialog(QtWidgets.QDialog):
     entries_changed = QtCore.Signal(list)
 
@@ -343,6 +425,7 @@ class ListManagerDialog(QtWidgets.QDialog):
         self._allow_headers = bool(allow_headers)
         self._auto_user_header = _normalize_text(auto_user_header, strip=True, max_length=120)
         self._user_owned_only = bool(user_owned_only)
+        self._duplicate_notice = ClickThroughNotice(self)
         self.setWindowTitle(f"Manage {title}")
         self.setModal(False)
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
@@ -362,8 +445,20 @@ class ListManagerDialog(QtWidgets.QDialog):
         self.setMaximumHeight(default_height)
 
         root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+
+        title_label = QtWidgets.QLabel(f"Manage {title}", self)
+        title_label.setObjectName("managerTitle")
+        root.addWidget(title_label)
+
+        hint_label = QtWidgets.QLabel(
+            "Select an entry to update or remove it. New entries are saved to your library.",
+            self,
+        )
+        hint_label.setObjectName("managerHint")
+        hint_label.setWordWrap(True)
+        root.addWidget(hint_label)
 
         self.list_widget = QtWidgets.QListWidget(self)
         self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
@@ -398,37 +493,59 @@ class ListManagerDialog(QtWidgets.QDialog):
         self.setStyleSheet(
             """
             QDialog {
-                background: #12161d;
-                border: 1px solid #283244;
-                border-radius: 10px;
+                background: #1a1b1d;
+                border: 1px solid #343a3e;
+                border-radius: 14px;
             }
             QLabel {
-                color: #dce8f4;
+                color: #edf7fb;
+                font-family: 'Segoe UI';
+            }
+            QLabel#managerTitle {
+                color: #f2fbff;
+                font: 700 15px 'Segoe UI';
+            }
+            QLabel#managerHint {
+                color: #93a7b3;
+                font: 10px 'Segoe UI';
             }
             QListWidget {
-                background: #0b0f15;
-                color: #ebf2ff;
-                border: 1px solid #263142;
-                border-radius: 8px;
-                padding: 4px;
+                background: #151719;
+                color: #edf7fb;
+                border: 1px solid #373d42;
+                border-radius: 10px;
+                padding: 6px;
+                outline: none;
+                selection-background-color: #173f4d;
             }
             QLineEdit {
-                background: #0b0f15;
-                color: #ebf2ff;
-                border: 1px solid #263142;
-                border-radius: 6px;
+                min-height: 24px;
+                background: #151719;
+                color: #edf7fb;
+                border: 1px solid #373d42;
+                border-radius: 9px;
                 padding: 6px 8px;
+                selection-background-color: #17485a;
+            }
+            QLineEdit:focus {
+                border-color: #00b2b2;
             }
             QPushButton {
-                background: transparent;
-                color: #ebf2ff;
-                border: 1px solid #31435e;
-                border-radius: 6px;
+                min-height: 26px;
+                background: #25282b;
+                color: #edf7fb;
+                border: 1px solid #3a4045;
+                border-radius: 10px;
                 padding: 6px 12px;
             }
             QPushButton:hover {
-                background: rgba(59, 124, 240, 0.12);
-                border-color: #4d8dff;
+                background: #293537;
+                border-color: #00b2b2;
+            }
+            QPushButton:disabled {
+                color: #61727a;
+                background: #121a21;
+                border-color: #293942;
             }
             """
         )
@@ -452,6 +569,7 @@ class ListManagerDialog(QtWidgets.QDialog):
         return super().eventFilter(obj, event)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._duplicate_notice.hide()
         app = QtWidgets.QApplication.instance()
         if app is not None:
             try:
@@ -502,6 +620,12 @@ class ListManagerDialog(QtWidgets.QDialog):
             if _managed_entry_key(entry.text) == candidate:
                 return entry.text
         return None
+
+    def _show_duplicate_notice(self, conflict: str) -> None:
+        self._duplicate_notice.show_message(
+            f'"{conflict}" already exists.',
+            anchor=self.entry_edit,
+        )
 
     def _nearest_selectable_row(self, preferred_row: int) -> int:
         if self._is_selectable_row(preferred_row):
@@ -625,11 +749,7 @@ class ListManagerDialog(QtWidgets.QDialog):
             return
         conflict = self._duplicate_conflict(entry.text)
         if conflict is not None:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Duplicate option",
-                f"That option conflicts with the existing entry: {conflict}",
-            )
+            self._show_duplicate_notice(conflict)
             return
         if self._allow_headers and self._auto_user_header:
             insert_at = self._insert_under_auto_header(ManagedListEntry(entry.text, False, True))
@@ -647,11 +767,7 @@ class ListManagerDialog(QtWidgets.QDialog):
             return
         conflict = self._duplicate_conflict(entry.text, exclude_row=row)
         if conflict is not None:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Duplicate option",
-                f"That option conflicts with the existing entry: {conflict}",
-            )
+            self._show_duplicate_notice(conflict)
             return
         self._entries[row] = ManagedListEntry(entry.text, False, self._entries[row].is_user)
         self._refresh_list(row)
@@ -907,12 +1023,13 @@ def _parse_color_list_entries(lines: List[str]) -> List[ManagedListEntry]:
                 entries.append(ManagedListEntry(item.text, False, False))
                 seen_items.add(item_key)
 
-    entries.append(ManagedListEntry(USER_ADDED_HEADER, True))
-    for item in user_items:
-        item_key = _managed_entry_key(item.text)
-        if item_key and item_key not in seen_items:
-            entries.append(ManagedListEntry(item.text, False, True))
-            seen_items.add(item_key)
+    if user_items:
+        entries.append(ManagedListEntry(USER_ADDED_HEADER, True, True))
+        for item in user_items:
+            item_key = _managed_entry_key(item.text)
+            if item_key and item_key not in seen_items:
+                entries.append(ManagedListEntry(item.text, False, True))
+                seen_items.add(item_key)
     return entries
 
 
@@ -972,7 +1089,12 @@ def render_prompt_html(payload: PromptPayload) -> str:
 
 
 CHECKBOX_QSS = """
-QCheckBox { color: #dcdce0; spacing: 8px; }
+QCheckBox {
+    color: #d9e6ec;
+    spacing: 8px;
+    font: 10px 'Segoe UI';
+}
+QCheckBox:disabled { color: #667985; }
 """
 
 
@@ -1002,15 +1124,15 @@ class GoldenCheckBox(QtWidgets.QCheckBox):
             contents = QtCore.QRect(size + 8, 0, max(0, self.width() - size - 8), self.height())
 
         hovered = bool(option.state & QtWidgets.QStyle.State_MouseOver)
-        border = QColor(COL_CHECK_MARK if self.isChecked() else ("#3a4355" if hovered else "#2b2b31"))
-        fill = QColor(COL_CHECK if self.isChecked() else ("#121722" if hovered else "#0d0e11"))
+        border = QColor(UI_ACCENT if self.isChecked() else ("#48616f" if hovered else "#344956"))
+        fill = QColor("#123d49" if self.isChecked() else ("#17232c" if hovered else "#0c141a"))
 
         painter.setPen(QtGui.QPen(border, 1.35))
         painter.setBrush(fill)
         painter.drawRoundedRect(QtCore.QRectF(indicator), 3, 3)
 
         if self.isChecked():
-            pen = QtGui.QPen(QColor(COL_CHECK_MARK), 2.35, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            pen = QtGui.QPen(QColor(UI_TEXT_PRIMARY), 2.35, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
             painter.setPen(pen)
             path = QtGui.QPainterPath()
             path.moveTo(indicator.left() + 3.5, indicator.center().y() + 0.5)
@@ -1018,7 +1140,7 @@ class GoldenCheckBox(QtWidgets.QCheckBox):
             path.lineTo(indicator.right() - 3.0, indicator.top() + 4.0)
             painter.drawPath(path)
 
-        painter.setPen(QColor("#dcdce0" if self.isEnabled() else "#777a84"))
+        painter.setPen(QColor("#d9e6ec" if self.isEnabled() else "#667985"))
         painter.drawText(contents, Qt.AlignVCenter | Qt.AlignLeft, self.text())
         painter.end()
 
@@ -1402,7 +1524,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 return []
         legacy_lines, _ = _read_list_file_cached(legacy_path)
         legacy_entries = _parse_color_list_entries(legacy_lines)
-        legacy_user = normalize([entry.text for entry in legacy_entries if entry.is_user])
+        legacy_user = normalize([
+            entry.text
+            for entry in legacy_entries
+            if entry.is_user and not entry.is_header
+        ])
         if legacy_user:
             try:
                 builtin_entries = [entry for entry in legacy_entries if not entry.is_user]
@@ -1426,12 +1552,17 @@ class PromptWriterPanel(QtWidgets.QWidget):
         lines, _ = _read_list_file_cached(path)
         if key == "color":
             builtin_entries = [entry for entry in _parse_color_list_entries(lines) if not entry.is_user]
+            builtin_keys = {
+                _managed_entry_key(entry.text)
+                for entry in builtin_entries
+                if not entry.is_header
+            }
             builtin_entries.append(ManagedListEntry(USER_ADDED_HEADER, True))
-            builtin_entries.extend(
-                ManagedListEntry(text, False, True)
-                for text in self._load_user_colors()
-                if _managed_entry_key(text)
-            )
+            for text in self._load_user_colors():
+                item_key = _managed_entry_key(text)
+                if item_key and item_key not in builtin_keys:
+                    builtin_entries.append(ManagedListEntry(text, False, True))
+                    builtin_keys.add(item_key)
             return builtin_entries
         return _parse_managed_list_entries(lines, allow_headers=bool(config["allow_headers"]))
 
@@ -1451,6 +1582,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         entries: List[ManagedListEntry],
         *,
         allow_none: bool,
+        normalized_match: bool = False,
     ) -> None:
         current_text = combo.currentText().strip()
         is_editable = combo.isEditable()
@@ -1469,7 +1601,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     model_item.setData(False, MANAGED_LIST_HEADER_ROLE)
 
             if current_text:
-                restored_index = combo.findText(current_text)
+                restored_index = self._find_combo_text(
+                    combo,
+                    current_text,
+                    normalized=normalized_match,
+                )
                 if restored_index >= 0:
                     combo.setCurrentIndex(restored_index)
                 elif is_editable:
@@ -1485,16 +1621,38 @@ class PromptWriterPanel(QtWidgets.QWidget):
             combo.blockSignals(signals_were_blocked)
 
     @staticmethod
+    def _find_combo_text(
+        combo: QtWidgets.QComboBox,
+        value: str,
+        *,
+        normalized: bool,
+    ) -> int:
+        if not normalized:
+            return combo.findText(value)
+        target = _managed_entry_key(value)
+        if not target:
+            return -1
+        for index in range(combo.count()):
+            if _managed_entry_key(combo.itemText(index)) == target:
+                return index
+        return -1
+
+    @staticmethod
     def _restore_combo_value(
         combo: QtWidgets.QComboBox,
         value: str,
         *,
         empty_index: int,
+        normalized_match: bool = False,
     ) -> None:
         if not value:
             combo.setCurrentIndex(empty_index)
             return
-        index = combo.findText(value)
+        index = PromptWriterPanel._find_combo_text(
+            combo,
+            value,
+            normalized=normalized_match,
+        )
         if index < 0:
             combo.addItem(value)
             index = combo.count() - 1
@@ -1505,7 +1663,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
         entries = self._read_managed_entries(key)
         combo = self._managed_combo_for_key(key)
         previous_text = combo.currentText().strip()
-        self._populate_managed_combo(combo, entries, allow_none=bool(config["allow_none"]))
+        self._populate_managed_combo(
+            combo,
+            entries,
+            allow_none=bool(config["allow_none"]),
+            normalized_match=key == "color",
+        )
         if previous_text and combo.currentText().strip() != previous_text:
             self._invalidate_generated_output()
         if key == "color":
@@ -1850,7 +2013,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 LOGGER.exception("Prompt Writer subject selection restoration failed: %s", error)
             try:
                 c = str(state.get("color", "")).strip()
-                self._restore_combo_value(self.cmb_color, c, empty_index=0)
+                self._restore_combo_value(
+                    self.cmb_color,
+                    c,
+                    empty_index=0,
+                    normalized_match=True,
+                )
             except (RuntimeError, TypeError, ValueError) as error:
                 LOGGER.exception("Prompt Writer color selection restoration failed: %s", error)
 
@@ -1888,7 +2056,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     for page in self._page_specs:
                         txt = self._generated_prompts.get(page.key, "")
                         if page.preview_widget is not None and txt.strip():
-                            page.preview_widget.setPlainText(txt)
+                            self._set_colored_saved_preview(page, txt)
                     self._set_generated_output_valid(True)
                 else:
                     self._invalidate_generated_output()
@@ -1906,13 +2074,13 @@ class PromptWriterPanel(QtWidgets.QWidget):
     # -----------------------
     def _build_ui(self):
         root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(0)
 
         container = QtWidgets.QFrame(self)
         container.setObjectName("container")
         cl = QtWidgets.QVBoxLayout(container)
-        cl.setContentsMargins(12, 12, 12, 12)
+        cl.setContentsMargins(12, 10, 12, 12)
         cl.setSpacing(10)
         root.addWidget(container)
 
@@ -1927,21 +2095,29 @@ class PromptWriterPanel(QtWidgets.QWidget):
         )
         cl.addWidget(self.title_bar)
 
-        header = QtWidgets.QHBoxLayout()
+        action_bar = QtWidgets.QFrame()
+        action_bar.setObjectName("actionBar")
+        header = QtWidgets.QHBoxLayout(action_bar)
+        header.setContentsMargins(10, 8, 10, 8)
         header.setSpacing(8)
 
         self.btn_generate = QtWidgets.QPushButton("Generate")
+        self.btn_generate.setObjectName("primaryButton")
         self.btn_copy = QtWidgets.QPushButton("Copy All")
+        self.btn_copy.setObjectName("secondaryButton")
         self.btn_copy.setEnabled(False)
         self.btn_erase = QtWidgets.QPushButton("Erase All")
+        self.btn_erase.setObjectName("dangerButton")
         for b in (self.btn_generate, self.btn_copy, self.btn_erase):
-            b.setFixedHeight(28)
+            b.setFixedHeight(34)
+            b.setCursor(Qt.PointingHandCursor)
         header.addWidget(self.btn_generate)
         header.addWidget(self.btn_copy)
         header.addWidget(self.btn_erase)
+        header.addStretch(1)
 
         self.lbl_visionary_prefix = QtWidgets.QLabel("For best results, use")
-        self.lbl_visionary_prefix.setStyleSheet("color:#cfd3da; padding-left:6px;")
+        self.lbl_visionary_prefix.setObjectName("visionaryPrefix")
         _set_help(
             self.lbl_visionary_prefix,
             "Open The Visionary if you want extra prompt-writing guidance before you generate the image set.",
@@ -1952,13 +2128,14 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.btn_visionary.setObjectName("visionary_btn")
         self.btn_visionary.setCursor(Qt.PointingHandCursor)
         self.btn_visionary.setFlat(True)
+        self.btn_visionary.setFixedHeight(32)
         self.btn_visionary.setToolTip("Open The Visionary (recommended guide)")
         self.btn_visionary.setStyleSheet(
             "QPushButton#visionary_btn{"
-            "background:transparent;border:none;padding:0 6px;"
-            "font-weight:700;text-decoration:underline;color:#2d6bff;"
+            "background:#25282b;border:1px solid #00b2b2;border-radius:10px;padding:5px 12px;"
+            "font:700 10px 'Segoe UI';color:#dffbff;"
             "}"
-            "QPushButton#visionary_btn:hover{opacity:0.95;}"
+            "QPushButton#visionary_btn:hover{background:#293537;color:#ffffff;}"
         )
         self._visionary_effect = QGraphicsDropShadowEffect(self.btn_visionary)
         self._visionary_effect.setBlurRadius(32)
@@ -1972,12 +2149,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
         )
 
         header.addWidget(self.btn_visionary)
-        header.addStretch(1)
-
-        cl.addLayout(header)
+        cl.addWidget(action_bar)
 
         main_h = QtWidgets.QHBoxLayout()
-        main_h.setSpacing(12)
+        main_h.setSpacing(16)
         cl.addLayout(main_h, 1)
 
         self._left_scroll = QtWidgets.QScrollArea()
@@ -1987,24 +2162,56 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._left_scroll.setObjectName("left_scroll")
         left_panel = QtWidgets.QWidget()
+        left_panel.setObjectName("leftPanel")
         left_v = QtWidgets.QVBoxLayout(left_panel)
-        left_v.setContentsMargins(0, 0, 6, 0)
-        left_v.setSpacing(10)
+        left_v.setContentsMargins(0, 0, 8, 0)
+        left_v.setSpacing(12)
         self._left_scroll.setWidget(left_panel)
-        main_h.addWidget(self._left_scroll, 1)
+        main_h.addWidget(self._left_scroll, 10)
+
+        controls_title = QtWidgets.QLabel("Prompt Direction")
+        controls_title.setObjectName("columnTitle")
+        left_v.addWidget(controls_title)
+        controls_hint = QtWidgets.QLabel(
+            "Choose the shared direction, then add optional guidance and page-specific details."
+        )
+        controls_hint.setObjectName("columnHint")
+        controls_hint.setWordWrap(True)
+        left_v.addWidget(controls_hint)
+
+        selection_card = QtWidgets.QFrame()
+        selection_card.setObjectName("sectionCard")
+        selection_layout = QtWidgets.QVBoxLayout(selection_card)
+        selection_layout.setContentsMargins(14, 12, 14, 14)
+        selection_layout.setSpacing(10)
+
+        selection_title = QtWidgets.QLabel("Image Set")
+        selection_title.setObjectName("sectionTitle")
+        selection_layout.addWidget(selection_title)
+        selection_hint = QtWidgets.QLabel(
+            "Double-click a label or menu to manage its saved options."
+        )
+        selection_hint.setObjectName("sectionHint")
+        selection_hint.setWordWrap(True)
+        selection_layout.addWidget(selection_hint)
 
         sel_grid = QtWidgets.QGridLayout()
-        sel_grid.setHorizontalSpacing(8)
-        sel_grid.setVerticalSpacing(8)
+        sel_grid.setHorizontalSpacing(12)
+        sel_grid.setVerticalSpacing(6)
+        sel_grid.setColumnStretch(0, 0)
+        sel_grid.setColumnStretch(1, 1)
 
         self.lbl_type = QtWidgets.QLabel("Graphics and Illustration")
-        self.lbl_type.setStyleSheet(f"font-weight:900; color:{COL_TYPE};")
+        self.lbl_type.setProperty("inputLabel", True)
+        self.lbl_type.setStyleSheet(f"color:{COL_TYPE};")
         _set_help(
             self.lbl_type,
             "Choose the overall visual or illustration style for the generated images. This changes how the full image set looks, not what the subject is.",
         )
         self.cmb_type = QtWidgets.QComboBox()
         self.cmb_type.setEditable(False)
+        self.cmb_type.setFixedSize(238, 34)
+        self.cmb_type.view().setMinimumWidth(320)
         self.cmb_type.setItemDelegate(HeaderAwareItemDelegate(self.cmb_type))
         _set_help(
             self.cmb_type,
@@ -2014,16 +2221,19 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._install_manage_trigger(self.lbl_type, "type")
         self._install_manage_trigger(self.cmb_type, "type")
         sel_grid.addWidget(self.lbl_type, 0, 0)
-        sel_grid.addWidget(self.cmb_type, 0, 1)
+        sel_grid.addWidget(self.cmb_type, 1, 0, Qt.AlignLeft)
 
         self.lbl_subject = QtWidgets.QLabel("Subject")
-        self.lbl_subject.setStyleSheet(f"font-weight:900; color:{COL_SUBJECT};")
+        self.lbl_subject.setProperty("inputLabel", True)
+        self.lbl_subject.setStyleSheet(f"color:{COL_SUBJECT};")
         _set_help(
             self.lbl_subject,
             "Choose the main thing the images should be about. Double-click Subject to add, update, or remove subject entries.",
         )
         self.cmb_subject = QtWidgets.QComboBox()
         self.cmb_subject.setEditable(False)
+        self.cmb_subject.setFixedSize(238, 34)
+        self.cmb_subject.view().setMinimumWidth(320)
         self.cmb_subject.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
         self.cmb_subject.setItemDelegate(HeaderAwareItemDelegate(self.cmb_subject))
         _set_help(
@@ -2033,17 +2243,20 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._populate_managed_combo(self.cmb_subject, self._read_managed_entries("subject"), allow_none=False)
         self._install_manage_trigger(self.lbl_subject, "subject")
         self._install_manage_trigger(self.cmb_subject, "subject")
-        sel_grid.addWidget(self.lbl_subject, 1, 0)
-        sel_grid.addWidget(self.cmb_subject, 1, 1)
+        sel_grid.addWidget(self.lbl_subject, 2, 0)
+        sel_grid.addWidget(self.cmb_subject, 3, 0, Qt.AlignLeft)
 
         self.lbl_color = QtWidgets.QLabel("Color Scheme")
-        self.lbl_color.setStyleSheet(f"font-weight:900; color:{COL_SCHEME};")
+        self.lbl_color.setProperty("inputLabel", True)
+        self.lbl_color.setStyleSheet(f"color:{COL_SCHEME};")
         _set_help(
             self.lbl_color,
             "Choose the main palette or color direction for the images. Leave it empty if you do not want to force a shared color mood.",
         )
         self.cmb_color = QtWidgets.QComboBox()
         self.cmb_color.setEditable(False)
+        self.cmb_color.setFixedSize(238, 34)
+        self.cmb_color.view().setMinimumWidth(320)
         self.cmb_color.setItemDelegate(HeaderAwareItemDelegate(self.cmb_color))
         _set_help(
             self.cmb_color,
@@ -2052,71 +2265,102 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._reload_managed_list("color")
         self._install_manage_trigger(self.lbl_color, "color")
         self._install_manage_trigger(self.cmb_color, "color")
-        sel_grid.addWidget(self.lbl_color, 2, 0)
-        sel_grid.addWidget(self.cmb_color, 2, 1)
+        sel_grid.addWidget(self.lbl_color, 4, 0)
+        sel_grid.addWidget(self.cmb_color, 5, 0, Qt.AlignLeft)
 
-        left_v.addLayout(sel_grid)
+        selection_layout.addLayout(sel_grid)
+        left_v.addWidget(selection_card)
 
         self.gb_helpful = QtWidgets.QGroupBox("")
-        self.gb_helpful.setStyleSheet("QGroupBox { font-weight:900; }")
-        self.gb_helpful.setObjectName("gb_helpful")
+        self.gb_helpful.setObjectName("helpfulCard")
         _set_help(
             self.gb_helpful,
             "Use these built-in options to refine composition, framing, image policy, and style. They add supporting instructions to the generated prompts without changing the main subject field.",
         )
 
         gb_layout = QtWidgets.QGridLayout()
-        gb_layout.setContentsMargins(10, 10, 10, 10)
+        gb_layout.setContentsMargins(14, 12, 14, 14)
         gb_layout.setHorizontalSpacing(12)
-        gb_layout.setVerticalSpacing(6)
+        gb_layout.setVerticalSpacing(8)
+        gb_layout.setColumnStretch(0, 1)
+        gb_layout.setColumnStretch(1, 1)
         self.gb_helpful.setLayout(gb_layout)
 
         self.lbl_helpful = QtWidgets.QLabel("Helpful Options / Guidance")
-        self.lbl_helpful.setStyleSheet(f"font-weight:900; color:{COL_HELPFUL};")
+        self.lbl_helpful.setObjectName("sectionTitle")
+        self.lbl_helpful.setStyleSheet(f"color:{COL_HELPFUL};")
         _set_help(
             self.lbl_helpful,
             "Use these built-in options to refine composition, framing, image policy, and style. Group headers are visual only and are not copied into the final prompt. Some options are intentionally mutually exclusive so only combinations that make sense can stay active.",
         )
         gb_layout.addWidget(self.lbl_helpful, 0, 0, 1, 2)
 
-        def add_helpful_header(row: int, title: str) -> None:
-            label = QtWidgets.QLabel(title)
-            label.setProperty("managedHeaderLabel", True)
-            label.setStyleSheet(f"font-weight:900; color:{COL_HEADER_TEXT}; margin-top:8px;")
-            label.setTextInteractionFlags(Qt.NoTextInteraction)
-            gb_layout.addWidget(label, row, 0, 1, 2)
+        def helpful_group(title: str, object_name: str) -> Tuple[QtWidgets.QGroupBox, QtWidgets.QGridLayout]:
+            group = QtWidgets.QGroupBox(title)
+            group.setObjectName(object_name)
+            group.setStyleSheet(
+                f"QGroupBox#{object_name} {{"
+                f"color: {COL_HEADER_TEXT};"
+                "font: 700 10px 'Segoe UI';"
+                "background: #1b1d20;"
+                "border: 1px solid #303438;"
+                "border-radius: 11px;"
+                "margin-top: 8px;"
+                "padding-top: 7px;"
+                "}"
+                f"QGroupBox#{object_name}::title {{"
+                "subcontrol-origin: margin;"
+                "left: 8px;"
+                "padding: 0 4px;"
+                "}"
+            )
+            layout = QtWidgets.QGridLayout(group)
+            layout.setContentsMargins(8, 10, 8, 7)
+            layout.setHorizontalSpacing(8)
+            layout.setVerticalSpacing(4)
+            return group, layout
 
-        add_helpful_header(1, "Border & Frame")
+        decorative_group, decorative_layout = helpful_group(
+            "Decorative Frames",
+            "helpful_decorative_frames",
+        )
+        style_group, style_layout = helpful_group("Style Bias", "helpful_style_bias")
+        safety_group, safety_layout = helpful_group(
+            "Image Safety / Clean Output",
+            "helpful_image_safety",
+        )
+        camera_group, camera_layout = helpful_group(
+            "Camera / Framing",
+            "helpful_camera_framing",
+        )
+
         self.cb_black = GoldenCheckBox("Thin Black Border")
         self.cb_white = GoldenCheckBox("Thin White Border")
         self.cb_frame = GoldenCheckBox("Decorative Frame")
         self.cb_vignette = GoldenCheckBox("Subtle Edge Vignette")
         self.cb_polaroid = GoldenCheckBox("Polaroid-Style Margin")
         self.cb_cardshadow = GoldenCheckBox("Card With Soft Drop Shadow")
-        gb_layout.addWidget(self.cb_black, 2, 0)
-        gb_layout.addWidget(self.cb_white, 2, 1)
-        gb_layout.addWidget(self.cb_frame, 3, 0)
-        gb_layout.addWidget(self.cb_vignette, 3, 1)
-        gb_layout.addWidget(self.cb_polaroid, 4, 0)
-        gb_layout.addWidget(self.cb_cardshadow, 4, 1)
+        decorative_layout.addWidget(self.cb_black, 0, 0)
+        decorative_layout.addWidget(self.cb_white, 1, 0)
+        decorative_layout.addWidget(self.cb_frame, 2, 0)
+        decorative_layout.addWidget(self.cb_vignette, 3, 0)
+        decorative_layout.addWidget(self.cb_polaroid, 4, 0)
+        decorative_layout.addWidget(self.cb_cardshadow, 5, 0)
 
-        add_helpful_header(5, "Style / Detail Bias")
-        self.cb_real = GoldenCheckBox("Bias Toward Photorealism")
-        self.cb_paint = GoldenCheckBox("Bias Toward Painterly Style")
-        self.cb_minimal = GoldenCheckBox("Bias Toward Minimalistic Composition")
+        self.cb_real = GoldenCheckBox("Photorealistic")
+        self.cb_paint = GoldenCheckBox("Painterly")
+        self.cb_minimal = GoldenCheckBox("Minimalistic")
         self.cb_simplified_details = GoldenCheckBox("Simplified Details")
-        gb_layout.addWidget(self.cb_real, 6, 0)
-        gb_layout.addWidget(self.cb_paint, 6, 1)
-        gb_layout.addWidget(self.cb_minimal, 7, 0)
-        gb_layout.addWidget(self.cb_simplified_details, 8, 0, 1, 2)
+        style_layout.addWidget(self.cb_real, 0, 0)
+        style_layout.addWidget(self.cb_paint, 1, 0)
+        style_layout.addWidget(self.cb_minimal, 2, 0)
 
-        add_helpful_header(9, "Image Safety / Clean Output")
         self.cb_forbid = GoldenCheckBox("No Text in the Image")
         self.cb_clean_composition = GoldenCheckBox("Clean Composition")
-        gb_layout.addWidget(self.cb_forbid, 10, 0, 1, 2)
-        gb_layout.addWidget(self.cb_clean_composition, 11, 0, 1, 2)
+        safety_layout.addWidget(self.cb_forbid, 0, 0)
+        safety_layout.addWidget(self.cb_clean_composition, 1, 0)
+        safety_layout.addWidget(self.cb_simplified_details, 2, 0)
 
-        add_helpful_header(12, "Camera / Framing")
         self.cb_strong_focal_point = GoldenCheckBox("Strong Focal Point")
         _set_help(
             self.cb_strong_focal_point,
@@ -2131,42 +2375,77 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self.cb_wide_scene,
             "Wide Scene means showing more environment inside the same portrait 2048×3072 frame. It does not change the aspect ratio.",
         )
-        gb_layout.addWidget(self.cb_strong_focal_point, 13, 0, 1, 2)
-        gb_layout.addWidget(self.cb_dynamic_angle, 14, 0)
-        gb_layout.addWidget(self.cb_cinematic_framing, 14, 1)
-        gb_layout.addWidget(self.cb_close_up_focus, 15, 0)
-        gb_layout.addWidget(self.cb_full_body_view, 15, 1)
-        gb_layout.addWidget(self.cb_wide_scene, 16, 0)
+        camera_layout.addWidget(self.cb_strong_focal_point, 0, 0)
+        camera_layout.addWidget(self.cb_dynamic_angle, 1, 0)
+        camera_layout.addWidget(self.cb_cinematic_framing, 2, 0)
+        camera_layout.addWidget(self.cb_close_up_focus, 3, 0)
+        camera_layout.addWidget(self.cb_full_body_view, 4, 0)
+        camera_layout.addWidget(self.cb_wide_scene, 5, 0)
+
+        gb_layout.addWidget(decorative_group, 1, 0, 1, 2)
+        gb_layout.addWidget(style_group, 2, 0, 1, 2)
+        gb_layout.addWidget(safety_group, 3, 0, 1, 2)
+        gb_layout.addWidget(camera_group, 4, 0, 1, 2)
 
         left_v.addWidget(self.gb_helpful)
 
-        lbl_global = QtWidgets.QLabel("Apply to All Images")
-        lbl_global.setStyleSheet(f"font-weight:900; color:{COL_GLOBAL};")
+        global_card = QtWidgets.QFrame()
+        global_card.setObjectName("sectionCard")
+        global_layout = QtWidgets.QVBoxLayout(global_card)
+        global_layout.setContentsMargins(14, 12, 14, 14)
+        global_layout.setSpacing(8)
+
+        self.lbl_global = QtWidgets.QLabel("Apply to All Images")
+        self.lbl_global.setObjectName("sectionTitle")
+        self.lbl_global.setStyleSheet(f"color:{COL_GLOBAL};")
         _set_help(
-            lbl_global,
+            self.lbl_global,
             "Anything written here is added to every generated image prompt, so use it for shared ideas, mood, setting, or details that should apply across the full set.",
         )
-        left_v.addWidget(lbl_global)
+        global_layout.addWidget(self.lbl_global)
         self.txt_global = QtWidgets.QPlainTextEdit()
+        self.txt_global.setLineWrapMode(
+            QtWidgets.QPlainTextEdit.LineWrapMode.WidgetWidth
+        )
+        self.txt_global.setWordWrapMode(
+            QtGui.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
+        )
+        self.txt_global.document().setDocumentMargin(6)
         self.txt_global.setPlaceholderText("Add ideas that should be applied across every image in the set.")
-        self.txt_global.setMaximumHeight(120)
+        self.txt_global.setMinimumHeight(92)
+        self.txt_global.setMaximumHeight(132)
         _set_help(
             self.txt_global,
             "Anything written here is added to every generated image prompt, so use it for shared ideas, mood, setting, or details that should apply across the full set.",
         )
-        left_v.addWidget(self.txt_global)
+        global_layout.addWidget(self.txt_global)
+        left_v.addWidget(global_card)
+
+        details_card = QtWidgets.QFrame()
+        details_card.setObjectName("sectionCard")
+        details_layout = QtWidgets.QVBoxLayout(details_card)
+        details_layout.setContentsMargins(14, 12, 14, 14)
+        details_layout.setSpacing(8)
 
         per_lbl = QtWidgets.QLabel("Details for Each Image")
-        per_lbl.setStyleSheet("font-weight:900; color:#ffffff;")
+        per_lbl.setObjectName("sectionTitle")
         _set_help(
             per_lbl,
             "Use these fields for details that should affect only one specific image, not the whole image set.",
         )
-        left_v.addWidget(per_lbl)
+        details_layout.addWidget(per_lbl)
 
         for page in self._page_specs:
             editor = QtWidgets.QPlainTextEdit()
-            editor.setMaximumHeight(70)
+            editor.setLineWrapMode(
+                QtWidgets.QPlainTextEdit.LineWrapMode.WidgetWidth
+            )
+            editor.setWordWrapMode(
+                QtGui.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
+            )
+            editor.document().setDocumentMargin(6)
+            editor.setMinimumHeight(76)
+            editor.setMaximumHeight(96)
             editor.setPlaceholderText(
                 f"Add details that should apply only to {page.output_filename}."
             )
@@ -2175,52 +2454,77 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 f"{page.detail_help}"
             )
             label = QtWidgets.QLabel(page.output_filename)
-            label.setStyleSheet(f"font-weight:900; color:{page.preview_color};")
+            label.setProperty("pageDetailLabel", True)
+            label.setStyleSheet(f"color:{page.preview_color};")
             _set_help(label, help_text)
             _set_help(editor, help_text)
-            left_v.addWidget(label)
-            left_v.addWidget(editor)
+            details_layout.addWidget(label)
+            details_layout.addWidget(editor)
             page.detail_widget = editor
             setattr(self, f"txt_{page.key}", editor)
+        left_v.addWidget(details_card)
         left_v.addStretch(1)
 
-        right_v = QtWidgets.QVBoxLayout(); right_v.setSpacing(8)
-        main_h.addLayout(right_v, 1)
+        output_panel = QtWidgets.QWidget()
+        output_panel.setObjectName("outputPanel")
+        right_v = QtWidgets.QVBoxLayout(output_panel)
+        right_v.setContentsMargins(0, 0, 0, 0)
+        right_v.setSpacing(8)
+        main_h.addWidget(output_panel, 11)
 
-        self._preview_scroll = QtWidgets.QScrollArea(); self._preview_scroll.setWidgetResizable(True)
+        output_title = QtWidgets.QLabel("Generated Prompts")
+        output_title.setObjectName("columnTitle")
+        right_v.addWidget(output_title)
+        output_hint = QtWidgets.QLabel(
+            "Generate the coordinated set, then copy one prompt or all four."
+        )
+        output_hint.setObjectName("columnHint")
+        output_hint.setWordWrap(True)
+        right_v.addWidget(output_hint)
+
+        self._preview_scroll = QtWidgets.QScrollArea()
+        self._preview_scroll.setWidgetResizable(True)
         self._preview_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self._preview_scroll.setObjectName("previewScroll")
         preview_container = QtWidgets.QWidget()
+        preview_container.setObjectName("previewContainer")
         self._preview_layout = QtWidgets.QVBoxLayout(preview_container)
-        self._preview_layout.setContentsMargins(0, 0, 0, 0)
+        self._preview_layout.setContentsMargins(0, 0, 8, 0)
         self._preview_layout.setSpacing(12)
 
         for page in self._page_specs:
             block = QtWidgets.QFrame()
+            block.setObjectName("promptCard")
+            block.setProperty("pageKey", page.key)
             block.setFrameShape(QtWidgets.QFrame.Box)
             block.setFrameShadow(QtWidgets.QFrame.Plain)
-            block.setStyleSheet("QFrame { border: 1px solid #222228; border-radius:6px; background: transparent; }")
             bl = QtWidgets.QVBoxLayout(block)
-            bl.setContentsMargins(8, 8, 8, 8)
-            bl.setSpacing(6)
+            bl.setContentsMargins(12, 10, 12, 12)
+            bl.setSpacing(8)
 
             header_row = QtWidgets.QHBoxLayout()
             header_label = QtWidgets.QLabel(page.display_label)
-            header_label.setStyleSheet(f"font-weight:900; color: {page.preview_color};")
+            header_label.setProperty("promptTitle", True)
+            header_label.setStyleSheet(f"color:{page.preview_color};")
             header_row.addWidget(header_label)
             header_row.addStretch(1)
             copy_btn = QtWidgets.QPushButton("Copy")
-            copy_btn.setFixedSize(64, 24)
+            copy_btn.setObjectName("promptCopyButton")
+            copy_btn.setFixedSize(68, 28)
+            copy_btn.setCursor(Qt.PointingHandCursor)
             copy_btn.setToolTip(f"Copy {page.display_label}")
             copy_btn.setEnabled(False)
             header_row.addWidget(copy_btn)
             bl.addLayout(header_row)
 
             editor = FocusablePlainTextEdit()
+            editor.setObjectName("promptOutput")
             editor.setReadOnly(True)
             editor.setAcceptRichText(True)
             editor.setPlaceholderText(f"Prompt for {page.display_label}")
             editor.setMinimumHeight(140)
             editor.setMaximumHeight(260)
+            editor.document().setDocumentMargin(8)
             bl.addWidget(editor)
 
             self._preview_layout.addWidget(block)
@@ -2237,56 +2541,185 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def _apply_styles(self):
         self.setStyleSheet(
             """
-            QWidget#PromptWriterPanel { background: rgba(0,0,0,0); }
+            QWidget#PromptWriterPanel {
+                background: rgba(0,0,0,0);
+                color: #d9e6ec;
+                font-family: 'Segoe UI';
+                font-size: 11px;
+            }
             QFrame#container {
-                background-color: #131318;
-                border: 1px solid #23232a;
-                border-radius: 10px;
+                background-color: #1a1b1d;
+                border: 1px solid #303438;
+                border-radius: 16px;
             }
-            QGroupBox#gb_helpful, QGroupBox {
-                border: none;
-                background: transparent;
+            QFrame#actionBar {
+                background: #1e2023;
+                border: 1px solid #2b3034;
+                border-radius: 12px;
+            }
+            QFrame#sectionCard,
+            QGroupBox#helpfulCard {
+                background: #202225;
+                border: 1px solid #2c3034;
+                border-radius: 14px;
+            }
+            QGroupBox#helpfulCard {
                 padding: 0;
-                margin-top: 0;
+                margin: 0;
             }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 0px;
-                padding: 0 0 6px 0;
+            QGroupBox#helpfulCard::title {
+                height: 0;
+                padding: 0;
+                margin: 0;
             }
             QLabel {
-                color: #dcdce0;
+                color: #d9e6ec;
                 background: transparent;
+            }
+            QLabel#columnTitle {
+                color: #f2fbff;
+                font: 650 14px 'Segoe UI';
+            }
+            QLabel#columnHint,
+            QLabel#sectionHint,
+            QLabel#visionaryPrefix {
+                color: #93a7b3;
+                font: 10px 'Segoe UI';
+            }
+            QLabel#sectionTitle {
+                color: #eaf8fc;
+                font: 700 12px 'Segoe UI';
+            }
+            QLabel[inputLabel="true"] {
+                color: #b9ccd5;
+                font: 600 10px 'Segoe UI';
+            }
+            QLabel[pageDetailLabel="true"],
+            QLabel[promptTitle="true"] {
+                font: 700 10px 'Segoe UI';
             }
             QPushButton {
                 padding: 6px 12px;
-                background: transparent;
-                border: 1px solid #313543;
-                color: #eaeaf0;
-                border-radius: 6px;
+                background: #25282b;
+                border: 1px solid #3a4045;
+                color: #edf7fb;
+                border-radius: 10px;
+                font: 600 10px 'Segoe UI';
             }
             QPushButton:hover {
-                background: rgba(59, 124, 240, 0.12);
-                border-color: #3b7cf0;
+                background: #293537;
+                border-color: #00b2b2;
+                color: #ffffff;
+            }
+            QPushButton:pressed {
+                background: #191c1f;
+            }
+            QPushButton:disabled {
+                color: #61727a;
+                background: #1d1f21;
+                border-color: #2c3033;
+            }
+            QPushButton#primaryButton {
+                background: #13585d;
+                border-color: #00b2b2;
+                color: #ffffff;
+                font-weight: 700;
+            }
+            QPushButton#primaryButton:hover {
+                background: #176c70;
+                border-color: #74e1e1;
+            }
+            QPushButton#dangerButton {
+                color: #ffb8bf;
+                border-color: #65434a;
+                background: #25191d;
+            }
+            QPushButton#dangerButton:hover {
+                color: #ffffff;
+                border-color: #d85c6a;
+                background: #702f38;
             }
             QLineEdit, QComboBox, QPlainTextEdit, QTextEdit {
-                background: rgba(7, 9, 13, 0.72);
-                color: #e8e8ea;
-                border: 1px solid #232834;
-                border-radius: 6px;
-                padding: 6px;
+                background: #151719;
+                color: #edf7fb;
+                border: 1px solid #373d42;
+                border-radius: 9px;
+                padding: 4px 7px;
+                selection-background-color: #215052;
+                selection-color: #ffffff;
+            }
+            QLineEdit:focus, QComboBox:focus,
+            QPlainTextEdit:focus, QTextEdit:focus {
+                border-color: #00b2b2;
+            }
+            QComboBox {
+                padding-right: 26px;
+            }
+            QComboBox::drop-down {
+                width: 24px;
+                border: none;
+                border-left: 1px solid #343a3e;
+            }
+            QComboBox QAbstractItemView {
+                background: #1c1f21;
+                color: #edf7fb;
+                border: 1px solid #3a4145;
+                selection-background-color: #215052;
+                outline: none;
+            }
+            QFrame#promptCard {
+                background: #202225;
+                border: 1px solid #34393d;
+                border-radius: 14px;
+            }
+            QFrame#promptCard[pageKey="cover"] { border-color: #71631e; }
+            QFrame#promptCard[pageKey="letter"] { border-color: #4c6a28; }
+            QFrame#promptCard[pageKey="wall"] { border-color: #28557a; }
+            QFrame#promptCard[pageKey="back"] { border-color: #765027; }
+            QTextEdit#promptOutput {
+                background: #151719;
+                color: #dce9ef;
+                border: 1px solid #343a3e;
+                border-radius: 10px;
+                padding: 0;
+            }
+            QTextEdit#promptOutput:focus {
+                border-color: #00b2b2;
+            }
+            QPushButton#promptCopyButton {
+                padding: 4px 10px;
             }
             QScrollArea {
                 background: transparent;
                 border: none;
             }
-            QScrollArea#left_scroll QWidget {
+            QScrollArea#left_scroll QWidget#leftPanel,
+            QScrollArea#previewScroll QWidget#previewContainer {
                 background: transparent;
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 10px;
+                margin: 2px 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #315a68;
+                border-radius: 4px;
+                min-height: 28px;
+            }
+            QScrollBar::handle:vertical:hover { background: #3b7181; }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical,
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: transparent;
+                border: none;
+                height: 0;
             }
             QToolTip {
                 background: #10141d;
                 color: #ecf2ff;
-                border: 1px solid #2d4267;
+                border: 1px solid #31505f;
                 padding: 6px 8px;
             }
             """ + CHECKBOX_QSS
@@ -2460,6 +2893,108 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def _set_last_focused(self, widget: QtWidgets.QTextEdit):
         self._last_focused_widget = widget
+
+    @staticmethod
+    def _color_preview_range(
+        document: QtGui.QTextDocument,
+        start: int,
+        length: int,
+        color: str,
+        *,
+        bold: bool = False,
+    ) -> None:
+        if start < 0 or length <= 0:
+            return
+        cursor = QtGui.QTextCursor(document)
+        cursor.setPosition(start)
+        cursor.setPosition(start + length, QtGui.QTextCursor.KeepAnchor)
+        text_format = QtGui.QTextCharFormat()
+        text_format.setForeground(QColor(color))
+        if bold:
+            text_format.setFontWeight(QtGui.QFont.Bold)
+        cursor.mergeCharFormat(text_format)
+
+    def _set_colored_saved_preview(self, page: PageSpec, text: str) -> None:
+        """Restore exact saved prompt text while reapplying its semantic colors."""
+        widget = page.preview_widget
+        if widget is None:
+            return
+        widget.setPlainText(text)
+        plain = widget.toPlainText()
+        document = widget.document()
+
+        def color_exact(
+            prefix: str,
+            value: str,
+            suffix: str,
+            color: str,
+            *,
+            bold: bool = False,
+        ) -> None:
+            if not value:
+                return
+            needle = f"{prefix}{value}{suffix}"
+            match = plain.find(needle)
+            if match >= 0:
+                self._color_preview_range(
+                    document,
+                    match + len(prefix),
+                    len(value),
+                    color,
+                    bold=bold,
+                )
+
+        subject = _without_terminal_punctuation(
+            self.cmb_subject.currentText(),
+            max_length=300,
+        )
+        first_paragraph_end = plain.find("\n\n")
+        first_paragraph = plain if first_paragraph_end < 0 else plain[:first_paragraph_end]
+        subject_start = first_paragraph.rfind(subject) if subject else -1
+        self._color_preview_range(
+            document,
+            subject_start,
+            len(subject),
+            COL_SUBJECT,
+            bold=True,
+        )
+
+        type_choice = self.cmb_type.currentText().strip()
+        if type_choice == NONE_CHOICE_LABEL:
+            type_choice = ""
+        type_choice = _normalize_prompt_fragment(type_choice, max_length=300)
+        color_choice = _normalize_prompt_fragment(
+            self._get_color_choice() or "",
+            max_length=300,
+        )
+        global_extra = _normalize_prompt_fragment(self.txt_global.toPlainText())
+        image_extra = _normalize_prompt_fragment(
+            page.detail_widget.toPlainText() if page.detail_widget is not None else ""
+        )
+
+        color_exact("Use ", type_choice, " as the visual style.", COL_TYPE, bold=True)
+        color_exact("Use the ", color_choice, " palette.", COL_SCHEME, bold=True)
+        color_exact("Shared visual direction: ", global_extra, "", COL_GLOBAL)
+        color_exact("Page-specific direction: ", image_extra, "", page.preview_color)
+
+        guidance_start = plain.find("Guidance:")
+        if guidance_start >= 0:
+            guidance_end = plain.find("\n\n", guidance_start)
+            if guidance_end < 0:
+                guidance_end = len(plain)
+            self._color_preview_range(
+                document,
+                guidance_start,
+                guidance_end - guidance_start,
+                COL_HELPFUL,
+            )
+            self._color_preview_range(
+                document,
+                guidance_start,
+                len("Guidance:"),
+                COL_HELPFUL,
+                bold=True,
+            )
 
     def _set_generation_busy(self, busy: bool) -> None:
         self._generation_in_progress = bool(busy)
@@ -2729,7 +3264,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def _start_visionary_pulse(self):
         try:
-            self._visionary_colors = [QColor("#2d6bff"), QColor("#03d5ff"), QColor("#ffffff"), QColor("#03d5ff")]
+            self._visionary_colors = [
+                QColor("#008f8f"),
+                QColor("#00b2b2"),
+                QColor("#8ce3e3"),
+                QColor("#00b2b2"),
+            ]
             self._visionary_index = 0
             self._visionary_timer = QtCore.QTimer(self)
             self._visionary_timer.setInterval(520)
@@ -2751,10 +3291,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         style = (
             "QPushButton#visionary_btn{"
-            "background:transparent;border:none;padding:0 6px;"
-            "font-weight:700;text-decoration:underline;color:%s;"
+            "background:#25282b;border:1px solid %s;border-radius:10px;padding:5px 12px;"
+            "font:700 10px 'Segoe UI';color:#dffbff;"
             "}"
-            "QPushButton#visionary_btn:hover{color:#ffffff;}"
+            "QPushButton#visionary_btn:hover{background:#293537;color:#ffffff;}"
         ) % col.name()
         try:
             self.btn_visionary.setStyleSheet(style)
@@ -2776,8 +3316,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
         screen_obj = self.screen() or QtGui.QGuiApplication.primaryScreen()
         avail = screen_obj.availableGeometry() if screen_obj else QtGui.QGuiApplication.primaryScreen().availableGeometry()
 
-        w = min(int(avail.width() * 0.72), 980)
-        h = min(int(avail.height() * 0.82), 820)
+        w = min(int(avail.width() * 0.816), 1104)
+        h = min(int(avail.height() * 0.84), 860)
         target = QtCore.QRect(avail.x() + 24, avail.y() + 24, w, h)
         off = QtCore.QRect(target.x() - w, target.y(), w, h)
 

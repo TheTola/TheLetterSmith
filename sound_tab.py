@@ -94,6 +94,7 @@ VALID_AUDIO_EXTS = {
 ANALYSIS_SETTINGS_KEY = "enable_sound_analysis"
 LAST_MUSIC_FOLDER_KEY = "last_music_folder"
 CROSSFADE_MS = 1000
+LOOP_DELAY_MS = 1200
 
 
 def _format_duration(
@@ -2107,6 +2108,22 @@ class PlaylistPlayer(
             self._crossfade_step
         )
 
+        self._loop_timer = QtCore.QTimer(
+            self
+        )
+
+        self._loop_timer.setSingleShot(
+            True
+        )
+
+        self._loop_timer.setInterval(
+            LOOP_DELAY_MS
+        )
+
+        self._loop_timer.timeout.connect(
+            self._advance_after_loop_delay
+        )
+
         self._crossfade_elapsed = 0
         self._crossfade_from = -1
         self._crossfade_to = -1
@@ -2294,6 +2311,8 @@ class PlaylistPlayer(
     def play(
         self,
     ) -> None:
+        self._loop_timer.stop()
+
         if (
             not self.queue
             or self.current_index < 0
@@ -2318,6 +2337,8 @@ class PlaylistPlayer(
     def pause(
         self,
     ) -> None:
+        self._loop_timer.stop()
+
         self._cancel_crossfade(
             keep_active=True
         )
@@ -2332,6 +2353,8 @@ class PlaylistPlayer(
         self,
         reset_position: bool = True,
     ) -> None:
+        self._loop_timer.stop()
+
         self._cancel_crossfade(
             keep_active=True
         )
@@ -2395,12 +2418,7 @@ class PlaylistPlayer(
         self,
         autoplay: bool = True,
     ) -> None:
-        if (
-            self.current_index + 1
-            >= len(
-                self.queue
-            )
-        ):
+        if not self.queue:
             self.stop(
                 reset_position=True
             )
@@ -2411,7 +2429,11 @@ class PlaylistPlayer(
             reset_position=True
         )
 
-        self.current_index += 1
+        self.current_index = (
+            self.current_index + 1
+        ) % len(
+            self.queue
+        )
         self._load_active_source()
 
         if autoplay:
@@ -2462,10 +2484,6 @@ class PlaylistPlayer(
                 self.queue
             )
             > 1
-            and self.current_index + 1
-            < len(
-                self.queue
-            )
             and duration
             > CROSSFADE_MS + 500
             and 0
@@ -2508,18 +2526,16 @@ class PlaylistPlayer(
             != QMediaPlayer.EndOfMedia
             or slot != self.active_slot
             or self._transitioning
+            or self._loop_timer.isActive()
         ):
             return
 
-        if (
-            self.current_index + 1
-            < len(
-                self.queue
+        if self.queue:
+            self.playbackChanged.emit(
+                False
             )
-        ):
-            self.next(
-                autoplay=True
-            )
+
+            self._loop_timer.start()
 
             return
 
@@ -2528,6 +2544,14 @@ class PlaylistPlayer(
         )
 
         self.finished.emit()
+
+    def _advance_after_loop_delay(
+        self,
+    ) -> None:
+        if self.queue:
+            self.next(
+                autoplay=True
+            )
 
     def _on_error(
         self,
@@ -2547,12 +2571,9 @@ class PlaylistPlayer(
     ) -> None:
         next_index = (
             self.current_index + 1
-        )
-
-        if next_index >= len(
+        ) % len(
             self.queue
-        ):
-            return
+        )
 
         next_slot = (
             1 - self.active_slot
@@ -2668,7 +2689,11 @@ class PlaylistPlayer(
         )
 
         self.active_slot = new_slot
-        self.current_index += 1
+        self.current_index = (
+            self.current_index + 1
+        ) % len(
+            self.queue
+        )
         self._transitioning = False
         self._crossfade_from = -1
         self._crossfade_to = -1

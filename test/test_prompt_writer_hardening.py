@@ -4,12 +4,24 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
 from PromptWriterPanel import (
+    COL_BACK,
+    COL_COVER,
+    COL_GLOBAL,
+    COL_HELPFUL,
+    COL_LETTER,
+    COL_SCHEME,
+    COL_SUBJECT,
+    COL_TYPE,
+    COL_WALL,
     HIDDEN_FRAMING_DEFAULT,
     HIDDEN_STYLE_DEFAULT,
+    ListManagerDialog,
+    ManagedListEntry,
     PromptWriterPanel,
+    USER_ADDED_HEADER,
     reset_prompt_writer_state_file,
 )
 from saved_letters import (
@@ -67,6 +79,56 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.panel.cb_close_up_focus.setChecked(True)
         self.assertNotIn(HIDDEN_STYLE_DEFAULT, self.panel._collect_guidance())
         self.assertNotIn(HIDDEN_FRAMING_DEFAULT, self.panel._collect_guidance())
+
+    def test_source_labels_and_generated_segments_share_unique_colors(self):
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+        self.panel.ensurePolished()
+
+        source_labels = {
+            self.panel.lbl_type: COL_TYPE,
+            self.panel.lbl_subject: COL_SUBJECT,
+            self.panel.lbl_color: COL_SCHEME,
+            self.panel.lbl_helpful: COL_HELPFUL,
+            self.panel.lbl_global: COL_GLOBAL,
+        }
+        page_labels = {
+            label.text(): label
+            for label in self.panel.findChildren(QtWidgets.QLabel)
+            if label.text() in {page.output_filename for page in self.panel._page_specs}
+        }
+        for page in self.panel._page_specs:
+            source_labels[page_labels[page.output_filename]] = page.preview_color
+
+        self.assertEqual(len(set(source_labels.values())), len(source_labels))
+        for label, expected in source_labels.items():
+            label.ensurePolished()
+            self.assertEqual(
+                label.palette().color(QtGui.QPalette.WindowText).name().casefold(),
+                expected.casefold(),
+            )
+
+        self.panel.cmb_type.setCurrentText("Illustration")
+        self.panel.cmb_subject.addItem("Excitement")
+        self.panel.cmb_subject.setCurrentText("Excitement")
+        self.panel.cmb_color.setCurrentText("Ruby")
+        self.panel.txt_global.setPlainText("Shared violet sky")
+        self.panel.cb_black.setChecked(True)
+        for page in self.panel._page_specs:
+            page.detail_widget.setPlainText(f"Exact {page.key} detail")
+
+        self.panel._on_generate()
+
+        for page in self.panel._page_specs:
+            html = page.preview_widget.toHtml().casefold()
+            for expected in (
+                COL_TYPE,
+                COL_SUBJECT,
+                COL_SCHEME,
+                COL_HELPFUL,
+                COL_GLOBAL,
+                page.preview_color,
+            ):
+                self.assertIn(expected.casefold(), html)
 
     def test_reset_clears_prompt_writer_but_preserves_user_options(self):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
@@ -208,6 +270,140 @@ class PromptWriterHardeningTests(unittest.TestCase):
             [],
         )
 
+    def test_duplicate_notice_is_click_through_and_normalizes_color_names(self):
+        dialog = ListManagerDialog(
+            title="Color Scheme",
+            entries=[
+                ManagedListEntry("Two-Color Combinations", True),
+                ManagedListEntry("Blue and Lavender Purple"),
+                ManagedListEntry(USER_ADDED_HEADER, True),
+            ],
+            allow_headers=True,
+            auto_user_header=USER_ADDED_HEADER,
+            user_owned_only=True,
+        )
+        self.addCleanup(dialog.close)
+        dialog.show()
+        self.app.processEvents()
+
+        changes = []
+        dialog.entries_changed.connect(changes.append)
+        dialog.entry_edit.setText("  blue and lavender purple  ")
+        QtTest.QTest.mouseClick(dialog.btn_add, QtCore.Qt.LeftButton)
+        self.app.processEvents()
+
+        self.assertTrue(dialog._duplicate_notice.isVisible())
+        self.assertTrue(
+            dialog._duplicate_notice.windowFlags() & QtCore.Qt.WindowTransparentForInput
+        )
+        self.assertTrue(
+            dialog._duplicate_notice.testAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        )
+        self.assertEqual(changes, [])
+        self.assertEqual(
+            [entry.text for entry in dialog._entries].count("Blue and Lavender Purple"),
+            1,
+        )
+
+        dialog.entry_edit.setText("New Cyan Scheme")
+        QtTest.QTest.mouseClick(dialog.btn_add, QtCore.Qt.LeftButton)
+        self.app.processEvents()
+
+        self.assertFalse(dialog._duplicate_notice.isVisible())
+        self.assertIn("New Cyan Scheme", [entry.text for entry in dialog._entries])
+        self.assertEqual(len(changes), 1)
+
+    def test_color_reload_has_one_user_header_and_deduplicates_builtin_conflicts(self):
+        modules = self.project_root / "Prompter" / "modules"
+        (modules / "color.txt").write_text(
+            "-Two-Color Combinations\nBlue and Lavender Purple\n\n"
+            "-User Added\n  blue and lavender purple  \nCustom Cyan\n",
+            encoding="utf-8",
+        )
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+
+        for _ in range(3):
+            self.panel._reload_managed_list("color")
+            entries = self.panel._read_managed_entries("color")
+            self.assertEqual(
+                [entry.text for entry in entries if entry.is_header].count(USER_ADDED_HEADER),
+                1,
+            )
+            self.assertEqual(
+                [entry.text.casefold() for entry in entries if not entry.is_header].count(
+                    "blue and lavender purple"
+                ),
+                1,
+            )
+            self.assertIn("Custom Cyan", [entry.text for entry in entries if entry.is_user])
+
+        self.assertEqual(
+            [self.panel.cmb_color.itemText(index) for index in range(self.panel.cmb_color.count())].count(
+                USER_ADDED_HEADER
+            ),
+            1,
+        )
+
+    def test_color_state_restore_reuses_normalized_builtin_entry(self):
+        modules = self.project_root / "Prompter" / "modules"
+        (modules / "color.txt").write_text(
+            "-Two-Color Combinations\nBlue and Lavender Purple\n",
+            encoding="utf-8",
+        )
+        (self.project_root / "prompt_writer_state.json").write_text(
+            json.dumps({"color": "  blue and lavender purple  "}),
+            encoding="utf-8",
+        )
+
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+
+        self.assertEqual(self.panel.cmb_color.currentText(), "Blue and Lavender Purple")
+        self.assertEqual(
+            [
+                self.panel.cmb_color.itemText(index).casefold()
+                for index in range(self.panel.cmb_color.count())
+            ].count("blue and lavender purple"),
+            1,
+        )
+
+    def test_bundled_color_schemes_include_each_intended_option_once(self):
+        color_path = Path(__file__).resolve().parents[1] / "Prompter" / "modules" / "color.txt"
+        choices = [
+            line.strip()
+            for line in color_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("-")
+        ]
+        for expected in (
+            "Blue and Lavender Purple",
+            "Turquoise Gold",
+            "Deep Violet Kintsugi",
+            "Turquoise Black",
+            "Gold Kintsugi",
+            "Natural Colors",
+        ):
+            self.assertEqual(choices.count(expected), 1)
+
+    def test_helpful_guidance_stacks_groups_to_prevent_horizontal_overflow(self):
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+        layout = self.panel.gb_helpful.layout()
+        positions = {}
+        for object_name in (
+            "helpful_decorative_frames",
+            "helpful_style_bias",
+            "helpful_image_safety",
+            "helpful_camera_framing",
+        ):
+            group = self.panel.gb_helpful.findChild(QtWidgets.QGroupBox, object_name)
+            self.assertIsNotNone(group)
+            row, column, _row_span, _column_span = layout.getItemPosition(layout.indexOf(group))
+            positions[object_name] = (row, column)
+
+        self.assertEqual(
+            [positions[name][0] for name in positions],
+            [1, 2, 3, 4],
+        )
+        self.assertEqual({column for _row, column in positions.values()}, {0})
+
     def test_malformed_persisted_generated_output_is_invalidated(self):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
         self.panel.cmb_subject.setCurrentText("Subject")
@@ -281,6 +477,21 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.assertEqual(self.panel._generated_prompts, expected_prompts)
         self.assertEqual(self.panel._generated_prompts["cover"], exact_cover)
         self.assertTrue(self.panel._generated_output_valid)
+        cover_page = next(page for page in self.panel._page_specs if page.key == "cover")
+        self.assertEqual(
+            cover_page.preview_widget.toPlainText(),
+            exact_cover.replace("\r\n", "\n"),
+        )
+        restored_html = cover_page.preview_widget.toHtml().casefold()
+        for expected in (
+            COL_TYPE,
+            COL_SUBJECT,
+            COL_SCHEME,
+            COL_HELPFUL,
+            COL_GLOBAL,
+            COL_COVER,
+        ):
+            self.assertIn(expected.casefold(), restored_html)
 
     def test_overlong_module_entries_are_rejected(self):
         modules = self.project_root / "Prompter" / "modules"

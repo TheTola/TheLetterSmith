@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 from typing import Iterable, Optional
 
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 RGB = tuple[int, int, int]
 Lab = tuple[float, float, float]
@@ -32,6 +32,8 @@ _EXTREME_INTERIOR_THRESHOLD = 0.20
 _CURTAIN_LOW_PERCENTILE = 0.02
 _CURTAIN_MID_PERCENTILE = 0.50
 _CURTAIN_HIGH_PERCENTILE = 0.98
+_BANNER_TRANSPARENT_ALPHA = 3
+_BANNER_OPAQUE_ALPHA = 248
 
 
 def extract_deep_dominant_color(image_path: Path, *, hue_shift: float = 0.0) -> RGB:
@@ -185,13 +187,10 @@ def is_gold_pixel(red: int, green: int, blue: int, alpha: int) -> bool:
         green / 255.0,
         blue / 255.0,
     )
-    warm_highlight = red >= green >= blue and red - blue >= 45
     return bool(
         value >= 0.10
-        and (
-            (hue <= 0.19 and saturation >= 0.28)
-            or (warm_highlight and saturation >= 0.18)
-        )
+        and hue <= 0.19
+        and saturation >= 0.55
     )
 
 
@@ -211,7 +210,7 @@ def is_cream_banner_pixel(
     )
     return bool(
         value >= 0.28
-        and saturation <= 0.20
+        and saturation <= 0.48
         and red - blue >= 3
         and green - blue >= 2
     )
@@ -256,8 +255,11 @@ def recolor_banner_to_curtain_color(
     image: Image.Image,
     curtain_rgb: RGB,
 ) -> Image.Image:
-    """Theme the non-gold banner artwork while retaining source alpha and shade."""
+    """Theme banner artwork while preserving shading and useful edge alpha."""
     source = image.convert("RGBA")
+    source.putalpha(
+        source.getchannel("A").point(_clean_banner_alpha)
+    )
     width, height = source.size
     source_pixels = list(source.get_flattened_data())
     gold_seed = Image.new("L", source.size)
@@ -267,8 +269,22 @@ def recolor_banner_to_curtain_color(
             for pixel in source_pixels
         ]
     )
-    gold_mask = list(
-        gold_seed.filter(ImageFilter.MaxFilter(7)).get_flattened_data()
+    closed_gold_mask = list(
+        gold_seed.filter(ImageFilter.MaxFilter(11))
+        .filter(ImageFilter.MinFilter(11))
+        .get_flattened_data()
+    )
+    gold_mask = [
+        max(seed, closed)
+        for seed, closed in zip(
+            gold_seed.get_flattened_data(),
+            closed_gold_mask,
+        )
+    ]
+    parchment_mask = _connected_banner_parchment_mask(
+        source_pixels,
+        width=width,
+        height=height,
     )
     categories = bytearray(len(source_pixels))
     luminances = bytearray(len(source_pixels))
@@ -297,16 +313,11 @@ def recolor_banner_to_curtain_color(
             if _is_white_gem_sparkle(red, green, blue):
                 continue
             category = 3
-        elif is_cream_banner_pixel(red, green, blue, alpha) or (
-            _is_central_banner_neutral(
-                red,
-                green,
-                blue,
-                x=x,
-                y=y,
-                width=width,
-                height=height,
-            )
+        elif parchment_mask[index] or is_cream_banner_pixel(
+            red,
+            green,
+            blue,
+            alpha,
         ):
             category = 1
         elif is_gray_ribbon_pixel(red, green, blue, alpha):
@@ -345,6 +356,14 @@ def recolor_banner_to_curtain_color(
     themed = Image.new("RGBA", source.size)
     themed.putdata(themed_pixels)
     return themed
+
+
+def _clean_banner_alpha(alpha: int) -> int:
+    if alpha <= _BANNER_TRANSPARENT_ALPHA:
+        return 0
+    if alpha >= _BANNER_OPAQUE_ALPHA:
+        return 255
+    return alpha
 
 
 def write_recolored_banner_image(
@@ -424,27 +443,51 @@ def _is_white_gem_sparkle(red: int, green: int, blue: int) -> bool:
     ) <= 7
 
 
-def _is_central_banner_neutral(
+def _connected_banner_parchment_mask(
+    source_pixels: list[tuple[int, int, int, int]],
+    *,
+    width: int,
+    height: int,
+) -> bytearray:
+    candidate = Image.new("L", (width, height))
+    candidate.putdata(
+        [
+            255 if _is_neutral_parchment_candidate(*pixel) else 0
+            for pixel in source_pixels
+        ]
+    )
+    for normalized_x, normalized_y in (
+        (0.500, 0.500),
+        (0.064, 0.575),
+        (0.080, 0.575),
+        (0.936, 0.575),
+    ):
+        seed = (
+            round(normalized_x * max(0, width - 1)),
+            round(normalized_y * max(0, height - 1)),
+        )
+        if candidate.getpixel(seed) == 255:
+            ImageDraw.floodfill(candidate, seed, 128, thresh=0)
+    return bytearray(
+        1 if value == 128 else 0
+        for value in candidate.get_flattened_data()
+    )
+
+
+def _is_neutral_parchment_candidate(
     red: int,
     green: int,
     blue: int,
-    *,
-    x: int,
-    y: int,
-    width: int,
-    height: int,
+    alpha: int,
 ) -> bool:
+    if alpha <= 0:
+        return False
     _hue, saturation, value = colorsys.rgb_to_hsv(
         red / 255.0,
         green / 255.0,
         blue / 255.0,
     )
-    return bool(
-        0.10 * width <= x <= 0.90 * width
-        and 0.43 * height <= y <= 0.56 * height
-        and saturation <= 0.12
-        and value >= 0.72
-    )
+    return saturation <= 0.28 and value >= 0.25
 
 
 def _pixel_luminance(red: int, green: int, blue: int) -> int:

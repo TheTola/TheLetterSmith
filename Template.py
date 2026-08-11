@@ -391,6 +391,8 @@ document.addEventListener('DOMContentLoaded', () => {
   let flipping = false;
   let musicPlaylistIndex = 0;
   let playlistTransitioning = false;
+  let playlistTransitionTimer = null;
+  const musicLoopDelayMs = 1200;
   const muteStorageKey = 'lettersmith.viewerMuted';
   let viewerMuted = loadViewerMuted();
   let currentVolume = loadVolume0to100();
@@ -1092,27 +1094,60 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!music.getAttribute('src') || !music.src.endsWith(wanted)) music.src = wanted;
     return true;
   }
+  function nextMusicIndex(sources){
+    if (!sources.length) return -1;
+    return (musicPlaylistIndex + 1) % sources.length;
+  }
   function installPlaylistListeners(audio){
     if (!audio) return;
     audio.addEventListener('timeupdate', () => {
       if (audio !== music || playlistTransitioning) return;
       const sources = musicSources();
-      if (musicPlaylistIndex + 1 >= sources.length) return;
+      const crossfadeMs = Math.max(0, Number(MUSIC_CROSSFADE_MS) || 0);
+      if (sources.length < 2 || crossfadeMs <= 0) return;
       if (!Number.isFinite(audio.duration) || audio.duration <= 0) return;
       const remainingMs = (audio.duration - audio.currentTime) * 1000;
-      if (remainingMs > 0 && remainingMs <= Math.max(120, MUSIC_CROSSFADE_MS || 1000)) crossfadeToNextTrack();
+      if (remainingMs > 0 && remainingMs <= Math.max(120, crossfadeMs)) crossfadeToNextTrack();
     });
     audio.addEventListener('ended', () => {
       if (audio !== music || playlistTransitioning) return;
-      const sources = musicSources();
-      if (musicPlaylistIndex + 1 < sources.length) crossfadeToNextTrack();
+      advanceMusicSequence();
     });
+  }
+  function advanceMusicSequence(){
+    const sources = musicSources();
+    if (playlistTransitioning || !sources.length || !music) return;
+    if (sources.length > 1 && Number(MUSIC_CROSSFADE_MS) > 0){
+      crossfadeToNextTrack();
+      return;
+    }
+    const nextIndex = nextMusicIndex(sources);
+    playlistTransitioning = true;
+    if (playlistTransitionTimer !== null) clearTimeout(playlistTransitionTimer);
+    playlistTransitionTimer = setTimeout(() => {
+      playlistTransitionTimer = null;
+      const currentSources = musicSources();
+      if (!music || !currentSources.length){
+        playlistTransitioning = false;
+        return;
+      }
+      musicPlaylistIndex = nextIndex % currentSources.length;
+      const wanted = currentSources[musicPlaylistIndex];
+      try{
+        if (!music.getAttribute('src') || !music.src.endsWith(wanted)) music.src = wanted;
+        music.currentTime = 0;
+        music.volume = clamp(currentVolume / 100, 0, 1);
+        music.muted = viewerMuted || currentVolume === 0;
+        music.play().catch(()=>{});
+      }catch(_){ }
+      playlistTransitioning = false;
+    }, musicLoopDelayMs);
   }
   function crossfadeToNextTrack(){
     const sources = musicSources();
-    if (playlistTransitioning || musicPlaylistIndex + 1 >= sources.length || !music || !musicStandby) return;
+    if (playlistTransitioning || !sources.length || !music || !musicStandby) return;
     playlistTransitioning = true;
-    const nextIndex = musicPlaylistIndex + 1;
+    const nextIndex = nextMusicIndex(sources);
     const target = clamp(currentVolume / 100, 0, 1);
     const muted = viewerMuted || target === 0;
     musicStandby.src = sources[nextIndex];
