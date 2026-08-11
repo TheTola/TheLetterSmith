@@ -3,6 +3,7 @@ Pillow>=10.0.0
 pygame>=2.5.2
 mutagen>=1.47.0
 PySide6>=6.11.0,<7
+pyspellchecker>=0.9.0,<1
 boto3>=1.40.0,<2
 
 mammoth

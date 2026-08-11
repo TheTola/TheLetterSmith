@@ -50,16 +50,21 @@ MAX_MANAGED_LIST_ENTRY_LENGTH = 300
 # COLOR SYSTEM (UI + Prompt Preview)
 # =========================
 
-COL_TYPE = "#ff453a"       # GRAPHICS & ILLUSTRATION / CORAL RED
-COL_SUBJECT = "#ff2d95"    # SUBJECT / HOT PINK
-COL_SCHEME = "#30d158"     # COLOR SCHEME / GREEN
-COL_HELPFUL = "#64d2ff"    # HELPFUL OPTIONS / CYAN
-COL_GLOBAL = "#bf5af2"     # APPLY TO ALL / PURPLE
+PROMPT_COLORS: Dict[str, str] = {
+    "type": "#B084FF",
+    "subject": "#FF5C7A",
+    "scheme": "#35D07F",
+    "helpful": "#32C7E8",
+    "global": "#E5E7EB",
+    "cover": "#FFD54A",
+    "letter": "#4D8DFF",
+    "wall": "#FF8A3D",
+    "back": "#F25ACD",
+}
 
-COL_COVER = "#ffd60a"      # COVER / YELLOW
-COL_LETTER = "#a3ff12"     # LETTER / LIME
-COL_WALL = "#0a84ff"       # WALL / STRONG BLUE
-COL_BACK = "#ff9f0a"       # BACK / AMBER
+
+def prompt_color(semantic_key: str) -> str:
+    return PROMPT_COLORS[semantic_key]
 
 COL_CHECK = "#005dff"
 COL_CHECK_MARK = "#ffd60a"
@@ -103,12 +108,19 @@ class PageSpec:
     key: str
     display_label: str
     output_filename: str
-    preview_color: str
+    color_key: str
     baseline: str
     detail_help: str
     detail_widget: Optional[QtWidgets.QPlainTextEdit] = None
     preview_widget: Optional[QtWidgets.QTextEdit] = None
     copy_button: Optional[QtWidgets.QPushButton] = None
+    detail_label: Optional[QtWidgets.QLabel] = None
+    preview_title: Optional[QtWidgets.QLabel] = None
+    preview_card: Optional[QtWidgets.QFrame] = None
+
+    @property
+    def preview_color(self) -> str:
+        return prompt_color(self.color_key)
 
 
 PAGE_SPECS: Tuple[PageSpec, ...] = (
@@ -116,7 +128,7 @@ PAGE_SPECS: Tuple[PageSpec, ...] = (
         key="cover",
         display_label="Cover Prompt",
         output_filename="cover.png",
-        preview_color=COL_COVER,
+        color_key="cover",
         baseline="The Cover Page is a bold, decorative opening image that captures attention and sets the tone.",
         detail_help="Use it for cover-specific details, composition, or mood.",
     ),
@@ -124,7 +136,7 @@ PAGE_SPECS: Tuple[PageSpec, ...] = (
         key="letter",
         display_label="Letter Prompt",
         output_filename="letter.png",
-        preview_color=COL_LETTER,
+        color_key="letter",
         baseline="The Letter Page is a subtle, elegant backdrop that frames the main written message without distraction.",
         detail_help="Use it for letter-specific details or layout direction.",
     ),
@@ -132,7 +144,7 @@ PAGE_SPECS: Tuple[PageSpec, ...] = (
         key="wall",
         display_label="Wall Prompt",
         output_filename="wall.png",
-        preview_color=COL_WALL,
+        color_key="wall",
         baseline="The Wall Page is a calm, minimalist background designed to support large blocks of text.",
         detail_help="Use it for wall-specific environment or background details.",
     ),
@@ -140,7 +152,7 @@ PAGE_SPECS: Tuple[PageSpec, ...] = (
         key="back",
         display_label="Back Prompt",
         output_filename="back.png",
-        preview_color=COL_BACK,
+        color_key="back",
         baseline="The Back Page is a simple, graceful closing image that echoes the cover while providing a sense of finality.",
         detail_help="Use it for back-page details or closing visual accents.",
     ),
@@ -1051,12 +1063,16 @@ def _serialize_managed_list_entries(entries: List[ManagedListEntry], *, allow_he
 def render_prompt_html(payload: PromptPayload) -> str:
     """Render the preview with colored values (preview should match emitted text)."""
     page = _page_spec_for(payload.page_key)
-    col_img = page.preview_color if page is not None else COL_BACK
+    col_img = page.preview_color if page is not None else prompt_color("back")
     parts: list[str] = []
 
     first = _join_nonempty(payload.role_sentence, payload.order_fragment)
     if payload.subject_fragment.strip():
-        first = (first + " " if first else "") + _span(payload.subject_fragment.strip(), COL_SUBJECT, bold=True)
+        first = (first + " " if first else "") + _span(
+            payload.subject_fragment.strip(),
+            prompt_color("subject"),
+            bold=True,
+        )
     if first:
         parts.append(first.rstrip(".!?") + ".")
 
@@ -1064,13 +1080,24 @@ def render_prompt_html(payload: PromptPayload) -> str:
         parts.append(_html_escape(_as_prompt_sentence(payload.baseline)))
 
     if payload.color_choice.strip():
-        parts.append("Use the " + _span(payload.color_choice.strip(), COL_SCHEME, bold=True) + " palette.")
+        parts.append(
+            "Use the "
+            + _span(payload.color_choice.strip(), prompt_color("scheme"), bold=True)
+            + " palette."
+        )
 
     if payload.type_choice.strip():
-        parts.append("Use " + _span(payload.type_choice.strip(), COL_TYPE, bold=True) + " as the visual style.")
+        parts.append(
+            "Use "
+            + _span(payload.type_choice.strip(), prompt_color("type"), bold=True)
+            + " as the visual style."
+        )
 
     if payload.global_extra.strip():
-        parts.append("Shared visual direction: " + _span(payload.global_extra.strip(), COL_GLOBAL))
+        parts.append(
+            "Shared visual direction: "
+            + _span(payload.global_extra.strip(), prompt_color("global"))
+        )
 
     if payload.image_extra.strip():
         parts.append("Page-specific direction: " + _span(payload.image_extra.strip(), col_img))
@@ -1079,8 +1106,9 @@ def render_prompt_html(payload: PromptPayload) -> str:
         parts.append(_html_escape(_format_effort_line(payload.effort_line)))
 
     if payload.guidance_lines:
-        g = "<br>".join(_span(f"- {line}", COL_HELPFUL) for line in payload.guidance_lines)
-        parts.append(_span("Guidance:", COL_HELPFUL, bold=True) + "<br>" + g)
+        helpful_color = prompt_color("helpful")
+        g = "<br>".join(_span(f"- {line}", helpful_color) for line in payload.guidance_lines)
+        parts.append(_span("Guidance:", helpful_color, bold=True) + "<br>" + g)
 
     if payload.format_paragraph.strip():
         parts.append(_html_escape(_as_prompt_sentence(payload.format_paragraph)))
@@ -1420,6 +1448,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         self._build_ui()
         self._apply_styles()
+        self.refresh_semantic_palette()
         self._connect_signals()
 
         self._load_colors_into_combo()
@@ -2203,7 +2232,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         self.lbl_type = QtWidgets.QLabel("Graphics and Illustration")
         self.lbl_type.setProperty("inputLabel", True)
-        self.lbl_type.setStyleSheet(f"color:{COL_TYPE};")
         _set_help(
             self.lbl_type,
             "Choose the overall visual or illustration style for the generated images. This changes how the full image set looks, not what the subject is.",
@@ -2225,7 +2253,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         self.lbl_subject = QtWidgets.QLabel("Subject")
         self.lbl_subject.setProperty("inputLabel", True)
-        self.lbl_subject.setStyleSheet(f"color:{COL_SUBJECT};")
         _set_help(
             self.lbl_subject,
             "Choose the main thing the images should be about. Double-click Subject to add, update, or remove subject entries.",
@@ -2248,7 +2275,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         self.lbl_color = QtWidgets.QLabel("Color Scheme")
         self.lbl_color.setProperty("inputLabel", True)
-        self.lbl_color.setStyleSheet(f"color:{COL_SCHEME};")
         _set_help(
             self.lbl_color,
             "Choose the main palette or color direction for the images. Leave it empty if you do not want to force a shared color mood.",
@@ -2288,7 +2314,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         self.lbl_helpful = QtWidgets.QLabel("Helpful Options / Guidance")
         self.lbl_helpful.setObjectName("sectionTitle")
-        self.lbl_helpful.setStyleSheet(f"color:{COL_HELPFUL};")
         _set_help(
             self.lbl_helpful,
             "Use these built-in options to refine composition, framing, image policy, and style. Group headers are visual only and are not copied into the final prompt. Some options are intentionally mutually exclusive so only combinations that make sense can stay active.",
@@ -2397,7 +2422,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         self.lbl_global = QtWidgets.QLabel("Apply to All Images")
         self.lbl_global.setObjectName("sectionTitle")
-        self.lbl_global.setStyleSheet(f"color:{COL_GLOBAL};")
         _set_help(
             self.lbl_global,
             "Anything written here is added to every generated image prompt, so use it for shared ideas, mood, setting, or details that should apply across the full set.",
@@ -2455,12 +2479,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
             )
             label = QtWidgets.QLabel(page.output_filename)
             label.setProperty("pageDetailLabel", True)
-            label.setStyleSheet(f"color:{page.preview_color};")
             _set_help(label, help_text)
             _set_help(editor, help_text)
             details_layout.addWidget(label)
             details_layout.addWidget(editor)
             page.detail_widget = editor
+            page.detail_label = label
             setattr(self, f"txt_{page.key}", editor)
         left_v.addWidget(details_card)
         left_v.addStretch(1)
@@ -2505,7 +2529,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             header_row = QtWidgets.QHBoxLayout()
             header_label = QtWidgets.QLabel(page.display_label)
             header_label.setProperty("promptTitle", True)
-            header_label.setStyleSheet(f"color:{page.preview_color};")
             header_row.addWidget(header_label)
             header_row.addStretch(1)
             copy_btn = QtWidgets.QPushButton("Copy")
@@ -2530,6 +2553,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._preview_layout.addWidget(block)
             page.preview_widget = editor
             page.copy_button = copy_btn
+            page.preview_title = header_label
+            page.preview_card = block
 
             copy_btn.clicked.connect(lambda _, page_key=page.key: self._copy_prompt(page_key))
             editor.focused.connect(lambda ed=editor: self._set_last_focused(ed))
@@ -2672,10 +2697,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 border: 1px solid #34393d;
                 border-radius: 14px;
             }
-            QFrame#promptCard[pageKey="cover"] { border-color: #71631e; }
-            QFrame#promptCard[pageKey="letter"] { border-color: #4c6a28; }
-            QFrame#promptCard[pageKey="wall"] { border-color: #28557a; }
-            QFrame#promptCard[pageKey="back"] { border-color: #765027; }
             QTextEdit#promptOutput {
                 background: #151719;
                 color: #dce9ef;
@@ -2948,6 +2969,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self.cmb_subject.currentText(),
             max_length=300,
         )
+
         first_paragraph_end = plain.find("\n\n")
         first_paragraph = plain if first_paragraph_end < 0 else plain[:first_paragraph_end]
         subject_start = first_paragraph.rfind(subject) if subject else -1
@@ -2955,7 +2977,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             document,
             subject_start,
             len(subject),
-            COL_SUBJECT,
+            prompt_color("subject"),
             bold=True,
         )
 
@@ -2972,9 +2994,26 @@ class PromptWriterPanel(QtWidgets.QWidget):
             page.detail_widget.toPlainText() if page.detail_widget is not None else ""
         )
 
-        color_exact("Use ", type_choice, " as the visual style.", COL_TYPE, bold=True)
-        color_exact("Use the ", color_choice, " palette.", COL_SCHEME, bold=True)
-        color_exact("Shared visual direction: ", global_extra, "", COL_GLOBAL)
+        color_exact(
+            "Use ",
+            type_choice,
+            " as the visual style.",
+            prompt_color("type"),
+            bold=True,
+        )
+        color_exact(
+            "Use the ",
+            color_choice,
+            " palette.",
+            prompt_color("scheme"),
+            bold=True,
+        )
+        color_exact(
+            "Shared visual direction: ",
+            global_extra,
+            "",
+            prompt_color("global"),
+        )
         color_exact("Page-specific direction: ", image_extra, "", page.preview_color)
 
         guidance_start = plain.find("Guidance:")
@@ -2986,15 +3025,52 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 document,
                 guidance_start,
                 guidance_end - guidance_start,
-                COL_HELPFUL,
+                prompt_color("helpful"),
             )
             self._color_preview_range(
                 document,
                 guidance_start,
                 len("Guidance:"),
-                COL_HELPFUL,
+                prompt_color("helpful"),
                 bold=True,
             )
+
+    def set_semantic_color(self, semantic_key: str, color: str) -> None:
+        """Update one semantic color and immediately refresh the visible panel."""
+        if semantic_key not in PROMPT_COLORS:
+            raise KeyError(f"unknown Prompt Writer semantic color: {semantic_key}")
+        parsed = QColor(color)
+        if not parsed.isValid():
+            raise ValueError(f"invalid Prompt Writer semantic color: {color}")
+        PROMPT_COLORS[semantic_key] = parsed.name().upper()
+        self.refresh_semantic_palette()
+
+    def refresh_semantic_palette(self) -> None:
+        """Apply the centralized semantic palette to every live consumer."""
+        labels = (
+            (getattr(self, "lbl_type", None), "type"),
+            (getattr(self, "lbl_subject", None), "subject"),
+            (getattr(self, "lbl_color", None), "scheme"),
+            (getattr(self, "lbl_helpful", None), "helpful"),
+            (getattr(self, "lbl_global", None), "global"),
+        )
+        for label, semantic_key in labels:
+            if label is not None:
+                label.setStyleSheet(f"color:{prompt_color(semantic_key)};")
+
+        for page in getattr(self, "_page_specs", ()):
+            page_color = page.preview_color
+            if page.detail_label is not None:
+                page.detail_label.setStyleSheet(f"color:{page_color};")
+            if page.preview_title is not None:
+                page.preview_title.setStyleSheet(f"color:{page_color};")
+            if page.preview_card is not None:
+                page.preview_card.setStyleSheet(
+                    f"QFrame#promptCard {{ border-color:{page_color}; }}"
+                )
+            prompt_text = self._generated_prompts.get(page.key, "")
+            if page.preview_widget is not None and prompt_text.strip():
+                self._set_colored_saved_preview(page, prompt_text)
 
     def _set_generation_busy(self, busy: bool) -> None:
         self._generation_in_progress = bool(busy)

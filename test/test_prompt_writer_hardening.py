@@ -7,19 +7,11 @@ from unittest import mock
 from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
 from PromptWriterPanel import (
-    COL_BACK,
-    COL_COVER,
-    COL_GLOBAL,
-    COL_HELPFUL,
-    COL_LETTER,
-    COL_SCHEME,
-    COL_SUBJECT,
-    COL_TYPE,
-    COL_WALL,
     HIDDEN_FRAMING_DEFAULT,
     HIDDEN_STYLE_DEFAULT,
     ListManagerDialog,
     ManagedListEntry,
+    PROMPT_COLORS,
     PromptWriterPanel,
     USER_ADDED_HEADER,
     reset_prompt_writer_state_file,
@@ -85,11 +77,11 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.panel.ensurePolished()
 
         source_labels = {
-            self.panel.lbl_type: COL_TYPE,
-            self.panel.lbl_subject: COL_SUBJECT,
-            self.panel.lbl_color: COL_SCHEME,
-            self.panel.lbl_helpful: COL_HELPFUL,
-            self.panel.lbl_global: COL_GLOBAL,
+            self.panel.lbl_type: PROMPT_COLORS["type"],
+            self.panel.lbl_subject: PROMPT_COLORS["subject"],
+            self.panel.lbl_color: PROMPT_COLORS["scheme"],
+            self.panel.lbl_helpful: PROMPT_COLORS["helpful"],
+            self.panel.lbl_global: PROMPT_COLORS["global"],
         }
         page_labels = {
             label.text(): label
@@ -121,14 +113,79 @@ class PromptWriterHardeningTests(unittest.TestCase):
         for page in self.panel._page_specs:
             html = page.preview_widget.toHtml().casefold()
             for expected in (
-                COL_TYPE,
-                COL_SUBJECT,
-                COL_SCHEME,
-                COL_HELPFUL,
-                COL_GLOBAL,
+                PROMPT_COLORS["type"],
+                PROMPT_COLORS["subject"],
+                PROMPT_COLORS["scheme"],
+                PROMPT_COLORS["helpful"],
+                PROMPT_COLORS["global"],
                 page.preview_color,
             ):
                 self.assertIn(expected.casefold(), html)
+
+        before = dict(self.panel._generated_prompts)
+        original_colors = dict(PROMPT_COLORS)
+        self.addCleanup(PROMPT_COLORS.update, original_colors)
+        shared_consumers = {
+            "type": self.panel.lbl_type,
+            "subject": self.panel.lbl_subject,
+            "scheme": self.panel.lbl_color,
+            "helpful": self.panel.lbl_helpful,
+            "global": self.panel.lbl_global,
+        }
+        replacement_colors = {
+            "type": "#7A5CFF",
+            "subject": "#FF315A",
+            "scheme": "#20B86B",
+            "helpful": "#20AFCF",
+            "global": "#F4F5F6",
+            "cover": "#F2BF20",
+            "letter": "#3574E8",
+            "wall": "#EC7025",
+            "back": "#DA3EB5",
+        }
+
+        for semantic_key, label in shared_consumers.items():
+            replacement = replacement_colors[semantic_key]
+            self.panel.set_semantic_color(semantic_key, replacement)
+            self.assertEqual(
+                label.palette().color(QtGui.QPalette.WindowText).name(),
+                replacement.casefold(),
+            )
+            for page in self.panel._page_specs:
+                self.assertIn(
+                    replacement.casefold(),
+                    page.preview_widget.toHtml().casefold(),
+                )
+
+        for page in self.panel._page_specs:
+            replacement = replacement_colors[page.color_key]
+            self.panel.set_semantic_color(page.color_key, replacement)
+            for label in (page.detail_label, page.preview_title):
+                self.assertEqual(
+                    label.palette().color(QtGui.QPalette.WindowText).name(),
+                    replacement.casefold(),
+                )
+            self.assertIn(replacement.casefold(), page.preview_card.styleSheet().casefold())
+            self.assertIn(replacement.casefold(), page.preview_widget.toHtml().casefold())
+
+        self.assertEqual(self.panel._generated_prompts, before)
+
+    def test_semantic_palette_matches_requested_high_contrast_colors(self):
+        self.assertEqual(
+            PROMPT_COLORS,
+            {
+                "type": "#B084FF",
+                "subject": "#FF5C7A",
+                "scheme": "#35D07F",
+                "helpful": "#32C7E8",
+                "global": "#E5E7EB",
+                "cover": "#FFD54A",
+                "letter": "#4D8DFF",
+                "wall": "#FF8A3D",
+                "back": "#F25ACD",
+            },
+        )
+        self.assertEqual(len(PROMPT_COLORS), len(set(PROMPT_COLORS.values())))
 
     def test_reset_clears_prompt_writer_but_preserves_user_options(self):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
@@ -484,12 +541,12 @@ class PromptWriterHardeningTests(unittest.TestCase):
         )
         restored_html = cover_page.preview_widget.toHtml().casefold()
         for expected in (
-            COL_TYPE,
-            COL_SUBJECT,
-            COL_SCHEME,
-            COL_HELPFUL,
-            COL_GLOBAL,
-            COL_COVER,
+            PROMPT_COLORS["type"],
+            PROMPT_COLORS["subject"],
+            PROMPT_COLORS["scheme"],
+            PROMPT_COLORS["helpful"],
+            PROMPT_COLORS["global"],
+            PROMPT_COLORS["cover"],
         ):
             self.assertIn(expected.casefold(), restored_html)
 
