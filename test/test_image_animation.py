@@ -10,6 +10,7 @@ from unittest import mock
 from PIL import Image
 
 from config import CONTROL_FILES
+from curtain_color import recolor_banner_to_curtain_color
 import generate
 import image_animation
 from image_animation import (
@@ -54,6 +55,40 @@ class ImageAnimationTests(unittest.TestCase):
     def _write_png(path: Path, color: str = "white") -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         Image.new("RGBA", (12, 9), color).save(path, format="PNG")
+
+    @staticmethod
+    def _write_banner_source(root: Path) -> Path:
+        path = root / generate.APP_BANNER_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        image = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+        image.putpixel((10, 10), (220, 150, 20, 255))
+        image.putpixel((20, 50), (248, 244, 230, 255))
+        image.putpixel((80, 75), (150, 150, 155, 255))
+        image.putpixel((50, 38), (150, 150, 155, 255))
+        image.putpixel((50, 39), (255, 255, 255, 255))
+        image.save(path, format="PNG")
+        return path
+
+    def test_banner_recolor_preserves_gold_alpha_and_category_shading(self) -> None:
+        source = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+        source.putpixel((10, 10), (220, 150, 20, 255))
+        source.putpixel((20, 50), (248, 244, 230, 255))
+        source.putpixel((80, 75), (150, 150, 155, 255))
+        source.putpixel((50, 38), (150, 150, 155, 255))
+        source.putpixel((50, 39), (255, 255, 255, 255))
+
+        themed = recolor_banner_to_curtain_color(source, (48, 52, 176))
+
+        self.assertEqual(themed.getpixel((0, 0)), (0, 0, 0, 0))
+        self.assertEqual(themed.getpixel((10, 10)), source.getpixel((10, 10)))
+        self.assertEqual(themed.getpixel((20, 50)), (48, 52, 176, 255))
+        ribbon = themed.getpixel((80, 75))
+        gem = themed.getpixel((50, 38))
+        self.assertGreater(ribbon[2], ribbon[0])
+        self.assertLess(sum(ribbon[:3]), sum(themed.getpixel((20, 50))[:3]))
+        self.assertGreater(gem[2], gem[0])
+        self.assertGreater(sum(gem[:3]), sum(themed.getpixel((20, 50))[:3]))
+        self.assertEqual(themed.getpixel((50, 39)), (255, 255, 255, 255))
 
     def test_install_preserves_original_gif_and_independent_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -175,6 +210,7 @@ class ImageAnimationTests(unittest.TestCase):
 
             for filename in CONTROL_FILES:
                 self._write_png(controls / filename)
+            self._write_banner_source(root)
             SettingsStore(root).update_fields(
                 {
                     "recipient_name": "Amanda Miller",
@@ -209,6 +245,11 @@ class ImageAnimationTests(unittest.TestCase):
             self.assertNotIn("{{TITLE_BANNER_RGB}}", index)
             self.assertNotIn("{{TITLE_BANNER_TEXT_RGB}}", index)
             self.assertIn('id="title-banner"', index)
+            self.assertIn('id="title-banner-art"', index)
+            self.assertIn("gallery/controls/bannerman.png", index)
+            self.assertTrue(
+                (play / "gallery/controls/bannerman.png").is_file()
+            )
             self.assertIn("Perfection&#x27;s Path", index)
             self.assertIn("#title-banner.is-showing", styles)
             self.assertIn(

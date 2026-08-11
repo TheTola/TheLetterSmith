@@ -15,6 +15,7 @@ TEMPLATE_HTML = r"""
   <link rel="preload" as="image" href="gallery/pages/cover.png" fetchpriority="high">
   <link rel="preload" as="image" href="gallery/controls/cleft.png" fetchpriority="high">
   <link rel="preload" as="image" href="gallery/controls/cright.png" fetchpriority="high">
+  <link rel="preload" as="image" href="gallery/controls/bannerman.png">
   <link rel="preload" as="audio" href="gallery/sounds/glissando.mp3">
   {{MUSIC_PRELOAD_HTML}}
 </head>
@@ -29,8 +30,15 @@ TEMPLATE_HTML = r"""
   <div
     id="title-banner"
     aria-hidden="true"
-    style="--title-banner-rgb:{{TITLE_BANNER_RGB}};--title-banner-text-rgb:{{TITLE_BANNER_TEXT_RGB}}"
+    style="--title-banner-text-rgb:{{TITLE_BANNER_TEXT_RGB}}"
   >
+    <img
+      id="title-banner-art"
+      src="gallery/controls/bannerman.png"
+      alt=""
+      aria-hidden="true"
+      decoding="async"
+    >
     <span>{{TITLE}}</span>
   </div>
 
@@ -134,6 +142,7 @@ TEMPLATE_HTML = r"""
     const MUSIC_PLAYLIST = {{MUSIC_PLAYLIST_JSON}};
     const MUSIC_CROSSFADE_MS = {{MUSIC_CROSSFADE_MS}};
     const IMAGE_ANIMATIONS = {{IMAGE_ANIMATIONS_JSON}};
+    const HAS_MESSAGE = {{HAS_MESSAGE_JSON}};
   </script>
 
   <script src="script.js"></script>
@@ -221,11 +230,9 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 #curtain-overlay:not(.is-visible) #begin-button{opacity:0}
 #begin-button.is-dismissed{animation:none;opacity:0;visibility:hidden;transition:opacity 160ms ease-out,visibility 0s linear 160ms}
 #begin-button:hover{background:linear-gradient(180deg,rgba(20,31,48,.94),rgba(8,12,20,.84))}
-#title-banner{position:absolute;top:50%;left:50%;z-index:10002;width:min(82vw,760px);min-height:clamp(92px,16vw,150px);padding:clamp(22px,4vw,38px) clamp(52px,8vw,94px);display:flex;align-items:center;justify-content:center;visibility:hidden;opacity:0;pointer-events:none;transform:translate(-50%,-50%) scale(.92);background-color:rgb(var(--title-banner-rgb));color:rgb(var(--title-banner-text-rgb));border:3px double rgba(var(--title-banner-text-rgb),.88);clip-path:polygon(0 18%,7% 18%,7% 0,93% 0,93% 18%,100% 18%,96% 50%,100% 82%,93% 82%,93% 100%,7% 100%,7% 82%,0 82%,4% 50%);box-shadow:0 20px 52px rgba(0,0,0,.48),inset 0 0 0 2px rgba(255,255,255,.18),inset 0 0 30px rgba(0,0,0,.18);filter:drop-shadow(0 7px 12px rgba(0,0,0,.38));will-change:opacity,transform}
-#title-banner::before,#title-banner::after{content:"";position:absolute;top:50%;width:clamp(30px,7vw,76px);height:2px;background:linear-gradient(90deg,transparent,rgba(var(--title-banner-text-rgb),.96),transparent);box-shadow:0 -7px 0 -1px rgba(var(--title-banner-text-rgb),.58),0 7px 0 -1px rgba(var(--title-banner-text-rgb),.58);filter:drop-shadow(0 1px 1px rgba(0,0,0,.72))}
-#title-banner::before{left:clamp(14px,3vw,30px)}
-#title-banner::after{right:clamp(14px,3vw,30px)}
-#title-banner span{position:relative;max-width:100%;font-family:var(--font-letter);font-size:clamp(28px,5vw,72px);font-weight:700;font-style:italic;line-height:1.08;letter-spacing:.025em;text-align:center;overflow-wrap:anywhere;text-shadow:0 1px 0 rgba(255,255,255,.34),0 4px 9px rgba(0,0,0,.72);-webkit-text-stroke:clamp(1px,.12vw,2px) rgba(0,0,0,.68);paint-order:stroke fill}
+#title-banner{position:absolute;top:50%;left:50%;z-index:10002;width:min(94vw,1000px,92vh);aspect-ratio:1/1;display:grid;place-items:center;visibility:hidden;opacity:0;pointer-events:none;transform:translate(-50%,-50%) scale(.92);color:rgb(var(--title-banner-text-rgb));filter:drop-shadow(0 12px 20px rgba(0,0,0,.5));will-change:opacity,transform}
+#title-banner-art{grid-area:1/1;width:100%;height:100%;object-fit:contain;pointer-events:none;user-select:none}
+#title-banner span{grid-area:1/1;position:relative;z-index:1;width:68%;max-width:68%;font-family:var(--font-letter);font-size:clamp(24px,4.7vw,68px);font-weight:700;font-style:italic;line-height:1.08;letter-spacing:.025em;text-align:center;overflow-wrap:anywhere;text-shadow:0 1px 0 rgba(255,255,255,.4),0 4px 9px rgba(0,0,0,.72);-webkit-text-stroke:clamp(1px,.12vw,2px) rgba(0,0,0,.68);paint-order:stroke fill}
 #title-banner.is-showing{visibility:visible;animation:titleBannerFadeIn 280ms cubic-bezier(.18,.82,.2,1) forwards}
 #title-banner.is-hiding{visibility:visible;animation:titleBannerFadeOut 360ms ease-in forwards}
 @keyframes curtainIntroFadeIn{from{opacity:0}to{opacity:1}}
@@ -821,6 +828,19 @@ document.addEventListener('DOMContentLoaded', () => {
     }, wallRevealDelayMs);
   }
   function syncWallUI(){
+    if (!HAS_MESSAGE){
+      clearWallRevealTimers();
+      wallRevealLocked = false;
+      wall.classList.remove('is-open');
+      openText.classList.remove('is-visible');
+      closeText.classList.remove('is-visible');
+      setHiddenState(wall, true);
+      setHiddenState(openText, true);
+      setHiddenState(closeText, true);
+      setExpandedState(openText, false);
+      syncButtons();
+      return;
+    }
     if (!isWallPage()){
       clearWallRevealTimers();
       wallRevealLocked = false;

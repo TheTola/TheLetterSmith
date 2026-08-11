@@ -1039,6 +1039,14 @@ class Nexus(QtWidgets.QMainWindow):
         self.tabbar.setDrawBase(False)
         self.tabbar.setMouseTracking(True)
         self.tabbar.setAttribute(Qt.WA_Hover, True)
+        self.tabbar.installEventFilter(self)
+        self._readiness_hovered_tab = -1
+        self._image_tab_readiness_hide_timer = QtCore.QTimer(self)
+        self._image_tab_readiness_hide_timer.setSingleShot(True)
+        self._image_tab_readiness_hide_timer.setInterval(1000)
+        self._image_tab_readiness_hide_timer.timeout.connect(
+            self._hide_readiness_after_image_tab_hover
+        )
         self.tabbar.currentChanged.connect(self._tab_changed)
         main_layout.addWidget(self.tabbar)
         self._command_immersive = False
@@ -1784,9 +1792,10 @@ class Nexus(QtWidgets.QMainWindow):
             status_message = f"{status_message}. {autosave_note}"
         self.status(status_message)
         self._set_forge_preview_visible(idx == 3)
-        self.forge_tab.set_readiness_context_visible(
-            idx in {0, 1, 2, 3}
-        )
+        if idx == 0:
+            self.forge_tab.dismiss_readiness()
+        else:
+            self.forge_tab.set_readiness_context_visible(idx in {1, 2, 3})
 
         if idx == 0:
             self.preview_stack.setCurrentIndex(0)
@@ -2553,7 +2562,19 @@ class Nexus(QtWidgets.QMainWindow):
             self.project_state.remove_listener(
                 self._on_project_state_transition
             )
-            self.project_state.shutdown()
+            if not self.flush_prompt_writer_state():
+                _LOGGER.warning(
+                    "Prompt Writer state could not be flushed during shutdown."
+                )
+            prompt_writer = getattr(self, "_prompt_writer_win", None)
+            prompt_writer_shutdown = getattr(prompt_writer, "shutdown", None)
+            if callable(prompt_writer_shutdown):
+                try:
+                    prompt_writer_shutdown()
+                except Exception:
+                    _LOGGER.exception(
+                        "Prompt Writer shutdown cleanup failed."
+                    )
             if self._project_tabs_initialized:
                 try:
                     self._release_forge_preview_files()
@@ -2579,6 +2600,10 @@ class Nexus(QtWidgets.QMainWindow):
                 except Exception:
                     pass
         finally:
+            try:
+                self.project_state.shutdown()
+            except Exception:
+                _LOGGER.exception("Project state shutdown failed.")
             if self._tray_icon is not None:
                 self._tray_icon.hide()
             self._shutdown_complete = True
@@ -2951,6 +2976,21 @@ class Nexus(QtWidgets.QMainWindow):
     def _hide_help_popover(self):
         self.help_pop.popdown()
 
+    def _track_readiness_tab_hover(self, index: int) -> None:
+        self._readiness_hovered_tab = index
+        if index == 0:
+            if not self._image_tab_readiness_hide_timer.isActive():
+                self._image_tab_readiness_hide_timer.start()
+            return
+        self._image_tab_readiness_hide_timer.stop()
+
+    def _hide_readiness_after_image_tab_hover(self) -> None:
+        if self._readiness_hovered_tab != 0:
+            return
+        forge_tab = getattr(self, "forge_tab", None)
+        if forge_tab is not None:
+            forge_tab.dismiss_readiness()
+
     # =============================================================================================
     # Global event filter for help hover (robust)
     # =============================================================================================
@@ -2959,6 +2999,16 @@ class Nexus(QtWidgets.QMainWindow):
         icon = getattr(self, "help_icon", None)
         pop  = getattr(self, "help_pop", None)
         web_view = getattr(self, "html_preview", None)
+
+        if watched is getattr(self, "tabbar", None):
+            event_type = event.type()
+            if event_type in (QEvent.MouseMove, QEvent.HoverMove):
+                position = getattr(event, "position", lambda: QtCore.QPointF())()
+                self._track_readiness_tab_hover(
+                    self.tabbar.tabAt(position.toPoint())
+                )
+            elif event_type in (QEvent.Leave, QEvent.HoverLeave):
+                self._track_readiness_tab_hover(-1)
 
         if (
             web_view is not None

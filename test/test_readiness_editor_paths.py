@@ -59,6 +59,13 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             panel.show()
             self.app.processEvents()
             self.assertTrue(panel.isVisible())
+            correction_spy = QtTest.QSignalSpy(panel.correction_requested)
+            panel._missing_buttons["recipient"].click()
+            self.app.processEvents()
+            self.assertFalse(panel.isVisible())
+            self.assertEqual(correction_spy.count(), 1)
+            panel.show()
+            self.app.processEvents()
             panel.close()
             self.app.processEvents()
             self.assertTrue(panel.isVisible())
@@ -70,6 +77,16 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
     def test_complete_readiness_closes_panel_and_preview_selector_is_bright(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tab = ForgeTab(Path(directory))
+            self.assertEqual(tab.readiness_btn.text(), "Review")
+            correction_spy = QtTest.QSignalSpy(tab.correction_requested)
+            tab._readiness_requested = True
+            tab.readiness_window.show()
+            self.app.processEvents()
+            tab.readiness_window._missing_buttons["cover"].click()
+            self.app.processEvents()
+            self.assertFalse(tab.readiness_window.isVisible())
+            self.assertFalse(tab._readiness_requested)
+            self.assertEqual(correction_spy.count(), 1)
             ready = ReadinessResult(
                 items=(),
                 completion_percentage=100,
@@ -236,8 +253,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             )
             pages = root / "gallery" / "user" / "pages"
             pages.mkdir(parents=True)
-            for name in REQUIRED_SLIDES:
-                (pages / name).write_bytes(name.encode("ascii"))
+            (pages / "cover.png").write_bytes(b"cover")
 
             resolver = ProjectPathResolver(root)
             service = ProjectSaveService(
@@ -246,7 +262,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 resolver=resolver,
             )
             eligibility = evaluate_project_save_eligibility(root)
-            self.assertEqual(eligibility.completed_tabs, ("images",))
+            self.assertEqual(eligibility.completed_tabs, ("message",))
             self.assertFalse(eligibility.can_save)
             context = resolver.context_from_settings(
                 SettingsStore(root).snapshot()
@@ -257,26 +273,28 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             )
             self.assertFalse(context.autosave_directory.exists())
 
-            message = root / "gallery" / "user" / "message" / "message.html"
-            message.parent.mkdir(parents=True)
-            message.write_text("<p>Good morning.</p>", encoding="utf-8")
+            for name in REQUIRED_SLIDES:
+                if not (pages / name).exists():
+                    (pages / name).write_bytes(name.encode("ascii"))
             eligibility = evaluate_project_save_eligibility(root)
             self.assertEqual(
                 eligibility.completed_tabs,
                 ("images", "message"),
             )
             self.assertTrue(eligibility.can_save)
+            readiness = evaluate_readiness(root)
+            message_item = next(
+                item for item in readiness.items if item.key == "message"
+            )
+            self.assertFalse(message_item.ready)
+            self.assertFalse(message_item.required)
+            self.assertTrue(readiness.can_preview)
 
             saved = service.save_workspace_snapshot(reason="tab-switch")
 
             self.assertEqual(saved, context.autosave_directory)
             self.assertTrue((saved / "pages" / "cover.png").is_file())
-            self.assertEqual(
-                (saved / "message" / "message.html").read_text(
-                    encoding="utf-8"
-                ),
-                "<p>Good morning.</p>",
-            )
+            self.assertFalse((saved / "message" / "message.html").exists())
             metadata = json.loads(
                 (saved / "lettersmith-metadata.json").read_text(
                     encoding="utf-8"
@@ -431,14 +449,14 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 ["Morning Joy"],
             )
 
-    def test_each_two_tab_combination_is_save_eligible(self) -> None:
-        combinations = (
-            ("images", "sound"),
-            ("images", "message"),
-            ("sound", "message"),
-        )
-        for completed in combinations:
-            with self.subTest(completed=completed):
+    def test_each_completed_workflow_counts_toward_two_tab_gate(self) -> None:
+        expected_by_workflow = {
+            "images": ("images", "message"),
+            "sound": ("sound", "message"),
+            "prompt_writer": ("message", "prompt_writer"),
+        }
+        for workflow, expected in expected_by_workflow.items():
+            with self.subTest(workflow=workflow):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     state = ProjectStateController(root)
@@ -450,22 +468,16 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                     SettingsStore(root).update_fields(
                         {"recipient_title": "A Unique Title"}
                     )
-                    if "images" in completed:
+                    baseline = evaluate_project_save_eligibility(root)
+                    self.assertEqual(baseline.completed_tabs, ("message",))
+                    self.assertFalse(baseline.can_save)
+
+                    if workflow == "images":
                         pages = root / "gallery" / "user" / "pages"
                         pages.mkdir(parents=True)
                         for name in REQUIRED_SLIDES:
                             (pages / name).write_bytes(b"image")
-                    if "message" in completed:
-                        message = (
-                            root
-                            / "gallery"
-                            / "user"
-                            / "message"
-                            / "message.html"
-                        )
-                        message.parent.mkdir(parents=True)
-                        message.write_text("<p>Letter</p>", encoding="utf-8")
-                    if "sound" in completed:
+                    if workflow == "sound":
                         source = root / "song.mp3"
                         source.write_bytes(b"sound")
                         record = import_runtime_track(
@@ -481,12 +493,23 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                                 selected_track_id=record.track_id,
                             ),
                         )
+                    if workflow == "prompt_writer":
+                        (root / "prompt_writer_state.json").write_text(
+                            json.dumps(
+                                {
+                                    "generated_prompts": {
+                                        "cover": "A generated cover prompt"
+                                    }
+                                }
+                            ),
+                            encoding="utf-8",
+                        )
 
                     eligibility = evaluate_project_save_eligibility(root)
 
                     self.assertEqual(
                         eligibility.completed_tabs,
-                        completed,
+                        expected,
                     )
                     self.assertTrue(eligibility.can_save)
 
@@ -882,6 +905,9 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 self.assertTrue(image.save(str(pages / name)))
             for name in CONTROL_FILES:
                 self.assertTrue(image.save(str(controls / name)))
+            banner = root / generate.APP_BANNER_PATH
+            banner.parent.mkdir(parents=True, exist_ok=True)
+            self.assertTrue(image.save(str(banner)))
 
             font_path = fonts / "Arcane_Font.ttf"
             header = struct.pack(">IHHHH", 0x00010000, 1, 0, 0, 0)
@@ -910,6 +936,47 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.assertEqual(len(exported_files), 1)
             self.assertTrue(
                 (play_dir / "gallery/fonts" / exported_files[0]).is_file()
+            )
+
+    def test_generated_viewer_allows_an_empty_message(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pages = root / "gallery/user/pages"
+            controls = root / "gallery/user/card/controls"
+            pages.mkdir(parents=True)
+            controls.mkdir(parents=True)
+            image = QtGui.QImage(8, 8, QtGui.QImage.Format_RGBA8888)
+            image.fill(QtGui.QColor("white"))
+            for name in REQUIRED_SLIDES:
+                self.assertTrue(image.save(str(pages / name)))
+            for name in CONTROL_FILES:
+                self.assertTrue(image.save(str(controls / name)))
+            banner = root / generate.APP_BANNER_PATH
+            banner.parent.mkdir(parents=True, exist_ok=True)
+            self.assertTrue(image.save(str(banner)))
+            SettingsStore(root).update_fields(
+                {
+                    "recipient_name": "Amanda Miller",
+                    "recipient_title": "Picture Letter",
+                }
+            )
+
+            play_dir = generate.generate_play_bundle(
+                root,
+                message_html="",
+                seed_sfx=False,
+            )
+
+            generate.validate_play_bundle(play_dir)
+            index = (play_dir / "index.html").read_text(encoding="utf-8")
+            script = (play_dir / "script.js").read_text(encoding="utf-8")
+            self.assertIn("const HAS_MESSAGE = false;", index)
+            self.assertIn("if (!HAS_MESSAGE){", script)
+            self.assertEqual(
+                (play_dir / "gallery/message/message.html").read_text(
+                    encoding="utf-8"
+                ),
+                "",
             )
 
     def test_ultralink_button_requires_safe_selected_text(self) -> None:

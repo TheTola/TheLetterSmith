@@ -12,7 +12,14 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from Message_tab import IDENTITY_LOCK_KEYS, IdentityLineEdit, MessageTab
 from Nexus import Nexus
 from project_paths import ProjectPathResolver
-from project_state import ProjectStateController, load_project_settings
+from project_state import (
+    ApplicationState,
+    ProjectStateController,
+    load_project_settings,
+)
+from readiness import evaluate_project_save_eligibility
+from saved_letters import SavedLetterCatalog
+from settings_store import SettingsStore
 
 
 class IdentityFieldLockingTests(unittest.TestCase):
@@ -197,6 +204,85 @@ class IdentityFieldLockingTests(unittest.TestCase):
             reason="tab-switch"
         )
         self.assertEqual(note, "Project autosaved.")
+
+    def test_incomplete_active_project_returns_without_becoming_loadable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_state = ProjectStateController(root)
+            project_state.initialize()
+            identity = project_state.establish_project(
+                "Amanda Miller",
+                custom_capitalization=True,
+            )
+            SettingsStore(root).update_fields(
+                {"recipient_title": "Halfway Letter"}
+            )
+
+            self.assertFalse(
+                evaluate_project_save_eligibility(root).can_save
+            )
+            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+
+            project_state.shutdown()
+            restored = ProjectStateController(root)
+            self.assertEqual(
+                restored.initialize(),
+                ApplicationState.PROJECT_READY,
+            )
+            self.assertEqual(restored.identity, identity)
+            self.assertEqual(
+                load_project_settings(root)["recipient_title"],
+                "Halfway Letter",
+            )
+            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+
+    def test_shutdown_flushes_draft_before_project_state_closes(self) -> None:
+        events: list[str] = []
+
+        class ProjectState:
+            def remove_listener(self, _listener: object) -> None:
+                events.append("listener")
+
+            def shutdown(self) -> None:
+                events.append("project")
+
+        class Tab:
+            def deactivate_for_tab_change(self) -> None:
+                events.append("tab")
+
+            def set_readiness_context_visible(self, _visible: bool) -> None:
+                return None
+
+            readiness_window = types.SimpleNamespace(shutdown=lambda: None)
+
+        harness = types.SimpleNamespace(
+            _shutdown_complete=False,
+            _shutdown_in_progress=False,
+            _project_tabs_initialized=True,
+            _on_project_state_transition=object(),
+            _prompt_writer_win=None,
+            _tray_icon=None,
+            project_state=ProjectState(),
+            flush_prompt_writer_state=lambda: events.append("prompt") or True,
+            _release_forge_preview_files=lambda: None,
+            forge_tab=Tab(),
+            sound_tab=types.SimpleNamespace(
+                deactivate_for_tab_change=lambda: events.append("sound"),
+                release_current_file_handle=lambda: None,
+            ),
+            message_tab=types.SimpleNamespace(
+                shutdown=lambda: events.append("message")
+            ),
+            image_tab=types.SimpleNamespace(
+                shutdown=lambda: events.append("image")
+            ),
+        )
+
+        Nexus.shutdown(harness)
+
+        self.assertLess(events.index("prompt"), events.index("project"))
+        self.assertLess(events.index("message"), events.index("project"))
+        self.assertLess(events.index("image"), events.index("project"))
 
     def test_message_tab_keeps_its_project_path_resolver(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -49,6 +49,7 @@ from urllib.parse import unquote, urlsplit
 from Template import TEMPLATE_HTML, TEMPLATE_CSS, TEMPLATE_JS
 from curtain_color import (
     curtain_rgb_for_style,
+    write_recolored_banner_image,
     write_tinted_curtain_image,
 )
 from font_export import FontExportError, build_embedded_font_payload
@@ -57,6 +58,7 @@ from image_animation import (
     build_runtime_image_assets,
     validate_runtime_image_manifest,
 )
+from message_format import message_plain_text
 from sound_model import (
     BUILD_SOUND_MANIFEST_NAME,
     build_sound_manifest,
@@ -90,12 +92,14 @@ from config import (
 
 # App-owned SFX live here (relative to project root)
 APP_SOUNDS_DIR = Path("gallery") / "app" / "sounds"
+APP_BANNER_PATH = Path("gallery") / "app" / "icons" / "bannerman.png"
+BANNER_FILE = "bannerman.png"
 LEGACY_SFX_DIRS = (
     Path("gallery") / "user" / "sounds",
     Path("gallery") / "app" / "icons" / "Sounds",
 )
 BUILD_STATE_FILE = "lettersmith-build.json"
-BUILD_SCHEMA_VERSION = 11
+BUILD_SCHEMA_VERSION = 12
 CURTAIN_FILES = {"cleft.png", "cright.png"}
 CURTAIN_ANALYSIS_PAGE_ORDER = (
     "cover.png",
@@ -371,9 +375,9 @@ def _validate_template_placeholders() -> None:
     """
     required = (
         "{{TITLE}}",
-        "{{TITLE_BANNER_RGB}}",
         "{{TITLE_BANNER_TEXT_RGB}}",
         "{{MESSAGE_HTML}}",
+        "{{HAS_MESSAGE_JSON}}",
         "{{INITIAL_VOLUME}}",
         "{{MESSAGE_OVERLAY_STYLE}}",
         "{{MUSIC_PLAYLIST_JSON}}",
@@ -481,20 +485,20 @@ def _curtain_rgb_for_settings(
     return curtain_rgb_for_style(page_paths, style)
 
 
-def _title_banner_rgbs_for_settings(
+def _title_banner_text_rgb_for_settings(
     project_root: Path,
-) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    curtain_rgb: tuple[int, int, int],
+) -> tuple[int, int, int]:
     page_paths = [
         project_root / USER_PAGES_DIR / name
         for name in CURTAIN_ANALYSIS_PAGE_ORDER
     ]
-    return (
-        curtain_rgb_for_style(page_paths, "average_color"),
-        curtain_rgb_for_style(
-            page_paths,
-            "complementary_average_color",
-        ),
+    normal = curtain_rgb_for_style(page_paths, "average_color")
+    complementary = curtain_rgb_for_style(
+        page_paths,
+        "complementary_average_color",
     )
+    return normal if curtain_rgb == complementary else complementary
 
 
 def _rgb_css_value(rgb: tuple[int, int, int]) -> str:
@@ -553,6 +557,9 @@ def build_source_fingerprint(project_root: str | Path) -> str:
                 for path in directory.rglob("*")
                 if path.is_file() and not path.is_symlink()
             )
+    banner_source = root / APP_BANNER_PATH
+    if banner_source.is_file() and not banner_source.is_symlink():
+        files.add(banner_source.resolve())
 
     sound_state, sound_tracks = resolve_project_tracks(root)
     digest.update(
@@ -643,6 +650,7 @@ def validate_play_bundle(directory: str | Path) -> Path:
         *(root / "gallery/pages" / name for name in REQUIRED_SLIDES),
         root / "gallery/pages" / IMAGE_MANIFEST_NAME,
         *(root / "gallery/controls" / name for name in CONTROL_FILES),
+        root / "gallery/controls" / BANNER_FILE,
         root / "gallery/message/message.html",
         root / "gallery/sounds" / BUILD_SOUND_MANIFEST_NAME,
         root / BUILD_STATE_FILE,
@@ -658,10 +666,7 @@ def validate_play_bundle(directory: str | Path) -> Path:
         )
 
     try:
-        if not (root / "gallery/message/message.html").read_text(
-            encoding="utf-8"
-        ).strip():
-            raise ValueError("message.html is empty")
+        (root / "gallery/message/message.html").read_text(encoding="utf-8")
         sound_manifest = json.loads(
             (root / "gallery/sounds" / BUILD_SOUND_MANIFEST_NAME).read_text(
                 encoding="utf-8"
@@ -807,8 +812,8 @@ def build_play_bundle_to(
     msg_html_src = pr / MESSAGE_HTML_FILE
     if message_html is None:
         message_html = _read_text_safe(msg_html_src)
-    if not (message_html or "").strip():
-        raise FileNotFoundError("Message content is required.")
+    message_html = message_html or ""
+    has_message = bool(message_plain_text(message_html).strip())
     embedded_message_html = _prepare_embedded_message_html(
         message_html,
         project_root=pr,
@@ -819,8 +824,10 @@ def build_play_bundle_to(
     settings = SettingsStore(pr).snapshot()
     recipient = _recipient_from_settings(settings)
     title = _title_from_settings(settings, recipient)
-    title_banner_rgb, title_banner_text_rgb = (
-        _title_banner_rgbs_for_settings(pr)
+    curtain_rgb = _curtain_rgb_for_settings(pr, settings)
+    title_banner_text_rgb = _title_banner_text_rgb_for_settings(
+        pr,
+        curtain_rgb,
     )
     starting_vol = _starting_volume_from_settings(settings)
     project_id = ensure_project_identity(pr)
@@ -843,7 +850,18 @@ def build_play_bundle_to(
         controls_src,
         bp.play_controls_dir,
         CONTROL_FILES,
-        curtain_rgb=_curtain_rgb_for_settings(pr, settings),
+        curtain_rgb=curtain_rgb,
+    )
+    banner_source = pr / APP_BANNER_PATH
+    _require_file(
+        banner_source,
+        what="reusable banner asset",
+        expected_rel_hint=APP_BANNER_PATH.as_posix(),
+    )
+    write_recolored_banner_image(
+        banner_source,
+        bp.play_controls_dir / BANNER_FILE,
+        curtain_rgb,
     )
     _copy_directory_files(message_src, bp.play_message_dir)
     _atomic_write_text(bp.play_message_dir / "message.html", message_html)
@@ -903,14 +921,11 @@ def build_play_bundle_to(
         TEMPLATE_HTML
         .replace("{{TITLE}}", _html.escape(title, quote=True))
         .replace(
-            "{{TITLE_BANNER_RGB}}",
-            _rgb_css_value(title_banner_rgb),
-        )
-        .replace(
             "{{TITLE_BANNER_TEXT_RGB}}",
             _rgb_css_value(title_banner_text_rgb),
         )
         .replace("{{MESSAGE_HTML}}", embedded_message_html)
+        .replace("{{HAS_MESSAGE_JSON}}", json.dumps(has_message))
         .replace("{{INITIAL_VOLUME}}", str(starting_vol))
         .replace(
             "{{MESSAGE_OVERLAY_STYLE}}",

@@ -467,10 +467,14 @@ class ReadinessWindow(QtWidgets.QFrame):
             button.clicked.connect(
                 lambda _checked=False, tab=item.correction_tab,
                 target=item.correction_target:
-                self.correction_requested.emit(tab, target)
+                self._request_correction(tab, target)
             )
             self.items_layout.addWidget(button)
             self._missing_buttons[item.key] = button
+
+    def _request_correction(self, tab: str, target: str) -> None:
+        self.hide()
+        self.correction_requested.emit(tab, target)
 
     def refresh(self, result: ReadinessResult) -> None:
         self.percentage.setText(f"{result.completion_percentage}%")
@@ -713,7 +717,7 @@ class ForgeTab(QtWidgets.QWidget):
 
         self.readiness_window = ReadinessWindow(self.project_root)
         self.readiness_window.correction_requested.connect(
-            self.correction_requested.emit
+            self._handle_readiness_correction
         )
         self._init_ui()
 
@@ -823,7 +827,7 @@ class ForgeTab(QtWidgets.QWidget):
         self.readiness_summary = QtWidgets.QLabel()
         self.readiness_summary.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         readiness_row.addWidget(self.readiness_summary)
-        self.readiness_btn = self._small_button("Review Readiness")
+        self.readiness_btn = self._small_button("Review")
         self.readiness_btn.clicked.connect(self.show_readiness_window)
         readiness_row.addWidget(self.readiness_btn)
         heading_row.addWidget(self._readiness_controls)
@@ -1507,6 +1511,14 @@ class ForgeTab(QtWidgets.QWidget):
 
     def attach_readiness_window(self, owner: QtWidgets.QWidget) -> None:
         self.readiness_window.attach_to(owner)
+
+    def dismiss_readiness(self) -> None:
+        self._readiness_requested = False
+        self.readiness_window.hide()
+
+    def _handle_readiness_correction(self, tab: str, target: str) -> None:
+        self.dismiss_readiness()
+        self.correction_requested.emit(tab, target)
 
     def set_readiness_context_visible(self, visible: bool) -> None:
         if not visible:
@@ -2221,9 +2233,12 @@ class ForgeTab(QtWidgets.QWidget):
         if not self._flush_prompt_writer_state():
             return
         ensure_output_dirs(self.project_root)
+        message_path = self.project_root / MESSAGE_HTML_FILE
         try:
-            message = read_text_normalized(
-                self.project_root / MESSAGE_HTML_FILE
+            message = (
+                read_text_normalized(message_path)
+                if message_path.is_file()
+                else ""
             )
         except Exception:
             _LOGGER.exception("Could not read the current message.")
@@ -2384,9 +2399,12 @@ class ForgeTab(QtWidgets.QWidget):
         if not self._flush_prompt_writer_state():
             return
 
+        message_path = self.project_root / MESSAGE_HTML_FILE
         try:
-            message = read_text_normalized(
-                self.project_root / MESSAGE_HTML_FILE
+            message = (
+                read_text_normalized(message_path)
+                if message_path.is_file()
+                else ""
             )
         except Exception:
             _LOGGER.exception("Could not read the current message.")
