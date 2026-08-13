@@ -2587,8 +2587,7 @@ class Nexus(QtWidgets.QMainWindow):
                 except Exception:
                     pass
                 try:
-                    self.sound_tab.deactivate_for_tab_change()
-                    self.sound_tab.release_current_file_handle()
+                    self.sound_tab.shutdown()
                 except Exception:
                     pass
                 try:

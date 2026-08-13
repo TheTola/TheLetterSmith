@@ -241,6 +241,12 @@ class AudioVisualizerUltra(QtWidgets.QWidget):
         self._hue = (205.0 - 38.0 * bassy + 22.0 * bright) % 360.0
         self.update()
 
+    def has_analysis(self) -> bool:
+        return self._analysis.ok()
+
+    def is_animation_running(self) -> bool:
+        return self._timer.isActive()
+
     def set_active(self, active: bool) -> None:
         active = bool(active)
         if active == self._active:
@@ -481,14 +487,8 @@ class AudioVisualizerUltra(QtWidgets.QWidget):
             float(max(1, r.height() - pad * 2)),
         )
 
-        # If active but cache is missing, tell the truth visually instead of faking.
+        # Missing analysis is handled by SoundPreviewWidget's live renderer.
         if not self._analysis.ok():
-            if self._active:
-                p.setPen(self._text)
-                font = QtGui.QFont("Segoe UI", 9)
-                font.setWeight(QtGui.QFont.Medium)
-                p.setFont(font)
-                p.drawText(r, Qt.AlignCenter, "Analysis cache unavailable")
             p.end()
             return
 

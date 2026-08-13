@@ -75,7 +75,7 @@ except Exception as error:
 
     AudioAnalysisManager = None
 
-    def analysis_runtime_status() -> tuple[bool, str]:
+    def analysis_runtime_status(_project_root=None) -> tuple[bool, str]:
         return (
             False,
             "Sound analysis module could not be imported.",
@@ -2672,22 +2672,6 @@ class PlaylistPlayer(
 
         self._crossfade_timer.stop()
 
-        self.players[
-            old_slot
-        ].stop()
-
-        self.players[
-            old_slot
-        ].setPosition(
-            0
-        )
-
-        self.outputs[
-            old_slot
-        ].setVolume(
-            self._volume
-        )
-
         self.active_slot = new_slot
         self.current_index = (
             self.current_index + 1
@@ -2708,6 +2692,24 @@ class PlaylistPlayer(
 
         self.playbackChanged.emit(
             True
+        )
+
+        # Rebind the preview while both sources are still playing. Stopping the
+        # outgoing player first would briefly collapse the visualization.
+        self.players[
+            old_slot
+        ].stop()
+
+        self.players[
+            old_slot
+        ].setPosition(
+            0
+        )
+
+        self.outputs[
+            old_slot
+        ].setVolume(
+            self._volume
         )
 
     def _cancel_crossfade(
@@ -3515,6 +3517,7 @@ class SoundTab(QtWidgets.QWidget):
         self._analysis = None
         self._analysis_key = ""
         self._analysis_disabled = False
+        self._shutdown = False
 
         self._preview = SoundPreviewWidget(
             self.player.player,
@@ -3566,7 +3569,9 @@ class SoundTab(QtWidgets.QWidget):
             return
 
         ready, reason = (
-            analysis_runtime_status()
+            analysis_runtime_status(
+                self.project_root
+            )
         )
 
         if not ready:
@@ -4576,7 +4581,8 @@ class SoundTab(QtWidgets.QWidget):
         self._sync_transport_enabled()
 
         self._on_track_changed(
-            self.player.current_track_id
+            self.player.current_track_id,
+            persist_selection=False,
         )
 
     def _refresh_playlist(
@@ -5452,9 +5458,12 @@ class SoundTab(QtWidgets.QWidget):
     def _on_track_changed(
         self,
         track_id: str,
+        *,
+        persist_selection: bool = True,
     ) -> None:
         if (
-            track_id
+            persist_selection
+            and track_id
             and track_id
             in self.project_sound
             .ordered_ids()
@@ -5532,6 +5541,7 @@ class SoundTab(QtWidgets.QWidget):
         else:
             preview_path = ""
 
+        self._analysis_key = ""
         self._preview.set_audio_file(
             preview_path
         )
@@ -5599,6 +5609,10 @@ class SoundTab(QtWidgets.QWidget):
         self,
         player: QMediaPlayer,
     ) -> None:
+        self._analysis_key = ""
+        self._preview.set_analysis_payload(
+            None
+        )
         self._preview.set_media_player(
             player
         )
@@ -5610,6 +5624,7 @@ class SoundTab(QtWidgets.QWidget):
             self._analysis is None
             or self._analysis_disabled
         ):
+            self._analysis_key = ""
             return
 
         path = self.library.path_for(
@@ -5617,6 +5632,7 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         if path is None:
+            self._analysis_key = ""
             return
 
         self._analysis_key = str(
@@ -5660,9 +5676,11 @@ class SoundTab(QtWidgets.QWidget):
 
     def _on_analysis_failed(
         self,
-        _path_key: str,
+        path_key: str,
         message: str,
     ) -> None:
+        if str(path_key) != self._analysis_key:
+            return
         self._disable_analysis(
             message
         )
@@ -5773,24 +5791,28 @@ class SoundTab(QtWidgets.QWidget):
         return self._preview
 
     def activate_for_tab_change(self) -> None:
+        if self._tab_active or self._shutdown:
+            return
         self._tab_active = True
+
+        # Reload project_sound.json and purge tracks whose files disappeared.
+        self.reload_project_from_disk()
 
         self._preview.set_tab_active(
             True
         )
 
-        # Reload project_sound.json and purge tracks whose files disappeared.
-        self.reload_project_from_disk()
-
     def deactivate_for_tab_change(self) -> None:
+        if not self._tab_active:
+            return
         self._tab_active = False
-
-        self.player.stop(
-            reset_position=True
-        )
 
         self._preview.set_tab_active(
             False
+        )
+
+        self.player.stop(
+            reset_position=True
         )
 
         self.play_btn.setText(
@@ -5840,6 +5862,7 @@ class SoundTab(QtWidgets.QWidget):
 
         if self._analysis is not None:
             self._analysis.shutdown()
+            self._analysis = None
             self._analysis_key = ""
 
         self.release_current_file_handle()
@@ -5901,6 +5924,12 @@ class SoundTab(QtWidgets.QWidget):
         self.player.stop(
             reset_position=True
         )
+
+        if (
+            self._analysis is None
+            and not self._analysis_disabled
+        ):
+            self._init_analysis()
 
         self.library.records = load_library(
             self.project_root
@@ -5994,6 +6023,19 @@ class SoundTab(QtWidgets.QWidget):
         self,
         event: QtGui.QCloseEvent,
     ) -> None:
+        self.shutdown()
+
+        super().closeEvent(
+            event
+        )
+
+    def shutdown(self) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+
+        self._tab_active = False
+        self._preview.set_tab_active(False)
         self._stop_background_threads()
 
         self.player.shutdown()
@@ -6005,10 +6047,6 @@ class SoundTab(QtWidgets.QWidget):
 
             except Exception:
                 pass
-
-        super().closeEvent(
-            event
-        )
 
 
 __all__ = [

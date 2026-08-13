@@ -10,7 +10,7 @@ import os
 import tempfile
 
 from config import USER_SOUNDS_DIR
-from audio_tools import AudioToolError, decode_mono_pcm16
+from audio_tools import AudioToolError, decode_mono_pcm16, toolchain_available
 
 import zlib
 from dataclasses import dataclass
@@ -45,10 +45,21 @@ def _safe_mtime_size(path: Path) -> Tuple[float, int]:
         return 0.0, -1
 
 
-def analysis_runtime_status() -> tuple[bool, str]:
+def analysis_runtime_status(project_root: Optional[Path] = None) -> tuple[bool, str]:
     """Return whether the optional analysis runtime can operate."""
     if np is None:
         return False, "NumPy is not installed."
+    if not toolchain_available():
+        return False, "The bundled FFmpeg tools are unavailable."
+    if project_root is not None:
+        directory = Path(project_root) / USER_SOUNDS_DIR / "appssong" / "analysis"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            fd, probe_name = tempfile.mkstemp(prefix=".analysis-write-test.", dir=directory)
+            os.close(fd)
+            Path(probe_name).unlink(missing_ok=True)
+        except OSError as error:
+            return False, f"The analysis cache is not writable: {error}"
     return True, ""
 
 
@@ -378,6 +389,7 @@ class AudioAnalysisManager(QtCore.QObject):
         self._total = 0
         self._done = 0
         self._busy = False
+        self._shutting_down = False
 
         self._hop_ms = 20
         self._nbands = 32
@@ -387,9 +399,10 @@ class AudioAnalysisManager(QtCore.QObject):
         return self._busy
 
     def shutdown(self) -> None:
+        self._shutting_down = True
         self._queue.clear()
         self._pending.clear()
-        self._cleanup_thread()
+        self._cleanup_thread(wait_ms=None)
         self._set_busy(False)
 
     def enqueue_missing(self) -> None:
@@ -402,6 +415,8 @@ class AudioAnalysisManager(QtCore.QObject):
                 self.ensure_analyzed(p, priority=False)
 
     def ensure_analyzed(self, path: Path, priority: bool = True) -> None:
+        if self._shutting_down:
+            return
         p = Path(path).resolve()
         key = str(p)
 
@@ -473,8 +488,15 @@ class AudioAnalysisManager(QtCore.QObject):
         self.busyChanged.emit(v)
 
     def _start_next(self) -> None:
+        if self._shutting_down:
+            self._queue.clear()
+            self._pending.clear()
+            self._set_busy(False)
+            return
         # cleanup old thread
-        self._cleanup_thread()
+        if not self._cleanup_thread():
+            QtCore.QTimer.singleShot(100, self._start_next)
+            return
 
         if not self._queue:
             self._pending.clear()
@@ -513,7 +535,7 @@ class AudioAnalysisManager(QtCore.QObject):
         self.batchProgress.emit(self._done, max(self._total, 1), job.path.name, 0)
         self._thread.start()
 
-    def _cleanup_thread(self) -> None:
+    def _cleanup_thread(self, wait_ms: Optional[int] = 2000) -> bool:
         try:
             if self._worker is not None:
                 self._worker.abort()
@@ -523,18 +545,29 @@ class AudioAnalysisManager(QtCore.QObject):
         if self._thread is not None:
             try:
                 self._thread.quit()
-                self._thread.wait(2000)
+                stopped = (
+                    self._thread.wait()
+                    if wait_ms is None
+                    else self._thread.wait(wait_ms)
+                )
+                if not stopped:
+                    return False
             except Exception:
-                pass
+                return False
 
         self._worker = None
         self._thread = None
+        return True
 
     def _on_progress(self, path_str: str, pct: int) -> None:
+        if self._shutting_down:
+            return
         name = Path(path_str).name
         self.batchProgress.emit(self._done, max(self._total, 1), name, int(pct))
 
     def _on_finished(self, path_str: str, payload: dict) -> None:
+        if self._shutting_down:
+            return
         self._pending.discard(path_str)
         self._done += 1
         self._recount_totals()
@@ -544,6 +577,8 @@ class AudioAnalysisManager(QtCore.QObject):
         QtCore.QTimer.singleShot(0, self._start_next)
 
     def _on_failed(self, path_str: str, msg: str) -> None:
+        if self._shutting_down:
+            return
         self._pending.discard(path_str)
         self._done += 1
         self._recount_totals()
