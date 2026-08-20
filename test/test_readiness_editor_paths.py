@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -20,9 +21,10 @@ from Forge_Tab import ForgeTab, ReadinessWindow
 from config import (
     CONTROL_FILES,
     REQUIRED_SLIDES,
+    canonical_stock_letters_root,
     resolve_play_bundle_directory,
 )
-from project_paths import ProjectPathError, ProjectPathResolver
+from project_paths import ProjectPathError, ProjectPathResolver, application_paths
 from project_save import ProjectNotReadyError, ProjectSaveService
 from project_state import ProjectStateController
 from readiness import (
@@ -38,6 +40,51 @@ from sound_model import (
     save_project_state,
 )
 from sound_tab import ArchiveDialog
+
+
+class FakeLanguageService:
+    def __init__(
+        self,
+        issues=(),
+        *,
+        error: BaseException | None = None,
+        issue_provider=None,
+    ) -> None:
+        self.issues = tuple(issues)
+        self.error = error
+        self.issue_provider = issue_provider
+        self.calls: list[tuple[str, str, tuple[str, ...]]] = []
+        self.added_words: list[str] = []
+        self.ignored_words: list[str] = []
+
+    def get_issues(
+        self,
+        text: str,
+        *,
+        context: str,
+        protected_terms=(),
+    ):
+        self.calls.append((text, context, tuple(protected_terms)))
+        if self.error is not None:
+            raise self.error
+        if self.issue_provider is not None:
+            issues = tuple(self.issue_provider(text))
+        else:
+            issues = self.issues
+        ignored = {word.casefold() for word in self.ignored_words}
+        return tuple(
+            issue
+            for issue in issues
+            if str(getattr(issue, "text", "")).casefold() not in ignored
+        )
+
+    def add_to_dictionary(self, word: str) -> bool:
+        self.added_words.append(word)
+        return True
+
+    def ignore_word(self, word: str) -> bool:
+        self.ignored_words.append(word)
+        return True
 
 
 class ReadinessEditorAndProjectPathTests(unittest.TestCase):
@@ -110,6 +157,72 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 48,
             )
             tab.close()
+
+    def test_forge_builds_a_missing_preview_and_reuses_a_current_one(self) -> None:
+        missing = SimpleNamespace(
+            _busy=False,
+            _preview_refresh_pending=True,
+            _preview_refresh_requested=False,
+            _current_play_index=mock.Mock(return_value=None),
+            _prepare_preview=mock.Mock(),
+            request_preview=mock.Mock(),
+        )
+
+        ForgeTab.ensure_preview_current(missing)
+
+        missing._prepare_preview.assert_called_once_with(open_in_browser=False)
+        missing.request_preview.assert_not_called()
+
+        current = SimpleNamespace(
+            _busy=False,
+            _preview_refresh_pending=False,
+            _preview_refresh_requested=False,
+            _current_play_index=mock.Mock(return_value=Path("index.html")),
+            _prepare_preview=mock.Mock(),
+            request_preview=mock.Mock(),
+        )
+
+        ForgeTab.ensure_preview_current(current)
+
+        current.request_preview.assert_called_once_with()
+        current._prepare_preview.assert_not_called()
+
+    def test_forge_does_not_retry_a_preview_after_leaving_the_tab(self) -> None:
+        forge = SimpleNamespace(
+            _worker_thread=None,
+            _worker=object(),
+            _operation_error_message="error",
+            _operation_failure=mock.Mock(),
+            _busy=True,
+            _set_busy=mock.Mock(),
+            _finish_restore_activity=mock.Mock(),
+            _preview_refresh_requested=True,
+            _tab_active=False,
+            ensure_preview_current=mock.Mock(),
+        )
+
+        with mock.patch("Forge_Tab.QtCore.QTimer.singleShot") as single_shot:
+            ForgeTab._operation_finished(forge)
+
+        single_shot.assert_not_called()
+        self.assertFalse(forge._preview_refresh_requested)
+
+    def test_forge_deactivation_releases_preview_and_cancels_retry(self) -> None:
+        forge = SimpleNamespace(
+            _tab_active=True,
+            _preview_refresh_requested=True,
+            saved_panel=mock.Mock(),
+            preview_visibility_changed=mock.Mock(),
+            preview_files_release_requested=mock.Mock(),
+        )
+
+        ForgeTab.deactivate_for_tab_change(forge)
+
+        self.assertFalse(forge._tab_active)
+        self.assertFalse(forge._preview_refresh_requested)
+        forge.saved_panel.hide.assert_called_once_with()
+        forge.preview_visibility_changed.emit.assert_called_once_with(False)
+        forge.preview_files_release_requested.emit.assert_called_once_with()
 
     def test_duplicate_project_ids_are_reported_and_repaired_without_merging(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -239,6 +352,59 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.assertFalse(title_item.ready)
             self.assertIn("different letter title", title_item.detail)
 
+    def test_stock_prefixed_title_routes_outside_saved_letters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_id = str(uuid.uuid4())
+            source = root / "output" / "Play" / "Amani Hill" / "Stock Letter"
+            source.mkdir(parents=True)
+            for filename in ("index.html", "styles.css", "script.js"):
+                (source / filename).write_text("", encoding="utf-8")
+            (source / "lettersmith-metadata.json").write_text(
+                json.dumps(
+                    {
+                        "project_id": project_id,
+                        "recipient_name": "Amani Hill",
+                        "recipient_title": "Stock: Letter",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            stock = resolve_play_bundle_directory(
+                root,
+                recipient="Amani Hill",
+                title="Stock: Letter",
+                project_id=project_id,
+            )
+
+            self.assertEqual(
+                stock,
+                canonical_stock_letters_root(root) / "Stock Letter",
+            )
+            self.assertTrue(stock.is_dir())
+            self.assertFalse(source.exists())
+
+            play = resolve_play_bundle_directory(
+                root,
+                recipient="Amani Hill",
+                title="Regular Letter",
+                project_id=project_id,
+            )
+
+            self.assertEqual(
+                play,
+                (
+                    root
+                    / "output"
+                    / "Play"
+                    / "Amani Hill"
+                    / "Regular Letter"
+                ).resolve(),
+            )
+            self.assertTrue(play.is_dir())
+            self.assertFalse(stock.exists())
+
     def test_project_save_requires_two_completed_tabs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -305,6 +471,28 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 ["images", "message"],
             )
             self.assertEqual(metadata["autosave_reason"], "tab-switch")
+            self.assertEqual(metadata["schema_version"], "1.0")
+            self.assertEqual(
+                metadata["document_type"],
+                "project_autosave",
+            )
+
+    def test_valid_manual_url_satisfies_published_link_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            SettingsStore(root).update_fields(
+                {
+                    "published_page_url": "http://example.com/letter?preview=1",
+                }
+            )
+
+            published_link = next(
+                item
+                for item in evaluate_readiness(root).items
+                if item.key == "published_url"
+            )
+
+            self.assertTrue(published_link.ready)
 
     def test_title_change_renames_the_same_project_and_play_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -513,7 +701,12 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                     )
                     self.assertTrue(eligibility.can_save)
 
-    def _make_editor(self, preset: str) -> tuple[Editor, tempfile.TemporaryDirectory[str]]:
+    def _make_editor(
+        self,
+        preset: str,
+        *,
+        language_service=None,
+    ) -> tuple[Editor, tempfile.TemporaryDirectory[str]]:
         holder = tempfile.TemporaryDirectory()
         root = Path(holder.name)
         (root / "settings.json").write_text(
@@ -522,7 +715,11 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
         )
         host = QtWidgets.QWidget()
         host.project_root = root
-        editor = Editor("<p>Letter</p>", parent=host)
+        editor = Editor(
+            "<p>Letter</p>",
+            parent=host,
+            language_service=language_service,
+        )
         editor._host_for_test = host
         return editor, holder
 
@@ -618,6 +815,341 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.assertEqual(save.call_count, 1)
             self.assertIn("background-color:transparent", editor.editor.styleSheet())
         finally:
+            editor.deleteLater()
+            editor._host_for_test.deleteLater()
+            self.app.processEvents()
+            holder.cleanup()
+
+    def test_editor_debounces_language_analysis_and_underlines_issues(self) -> None:
+        issue = SimpleNamespace(
+            start=2,
+            end=5,
+            text="teh",
+            category="spelling",
+            replacement="the",
+            suggestions=("the",),
+            confidence="high",
+            auto_fix=True,
+        )
+        service = FakeLanguageService((issue,))
+        editor, holder = self._make_editor(
+            "paper",
+            language_service=service,
+        )
+        try:
+            editor.recipient_name = "Amani Hill"
+            editor._language_check_timer.stop()
+            editor._language_check_timer.setInterval(0)
+
+            editor.editor.setPlainText("A teh note for Amani Hill.")
+
+            self.assertTrue(editor._language_check_timer.isActive())
+            self.app.processEvents()
+            self.assertEqual(
+                service.calls[-1],
+                (
+                    "A teh note for Amani Hill.",
+                    "prose",
+                    ("Amani Hill",),
+                ),
+            )
+            selections = editor.editor.extraSelections()
+            self.assertEqual(len(selections), 1)
+            self.assertEqual(selections[0].cursor.selectedText(), "teh")
+            self.assertEqual(
+                selections[0].format.underlineStyle(),
+                QtGui.QTextCharFormat.UnderlineStyle.SpellCheckUnderline,
+            )
+        finally:
+            editor._closing = True
+            editor.close()
+            editor.deleteLater()
+            editor._host_for_test.deleteLater()
+            self.app.processEvents()
+            holder.cleanup()
+
+    def test_editor_proofreads_before_save_preserving_format_and_undo(self) -> None:
+        issue = SimpleNamespace(
+            start=0,
+            end=3,
+            text="teh",
+            category="spelling",
+            replacement="the",
+            suggestions=("the",),
+            confidence="high",
+            auto_fix=False,
+        )
+        service = FakeLanguageService((issue,))
+        editor, holder = self._make_editor(
+            "paper",
+            language_service=service,
+        )
+        try:
+            editor._language_check_timer.stop()
+            editor.editor.setHtml(
+                '<p><span style="color:#ff0000;font-weight:700">teh</span> '
+                '<span style="color:#0000ff;font-style:italic">world</span></p>'
+            )
+
+            with mock.patch.object(
+                editor.project_save_service,
+                "save_message",
+            ) as save:
+                self.assertTrue(editor._save_document())
+
+            saved_document = QtGui.QTextDocument()
+            saved_document.setHtml(save.call_args.args[0])
+            self.assertEqual(saved_document.toPlainText(), "the world")
+            self.assertEqual(editor.editor.toPlainText(), "the world")
+
+            corrected = QtGui.QTextCursor(editor.editor.document())
+            corrected.setPosition(0)
+            corrected.setPosition(3, QtGui.QTextCursor.KeepAnchor)
+            self.assertEqual(
+                corrected.charFormat().foreground().color().name(),
+                "#ff0000",
+            )
+            self.assertTrue(corrected.charFormat().font().bold())
+
+            untouched = QtGui.QTextCursor(editor.editor.document())
+            untouched.setPosition(4)
+            untouched.movePosition(
+                QtGui.QTextCursor.NextCharacter,
+                QtGui.QTextCursor.KeepAnchor,
+            )
+            self.assertEqual(
+                untouched.charFormat().foreground().color().name(),
+                "#0000ff",
+            )
+            self.assertTrue(untouched.charFormat().fontItalic())
+
+            self.assertTrue(editor.editor.document().isUndoAvailable())
+            editor.editor.undo()
+            self.assertEqual(editor.editor.toPlainText(), "teh world")
+        finally:
+            editor._closing = True
+            editor.close()
+            editor.deleteLater()
+            editor._host_for_test.deleteLater()
+            self.app.processEvents()
+            holder.cleanup()
+
+    def test_editor_maps_language_offsets_after_astral_emoji(self) -> None:
+        text = "😀 teh note"
+        issue = SimpleNamespace(
+            start=text.index("teh"),
+            end=text.index("teh") + len("teh"),
+            text="teh",
+            category="spelling",
+            replacement="the",
+            suggestions=("the",),
+            confidence="high",
+            auto_fix=True,
+        )
+        service = FakeLanguageService(
+            issue_provider=lambda current: (issue,) if "teh" in current else ()
+        )
+        editor, holder = self._make_editor(
+            "paper",
+            language_service=service,
+        )
+        try:
+            editor._language_check_timer.stop()
+            editor.editor.setPlainText(text)
+            editor._language_check_timer.stop()
+
+            editor._refresh_language_issues()
+
+            selections = editor.editor.extraSelections()
+            self.assertEqual(len(selections), 1)
+            self.assertEqual(selections[0].cursor.selectedText(), "teh")
+
+            with mock.patch.object(
+                editor.project_save_service,
+                "save_message",
+            ) as save:
+                self.assertTrue(editor._save_document())
+
+            saved_document = QtGui.QTextDocument()
+            saved_document.setHtml(save.call_args.args[0])
+            self.assertEqual(saved_document.toPlainText(), "😀 the note")
+            self.assertEqual(editor.editor.toPlainText(), "😀 the note")
+        finally:
+            editor._closing = True
+            editor.close()
+            editor.deleteLater()
+            editor._host_for_test.deleteLater()
+            self.app.processEvents()
+            holder.cleanup()
+
+    def test_editor_rechecks_safe_corrections_before_saving(self) -> None:
+        first_issue = SimpleNamespace(
+            start=0,
+            end=3,
+            text="teh",
+            category="spelling",
+            replacement="the",
+            suggestions=("the",),
+            confidence="high",
+            auto_fix=True,
+        )
+        second_issue = SimpleNamespace(
+            start=4,
+            end=7,
+            text="teh",
+            category="spelling",
+            replacement="the",
+            suggestions=("the",),
+            confidence="high",
+            auto_fix=True,
+        )
+
+        def staged_issues(text: str):
+            if text == "teh teh":
+                return (first_issue,)
+            if text == "the teh":
+                return (second_issue,)
+            return ()
+
+        service = FakeLanguageService(issue_provider=staged_issues)
+        editor, holder = self._make_editor(
+            "paper",
+            language_service=service,
+        )
+        try:
+            editor._language_check_timer.stop()
+            editor.editor.setPlainText("teh teh")
+            editor._language_check_timer.stop()
+
+            with mock.patch.object(
+                editor.project_save_service,
+                "save_message",
+            ) as save:
+                self.assertTrue(editor._save_document())
+
+            saved_document = QtGui.QTextDocument()
+            saved_document.setHtml(save.call_args.args[0])
+            self.assertEqual(saved_document.toPlainText(), "the the")
+            self.assertEqual(editor.editor.toPlainText(), "the the")
+            self.assertEqual(
+                [call[0] for call in service.calls[:2]],
+                ["teh teh", "the teh"],
+            )
+        finally:
+            editor._closing = True
+            editor.close()
+            editor.deleteLater()
+            editor._host_for_test.deleteLater()
+            self.app.processEvents()
+            holder.cleanup()
+
+    def test_editor_adds_spelling_issue_to_shared_dictionary(self) -> None:
+        issue = SimpleNamespace(
+            start=0,
+            end=7,
+            text="Quorvax",
+            category="spelling",
+        )
+        service = FakeLanguageService((issue,))
+        editor, holder = self._make_editor(
+            "paper",
+            language_service=service,
+        )
+        try:
+            refresh_spy = QtTest.QSignalSpy(
+                editor.editor.language_refresh_requested
+            )
+
+            self.assertTrue(
+                editor.editor.add_language_issue_to_dictionary(issue)
+            )
+
+            self.assertEqual(service.added_words, ["Quorvax"])
+            self.assertEqual(refresh_spy.count(), 1)
+        finally:
+            editor._closing = True
+            editor.close()
+            editor.deleteLater()
+            editor._host_for_test.deleteLater()
+            self.app.processEvents()
+            holder.cleanup()
+
+    def test_editor_ignored_spelling_issue_is_not_corrected_on_save(self) -> None:
+        issue = SimpleNamespace(
+            start=0,
+            end=3,
+            text="teh",
+            category="spelling",
+            replacement="the",
+            suggestions=("the",),
+            confidence="high",
+            auto_fix=True,
+        )
+        service = FakeLanguageService((issue,))
+        editor, holder = self._make_editor(
+            "paper",
+            language_service=service,
+        )
+        try:
+            editor._language_check_timer.stop()
+            editor.editor.setPlainText("teh remains")
+            editor._language_check_timer.stop()
+            editor.editor.set_language_issues((issue,))
+
+            editor.editor.ignore_language_issue(issue)
+
+            self.assertEqual(service.ignored_words, ["teh"])
+            self.assertEqual(editor.editor.language_issues, ())
+            with mock.patch.object(
+                editor.project_save_service,
+                "save_message",
+            ) as save:
+                self.assertTrue(editor._save_document())
+
+            saved_document = QtGui.QTextDocument()
+            saved_document.setHtml(save.call_args.args[0])
+            self.assertEqual(saved_document.toPlainText(), "teh remains")
+            self.assertEqual(editor.editor.toPlainText(), "teh remains")
+        finally:
+            editor._closing = True
+            editor.close()
+            editor.deleteLater()
+            editor._host_for_test.deleteLater()
+            self.app.processEvents()
+            holder.cleanup()
+
+    def test_editor_language_failure_does_not_block_manual_save(self) -> None:
+        error = RuntimeError("checker unavailable")
+        service = FakeLanguageService(error=error)
+        editor, holder = self._make_editor(
+            "paper",
+            language_service=service,
+        )
+        try:
+            editor._language_check_timer.stop()
+            editor.editor.setPlainText("Keep the original text.")
+            with (
+                mock.patch.object(editor, "_record_failure") as record_failure,
+                mock.patch.object(
+                    editor.project_save_service,
+                    "save_message",
+                ) as save,
+            ):
+                self.assertTrue(editor._save_document())
+
+            saved_document = QtGui.QTextDocument()
+            saved_document.setHtml(save.call_args.args[0])
+            self.assertEqual(
+                saved_document.toPlainText(),
+                "Keep the original text.",
+            )
+            record_failure.assert_any_call(
+                "proofread letter before save",
+                error,
+            )
+        finally:
+            editor._closing = True
+            editor.close()
             editor.deleteLater()
             editor._host_for_test.deleteLater()
             self.app.processEvents()
@@ -873,7 +1405,10 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                     lambda: (_ for _ in ()).throw(RuntimeError("injected")),
                 )
             warning.assert_called_once()
-            error_log = editor.project_root / "editor_error.log"
+            error_log = (
+                application_paths(editor.project_root).logs_root
+                / "editor_error.log"
+            )
             self.assertTrue(error_log.is_file())
             log_text = error_log.read_text(encoding="utf-8")
             self.assertIn("editor action: Injected failure", log_text)

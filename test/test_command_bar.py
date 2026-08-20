@@ -29,6 +29,18 @@ class CommandBarTests(unittest.TestCase):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 
     @staticmethod
+    def _verified_publication(url: str, public_path: str) -> dict[str, object]:
+        return {
+            "published_page_url": url,
+            "published_public_path": public_path,
+            "published_at": "2026-01-01T00:00:00+00:00",
+            "published_expires_at": "2099-01-31T00:00:00+00:00",
+            "publication_provider": "cloudflare_r2",
+            "publication_verified": True,
+            "published_source_fingerprint": "fixture-source",
+        }
+
+    @staticmethod
     def _write_saved_letter(
         root: Path,
         folder: str,
@@ -57,7 +69,10 @@ class CommandBarTests(unittest.TestCase):
                 {
                     "recipient_name": recipient,
                     "recipient_title": title,
-                    "published_page_url": published_url,
+                    **CommandBarTests._verified_publication(
+                        published_url,
+                        folder,
+                    ),
                     "last_activity_at": activity,
                 }
             ),
@@ -76,7 +91,10 @@ class CommandBarTests(unittest.TestCase):
                     {
                         "recipient_name": "Amanda Miller",
                         "recipient_title": "A Letter",
-                        "published_page_url": "https://example.com/letter",
+                        **self._verified_publication(
+                            "https://example.com/letter",
+                            "amanda-letter",
+                        ),
                     }
                 ),
                 encoding="utf-8",
@@ -95,6 +113,79 @@ class CommandBarTests(unittest.TestCase):
         self.assertEqual(data.recipient_title, "A Letter")
         self.assertEqual(data.published_url, "https://example.com/letter")
         self.assertTrue(data.local_preview_path is not None)
+
+    def test_valid_manual_url_is_exposed_as_a_published_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            SettingsStore(root).update_fields(
+                {
+                    "published_page_url": "https://example.com/manual",
+                    "recipient_name": "Amanda Miller",
+                    "recipient_title": "A Letter",
+                }
+            )
+
+            data = build_command_bar_data(root)
+
+        self.assertEqual(
+            data.published_url,
+            "https://example.com/manual",
+        )
+
+    def test_active_local_bundle_does_not_inherit_another_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            play_dir = self._write_saved_letter(
+                root,
+                "local-active",
+                recipient="Amanda Miller",
+                title="A Letter",
+                published_url="",
+                activity="2026-08-13T12:00:00+00:00",
+            )
+            SettingsStore(root).update_fields(
+                {
+                    ACTIVE_PLAY_DIR_KEY: str(play_dir),
+                    "recipient_name": "Amanda Miller",
+                    "recipient_title": "A Letter",
+                    **self._verified_publication(
+                        "https://example.com/another-letter",
+                        "another-letter",
+                    ),
+                }
+            )
+
+            data = build_command_bar_data(root)
+
+        self.assertEqual(data.published_url, "")
+
+    def test_active_stock_letter_is_a_valid_command_bar_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stock = root / "resources" / "stock" / "letters" / "Stock Letter"
+            stock.mkdir(parents=True)
+            (stock / "index.html").write_text("<html></html>", encoding="utf-8")
+            (stock / PLAY_METADATA_FILE).write_text(
+                json.dumps(
+                    {
+                        "recipient_name": "Stock",
+                        "recipient_title": "Stock: Letter",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            SettingsStore(root).update_fields(
+                {
+                    ACTIVE_PLAY_DIR_KEY: str(stock),
+                    "recipient_name": "Stock",
+                    "recipient_title": "Stock: Letter",
+                }
+            )
+
+            data = build_command_bar_data(root)
+
+            self.assertEqual(data.local_preview_path, stock.resolve() / "index.html")
+            self.assertTrue(command_bar_has_openable_target(data, root))
 
     def test_obsolete_metadata_filename_is_not_read(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

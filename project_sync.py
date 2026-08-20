@@ -9,6 +9,8 @@ changed through Letter Smith as well as files replaced directly on disk.
 import hashlib
 import json
 from pathlib import Path
+
+from project_paths import application_paths
 from typing import Iterable
 
 _SAMPLE_SIZE = 64 * 1024
@@ -103,7 +105,7 @@ def sound_fingerprint(project_root: str | Path) -> str:
 
 def settings_fingerprint(project_root: str | Path) -> str:
     root = Path(project_root).resolve()
-    path = root / "settings.json"
+    path = application_paths(root).settings_file
     if not path.is_file():
         return _paths_digest(root, (path,))
 

@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
 from Message_tab import IDENTITY_LOCK_KEYS, IdentityLineEdit, MessageTab
 from Nexus import Nexus
@@ -17,6 +17,7 @@ from project_state import (
     ProjectStateController,
     load_project_settings,
 )
+from recipient_page import RecipientPage
 from readiness import evaluate_project_save_eligibility
 from saved_letters import SavedLetterCatalog
 from settings_store import SettingsStore
@@ -34,6 +35,48 @@ class IdentityFieldLockingTests(unittest.TestCase):
         )
         self.assertFalse(MessageTab._setting_bool("false"))
         self.assertTrue(MessageTab._setting_bool("true"))
+
+    def test_recipient_page_has_load_stock_and_begin_actions(self) -> None:
+        page = RecipientPage()
+        load_spy = QtTest.QSignalSpy(page.load_requested)
+        stock_spy = QtTest.QSignalSpy(page.stock_requested)
+        recipient_spy = QtTest.QSignalSpy(page.recipient_submitted)
+
+        labels = {
+            label.text()
+            for label in page.findChildren(QtWidgets.QLabel)
+            if label.text()
+        }
+        self.assertIn("Who is this letter for?", labels)
+        self.assertNotIn("Recipient", labels)
+        self.assertFalse(hasattr(page, "custom_capitalization"))
+        self.assertEqual(page.load_button.text(), "Load")
+        self.assertEqual(page.stock_button.text(), "Stock")
+        self.assertEqual(page.begin_button.text(), "Begin")
+        self.assertEqual(
+            page.load_button.minimumSize(),
+            page.begin_button.minimumSize(),
+        )
+        self.assertEqual(
+            page.stock_button.minimumSize(),
+            page.begin_button.minimumSize(),
+        )
+
+        page.stock_button.click()
+        self.assertEqual(stock_spy.count(), 1)
+        self.assertEqual(load_spy.count(), 0)
+        self.assertEqual(recipient_spy.count(), 0)
+
+        page.load_button.click()
+        self.assertEqual(load_spy.count(), 1)
+        page.recipient_input.setText("aMANda mCCall")
+        page.begin_button.click()
+        self.assertEqual(recipient_spy.count(), 1)
+        self.assertEqual(
+            list(recipient_spy.at(0)),
+            ["aMANda mCCall", True],
+        )
+        page.deleteLater()
 
     def test_double_click_unlocks_a_committed_field(self) -> None:
         field = IdentityLineEdit("A Letter")
@@ -121,6 +164,127 @@ class IdentityFieldLockingTests(unittest.TestCase):
         self.assertFalse(field.isReadOnly())
         field.deleteLater()
 
+    def test_manual_url_change_clears_cloudflare_verification(self) -> None:
+        message = types.SimpleNamespace(
+            settings={
+                "published_page_url": "https://letters.example.com/letters/old/",
+                "published_public_path": "old",
+                "published_at": "2026-08-13T12:00:00+00:00",
+                "published_expires_at": "2099-09-12T12:00:00+00:00",
+                "publication_provider": "cloudflare_r2",
+                "publication_verified": True,
+                "published_source_fingerprint": "old-source",
+            },
+            url_input=IdentityLineEdit(),
+            status=QtWidgets.QLabel(),
+            _persist_settings=lambda *, announce: True,
+            published_page_url_changed=types.SimpleNamespace(emit=mock.Mock()),
+        )
+
+        saved = MessageTab.set_published_page_url(
+            message,
+            "https://example.com/manual",
+        )
+
+        self.assertTrue(saved)
+        self.assertEqual(
+            message.settings["published_page_url"],
+            "https://example.com/manual",
+        )
+        self.assertFalse(message.settings["publication_verified"])
+        self.assertEqual(message.settings["published_public_path"], "")
+        message.url_input.deleteLater()
+        message.status.deleteLater()
+
+    def test_enter_commits_manual_url_to_the_canonical_settings_store(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_state = ProjectStateController(root)
+            project_state.initialize()
+            project_state.establish_project(
+                "Recipient",
+                custom_capitalization=True,
+            )
+            message = MessageTab(
+                str(root),
+                project_state=project_state,
+            )
+            message.title_input.setText("A Letter")
+            message.name_input.setText("Recipient")
+            message.url_input.setText("https://example.com/manual")
+
+            message.url_input.returnPressed.emit()
+
+            saved = SettingsStore(root).snapshot()
+            self.assertTrue(message.url_input.isReadOnly())
+            self.assertTrue(saved[IDENTITY_LOCK_KEYS["published_url"]])
+            self.assertEqual(
+                saved["published_page_url"],
+                "https://example.com/manual",
+            )
+            message.deleteLater()
+            self.app.processEvents()
+
+    def test_loaded_letter_relocks_every_populated_identity_field(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_state = ProjectStateController(root)
+            project_state.initialize()
+            project_state.establish_project(
+                "Recipient",
+                custom_capitalization=True,
+            )
+            SettingsStore(root).update_fields(
+                {
+                    "recipient_title": "A Loaded Letter",
+                    "published_page_url": "https://example.com/loaded",
+                    **{
+                        lock_key: False
+                        for lock_key in IDENTITY_LOCK_KEYS.values()
+                    },
+                }
+            )
+
+            message = MessageTab(
+                str(root),
+                project_state=project_state,
+            )
+            fields = (
+                message.title_input,
+                message.name_input,
+                message.url_input,
+            )
+            self.assertTrue(all(field.isReadOnly() for field in fields))
+            saved = SettingsStore(root).snapshot()
+            self.assertTrue(
+                all(
+                    saved[lock_key]
+                    for lock_key in IDENTITY_LOCK_KEYS.values()
+                )
+            )
+
+            for field in fields:
+                field.setReadOnly(False)
+            SettingsStore(root).update_fields(
+                {
+                    lock_key: False
+                    for lock_key in IDENTITY_LOCK_KEYS.values()
+                }
+            )
+
+            message.refresh_from_disk()
+
+            self.assertTrue(all(field.isReadOnly() for field in fields))
+            reloaded = SettingsStore(root).snapshot()
+            self.assertTrue(
+                all(
+                    reloaded[lock_key]
+                    for lock_key in IDENTITY_LOCK_KEYS.values()
+                )
+            )
+            message.deleteLater()
+            self.app.processEvents()
+
     def test_recipient_edit_updates_canonical_project_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -205,6 +369,26 @@ class IdentityFieldLockingTests(unittest.TestCase):
         )
         self.assertEqual(note, "Project autosaved.")
 
+    def test_tab_switch_explicitly_releases_and_refreshes_images(self) -> None:
+        def harness(current_index: int) -> mock.Mock:
+            nexus = mock.Mock()
+            nexus.page_stack.currentIndex.return_value = current_index
+            nexus._tabswitch = None
+            nexus._sound_preview_index = None
+            nexus._autosave_project_on_tab_switch.return_value = ""
+            nexus.tabbar.tabText.return_value = "Images"
+            nexus.help_pop.isVisible.return_value = False
+            return nexus
+
+        with mock.patch("Nexus.QtCore.QTimer.singleShot"):
+            leaving = harness(0)
+            Nexus._apply_tab_state(leaving, 1, animate_page=False)
+            leaving.image_tab.deactivate_for_tab_change.assert_called_once_with()
+
+            entering = harness(1)
+            Nexus._apply_tab_state(entering, 0, animate_page=False)
+            entering.image_tab.activate_for_tab_change.assert_called_once_with()
+
     def test_incomplete_active_project_returns_without_becoming_loadable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -247,6 +431,10 @@ class IdentityFieldLockingTests(unittest.TestCase):
                 events.append("project")
 
         class Tab:
+            def shutdown_operations(self) -> bool:
+                events.append("forge-operation")
+                return True
+
             def deactivate_for_tab_change(self) -> None:
                 events.append("tab")
 
@@ -259,6 +447,7 @@ class IdentityFieldLockingTests(unittest.TestCase):
             _shutdown_complete=False,
             _shutdown_in_progress=False,
             _project_tabs_initialized=True,
+            _stop_curtain_preparation=lambda: events.append("curtain") or True,
             _on_project_state_transition=object(),
             _prompt_writer_win=None,
             _tray_icon=None,
@@ -267,8 +456,7 @@ class IdentityFieldLockingTests(unittest.TestCase):
             _release_forge_preview_files=lambda: None,
             forge_tab=Tab(),
             sound_tab=types.SimpleNamespace(
-                deactivate_for_tab_change=lambda: events.append("sound"),
-                release_current_file_handle=lambda: None,
+                shutdown=lambda: events.append("sound") or True,
             ),
             message_tab=types.SimpleNamespace(
                 shutdown=lambda: events.append("message")
@@ -280,7 +468,10 @@ class IdentityFieldLockingTests(unittest.TestCase):
 
         Nexus.shutdown(harness)
 
+        self.assertLess(events.index("curtain"), events.index("project"))
+        self.assertLess(events.index("forge-operation"), events.index("project"))
         self.assertLess(events.index("prompt"), events.index("project"))
+        self.assertLess(events.index("sound"), events.index("project"))
         self.assertLess(events.index("message"), events.index("project"))
         self.assertLess(events.index("image"), events.index("project"))
 
@@ -302,6 +493,9 @@ class IdentityFieldLockingTests(unittest.TestCase):
             )
 
             self.assertIs(message.project_paths, project_paths)
+            self.assertEqual(message.btn.height(), 80)
+            self.assertEqual(message.edit_btn.height(), 80)
+            self.assertEqual(message.revisions_btn.height(), 80)
             message.deleteLater()
             self.app.processEvents()
 

@@ -7,16 +7,19 @@ import re
 import shutil
 import stat
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from html import unescape
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import unquote, urlsplit
 
+from image_animation import (
+    IMAGE_MANIFEST_NAME,
+    validate_runtime_image_manifest,
+)
 from config import (
     CONTROL_FILES,
-    MESSAGE_HTML_FILE,
     PLAY_METADATA_FILE,
     REQUIRED_SLIDES,
     USER_MESSAGE_DIR,
@@ -24,11 +27,13 @@ from config import (
     USER_SOUNDS_DIR,
     canonical_play_root,
     canonical_recovery_root,
+    canonical_stock_letters_root,
 )
 from project_paths import (
     PROJECT_METADATA_SCHEMA_VERSION,
     ProjectContext,
     ProjectPathResolver,
+    application_paths,
 )
 from project_state import (
     PROJECT_SCHEMA_KEY,
@@ -40,8 +45,27 @@ from project_state import (
 )
 from recipient_registry import RecipientRegistry
 from readiness import ReadinessResult
+from publishing.expiration import publication_status as get_publication_status
+from save_schema import (
+    CURRENT_SAVE_SCHEMA_VERSION,
+    SAVED_LETTER_DOCUMENT_TYPE,
+    SaveSchemaError,
+    has_complete_saved_state,
+    is_current_save_schema,
+    stamp_current_save_schema,
+    validate_saved_letter_metadata,
+)
 from settings_store import (
     ACTIVE_PLAY_DIR_KEY,
+    PUBLICATION_PROVIDER_KEY,
+    PUBLICATION_VERIFIED_KEY,
+    PUBLISHED_AT_KEY,
+    PUBLISHED_EXPIRES_AT_KEY,
+    PUBLISHED_GITHUB_OWNER_KEY,
+    PUBLISHED_GITHUB_REPOSITORY_KEY,
+    PUBLISHED_PAGE_URL_KEY,
+    PUBLISHED_PUBLIC_PATH_KEY,
+    PUBLISHED_SOURCE_FINGERPRINT_KEY,
     SettingsStore,
     normalize_published_page_url,
 )
@@ -53,7 +77,11 @@ from sound_model import (
     display_title_from_name,
     hash_file,
     import_runtime_track,
+    library_path,
     load_library,
+    originals_dir,
+    processed_dir,
+    project_sound_path,
     resolve_project_tracks,
     save_project_state,
     sync_current_compatibility,
@@ -67,7 +95,7 @@ from transactional_io import (
 )
 
 
-METADATA_VERSION = 4
+METADATA_VERSION = CURRENT_SAVE_SCHEMA_VERSION
 LAST_ACTIVITY_AT_KEY = "last_activity_at"
 PROMPT_WRITER_STATE_FILE = "prompt_writer_state.json"
 RESTORABLE_SETTING_KEYS = (
@@ -79,8 +107,47 @@ RESTORABLE_SETTING_KEYS = (
     "required_features",
     "forge_preview_mode",
 )
+PUBLICATION_METADATA_KEYS = (
+    PUBLISHED_PAGE_URL_KEY,
+    PUBLISHED_PUBLIC_PATH_KEY,
+    PUBLISHED_AT_KEY,
+    PUBLISHED_EXPIRES_AT_KEY,
+    PUBLICATION_PROVIDER_KEY,
+    PUBLICATION_VERIFIED_KEY,
+    PUBLISHED_SOURCE_FINGERPRINT_KEY,
+    PUBLISHED_GITHUB_OWNER_KEY,
+    PUBLISHED_GITHUB_REPOSITORY_KEY,
+)
 _LOGGER = logging.getLogger(__name__)
 _ACTIVE_LETTER_LOAD_WORKSPACES: set[Path] = set()
+
+
+def _publication_metadata(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        PUBLISHED_PAGE_URL_KEY: normalize_published_page_url(
+            state.get(PUBLISHED_PAGE_URL_KEY, "")
+        ),
+        PUBLISHED_PUBLIC_PATH_KEY: str(
+            state.get(PUBLISHED_PUBLIC_PATH_KEY, "")
+        ).strip(),
+        PUBLISHED_AT_KEY: str(state.get(PUBLISHED_AT_KEY, "")).strip(),
+        PUBLISHED_EXPIRES_AT_KEY: str(
+            state.get(PUBLISHED_EXPIRES_AT_KEY, "")
+        ).strip(),
+        PUBLICATION_PROVIDER_KEY: str(
+            state.get(PUBLICATION_PROVIDER_KEY, "")
+        ).strip(),
+        PUBLICATION_VERIFIED_KEY: state.get(PUBLICATION_VERIFIED_KEY) is True,
+        PUBLISHED_SOURCE_FINGERPRINT_KEY: str(
+            state.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")
+        ).strip(),
+        PUBLISHED_GITHUB_OWNER_KEY: str(
+            state.get(PUBLISHED_GITHUB_OWNER_KEY, "")
+        ).strip(),
+        PUBLISHED_GITHUB_REPOSITORY_KEY: str(
+            state.get(PUBLISHED_GITHUB_REPOSITORY_KEY, "")
+        ).strip(),
+    }
 
 
 @dataclass(frozen=True)
@@ -98,6 +165,47 @@ class _FileSnapshot:
             self.path.unlink(missing_ok=True)
             return
         atomic_write_bytes(self.path, self.data)
+
+
+@dataclass(frozen=True)
+class _SoundArchiveSnapshot:
+    library: _FileSnapshot
+    directory_files: tuple[tuple[Path, frozenset[str]], ...]
+
+    @classmethod
+    def capture(cls, project_root: str | Path) -> "_SoundArchiveSnapshot":
+        directories = (
+            originals_dir(project_root),
+            processed_dir(project_root),
+        )
+        return cls(
+            library=_FileSnapshot.capture(library_path(project_root)),
+            directory_files=tuple(
+                (
+                    directory,
+                    frozenset(
+                        child.name
+                        for child in directory.iterdir()
+                        if child.is_file() or child.is_symlink()
+                    )
+                    if directory.is_dir()
+                    else frozenset(),
+                )
+                for directory in directories
+            ),
+        )
+
+    def restore(self) -> None:
+        self.library.restore()
+        for directory, existing_names in self.directory_files:
+            if not directory.is_dir():
+                continue
+            for child in directory.iterdir():
+                if (
+                    child.name not in existing_names
+                    and (child.is_file() or child.is_symlink())
+                ):
+                    child.unlink(missing_ok=True)
 
 
 def _remove_readonly_and_retry(function, path: str, error: BaseException) -> None:
@@ -121,7 +229,7 @@ def cleanup_stale_letter_load_workspaces(project_root: str | Path) -> tuple[Path
             root / USER_MESSAGE_DIR,
         )
     )
-    output_root = (root / "output").resolve()
+    output_root = application_paths(root).temporary_root.resolve()
     if not output_root.is_dir():
         return ()
     removed: list[Path] = []
@@ -170,13 +278,38 @@ class SavedLetter:
     modified_at: datetime
     published_url: str
     cover_path: Optional[Path]
+    published_public_path: str = ""
+    published_at: str = ""
+    published_expires_at: str = ""
+    publication_provider: str = ""
+    publication_verified: bool = False
+    published_source_fingerprint: str = ""
     recipient_id: str = ""
     project_id: str = ""
     recovery: bool = False
+    example: bool = False
 
     @property
     def published(self) -> bool:
-        return bool(self.published_url)
+        return self.publication_status == "published"
+
+    @property
+    def expired(self) -> bool:
+        return self.publication_status == "expired"
+
+    @property
+    def publication_status(self) -> str:
+        return get_publication_status(
+            {
+                PUBLISHED_PAGE_URL_KEY: self.published_url,
+                PUBLISHED_PUBLIC_PATH_KEY: self.published_public_path,
+                PUBLISHED_AT_KEY: self.published_at,
+                PUBLISHED_EXPIRES_AT_KEY: self.published_expires_at,
+                PUBLICATION_PROVIDER_KEY: self.publication_provider,
+                PUBLICATION_VERIFIED_KEY: self.publication_verified,
+                PUBLISHED_SOURCE_FINGERPRINT_KEY: self.published_source_fingerprint,
+            }
+        )
 
     @property
     def needs_recipient_assignment(self) -> bool:
@@ -198,6 +331,12 @@ class RestoredProject:
     recipient_normalized_key: str
     title: str
     published_url: str
+    published_public_path: str = ""
+    published_at: str = ""
+    published_expires_at: str = ""
+    publication_provider: str = ""
+    publication_verified: bool = False
+    published_source_fingerprint: str = ""
 
     @property
     def identity(self) -> ProjectIdentity:
@@ -208,7 +347,7 @@ class RestoredProject:
             project_id=self.project_id,
         )
 
-    def as_payload(self) -> dict[str, str]:
+    def as_payload(self) -> dict[str, object]:
         return {
             "play_dir": str(self.play_dir),
             "project_id": self.project_id,
@@ -218,6 +357,12 @@ class RestoredProject:
             "recipient_name": self.recipient,
             "recipient_title": self.title,
             "published_page_url": self.published_url,
+            PUBLISHED_PUBLIC_PATH_KEY: self.published_public_path,
+            PUBLISHED_AT_KEY: self.published_at,
+            PUBLISHED_EXPIRES_AT_KEY: self.published_expires_at,
+            PUBLICATION_PROVIDER_KEY: self.publication_provider,
+            PUBLICATION_VERIFIED_KEY: self.publication_verified,
+            PUBLISHED_SOURCE_FINGERPRINT_KEY: self.published_source_fingerprint,
         }
 
 
@@ -237,16 +382,34 @@ class SavedLetterDeleteError(RuntimeError):
     pass
 
 
-def _read_metadata(path: Path) -> dict[str, Any]:
+def _read_metadata(
+    path: Path,
+    *,
+    strict: bool = False,
+) -> dict[str, Any]:
     candidate = path / PLAY_METADATA_FILE
-    if not candidate.is_file() or candidate.is_symlink():
+    if candidate.is_symlink():
+        if strict:
+            raise SavedLetterRestoreError(
+                "The saved-letter metadata cannot be a link."
+            )
+        return {}
+    if not candidate.is_file():
         return {}
     try:
         value = json.loads(candidate.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        if strict:
+            raise SavedLetterRestoreError(
+                "The saved-letter metadata is unreadable."
+            ) from error
         return {}
     if isinstance(value, dict):
         return value
+    if strict:
+        raise SavedLetterRestoreError(
+            "The saved-letter metadata must contain an object."
+        )
     return {}
 
 
@@ -293,11 +456,7 @@ def _saved_prompt_writer_state(
     if state_path is not None:
         return _read_json_object(state_path, label="saved Prompt Writer state")
 
-    source_version = metadata.get("source_version", metadata.get("schema_version", 0))
-    try:
-        current_format = int(source_version) >= METADATA_VERSION
-    except (TypeError, ValueError):
-        current_format = False
+    current_format = has_complete_saved_state(metadata)
     if configured_path or current_format:
         raise SavedLetterRestoreError("The saved Prompt Writer state is missing.")
 
@@ -322,14 +481,7 @@ def _backfill_legacy_prompt_writer_state(
     ) is not None:
         return
 
-    source_version = metadata.get(
-        "source_version",
-        metadata.get("schema_version", 0),
-    )
-    try:
-        current_format = int(source_version) >= METADATA_VERSION
-    except (TypeError, ValueError):
-        current_format = False
+    current_format = has_complete_saved_state(metadata)
     if configured_path or current_format:
         return
 
@@ -458,14 +610,7 @@ def _legacy_optional_sound_migration_allowed(
         if isinstance(editable_assets, dict)
         else ""
     )
-    source_version = metadata.get(
-        "source_version",
-        metadata.get("schema_version", 0),
-    )
-    try:
-        current_format = int(source_version) >= METADATA_VERSION
-    except (TypeError, ValueError):
-        current_format = False
+    current_format = has_complete_saved_state(metadata)
     stored_settings = metadata.get("settings", {})
     required_features = (
         stored_settings.get("required_features", {})
@@ -522,21 +667,41 @@ def _readable_file(path: Path) -> bool:
 
 
 class SavedLetterCatalog:
-    def __init__(self, project_root: str | Path) -> None:
+    def __init__(
+        self,
+        project_root: str | Path,
+        *,
+        stock_only: bool = False,
+    ) -> None:
         self.project_root = Path(project_root).resolve()
         cleanup_stale_letter_load_workspaces(self.project_root)
+        self.stock_only = bool(stock_only)
         self.play_root = canonical_play_root(self.project_root)
         self.recovery_root = canonical_recovery_root(self.project_root)
-        self.managed_roots = (self.play_root, self.recovery_root)
+        self.stock_root = canonical_stock_letters_root(self.project_root)
+        self.example_root = application_paths(
+            self.project_root
+        ).examples_root.resolve()
+        self.managed_roots = (
+            (self.stock_root,)
+            if self.stock_only
+            else (self.play_root, self.recovery_root)
+        )
 
     def list_entries(self) -> tuple[SavedLetter, ...]:
         entries: list[SavedLetter] = []
         seen: set[Path] = set()
         validator = SavedLetterRestorer(self.project_root)
-        for root, recovery in (
-            (self.play_root, False),
-            (self.recovery_root, True),
-        ):
+        sources = (
+            ((self.stock_root, False, False),)
+            if self.stock_only
+            else (
+                (self.play_root, False, False),
+                (self.recovery_root, True, False),
+                (self.example_root, False, True),
+            )
+        )
+        for root, recovery, example in sources:
             if not root.is_dir():
                 continue
             for index in root.rglob("index.html"):
@@ -551,7 +716,11 @@ class SavedLetterCatalog:
                     if not self._is_valid_candidate(path):
                         continue
                     validator._validated_saved_letter_content(path)
-                    entry = self._entry(path, recovery=recovery)
+                    entry = self._entry(
+                        path,
+                        recovery=recovery,
+                        example=example,
+                    )
                 except Exception:
                     _LOGGER.warning(
                         "Skipping unloadable saved-letter candidate: %s",
@@ -562,7 +731,11 @@ class SavedLetterCatalog:
                 seen.add(path)
                 entries.append(entry)
         entries.sort(
-            key=lambda entry: (entry.modified_at, entry.title.casefold()),
+            key=lambda entry: (
+                entry.example,
+                entry.modified_at,
+                entry.title.casefold(),
+            ),
             reverse=True,
         )
         return tuple(entries)
@@ -580,6 +753,12 @@ class SavedLetterCatalog:
     def delete(self, entry: SavedLetter) -> Path:
         if not isinstance(entry, SavedLetter):
             raise SavedLetterDeleteError("The saved letter is invalid.")
+        if self.stock_only:
+            raise SavedLetterDeleteError("Stock letters cannot be deleted.")
+        if entry.example:
+            raise SavedLetterDeleteError(
+                "The bundled Example Letter cannot be deleted."
+            )
         source = Path(entry.path)
         if source.is_symlink():
             raise SavedLetterDeleteError("Saved-letter links cannot be deleted.")
@@ -663,7 +842,13 @@ class SavedLetterCatalog:
             and _readable_file(message / "message.html")
         )
 
-    def _entry(self, path: Path, *, recovery: bool = False) -> SavedLetter:
+    def _entry(
+        self,
+        path: Path,
+        *,
+        recovery: bool = False,
+        example: bool = False,
+    ) -> SavedLetter:
         metadata = _read_metadata(path)
         recipient = self._display_text(metadata.get("recipient_name"))
         title = self._display_text(metadata.get("recipient_title"))
@@ -692,9 +877,26 @@ class SavedLetterCatalog:
                 metadata.get("published_page_url", "")
             ),
             cover_path=cover,
+            published_public_path=str(
+                metadata.get(PUBLISHED_PUBLIC_PATH_KEY, "")
+            ).strip(),
+            published_at=str(metadata.get(PUBLISHED_AT_KEY, "")).strip(),
+            published_expires_at=str(
+                metadata.get(PUBLISHED_EXPIRES_AT_KEY, "")
+            ).strip(),
+            publication_provider=str(
+                metadata.get(PUBLICATION_PROVIDER_KEY, "")
+            ).strip(),
+            publication_verified=(
+                metadata.get(PUBLICATION_VERIFIED_KEY) is True
+            ),
+            published_source_fingerprint=str(
+                metadata.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")
+            ).strip(),
             recipient_id=_valid_uuid(metadata.get("recipient_id")),
             project_id=_valid_uuid(metadata.get("project_id")),
             recovery=recovery,
+            example=example,
         )
 
     @staticmethod
@@ -739,17 +941,13 @@ class SavedLetterRestorer:
         self.allowed_roots = (
             canonical_play_root(self.project_root),
             canonical_recovery_root(self.project_root),
+            canonical_stock_letters_root(self.project_root),
+            application_paths(self.project_root).examples_root.resolve(),
         )
 
     def restore(self, entry: SavedLetter) -> RestoredProject:
-        legacy_source = self._validated_play_directory(entry.path)
-        _backfill_legacy_optional_sound_manifest(
-            legacy_source,
-            _read_metadata(legacy_source),
-        )
-        entry = self.ensure_entry_identity(entry)
-        # The selected catalog path is authoritative. ProjectPathResolver owns
-        # write-only autosaves and must never supply a restoration source.
+        # Validate the selected catalog path before identity migration or any
+        # active-project mutation. Autosave storage is write-only here.
         (
             play_dir,
             pages,
@@ -763,6 +961,7 @@ class SavedLetterRestorer:
             entry.path,
             report_optional_sound_error=True,
         )
+        entry = self.ensure_entry_identity(entry)
         settings_before = self.settings.snapshot()
         restored_settings = self._prepare_settings(
             metadata,
@@ -772,7 +971,7 @@ class SavedLetterRestorer:
         )
 
         staged_root = create_staging_directory(
-            self.project_root / "output",
+            application_paths(self.project_root).temporary_root,
             prefix=".letter-load-",
         )
         _ACTIVE_LETTER_LOAD_WORKSPACES.add(staged_root)
@@ -796,9 +995,12 @@ class SavedLetterRestorer:
             for path in (
                 current_music_path(self.project_root),
                 current_manifest_path(self.project_root),
-                self.project_root / USER_SOUNDS_DIR / "appssong" / "project_sound.json",
+                project_sound_path(self.project_root),
                 self.project_root / PROMPT_WRITER_STATE_FILE,
             )
+        )
+        sound_archive_snapshot = _SoundArchiveSnapshot.capture(
+            self.project_root
         )
 
         try:
@@ -889,6 +1091,12 @@ class SavedLetterRestorer:
                     snapshot.restore()
                 except Exception:
                     _LOGGER.exception("Could not restore previous project file: %s", snapshot.path)
+            try:
+                sound_archive_snapshot.restore()
+            except Exception:
+                _LOGGER.exception(
+                    "Could not roll back imported Music Archive files."
+                )
             if settings_committed:
                 try:
                     self.settings.replace_snapshot(settings_before)
@@ -921,6 +1129,10 @@ class SavedLetterRestorer:
             metadata,
             prompt_writer_state,
         )
+        _backfill_legacy_optional_sound_manifest(
+            play_dir,
+            metadata,
+        )
         return RestoredProject(
             play_dir=play_dir,
             project_id=str(restored_settings["project_id"]),
@@ -936,12 +1148,38 @@ class SavedLetterRestorer:
             published_url=str(
                 restored_settings.get("published_page_url", "")
             ),
+            published_public_path=str(
+                restored_settings.get(PUBLISHED_PUBLIC_PATH_KEY, "")
+            ),
+            published_at=str(restored_settings.get(PUBLISHED_AT_KEY, "")),
+            published_expires_at=str(
+                restored_settings.get(PUBLISHED_EXPIRES_AT_KEY, "")
+            ),
+            publication_provider=str(
+                restored_settings.get(PUBLICATION_PROVIDER_KEY, "")
+            ),
+            publication_verified=(
+                restored_settings.get(PUBLICATION_VERIFIED_KEY) is True
+            ),
+            published_source_fingerprint=str(
+                restored_settings.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")
+            ),
         )
 
     def ensure_entry_identity(
         self,
         entry: SavedLetter,
     ) -> SavedLetter:
+        if entry.example:
+            record = self.registry.get_or_create(
+                entry.recipient or "A Friend",
+                custom_capitalization=True,
+            )
+            return replace(
+                entry,
+                recipient_id=record.recipient_id,
+                project_id=str(uuid.uuid4()),
+            )
         if entry.recipient_id and entry.project_id:
             recipient = self.registry.find_by_id(entry.recipient_id)
             if recipient is not None:
@@ -999,7 +1237,6 @@ class SavedLetterRestorer:
         identity_metadata = dict(metadata)
         identity_metadata.update(
             {
-                "schema_version": METADATA_VERSION,
                 "project_schema_version": (
                     PROJECT_METADATA_SCHEMA_VERSION
                 ),
@@ -1134,9 +1371,18 @@ class SavedLetterRestorer:
             raise SavedLetterRestoreError(
                 "The selected saved letter is missing editable content."
             )
-        self._validate_pages(pages)
+        metadata = _read_metadata(play_dir, strict=True)
+        try:
+            metadata = validate_saved_letter_metadata(metadata)
+        except SaveSchemaError as error:
+            raise SavedLetterRestoreError(
+                f"The saved-letter metadata is invalid: {error}."
+            ) from error
+        self._validate_pages(
+            pages,
+            require_manifest=is_current_save_schema(metadata),
+        )
         self._validate_message(play_dir, message)
-        metadata = _read_metadata(play_dir)
         prompt_writer_state = _saved_prompt_writer_state(play_dir, metadata)
         legacy_optional_sound = _legacy_optional_sound_migration_allowed(
             metadata
@@ -1178,7 +1424,11 @@ class SavedLetterRestorer:
         )
 
     @staticmethod
-    def _validate_pages(pages: Path) -> None:
+    def _validate_pages(
+        pages: Path,
+        *,
+        require_manifest: bool = False,
+    ) -> None:
         missing = [
             name
             for name in REQUIRED_SLIDES
@@ -1190,6 +1440,14 @@ class SavedLetterRestorer:
             raise SavedLetterRestoreError(
                 "Required saved images are missing: " + ", ".join(missing)
             )
+        manifest = pages / IMAGE_MANIFEST_NAME
+        if require_manifest or manifest.exists():
+            try:
+                validate_runtime_image_manifest(pages)
+            except ValueError as error:
+                raise SavedLetterRestoreError(
+                    "The saved image manifest is invalid."
+                ) from error
 
     @staticmethod
     def _validate_message(play_dir: Path, message: Path) -> None:
@@ -1202,9 +1460,6 @@ class SavedLetterRestorer:
             raise SavedLetterRestoreError(
                 "The saved message cannot be read."
             ) from error
-        if not html.strip():
-            raise SavedLetterRestoreError("The saved message is empty.")
-
         references = re.findall(
             r"""(?:src|poster)\s*=\s*["']([^"']+)["']""",
             html,
@@ -1362,9 +1617,7 @@ class SavedLetterRestorer:
             title = play_dir.name.replace("_", " ").replace("-", " ").strip()
         restored["recipient_name"] = recipient
         restored["recipient_title"] = title
-        restored["published_page_url"] = normalize_published_page_url(
-            metadata.get("published_page_url", "")
-        )
+        restored.update(_publication_metadata(metadata))
         project_id = (
             _valid_uuid(metadata.get("project_id"))
             or entry.project_id
@@ -1387,13 +1640,14 @@ class SavedLetterRestorer:
 
     def _verify_committed_state(self) -> None:
         pages = self.project_root / USER_PAGES_DIR
-        if any(not (pages / name).is_file() for name in REQUIRED_SLIDES):
-            raise RuntimeError("Restored page verification failed.")
-        message = self.project_root / MESSAGE_HTML_FILE
-        if not message.is_file() or not message.read_text(
-            encoding="utf-8"
-        ).strip():
-            raise RuntimeError("Restored message verification failed.")
+        self._validate_pages(
+            pages,
+            require_manifest=(pages / IMAGE_MANIFEST_NAME).is_file(),
+        )
+        self._validate_message(
+            self.project_root,
+            self.project_root / USER_MESSAGE_DIR,
+        )
         _read_json_object(
             self.project_root / PROMPT_WRITER_STATE_FILE,
             label="restored Prompt Writer state",
@@ -1413,6 +1667,20 @@ def update_saved_metadata(
     metadata_path = destination / PLAY_METADATA_FILE
     metadata = _read_metadata(destination)
     settings = SettingsStore(root).snapshot()
+    publication = _publication_metadata(settings)
+    normalized_public_path = str(public_path).strip()
+    if normalized_public_path:
+        if (
+            Path(normalized_public_path).name != normalized_public_path
+            or normalized_public_path in {".", ".."}
+        ):
+            raise ValueError("The published path is invalid.")
+        stored_public_path = str(
+            publication.get(PUBLISHED_PUBLIC_PATH_KEY, "")
+        ).strip()
+        if stored_public_path and normalized_public_path != stored_public_path:
+            raise ValueError("The published path does not match the active publication.")
+        publication[PUBLISHED_PUBLIC_PATH_KEY] = normalized_public_path
     sound_state, sound_tracks = resolve_project_tracks(root)
     prompt_writer_state = _active_prompt_writer_state(root)
     atomic_write_json(
@@ -1426,8 +1694,6 @@ def update_saved_metadata(
     }
     metadata.update(
         {
-            "schema_version": METADATA_VERSION,
-            "source_version": METADATA_VERSION,
             "project_id": ensure_project_identity(root),
             "project_schema_version": PROJECT_METADATA_SCHEMA_VERSION,
             "recipient_id": str(
@@ -1448,9 +1714,7 @@ def update_saved_metadata(
                 settings.get("recipient_title", "")
             ).strip(),
             "build_timestamp": datetime.now(timezone.utc).isoformat(),
-            "published_page_url": normalize_published_page_url(
-                settings.get("published_page_url", "")
-            ),
+            **publication,
             "settings": restorable_settings,
             "editable_assets": {
                 "pages": {
@@ -1462,6 +1726,9 @@ def update_saved_metadata(
                     f"gallery/sounds/{BUILD_SOUND_MANIFEST_NAME}"
                 ),
                 "prompt_writer_state": PROMPT_WRITER_STATE_FILE,
+                "image_manifest": (
+                    "gallery/pages/lettersmith-images.json"
+                ),
             },
             "sound": {
                 "mode": sound_state.mode,
@@ -1483,15 +1750,33 @@ def update_saved_metadata(
             "cover_thumbnail_path": "gallery/pages/cover.png",
         }
     )
-    normalized_public_path = str(public_path).strip()
-    if normalized_public_path:
-        if (
-            Path(normalized_public_path).name != normalized_public_path
-            or normalized_public_path in {".", ".."}
-        ):
-            raise ValueError("The published path is invalid.")
-        metadata["public_path"] = normalized_public_path
+    metadata = stamp_current_save_schema(
+        metadata,
+        document_type=SAVED_LETTER_DOCUMENT_TYPE,
+    )
+    metadata.pop("public_path", None)
     metadata.pop("build_location", None)
+    atomic_write_json(metadata_path, metadata)
+    return metadata
+
+
+def update_saved_publication_metadata(
+    play_dir: str | Path,
+    project_root: str | Path,
+) -> dict[str, Any]:
+    destination = Path(play_dir).resolve()
+    if not destination.is_dir():
+        raise FileNotFoundError(f"Saved letter does not exist: {destination}")
+    metadata_path = destination / PLAY_METADATA_FILE
+    metadata = _read_metadata(destination, strict=True)
+    metadata.update(
+        _publication_metadata(SettingsStore(project_root).snapshot())
+    )
+    metadata.pop("public_path", None)
+    metadata = stamp_current_save_schema(
+        metadata,
+        document_type=SAVED_LETTER_DOCUMENT_TYPE,
+    )
     atomic_write_json(metadata_path, metadata)
     return metadata
 
@@ -1515,6 +1800,17 @@ def record_saved_letter_activity(
     return timestamp
 
 
+def validate_saved_letter_bundle(
+    source: str | Path,
+    project_root: str | Path,
+) -> dict[str, Any]:
+    """Validate a saved-letter bundle without changing active project state."""
+    validated = SavedLetterRestorer(project_root)._validated_saved_letter_content(
+        Path(source).resolve()
+    )
+    return dict(validated[4])
+
+
 __all__ = [
     "METADATA_VERSION",
     "LAST_ACTIVITY_AT_KEY",
@@ -1529,4 +1825,6 @@ __all__ = [
     "record_saved_letter_activity",
     "SavedLetterRestorer",
     "update_saved_metadata",
+    "update_saved_publication_metadata",
+    "validate_saved_letter_bundle",
 ]

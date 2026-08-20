@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from io import BytesIO
 import hashlib
 import json
+import logging
 from pathlib import Path
 import shutil
 from typing import Any, Mapping
@@ -23,6 +24,7 @@ MAX_DELAY_MS = 86_400_000
 GIF_VIEWER_MAX_DIMENSION = 2048
 GIF_THUMBNAIL_MAX_DIMENSION = 384
 GIF_PROCESSING_VERSION = 1
+_LOGGER = logging.getLogger(__name__)
 
 SLOT_DEFINITIONS = {
     "cover": {
@@ -217,6 +219,16 @@ def install_image_asset(
     _remove_slot_frames(pages, slot)
     manifest["slots"][slot] = record
     write_image_manifest(pages, manifest)
+    if animated_gif:
+        gif_data = record.get("gif", {})
+        _LOGGER.info(
+            "Animated image installed: slot=%s frames=%s reused=%s.",
+            slot,
+            gif_data.get("frame_count", "unknown"),
+            reusable is not None,
+        )
+    else:
+        _LOGGER.info("Static image installed: slot=%s.", slot)
     return record
 
 
@@ -234,6 +246,12 @@ def update_slot_gif_settings(
     record["settings"] = normalized
     manifest["slots"][slot] = record
     write_image_manifest(pages, manifest)
+    _LOGGER.info(
+        "GIF playback settings updated: slot=%s mode=%s play_count=%s.",
+        slot,
+        normalized["playback_mode"],
+        normalized["play_count"],
+    )
     return normalized
 
 
@@ -559,6 +577,10 @@ def build_runtime_image_assets(
         "slots": runtime_slots,
     }
     write_image_manifest(destination_pages, runtime_manifest)
+    _LOGGER.info(
+        "Runtime image assets built: animated_slots=%d.",
+        len(animations),
+    )
     return RuntimeImageAssets(
         page_sources=page_sources,
         animations=animations,

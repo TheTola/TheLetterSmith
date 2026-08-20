@@ -9,6 +9,7 @@ from unittest import mock
 
 from config import CONTROL_FILES, REQUIRED_SLIDES
 from recipient_registry import RecipientRegistry
+from publishing.expiration import publication_status
 from readiness import ReadinessResult
 from saved_letters import (
     PROMPT_WRITER_STATE_FILE,
@@ -20,6 +21,7 @@ from saved_letters import (
 from settings_store import ACTIVE_PLAY_DIR_KEY, SettingsStore
 from sound_model import (
     ProjectSoundState,
+    archive_root,
     current_music_path,
     import_runtime_track,
     load_library,
@@ -41,6 +43,23 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
         controls.mkdir(parents=True)
         for name in REQUIRED_SLIDES:
             (pages / name).write_bytes(name.encode("ascii"))
+        (pages / "lettersmith-images.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "slots": {
+                        name.removesuffix(".png"): {
+                            "asset_type": "static",
+                            "is_animated_gif": False,
+                            "source_file": name,
+                            "preview_file": name,
+                        }
+                        for name in REQUIRED_SLIDES
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
         for name in CONTROL_FILES:
             (controls / name).write_bytes(b"control")
         (message / "message.html").write_text("<p>Saved letter</p>", encoding="utf-8")
@@ -171,6 +190,82 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 str(bundle.resolve()),
             )
 
+    def test_verified_publication_state_round_trips_without_cross_letter_leakage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            expected = {
+                "published_page_url": "https://letters.example.com/letters/saved/",
+                "published_public_path": "saved",
+                "published_at": "2026-08-13T12:00:00+00:00",
+                "published_expires_at": "2099-09-12T12:00:00+00:00",
+                "publication_provider": "cloudflare_r2",
+                "publication_verified": True,
+                "published_source_fingerprint": "saved-fingerprint",
+            }
+            identity = json.loads(
+                (bundle / "lettersmith-metadata.json").read_text(encoding="utf-8")
+            )
+            SettingsStore(root).update_fields(
+                {
+                    **expected,
+                    "project_id": identity["project_id"],
+                    "recipient_id": identity["recipient_id"],
+                    "recipient_name": identity["recipient_name"],
+                    "recipient_display_name": identity["recipient_name"],
+                    "recipient_title": identity["recipient_title"],
+                }
+            )
+            update_saved_metadata(
+                bundle,
+                root,
+                ReadinessResult((), 100, "Ready"),
+            )
+            SettingsStore(root).update_fields(
+                {
+                    **expected,
+                    "published_page_url": "https://letters.example.com/letters/other/",
+                    "published_public_path": "other",
+                    "published_source_fingerprint": "other-fingerprint",
+                }
+            )
+
+            restored = self._restore(root, bundle)
+            current = SettingsStore(root).snapshot()
+            saved = json.loads(
+                (bundle / "lettersmith-metadata.json").read_text(encoding="utf-8")
+            )
+
+            for key, value in expected.items():
+                self.assertEqual(saved[key], value)
+                self.assertEqual(current[key], value)
+            self.assertEqual(publication_status(current), "published")
+            self.assertEqual(restored.published_public_path, "saved")
+            self.assertTrue(restored.publication_verified)
+
+    def test_local_letter_restore_clears_another_letters_publication_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            SettingsStore(root).update_fields(
+                {
+                    "published_page_url": "https://letters.example.com/letters/other/",
+                    "published_public_path": "other",
+                    "published_at": "2026-08-13T12:00:00+00:00",
+                    "published_expires_at": "2099-09-12T12:00:00+00:00",
+                    "publication_provider": "cloudflare_r2",
+                    "publication_verified": True,
+                    "published_source_fingerprint": "other-fingerprint",
+                }
+            )
+
+            self._restore(root, bundle)
+            current = SettingsStore(root).snapshot()
+
+            self.assertEqual(publication_status(current), "local")
+            self.assertEqual(current["published_public_path"], "")
+            self.assertFalse(current["publication_verified"])
+
     def test_restore_uses_listed_bundle_when_project_snapshot_exists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -218,6 +313,41 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             (bundle / "gallery" / "pages" / "cover.png").unlink()
 
             self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+
+    def test_catalog_omits_bundle_with_corrupt_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            (bundle / "lettersmith-metadata.json").write_text(
+                "{not-json",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+
+    def test_catalog_accepts_letter_with_empty_message(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            (bundle / "gallery" / "message" / "message.html").write_text(
+                "",
+                encoding="utf-8",
+            )
+
+            entries = SavedLetterCatalog(root).list_entries()
+
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].path, bundle.resolve())
+
+            restored = SavedLetterRestorer(root).restore(entries[0])
+
+            self.assertEqual(restored.play_dir, bundle.resolve())
+            self.assertEqual(
+                (root / "gallery" / "user" / "message" / "message.html").read_text(
+                    encoding="utf-8"
+                ),
+                "",
+            )
 
     def test_prompt_writer_workspace_round_trips_without_loss(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -274,6 +404,10 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             )
 
             saved_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_metadata["schema_version"], "1.0")
+            self.assertEqual(saved_metadata["document_type"], "saved_letter")
+            self.assertNotIn("source_version", saved_metadata)
+            self.assertNotIn("release_schema_version", saved_metadata)
             self.assertEqual(
                 saved_metadata["editable_assets"]["prompt_writer_state"],
                 PROMPT_WRITER_STATE_FILE,
@@ -373,6 +507,11 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             prompt_state_path = root / PROMPT_WRITER_STATE_FILE
             prompt_state_path.write_bytes(b'{"subject": "Current prompt"}\n')
             old_prompt_state = prompt_state_path.read_bytes()
+            archive_files_before = {
+                path.relative_to(archive_root(root))
+                for path in archive_root(root).rglob("*")
+                if path.is_file()
+            }
             bundle = self._bundle(root)
             sounds = bundle / "gallery" / "sounds"
             sounds.mkdir()
@@ -391,6 +530,15 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             self.assertEqual(load_project_state(root).single_track_id, record.track_id)
             self.assertTrue(project_sound_path(root).exists())
             self.assertEqual(prompt_state_path.read_bytes(), old_prompt_state)
+            self.assertEqual(set(load_library(root)), {record.track_id})
+            self.assertEqual(
+                {
+                    path.relative_to(archive_root(root))
+                    for path in archive_root(root).rglob("*")
+                    if path.is_file()
+                },
+                archive_files_before,
+            )
 
 
 if __name__ == "__main__":

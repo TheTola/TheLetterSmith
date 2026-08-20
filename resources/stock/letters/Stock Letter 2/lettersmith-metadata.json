@@ -1,0 +1,48 @@
+{
+  "schema_version": "1.0",
+  "project_id": "5b4e1e97-9f7a-4055-a98f-cd97cf9ab809",
+  "project_schema_version": 2,
+  "recipient_id": "7fa89dca-f8cb-4c3b-bbb0-a096317ae11f",
+  "recipient_display_name": "Stock",
+  "recipient_normalized_key": "stock",
+  "recipient_name": "Stock",
+  "recipient_title": "Stock: Letter 2",
+  "build_timestamp": "2026-08-11T20:41:09.448913+00:00",
+  "published_page_url": "",
+  "settings": {
+    "starting_volume": 21,
+    "music_volume": 21,
+    "curtain_style": "average_color",
+    "message_overlay_preset": "white",
+    "message_overlay_opacity": 97,
+    "required_features": [],
+    "forge_preview_mode": "window"
+  },
+  "editable_assets": {
+    "pages": {
+      "cover.png": "gallery/pages/cover.png",
+      "letter.png": "gallery/pages/letter.png",
+      "wall.png": "gallery/pages/wall.png",
+      "back.png": "gallery/pages/back.png"
+    },
+    "message": "gallery/message/message.html",
+    "sound_manifest": "gallery/sounds/lettersmith-sound.json",
+    "prompt_writer_state": "prompt_writer_state.json",
+    "image_manifest": "gallery/pages/lettersmith-images.json"
+  },
+  "sound": {
+    "mode": "single",
+    "playlist_order": [
+      "Background Music"
+    ],
+    "track_count": 1,
+    "crossfade_ms": 0
+  },
+  "readiness": {
+    "percentage": 100,
+    "status": "Ready"
+  },
+  "cover_thumbnail_path": "gallery/pages/cover.png",
+  "last_activity_at": "2026-08-11T20:41:09.452853+00:00",
+  "document_type": "saved_letter"
+}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,6 +24,9 @@ from readiness import (
 from settings_store import ACTIVE_PLAY_DIR_KEY, SettingsStore
 from sound_model import project_sound_path
 from transactional_io import atomic_write_bytes, atomic_write_json
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProjectSaveError(RuntimeError):
@@ -225,6 +229,10 @@ class ProjectSaveService:
                 "completed_tabs": list(eligibility.completed_tabs),
             },
         )
+        _LOGGER.info(
+            "Project snapshot saved for project_id=%s.",
+            context.project_id,
+        )
         return context.autosave_directory
 
     def _copy_tree_to_context(
@@ -259,6 +267,10 @@ class ProjectSaveService:
             timezone.utc
         ).isoformat()
         self.resolver.write_autosave_metadata(context, metadata_updates)
+        _LOGGER.debug(
+            "Project autosave metadata updated for project_id=%s.",
+            context.project_id,
+        )
         try:
             play_directory = resolve_play_bundle_directory(
                 self.project_root,

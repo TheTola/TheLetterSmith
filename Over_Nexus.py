@@ -55,8 +55,6 @@ class OverNexusController(QtCore.QObject):
             return
 
         details = getattr(message_tab, "title_recipient_container", None)
-        if not isinstance(details, QtWidgets.QWidget):
-            details = getattr(message_tab, "title_sister_container", None)
         if isinstance(details, QtWidgets.QWidget):
             details.setVisible(visible)
 

@@ -24,6 +24,19 @@ from settings_store import SettingsStore, VISIONARY_URL_KEY
 from transactional_io import safe_write_json
 
 
+class _FakeLanguageService:
+    def __init__(self, corrections=None, *, error=None):
+        self.corrections = dict(corrections or {})
+        self.error = error
+        self.calls = []
+
+    def correct_text(self, text, *, context="prompt", protected_terms=()):
+        self.calls.append((text, context, tuple(protected_terms)))
+        if self.error is not None:
+            raise self.error
+        return self.corrections.get(text, text)
+
+
 class PromptWriterHardeningTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -71,6 +84,213 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.panel.cb_close_up_focus.setChecked(True)
         self.assertNotIn(HIDDEN_STYLE_DEFAULT, self.panel._collect_guidance())
         self.assertNotIn(HIDDEN_FRAMING_DEFAULT, self.panel._collect_guidance())
+
+    def test_generate_proofreads_all_free_text_and_persists_exact_prompts(self):
+        raw_fields = {
+            "global": "make all image dark and dramatc",
+            "cover": "a women standing under blue treee",
+            "letter": "the same women hold a sword",
+            "wall": "old medival castel wall",
+            "back": "sun is setting behind her,she look away",
+        }
+        corrected_fields = {
+            "global": "Make all images dark and dramatic.",
+            "cover": "A woman standing under a blue tree.",
+            "letter": "The same woman holds a sword.",
+            "wall": "An old medieval castle wall.",
+            "back": "The sun is setting behind her; she looks away.",
+        }
+        service = _FakeLanguageService(
+            {
+                raw_fields[key]: corrected_fields[key]
+                for key in raw_fields
+            }
+        )
+        self.panel = PromptWriterPanel(
+            project_root=str(self.project_root),
+            language_service=service,
+        )
+        self.panel.cmb_type.setCurrentText("Illustration")
+        self.panel.cmb_subject.setCurrentText("Subject")
+        self.panel.cmb_color.setCurrentText("Ruby")
+        self.panel.cb_black.setChecked(True)
+        self.panel.cb_cinematic_framing.setChecked(True)
+        self.panel.txt_global.setPlainText(raw_fields["global"])
+        for page in self.panel._page_specs:
+            page.detail_widget.setPlainText(raw_fields[page.key])
+
+        selections_before = (
+            (self.panel.cmb_type.currentIndex(), self.panel.cmb_type.currentText()),
+            (self.panel.cmb_subject.currentIndex(), self.panel.cmb_subject.currentText()),
+            (self.panel.cmb_color.currentIndex(), self.panel.cmb_color.currentText()),
+            {
+                state_key: checkbox.isChecked()
+                for checkbox, state_key in self.panel._checkbox_state_specs()
+            },
+        )
+
+        self.panel._on_generate()
+
+        self.assertTrue(self.panel._generated_output_valid)
+        self.assertEqual(self.panel.txt_global.toPlainText(), corrected_fields["global"])
+        for page in self.panel._page_specs:
+            self.assertEqual(
+                page.detail_widget.toPlainText(),
+                corrected_fields[page.key],
+            )
+            prompt = self.panel._generated_prompts[page.key]
+            self.assertIn(corrected_fields["global"], prompt)
+            self.assertIn(corrected_fields[page.key], prompt)
+            for other_page in self.panel._page_specs:
+                if other_page.key != page.key:
+                    self.assertNotIn(corrected_fields[other_page.key], prompt)
+
+        self.assertEqual(
+            {text for text, context, _terms in service.calls if context == "prompt"},
+            set(raw_fields.values()),
+        )
+        self.assertEqual(
+            selections_before,
+            (
+                (self.panel.cmb_type.currentIndex(), self.panel.cmb_type.currentText()),
+                (self.panel.cmb_subject.currentIndex(), self.panel.cmb_subject.currentText()),
+                (self.panel.cmb_color.currentIndex(), self.panel.cmb_color.currentText()),
+                {
+                    state_key: checkbox.isChecked()
+                    for checkbox, state_key in self.panel._checkbox_state_specs()
+                },
+            ),
+        )
+
+        saved = json.loads(
+            (self.project_root / "prompt_writer_state.json").read_text(encoding="utf-8")
+        )
+        for key, corrected in corrected_fields.items():
+            self.assertEqual(saved[key], corrected)
+        self.assertEqual(saved["generated_prompts"], self.panel._generated_prompts)
+
+    def test_generate_uses_original_text_when_proofreading_fails(self):
+        service = _FakeLanguageService(error=RuntimeError("checker unavailable"))
+        self.panel = PromptWriterPanel(
+            project_root=str(self.project_root),
+            language_service=service,
+        )
+        self.panel.cmb_subject.setCurrentText("Subject")
+        self.panel.cb_paint.setChecked(True)
+        original_fields = {
+            "global": "shared dramatc direction",
+            "cover": "cover treee direction",
+            "letter": "letter medival direction",
+            "wall": "wall castel direction",
+            "back": "back charcter direction",
+        }
+        self.panel.txt_global.setPlainText(original_fields["global"])
+        for page in self.panel._page_specs:
+            page.detail_widget.setPlainText(original_fields[page.key])
+
+        with self.assertLogs("PromptWriterPanel", level="ERROR") as logged:
+            self.panel._on_generate()
+
+        self.assertTrue(self.panel._generated_output_valid)
+        for field_name in (
+            "Apply to All",
+            "cover.png",
+            "letter.png",
+            "wall.png",
+            "back.png",
+        ):
+            self.assertTrue(any(field_name in message for message in logged.output))
+        self.assertTrue(self.panel.cb_paint.isChecked())
+        self.assertEqual(self.panel.txt_global.toPlainText(), original_fields["global"])
+        for page in self.panel._page_specs:
+            self.assertEqual(page.detail_widget.toPlainText(), original_fields[page.key])
+            prompt = self.panel._generated_prompts[page.key]
+            self.assertIn(original_fields["global"], prompt)
+            self.assertIn(original_fields[page.key], prompt)
+        self.assertTrue(
+            set(original_fields.values()).issubset(
+                {call[0] for call in service.calls}
+            )
+        )
+
+        saved = json.loads(
+            (self.project_root / "prompt_writer_state.json").read_text(encoding="utf-8")
+        )
+        for key, original in original_fields.items():
+            self.assertEqual(saved[key], original)
+        self.assertEqual(saved["generated_prompts"], self.panel._generated_prompts)
+
+    def test_open_and_close_proofread_all_free_text_and_persist_it(self):
+        raw_fields = {
+            "global": "make every image bright",
+            "cover": "cover needs punctuation",
+            "letter": "letter needs punctuation",
+            "wall": "wall needs punctuation",
+            "back": "back needs punctuation",
+        }
+        corrected_fields = {
+            key: value[:1].upper() + value[1:] + "."
+            for key, value in raw_fields.items()
+        }
+        service = _FakeLanguageService(
+            {
+                raw_fields[key]: corrected_fields[key]
+                for key in raw_fields
+            }
+        )
+        self.panel = PromptWriterPanel(
+            project_root=str(self.project_root),
+            language_service=service,
+        )
+        self.panel.cmb_subject.setCurrentText("Subject")
+        self.panel.txt_global.setPlainText(raw_fields["global"])
+        for page in self.panel._page_specs:
+            page.detail_widget.setPlainText(raw_fields[page.key])
+
+        self.panel._generated_prompts = {
+            page.key: f"Saved {page.key} prompt"
+            for page in self.panel._page_specs
+        }
+        self.panel._generated_input_signature = (
+            self.panel._current_prompt_input_signature()
+        )
+        self.panel._set_generated_output_valid(True)
+        self.assertTrue(self.panel._generated_output_valid)
+
+        self.panel.popup()
+
+        self.assertEqual(
+            self.panel.txt_global.toPlainText(),
+            corrected_fields["global"],
+        )
+        for page in self.panel._page_specs:
+            self.assertEqual(
+                page.detail_widget.toPlainText(),
+                corrected_fields[page.key],
+            )
+        self.assertFalse(self.panel._generated_output_valid)
+        self.assertEqual(self.panel._generated_prompts, {})
+        saved = json.loads(
+            (self.project_root / "prompt_writer_state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        for key, corrected in corrected_fields.items():
+            self.assertEqual(saved[key], corrected)
+
+        close_raw = "close also checks language"
+        close_corrected = "Close also checks language."
+        service.corrections[close_raw] = close_corrected
+        self.panel.txt_global.setPlainText(close_raw)
+        self.panel._on_close()
+
+        self.assertEqual(self.panel.txt_global.toPlainText(), close_corrected)
+        saved = json.loads(
+            (self.project_root / "prompt_writer_state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(saved["global"], close_corrected)
 
     def test_source_labels_and_generated_segments_share_unique_colors(self):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
@@ -527,7 +747,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.assertEqual(self.panel.cmb_type.currentText(), "Retired Etching")
         self.assertEqual(self.panel.cmb_subject.currentText(), "GO and Genesis Prime")
         self.assertEqual(self.panel.cmb_color.currentText(), "Archived Copper Palette")
-        self.assertEqual(self.panel.txt_global.toPlainText(), "Shared visual direction")
+        self.assertEqual(self.panel.txt_global.toPlainText(), "Shared visual direction.")
         self.assertTrue(self.panel.cb_black.isChecked())
         self.assertTrue(self.panel.cb_cinematic_framing.isChecked())
         self.assertEqual(self.panel._resolved_instructions, expected_resolved)

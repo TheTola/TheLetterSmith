@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from transactional_io import atomic_write_json
+from project_paths import application_paths
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -41,7 +42,7 @@ DEFAULT_AUDIO = "music.mp3"
 
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parent
+    return application_paths().resource_root
 
 
 _PROJECT_ROOT = _project_root()
@@ -52,6 +53,7 @@ _PROJECT_ROOT = _project_root()
 # ─────────────────────────────────────────────────────────────────────────────
 
 GALLERY_DIR = "gallery"
+APP_BANNER_PATH = Path("resources") / "app" / "icons" / "bannerman.png"
 
 PAGES_DIR = "pages"
 CONTROLS_DIR = "controls"
@@ -184,8 +186,7 @@ WINDOWS_RESERVED_FOLDER_NAMES = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_settings(project_root: str | Path) -> Dict:
-    pr = Path(project_root)
-    path = pr / SETTINGS_FILE
+    path = application_paths(project_root).settings_file
 
     try:
         if path.exists():
@@ -273,17 +274,42 @@ CONFIG_DICT = dict(_SETTINGS)
 def canonical_output_root(project_root: str | Path) -> Path:
     """Return the one output root, even when a frozen app passes it directly."""
     root = Path(project_root).resolve()
+    paths = application_paths(root)
+    if paths.workspace_root == root and paths.resource_root != root:
+        return paths.documents_root.resolve()
     if root.name.casefold() == OUTPUT_DIR.casefold():
         return root
     return (root / OUTPUT_DIR).resolve()
 
 
 def canonical_play_root(project_root: str | Path) -> Path:
-    return (canonical_output_root(project_root) / "Play").resolve()
+    root = Path(project_root).resolve()
+    paths = application_paths(root)
+    if paths.workspace_root == root and paths.resource_root != root:
+        return paths.saved_letters_root.resolve()
+    return (canonical_output_root(root) / "Play").resolve()
 
 
 def canonical_recovery_root(project_root: str | Path) -> Path:
-    return (canonical_output_root(project_root) / "Recovery").resolve()
+    root = Path(project_root).resolve()
+    paths = application_paths(root)
+    if paths.workspace_root == root and paths.resource_root != root:
+        return paths.recovery_root.resolve()
+    return (canonical_output_root(root) / "Recovery").resolve()
+
+
+def canonical_stock_letters_root(project_root: str | Path) -> Path:
+    root = Path(project_root).resolve()
+    paths = application_paths(root)
+    if paths.workspace_root == root and paths.resource_root != root:
+        return paths.stock_letters_root.resolve()
+    if root.name.casefold() == OUTPUT_DIR.casefold():
+        root = root.parent
+    return (root / "resources" / "stock" / "letters").resolve()
+
+
+def is_stock_letter_title(title: object) -> bool:
+    return str(title or "").strip().casefold().startswith("stock:")
 
 
 def safe_folder_name(
@@ -554,6 +580,33 @@ def _available_named_play_directory(
     )
 
 
+def _available_named_stock_directory(
+    stock_root: Path,
+    title: object,
+    *,
+    project_id: str,
+    source: Optional[Path] = None,
+) -> Path:
+    title_name = safe_folder_name(title, "Untitled Letter")
+    existing = _casefold_child(stock_root, title_name)
+    candidate = (
+        existing
+        if existing is not None
+        else stock_root / title_name
+    ).resolve()
+    if not _is_relative_to(candidate, stock_root):
+        raise ValueError("The stock-letter path escapes the Stock root.")
+    if source is not None and candidate == source:
+        return candidate
+    if existing is None:
+        return candidate
+    if project_id and _bundle_project_id(candidate) == project_id:
+        return candidate
+    raise FileExistsError(
+        f"A stock letter titled {title_name!r} already exists."
+    )
+
+
 def _write_migrated_metadata(
     play_dir: Path,
     metadata: dict,
@@ -650,6 +703,85 @@ def migrate_play_bundle(
     return PlayBundleMigration(source_path, destination, stable_id)
 
 
+def _relocate_managed_bundle(
+    source: Path,
+    destination: Path,
+    *,
+    play_root: Path,
+    stock_root: Path,
+    project_id: str,
+    recipient: object,
+    title: object,
+) -> Path:
+    source = source.resolve(strict=True)
+    destination = destination.resolve()
+    source_root = next(
+        (
+            root
+            for root in (play_root, stock_root)
+            if source != root and _is_relative_to(source, root)
+        ),
+        None,
+    )
+    target_root = (
+        stock_root
+        if _is_relative_to(destination, stock_root)
+        else play_root
+        if _is_relative_to(destination, play_root)
+        else None
+    )
+    if (
+        source_root is None
+        or target_root is None
+        or not _is_play_bundle(source)
+    ):
+        raise ValueError(
+            "The source or destination is outside managed letter storage."
+        )
+
+    source_stat = source.stat()
+    metadata = _read_play_metadata(source)
+    source_parent = source.parent
+    if destination != source:
+        if destination.exists():
+            raise FileExistsError(
+                f"Saved-letter destination exists: {destination}"
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, destination)
+
+    if target_root == stock_root:
+        destination = _rename_component_case(
+            destination,
+            safe_folder_name(title, "Untitled Letter"),
+        )
+    else:
+        destination = _case_normalized_bundle_path(
+            destination,
+            play_root,
+            recipient=recipient,
+            title=title,
+        )
+
+    _write_migrated_metadata(
+        destination,
+        metadata,
+        project_id=project_id,
+        recipient=str(recipient or "").strip() or "Unknown Recipient",
+        title=str(title or "").strip() or "Untitled Letter",
+    )
+    os.utime(
+        destination,
+        ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+    )
+    if source_root == play_root and source_parent != play_root:
+        try:
+            source_parent.rmdir()
+        except OSError:
+            pass
+    return destination
+
+
 def resolve_play_bundle_directory(
     project_root: str | Path,
     *,
@@ -663,38 +795,59 @@ def resolve_play_bundle_directory(
     if not stable_id:
         raise ValueError("project_id must be a UUID string")
     play_root = canonical_play_root(project_root)
+    stock_root = canonical_stock_letters_root(project_root)
+    stock_title = is_stock_letter_title(title)
+    target_root = stock_root if stock_title else play_root
     play_root.mkdir(parents=True, exist_ok=True)
+    if stock_title:
+        stock_root.mkdir(parents=True, exist_ok=True)
 
     candidates = [
         bundle
-        for bundle in _iter_play_bundles(play_root)
+        for root in (play_root, stock_root)
+        for bundle in _iter_play_bundles(root)
         if _bundle_project_id(bundle) == stable_id
     ]
     candidates.sort(
         key=lambda path: (
-            _is_relative_to(path, play_root),
+            _is_relative_to(path, target_root),
             path.stat().st_mtime,
         ),
         reverse=True,
     )
     source = candidates[0] if candidates else None
-    destination = _available_named_play_directory(
-        play_root,
-        recipient,
-        title,
-        project_id=stable_id,
-        source=source,
-        allow_existing_project=True,
-    )
-    case_mismatch = bool(
-        source is not None
-        and not _bundle_case_matches(
-            source,
-            play_root,
-            recipient=recipient,
-            title=title,
+    if stock_title:
+        destination = _available_named_stock_directory(
+            stock_root,
+            title,
+            project_id=stable_id,
+            source=source,
         )
-    )
+        case_mismatch = bool(
+            source is not None
+            and (
+                source.parent != stock_root
+                or source.name != safe_folder_name(title, "Untitled Letter")
+            )
+        )
+    else:
+        destination = _available_named_play_directory(
+            play_root,
+            recipient,
+            title,
+            project_id=stable_id,
+            source=source,
+            allow_existing_project=True,
+        )
+        case_mismatch = bool(
+            source is not None
+            and not _bundle_case_matches(
+                source,
+                play_root,
+                recipient=recipient,
+                title=title,
+            )
+        )
     if (
         source is not None
         and migrate_existing
@@ -712,14 +865,24 @@ def resolve_play_bundle_directory(
             and _bundle_project_id(destination) == stable_id
         ):
             return destination
-        return migrate_play_bundle(
-            project_root,
+        if _is_relative_to(source, play_root) and not stock_title:
+            return migrate_play_bundle(
+                project_root,
+                source,
+                recipient=recipient,
+                title=title,
+                project_id=stable_id,
+                allow_existing_project=True,
+            ).destination
+        return _relocate_managed_bundle(
             source,
+            destination,
+            play_root=play_root,
+            stock_root=stock_root,
+            project_id=stable_id,
             recipient=recipient,
             title=title,
-            project_id=stable_id,
-            allow_existing_project=True,
-        ).destination
+        )
     return destination
 
 
@@ -1104,6 +1267,9 @@ __all__ = [
     "FONTS_DIR",
     "ICONS_DIR",
 
+    # Application resources
+    "APP_BANNER_PATH",
+
     # Canonical source tree
     "GALLERY_USER_DIR",
     "USER_PAGES_DIR",
@@ -1154,6 +1320,8 @@ __all__ = [
     "canonical_output_root",
     "canonical_play_root",
     "canonical_recovery_root",
+    "canonical_stock_letters_root",
+    "is_stock_letter_title",
     "safe_folder_name",
     "migrate_play_bundle",
     "resolve_play_bundle_directory",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,8 @@ from readiness import ReadinessResult
 from saved_letters import (
     LAST_ACTIVITY_AT_KEY,
     SavedLetterCatalog,
+    SavedLetterDeleteError,
+    SavedLetterRestorer,
     record_saved_letter_activity,
 )
 
@@ -144,6 +147,85 @@ class SavedLetterActivityOrderTests(unittest.TestCase):
             ]
             self.assertEqual(archived_titles, ["Letter 02", "Letter 00"])
             tab.close()
+
+    def test_stock_menu_lists_only_stock_letters_and_restores_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            saved = _saved_bundle(root, "Saved Letter")
+            stock_source = _saved_bundle(root, "Stock Letter")
+            stock = root / "resources" / "stock" / "letters" / "Stock Letter"
+            stock.parent.mkdir(parents=True)
+            shutil.move(str(stock_source), str(stock))
+            metadata_path = stock / PLAY_METADATA_FILE
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["recipient_title"] = "Stock: Letter"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            saved_entries = SavedLetterCatalog(root).list_entries()
+            self.assertEqual(
+                [entry.path for entry in saved_entries],
+                [saved.resolve()],
+            )
+
+            stock_catalog = SavedLetterCatalog(root, stock_only=True)
+            stock_entries = stock_catalog.list_entries()
+            self.assertEqual(len(stock_entries), 1)
+            self.assertEqual(stock_entries[0].path, stock.resolve())
+            with self.assertRaisesRegex(
+                SavedLetterDeleteError,
+                "Stock letters cannot be deleted",
+            ):
+                stock_catalog.delete(stock_entries[0])
+
+            restored = SavedLetterRestorer(root).restore(stock_entries[0])
+            self.assertEqual(restored.play_dir, stock.resolve())
+
+            tab = ForgeTab(root)
+            tab.show_stock_letters()
+            self.assertEqual(tab.saved_heading.text(), "Stock Letters")
+            self.assertEqual(len(tab._saved_cards), 1)
+            self.assertEqual(tab._saved_cards[0].entry.path, stock.resolve())
+            self.assertTrue(tab.saved_delete_toggle.isHidden())
+            tab.saved_panel.hide()
+            tab.close()
+
+    def test_bundled_example_is_first_read_only_and_restores_from_a_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _saved_bundle(root, "Example Letter", recipient="A Friend")
+            example = root / "resources" / "examples" / "example_letter"
+            example.parent.mkdir(parents=True)
+            shutil.move(str(source), str(example))
+            metadata_path = example / PLAY_METADATA_FILE
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata.update(
+                {
+                    "schema_version": 4,
+                    "source_version": 4,
+                    "editable_assets": {
+                        "prompt_writer_state": "prompt_writer_state.json"
+                    },
+                }
+            )
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            (example / "prompt_writer_state.json").write_text(
+                json.dumps({"version": 6}),
+                encoding="utf-8",
+            )
+            original_metadata = metadata_path.read_bytes()
+
+            catalog = SavedLetterCatalog(root)
+            entries = catalog.list_entries()
+            self.assertEqual(len(entries), 1)
+            self.assertTrue(entries[0].example)
+            self.assertEqual(entries[0].title, "Example Letter")
+            with self.assertRaises(SavedLetterDeleteError):
+                catalog.delete(entries[0])
+
+            restored = SavedLetterRestorer(root).restore(entries[0])
+            self.assertEqual(restored.play_dir, example.resolve())
+            self.assertTrue(restored.project_id)
+            self.assertEqual(metadata_path.read_bytes(), original_metadata)
 
 
 if __name__ == "__main__":

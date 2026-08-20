@@ -4,14 +4,16 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+from project_paths import application_paths
+
 
 EDITOR_ERROR_LOG = "editor_error.log"
 _MAX_LOG_BYTES = 1_000_000
 
 
 def record_editor_failure(project_root: Path, operation: str, error: BaseException) -> Path:
-    """Append an editor failure with a traceback to a bounded project-local log."""
-    log_path = Path(project_root).resolve() / EDITOR_ERROR_LOG
+    """Append an editor failure to the bounded application diagnostic directory."""
+    log_path = application_paths(project_root).logs_root / EDITOR_ERROR_LOG
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     if log_path.is_file() and log_path.stat().st_size >= _MAX_LOG_BYTES:

@@ -50,16 +50,26 @@ from message_history import (
 )
 from message_format import normalize_ultralinks_in_document
 from message_html import is_lettersmith_message_html
-from project_paths import ProjectPathResolver
+from project_paths import ProjectPathResolver, application_paths
 from project_save import ProjectNotReadyError, ProjectSaveService
 from project_state import ProjectStateController
+from publishing.expiration import clear_publication_state
+from ui_help import set_control_help
 from settings_store import (
+    PUBLICATION_PROVIDER_KEY,
+    PUBLICATION_VERIFIED_KEY,
+    PUBLISHED_AT_KEY,
+    PUBLISHED_EXPIRES_AT_KEY,
+    PUBLISHED_GITHUB_OWNER_KEY,
+    PUBLISHED_GITHUB_REPOSITORY_KEY,
+    PUBLISHED_PAGE_URL_KEY,
+    PUBLISHED_PUBLIC_PATH_KEY,
+    PUBLISHED_SOURCE_FINGERPRINT_KEY,
     SettingsStore,
     normalize_published_page_url,
 )
 from config import (
     SETTINGS_FILE,
-    PUBLISHED_PAGE_URL_KEY,
     USER_PAGES_DIR,
     MESSAGE_HTML_FILE,
     MESSAGE_IMAGE_FILE,
@@ -71,6 +81,17 @@ IDENTITY_LOCK_KEYS = {
     "recipient": "recipient_name_locked",
     "published_url": "published_page_url_locked",
 }
+
+
+def _downloads_directory() -> str:
+    location = QtCore.QStandardPaths.writableLocation(
+        QtCore.QStandardPaths.DownloadLocation
+    )
+    if location:
+        return location
+
+    downloads = Path.home() / "Downloads"
+    return str(downloads if downloads.is_dir() else Path.home())
 
 
 class IdentityLineEdit(QtWidgets.QLineEdit):
@@ -180,6 +201,7 @@ def _normalize_published_page_url(value: str) -> str:
 
 MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
 MESSAGE_OVERLAY_OPACITY_KEY = "message_overlay_opacity"
+MESSAGE_ACTION_BUTTON_HEIGHT = 80
 DEFAULT_MESSAGE_OVERLAY_PRESET = "paper"
 DEFAULT_MESSAGE_OVERLAY_OPACITY = 68
 TRANSPARENT_MESSAGE_SURFACE_OPACITY = 18
@@ -258,7 +280,7 @@ class DropMessageButton(ArtworkButton):
         super().__init__(label, project_root, "EButton.png")
         self.setFont(QFont("Segoe UI Semibold", 24, QFont.Bold))
         self.setMinimumWidth(158)
-        self.setFixedHeight(66)
+        self.setFixedHeight(MESSAGE_ACTION_BUTTON_HEIGHT)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Fixed,
@@ -267,9 +289,10 @@ class DropMessageButton(ArtworkButton):
         self.set_artwork_stretch(True)
         self.setAcceptDrops(True)
         self.setAccessibleName("Import")
-        self.setToolTip(
+        set_control_help(
+            self,
             "Import a .txt, .docx, .pdf, .odt, or saved Letter Smith .html message. "
-            "You may also drag a supported file onto this button."
+            "You may also drag a supported file onto this button.",
         )
         if not self.has_artwork:
             self.setStyleSheet(self._default_style())
@@ -347,6 +370,22 @@ class RevisionHistoryDialog(QtWidgets.QDialog):
         self.restore_btn = QtWidgets.QPushButton("Restore", self)
         self.delete_btn = QtWidgets.QPushButton("Delete", self)
         close_btn = QtWidgets.QPushButton("Close", self)
+        set_control_help(
+            self.revision_list,
+            "Select a saved revision to preview it; double-click to restore it.",
+        )
+        set_control_help(
+            self.restore_btn,
+            "Replace the current message with the selected saved revision.",
+        )
+        set_control_help(
+            self.delete_btn,
+            "Permanently remove the selected saved revision from history.",
+        )
+        set_control_help(
+            close_btn,
+            "Close revision history without changing the current message.",
+        )
         buttons.addWidget(self.restore_btn)
         buttons.addWidget(self.delete_btn)
         buttons.addStretch(1)
@@ -501,8 +540,6 @@ class MessageTab(QtWidgets.QWidget):
         shell.addWidget(header)
 
         self.title_recipient_container = QtWidgets.QWidget(self.message_content_shell)
-        # Compatibility alias used by Over_Nexus and older code.
-        self.title_sister_container = self.title_recipient_container
         title_recipient_layout = QtWidgets.QFormLayout(self.title_recipient_container)
         title_recipient_layout.setContentsMargins(0, 0, 0, 0)
         title_recipient_layout.setHorizontalSpacing(10)
@@ -518,8 +555,8 @@ class MessageTab(QtWidgets.QWidget):
         )
         self.url_input.setPlaceholderText("https://your-published-letter-page")
         self.url_input.setToolTip(
-            "Save the public page address for this letter. "
-            "Forge uses this address for Open Letter."
+            "Save a valid HTTP or HTTPS address for this letter. "
+            "Open Letter uses the saved address."
         )
 
         self._configure_identity_field(
@@ -533,6 +570,9 @@ class MessageTab(QtWidgets.QWidget):
         self._configure_identity_field(
             self.url_input,
             "published_url",
+        )
+        self._apply_loaded_identity_locks(
+            persist=True
         )
 
         title_recipient_layout.addRow("Letter Title:", self.title_input)
@@ -570,7 +610,7 @@ class MessageTab(QtWidgets.QWidget):
 
         self.edit_btn = ArtworkButton("Edit", self.project_root, "ROButton.png", self)
         self.edit_btn.setMinimumWidth(158)
-        self.edit_btn.setFixedHeight(66)
+        self.edit_btn.setFixedHeight(MESSAGE_ACTION_BUTTON_HEIGHT)
         self.edit_btn.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Fixed,
@@ -580,15 +620,18 @@ class MessageTab(QtWidgets.QWidget):
         self.edit_btn.setFont(QFont("Segoe UI Semibold", 24, QFont.Bold))
         if not self.edit_btn.has_artwork:
             self.edit_btn.setStyleSheet(compact_button_style)
-        self.edit_btn.setToolTip("Open the rich-text editor for the current message.")
-        self.edit_btn.setAccessibleName("Edit")
+        set_control_help(
+            self.edit_btn,
+            "Open the rich-text editor to write or format the current message.",
+            accessible_name="Edit message",
+        )
         self.edit_btn.setEnabled(True)
         self.edit_btn.clicked.connect(self.open_editor)
         actions.addWidget(self.edit_btn, 0, 2)
 
         self.revisions_btn = ArtworkButton("Revisions", self.project_root, "RButton.png", self)
         self.revisions_btn.setMinimumWidth(158)
-        self.revisions_btn.setFixedHeight(66)
+        self.revisions_btn.setFixedHeight(MESSAGE_ACTION_BUTTON_HEIGHT)
         self.revisions_btn.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Fixed,
@@ -598,8 +641,11 @@ class MessageTab(QtWidgets.QWidget):
         self.revisions_btn.setFont(QFont("Segoe UI Semibold", 24, QFont.Bold))
         if not self.revisions_btn.has_artwork:
             self.revisions_btn.setStyleSheet(compact_button_style)
-        self.revisions_btn.setToolTip("Open autosaved message versions and restore an earlier version.")
-        self.revisions_btn.setAccessibleName("Revisions")
+        set_control_help(
+            self.revisions_btn,
+            "Open autosaved message versions to preview or restore an earlier version.",
+            accessible_name="Message revisions",
+        )
         self.revisions_btn.clicked.connect(self.open_revision_history)
         actions.addWidget(self.revisions_btn, 0, 3)
         shell.addLayout(actions)
@@ -635,6 +681,14 @@ class MessageTab(QtWidgets.QWidget):
                 "recipient_title",
                 "recipient_name",
                 PUBLISHED_PAGE_URL_KEY,
+                PUBLISHED_PUBLIC_PATH_KEY,
+                PUBLISHED_AT_KEY,
+                PUBLISHED_EXPIRES_AT_KEY,
+                PUBLICATION_PROVIDER_KEY,
+                PUBLICATION_VERIFIED_KEY,
+                PUBLISHED_SOURCE_FINGERPRINT_KEY,
+                PUBLISHED_GITHUB_OWNER_KEY,
+                PUBLISHED_GITHUB_REPOSITORY_KEY,
                 MESSAGE_OVERLAY_PRESET_KEY,
                 MESSAGE_OVERLAY_OPACITY_KEY,
             )
@@ -649,7 +703,12 @@ class MessageTab(QtWidgets.QWidget):
             "settings": self._message_settings_signature(),
         }
 
-    def sync_from_disk(self, *, force: bool = False) -> bool:
+    def sync_from_disk(
+        self,
+        *,
+        force: bool = False,
+        lock_loaded_identity: bool = False,
+    ) -> bool:
         """Reconcile Message content, metadata, rendering, and direct disk edits."""
         before = dict(getattr(self, "_sync_state", {}))
         after = self._capture_sync_state()
@@ -659,9 +718,14 @@ class MessageTab(QtWidgets.QWidget):
         self.title_input.setText(str(self.settings.get("recipient_title", "")))
         self.name_input.setText(str(self.settings.get("recipient_name", "")))
         self.url_input.setText(str(self.settings.get(PUBLISHED_PAGE_URL_KEY, "")))
-        self._sync_identity_field_lock(self.title_input, "title")
-        self._sync_identity_field_lock(self.name_input, "recipient")
-        self._sync_identity_field_lock(self.url_input, "published_url")
+        if lock_loaded_identity:
+            self._apply_loaded_identity_locks(
+                persist=True
+            )
+        else:
+            self._sync_identity_field_lock(self.title_input, "title")
+            self._sync_identity_field_lock(self.name_input, "recipient")
+            self._sync_identity_field_lock(self.url_input, "published_url")
         (
             self.overlay_preset,
             self.overlay_opacity,
@@ -753,7 +817,10 @@ class MessageTab(QtWidgets.QWidget):
         super().hideEvent(event)
 
     def refresh_from_disk(self) -> None:
-        self.sync_from_disk(force=True)
+        self.sync_from_disk(
+            force=True,
+            lock_loaded_identity=True,
+        )
 
     def focus_field(self, target: str) -> None:
         """Focus the Message correction requested by Project Readiness."""
@@ -771,10 +838,6 @@ class MessageTab(QtWidgets.QWidget):
     # ──────────────────────────────────────────────────────────────────
     def toggle_title_recipient_area(self) -> None:
         self.title_recipient_container.setVisible(not self.title_recipient_container.isVisible())
-
-    def toggle_title_sister_area(self) -> None:
-        # Compatibility shim for older Nexus wiring.
-        self.toggle_title_recipient_area()
 
     def open_message_editor(self) -> None:
         self.open_editor()
@@ -813,6 +876,10 @@ class MessageTab(QtWidgets.QWidget):
 
         self.overlay_preset_combo = QtWidgets.QComboBox(panel)
         self.overlay_preset_combo.setFixedWidth(210)
+        set_control_help(
+            self.overlay_preset_combo,
+            "Choose the background treatment behind the message text in the finished letter.",
+        )
         for key in ("paper", "black", "white", "clear"):
             self.overlay_preset_combo.addItem(MESSAGE_OVERLAY_PRESET_LABELS[key], key)
         self.overlay_preset_combo.currentIndexChanged.connect(self._on_overlay_preset_changed)
@@ -827,6 +894,11 @@ class MessageTab(QtWidgets.QWidget):
         self.overlay_opacity_slider.setRange(0, 100)
         self.overlay_opacity_slider.setValue(int(self.overlay_opacity))
         self.overlay_opacity_slider.setMaximumWidth(260)
+        set_control_help(
+            self.overlay_opacity_slider,
+            "Adjust how strongly the selected text background covers the letter artwork.",
+            accessible_name="Message background opacity",
+        )
         self.overlay_opacity_slider.valueChanged.connect(self._set_overlay_opacity)
         root.addWidget(self.overlay_opacity_slider, 1, 1)
 
@@ -997,6 +1069,34 @@ class MessageTab(QtWidgets.QWidget):
         )
         self._style_identity_field(field)
 
+    def _apply_loaded_identity_locks(
+        self,
+        *,
+        persist: bool,
+    ) -> None:
+        fields = {
+            "title": self.title_input,
+            "recipient": self.name_input,
+            "published_url": self.url_input,
+        }
+        lock_updates: dict[str, bool] = {}
+        for field_name, field in fields.items():
+            lock_key = IDENTITY_LOCK_KEYS[field_name]
+            locked = bool(field.text().strip())
+            field.setReadOnly(locked)
+            self.settings[lock_key] = locked
+            lock_updates[lock_key] = locked
+            self._style_identity_field(field)
+
+        if not persist:
+            return
+        try:
+            self.settings = self.settings_store.update_fields(
+                lock_updates
+            )
+        except Exception:
+            return
+
     @staticmethod
     def _style_identity_field(field: IdentityLineEdit) -> None:
         if field.isReadOnly():
@@ -1073,6 +1173,14 @@ class MessageTab(QtWidgets.QWidget):
                     "recipient_title",
                     "recipient_name",
                     PUBLISHED_PAGE_URL_KEY,
+                    PUBLISHED_PUBLIC_PATH_KEY,
+                    PUBLISHED_AT_KEY,
+                    PUBLISHED_EXPIRES_AT_KEY,
+                    PUBLICATION_PROVIDER_KEY,
+                    PUBLICATION_VERIFIED_KEY,
+                    PUBLISHED_SOURCE_FINGERPRINT_KEY,
+                    PUBLISHED_GITHUB_OWNER_KEY,
+                    PUBLISHED_GITHUB_REPOSITORY_KEY,
                     MESSAGE_OVERLAY_PRESET_KEY,
                     MESSAGE_OVERLAY_OPACITY_KEY,
                     *IDENTITY_LOCK_KEYS.values(),
@@ -1157,6 +1265,11 @@ class MessageTab(QtWidgets.QWidget):
             )
             return False
 
+        previous_url = normalize_published_page_url(
+            self.settings.get(PUBLISHED_PAGE_URL_KEY, "")
+        )
+        if normalized_url != previous_url:
+            self.settings.update(clear_publication_state())
         self.settings[PUBLISHED_PAGE_URL_KEY] = normalized_url
         self.url_input.setText(normalized_url)
         if self._persist_settings(announce=True):
@@ -1172,6 +1285,11 @@ class MessageTab(QtWidgets.QWidget):
                 self.status.setText("Published Page URL must be a valid HTTP or HTTPS address.")
             return False
 
+        previous_url = normalize_published_page_url(
+            self.settings.get(PUBLISHED_PAGE_URL_KEY, "")
+        )
+        if persist and normalized_url != previous_url:
+            self.settings.update(clear_publication_state())
         self.settings[PUBLISHED_PAGE_URL_KEY] = normalized_url
         if hasattr(self, "url_input"):
             self.url_input.setText(normalized_url)
@@ -1225,8 +1343,10 @@ class MessageTab(QtWidgets.QWidget):
                 )
 
     def _default_message_bg_path(self) -> Path:
-        # DEFAULT FALLBACK: gallery/app/pages/Dmessage.png
-        return Path(self.project_root) / "gallery" / "app" / "pages" / "Dmessage.png"
+        # DEFAULT FALLBACK: resources/app/pages/Dmessage.png
+        return application_paths(self.project_root).app_resource_path(
+            Path("pages") / "Dmessage.png"
+        )
 
     # ──────────────────────────────────────────────────────────────────
     # Fallback pipeline (Dmessage → wall, then wall → message.png if needed)
@@ -1234,7 +1354,7 @@ class MessageTab(QtWidgets.QWidget):
     def _ensure_wall_exists(self) -> bool:
         """
         Guarantees wall.png exists by copying:
-            gallery/app/pages/Dmessage.png -> gallery/user/pages/wall.png
+            resources/app/pages/Dmessage.png -> gallery/user/pages/wall.png
         if wall.png is missing.
         """
         wall_path = self._wall_path()
@@ -1360,7 +1480,7 @@ class MessageTab(QtWidgets.QWidget):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select Message File",
-            "",
+            _downloads_directory(),
             "Messages (*.txt *.docx *.pdf *.odt *.html *.htm)",
         )
         if path:
@@ -1656,6 +1776,30 @@ class MessageTab(QtWidgets.QWidget):
             # Force existence (wall->message) if generation fails
             self.status.setText(f"❌ Error generating message.png: {e}")
             self._ensure_message_exists()
+    def reset_project_message(self) -> None:
+        """Clear the live Message workspace after New Project commits."""
+        self._overlay_render_timer.stop()
+        self._tab_active = False
+        self.current_html = ""
+        self._content_has_intentional_formatting = False
+        self.settings = self.settings_store.snapshot()
+        self.title_input.setText("")
+        self.name_input.setText("")
+        self.url_input.setText("")
+        self.reset_identity_locks()
+        (
+            self.overlay_preset,
+            self.overlay_opacity,
+            _overlay_rgb,
+            _overlay_ink,
+        ) = _message_overlay_settings(self.settings_path)
+        self._sync_overlay_controls()
+        self._update_message_summary("")
+        self._sync_state = self._capture_sync_state()
+        self.text_selected.emit("")
+        self.published_page_url_changed.emit("")
+        self.status.setText("No message selected.")
+
     def shutdown(self) -> None:
         self._overlay_render_timer.stop()
         try:

@@ -22,27 +22,34 @@
 # - deletes:
 #     gallery/user/sounds/music.mp3
 #     gallery/sounds/music.mp3
-#     gallery/user/sounds/appssong/current.json
+#     configured active-project current sound manifest
 # - does NOT delete:
 #     glissando.mp3
 #     flip1..flip10.mp3
-#     appssong/originals, processed, analysis
+#     persistent Music Archive originals, processed data, and analysis
 # ===============================
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import sys
-import shutil
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt
 from command_bar import CommandBarData, build_command_bar_data
+from project_paths import ProjectPathResolver, application_paths
 from project_state import ApplicationState, ProjectStateController
+from settings_store import DEFAULT_SETTINGS, SettingsStore
+from sound_model import (
+    ProjectSoundState,
+    current_manifest_path,
+    current_music_path,
+    project_sound_path,
+)
+from transactional_io import PathTransaction, atomic_write_json
+from ui_help import set_control_help
 
 __all__ = [
     "CommandTab",
@@ -57,23 +64,24 @@ __all__ = [
 # ─────────────────────────────────────────────────────────────────────────────
 try:
     from config import (
-        SETTINGS_FILE,
-        PUBLISHED_PAGE_URL_KEY,
         USER_PAGES_DIR,
         USER_MESSAGE_DIR,
-        USER_SOUNDS_DIR,
         MUSIC_FILE,
     )
 except Exception:
-    SETTINGS_FILE = "settings.json"
-    PUBLISHED_PAGE_URL_KEY = "published_page_url"
     USER_PAGES_DIR = "gallery/user/pages"
     USER_MESSAGE_DIR = "gallery/user/message"
-    USER_SOUNDS_DIR = "gallery/user/sounds"
     MUSIC_FILE = "music.mp3"
 
 
-RESET_SETTINGS = {
+PROJECT_RESET_SETTINGS = {
+    "curtain_style": DEFAULT_SETTINGS["curtain_style"],
+    "message_overlay_preset": "paper",
+    "message_overlay_opacity": 68,
+    "forge_preview_mode": "portrait",
+    "required_features": [],
+    "music_required": False,
+    "music_muted": False,
     "starting_volume": 50,
     "music_volume": 50,
     "music_file": "",
@@ -83,11 +91,22 @@ RESET_SETTINGS = {
     "published_page_url_locked": False,
     "active_play_dir": "",
     "prompt_writer_state": {},
+    "published_public_path": "",
+    "published_at": "",
+    "published_expires_at": "",
+    "publication_provider": "",
+    "publication_verified": False,
+    "published_source_fingerprint": "",
+    "published_github_owner": "",
+    "published_github_repository": "",
+    "last_sealed_path": "",
 }
+
+RESET_SETTINGS = dict(PROJECT_RESET_SETTINGS)
 
 NEW_PROJECT_SETTINGS = {
     key: value
-    for key, value in RESET_SETTINGS.items()
+    for key, value in PROJECT_RESET_SETTINGS.items()
     if key not in {"starting_volume", "music_volume"}
 }
 
@@ -98,72 +117,58 @@ LOGGER = logging.getLogger(__name__)
 # Root resolver
 # ─────────────────────────────────────────────────────────────────────────────
 def app_root() -> Path:
-    base = getattr(sys, "_MEIPASS", None)
-
-    if base:
-        cwd = Path.cwd()
-
-        if (cwd / "gallery").exists() or (cwd / SETTINGS_FILE).exists():
-            return cwd
-
-        return Path(base)
-
-    here = Path(__file__).resolve()
-
-    for up in (
-        here.parent,
-        here.parent.parent,
-        here.parent.parent.parent,
-    ):
-        if (up / SETTINGS_FILE).exists() or (up / "gallery").exists():
-            return up
-
-    return here.parent
+    return application_paths().workspace_root
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # File helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def _safe_clear_dir_contents(
-    dir_path: Path,
-) -> Tuple[int, int]:
-    files_deleted = 0
-    dirs_deleted = 0
+def _path_counts(path: Path) -> Tuple[int, int]:
+    if path.is_file() or path.is_symlink():
+        return 1, 0
+    if not path.is_dir():
+        return 0, 0
+    files = 0
+    directories = 0
+    for child in path.rglob("*"):
+        if child.is_dir() and not child.is_symlink():
+            directories += 1
+        else:
+            files += 1
+    return files, directories
 
-    if not dir_path.exists() or not dir_path.is_dir():
-        return files_deleted, dirs_deleted
 
-    for entry in dir_path.iterdir():
+def _empty_prompt_writer_state() -> dict:
+    from PromptWriterPanel import empty_prompt_writer_state
+
+    return empty_prompt_writer_state()
+
+
+def _active_autosave_directories(
+    root: Path,
+    settings: Mapping[str, object],
+) -> tuple[Path, ...]:
+    project_id = str(settings.get("project_id", "")).strip()
+    if not project_id:
+        return ()
+    resolver = ProjectPathResolver(root)
+    recipient_id = str(settings.get("recipient_id", "")).strip()
+    paths = resolver.find_autosave_directories(
+        project_id,
+        recipient_id=recipient_id or None,
+    )
+    safe_paths: list[Path] = []
+    for path in paths:
+        resolved = path.resolve()
         try:
-            if entry.is_file() or entry.is_symlink():
-                entry.unlink(missing_ok=True)
-                files_deleted += 1
-
-            elif entry.is_dir():
-                shutil.rmtree(
-                    entry,
-                    ignore_errors=True,
-                )
-                dirs_deleted += 1
-
-        except Exception:
-            pass
-
-    return files_deleted, dirs_deleted
-
-
-def _safe_delete_file(
-    path: Path,
-) -> int:
-    try:
-        if path.exists() and path.is_file():
-            path.unlink(missing_ok=True)
-            return 1
-
-    except Exception:
-        pass
-
-    return 0
+            resolved.relative_to(resolver.autosave_root)
+        except ValueError:
+            raise RuntimeError(
+                f"Active autosave escaped its canonical root: {resolved}"
+            ) from None
+        if resolved != resolver.autosave_root:
+            safe_paths.append(resolved)
+    return tuple(dict.fromkeys(safe_paths))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,58 +205,14 @@ def _hard_stop_sound_system(
         )
 
         if sound_tab is not None:
-            wave = getattr(
+            release = getattr(
                 sound_tab,
-                "wave",
+                "release_current_file_handle",
                 None,
             )
 
-            if (
-                wave is not None
-                and hasattr(
-                    wave,
-                    "release_current_file_handle",
-                )
-            ):
-                wave.release_current_file_handle()
-
-    except Exception:
-        pass
-
-    try:
-        sound_tab = getattr(
-            win,
-            "sound_tab",
-            None,
-        )
-
-        if sound_tab is not None:
-            preview = getattr(
-                sound_tab,
-                "_preview",
-                None,
-            )
-
-            player = getattr(
-                preview,
-                "_player",
-                None,
-            )
-
-            if player is not None:
-                try:
-                    player.stop()
-
-                except Exception:
-                    pass
-
-                try:
-                    player.setSource(
-                        QUrl()
-                    )
-
-                except Exception:
-                    pass
+            if callable(release):
+                release()
 
     except Exception:
         pass
@@ -276,266 +237,153 @@ def _release_image_system(
         pass
 
 
-def _force_soundtab_no_audio(
+def _release_active_project_media(
     win: Optional[QtWidgets.QWidget],
 ) -> None:
-    """
-    Force the live Sound tab to immediately show no selected audio.
-    """
-
     if win is None:
         return
-
-    try:
-        sound_tab = getattr(
-            win,
-            "sound_tab",
-            None,
-        )
-
-        if sound_tab is None:
-            return
-
-        if hasattr(
-            sound_tab,
-            "reset_project_sound",
-        ):
-            try:
-                sound_tab.reset_project_sound()
-                return
-
-            except Exception:
-                pass
-
-        if hasattr(
-            sound_tab,
-            "_on_current_changed",
-        ):
-            try:
-                sound_tab._on_current_changed("")
-
-            except Exception:
-                pass
-
-        try:
-            if hasattr(
-                sound_tab,
-                "playpause_btn",
-            ):
-                sound_tab.playpause_btn.setText(
-                    "▶ Play"
-                )
-
-        except Exception:
-            pass
-
-        try:
-            if hasattr(
-                sound_tab,
-                "status",
-            ):
-                sound_tab.status.setText(
-                    "No audio loaded."
-                )
-
-        except Exception:
-            pass
-
-    except Exception:
-        pass
-
-
-def _clear_message_tab_inputs(
-    win: Optional[QtWidgets.QWidget],
-) -> None:
-    """
-    Clear the Message tab's visible and in-memory fields.
-    """
-
-    if win is None:
+    prepare_reset = getattr(
+        win,
+        "prepare_for_project_reset",
+        None,
+    )
+    if callable(prepare_reset):
+        prepare_reset()
         return
+    release_preview = getattr(
+        win,
+        "_release_forge_preview_files",
+        None,
+    )
+    if callable(release_preview):
+        release_preview()
+    release_project_files = getattr(
+        win,
+        "_release_project_files_for_restore",
+        None,
+    )
+    if callable(release_project_files):
+        release_project_files()
+        return
+    _hard_stop_sound_system(win)
+    _release_image_system(win)
 
+
+def _reset_active_paths(
+    root: Path,
+    *,
+    settings_before: Mapping[str, object],
+    controller: ProjectStateController,
+    settings_updates: Mapping[str, object],
+) -> Tuple[int, int]:
+    directory_targets = [
+        (root / USER_PAGES_DIR).resolve(),
+        (root / USER_MESSAGE_DIR).resolve(),
+    ]
+    deletion_targets = [
+        current_music_path(root).resolve(),
+        (root / "gallery" / "sounds" / MUSIC_FILE).resolve(),
+        current_manifest_path(root).resolve(),
+        (root / "gallery" / "user" / "cache" / "curtains").resolve(),
+        *_active_autosave_directories(root, settings_before),
+    ]
+    json_targets = [
+        (
+            project_sound_path(root).resolve(),
+            ProjectSoundState().to_dict(),
+        ),
+        (
+            (root / "prompt_writer_state.json").resolve(),
+            _empty_prompt_writer_state(),
+        ),
+    ]
+
+    files_removed = 0
+    directories_removed = 0
+    for target in (*directory_targets, *deletion_targets):
+        files, directories = _path_counts(target)
+        files_removed += files
+        directories_removed += directories
+
+    transactions: list[tuple[PathTransaction, bool]] = []
+    committed: list[PathTransaction] = []
+    settings_store = SettingsStore(root)
     try:
-        message_tab = getattr(
-            win,
-            "message_tab",
-            None,
-        )
-
-        if message_tab is None:
-            return
-
-        if hasattr(message_tab, "reset_identity_locks"):
-            try:
-                message_tab.reset_identity_locks()
-            except Exception:
-                LOGGER.exception("Could not clear Message identity locks during reset")
-
-        try:
-            if hasattr(
-                message_tab,
-                "title_input",
-            ):
-                message_tab.title_input.setText("")
-
-        except Exception:
-            pass
-
-        try:
-            if hasattr(
-                message_tab,
-                "name_input",
-            ):
-                message_tab.name_input.setText("")
-
-        except Exception:
-            pass
-
-        try:
-            if hasattr(
-                message_tab,
-                "set_published_page_url",
-            ):
-                message_tab.set_published_page_url(
-                    "",
-                    persist=False,
-                    announce=False,
-                )
-
-        except Exception:
-            pass
-
-        try:
-            if hasattr(
-                message_tab,
-                "current_html",
-            ):
-                message_tab.current_html = ""
-
-            if hasattr(
-                message_tab,
-                "_content_has_intentional_formatting",
-            ):
-                message_tab._content_has_intentional_formatting = False
-
-            if hasattr(
-                message_tab,
-                "_update_message_summary",
-            ):
-                message_tab._update_message_summary("")
-
-        except Exception:
-            pass
-
-        try:
-            settings = getattr(
-                message_tab,
-                "settings",
-                None,
+        for target in directory_targets:
+            transaction = PathTransaction(
+                target,
+                staging_suffix=".new-project-staging",
+                backup_suffix=".new-project-backup",
+                unique_staging=True,
             )
+            staging = transaction.prepare()
+            staging.mkdir(parents=True)
+            transactions.append((transaction, True))
 
-            if isinstance(
-                settings,
-                dict,
-            ):
-                settings["recipient_title"] = ""
-                settings["recipient_name"] = ""
-                settings[PUBLISHED_PAGE_URL_KEY] = ""
-                settings["recipient_title_locked"] = False
-                settings["recipient_name_locked"] = False
-                settings["published_page_url_locked"] = False
+        for target, payload in json_targets:
+            transaction = PathTransaction(
+                target,
+                staging_suffix=".new-project-staging",
+                backup_suffix=".new-project-backup",
+                unique_staging=True,
+            )
+            staging = transaction.prepare()
+            atomic_write_json(staging, payload)
+            transactions.append((transaction, True))
 
+        for target in deletion_targets:
+            transaction = PathTransaction(
+                target,
+                staging_suffix=".new-project-staging",
+                backup_suffix=".new-project-backup",
+                unique_staging=True,
+            )
+            transaction.prepare()
+            transactions.append((transaction, False))
+
+        for transaction, replace in transactions:
+            transaction.commit(
+                replace=replace,
+                keep_backup=True,
+            )
+            committed.append(transaction)
+
+        controller.begin_new_project(
+            additional_settings=settings_updates,
+        )
+    except Exception:
+        LOGGER.exception("New Project transaction failed; rolling back.")
+        try:
+            settings_store.replace_snapshot(settings_before)
         except Exception:
-            pass
+            LOGGER.exception("Could not restore settings after New Project failure.")
+        for transaction in reversed(committed):
+            try:
+                transaction.rollback()
+            except Exception:
+                LOGGER.exception(
+                    "Could not roll back New Project path: %s",
+                    transaction.final_path,
+                )
+        for transaction, _replace in transactions:
+            try:
+                transaction.abort()
+            except Exception:
+                LOGGER.exception(
+                    "Could not clean New Project staging path: %s",
+                    transaction.staging_path,
+                )
+        raise
 
-    except Exception:
-        pass
-
-
-def _reset_project_sound_state(
-    root: Path,
-) -> None:
-    """
-    Clear the Sound tab's persisted single-track and playlist assignment.
-
-    The music archive itself is preserved.
-    """
-
-    state_path = (
-        root
-        / USER_SOUNDS_DIR
-        / "appssong"
-        / "project_sound.json"
-    ).resolve()
-
-    try:
-        state_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        state_path.write_text(
-            json.dumps(
-                {
-                    "version": 2,
-                    "mode": "single",
-                    "single_track_id": "",
-                    "playlist": [],
-                    "playlist_expanded": True,
-                    "selected_track_id": "",
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-    except Exception:
-        pass
-
-
-def _delete_music_and_manifest(
-    root: Path,
-) -> int:
-    """
-    Delete the active compatibility music files and manifest.
-    """
-
-    total = 0
-
-    user_sound_dir = (
-        root / USER_SOUNDS_DIR
-    ).resolve()
-
-    user_music = (
-        user_sound_dir / MUSIC_FILE
-    ).resolve()
-
-    runtime_music = (
-        root
-        / "gallery"
-        / "sounds"
-        / MUSIC_FILE
-    ).resolve()
-
-    current_manifest = (
-        user_sound_dir
-        / "appssong"
-        / "current.json"
-    ).resolve()
-
-    total += _safe_delete_file(
-        user_music
-    )
-
-    total += _safe_delete_file(
-        runtime_music
-    )
-
-    total += _safe_delete_file(
-        current_manifest
-    )
-
-    return total
+    for transaction, _replace in transactions:
+        try:
+            transaction.finalize()
+        except OSError:
+            LOGGER.exception(
+                "Could not clean New Project backup: %s",
+                transaction.backup_path,
+            )
+    return files_removed, directories_removed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -554,82 +402,30 @@ def reset_everything(
         else app_root()
     )
 
-    pages_dir = (
-        root / USER_PAGES_DIR
-    ).resolve()
-
-    message_dir = (
-        root / USER_MESSAGE_DIR
-    ).resolve()
-
-    pages_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    message_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    total_files = 0
-    total_dirs = 0
-
     window = _get_nexus_window(
         parent
     )
-
-    # Stop all active audio before deleting files.
-    _hard_stop_sound_system(
-        window
-    )
-    _release_image_system(
-        window
-    )
-
-    files, directories = _safe_clear_dir_contents(
-        pages_dir
-    )
-
-    total_files += files
-    total_dirs += directories
-
-    files, directories = _safe_clear_dir_contents(
-        message_dir
-    )
-
-    total_files += files
-    total_dirs += directories
-
-    # Remove active generated music and compatibility manifest.
-    total_files += _delete_music_and_manifest(
-        root
-    )
-
-    # Clear the selected track or playlist.
-    _reset_project_sound_state(
-        root
-    )
-
-    # Clear live Message fields.
-    _clear_message_tab_inputs(
-        window
-    )
-
-    # Clear the live Sound tab immediately.
-    _force_soundtab_no_audio(
-        window
-    )
-
     controller = project_state or ProjectStateController(root)
-    controller.begin_new_project(
-        additional_settings=(
+    forge_tab = getattr(window, "forge_tab", None)
+    if (
+        forge_tab is not None
+        and bool(getattr(forge_tab, "operation_in_progress", False))
+    ):
+        raise RuntimeError(
+            "Finish the current Forge operation before starting a new project."
+        )
+    _release_active_project_media(window)
+    settings_before = SettingsStore(root).snapshot()
+    total_files, total_dirs = _reset_active_paths(
+        root,
+        settings_before=settings_before,
+        controller=controller,
+        settings_updates=(
             RESET_SETTINGS
             if settings_updates is None
             else settings_updates
-        )
+        ),
     )
-
     return total_files, total_dirs
 
 
@@ -774,6 +570,16 @@ class _ConfirmDialog(
 
         yes_button.setObjectName(
             "danger"
+        )
+
+        set_control_help(
+            no_button,
+            "Cancel and keep the current letter unchanged.",
+        )
+
+        set_control_help(
+            yes_button,
+            "Confirm the reset and permanently clear the current letter workspace.",
         )
 
         row.addWidget(
@@ -921,6 +727,11 @@ def _perform_confirmed_reset(
     announce: bool = True,
     settings_updates: Mapping[str, object] | None = None,
 ) -> bool:
+    previous_state = (
+        project_state.state
+        if project_state is not None
+        else None
+    )
     previous_identity = (
         project_state.identity
         if project_state is not None
@@ -941,16 +752,25 @@ def _perform_confirmed_reset(
             settings_updates=settings_updates,
         )
     except Exception:
-        if (
-            project_state is not None
-            and previous_identity is not None
-            and previous_identity.is_valid
-            and project_state.state is ApplicationState.PROJECT_CLEARING
-        ):
-            project_state.transition(
-                ApplicationState.PROJECT_READY,
-                identity=previous_identity,
-            )
+        if project_state is not None and previous_state is not None:
+            try:
+                if (
+                    previous_state is ApplicationState.PROJECT_READY
+                    and previous_identity is not None
+                    and previous_identity.is_valid
+                ):
+                    project_state.transition(
+                        ApplicationState.PROJECT_READY,
+                        identity=previous_identity,
+                    )
+                elif previous_state is ApplicationState.RECIPIENT_REQUIRED:
+                    project_state.transition(
+                        ApplicationState.RECIPIENT_REQUIRED,
+                    )
+            except Exception:
+                LOGGER.exception(
+                    "Could not restore project state after reset failure."
+                )
         raise
 
     if announce:
@@ -1682,12 +1502,7 @@ class CommandTab(
             """
         )
 
-        icons_dir = (
-            self.project_root
-            / "gallery"
-            / "app"
-            / "icons"
-        )
+        icons_dir = application_paths(self.project_root).app_resource_path("icons")
 
         self._bg_path = (
             icons_dir / "command.png"
@@ -1730,8 +1545,10 @@ class CommandTab(
             self
         )
 
-        self.go_btn.setToolTip(
-            "Hold Go for 3 seconds to wipe the letter"
+        set_control_help(
+            self.go_btn,
+            "Hold Go for three seconds to finish this letter and clear the workspace for a new project.",
+            accessible_name="Finish letter and start new project",
         )
 
         self._interaction_state = "idle"
@@ -1765,8 +1582,9 @@ class CommandTab(
 
         self._interaction_state = "confirming"
         self.go_btn.setEnabled(False)
-        self.go_btn.setToolTip(
-            "Confirm or cancel the wipe"
+        set_control_help(
+            self.go_btn,
+            "Confirm or cancel clearing the current letter in the open dialog.",
         )
         self.go_btn.set_busy(True)
 
@@ -1806,8 +1624,9 @@ class CommandTab(
         if self._interaction_state != "confirming":
             return
         self._interaction_state = "running"
-        self.go_btn.setToolTip(
-            "Wiping the letter"
+        set_control_help(
+            self.go_btn,
+            "Clearing the completed letter and preparing a new workspace.",
         )
         QtCore.QTimer.singleShot(
             0,
@@ -1820,9 +1639,6 @@ class CommandTab(
         if self._interaction_state != "running":
             return
         try:
-            hook = getattr(self.window(), "reset_prompt_writer_state", None)
-            if callable(hook) and not hook():
-                raise RuntimeError("Prompt Writer reset was not completed")
             opener = getattr(
                 self.window(),
                 "open_command_bar_and_close_editor",
@@ -1883,8 +1699,10 @@ class CommandTab(
     ) -> None:
         self.go_btn.set_busy(False)
         self.go_btn.setEnabled(True)
-        self.go_btn.setToolTip(
-            "Hold Go for 3 seconds to wipe the letter"
+        set_control_help(
+            self.go_btn,
+            "Hold Go for three seconds to finish this letter and clear the workspace for a new project.",
+            accessible_name="Finish letter and start new project",
         )
         self._interaction_state = "idle"
 

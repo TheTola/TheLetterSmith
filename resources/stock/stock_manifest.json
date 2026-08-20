@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "images": {
+    "cover": [
+      "images/cover/stock cover 1.png",
+      "images/cover/stock cover 2.png",
+      "images/cover/stock cover 3.png"
+    ],
+    "letter": [
+      "images/letter/stock letter 1.png",
+      "images/letter/stock letter 2.png",
+      "images/letter/stock letter 3.png"
+    ],
+    "wall": [
+      "images/wall/stock wall 1.png",
+      "images/wall/stock wall 2.png",
+      "images/wall/stock wall 3.png"
+    ],
+    "back": [
+      "images/back/stock back 1.png",
+      "images/back/stock back 2.png",
+      "images/back/stock back 3.png"
+    ]
+  },
+  "music": [
+    {
+      "filename": "music/stock song Background Music.mp3",
+      "title": "Background Music"
+    },
+    {
+      "filename": "music/stock song Dark.mp3",
+      "title": "Dark"
+    },
+    {
+      "filename": "music/stock song Sigma Music.mp3",
+      "title": "Sigma Music"
+    }
+  ]
+}

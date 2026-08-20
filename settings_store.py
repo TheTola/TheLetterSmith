@@ -11,12 +11,21 @@ from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
 from transactional_io import atomic_write_text
+from project_paths import application_paths
 
 
 SETTINGS_FILENAME = "settings.json"
 
 REQUIRED_FEATURES_KEY = "required_features"
 PUBLISHED_PAGE_URL_KEY = "published_page_url"
+PUBLISHED_PUBLIC_PATH_KEY = "published_public_path"
+PUBLISHED_AT_KEY = "published_at"
+PUBLISHED_EXPIRES_AT_KEY = "published_expires_at"
+PUBLICATION_PROVIDER_KEY = "publication_provider"
+PUBLICATION_VERIFIED_KEY = "publication_verified"
+PUBLISHED_SOURCE_FINGERPRINT_KEY = "published_source_fingerprint"
+PUBLISHED_GITHUB_OWNER_KEY = "published_github_owner"
+PUBLISHED_GITHUB_REPOSITORY_KEY = "published_github_repository"
 ACTIVE_PLAY_DIR_KEY = "active_play_dir"
 VISIONARY_URL_KEY = "visionary_url"
 DEFAULT_VISIONARY_URL = (
@@ -30,6 +39,14 @@ DEFAULT_SETTINGS = {
     "curtain_style": "pure_white",
     REQUIRED_FEATURES_KEY: [],
     PUBLISHED_PAGE_URL_KEY: "",
+    PUBLISHED_PUBLIC_PATH_KEY: "",
+    PUBLISHED_AT_KEY: "",
+    PUBLISHED_EXPIRES_AT_KEY: "",
+    PUBLICATION_PROVIDER_KEY: "",
+    PUBLICATION_VERIFIED_KEY: False,
+    PUBLISHED_SOURCE_FINGERPRINT_KEY: "",
+    PUBLISHED_GITHUB_OWNER_KEY: "",
+    PUBLISHED_GITHUB_REPOSITORY_KEY: "",
     ACTIVE_PLAY_DIR_KEY: "",
     VISIONARY_URL_KEY: DEFAULT_VISIONARY_URL,
 }
@@ -39,8 +56,10 @@ VALID_CURTAIN_STYLES = {
     "pure_white",
     "average_color",
     "complementary_average_color",
-    "light",
-    "dark",
+    "normal_light",
+    "complementary_light",
+    "normal_dark",
+    "complementary_dark",
 }
 
 
@@ -50,8 +69,20 @@ CURTAIN_STYLE_LABELS = {
     "complementary_average_color": (
         "Complementary Curtain"
     ),
-    "light": "Light Curtain",
-    "dark": "Dark Curtain",
+    "normal_light": "Normal Light",
+    "complementary_light": "Complementary Light",
+    "normal_dark": "Normal Dark",
+    "complementary_dark": "Complementary Dark",
+}
+
+
+CURTAIN_TEXT_STYLE_PAIRS = {
+    "average_color": "complementary_average_color",
+    "complementary_average_color": "average_color",
+    "normal_light": "complementary_dark",
+    "complementary_light": "normal_dark",
+    "normal_dark": "complementary_light",
+    "complementary_dark": "normal_light",
 }
 
 
@@ -74,13 +105,23 @@ CURTAIN_STYLE_ALIASES = {
         "complementary_average_color"
     ),
 
-    "light curtain": "light",
-    "light_curtain": "light",
-    "lighter": "light",
+    "light": "normal_light",
+    "light curtain": "normal_light",
+    "light_curtain": "normal_light",
+    "lighter": "normal_light",
+    "normal light": "normal_light",
+    "normal light curtain": "normal_light",
+    "complementary light": "complementary_light",
+    "complementary light curtain": "complementary_light",
 
-    "dark curtain": "dark",
-    "dark_curtain": "dark",
-    "darker": "dark",
+    "dark": "normal_dark",
+    "dark curtain": "normal_dark",
+    "dark_curtain": "normal_dark",
+    "darker": "normal_dark",
+    "normal dark": "normal_dark",
+    "normal dark curtain": "normal_dark",
+    "complementary dark": "complementary_dark",
+    "complementary dark curtain": "complementary_dark",
 }
 
 
@@ -228,10 +269,9 @@ class SettingsStore:
             project_root
         ).resolve()
 
-        self.path = (
+        self.path = application_paths(
             self.project_root
-            / SETTINGS_FILENAME
-        )
+        ).settings_file
 
         self.changed = SettingsChanged()
 
@@ -663,6 +703,33 @@ class SettingsStore:
                 "",
             )
         )
+        for key in (
+            PUBLISHED_PUBLIC_PATH_KEY,
+            PUBLISHED_AT_KEY,
+            PUBLISHED_EXPIRES_AT_KEY,
+            PUBLICATION_PROVIDER_KEY,
+            PUBLISHED_SOURCE_FINGERPRINT_KEY,
+            PUBLISHED_GITHUB_OWNER_KEY,
+            PUBLISHED_GITHUB_REPOSITORY_KEY,
+        ):
+            value = normalized.get(key, DEFAULT_SETTINGS[key])
+            normalized[key] = value.strip() if isinstance(value, str) else ""
+        normalized[PUBLICATION_VERIFIED_KEY] = (
+            normalized.get(PUBLICATION_VERIFIED_KEY) is True
+        )
+        for obsolete_key in (
+            "r2_account_id",
+            "r2_authentication_mode",
+            "r2_bucket",
+            "r2_current_public_path",
+            "r2_free_tier_limit_bytes",
+            "r2_last_object_count",
+            "r2_last_usage_at",
+            "r2_last_used_bytes",
+            "r2_public_base_url",
+            "r2_public_warning_acknowledged",
+        ):
+            normalized.pop(obsolete_key, None)
 
         # Active generated-letter directory. Path validation remains with the
         # owning workflow because the folder may be moved between sessions.
@@ -726,10 +793,19 @@ class SettingsStore:
 __all__ = [
     "CURTAIN_STYLE_ALIASES",
     "CURTAIN_STYLE_LABELS",
+    "CURTAIN_TEXT_STYLE_PAIRS",
     "DEFAULT_SETTINGS",
     "DEFAULT_VISIONARY_URL",
     "ACTIVE_PLAY_DIR_KEY",
+    "PUBLICATION_PROVIDER_KEY",
+    "PUBLICATION_VERIFIED_KEY",
+    "PUBLISHED_AT_KEY",
+    "PUBLISHED_EXPIRES_AT_KEY",
+    "PUBLISHED_GITHUB_OWNER_KEY",
+    "PUBLISHED_GITHUB_REPOSITORY_KEY",
     "PUBLISHED_PAGE_URL_KEY",
+    "PUBLISHED_PUBLIC_PATH_KEY",
+    "PUBLISHED_SOURCE_FINGERPRINT_KEY",
     "REQUIRED_FEATURES_KEY",
     "VISIONARY_URL_KEY",
     "SETTINGS_FILENAME",

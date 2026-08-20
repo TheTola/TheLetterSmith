@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 from PIL import Image
+from PySide6 import QtCore, QtWidgets
 
 from config import CONTROL_FILES
 from curtain_color import recolor_banner_to_curtain_color
 import generate
 import image_animation
+from Image_tab import (
+    ImageTab,
+    StockImageDialog,
+    _ResetImagesConfirmationDialog,
+)
 from image_animation import (
     IMAGE_MANIFEST_NAME,
     build_runtime_image_assets,
@@ -24,10 +34,15 @@ from image_animation import (
     validate_runtime_image_manifest,
 )
 from portable_export import create_single_html
+from Message_tab import MessageTab
 from settings_store import SettingsStore
 
 
 class ImageAnimationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+
     @staticmethod
     def _write_gif(
         path: Path,
@@ -260,6 +275,9 @@ class ImageAnimationTests(unittest.TestCase):
             )
             self.assertIn("Perfection&#x27;s Path", index)
             self.assertIn("#title-banner.is-showing", styles)
+            self.assertIn("container-type:inline-size", styles)
+            self.assertIn("font-size:6.8cqw", styles)
+            self.assertNotIn("font-size:clamp(24px,4.7vw,68px)", styles)
             self.assertIn(
                 "const titleBannerDelayMs = prefersReducedMotion ? 80 : 500;",
                 script,
@@ -287,6 +305,7 @@ class ImageAnimationTests(unittest.TestCase):
             exported = create_single_html(play, root / "exports")
             exported_html = exported.read_text(encoding="utf-8")
             self.assertIn("data:image/png;base64,", exported_html)
+            self.assertNotIn("gallery/controls/bannerman.png", exported_html)
             self.assertNotIn("gallery/pages/gif_frames/cover", exported_html)
 
     def test_runtime_builder_keeps_static_paths_unchanged(self) -> None:
@@ -370,6 +389,142 @@ class ImageAnimationTests(unittest.TestCase):
                 self.assertEqual(thumbnail.n_frames, 2)
             self.assertEqual(record["processing"]["max_dimension"], 2048)
             self.assertEqual(record["thumbnail_file"], "cover.thumbnail.gif")
+
+    def test_stock_image_tray_is_compact_frameless_and_single_click(self) -> None:
+        paths = tuple(Path(f"stock-{index}.png") for index in range(3))
+        dialog = StockImageDialog("Cover Page", paths)
+        try:
+            self.assertTrue(dialog.windowFlags() & QtCore.Qt.Popup)
+            self.assertTrue(dialog.windowFlags() & QtCore.Qt.FramelessWindowHint)
+            self.assertEqual(dialog.size(), QtCore.QSize(420, 146))
+            self.assertIsNone(dialog.findChild(QtWidgets.QDialogButtonBox))
+
+            item = dialog._images.item(1)
+            dialog._images.itemClicked.emit(item)
+
+            self.assertEqual(dialog.result(), QtWidgets.QDialog.Accepted)
+            self.assertEqual(dialog.selected_path(), paths[1])
+        finally:
+            dialog.close()
+
+    def test_empty_image_uses_stock_tray_and_filled_image_browses(self) -> None:
+        tab = mock.Mock()
+        tab.labels = {1: ("Cover Page", "cover.png")}
+        tab.image_paths = {1: None}
+
+        ImageTab._pick_image_dialog(tab, 1)
+
+        tab.open_stock_gallery.assert_called_once_with(1)
+        tab._browse_image_file.assert_not_called()
+
+        tab.image_paths[1] = "cover.png"
+        ImageTab._pick_image_dialog(tab, 1)
+
+        tab._browse_image_file.assert_called_once_with(1)
+
+    def test_image_and_message_imports_open_in_downloads(self) -> None:
+        image_tab = mock.Mock()
+        image_tab.labels = {1: ("Cover Page", "cover.png")}
+        message_tab = mock.Mock()
+        with (
+            mock.patch(
+                "Image_tab.QtCore.QStandardPaths.writableLocation",
+                return_value="C:/Users/Test/Downloads",
+            ),
+            mock.patch.object(
+                QtWidgets.QFileDialog,
+                "getOpenFileName",
+                return_value=("", ""),
+            ) as image_chooser,
+        ):
+            ImageTab._browse_image_file(image_tab, 1)
+
+        with (
+            mock.patch(
+                "Message_tab.QtCore.QStandardPaths.writableLocation",
+                return_value="C:/Users/Test/Downloads",
+            ),
+            mock.patch.object(
+                QtWidgets.QFileDialog,
+                "getOpenFileName",
+                return_value=("", ""),
+            ) as message_chooser,
+        ):
+            MessageTab.select_file(message_tab)
+
+        self.assertEqual(image_chooser.call_args.args[2], "C:/Users/Test/Downloads")
+        self.assertEqual(message_chooser.call_args.args[2], "C:/Users/Test/Downloads")
+
+    def test_reset_confirmation_is_frameless_modal_and_color_coded(self) -> None:
+        dialog = _ResetImagesConfirmationDialog()
+        try:
+            self.assertTrue(
+                dialog.windowFlags()
+                & QtCore.Qt.FramelessWindowHint
+            )
+            self.assertTrue(dialog.isModal())
+            self.assertEqual(
+                dialog.windowModality(),
+                QtCore.Qt.ApplicationModal,
+            )
+            self.assertEqual(dialog.yes_button.text(), "Yes")
+            self.assertEqual(dialog.no_button.text(), "No")
+            self.assertIn("#ff626c", dialog.styleSheet())
+            self.assertIn("#00d0ff", dialog.styleSheet())
+        finally:
+            dialog.close()
+
+    def test_reset_requires_yes_before_clearing_images(self) -> None:
+        tab = mock.Mock()
+        with mock.patch(
+            "Image_tab._ResetImagesConfirmationDialog"
+        ) as dialog_type:
+            dialog_type.return_value.exec.return_value = (
+                QtWidgets.QDialog.DialogCode.Rejected
+            )
+            ImageTab.reset_images(tab)
+            tab._reset_images_confirmed.assert_not_called()
+
+            dialog_type.return_value.exec.return_value = (
+                QtWidgets.QDialog.DialogCode.Accepted
+            )
+            ImageTab.reset_images(tab)
+            tab._reset_images_confirmed.assert_called_once_with()
+
+    def test_image_utility_buttons_preserve_artwork_and_do_not_overlap_cards(self) -> None:
+        self.assertEqual(ImageTab.UTILITY_BUTTON_WIDTH, 210)
+        self.assertEqual(ImageTab.UTILITY_BUTTON_HEIGHT, 120)
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_tab = ImageTab(directory)
+            image_tab.resize(1180, 340)
+            image_tab.show()
+            self.app.processEvents()
+            image_tab.reset_btn.apply_theme_assets(None)
+            image_tab.open_btn.apply_theme_assets(None)
+            self.app.processEvents()
+            try:
+                self.assertEqual(
+                    image_tab.reset_btn.size(),
+                    QtCore.QSize(210, 120),
+                )
+                self.assertEqual(
+                    image_tab.open_btn.size(),
+                    QtCore.QSize(210, 120),
+                )
+                self.assertFalse(image_tab.reset_btn._artwork_stretch)
+                self.assertFalse(image_tab.open_btn._artwork_stretch)
+                for button in (
+                    image_tab.reset_btn,
+                    image_tab.open_btn,
+                ):
+                    self.assertFalse(
+                        button.geometry().intersects(
+                            image_tab.cards[1].geometry()
+                        )
+                    )
+            finally:
+                image_tab.close()
 
 
 if __name__ == "__main__":

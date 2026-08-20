@@ -8,10 +8,10 @@ from config import MESSAGE_HTML_FILE, REQUIRED_SLIDES, USER_PAGES_DIR
 from message_format import message_plain_text
 from message_html import read_text_normalized
 from project_paths import ProjectPathError, ProjectPathResolver
+from publishing.expiration import publication_status
 from settings_store import (
     REQUIRED_FEATURES_KEY,
     SettingsStore,
-    normalize_published_page_url,
 )
 from sound_model import resolve_project_tracks
 
@@ -256,16 +256,12 @@ def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
         ),
         (
             "published_url",
-            "Published Page URL",
-            bool(
-                normalize_published_page_url(
-                    settings.get("published_page_url", "")
-                )
-            ),
+            "Published Letter Link",
+            publication_status(settings) == "published",
             False,
-            "Publish the letter or save its public URL.",
-            "message",
-            "published_url",
+            "Enter a valid Published Page URL in Message or publish the letter in Forge.",
+            "forge",
+            "publish",
         ),
     )
     items = tuple(ReadinessItem(*definition) for definition in definitions)

@@ -20,7 +20,18 @@ from recipient_identity import (
     normalize_recipient_display_name,
 )
 from recipient_registry import RecipientRegistry
-from settings_store import SettingsStore
+from settings_store import (
+    PUBLICATION_PROVIDER_KEY,
+    PUBLICATION_VERIFIED_KEY,
+    PUBLISHED_AT_KEY,
+    PUBLISHED_EXPIRES_AT_KEY,
+    PUBLISHED_GITHUB_OWNER_KEY,
+    PUBLISHED_GITHUB_REPOSITORY_KEY,
+    PUBLISHED_PAGE_URL_KEY,
+    PUBLISHED_PUBLIC_PATH_KEY,
+    PUBLISHED_SOURCE_FINGERPRINT_KEY,
+    SettingsStore,
+)
 
 PROJECT_ID_KEY = "project_id"
 RECIPIENT_ID_KEY = "recipient_id"
@@ -436,6 +447,12 @@ class ProjectStateController:
                 "recipient_title": "",
                 "published_page_url": "",
                 "published_public_path": "",
+                "published_at": "",
+                "published_expires_at": "",
+                "publication_provider": "",
+                "publication_verified": False,
+                "published_source_fingerprint": "",
+                "active_play_dir": "",
             }
         )
         SettingsStore(self.project_root).update_fields(updates)
@@ -568,6 +585,18 @@ def adopt_loaded_project(project_root: str | Path, metadata: Mapping[str, Any]) 
             LEGACY_RECIPIENT_NAME_KEY: display_name,
             "recipient_title": str(metadata.get("recipient_title", "")).strip(),
         })
-        if "published_page_url" in metadata:
-            current["published_page_url"] = str(metadata.get("published_page_url", "")).strip()
+        for key in (
+            PUBLISHED_PAGE_URL_KEY,
+            PUBLISHED_PUBLIC_PATH_KEY,
+            PUBLISHED_AT_KEY,
+            PUBLISHED_EXPIRES_AT_KEY,
+            PUBLICATION_PROVIDER_KEY,
+            PUBLISHED_SOURCE_FINGERPRINT_KEY,
+            PUBLISHED_GITHUB_OWNER_KEY,
+            PUBLISHED_GITHUB_REPOSITORY_KEY,
+        ):
+            current[key] = str(metadata.get(key, "")).strip()
+        current[PUBLICATION_VERIFIED_KEY] = (
+            metadata.get(PUBLICATION_VERIFIED_KEY) is True
+        )
         return store.replace_snapshot(current)

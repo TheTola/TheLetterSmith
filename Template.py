@@ -230,9 +230,9 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 #curtain-overlay:not(.is-visible) #begin-button{opacity:0}
 #begin-button.is-dismissed{animation:none;opacity:0;visibility:hidden;transition:opacity 160ms ease-out,visibility 0s linear 160ms}
 #begin-button:hover{background:linear-gradient(180deg,rgba(20,31,48,.94),rgba(8,12,20,.84))}
-#title-banner{position:absolute;top:50%;left:50%;z-index:10002;width:min(94vw,1000px,92vh);aspect-ratio:1/1;display:grid;place-items:center;visibility:hidden;opacity:0;pointer-events:none;transform:translate(-50%,-50%) scale(.92);color:rgb(var(--title-banner-text-rgb));filter:drop-shadow(0 12px 20px rgba(0,0,0,.5));will-change:opacity,transform}
+#title-banner{position:absolute;top:50%;left:50%;z-index:10002;width:min(94vw,1000px,92vh);aspect-ratio:1/1;container-type:inline-size;display:grid;place-items:center;visibility:hidden;opacity:0;pointer-events:none;transform:translate(-50%,-50%) scale(.92);color:rgb(var(--title-banner-text-rgb));filter:drop-shadow(0 12px 20px rgba(0,0,0,.5));will-change:opacity,transform}
 #title-banner-art{grid-area:1/1;width:100%;height:100%;object-fit:contain;pointer-events:none;user-select:none}
-#title-banner span{grid-area:1/1;position:relative;z-index:1;width:68%;max-width:68%;font-family:var(--font-letter);font-size:clamp(24px,4.7vw,68px);font-weight:700;font-style:italic;line-height:1.08;letter-spacing:.025em;text-align:center;overflow-wrap:anywhere;text-shadow:0 1px 0 rgba(255,255,255,.4),0 4px 9px rgba(0,0,0,.72);-webkit-text-stroke:clamp(1px,.12vw,2px) rgba(0,0,0,.68);paint-order:stroke fill}
+#title-banner span{grid-area:1/1;position:relative;z-index:1;width:68%;max-width:68%;font-family:var(--font-letter);font-size:6.8cqw;font-weight:700;font-style:italic;line-height:1.08;letter-spacing:.025em;text-align:center;overflow-wrap:anywhere;text-shadow:0 1px 0 rgba(255,255,255,.4),0 4px 9px rgba(0,0,0,.72);-webkit-text-stroke:clamp(1px,.18cqw,2px) rgba(0,0,0,.68);paint-order:stroke fill}
 #title-banner.is-showing{visibility:visible;animation:titleBannerFadeIn 280ms cubic-bezier(.18,.82,.2,1) forwards}
 #title-banner.is-hiding{visibility:visible;animation:titleBannerFadeOut 360ms ease-in forwards}
 @keyframes curtainIntroFadeIn{from{opacity:0}to{opacity:1}}

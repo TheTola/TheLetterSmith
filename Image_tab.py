@@ -11,9 +11,9 @@ Canonical preview files:
 Animated selections also retain their original ``<slot>.gif`` source and
 per-image playback settings in ``lettersmith-images.json``.
 
-The Reset Images and Gallery artwork buttons are deliberately large. They live
-in their own left-aligned horizontal strip below the image cards, with fixed
-geometry so repainting and hover effects cannot move or overlap them.
+The Reset Images and Gallery artwork buttons sit in a fixed-size column beside
+the image cards. Their native aspect ratios are preserved so they stay readable
+without consuming the compact vertical space below the cards.
 """
 
 from __future__ import annotations
@@ -41,10 +41,99 @@ from image_animation import (
     reconcile_external_image_assets,
     update_slot_gif_settings,
 )
-from project_paths import ProjectPathResolver
+from project_paths import ProjectPathResolver, application_paths
 from project_save import ProjectSaveService
 from project_state import ProjectStateController
-from project_sync import image_fingerprint
+from project_sync import file_fingerprint, image_fingerprint
+from ui_help import set_control_help
+
+
+STOCK_IMAGE_FILES = {
+    1: ("stock cover 1.png", "stock cover 2.png", "stock cover 3.png"),
+    2: ("stock letter 1.png", "stock letter 2.png", "stock letter 3.png"),
+    3: ("stock wall 1.png", "stock wall 2.png", "stock wall 3.png"),
+    4: ("stock back 1.png", "stock back 2.png", "stock back 3.png"),
+}
+
+
+def _downloads_directory() -> str:
+    location = QtCore.QStandardPaths.writableLocation(
+        QtCore.QStandardPaths.DownloadLocation
+    )
+    if location:
+        return location
+
+    downloads = Path.home() / "Downloads"
+    return str(downloads if downloads.is_dir() else Path.home())
+
+
+class StockImageDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        title: str,
+        image_paths: tuple[Path, ...],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(
+            parent,
+            QtCore.Qt.Popup | QtCore.Qt.FramelessWindowHint,
+        )
+        self.setObjectName("StockImageTray")
+        self.setAccessibleName(f"Stock Images - {title}")
+        self.setFixedSize(420, 146)
+        self._selected_path: Path | None = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        self._images = QtWidgets.QListWidget()
+        self._images.setViewMode(QtWidgets.QListView.IconMode)
+        self._images.setIconSize(QtCore.QSize(112, 112))
+        self._images.setGridSize(QtCore.QSize(130, 126))
+        self._images.setSpacing(3)
+        self._images.setMovement(QtWidgets.QListView.Static)
+        self._images.setResizeMode(QtWidgets.QListView.Adjust)
+        self._images.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self._images.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        for path in image_paths:
+            item = QtWidgets.QListWidgetItem(QIcon(str(path)), "")
+            item.setData(QtCore.Qt.UserRole, str(path))
+            item.setToolTip(path.stem)
+            self._images.addItem(item)
+        self._images.itemClicked.connect(self._accept_item)
+        layout.addWidget(self._images)
+        self.setStyleSheet(
+            "QDialog#StockImageTray{background:#101317;border:1px solid #394654;"
+            "border-radius:8px;}"
+            "QListWidget{background:transparent;border:none;outline:none;}"
+            "QListWidget::item{border:1px solid #2d3540;border-radius:6px;}"
+            "QListWidget::item:hover,QListWidget::item:selected{"
+            "border:2px solid #00d0ff;background:#19232d;}"
+        )
+
+    def selected_path(self) -> Path | None:
+        return self._selected_path
+
+    def _accept_item(self, item: QtWidgets.QListWidgetItem) -> None:
+        self._selected_path = Path(str(item.data(QtCore.Qt.UserRole)))
+        self.accept()
+
+    def focusOutEvent(self, event: QtGui.QFocusEvent) -> None:
+        self.reject()
+        super().focusOutEvent(event)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        cursor = QtGui.QCursor.pos()
+        screen = QtGui.QGuiApplication.screenAt(cursor)
+        if screen is None:
+            screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        x = min(max(cursor.x() + 8, available.left()), available.right() - self.width())
+        y = min(max(cursor.y() + 8, available.top()), available.bottom() - self.height())
+        self.move(x, y)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,10 +289,17 @@ def _trim_artwork_canvas(
                 )
             )
 
-            combined_mask = ImageChops.lighter(
-                alpha_mask,
-                difference_mask,
-            )
+            alpha_bounds = alpha_mask.getbbox()
+            if alpha_bounds not in {
+                None,
+                (0, 0, width, height),
+            }:
+                # Transparent pixels may retain arbitrary RGB data. Including
+                # their color difference restores the invisible canvas that
+                # the alpha channel already identified correctly.
+                combined_mask = alpha_mask
+            else:
+                combined_mask = difference_mask
 
             bounds = combined_mask.getbbox()
 
@@ -315,6 +411,145 @@ def _mask_button_to_artwork(
     button.setMask(QtGui.QRegion(target))
 
 
+class _ImageUtilityButton(ArtworkButton):
+    def __init__(
+        self,
+        text: str,
+        project_root: str | Path,
+        artwork_filename: str,
+        *,
+        width: int,
+        height: int,
+        font_size: int,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        self._utility_width = int(width)
+        self._utility_height = int(height)
+        self._utility_font_size = int(font_size)
+        super().__init__(
+            text,
+            project_root,
+            artwork_filename,
+            parent,
+        )
+
+    def apply_theme_assets(
+        self,
+        theme_service: object | None = None,
+    ) -> None:
+        super().apply_theme_assets(
+            theme_service
+        )
+        _trim_artwork_canvas(self)
+        self.set_artwork_stretch(False)
+        self.set_text_word_wrap(True)
+        self.setFixedSize(
+            self._utility_width,
+            self._utility_height,
+        )
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Fixed,
+            QtWidgets.QSizePolicy.Fixed,
+        )
+        self.setFont(
+            QtGui.QFont(
+                "Segoe UI Semibold",
+                self._utility_font_size,
+                QtGui.QFont.Weight.Bold,
+            )
+        )
+        _mask_button_to_artwork(self)
+
+
+class _ResetImagesConfirmationDialog(
+    QtWidgets.QDialog
+):
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(
+            parent,
+            QtCore.Qt.Dialog
+            | QtCore.Qt.FramelessWindowHint,
+        )
+        self.setObjectName(
+            "ResetImagesConfirmationDialog"
+        )
+        self.setAccessibleName(
+            "Confirm reset images"
+        )
+        self.setModal(True)
+        self.setWindowModality(
+            QtCore.Qt.ApplicationModal
+        )
+        self.setFixedWidth(390)
+        self.setStyleSheet(
+            "QDialog#ResetImagesConfirmationDialog{"
+            "background:#101317;border:1px solid #43505d;"
+            "border-radius:10px;}"
+            "QLabel{color:#f2f5f7;font:600 13pt 'Segoe UI';}"
+            "QPushButton{background:#171c22;border:1px solid #465260;"
+            "border-radius:7px;padding:9px 26px;font:700 12pt 'Segoe UI';}"
+            "QPushButton#ResetImagesYes{color:#ff626c;border-color:#9b3740;}"
+            "QPushButton#ResetImagesYes:hover{background:#32191d;}"
+            "QPushButton#ResetImagesNo{color:#00d0ff;border-color:#287f92;}"
+            "QPushButton#ResetImagesNo:hover{background:#132a31;}"
+        )
+
+        layout = QtWidgets.QVBoxLayout(
+            self
+        )
+        layout.setContentsMargins(
+            28,
+            24,
+            28,
+            22,
+        )
+        layout.setSpacing(20)
+
+        question = QtWidgets.QLabel(
+            "Are you sure you want to reset?"
+        )
+        question.setAlignment(
+            QtCore.Qt.AlignCenter
+        )
+        question.setWordWrap(True)
+        layout.addWidget(question)
+
+        actions = QtWidgets.QHBoxLayout()
+        actions.setSpacing(12)
+        actions.addStretch(1)
+
+        yes_button = QtWidgets.QPushButton(
+            "Yes"
+        )
+        yes_button.setObjectName(
+            "ResetImagesYes"
+        )
+        yes_button.clicked.connect(
+            self.accept
+        )
+        actions.addWidget(yes_button)
+
+        no_button = QtWidgets.QPushButton(
+            "No"
+        )
+        no_button.setObjectName(
+            "ResetImagesNo"
+        )
+        no_button.setDefault(True)
+        no_button.clicked.connect(
+            self.reject
+        )
+        actions.addWidget(no_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        self.yes_button = yes_button
+        self.no_button = no_button
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Clickable image thumbnail
 # ─────────────────────────────────────────────────────────────────────────────
@@ -372,9 +607,10 @@ class _ImageThumbnail(
             QtCore.Qt.StrongFocus
         )
 
-        self.setToolTip(
+        set_control_help(
+            self,
             "Click to select an image, "
-            "or drag an image here."
+            "or drag an image here.",
         )
 
         self.setStyleSheet(
@@ -611,6 +847,12 @@ class ImageAssetCard(
             QtCore.Qt.PointingHandCursor
         )
 
+        set_control_help(
+            self.clear_btn,
+            "Remove this image from the letter and return this slot to its empty state.",
+            accessible_name="Clear image",
+        )
+
         self.clear_btn.setStyleSheet(
             "QPushButton {"
             "background: #151a20;"
@@ -644,8 +886,10 @@ class ImageAssetCard(
         self.settings_btn.setCursor(
             QtCore.Qt.PointingHandCursor
         )
-        self.settings_btn.setToolTip(
-            "Settings for this image"
+        set_control_help(
+            self.settings_btn,
+            "Adjust playback settings for this animated image.",
+            accessible_name="Image animation settings",
         )
         self.settings_btn.setEnabled(False)
         self.settings_btn.setVisible(False)
@@ -945,6 +1189,10 @@ class ImageSettingsDialog(QtWidgets.QDialog):
                 ),
             )
         )
+        set_control_help(
+            self.playback_mode,
+            "Choose whether this animated image plays normally, loops, or reverses between cycles.",
+        )
         form.addRow("Playback Mode", self.playback_mode)
 
         count_row = QtWidgets.QWidget()
@@ -960,6 +1208,14 @@ class ImageSettingsDialog(QtWidgets.QDialog):
         self.custom_count = QtWidgets.QSpinBox()
         self.custom_count.setRange(1, MAX_PLAY_COUNT)
         self.custom_count.setValue(4)
+        set_control_help(
+            self.play_count,
+            "Choose how many times the animation plays before stopping.",
+        )
+        set_control_help(
+            self.custom_count,
+            "Set the exact number of animation cycles when Custom number is selected.",
+        )
         stored_count = normalized["play_count"]
         if stored_count in (1, 2, 3, FOREVER):
             count_index = self.play_count.findData(stored_count)
@@ -1067,19 +1323,18 @@ class ImageTab(
     clear_preview = Signal()
 
     images_changed = Signal(str)
+    cover_changed = Signal()
     animation_settings_changed = Signal(int)
 
     FAB_FIXED_X = 55
     FAB_CARD_GAP = 12
 
-    UTILITY_BUTTON_WIDTH = 150
-    UTILITY_BUTTON_HEIGHT = 150
+    UTILITY_BUTTON_WIDTH = 210
+    UTILITY_BUTTON_HEIGHT = 120
+    UTILITY_BUTTON_FONT_SIZE = 12
 
     # Space between Reset Images and Gallery.
     UTILITY_BUTTON_GAP = 10
-
-    # Space above the utility-button row.
-    UTILITY_BUTTON_TOP_GAP = 4
 
     def __init__(
         self,
@@ -1090,7 +1345,7 @@ class ImageTab(
     ) -> None:
         super().__init__()
         self.project_root = Path(
-            project_root or Path(__file__).resolve().parent
+            project_root or application_paths().workspace_root
         ).resolve()
         self.project_state = project_state
         if self.project_state is None:
@@ -1136,6 +1391,7 @@ class ImageTab(
                 self._project_dir()
             )
         )
+        self._cover_fingerprint = self._cover_file_fingerprint()
 
         self._tab_active = False
 
@@ -1239,6 +1495,10 @@ class ImageTab(
             0,
         )
 
+        centered_cards.setSpacing(
+            12
+        )
+
         centered_cards.addStretch(1)
 
         centered_cards.addLayout(
@@ -1251,50 +1511,30 @@ class ImageTab(
             centered_cards
         )
 
-        self.reset_btn = ArtworkButton(
+        self.reset_btn = _ImageUtilityButton(
             "Reset Images",
             self._project_dir(),
             "BButton.png",
-            self,
+            width=self.UTILITY_BUTTON_WIDTH,
+            height=self.UTILITY_BUTTON_HEIGHT,
+            font_size=self.UTILITY_BUTTON_FONT_SIZE,
+            parent=self,
         )
 
-        self.open_btn = ArtworkButton(
+        self.open_btn = _ImageUtilityButton(
             "Gallery",
             self._project_dir(),
             "PButton.png",
-            self,
+            width=self.UTILITY_BUTTON_WIDTH,
+            height=self.UTILITY_BUTTON_HEIGHT,
+            font_size=self.UTILITY_BUTTON_FONT_SIZE,
+            parent=self,
         )
 
         for button in (
             self.reset_btn,
             self.open_btn,
         ):
-            _trim_artwork_canvas(
-                button
-            )
-
-            button.setFixedSize(
-                self.UTILITY_BUTTON_WIDTH,
-                self.UTILITY_BUTTON_HEIGHT,
-            )
-
-            _mask_button_to_artwork(
-                button
-            )
-
-            button.setSizePolicy(
-                QtWidgets.QSizePolicy.Fixed,
-                QtWidgets.QSizePolicy.Fixed,
-            )
-
-            button.setFont(
-                QtGui.QFont(
-                    "Segoe UI Semibold",
-                    18,
-                    QtGui.QFont.Weight.Bold,
-                )
-            )
-
             if not button.has_artwork:
                 button.setStyleSheet(
                     "QPushButton {"
@@ -1314,71 +1554,63 @@ class ImageTab(
                     "}"
                 )
 
-        self.reset_btn.setAccessibleName(
-            "Reset Images"
-        )
-
-        self.reset_btn.setToolTip(
-            "Clear all four selected "
-            "letter images."
+        set_control_help(
+            self.reset_btn,
+            "Clear the current image selections and return the Images workspace to its default state.",
+            accessible_name="Reset Images",
         )
 
         self.reset_btn.clicked.connect(
             self.reset_images
         )
 
-        self.open_btn.setAccessibleName(
-            "Gallery"
-        )
-
-        self.open_btn.setToolTip(
-            "Open the working image "
-            "gallery folder."
+        set_control_help(
+            self.open_btn,
+            "Open the working image gallery folder to review or manage letter artwork.",
+            accessible_name="Gallery",
         )
 
         self.open_btn.clicked.connect(
             self.open_gallery_folder
         )
 
-        # Keep both utility buttons inside the Image tab's layout so hover
-        # repainting cannot expose a delayed move to overlapping coordinates.
-        root.addSpacing(
-            self.UTILITY_BUTTON_TOP_GAP
+        # Keep the utility controls beside the cards. The tab's vertical space
+        # is intentionally compact, so placing large controls below the cards
+        # clips their artwork and lets their widget rectangles overlap a card.
+        utility_position_column = (
+            QtWidgets.QVBoxLayout()
         )
 
-        utility_position_row = (
-            QtWidgets.QHBoxLayout()
-        )
-
-        utility_position_row.setContentsMargins(
+        utility_position_column.setContentsMargins(
             0,
             0,
             0,
             0,
         )
 
-        utility_position_row.setSpacing(
+        utility_position_column.setSpacing(
             self.UTILITY_BUTTON_GAP
         )
 
-        utility_position_row.addWidget(
+        utility_position_column.addStretch(1)
+
+        utility_position_column.addWidget(
             self.reset_btn,
             0,
-            QtCore.Qt.AlignLeft
-            | QtCore.Qt.AlignVCenter,
+            QtCore.Qt.AlignHCenter,
         )
 
-        utility_position_row.addWidget(
+        utility_position_column.addWidget(
             self.open_btn,
             0,
-            QtCore.Qt.AlignLeft
-            | QtCore.Qt.AlignVCenter,
+            QtCore.Qt.AlignHCenter,
         )
 
-        utility_position_row.addStretch(1)
+        utility_position_column.addStretch(1)
 
-        root.addLayout(
-            utility_position_row
+        centered_cards.insertLayout(
+            1,
+            utility_position_column,
         )
 
         self.status = QtWidgets.QLabel()
@@ -1421,61 +1653,15 @@ class ImageTab(
             self,
         )
 
-        prompt_writer_icon: Optional[
-            QIcon
-        ] = None
+        set_control_help(
+            self.pwrite_fab,
+            "Open Prompt Writer to create and manage image-generation prompts for your letter.",
+            accessible_name="Prompt Writer",
+        )
 
-        for icon_path in (
-            os.path.join(
-                self._project_dir(),
-                "gallery",
-                "app",
-                "icons",
-                "Pwrite.png",
-            ),
-            os.path.join(
-                self._project_dir(),
-                "gallery",
-                "app",
-                "icons",
-                "pwrite.png",
-            ),
-        ):
-            if os.path.exists(icon_path):
-                prompt_writer_icon = QIcon(
-                    icon_path
-                )
-                break
-
-        if (
-            prompt_writer_icon is not None
-            and not prompt_writer_icon.isNull()
-        ):
-            self.pwrite_fab.setIcon(
-                prompt_writer_icon
-            )
-
-            self.pwrite_fab.setIconSize(
-                QSize(
-                    200,
-                    200,
-                )
-            )
-
-        else:
-            self.pwrite_fab.setText(
-                "PROMPT\nWRITER"
-            )
-
-            self.pwrite_fab.setStyleSheet(
-                self.pwrite_fab.styleSheet()
-                + (
-                    "#PWriteFab {"
-                    "color: #00e5e5;"
-                    "font: 700 18px 'Segoe UI';"
-                    "}"
-                )
-            )
+        self.apply_theme_assets(
+            getattr(self.window(), "theme_service", None)
+        )
 
         self.pwrite_fab.clicked.connect(
             self._open_prompt_writer_bridge
@@ -1492,6 +1678,62 @@ class ImageTab(
     def _project_dir(self) -> str:
         return str(self.project_root)
 
+    def apply_theme_assets(self, theme_service: object | None = None) -> None:
+        """Refresh cloud buttons and Prompt Writer art for the active theme."""
+        for button_name in ("reset_btn", "open_btn"):
+            button = getattr(self, button_name, None)
+            refresher = getattr(button, "apply_theme_assets", None)
+            if callable(refresher):
+                refresher(theme_service)
+
+        prompt_button = getattr(self, "pwrite_fab", None)
+        if prompt_button is None:
+            return
+
+        paths = application_paths(self._project_dir())
+        fallback_candidates = (
+            paths.app_resource_path("icons/Pwrite.png"),
+            paths.app_resource_path("icons/pwrite.png"),
+        )
+        fallback_path = next(
+            (path for path in fallback_candidates if path.is_file()),
+            fallback_candidates[0],
+        )
+        icon_path = fallback_path
+        resolver = getattr(theme_service, "resolve_asset", None)
+        if callable(resolver):
+            try:
+                fallback = fallback_path.resolve().relative_to(
+                    paths.resource_root
+                ).as_posix()
+                icon_path = resolver(
+                    "prompt_writer/Pwrite.png",
+                    fallback=fallback,
+                )
+            except (TypeError, ValueError):
+                icon_path = fallback_path
+
+        prompt_writer_icon = QIcon(str(icon_path))
+        if not prompt_writer_icon.isNull():
+            prompt_button.setText("")
+            prompt_button.setIcon(prompt_writer_icon)
+            prompt_button.setIconSize(QSize(200, 200))
+            return
+
+        prompt_button.setIcon(QIcon())
+        prompt_button.setText("PROMPT\nWRITER")
+        if not bool(prompt_button.property("promptWriterTextFallback")):
+            prompt_button.setProperty("promptWriterTextFallback", True)
+            prompt_button.setStyleSheet(
+                prompt_button.styleSheet()
+                + (
+                    "#PWriteFab {"
+                    "color: #00e5e5;"
+                    "font: 700 18px 'Segoe UI';"
+                    "}"
+                )
+            )
+
     def _user_pages_dir(self) -> str:
         return os.path.join(
             self._project_dir(),
@@ -1499,6 +1741,19 @@ class ImageTab(
             "user",
             "pages",
         )
+
+    def _cover_file_fingerprint(self) -> str:
+        return file_fingerprint(
+            Path(self._user_pages_dir()) / "cover.png"
+        )
+
+    def _emit_cover_change_if_needed(self) -> bool:
+        current = self._cover_file_fingerprint()
+        if current == self._cover_fingerprint:
+            return False
+        self._cover_fingerprint = current
+        self.cover_changed.emit()
+        return True
 
     def refresh_cards(self) -> None:
         reconcile_external_image_assets(
@@ -1579,6 +1834,7 @@ class ImageTab(
                 self._project_dir()
             )
         )
+        self._emit_cover_change_if_needed()
 
         if changed:
             self.images_changed.emit(
@@ -1605,6 +1861,8 @@ class ImageTab(
             self.images_changed.emit(
                 "saved"
             )
+
+        self._emit_cover_change_if_needed()
 
         self.refresh_cards()
 
@@ -1881,6 +2139,15 @@ class ImageTab(
         self,
         index: int,
     ) -> None:
+        if index not in self.labels:
+            return
+        if not self.image_paths.get(index):
+            self.open_stock_gallery(index)
+            return
+
+        self._browse_image_file(index)
+
+    def _browse_image_file(self, index: int) -> None:
         path, _selected_filter = (
             QtWidgets.QFileDialog.getOpenFileName(
                 self,
@@ -1888,7 +2155,7 @@ class ImageTab(
                     f"Select "
                     f"{self.labels[index][0]}"
                 ),
-                "",
+                _downloads_directory(),
                 (
                     "Images "
                     "(*.png *.jpg *.jpeg *.bmp *.gif)"
@@ -1901,6 +2168,41 @@ class ImageTab(
                 index,
                 path,
             )
+
+    def _stock_image_paths(self, index: int) -> tuple[Path, ...]:
+        slot = INDEX_TO_SLOT.get(index)
+        filenames = STOCK_IMAGE_FILES.get(index, ())
+        if not slot:
+            return ()
+        stock_directory = (
+            application_paths(self.project_root).stock_images_root / slot
+        )
+        return tuple(
+            path
+            for filename in filenames
+            if (path := stock_directory / filename).is_file()
+        )
+
+    def open_stock_gallery(self, index: int) -> None:
+        if index not in self.labels:
+            return
+        image_paths = self._stock_image_paths(index)
+        if len(image_paths) != 3:
+            self._show_temporary_status(
+                f"Stock images are unavailable for {self.labels[index][0]}.",
+                5000,
+            )
+            return
+        dialog = StockImageDialog(
+            self.labels[index][0],
+            image_paths,
+            self,
+        )
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        selected_path = dialog.selected_path()
+        if selected_path is not None:
+            self.set_image_path(index, str(selected_path))
 
     def _set_image_from_drop(
         self,
@@ -1922,6 +2224,7 @@ class ImageTab(
                 self._project_dir()
             )
         )
+        self._emit_cover_change_if_needed()
 
         self.images_changed.emit(
             reason
@@ -2201,6 +2504,18 @@ class ImageTab(
             )
 
     def reset_images(self) -> None:
+        confirmation = _ResetImagesConfirmationDialog(
+            self
+        )
+        if (
+            confirmation.exec()
+            != QtWidgets.QDialog.DialogCode.Accepted
+        ):
+            return
+
+        self._reset_images_confirmed()
+
+    def _reset_images_confirmed(self) -> None:
         for index in self.labels:
             _label, filename = (
                 self.labels[index]
@@ -2253,6 +2568,15 @@ class ImageTab(
 
         self._show_temporary_status(
             "All images cleared."
+        )
+
+    def reset_project_images(self) -> None:
+        """Refresh the empty image workspace after New Project commits."""
+        self.deactivate_for_tab_change()
+        self.refresh_from_disk()
+        self.clear_preview.emit()
+        self._show_temporary_status(
+            "No images selected."
         )
 
     def open_gallery_folder(

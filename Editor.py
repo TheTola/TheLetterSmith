@@ -47,6 +47,7 @@ import os
 import re
 import shutil
 import time
+from bisect import bisect_right
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -89,14 +90,15 @@ from PySide6.QtWidgets import (
 )
 
 from config import (
-    SETTINGS_FILE,
     GALLERY_DIR,
     USER_PAGES_DIR,
     MESSAGE_HTML_FILE,
 )
+from language_service import get_language_service
 from message_format import normalize_ultralinks_in_document
 from project_save import ProjectNotReadyError, ProjectSaveService
 from project_state import ProjectStateController
+from project_paths import application_paths
 from editor_diagnostics import record_editor_failure
 from message_html import (
     is_ultralink_href,
@@ -425,12 +427,231 @@ class UltralinkDialog(QDialog):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RichTextEdit(QTextEdit):
-    def __init__(self, project_root: Path, *args, **kwargs):
+    language_refresh_requested = QtCore.Signal()
+
+    def __init__(
+        self,
+        project_root: Path,
+        *args,
+        language_service: Optional[object] = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.project_root = Path(project_root)
+        self._language_service = language_service
+        self._language_issues: tuple[object, ...] = ()
+        self._ignored_language_words: set[str] = set()
         self.setAcceptRichText(True)
         self.setAcceptDrops(True)
         self.viewport().setMouseTracking(True)
+
+    @property
+    def language_issues(self) -> tuple[object, ...]:
+        return self._language_issues
+
+    def set_language_issues(self, issues) -> None:
+        filtered = tuple(
+            issue
+            for issue in issues
+            if self._language_issue_key(issue)
+            not in self._ignored_language_words
+        )
+        self._language_issues = filtered
+        selections: list[QTextEdit.ExtraSelection] = []
+        source = self.toPlainText()
+        qt_offsets = self._python_to_qt_offsets(source)
+        document_length = len(source)
+        for issue in filtered:
+            start = max(0, int(getattr(issue, "start", 0)))
+            end = min(document_length, int(getattr(issue, "end", start)))
+            if end <= start:
+                continue
+            cursor = QTextCursor(self.document())
+            cursor.setPosition(qt_offsets[start])
+            cursor.setPosition(qt_offsets[end], QTextCursor.KeepAnchor)
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = cursor
+            category = str(getattr(issue, "category", "spelling"))
+            selection.format.setUnderlineColor(
+                QColor("#ff6b7d" if category == "spelling" else "#f5b84b")
+            )
+            selection.format.setUnderlineStyle(
+                QTextCharFormat.UnderlineStyle.SpellCheckUnderline
+            )
+            selections.append(selection)
+        self.setExtraSelections(selections)
+
+    def _language_issue_at(self, position: int):
+        source = self.toPlainText()
+        offsets = self._python_to_qt_offsets(source)
+        python_position = max(
+            0,
+            min(len(source), bisect_right(offsets, int(position)) - 1),
+        )
+        return next(
+            (
+                issue
+                for issue in self._language_issues
+                if int(getattr(issue, "start", -1))
+                <= python_position
+                < int(getattr(issue, "end", -1))
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _python_to_qt_offsets(text: str) -> list[int]:
+        offsets = [0]
+        qt_position = 0
+        for character in text:
+            qt_position += 2 if ord(character) > 0xFFFF else 1
+            offsets.append(qt_position)
+        return offsets
+
+    @staticmethod
+    def _language_issue_key(issue) -> str:
+        return str(getattr(issue, "text", "")).strip().casefold()
+
+    def is_language_issue_ignored(self, issue) -> bool:
+        key = self._language_issue_key(issue)
+        return bool(key and key in self._ignored_language_words)
+
+    def replace_language_issue(self, issue, replacement: str) -> bool:
+        replacement = str(replacement or "")
+        start = int(getattr(issue, "start", -1))
+        end = int(getattr(issue, "end", -1))
+        source = self.toPlainText()
+        if start < 0 or end < start or end > len(source):
+            return False
+        qt_offsets = self._python_to_qt_offsets(source)
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(qt_offsets[start])
+        cursor.setPosition(qt_offsets[end], QTextCursor.KeepAnchor)
+        char_format = QTextCharFormat(cursor.charFormat())
+        cursor.beginEditBlock()
+        try:
+            cursor.insertText(replacement, char_format)
+        finally:
+            cursor.endEditBlock()
+        self.language_refresh_requested.emit()
+        return True
+
+    def apply_language_replacements(
+        self,
+        issues,
+        *,
+        edit_cursor: Optional[QTextCursor] = None,
+        emit_refresh: bool = True,
+    ) -> int:
+        replacements = sorted(
+            (
+                issue
+                for issue in issues
+                if getattr(issue, "replacement", None) is not None
+            ),
+            key=lambda issue: int(getattr(issue, "start", -1)),
+            reverse=True,
+        )
+        if not replacements:
+            return 0
+        source = self.toPlainText()
+        document_length = len(source)
+        qt_offsets = self._python_to_qt_offsets(source)
+        for issue in replacements:
+            start = int(getattr(issue, "start", -1))
+            end = int(getattr(issue, "end", -1))
+            if start < 0 or end < start or end > document_length:
+                raise ValueError("language issue range is outside the editor document")
+
+        cursor = edit_cursor or QTextCursor(self.document())
+        owns_edit_block = edit_cursor is None
+        if owns_edit_block:
+            cursor.beginEditBlock()
+        applied = 0
+        try:
+            for issue in replacements:
+                start = int(getattr(issue, "start"))
+                end = int(getattr(issue, "end"))
+                cursor.setPosition(qt_offsets[start])
+                cursor.setPosition(qt_offsets[end], QTextCursor.KeepAnchor)
+                char_format = QTextCharFormat(cursor.charFormat())
+                cursor.insertText(str(getattr(issue, "replacement")), char_format)
+                applied += 1
+        finally:
+            if owns_edit_block:
+                cursor.endEditBlock()
+        if applied and emit_refresh:
+            self.language_refresh_requested.emit()
+        return applied
+
+    def ignore_language_issue(self, issue) -> None:
+        word = str(getattr(issue, "text", "")).strip()
+        key = word.casefold()
+        if key:
+            self._ignored_language_words.add(key)
+        ignore_word = getattr(self._language_service, "ignore_word", None)
+        if (
+            word
+            and str(getattr(issue, "category", "")) == "spelling"
+            and callable(ignore_word)
+        ):
+            try:
+                ignore_word(word)
+            except Exception:
+                _LOGGER.exception("Could not ignore Editor word for this session")
+        self.set_language_issues(self._language_issues)
+
+    def add_language_issue_to_dictionary(self, issue) -> bool:
+        if self._language_service is None:
+            return False
+        word = str(getattr(issue, "text", "")).strip()
+        if not word:
+            return False
+        try:
+            added = bool(self._language_service.add_to_dictionary(word))
+        except Exception:
+            _LOGGER.exception("Could not add Editor word to the shared dictionary")
+            return False
+        self.language_refresh_requested.emit()
+        return added
+
+    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
+        menu = self.createStandardContextMenu()
+        issue = self._language_issue_at(self.cursorForPosition(event.pos()).position())
+        if issue is not None:
+            writing_menu = QMenu("Writing Suggestions", menu)
+            suggestions = tuple(getattr(issue, "suggestions", ()) or ())
+            replacement = getattr(issue, "replacement", None)
+            if replacement is not None and replacement not in suggestions:
+                suggestions = (replacement, *suggestions)
+            for suggestion in suggestions[:5]:
+                label = (
+                    "Remove duplicate"
+                    if suggestion == ""
+                    else f"Replace with {suggestion}"
+                )
+                action = writing_menu.addAction(label)
+                action.triggered.connect(
+                    lambda _checked=False, value=suggestion, current=issue:
+                    self.replace_language_issue(current, value)
+                )
+            if suggestions:
+                writing_menu.addSeparator()
+            ignore_action = writing_menu.addAction("Ignore")
+            ignore_action.triggered.connect(
+                lambda _checked=False, current=issue: self.ignore_language_issue(current)
+            )
+            if str(getattr(issue, "category", "")) == "spelling":
+                add_action = writing_menu.addAction("Add to Dictionary")
+                add_action.triggered.connect(
+                    lambda _checked=False, current=issue:
+                    self.add_language_issue_to_dictionary(current)
+                )
+            first_action = menu.actions()[0] if menu.actions() else None
+            menu.insertMenu(first_action, writing_menu)
+            menu.insertSeparator(first_action)
+        menu.exec(event.globalPos())
+        menu.deleteLater()
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         super().paintEvent(event)
@@ -606,16 +827,26 @@ class Editor(QDialog):
         parent=None,
         *,
         apply_defaults: bool = False,
+        language_service: Optional[object] = None,
     ) -> None:
         super().__init__(parent)
 
         # Resolve project root (authoritative)
         self.project_root = Path(getattr(parent, "project_root", os.getcwd()))
+        try:
+            self._language_service = language_service or get_language_service(
+                self.project_root
+            )
+        except Exception:
+            _LOGGER.exception("Could not initialize the shared language service")
+            self._language_service = None
 
         # Canonical message location (SOURCE OF TRUTH)
         self.message_path = (self.project_root / MESSAGE_HTML_FILE).resolve()
         self.message_path.parent.mkdir(parents=True, exist_ok=True)
-        self.settings_path = (self.project_root / SETTINGS_FILE).resolve()
+        self.settings_path = application_paths(
+            self.project_root
+        ).settings_file.resolve()
         self.project_state = getattr(parent, "project_state", None)
         if self.project_state is None:
             self.project_state = ProjectStateController(self.project_root)
@@ -670,6 +901,10 @@ class Editor(QDialog):
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.setInterval(900)
         self._autosave_timer.timeout.connect(self._autosave_now)
+        self._language_check_timer = QtCore.QTimer(self)
+        self._language_check_timer.setSingleShot(True)
+        self._language_check_timer.setInterval(550)
+        self._language_check_timer.timeout.connect(self._refresh_language_issues)
 
         self.setWindowTitle("Letter Smith — Editor")
         self.setModal(True)
@@ -713,7 +948,10 @@ class Editor(QDialog):
         self.toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         main_layout.addWidget(self.toolbar)
 
-        self.editor = RichTextEdit(self.project_root)
+        self.editor = RichTextEdit(
+            self.project_root,
+            language_service=self._language_service,
+        )
         self.editor.setObjectName("EditorTextArea")
         self.editor.document().setDefaultFont(QFont("Papyrus", DEFAULT_FONT_SIZE))
         self.editor.setHtml(self.message_html)
@@ -728,6 +966,8 @@ class Editor(QDialog):
         self.editor.textChanged.connect(self.preview.update)
         self.editor.textChanged.connect(self.update_word_count)
         self.editor.textChanged.connect(self._schedule_autosave)
+        self.editor.textChanged.connect(self._schedule_language_check)
+        self.editor.language_refresh_requested.connect(self._schedule_language_check)
         self.editor.currentCharFormatChanged.connect(self.preview.update)
         self.editor.currentCharFormatChanged.connect(self._sync_format)
 
@@ -768,6 +1008,7 @@ class Editor(QDialog):
         self.editor.selectionChanged.connect(self._sync_current_format)
         self._apply_editor_background()
         self._sync_current_format()
+        self._schedule_language_check()
 
     def _editor_background_setting(self) -> tuple[str, str]:
         data = _read_json(self.settings_path)
@@ -1283,6 +1524,73 @@ class Editor(QDialog):
     # Public API + autosave
     # ──────────────────────────────────────────────────────────────────────
 
+    def _language_protected_terms(self) -> tuple[str, ...]:
+        return tuple(
+            value
+            for value in (str(self.recipient_name or "").strip(),)
+            if value
+        )
+
+    def _schedule_language_check(self) -> None:
+        if self._closing or self._language_service is None:
+            return
+        self._language_check_timer.start()
+
+    def _refresh_language_issues(self) -> None:
+        if self._closing or self._language_service is None:
+            return
+        try:
+            issues = self._language_service.get_issues(
+                self.editor.toPlainText(),
+                context="prose",
+                protected_terms=self._language_protected_terms(),
+            )
+            self.editor.set_language_issues(issues)
+        except Exception as error:
+            self._record_failure("proofread Editor text", error)
+
+    def _apply_safe_language_corrections(self) -> int:
+        if self._language_service is None:
+            return 0
+        edit_cursor = QTextCursor(self.editor.document())
+        edit_cursor.beginEditBlock()
+        applied = 0
+        try:
+            for _pass in range(3):
+                before = self.editor.toPlainText()
+                issues = self._language_service.get_issues(
+                    before,
+                    context="prose",
+                    protected_terms=self._language_protected_terms(),
+                )
+                safe_issues = tuple(
+                    issue
+                    for issue in issues
+                    if getattr(issue, "replacement", None) is not None
+                    and not self.editor.is_language_issue_ignored(issue)
+                    and (
+                        bool(getattr(issue, "auto_fix", False))
+                        or str(getattr(issue, "confidence", "")).casefold()
+                        == "high"
+                    )
+                )
+                if not safe_issues:
+                    break
+                applied += self.editor.apply_language_replacements(
+                    safe_issues,
+                    edit_cursor=edit_cursor,
+                    emit_refresh=False,
+                )
+                if self.editor.toPlainText() == before:
+                    break
+        finally:
+            edit_cursor.endEditBlock()
+        if applied:
+            self.editor.language_refresh_requested.emit()
+            self._language_check_timer.stop()
+            self._schedule_language_check()
+        return applied
+
     def get_edited_html(self) -> str:
         if self._discard_changes:
             return self._last_persisted_html or self.message_html
@@ -1303,6 +1611,7 @@ class Editor(QDialog):
     def _schedule_autosave(self) -> None:
         if (
             self._initializing
+            or self._save_in_progress
             or not self.project_state.is_project_ready
         ):
             return
@@ -1340,6 +1649,11 @@ class Editor(QDialog):
         self._save_in_progress = True
         self._set_save_controls_enabled(False)
         try:
+            try:
+                self._apply_safe_language_corrections()
+            except Exception as error:
+                self._record_failure("proofread letter before save", error)
+            self._autosave_timer.stop()
             content = self._prepared_html()
             self.project_save_service.save_message(
                 content,
@@ -1419,6 +1733,7 @@ class Editor(QDialog):
             return
         self._closing = True
         self._autosave_timer.stop()
+        self._language_check_timer.stop()
         if self._find_dialog is not None:
             self._find_dialog.hide()
         watcher = getattr(self, "_settings_watcher", None)
@@ -1429,10 +1744,6 @@ class Editor(QDialog):
         except Exception as error:
             self._record_failure("persist editor geometry", error)
         super().accept()
-
-    def apply_changes(self) -> None:
-        """Compatibility entry point for callers that mean Save and Close."""
-        self.save_and_close()
 
     def _inject_export_line_spacing_wrapper(self, html: str) -> str:
         if not html:

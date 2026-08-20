@@ -639,9 +639,16 @@ class _HoverGlowFilter(QtCore.QObject):
 class _HoverTabSwitchFilter(QtCore.QObject):
     """Switch a QTabBar after the cursor rests on a tab for a short delay."""
 
-    def __init__(self, tabbar: QtWidgets.QTabBar, delay_ms: int = FX.TAB_HOVER_DELAY_MS) -> None:
+    def __init__(
+        self,
+        tabbar: QtWidgets.QTabBar,
+        delay_ms: int = FX.TAB_HOVER_DELAY_MS,
+        *,
+        excluded_indices: Iterable[int] = (),
+    ) -> None:
         super().__init__(tabbar)
         self.tabbar = tabbar
+        self._excluded_indices = frozenset(int(index) for index in excluded_indices)
         self._pending_index = -1
         self._timer = QtCore.QTimer(self)
         self._timer.setSingleShot(True)
@@ -681,7 +688,11 @@ class _HoverTabSwitchFilter(QtCore.QObject):
             return None
 
     def _schedule(self, index: int) -> None:
-        if index < 0 or index == self.tabbar.currentIndex():
+        if (
+            index < 0
+            or index == self.tabbar.currentIndex()
+            or index in self._excluded_indices
+        ):
             self._cancel()
             return
         if index != self._pending_index:
@@ -695,7 +706,7 @@ class _HoverTabSwitchFilter(QtCore.QObject):
     def _activate_pending_tab(self) -> None:
         index = self._pending_index
         self._cancel()
-        if index < 0:
+        if index < 0 or index in self._excluded_indices:
             return
 
         try:
@@ -711,6 +722,7 @@ def install_hover_tab_switch(
     tabbar: QtWidgets.QTabBar,
     *,
     delay_ms: int = FX.TAB_HOVER_DELAY_MS,
+    excluded_indices: Iterable[int] = (),
 ) -> _HoverTabSwitchFilter:
     """
     Restore switch-on-hover behavior for a QTabBar.
@@ -725,7 +737,11 @@ def install_hover_tab_switch(
     tabbar.setMouseTracking(True)
     tabbar.setAttribute(Qt.WA_Hover, True)
 
-    hover_filter = _HoverTabSwitchFilter(tabbar, delay_ms=delay_ms)
+    hover_filter = _HoverTabSwitchFilter(
+        tabbar,
+        delay_ms=delay_ms,
+        excluded_indices=excluded_indices,
+    )
     tabbar.installEventFilter(hover_filter)
     setattr(tabbar, "_anima_hover_tab_switch", hover_filter)
     tabbar.setProperty("anima.HoverTabSwitchInstalled", True)
@@ -754,9 +770,18 @@ class TabSwitcher(QtCore.QObject):
       can be found on the stack's window
     """
 
-    def __init__(self, stack: QtWidgets.QStackedWidget, parent: Optional[QtCore.QObject] = None) -> None:
+    def __init__(
+        self,
+        stack: QtWidgets.QStackedWidget,
+        parent: Optional[QtCore.QObject] = None,
+        *,
+        hover_excluded_indices: Iterable[int] = (),
+    ) -> None:
         super().__init__(parent or stack)
         self.stack = stack
+        self._hover_excluded_indices = tuple(
+            int(index) for index in hover_excluded_indices
+        )
         self._active: Optional[QtCore.QParallelAnimationGroup] = None
         self._active_target: Optional[QtWidgets.QWidget] = None
         self._active_cleanup = None
@@ -782,7 +807,10 @@ class TabSwitcher(QtCore.QObject):
                 candidate = candidates[0] if candidates else None
 
             if isinstance(candidate, QtWidgets.QTabBar):
-                self._hover_tab_switch = install_hover_tab_switch(candidate)
+                self._hover_tab_switch = install_hover_tab_switch(
+                    candidate,
+                    excluded_indices=self._hover_excluded_indices,
+                )
         except Exception:
             self._hover_tab_switch = None
 

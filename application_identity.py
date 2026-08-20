@@ -1,0 +1,23 @@
+from __future__ import annotations
+
+
+APPLICATION_NAME = "Letter Smith"
+APPLICATION_VERSION = "1.0.0"
+PUBLISHER_NAME = "Infini Works"
+ORGANIZATION_DOMAIN = "infini.works"
+APP_USER_MODEL_ID = "InfiniWorks.LetterSmith"
+EXECUTABLE_NAME = "LetterSmith.exe"
+INSTALLER_NAME = "LetterSmith-Setup-1.0.0.exe"
+INSTALLER_APP_ID = "{44498786-B309-5F44-9BDB-E2B7250E6304}"
+
+
+__all__ = [
+    "APPLICATION_NAME",
+    "APPLICATION_VERSION",
+    "PUBLISHER_NAME",
+    "ORGANIZATION_DOMAIN",
+    "APP_USER_MODEL_ID",
+    "EXECUTABLE_NAME",
+    "INSTALLER_NAME",
+    "INSTALLER_APP_ID",
+]

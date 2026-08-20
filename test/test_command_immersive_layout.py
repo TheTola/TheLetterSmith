@@ -48,6 +48,27 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
         finally:
             tab.close()
 
+    def test_curtain_preparation_is_delayed_and_uses_a_worker_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cover = root / "gallery" / "user" / "pages" / "cover.png"
+            cover.parent.mkdir(parents=True)
+            cover.write_bytes(b"cover")
+            window = Nexus(root)
+            try:
+                window._schedule_curtain_preparation()
+                self.assertEqual(
+                    window._curtain_preparation_timer.interval(),
+                    5000,
+                )
+                self.assertTrue(window._curtain_preparation_timer.isActive())
+                self.assertEqual(
+                    window._curtain_preparation_pool.maxThreadCount(),
+                    1,
+                )
+            finally:
+                window.close()
+
     def test_immersive_shell_covers_everything_below_title_bar(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             window = Nexus(temp_dir)

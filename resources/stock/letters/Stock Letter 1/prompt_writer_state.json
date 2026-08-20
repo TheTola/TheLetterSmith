@@ -1,0 +1,46 @@
+{
+  "version": 6,
+  "type": "Chibi Style Illustration",
+  "subject": "Affection & Admiration",
+  "color": "Valentine’s Day — Crimson Romance — Suggested colors: Passion Red — #C9184A, Heart Pink — #FF758F, Rose Blush — #FFB3C1, Chocolate Brown — #5A2A27, Love-Letter Cream — #FFF0E6",
+  "global": "",
+  "cover": "",
+  "letter": "",
+  "wall": "",
+  "back": "",
+  "checks": {
+    "black": false,
+    "white": false,
+    "frame": true,
+    "vignette": false,
+    "polaroid": false,
+    "cardshadow": false,
+    "real": false,
+    "paint": true,
+    "minimal": false,
+    "forbid_text": false,
+    "clean_composition": false,
+    "strong_focal_point": false,
+    "dynamic_angle": false,
+    "cinematic_framing": true,
+    "close_up_focus": false,
+    "full_body_view": false,
+    "wide_scene": false,
+    "simplified_details": false
+  },
+  "resolved_instructions": {
+    "role": "a high-caliber visual designer skilled in producing four-page image collections with unified art direction and page-specific compositional decisions",
+    "subject_lead_in": [
+      "Create an image of"
+    ],
+    "effort": "use maximum visual fidelity, physically coherent construction, correct anatomy and object geometry, deliberate composition, and clearly defined materials and textures.",
+    "format": "Create a portrait image at exactly 2048×3072 pixels. Keep all essential subjects and text fully inside the frame with safe margins, avoid cropping important elements, and ensure any rendered text is complete, readable, and free of errors or unintended symbols."
+  },
+  "generated_prompts": {
+    "cover": "You are a high-caliber visual designer skilled in producing four-page image collections with unified art direction and page-specific compositional decisions. Create an image of Affection & Admiration.\n\nThe Cover Page is a bold, decorative opening image that captures attention and sets the tone.\n\nUse the Valentine’s Day — Crimson Romance — Suggested colors: Passion Red — #C9184A, Heart Pink — #FF758F, Rose Blush — #FFB3C1, Chocolate Brown — #5A2A27, Love-Letter Cream — #FFF0E6 palette.\n\nUse Chibi Style Illustration as the visual style.\n\nRender with maximum visual fidelity, physically coherent construction, correct anatomy and object geometry, deliberate composition, and clearly defined materials and textures.\n\nGuidance:\n- add a decorative frame around the image.\n- bias toward painterly style.\n- use cinematic framing with deliberate composition and film-like staging.\n- Use the framing that best serves the composition; do not force a close-up, full-body, or wide-scene view.\n\nCreate a portrait image at exactly 2048×3072 pixels. Keep all essential subjects and text fully inside the frame with safe margins, avoid cropping important elements, and ensure any rendered text is complete, readable, and free of errors or unintended symbols.",
+    "letter": "You are a high-caliber visual designer skilled in producing four-page image collections with unified art direction and page-specific compositional decisions. Create an image of Affection & Admiration.\n\nThe Letter Page is a subtle, elegant backdrop that frames the main written message without distraction.\n\nUse the Valentine’s Day — Crimson Romance — Suggested colors: Passion Red — #C9184A, Heart Pink — #FF758F, Rose Blush — #FFB3C1, Chocolate Brown — #5A2A27, Love-Letter Cream — #FFF0E6 palette.\n\nUse Chibi Style Illustration as the visual style.\n\nRender with maximum visual fidelity, physically coherent construction, correct anatomy and object geometry, deliberate composition, and clearly defined materials and textures.\n\nGuidance:\n- add a decorative frame around the image.\n- bias toward painterly style.\n- use cinematic framing with deliberate composition and film-like staging.\n- Use the framing that best serves the composition; do not force a close-up, full-body, or wide-scene view.\n\nCreate a portrait image at exactly 2048×3072 pixels. Keep all essential subjects and text fully inside the frame with safe margins, avoid cropping important elements, and ensure any rendered text is complete, readable, and free of errors or unintended symbols.",
+    "wall": "You are a high-caliber visual designer skilled in producing four-page image collections with unified art direction and page-specific compositional decisions. Create an image of Affection & Admiration.\n\nThe Wall Page is a calm, minimalist background designed to support large blocks of text.\n\nUse the Valentine’s Day — Crimson Romance — Suggested colors: Passion Red — #C9184A, Heart Pink — #FF758F, Rose Blush — #FFB3C1, Chocolate Brown — #5A2A27, Love-Letter Cream — #FFF0E6 palette.\n\nUse Chibi Style Illustration as the visual style.\n\nRender with maximum visual fidelity, physically coherent construction, correct anatomy and object geometry, deliberate composition, and clearly defined materials and textures.\n\nGuidance:\n- add a decorative frame around the image.\n- bias toward painterly style.\n- use cinematic framing with deliberate composition and film-like staging.\n- Use the framing that best serves the composition; do not force a close-up, full-body, or wide-scene view.\n\nCreate a portrait image at exactly 2048×3072 pixels. Keep all essential subjects and text fully inside the frame with safe margins, avoid cropping important elements, and ensure any rendered text is complete, readable, and free of errors or unintended symbols.",
+    "back": "You are a high-caliber visual designer skilled in producing four-page image collections with unified art direction and page-specific compositional decisions. Create an image of Affection & Admiration.\n\nThe Back Page is a simple, graceful closing image that echoes the cover while providing a sense of finality.\n\nUse the Valentine’s Day — Crimson Romance — Suggested colors: Passion Red — #C9184A, Heart Pink — #FF758F, Rose Blush — #FFB3C1, Chocolate Brown — #5A2A27, Love-Letter Cream — #FFF0E6 palette.\n\nUse Chibi Style Illustration as the visual style.\n\nRender with maximum visual fidelity, physically coherent construction, correct anatomy and object geometry, deliberate composition, and clearly defined materials and textures.\n\nGuidance:\n- add a decorative frame around the image.\n- bias toward painterly style.\n- use cinematic framing with deliberate composition and film-like staging.\n- Use the framing that best serves the composition; do not force a close-up, full-body, or wide-scene view.\n\nCreate a portrait image at exactly 2048×3072 pixels. Keep all essential subjects and text fully inside the frame with safe margins, avoid cropping important elements, and ensure any rendered text is complete, readable, and free of errors or unintended symbols."
+  },
+  "generated_input_signature": "d25f9a4a7f9e29457d60b574c3c7de923db44fb62ffedfc817ad6b1acfdeae30"
+}

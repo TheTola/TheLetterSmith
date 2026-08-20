@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Example Letter</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="viewer" aria-label="Example Letter">
+    <section class="page active" aria-label="Cover">
+      <img src="gallery/pages/cover.png" alt="Example letter cover">
+      <div class="caption"><strong>Example Letter</strong><span>A small beginning can hold a lasting memory.</span></div>
+    </section>
+    <section class="page" aria-label="Letter">
+      <img src="gallery/pages/letter.png" alt="Main letter artwork">
+      <iframe src="gallery/message/message.html" title="Example message"></iframe>
+    </section>
+    <section class="page" aria-label="Wall">
+      <img src="gallery/pages/wall.png" alt="Letter wall artwork">
+      <div class="caption"><strong>Made with Letter Smith</strong><span>Images, words, music, and presentation working together.</span></div>
+    </section>
+    <section class="page" aria-label="Back">
+      <img src="gallery/pages/back.png" alt="Final backdrop artwork">
+      <div class="caption"><strong>Now make it yours.</strong><span>Start a New Project and choose the details that matter to you.</span></div>
+    </section>
+    <nav aria-label="Letter controls">
+      <button id="previous" type="button" aria-label="Previous page">Previous</button>
+      <span id="counter" aria-live="polite">1 / 4</span>
+      <button id="music" type="button" aria-label="Play or pause music">Play music</button>
+      <button id="next" type="button" aria-label="Next page">Next</button>
+    </nav>
+  </main>
+  <audio id="soundtrack" src="gallery/sounds/music-001.mp3" loop></audio>
+  <script src="script.js"></script>
+</body>
+</html>

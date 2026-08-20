@@ -20,6 +20,8 @@ from PySide6.QtGui import QDesktopServices, QColor
 from PySide6.QtWidgets import QGraphicsDropShadowEffect
 
 from app_icon import apply_qt_window_icon, configure_windows_app_identity
+from language_service import get_language_service
+from project_paths import application_paths
 from settings_store import (
     DEFAULT_VISIONARY_URL,
     SettingsStore,
@@ -27,6 +29,7 @@ from settings_store import (
 )
 from window_chrome import StandardTitleBar
 from transactional_io import atomic_write_text, safe_write_json
+from ui_help import set_control_help
 
 
 LOGGER = logging.getLogger(__name__)
@@ -37,7 +40,6 @@ LOGGER = logging.getLogger(__name__)
 # ---------------------------
 
 _FILE_CACHE: Dict[str, Tuple[List[str], Optional[Path], Optional[Tuple[int, int]]]] = {}
-PROMPTER_ROOT = Path(__file__).resolve().parent
 PROMPT_WRITER_STATE_VERSION = 6
 PROMPT_LANGUAGE_VERSION = 2
 STATE_PERSIST_DEBOUNCE_MS = 350
@@ -489,6 +491,26 @@ class ListManagerDialog(QtWidgets.QDialog):
         self.btn_add = QtWidgets.QPushButton("Add", self)
         self.btn_update = QtWidgets.QPushButton("Update", self)
         self.btn_remove = QtWidgets.QPushButton("Remove", self)
+        set_control_help(
+            self.entry_edit,
+            "Enter the option text you want to add or use to update the selected entry.",
+        )
+        set_control_help(
+            self.list_widget,
+            "Select a saved option to edit or remove it.",
+        )
+        set_control_help(
+            self.btn_add,
+            "Add the entered option to this Prompt Writer list.",
+        )
+        set_control_help(
+            self.btn_update,
+            "Replace the selected option with the entered text.",
+        )
+        set_control_help(
+            self.btn_remove,
+            "Remove the selected option from this Prompt Writer list.",
+        )
         button_row.addWidget(self.btn_add)
         button_row.addWidget(self.btn_update)
         button_row.addWidget(self.btn_remove)
@@ -926,9 +948,7 @@ def _normalize_guidance_lines(guidance: Optional[List[str]]) -> Tuple[str, ...]:
 
 def _set_help(widget: QtWidgets.QWidget, text: str) -> None:
     help_text = _normalize_text(text, strip=True, max_length=900)
-    widget.setToolTip(help_text)
-    widget.setStatusTip(help_text)
-    widget.setWhatsThis(help_text)
+    set_control_help(widget, help_text)
 
 
 def _normalize_managed_list_line(line: object) -> str:
@@ -1184,7 +1204,7 @@ def _file_signature(path: Path) -> Optional[Tuple[int, int]]:
 def _candidate_paths_for(name: str | Path) -> List[Path]:
     path = Path(name)
     if not path.is_absolute():
-        path = PROMPTER_ROOT / "Prompter" / "modules" / path.name
+        path = application_paths().bundled_prompt_writer_root / path.name
     return [path.resolve()]
 
 
@@ -1383,18 +1403,26 @@ class PromptWriterPanel(QtWidgets.QWidget):
     dismissed = QtCore.Signal()
     prompts_generated = QtCore.Signal(dict, dict)  # prompts_map, debug_map
 
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None, project_root: Optional[str] = None):
+    def __init__(
+        self,
+        parent: Optional[QtWidgets.QWidget] = None,
+        project_root: Optional[str] = None,
+        *,
+        language_service: Optional[object] = None,
+    ):
         super().__init__(parent)
         self.setObjectName("PromptWriterPanel")
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
         self.project_root = Path(project_root).resolve() if project_root else self._discover_project_root()
+        self.application_paths = application_paths(self.project_root)
+        self._language_service = language_service or get_language_service(self.project_root)
         self.setWindowTitle("Letter Smith — Prompt Writer")
         apply_qt_window_icon(self, self.project_root)
 
         # Prompt Writer persistence (separate file so other modules can\'t overwrite it)
-        self._state_path = self.project_root / "prompt_writer_state.json"
+        self._state_path = self.application_paths.workspace_root / "prompt_writer_state.json"
         self._persist_timer = QtCore.QTimer(self)
         self._persist_timer.setSingleShot(True)
         self._persist_timer.timeout.connect(self._persist_state_now)
@@ -1456,20 +1484,13 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.reload_project_state()
 
     def _module_path(self, name: str) -> Path:
-        return self._default_modules_dir() / name
+        return self._builtin_modules_dir() / name
 
     # -----------------------
     # Persistence
     # -----------------------
     def _discover_project_root(self) -> Path:
-        here = Path(__file__).resolve()
-        for up in (here.parent, here.parent.parent, here.parent.parent.parent):
-            if (up / "settings.json").exists() or (up / "gallery").exists():
-                return up
-        cwd = Path.cwd()
-        if (cwd / "settings.json").exists() or (cwd / "gallery").exists():
-            return cwd
-        return here.parent
+        return application_paths().workspace_root
 
     def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.MouseButtonDblClick:
@@ -1515,14 +1536,26 @@ class PromptWriterPanel(QtWidgets.QWidget):
         return combos[key]
 
     def _default_modules_dir(self) -> Path:
-        return (self.project_root / "Prompter" / "modules").resolve()
+        return self._builtin_modules_dir()
+
+    def _builtin_modules_dir(self) -> Path:
+        return self.application_paths.bundled_prompt_writer_root.resolve()
+
+    def _user_modules_dir(self) -> Path:
+        return self.application_paths.prompt_writer_content_root.resolve()
 
     def _user_colors_path(self) -> Path:
-        return self._default_modules_dir() / "user_colors.json"
+        return self.application_paths.custom_palette_root / "user_colors.json"
 
     def _resolve_managed_list_path(self, key: str) -> Path:
         config = self._managed_list_config(key)
-        return self._default_modules_dir() / config["primary_name"]
+        filename = config["primary_name"]
+        user_path = self._user_modules_dir() / filename
+        return user_path if user_path.is_file() else self._builtin_modules_dir() / filename
+
+    def _managed_list_write_path(self, key: str) -> Path:
+        config = self._managed_list_config(key)
+        return self._user_modules_dir() / config["primary_name"]
 
     def _load_user_colors(self) -> List[str]:
         path = self._user_colors_path()
@@ -1566,9 +1599,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 if any(entry.is_user for entry in verified_entries):
                     raise ValueError("legacy User Added entries remain in migrated color data")
                 safe_write_json(path, {"version": 1, "colors": legacy_user})
-                atomic_write_text(legacy_path, migrated_text)
-                _FILE_CACHE.pop(legacy_path, None)
-                _FILE_CACHE.pop(legacy_path.name, None)
+                if legacy_path.parent == self._user_modules_dir():
+                    atomic_write_text(legacy_path, migrated_text)
+                    _FILE_CACHE.pop(legacy_path, None)
+                    _FILE_CACHE.pop(legacy_path.name, None)
                 LOGGER.info("Migrated User Added colors to %s", path)
             except (OSError, ValueError, TypeError) as error:
                 LOGGER.exception("User color migration failed: %s (%s)", path, error)
@@ -1713,7 +1747,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
             return
         self._list_save_in_progress = True
         config = self._managed_list_config(key)
-        path = self._user_colors_path() if key == "color" else self._resolve_managed_list_path(key)
+        path = (
+            self._user_colors_path()
+            if key == "color"
+            else self._managed_list_write_path(key)
+        )
         try:
             if key == "color":
                 values: List[str] = []
@@ -2140,6 +2178,18 @@ class PromptWriterPanel(QtWidgets.QWidget):
         for b in (self.btn_generate, self.btn_copy, self.btn_erase):
             b.setFixedHeight(34)
             b.setCursor(Qt.PointingHandCursor)
+        set_control_help(
+            self.btn_generate,
+            "Generate coordinated prompts for the cover, letter, wall, and back images.",
+        )
+        set_control_help(
+            self.btn_copy,
+            "Copy all four generated image prompts to the clipboard.",
+        )
+        set_control_help(
+            self.btn_erase,
+            "Clear every Prompt Writer selection, detail, and generated prompt.",
+        )
         header.addWidget(self.btn_generate)
         header.addWidget(self.btn_copy)
         header.addWidget(self.btn_erase)
@@ -2158,7 +2208,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.btn_visionary.setCursor(Qt.PointingHandCursor)
         self.btn_visionary.setFlat(True)
         self.btn_visionary.setFixedHeight(32)
-        self.btn_visionary.setToolTip("Open The Visionary (recommended guide)")
         self.btn_visionary.setStyleSheet(
             "QPushButton#visionary_btn{"
             "background:#25282b;border:1px solid #00b2b2;border-radius:10px;padding:5px 12px;"
@@ -2535,7 +2584,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
             copy_btn.setObjectName("promptCopyButton")
             copy_btn.setFixedSize(68, 28)
             copy_btn.setCursor(Qt.PointingHandCursor)
-            copy_btn.setToolTip(f"Copy {page.display_label}")
+            set_control_help(
+                copy_btn,
+                f"Copy the generated prompt for {page.display_label} to the clipboard.",
+            )
             copy_btn.setEnabled(False)
             header_row.addWidget(copy_btn)
             bl.addLayout(header_row)
@@ -2747,6 +2799,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         )
 
     def _open_visionary(self) -> None:
+        self._copy_all_prompts_text()
         url = str(
             SettingsStore(self.project_root).get(
                 VISIONARY_URL_KEY,
@@ -3098,6 +3151,100 @@ class PromptWriterPanel(QtWidgets.QWidget):
             if unresolved.search(text):
                 raise ValueError(f"generated {key} prompt contains an unresolved placeholder")
 
+    def _proofread_prompt_text(
+        self,
+        field_name: str,
+        text: str,
+        *,
+        protected_terms: Tuple[str, ...] = (),
+    ) -> str:
+        try:
+            corrected = self._language_service.correct_text(
+                text,
+                context="prompt",
+                protected_terms=protected_terms,
+            )
+            if not isinstance(corrected, str):
+                raise TypeError("language service returned non-text output")
+            return corrected
+        except Exception as error:
+            LOGGER.exception(
+                "Prompt Writer proofreading failed for %s: %s",
+                field_name,
+                error,
+            )
+            return text
+
+    def _proofread_visible_prompt_fields(self, lifecycle: str) -> bool:
+        """Proofread every free-text source before an open/close boundary."""
+        if self._generation_in_progress:
+            return False
+        try:
+            type_text = self.cmb_type.currentText().strip()
+            if type_text == NONE_CHOICE_LABEL:
+                type_text = ""
+            protected_terms = tuple(
+                value
+                for value in (
+                    self.cmb_subject.currentText().strip(),
+                    type_text,
+                    self._get_color_choice() or "",
+                )
+                if value
+            )
+        except (RuntimeError, TypeError, ValueError) as error:
+            LOGGER.exception(
+                "Prompt Writer %s proofreading context failed: %s",
+                lifecycle,
+                error,
+            )
+            protected_terms = ()
+
+        fields: List[Tuple[str, QtWidgets.QPlainTextEdit]] = [
+            ("Apply to All", self.txt_global),
+            *(
+                (page.output_filename, page.detail_widget)
+                for page in self._page_specs
+                if page.detail_widget is not None
+            ),
+        ]
+        corrections = [
+            (
+                widget,
+                self._proofread_prompt_text(
+                    f"{field_name} during {lifecycle}",
+                    widget.toPlainText(),
+                    protected_terms=protected_terms,
+                ),
+            )
+            for field_name, widget in fields
+        ]
+        changed = any(widget.toPlainText() != corrected for widget, corrected in corrections)
+        if not changed:
+            return False
+        for widget, corrected in corrections:
+            self._replace_plain_text_as_one_edit(widget, corrected)
+        # Generated prompts cannot remain copyable after their source text changes.
+        self._invalidate_generated_output()
+        return True
+
+    @staticmethod
+    def _replace_plain_text_as_one_edit(
+        widget: QtWidgets.QPlainTextEdit,
+        text: str,
+    ) -> None:
+        if widget.toPlainText() == text:
+            return
+        blocker = QtCore.QSignalBlocker(widget)
+        cursor = QtGui.QTextCursor(widget.document())
+        cursor.beginEditBlock()
+        try:
+            cursor.select(QtGui.QTextCursor.Document)
+            cursor.insertText(text)
+        finally:
+            cursor.endEditBlock()
+            blocker.unblock()
+
     def _on_generate(self):
         if self._generation_in_progress:
             return
@@ -3113,11 +3260,29 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 t = None
             c = self._get_color_choice()
             guidance = self._collect_guidance()
-            global_extra = self.txt_global.toPlainText().strip()
-            per_extras = {
+            protected_terms = tuple(
+                value
+                for value in (subject, t or "", c or "")
+                if value
+            )
+            original_global = self.txt_global.toPlainText().strip()
+            original_per_extras = {
                 page.key: page.detail_widget.toPlainText().strip()
                 if page.detail_widget is not None
                 else ""
+                for page in self._page_specs
+            }
+            global_extra = self._proofread_prompt_text(
+                "Apply to All",
+                original_global,
+                protected_terms=protected_terms,
+            )
+            per_extras = {
+                page.key: self._proofread_prompt_text(
+                    page.output_filename,
+                    original_per_extras[page.key],
+                    protected_terms=protected_terms,
+                )
                 for page in self._page_specs
             }
 
@@ -3144,6 +3309,14 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 debug_map[page.key] = dbg
 
             self._validate_generated_prompt_set(prompts)
+
+            self._replace_plain_text_as_one_edit(self.txt_global, global_extra)
+            for page in self._page_specs:
+                if page.detail_widget is not None:
+                    self._replace_plain_text_as_one_edit(
+                        page.detail_widget,
+                        per_extras[page.key],
+                    )
 
             self._generated_prompts = dict(prompts)
             subject_lead_in = shared_prompt_data.get("order", [])
@@ -3333,6 +3506,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def _on_close(self):
         if self._shutdown:
             return
+        self._proofread_visible_prompt_fields("close")
         if not self._persist_state_now():
             QtWidgets.QMessageBox.warning(self, "Prompt Writer", "The current Prompt Writer state could not be saved.")
         self.dismissed.emit()
@@ -3382,6 +3556,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._animation_generation += 1
         if self._shutdown:
             return
+        if self._proofread_visible_prompt_fields("open"):
+            if not self._persist_state_now():
+                LOGGER.warning(
+                    "Prompt Writer open-time proofreading could not be persisted"
+                )
         self._geom_anim.stop()
         self._fade_anim.stop()
         self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
@@ -3488,6 +3667,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def shutdown(self) -> None:
         if self._shutdown:
             return
+        self._proofread_visible_prompt_fields("shutdown")
         self._shutdown = True
 
         self._persist_timer.stop()

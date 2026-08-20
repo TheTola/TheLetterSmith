@@ -65,39 +65,75 @@ def curtain_rgb_for_style(image_paths: Iterable[Path], style: str) -> RGB:
 
     if normalized in {"pure_white", "white", "white_curtain"}:
         return FALLBACK_CURTAIN_RGB
-    source_color = (
-        _representative_cover_color(cover_path)
-        if cover_path is not None
-        else FALLBACK_CURTAIN_RGB
-    )
-    normal = _normal_rgb_from_source(source_color)
+    variants = curtain_variant_rgbs(cover_path)
     if normalized in {
         "complementary",
         "complementary_curtain",
         "complementary_average_color",
     }:
-        return _rotate_rgb_hue(normal, 0.5)
-
+        return variants["complementary_average_color"]
     if normalized in {
         "normal",
         "normal_curtain",
         "inverse_complementary_color",
         "average_color",
     }:
-        return normal
-    if normalized in {"light", "light_curtain", "light_average_color"}:
-        return _relative_hls_variant(
+        return variants["average_color"]
+    if normalized in {
+        "light",
+        "light_curtain",
+        "light_average_color",
+        "normal_light",
+    }:
+        return variants["normal_light"]
+    if normalized in {"complementary_light", "complementary_light_curtain"}:
+        return variants["complementary_light"]
+    if normalized in {
+        "dark",
+        "dark_curtain",
+        "dark_average_color",
+        "normal_dark",
+    }:
+        return variants["normal_dark"]
+    if normalized in {"complementary_dark", "complementary_dark_curtain"}:
+        return variants["complementary_dark"]
+    return FALLBACK_CURTAIN_RGB
+
+
+def curtain_variant_rgbs(cover_path: Path | None) -> dict[str, RGB]:
+    """Analyze one cover once and derive every supported curtain color."""
+    source_color = (
+        _representative_cover_color(Path(cover_path))
+        if cover_path is not None
+        else FALLBACK_CURTAIN_RGB
+    )
+    normal = _normal_rgb_from_source(source_color)
+    complementary = _rotate_rgb_hue(normal, 0.5)
+    return {
+        "pure_white": FALLBACK_CURTAIN_RGB,
+        "average_color": normal,
+        "complementary_average_color": complementary,
+        "normal_light": _relative_hls_variant(
             normal,
             lightness_scale=0.72,
             saturation_scale=0.82,
-        )
-    if normalized in {"dark", "dark_curtain", "dark_average_color"}:
-        return _relative_hls_variant(
+        ),
+        "complementary_light": _relative_hls_variant(
+            complementary,
+            lightness_scale=0.72,
+            saturation_scale=0.82,
+        ),
+        "normal_dark": _relative_hls_variant(
             normal,
             lightness_scale=-0.55,
             saturation_scale=1.42,
-        )
-    return FALLBACK_CURTAIN_RGB
+        ),
+        "complementary_dark": _relative_hls_variant(
+            complementary,
+            lightness_scale=-0.55,
+            saturation_scale=1.42,
+        ),
+    }
 
 
 def _normal_rgb_from_source(rgb: RGB) -> RGB:
