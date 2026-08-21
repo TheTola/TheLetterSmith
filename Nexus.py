@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
-import os, sys, subprocess, json
+import os, sys, subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -32,11 +32,18 @@ from settings_store import (
 )
 from project_state import (
     ApplicationState,
+    ProjectDirtyController,
     ProjectStateController,
 )
 from project_paths import ProjectPathResolver
 from project_save import ProjectNotReadyError, ProjectSaveService
 from recipient_page import RecipientPage
+from ui_constants import (
+    HELP_HIDE_DELAY_MS,
+    HELP_HOVER_DELAY_MS,
+    TOAST_DURATION_MS,
+    TRANSIENT_STATUS_MS,
+)
 
 # ===================================================================================================================================================================================
 # Overlay integration
@@ -311,12 +318,12 @@ class TitleBar(QtWidgets.QWidget):
             )
             layout.addWidget(app_icon)
 
-        title = QtWidgets.QLabel(
+        self.title_label = QtWidgets.QLabel(
             "The Silver-Tongued Lettersmith",
             self,
         )
 
-        title.setStyleSheet(
+        self.title_label.setStyleSheet(
             """
             QLabel {
                 color: #00ffff;
@@ -328,7 +335,7 @@ class TitleBar(QtWidgets.QWidget):
             """
         )
 
-        layout.addWidget(title)
+        layout.addWidget(self.title_label)
         layout.addStretch()
 
         # ---------------------------------------------------------------------
@@ -392,6 +399,7 @@ class TitleBar(QtWidgets.QWidget):
         self.new_project_action = self.settings_menu.addAction(
             "New Project"
         )
+        self.new_project_action.setShortcut(QtGui.QKeySequence.New)
         self.new_project_action.triggered.connect(
             self.parent.start_new_project
         )
@@ -485,6 +493,13 @@ class TitleBar(QtWidgets.QWidget):
         # the window state outside this button.
         self.parent.installEventFilter(self)
         self._sync_max_restore_button()
+
+    def set_project_dirty(self, dirty: bool) -> None:
+        suffix = " •" if dirty else ""
+        self.title_label.setText(f"The Silver-Tongued Lettersmith{suffix}")
+        self.title_label.setToolTip(
+            "Unsaved project changes" if dirty else "Letter Smith"
+        )
 
     def _sync_curtain_menu(self) -> None:
         current = str(
@@ -881,6 +896,8 @@ class Nexus(QtWidgets.QMainWindow):
         self._tray_menu: Optional[QtWidgets.QMenu] = None
         self._command_bar: Optional[QtWidgets.QWidget] = None
         self._setup_system_tray()
+        self.settings_store = SettingsStore(self.project_root)
+        self.project_dirty = ProjectDirtyController()
         self.project_state = ProjectStateController(self.project_root)
         self.project_paths = ProjectPathResolver(self.project_root)
         self.project_save_service = ProjectSaveService(
@@ -896,6 +913,7 @@ class Nexus(QtWidgets.QMainWindow):
         ] = None
         self._shutdown_complete = False
         self._shutdown_in_progress = False
+        self._save_in_progress = False
         self.setObjectName("NexusWindow")
 
         # Frameless + QSS
@@ -1029,6 +1047,7 @@ class Nexus(QtWidgets.QMainWindow):
 
         # Title bar
         self.title_bar = TitleBar(self)
+        self.project_dirty.add_listener(self.title_bar.set_project_dirty)
         main_layout.addWidget(self.title_bar)
 
         # Tab bar
@@ -1170,12 +1189,12 @@ class Nexus(QtWidgets.QMainWindow):
         # Show/hide timers for hover UX
         self._help_show_timer = QtCore.QTimer(self)
         self._help_show_timer.setSingleShot(True)
-        self._help_show_timer.setInterval(150)  # 120ΓÇô160 ms
+        self._help_show_timer.setInterval(HELP_HOVER_DELAY_MS)
         self._help_show_timer.timeout.connect(self._show_help_from_icon)
 
         self._help_hide_timer = QtCore.QTimer(self)
         self._help_hide_timer.setSingleShot(True)
-        self._help_hide_timer.setInterval(360)  # 300ΓÇô400 ms
+        self._help_hide_timer.setInterval(HELP_HIDE_DELAY_MS)
         self._help_hide_timer.timeout.connect(self._hide_help_popover)
 
         # Install event filters to manage hover persistence and GIF swap
@@ -1255,13 +1274,17 @@ class Nexus(QtWidgets.QMainWindow):
         # Initial sizing & tab
         self.setMinimumSize(1180, 820)
         self.resize(WIN_W, WIN_H)
+        self._restore_window_preferences()
 
         # Shortcuts + click effects
         self._install_shortcuts()
         try:
             install_click_fx(self)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         # Double-click filter for full message view
         self._dbl_filter = _DoubleClickFilter(self)
@@ -1269,6 +1292,7 @@ class Nexus(QtWidgets.QMainWindow):
 
         self.project_state.add_listener(self._on_project_state_transition)
         self._apply_application_state(initial_project_state)
+        self.project_dirty.mark_saved()
 
         # Diagnostics after event loop starts
         QtCore.QTimer.singleShot(0, self._post_init_diagnostics)
@@ -1388,6 +1412,19 @@ class Nexus(QtWidgets.QMainWindow):
         self.message_tab.project_changed.connect(
             self.forge_tab.schedule_refresh
         )
+        self.image_tab.images_changed.connect(
+            lambda _reason: self.project_dirty.mark_changed("images")
+        )
+        self.image_tab.animation_settings_changed.connect(
+            lambda _index: self.project_dirty.mark_changed("image-animation")
+        )
+        self.sound_tab.project_sound.changed.connect(
+            lambda: self.project_dirty.mark_changed("sound")
+        )
+        self.message_tab.project_changed.connect(
+            lambda: self.project_dirty.mark_changed("message")
+        )
+        self.settings_store.changed.connect(self._on_project_settings_changed)
         self.image_tab.image_selected.connect(
             lambda pixmap: self._show_image_for_tab(0, pixmap)
         )
@@ -1411,8 +1448,33 @@ class Nexus(QtWidgets.QMainWindow):
             else None
         )
         self._project_tabs_initialized = True
-        self.tabbar.setCurrentIndex(0)
-        self._tab_changed(0)
+        saved_tab = str(self.settings_store.get("ui_last_tab", "Images"))
+        saved_index = next(
+            (
+                index
+                for index in range(self.tabbar.count())
+                if self.tabbar.tabText(index) == saved_tab
+            ),
+            0,
+        )
+        self.tabbar.setCurrentIndex(saved_index)
+        self._tab_changed(saved_index)
+
+    def _on_project_settings_changed(
+        self,
+        _settings: dict,
+        keys: tuple[str, ...],
+    ) -> None:
+        ignored = {
+            "active_play_dir",
+            "app_icon",
+            "debug",
+            "last_music_folder",
+            "settings_schema_version",
+            "visionary_url",
+        }
+        if any(not key.startswith("ui_") and key not in ignored for key in keys):
+            self.project_dirty.mark_changed("settings")
 
     def _on_project_state_transition(
         self,
@@ -1521,24 +1583,74 @@ class Nexus(QtWidgets.QMainWindow):
     # Shortcuts
     # =============================================================================================
     def _install_shortcuts(self) -> None:
+        self._shortcuts: list[QtGui.QShortcut] = []
+
+        def add(sequence: str | QtGui.QKeySequence, callback) -> None:
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(sequence), self)
+            shortcut.activated.connect(callback)
+            self._shortcuts.append(shortcut)
+
+        add(QtGui.QKeySequence.Save, self.save_project)
+        add(QtGui.QKeySequence.Open, self.open_saved_letters)
+        add("Ctrl+P", self.preview_project)
+
         # Ctrl+Alt+P opens prompt writer (no button)
-        sc = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Alt+P"), self)
-        sc.activated.connect(self.open_prompt_writer)
+        add("Ctrl+Alt+P", self.open_prompt_writer)
 
         # Ctrl+H toggles help popover
-        sc2 = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+H"), self)
-        sc2.activated.connect(lambda: (self._show_help_from_icon() if not self.help_pop.isVisible() else self._hide_help_popover()))
+        add(
+            "Ctrl+H",
+            lambda: (
+                self._show_help_from_icon()
+                if not self.help_pop.isVisible()
+                else self._hide_help_popover()
+            ),
+        )
+
+    def save_project(self) -> None:
+        if self._save_in_progress:
+            return
+        self._save_in_progress = True
+        try:
+            if not self.flush_prompt_writer_state():
+                raise RuntimeError("Prompt Writer state could not be saved.")
+            self.project_save_service.save_workspace_snapshot(reason="manual-save")
+        except ProjectNotReadyError as error:
+            self.status(str(error))
+        except Exception as error:
+            _LOGGER.exception("Project save failed: %s", error)
+            self.status(f"Project could not be saved: {error}")
+        else:
+            self.project_dirty.mark_saved()
+            self.status("Saved.")
+            self.toast("Saved")
+        finally:
+            self._save_in_progress = False
+
+    def open_saved_letters(self) -> None:
+        if not self._project_tabs_initialized or self.forge_tab.operation_in_progress:
+            self.status("Finish the current operation before loading a project.")
+            return
+        self.tabbar.setCurrentIndex(3)
+        self.forge_tab.show_saved_letters()
+
+    def preview_project(self) -> None:
+        if not self._project_tabs_initialized or self.forge_tab.operation_in_progress:
+            self.status("Finish the current operation before previewing.")
+            return
+        self.tabbar.setCurrentIndex(3)
+        self.forge_tab.preview_letter()
 
     # =============================================================================================
     # Status / Toast utilities
     # =============================================================================================
     def status(self, msg: str) -> None:
         try:
-            self._status.showMessage(msg, 5000)
+            self._status.showMessage(msg, TRANSIENT_STATUS_MS)
         except Exception:
-            pass
+            _LOGGER.exception("Status message could not be displayed: %s", msg)
 
-    def toast(self, msg: str, ms: int = 1200) -> None:
+    def toast(self, msg: str, ms: int = TOAST_DURATION_MS) -> None:
         if not msg:
             return
         try:
@@ -1552,7 +1664,7 @@ class Nexus(QtWidgets.QMainWindow):
             self._toast.raise_()
             self._toast_timer.start(ms)
         except Exception:
-            pass
+            _LOGGER.exception("Toast could not be displayed: %s", msg)
 
     # =============================================================================================
     # Sound preview mounting (widget-based visualizer)
@@ -1612,6 +1724,7 @@ class Nexus(QtWidgets.QMainWindow):
         self.forge_tab.refresh_project_state()
         self.forge_tab.refresh_saved_letters()
         self._show_forge_preview()
+        self.project_dirty.mark_saved()
 
     def _route_forge_correction(self, tab: str, target: str) -> None:
         destinations = {
@@ -1757,7 +1870,10 @@ class Nexus(QtWidgets.QMainWindow):
             try:
                 self.sound_tab.deactivate_for_tab_change()
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
             self._detach_sound_preview()
 
         if old_idx != idx:
@@ -1779,6 +1895,7 @@ class Nexus(QtWidgets.QMainWindow):
             self.page_stack.setCurrentIndex(idx)
 
         tab_name = self.tabbar.tabText(idx)
+        self.settings_store.update_fields({"ui_last_tab": tab_name})
         status_message = f"Switched to: {tab_name}"
         if autosave_note:
             status_message = f"{status_message}. {autosave_note}"
@@ -1840,6 +1957,7 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception as error:
             _LOGGER.exception("Project tab-switch autosave failed: %s", error)
             return f"Project autosave failed: {error}"
+        self.project_dirty.mark_saved()
         return "Project autosaved."
 
     def _update_preview_tools_geometry(self) -> None:
@@ -1863,14 +1981,20 @@ class Nexus(QtWidgets.QMainWindow):
                 stop()
                 return
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
 
         active = getattr(switcher, "_active", None)
         if active is not None:
             try:
                 active.stop()
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
 
     def _grab_body_snapshot(self) -> QPixmap:
         """Capture the body without including temporary transition overlays."""
@@ -1934,7 +2058,10 @@ class Nexus(QtWidgets.QMainWindow):
                 | QtCore.QEventLoop.ExcludeSocketNotifiers
             )
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     def _run_command_transition(self, new_idx: int) -> None:
         """
@@ -2084,25 +2211,40 @@ class Nexus(QtWidgets.QMainWindow):
         try:
             self.message_tab.sync_from_disk(force=True)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         try:
             self.forge_tab.reset_after_project_wipe()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         try:
             self._release_forge_preview_files()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         self._last_pixmap = None
         self._clear_preview()
         try:
             self.preview_stack.setCurrentIndex(0)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         try:
             self.preview_caption.setVisible(False)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     def _request_message_preview(self) -> None:
         """Ask MessageTab to emit whichever preview it thinks is correct."""
@@ -2117,7 +2259,10 @@ class Nexus(QtWidgets.QMainWindow):
                 self.message_tab._emit_preview()  # type: ignore[attr-defined]
                 return
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     def _show_forge_preview(self) -> None:
         """Show the actual generated viewer, never a static Forge stand-in."""
@@ -2234,7 +2379,10 @@ class Nexus(QtWidgets.QMainWindow):
                 "media => { try { media.pause(); media.currentTime = 0; } catch (_) {} });"
             )
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         if self.preview_stack.currentWidget() is self.html_preview:
             self.preview_stack.setCurrentIndex(0)
         if self.tabbar.currentIndex() == 3:
@@ -2391,15 +2539,32 @@ class Nexus(QtWidgets.QMainWindow):
     def _read_project_title(self) -> str:
         """Read recipient_title from settings.json (best available 'project title' signal)."""
         try:
-            settings_path = os.path.join(self.project_root, "settings.json")
-            if os.path.exists(settings_path):
-                data = json.loads(Path(settings_path).read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    t = str(data.get("recipient_title", "")).strip()
-                    return t
+            return str(
+                self.settings_store.get("recipient_title", "")
+            ).strip()
         except Exception:
-            pass
+            _LOGGER.exception("Project title could not be read.")
         return ""
+
+    def _restore_window_preferences(self) -> None:
+        encoded = str(self.settings_store.get("ui_window_geometry", ""))
+        if encoded:
+            try:
+                geometry = QtCore.QByteArray.fromBase64(encoded.encode("ascii"))
+                self.restoreGeometry(geometry)
+            except Exception:
+                _LOGGER.exception("Window geometry could not be restored.")
+        if bool(self.settings_store.get("ui_window_maximized", False)):
+            self.setWindowState(self.windowState() | Qt.WindowMaximized)
+
+    def _save_window_preferences(self) -> None:
+        geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
+        self.settings_store.update_fields(
+            {
+                "ui_window_geometry": geometry,
+                "ui_window_maximized": self.isMaximized(),
+            }
+        )
 
     # =============================================================================================
     # Resize/Move: keep preview aspect; keep popover aligned
@@ -2525,7 +2690,10 @@ class Nexus(QtWidgets.QMainWindow):
                 )
                 self.image_preview.setPixmap(scaled)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         # Keep help popover adjacent to the icon if visible
         if self.help_pop.isVisible():
@@ -2550,6 +2718,9 @@ class Nexus(QtWidgets.QMainWindow):
             return
         self._shutdown_in_progress = True
         try:
+            self._save_window_preferences()
+            self.settings_store.changed.disconnect(self._on_project_settings_changed)
+            self.project_dirty.remove_listener(self.title_bar.set_project_dirty)
             self.project_state.remove_listener(
                 self._on_project_state_transition
             )
@@ -2558,26 +2729,41 @@ class Nexus(QtWidgets.QMainWindow):
                 try:
                     self._release_forge_preview_files()
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug(
+                        "Best-effort operation failed.",
+                        exc_info=True,
+                    )
                 try:
                     self.forge_tab.deactivate_for_tab_change()
                     self.forge_tab.set_readiness_context_visible(False)
                     self.forge_tab.readiness_window.shutdown()
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug(
+                        "Best-effort operation failed.",
+                        exc_info=True,
+                    )
                 try:
                     self.sound_tab.deactivate_for_tab_change()
                     self.sound_tab.release_current_file_handle()
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug(
+                        "Best-effort operation failed.",
+                        exc_info=True,
+                    )
                 try:
                     self.message_tab.shutdown()
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug(
+                        "Best-effort operation failed.",
+                        exc_info=True,
+                    )
                 try:
                     self.image_tab.shutdown()
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug(
+                        "Best-effort operation failed.",
+                        exc_info=True,
+                    )
         finally:
             if self._tray_icon is not None:
                 self._tray_icon.hide()
@@ -2592,7 +2778,7 @@ class Nexus(QtWidgets.QMainWindow):
         if forge_tab is not None and forge_tab.operation_in_progress:
             self.status("Finish the current Forge operation before starting a new project.")
             return
-        if self.project_state.is_project_ready:
+        if self.project_state.is_project_ready and self.project_dirty.is_dirty:
             answer = QtWidgets.QMessageBox.question(
                 self,
                 "Start New Project",
@@ -2630,6 +2816,7 @@ class Nexus(QtWidgets.QMainWindow):
             return
         if completed:
             self._on_command_wiped()
+            self.project_dirty.mark_saved()
             self.status("New project ready. Enter a recipient to begin.")
 
     def open_command_bar_and_close_editor(self, data: object) -> bool:

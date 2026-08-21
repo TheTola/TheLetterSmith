@@ -26,13 +26,14 @@ from audio_tools import (
 
 from config import (
     MAX_AUDIO_MB,
-    SETTINGS_FILE,
     STARTING_VOLUME,
     USER_SOUNDS_DIR,
 )
 from project_paths import ProjectPathResolver
 from project_save import ProjectSaveService
 from project_state import ProjectStateController
+from settings_store import SettingsStore
+from ui_constants import TRANSIENT_STATUS_MS
 
 from sound_model import (
     ProjectSoundState,
@@ -201,46 +202,18 @@ def _atomic_copy(
 def _read_settings(
     project_root: Path,
 ) -> dict:
-    path = (
-        project_root
-        / SETTINGS_FILE
-    )
-
     try:
-        if path.is_file():
-            payload = json.loads(
-                path.read_text(
-                    encoding="utf-8",
-                )
-            )
-
-        else:
-            payload = {}
-
-    except (
-        OSError,
-        json.JSONDecodeError,
-    ):
-        payload = {}
-
-    if isinstance(
-        payload,
-        dict,
-    ):
-        return payload
-
-    return {}
+        return SettingsStore(project_root).snapshot()
+    except (OSError, ValueError):
+        logging.getLogger(__name__).exception("Sound settings could not be read.")
+        return {}
 
 
 def _write_settings(
     project_root: Path,
     settings: dict,
 ) -> None:
-    atomic_write_json(
-        project_root
-        / SETTINGS_FILE,
-        settings,
-    )
+    SettingsStore(project_root).update_fields(settings)
 
 
 def _analysis_requested(
@@ -3448,6 +3421,7 @@ class SoundTab(QtWidgets.QWidget):
             self.project_state,
             resolver=project_paths,
         )
+        self.settings_store = SettingsStore(self.project_root)
 
         self.library = SoundLibrary(
             self.project_root,
@@ -4379,21 +4353,11 @@ class SoundTab(QtWidgets.QWidget):
     def _save_volume(
         self,
     ) -> None:
-        settings = _read_settings(
-            self.project_root
-        )
-
-        settings["music_volume"] = (
-            self.volume.value()
-        )
-
-        settings["starting_volume"] = (
-            self.volume.value()
-        )
-
-        _write_settings(
-            self.project_root,
-            settings,
+        self.settings_store.update_fields(
+            {
+                "music_volume": self.volume.value(),
+                "starting_volume": self.volume.value(),
+            }
         )
 
     def _volume_changed(self, value: int) -> None:
@@ -4770,16 +4734,7 @@ class SoundTab(QtWidgets.QWidget):
     def _choose_new_files(
         self,
     ) -> None:
-        settings = _read_settings(
-            self.project_root
-        )
-
-        start = str(
-            settings.get(
-                LAST_MUSIC_FOLDER_KEY,
-                "",
-            )
-        )
+        start = SettingsStore(self.project_root).last_folder("music")
 
         if (
             self.project_sound
@@ -4837,22 +4792,9 @@ class SoundTab(QtWidgets.QWidget):
         self,
         path: str,
     ) -> None:
-        settings = _read_settings(
-            self.project_root
-        )
-
-        settings[
-            LAST_MUSIC_FOLDER_KEY
-        ] = str(
-            Path(
-                path
-            ).resolve().parent
-        )
-
-        _write_settings(
-            self.project_root,
-            settings,
-        )
+        store = SettingsStore(self.project_root)
+        folder = store.remember_folder("music", path)
+        store.update_fields({LAST_MUSIC_FOLDER_KEY: folder})
 
     def _start_import(
         self,
@@ -5669,7 +5611,10 @@ class SoundTab(QtWidgets.QWidget):
                 manager.shutdown()
 
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     def _show_status(
         self,
@@ -5684,7 +5629,7 @@ class SoundTab(QtWidgets.QWidget):
 
         if not persistent:
             self._status_timer.start(
-                4200
+                TRANSIENT_STATUS_MS
             )
 
     def dragEnterEvent(
@@ -5979,7 +5924,10 @@ class SoundTab(QtWidgets.QWidget):
                 self._analysis.shutdown()
 
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
 
         super().closeEvent(
             event

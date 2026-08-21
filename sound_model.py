@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from config import MUSIC_FILE, USER_SOUNDS_DIR
+from transactional_io import atomic_write_json
 
 SOUND_MODEL_VERSION = 2
 ARCHIVE_DIR_NAME = "appssong"
@@ -82,21 +83,6 @@ def ensure_sound_dirs(project_root: str | Path) -> None:
     originals_dir(project_root).mkdir(parents=True, exist_ok=True)
     processed_dir(project_root).mkdir(parents=True, exist_ok=True)
     analysis_dir(project_root).mkdir(parents=True, exist_ok=True)
-
-
-def atomic_write_json(path: str | Path, payload: dict) -> None:
-    destination = Path(path).resolve()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
-    )
-    os.close(fd)
-    tmp = Path(tmp_name)
-    try:
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        _replace_with_retry(tmp, destination)
-    finally:
-        tmp.unlink(missing_ok=True)
 
 
 def read_json(path: str | Path, default: dict) -> dict:

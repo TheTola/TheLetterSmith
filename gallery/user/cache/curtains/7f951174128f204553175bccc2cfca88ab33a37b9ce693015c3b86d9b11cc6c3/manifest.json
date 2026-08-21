@@ -1,0 +1,41 @@
+{
+  "schema_version": 2,
+  "source_fingerprint": "7f951174128f204553175bccc2cfca88ab33a37b9ce693015c3b86d9b11cc6c3",
+  "colors": {
+    "pure_white": [
+      255,
+      255,
+      255
+    ],
+    "average_color": [
+      30,
+      86,
+      195
+    ],
+    "complementary_average_color": [
+      195,
+      139,
+      30
+    ],
+    "normal_light": [
+      191,
+      207,
+      239
+    ],
+    "complementary_light": [
+      239,
+      223,
+      191
+    ],
+    "normal_dark": [
+      0,
+      34,
+      101
+    ],
+    "complementary_dark": [
+      101,
+      67,
+      0
+    ]
+  }
+}

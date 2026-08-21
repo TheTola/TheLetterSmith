@@ -41,7 +41,6 @@ into the saved HTML body.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -88,6 +87,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
 )
 
+from app_paths import resolve_application_root
 from config import (
     SETTINGS_FILE,
     GALLERY_DIR,
@@ -97,6 +97,8 @@ from config import (
 from message_format import normalize_ultralinks_in_document
 from project_save import ProjectNotReadyError, ProjectSaveService
 from project_state import ProjectStateController
+from settings_store import SettingsStore
+from transactional_io import atomic_write_text
 from editor_diagnostics import record_editor_failure
 from message_html import (
     is_ultralink_href,
@@ -144,31 +146,17 @@ def _safe_name(filename: str) -> str:
 
 def _read_json(fp: Path) -> dict:
     try:
-        return json.loads(fp.read_text(encoding="utf-8")) if fp.exists() else {}
+        return SettingsStore(fp.resolve().parent).snapshot()
     except Exception:
+        _LOGGER.exception("Editor settings could not be read: %s", fp)
         return {}
 
 
 def _atomic_write(path: Path, data: str, *, encoding: str = "utf-8") -> None:
+    if encoding.casefold().replace("-", "") != "utf8":
+        raise ValueError("Editor atomic writes require UTF-8 text.")
     _ensure_dir(path.parent)
-    tmp = path.with_suffix(path.suffix + f".tmp.{int(time.time() * 1000)}")
-    tmp.write_text(data, encoding=encoding)
-
-    tries = 4
-    for _ in range(tries):
-        try:
-            if path.exists():
-                tmp.replace(path)
-            else:
-                tmp.rename(path)
-            return
-        except Exception:
-            time.sleep(0.05)
-
-    if path.exists():
-        tmp.replace(path)
-    else:
-        tmp.rename(path)
+    atomic_write_text(path, data, encoding=encoding)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -604,7 +592,9 @@ class Editor(QDialog):
         super().__init__(parent)
 
         # Resolve project root (authoritative)
-        self.project_root = Path(getattr(parent, "project_root", os.getcwd()))
+        self.project_root = resolve_application_root(
+            getattr(parent, "project_root", None)
+        )
 
         # Canonical message location (SOURCE OF TRUTH)
         self.message_path = (self.project_root / MESSAGE_HTML_FILE).resolve()
@@ -2190,7 +2180,10 @@ class Editor(QDialog):
         try:
             self.settings.setValue(SETTINGS_KEY_COLOR, color)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         fmt = QTextCharFormat()
         fmt.setForeground(color)

@@ -2,19 +2,11 @@ from __future__ import annotations
 
 """Reusable artwork-backed QPushButton with a safe text-button fallback."""
 
-import sys
 from pathlib import Path
 from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
-
-
-def resolve_application_root(explicit_root: str | Path | None = None) -> Path:
-    if explicit_root is not None:
-        return Path(explicit_root).resolve()
-    if bool(getattr(sys, "frozen", False)):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+from app_paths import resolve_application_root
 
 
 def button_art_path(project_root: str | Path, filename: str) -> Path:

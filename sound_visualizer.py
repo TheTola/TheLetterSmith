@@ -188,12 +188,18 @@ class AudioVisualizerUltra(QtWidgets.QWidget):
                     if hasattr(ao, "volumeChanged"):
                         ao.volumeChanged.connect(self._on_volume_changed)
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug(
+                        "Best-effort operation failed.",
+                        exc_info=True,
+                    )
                 try:
                     if hasattr(ao, "mutedChanged"):
                         ao.mutedChanged.connect(self._on_muted_changed)
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug(
+                        "Best-effort operation failed.",
+                        exc_info=True,
+                    )
         except Exception:
             self._audio_out = None
 
@@ -268,12 +274,18 @@ class AudioVisualizerUltra(QtWidgets.QWidget):
             if hasattr(ao, "volumeChanged"):
                 ao.volumeChanged.disconnect(self._on_volume_changed)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         try:
             if hasattr(ao, "mutedChanged"):
                 ao.mutedChanged.disconnect(self._on_muted_changed)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         self._audio_out = None
 
     def _on_volume_changed(self, v) -> None:

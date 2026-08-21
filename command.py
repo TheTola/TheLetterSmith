@@ -41,6 +41,7 @@ from typing import Callable, Mapping, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
+from app_paths import resolve_application_root
 from command_bar import CommandBarData, build_command_bar_data
 from project_state import ApplicationState, ProjectStateController
 
@@ -98,27 +99,7 @@ LOGGER = logging.getLogger(__name__)
 # Root resolver
 # ─────────────────────────────────────────────────────────────────────────────
 def app_root() -> Path:
-    base = getattr(sys, "_MEIPASS", None)
-
-    if base:
-        cwd = Path.cwd()
-
-        if (cwd / "gallery").exists() or (cwd / SETTINGS_FILE).exists():
-            return cwd
-
-        return Path(base)
-
-    here = Path(__file__).resolve()
-
-    for up in (
-        here.parent,
-        here.parent.parent,
-        here.parent.parent.parent,
-    ):
-        if (up / SETTINGS_FILE).exists() or (up / "gallery").exists():
-            return up
-
-    return here.parent
+    return resolve_application_root()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,7 +128,10 @@ def _safe_clear_dir_contents(
                 dirs_deleted += 1
 
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     return files_deleted, dirs_deleted
 
@@ -161,7 +145,10 @@ def _safe_delete_file(
             return 1
 
     except Exception:
-        pass
+        logging.getLogger(__name__).debug(
+            "Best-effort operation failed.",
+            exc_info=True,
+        )
 
     return 0
 
@@ -216,7 +203,10 @@ def _hard_stop_sound_system(
                 wave.release_current_file_handle()
 
     except Exception:
-        pass
+        logging.getLogger(__name__).debug(
+            "Best-effort operation failed.",
+            exc_info=True,
+        )
 
     try:
         sound_tab = getattr(
@@ -243,7 +233,10 @@ def _hard_stop_sound_system(
                     player.stop()
 
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug(
+                        "Best-effort operation failed.",
+                        exc_info=True,
+                    )
 
                 try:
                     player.setSource(
@@ -251,10 +244,16 @@ def _hard_stop_sound_system(
                     )
 
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug(
+                        "Best-effort operation failed.",
+                        exc_info=True,
+                    )
 
     except Exception:
-        pass
+        logging.getLogger(__name__).debug(
+            "Best-effort operation failed.",
+            exc_info=True,
+        )
 
 
 def _release_image_system(
@@ -273,7 +272,10 @@ def _release_image_system(
         if callable(release):
             release()
     except Exception:
-        pass
+        logging.getLogger(__name__).debug(
+            "Best-effort operation failed.",
+            exc_info=True,
+        )
 
 
 def _force_soundtab_no_audio(
@@ -305,7 +307,10 @@ def _force_soundtab_no_audio(
                 return
 
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
 
         if hasattr(
             sound_tab,
@@ -315,7 +320,10 @@ def _force_soundtab_no_audio(
                 sound_tab._on_current_changed("")
 
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
 
         try:
             if hasattr(
@@ -327,7 +335,10 @@ def _force_soundtab_no_audio(
                 )
 
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         try:
             if hasattr(
@@ -339,10 +350,16 @@ def _force_soundtab_no_audio(
                 )
 
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     except Exception:
-        pass
+        logging.getLogger(__name__).debug(
+            "Best-effort operation failed.",
+            exc_info=True,
+        )
 
 
 def _clear_message_tab_inputs(
@@ -379,7 +396,10 @@ def _clear_message_tab_inputs(
                 message_tab.title_input.setText("")
 
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         try:
             if hasattr(
@@ -389,7 +409,10 @@ def _clear_message_tab_inputs(
                 message_tab.name_input.setText("")
 
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         try:
             if hasattr(
@@ -403,7 +426,10 @@ def _clear_message_tab_inputs(
                 )
 
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         try:
             if hasattr(
@@ -425,7 +451,10 @@ def _clear_message_tab_inputs(
                 message_tab._update_message_summary("")
 
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         try:
             settings = getattr(
@@ -446,10 +475,16 @@ def _clear_message_tab_inputs(
                 settings["published_page_url_locked"] = False
 
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     except Exception:
-        pass
+        logging.getLogger(__name__).debug(
+            "Best-effort operation failed.",
+            exc_info=True,
+        )
 
 
 def _reset_project_sound_state(
@@ -490,7 +525,10 @@ def _reset_project_sound_state(
         )
 
     except Exception:
-        pass
+        logging.getLogger(__name__).debug(
+            "Best-effort operation failed.",
+            exc_info=True,
+        )
 
 
 def _delete_music_and_manifest(
@@ -970,7 +1008,10 @@ def _perform_confirmed_reset(
             parent.wiped.emit()
 
     except Exception:
-        pass
+        logging.getLogger(__name__).debug(
+            "Best-effort operation failed.",
+            exc_info=True,
+        )
 
     return True
 

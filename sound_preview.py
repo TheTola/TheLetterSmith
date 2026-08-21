@@ -222,7 +222,10 @@ class _VisualizerGate(QtCore.QObject):
         try:
             self._poll.stop()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         self._disconnect_player()
         self._disconnect_audio_out()
         self._player = None
@@ -239,13 +242,19 @@ class _VisualizerGate(QtCore.QObject):
             try:
                 return state_obj == QMediaPlayer.PlayingState  # Qt6 PlaybackState enum
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
 
         # Fallback: int coercion
         try:
             return int(state_obj) == 1
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         # Last resort: string contains "playing"
         try:
@@ -329,7 +338,10 @@ class _VisualizerGate(QtCore.QObject):
             if sig is not None:
                 sig.connect(slot)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     def _try_disconnect(self, signal_name: str, slot) -> None:
         try:
@@ -337,7 +349,10 @@ class _VisualizerGate(QtCore.QObject):
             if sig is not None:
                 sig.disconnect(slot)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     def _disconnect_player(self) -> None:
         if not self._player:
@@ -354,12 +369,18 @@ class _VisualizerGate(QtCore.QObject):
             if hasattr(ao, "volumeChanged"):
                 ao.volumeChanged.disconnect(self._on_volume_changed)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         try:
             if hasattr(ao, "mutedChanged"):
                 ao.mutedChanged.disconnect(self._on_muted_changed)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         self._audio_out = None
 
     def _wire_audio_out(self) -> None:
@@ -390,15 +411,24 @@ class _VisualizerGate(QtCore.QObject):
                     if hasattr(ao, "volumeChanged"):
                         ao.volumeChanged.connect(self._on_volume_changed)
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug(
+                        "Best-effort operation failed.",
+                        exc_info=True,
+                    )
                 try:
                     if hasattr(ao, "mutedChanged"):
                         ao.mutedChanged.connect(self._on_muted_changed)
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug(
+                        "Best-effort operation failed.",
+                        exc_info=True,
+                    )
                 return
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         # Fallback: player.volume() 0..100, player.isMuted()
         try:
@@ -474,7 +504,10 @@ class _VisualizerGate(QtCore.QObject):
             if attr is not None:
                 return int(attr)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         return None
 
     def _poll_tick(self) -> None:
@@ -490,11 +523,17 @@ class _VisualizerGate(QtCore.QObject):
             try:
                 self._volume = float(self._audio_out.volume())
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
             try:
                 self._muted = bool(self._audio_out.isMuted())
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
 
         st = self._read_state()
         if st is not None:
@@ -645,7 +684,10 @@ class SoundPreviewWidget(QtWidgets.QFrame):
             if hasattr(self._visualizer, "set_active"):
                 self._visualizer.set_active(bool(show))  # type: ignore[attr-defined]
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     # ── Public API ──────────────────────────────────────────────────────────
     def set_media_player(self, player) -> None:
@@ -726,21 +768,33 @@ class SoundPreviewWidget(QtWidgets.QFrame):
         try:
             self._gate.shutdown()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         try:
             self._on_gate_visible(False)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         try:
             if hasattr(self._visualizer, "set_media_player"):
                 self._visualizer.set_media_player(None)  # type: ignore[call-arg]
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         try:
             if hasattr(self._visualizer, "shutdown"):
                 self._visualizer.shutdown()  # type: ignore[attr-defined]
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.shutdown()

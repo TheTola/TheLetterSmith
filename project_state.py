@@ -188,6 +188,56 @@ class ProjectIdentity:
         }
 
 
+class ProjectDirtyController:
+    """Single authority for changes made since the last project save."""
+
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._dirty = False
+        self._sources: set[str] = set()
+        self._listeners: list[Callable[[bool], None]] = []
+
+    @property
+    def is_dirty(self) -> bool:
+        with self._lock:
+            return self._dirty
+
+    @property
+    def sources(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._sources))
+
+    def add_listener(self, listener: Callable[[bool], None]) -> None:
+        with self._lock:
+            if listener not in self._listeners:
+                self._listeners.append(listener)
+            dirty = self._dirty
+        listener(dirty)
+
+    def remove_listener(self, listener: Callable[[bool], None]) -> None:
+        with self._lock:
+            if listener in self._listeners:
+                self._listeners.remove(listener)
+
+    def mark_changed(self, source: str = "project") -> None:
+        with self._lock:
+            self._sources.add(str(source or "project"))
+            changed = not self._dirty
+            self._dirty = True
+            listeners = tuple(self._listeners) if changed else ()
+        for listener in listeners:
+            listener(True)
+
+    def mark_saved(self) -> None:
+        with self._lock:
+            changed = self._dirty
+            self._dirty = False
+            self._sources.clear()
+            listeners = tuple(self._listeners) if changed else ()
+        for listener in listeners:
+            listener(False)
+
+
 class ProjectStateController:
     """Single authority for project availability and lifecycle transitions."""
 

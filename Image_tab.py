@@ -28,6 +28,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPoint, QSize, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon
 
+from app_paths import resolve_application_root
 from image_button import ArtworkButton
 from image_animation import (
     FOREVER,
@@ -45,6 +46,8 @@ from project_paths import ProjectPathResolver
 from project_save import ProjectSaveService
 from project_state import ProjectStateController
 from project_sync import image_fingerprint
+from settings_store import SettingsStore
+from ui_constants import TRANSIENT_STATUS_MS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1078,9 +1081,7 @@ class ImageTab(
         project_paths: ProjectPathResolver | None = None,
     ) -> None:
         super().__init__()
-        self.project_root = Path(
-            project_root or Path(__file__).resolve().parent
-        ).resolve()
+        self.project_root = resolve_application_root(project_root)
         self.project_state = project_state
         if self.project_state is None:
             self.project_state = ProjectStateController(
@@ -1092,6 +1093,7 @@ class ImageTab(
             self.project_state,
             resolver=project_paths,
         )
+        self.settings_store = SettingsStore(self.project_root)
 
         self.labels = {
             1: (
@@ -1869,7 +1871,7 @@ class ImageTab(
                     f"Select "
                     f"{self.labels[index][0]}"
                 ),
-                "",
+                self.settings_store.last_folder("image"),
                 (
                     "Images "
                     "(*.png *.jpg *.jpeg *.bmp *.gif)"
@@ -1878,6 +1880,7 @@ class ImageTab(
         )
 
         if path:
+            self.settings_store.remember_folder("image", path)
             self.set_image_path(
                 index,
                 path,
@@ -2262,7 +2265,7 @@ class ImageTab(
     def _show_temporary_status(
         self,
         message: str,
-        duration_ms: int = 3000,
+        duration_ms: int = TRANSIENT_STATUS_MS,
     ) -> None:
         self._status_clear_timer.stop()
 
@@ -2341,7 +2344,10 @@ class ImageTab(
         try:
             self.sync_to_disk()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     def prepare_for_project_restore(self) -> None:
         for card in self.cards.values():

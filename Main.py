@@ -16,8 +16,8 @@ Responsibilities:
 
 from __future__ import annotations
 
-import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 import traceback
@@ -25,20 +25,23 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
+from app_paths import (
+    APP_NAME,
+    APP_VERSION,
+    ORG_DOMAIN,
+    ORG_NAME,
+    resolve_application_root,
+    resolve_user_data_root,
+)
 from app_icon import configure_windows_app_identity, resolve_app_icon
 from project_paths import PROJECTS_RELATIVE_PATH
+from settings_store import SettingsStore
+from startup_check import run_startup_self_check
 
 
 # =============================================================================
 # Application identity
 # =============================================================================
-
-APP_NAME: str = "Letter Smith"
-ORG_NAME: str = "Infini Works"
-ORG_DOMAIN: str = "infini.works"
-
-SETTINGS_FILE: str = "settings.json"
-
 
 # =============================================================================
 # Environment and project root
@@ -64,14 +67,7 @@ def resolve_project_root() -> Path:
     Source application:
         Directory containing Main.py.
     """
-    if is_frozen():
-        return Path(
-            sys.executable
-        ).resolve().parent
-
-    return Path(
-        __file__
-    ).resolve().parent
+    return resolve_application_root()
 
 
 def set_cwd(
@@ -86,7 +82,7 @@ def set_cwd(
         )
 
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("Could not set the application directory: %s", root)
 
 
 def ensure_root_on_syspath(
@@ -116,32 +112,10 @@ def load_settings(
 
     Missing or invalid settings must not prevent application startup.
     """
-    path = (
-        root
-        / SETTINGS_FILE
-    )
-
-    if not path.exists():
-        return {}
-
     try:
-        value = json.loads(
-            path.read_text(
-                encoding="utf-8",
-                errors="ignore",
-            )
-        )
-
-        return (
-            value
-            if isinstance(
-                value,
-                dict,
-            )
-            else {}
-        )
-
+        return SettingsStore(root).snapshot()
     except Exception:
+        logging.getLogger(__name__).exception("Application settings could not be loaded.")
         return {}
 
 
@@ -151,6 +125,7 @@ def load_settings(
 
 def setup_logging(
     settings: dict,
+    root: Path,
 ) -> None:
     """
     Configure console logging.
@@ -168,14 +143,25 @@ def setup_logging(
         else logging.INFO
     )
 
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    try:
+        logs = resolve_user_data_root(root) / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            RotatingFileHandler(
+                logs / "lettersmith.log",
+                maxBytes=1_000_000,
+                backupCount=4,
+                encoding="utf-8",
+            )
+        )
+    except OSError:
+        logging.getLogger(__name__).exception("Application log file could not be opened.")
+
     logging.basicConfig(
         level=level,
-        format="%(message)s",
-        handlers=[
-            logging.StreamHandler(
-                sys.stdout
-            )
-        ],
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        handlers=handlers,
         force=True,
     )
 
@@ -190,7 +176,7 @@ def configure_qt_logging() -> None:
         )
 
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("Qt logging configuration failed.")
 
 
 def log_startup(
@@ -218,7 +204,7 @@ def log_startup(
     )
 
     logging.info(
-        f"— {APP_NAME} —"
+        f"— {APP_NAME} {APP_VERSION} —"
     )
 
     logging.info(
@@ -352,7 +338,7 @@ def _show_critical(
         )
 
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("Critical error dialog could not be displayed.")
 
 
 def install_exception_hook(
@@ -390,7 +376,7 @@ def install_exception_hook(
                     application.quit()
 
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).exception("Application quit request failed.")
 
             return
 
@@ -491,7 +477,8 @@ def main() -> None:
     )
 
     setup_logging(
-        settings
+        settings,
+        root,
     )
 
     configure_qt_logging()
@@ -515,6 +502,14 @@ def main() -> None:
     application = bootstrap_qt(
         icon
     )
+
+    startup_issues = run_startup_self_check(root)
+    critical_issues = tuple(issue for issue in startup_issues if issue.critical)
+    if critical_issues:
+        message = "\n".join(issue.message for issue in critical_issues)
+        logging.error("Startup self-check failed:\n%s", message)
+        _show_critical(f"{APP_NAME} — Startup Error", message)
+        raise SystemExit(1)
 
     install_exception_hook(
         APP_NAME

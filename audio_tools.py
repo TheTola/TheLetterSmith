@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+from app_paths import resolve_application_root
+
+
+PROJECT_ROOT = resolve_application_root()
 TOOLS_DIR = PROJECT_ROOT / "tools"
 FFMPEG_PATH = TOOLS_DIR / "ffmpeg.exe"
 FFPROBE_PATH = TOOLS_DIR / "ffprobe.exe"
@@ -191,7 +194,10 @@ def convert_to_mp3(
             try:
                 process.wait(timeout=2)
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
         tmp.unlink(missing_ok=True)
 
 
@@ -269,6 +275,9 @@ def decode_mono_pcm16(
             try:
                 process.wait(timeout=2)
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
         tmp.unlink(missing_ok=True)
 

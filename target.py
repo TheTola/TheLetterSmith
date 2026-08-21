@@ -445,7 +445,10 @@ def open_in_file_explorer_select(path: str) -> None:
         folder = os.path.dirname(path)
         subprocess.Popen(["xdg-open", folder])
     except Exception:
-        pass
+        logging.getLogger(__name__).debug(
+            "Best-effort operation failed.",
+            exc_info=True,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -481,13 +484,19 @@ def apply_window_icon(win: tk.Tk | tk.Toplevel, icon_path: Optional[Path]) -> No
             win.iconphoto(True, photo)
             setattr(win, "_letter_smith_icon_photo", photo)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     try:
         if os.name == "nt" and ico_path.is_file():
             win.iconbitmap(str(ico_path))
     except Exception:
-        pass
+        logging.getLogger(__name__).debug(
+            "Best-effort operation failed.",
+            exc_info=True,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -507,7 +516,10 @@ class SpinnerOverlay(tk.Toplevel):
         try:
             self.attributes("-topmost", True)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         apply_window_icon(self, icon_path)
 
@@ -580,7 +592,10 @@ class SpinnerOverlay(tk.Toplevel):
         try:
             self.destroy()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -605,7 +620,10 @@ class TinyResultPrompt(tk.Toplevel):
         try:
             self.attributes("-topmost", True)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         self.lift(parent)
         apply_window_icon(self, parent.icon_path)
@@ -692,11 +710,17 @@ class TinyResultPrompt(tk.Toplevel):
         try:
             self.grab_set()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         try:
             self.focus_force()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     @staticmethod
     def _roundrect(c: tk.Canvas, x1: int, y1: int, x2: int, y2: int, r: int = 12, **kw) -> int:
@@ -997,7 +1021,10 @@ class TargetApp(tk.Tk):
             try:
                 self.attributes("-topmost", True)
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
             self.update_idletasks()
             return func(parent=self, **kwargs)
         finally:
@@ -1005,7 +1032,10 @@ class TargetApp(tk.Tk):
                 try:
                     self.attributes("-topmost", restore_topmost)
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug(
+                        "Best-effort operation failed.",
+                        exc_info=True,
+                    )
 
     def select_folder_flow(self) -> None:
         folder = self._run_modal_dialog(filedialog.askdirectory, title="Select Folder")
@@ -1138,7 +1168,10 @@ class TargetApp(tk.Tk):
         try:
             self.btn_canvas.itemconfig(self._btn_rect, fill=color)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         self.after(16, self._animate)
 
     def _bind_invisible_scroll(self, widget: tk.Text) -> None:
@@ -1226,7 +1259,10 @@ def on_select_folder() -> None:
         try:
             subprocess.Popen(args)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

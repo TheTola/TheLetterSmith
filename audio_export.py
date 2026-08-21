@@ -7,6 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from app_paths import resolve_application_root
 from transactional_io import atomic_write_bytes
 
 
@@ -26,7 +27,7 @@ def _find_audio_tool(env_name: str, exe_name: str) -> str:
     if found:
         return found
 
-    root = Path(__file__).resolve().parent
+    root = resolve_application_root()
     candidates = [
         root / "ffmpeg" / "bin" / exe_name,
         root / "tools" / "ffmpeg" / "bin" / exe_name,
@@ -149,7 +150,10 @@ def _export_apple_safe_mp3(src: Path, dst: Path) -> None:
             if tmp.exists():
                 tmp.unlink()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         if pydub_error is not None and ffmpeg_error is not None:
             raise RuntimeError(
                 f"Failed to export Apple-safe MP3 from {src} to {dst}: "

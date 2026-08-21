@@ -215,6 +215,42 @@ def cleanup_abandoned_staging(
     return tuple(removed)
 
 
+def cleanup_abandoned_temp_files(
+    roots: Iterable[str | Path],
+    *,
+    older_than_seconds: float = 24 * 60 * 60,
+    now: Optional[float] = None,
+    recursive: bool = True,
+) -> tuple[Path, ...]:
+    """Remove only stale Letter Smith-style temporary files from known roots."""
+    cutoff = (time.time() if now is None else now) - max(0.0, older_than_seconds)
+    removed: list[Path] = []
+    visited: set[Path] = set()
+    for raw_root in roots:
+        root = Path(raw_root).resolve()
+        if root in visited or not root.is_dir():
+            continue
+        visited.add(root)
+        iterator = root.rglob("*") if recursive else root.iterdir()
+        candidates = (path for path in iterator if path.is_file())
+        for candidate in candidates:
+            name = candidate.name.casefold()
+            if ".tmp" not in name:
+                continue
+            resolved = candidate.resolve()
+            if not _safe_child(root, resolved):
+                continue
+            try:
+                if candidate.stat().st_mtime > cutoff:
+                    continue
+                candidate.unlink()
+                removed.append(resolved)
+                _LOGGER.info("Removed abandoned temporary file: %s", resolved)
+            except OSError:
+                _LOGGER.exception("Could not remove abandoned temporary file: %s", resolved)
+    return tuple(removed)
+
+
 def recover_stale_transactions(
     destinations: Iterable[str | Path],
     *,
@@ -387,6 +423,7 @@ __all__ = [
     "safe_write_json",
     "atomic_write_text",
     "cleanup_abandoned_staging",
+    "cleanup_abandoned_temp_files",
     "create_staging_directory",
     "recover_stale_transactions",
     "replace_directory",

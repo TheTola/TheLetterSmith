@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import html as _html
+import logging
 import os
 import re
 import json
@@ -57,6 +58,8 @@ from settings_store import (
     SettingsStore,
     normalize_published_page_url,
 )
+from ui_constants import MESSAGE_RENDER_DEBOUNCE_MS
+from ui_status import TransientStatusLabel
 from config import (
     SETTINGS_FILE,
     PUBLISHED_PAGE_URL_KEY,
@@ -71,6 +74,7 @@ IDENTITY_LOCK_KEYS = {
     "recipient": "recipient_name_locked",
     "published_url": "published_page_url_locked",
 }
+_LOGGER = logging.getLogger(__name__)
 
 
 class IdentityLineEdit(QtWidgets.QLineEdit):
@@ -200,8 +204,9 @@ MESSAGE_OVERLAY_PRESET_LABELS: dict[str, str] = {
 
 def _message_overlay_settings(settings_path: str | os.PathLike) -> tuple[str, int, tuple[int, int, int], str]:
     try:
-        data = json.loads(Path(settings_path).read_text(encoding="utf-8")) if Path(settings_path).exists() else {}
+        data = SettingsStore(Path(settings_path).resolve().parent).snapshot()
     except Exception:
+        _LOGGER.exception("Message overlay settings could not be loaded.")
         data = {}
 
     preset = str(data.get(MESSAGE_OVERLAY_PRESET_KEY, DEFAULT_MESSAGE_OVERLAY_PRESET)).strip().lower()
@@ -471,7 +476,7 @@ class MessageTab(QtWidgets.QWidget):
         self.overlay_buttons: dict[str, QtWidgets.QPushButton] = {}
         self._overlay_render_timer = QtCore.QTimer(self)
         self._overlay_render_timer.setSingleShot(True)
-        self._overlay_render_timer.setInterval(180)
+        self._overlay_render_timer.setInterval(MESSAGE_RENDER_DEBOUNCE_MS)
         self._overlay_render_timer.timeout.connect(self._render_overlay_preview)
         self._sync_state = self._capture_sync_state()
         self._tab_active = False
@@ -604,7 +609,7 @@ class MessageTab(QtWidgets.QWidget):
         actions.addWidget(self.revisions_btn, 0, 3)
         shell.addLayout(actions)
 
-        self.status = QtWidgets.QLabel()
+        self.status = TransientStatusLabel()
         self.status.setFont(QFont("Segoe UI", 9))
         self.status.setAlignment(Qt.AlignCenter)
         self.status.setStyleSheet("color:#aeb8c6; min-height:16px;")
@@ -910,7 +915,10 @@ class MessageTab(QtWidgets.QWidget):
             self.current_html = path.read_text(encoding="utf-8")
             self._content_has_intentional_formatting = True
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     def open_revision_history(self) -> None:
         RevisionHistoryDialog(self).exec()
@@ -1248,7 +1256,10 @@ class MessageTab(QtWidgets.QWidget):
                 shutil.copyfile(str(src), str(wall_path))
                 return True
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         return wall_path.exists()
 
     def _ensure_message_exists(self) -> None:
@@ -1274,7 +1285,10 @@ class MessageTab(QtWidgets.QWidget):
             if out_png.exists():
                 return
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         # Hard fallback: copy wall into message.png (scaled to 2048×3072)
         try:
@@ -1296,7 +1310,10 @@ class MessageTab(QtWidgets.QWidget):
                     p.end()
                     _atomic_save_image(canvas, str(out_png))
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     # ──────────────────────────────────────────────────────────────────
     # Existing content load
@@ -1357,13 +1374,15 @@ class MessageTab(QtWidgets.QWidget):
     # File selection / drop
     # ──────────────────────────────────────────────────────────────────
     def select_file(self) -> None:
+        start = self.settings_store.last_folder("message")
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select Message File",
-            "",
+            start,
             "Messages (*.txt *.docx *.pdf *.odt *.html *.htm)",
         )
         if path:
+            self.settings_store.remember_folder("message", path)
             self._process_file(path)
 
     def handle_drop(self, path: str) -> None:
@@ -1470,7 +1489,10 @@ class MessageTab(QtWidgets.QWidget):
                             res = mammoth.convert_to_html(docx_file)
                         return res.value
                     except Exception:
-                        pass
+                        logging.getLogger(__name__).debug(
+                            "Best-effort operation failed.",
+                            exc_info=True,
+                        )
                 if Document is not None:
                     try:
                         doc = Document(path)
@@ -1481,7 +1503,10 @@ class MessageTab(QtWidgets.QWidget):
                                 parts.append(_html.escape(t))
                         return "<br>".join(parts)
                     except Exception:
-                        pass
+                        logging.getLogger(__name__).debug(
+                            "Best-effort operation failed.",
+                            exc_info=True,
+                        )
                 return ""
 
             if low.endswith(".pdf"):
@@ -1491,7 +1516,10 @@ class MessageTab(QtWidgets.QWidget):
                         pages = [(page.extract_text() or "").replace("\n", "<br>") for page in reader.pages]
                         return "<br><br>".join(pages)
                     except Exception:
-                        pass
+                        logging.getLogger(__name__).debug(
+                            "Best-effort operation failed.",
+                            exc_info=True,
+                        )
                 try:
                     import pdfplumber  # type: ignore
                     txt_pages = []
@@ -1664,4 +1692,7 @@ class MessageTab(QtWidgets.QWidget):
             else:
                 self.sync_from_disk()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )

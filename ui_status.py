@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Callable, Optional
 
 from PySide6 import QtCore, QtWidgets
+from ui_constants import TRANSIENT_STATUS_MS
 
 
 class StatusLevel(Enum):
@@ -167,9 +168,27 @@ class StatusBanner(QtWidgets.QFrame):
         self.show()
 
 
+class TransientStatusLabel(QtWidgets.QLabel):
+    """QLabel-compatible status text that clears after the shared duration."""
+
+    def __init__(self, *args, timeout_ms: int = TRANSIENT_STATUS_MS, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._timeout_ms = max(0, int(timeout_ms))
+        self._clear_timer = QtCore.QTimer(self)
+        self._clear_timer.setSingleShot(True)
+        self._clear_timer.timeout.connect(self.clear)
+
+    def setText(self, text: str) -> None:
+        self._clear_timer.stop()
+        super().setText(text)
+        if text and self._timeout_ms:
+            self._clear_timer.start(self._timeout_ms)
+
+
 __all__ = [
     "StatusBanner",
     "StatusController",
     "StatusLevel",
     "StatusMessage",
+    "TransientStatusLabel",
 ]

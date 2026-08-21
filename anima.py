@@ -213,12 +213,18 @@ def _keep_anim(owner: QtCore.QObject, anim: QtCore.QAbstractAnimation) -> None:
         try:
             lst.remove(anim)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     try:
         anim.finished.connect(_drop)  # type: ignore[attr-defined]
     except Exception:
-        pass
+        logging.getLogger(__name__).debug(
+            "Best-effort operation failed.",
+            exc_info=True,
+        )
 
 
 def _has_icon(btn: QtWidgets.QAbstractButton) -> bool:
@@ -291,7 +297,10 @@ class ParticleBurst(QtWidgets.QWidget):
                 parent.installEventFilter(self)
                 self.raise_()
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
 
         self.hide()
 
@@ -303,7 +312,10 @@ class ParticleBurst(QtWidgets.QWidget):
                 try:
                     self.setGeometry(obj.rect())
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug(
+                        "Best-effort operation failed.",
+                        exc_info=True,
+                    )
         return False
 
     def burst_at(self, center: QPoint, *, count: Optional[int] = None, excitement: Optional[int] = None) -> None:
@@ -502,7 +514,10 @@ class ButtonPulseFilter(QtCore.QObject):
             if bool(obj.property("anima.NoPressPulse")):
                 return False
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         # A) opacity pulse only when safe (no existing effect)
         if obj.graphicsEffect() is None:
@@ -607,7 +622,10 @@ class _HoverGlowFilter(QtCore.QObject):
             if bool(obj.property("anima.NoHoverGlow")):
                 return False
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         if event.type() == QEvent.Enter:
             eff = obj.graphicsEffect()
@@ -674,7 +692,10 @@ class _HoverTabSwitchFilter(QtCore.QObject):
             if hasattr(event, "pos"):
                 return event.pos()  # type: ignore[attr-defined]
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         try:
             return self.tabbar.mapFromGlobal(QtGui.QCursor.pos())
         except RuntimeError:
@@ -796,13 +817,19 @@ class TabSwitcher(QtCore.QObject):
             if mode in {"fade", "command-fade", "command_fade"}:
                 return True
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         try:
             if widget.objectName().strip().lower() == "commandtab":
                 return True
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         return widget.__class__.__name__.strip().lower() == "commandtab"
 
@@ -1191,7 +1218,10 @@ def install_click_fx(root: QtWidgets.QWidget, *, include_toolbuttons: bool = Tru
             if bool(btn.property("anima.fxInstalled")):
                 return False
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         return True
 
     def _wire_button(btn: QtWidgets.QAbstractButton) -> None:
@@ -1215,7 +1245,10 @@ def install_click_fx(root: QtWidgets.QWidget, *, include_toolbuttons: bool = Tru
             if bool(w.property("anima.treeWatchInstalled")):
                 return
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         w.installEventFilter(tree)
         w.setProperty("anima.treeWatchInstalled", True)
 

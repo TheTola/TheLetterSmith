@@ -54,5 +54,6 @@
   "recipient_display_name": "Amanda Miller",
   "recipient_normalized_key": "amanda miller",
   "recipient_title_locked": true,
-  "published_public_path": ""
+  "published_public_path": "",
+  "settings_schema_version": 1
 }

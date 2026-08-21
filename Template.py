@@ -164,14 +164,21 @@ TEMPLATE_CSS = r"""
   --message-overlay-blur:0px;
   --message-overlay-texture-opacity:0;
   --message-ink:#221710;
-  --wall-fade-ms:900ms;
+  --duration-hover:150ms;
+  --duration-overlay:180ms;
+  --duration-major:640ms;
+  --duration-curtain:1500ms;
+  --duration-attention:2000ms;
+  --ease-standard:cubic-bezier(.2,.8,.2,1);
+  --ease-emphasized:cubic-bezier(.65,0,.35,1);
+  --motion-hover:var(--duration-hover) var(--ease-standard);
+  --motion-overlay:var(--duration-overlay) var(--ease-standard);
+  --motion-major:var(--duration-major) var(--ease-emphasized);
   --stage-backdrop:
     radial-gradient(900px 600px at 30% 25%, var(--bg-rim), transparent 60%),
     radial-gradient(900px 600px at 80% 70%, var(--bg-depth), transparent 60%),
     linear-gradient(180deg, var(--bg-top), var(--bg-bottom));
   --shadow-page:0 18px 40px rgba(0,0,0,.45);
-  --motion-fast:180ms ease;
-  --motion-medium:240ms cubic-bezier(.2,.8,.2,1);
   --nav-offset:clamp(14px,3vw,36px);
   --nav-size:clamp(52px,6vw,78px);
   --nav-pad:clamp(5px,.7vw,8px);
@@ -198,7 +205,7 @@ button{margin:0;border:0;background:none;color:inherit}
 #slideshow{
   position:relative;width:100%;height:100%;
   opacity:0;visibility:hidden;pointer-events:none;
-  transition:opacity var(--motion-fast);
+  transition:opacity var(--motion-major);
   background:var(--stage-backdrop);
   perspective:6000px;
   transform-style:preserve-3d;
@@ -206,11 +213,11 @@ button{margin:0;border:0;background:none;color:inherit}
 body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 
 #curtain-overlay{position:absolute;inset:0;z-index:9999;overflow:hidden;pointer-events:all;opacity:0;background:var(--stage-backdrop);will-change:opacity}
-#curtain-overlay.is-visible{animation:curtainIntroFadeIn 520ms ease-out forwards}
+#curtain-overlay.is-visible{animation:curtainIntroFadeIn var(--motion-major) forwards}
 #curtain-left,#curtain-right{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;z-index:10000;pointer-events:none;opacity:0;will-change:opacity,transform}
-#curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right{animation:curtainPanelFadeIn 420ms ease-out forwards}
+#curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right{animation:curtainPanelFadeIn var(--motion-major) forwards}
 #curtain-overlay.curtain-fallback #curtain-left,#curtain-overlay.curtain-fallback #curtain-right{display:none}
-#begin-button{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);min-width:min(80vw,280px);padding:14px 30px;border:1px solid rgba(155,255,251,.42);border-radius:var(--pill-radius);background:linear-gradient(180deg,rgba(15,24,38,.88),rgba(6,10,18,.72));color:var(--text-main);font-size:clamp(22px,3.2vw,42px);font-weight:700;letter-spacing:.02em;cursor:pointer;z-index:10001;animation:pulse 2s infinite;box-shadow:var(--hud-shadow),0 0 0 1px rgba(0,255,255,.14)}
+#begin-button{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);min-width:min(80vw,280px);padding:14px 30px;border:1px solid rgba(155,255,251,.42);border-radius:var(--pill-radius);background:linear-gradient(180deg,rgba(15,24,38,.88),rgba(6,10,18,.72));color:var(--text-main);font-size:clamp(22px,3.2vw,42px);font-weight:700;letter-spacing:.02em;cursor:pointer;z-index:10001;animation:pulse var(--duration-attention) infinite;box-shadow:var(--hud-shadow),0 0 0 1px rgba(0,255,255,.14)}
 #curtain-overlay:not(.is-visible) #begin-button{opacity:0}
 #begin-button:hover{background:linear-gradient(180deg,rgba(20,31,48,.94),rgba(8,12,20,.84))}
 @keyframes curtainIntroFadeIn{from{opacity:0}to{opacity:1}}
@@ -227,7 +234,7 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .slide.asset-failed::after{content:attr(data-fallback-label);position:absolute;inset:50% auto auto 50%;transform:translate(-50%,-50%);width:min(520px,72%);padding:18px 22px;color:var(--text-main);text-align:center;font:700 20px/1.4 var(--font-ui);background:rgba(0,0,0,.58);border:1px solid var(--hud-border);border-radius:var(--page-radius);box-shadow:var(--shadow-page);z-index:6}
 .slide img{max-width:calc(100% - (2 * var(--page-side-rail)));max-height:calc(100% - var(--control-rail) - var(--bottom-control-rail));position:absolute;inset:var(--control-rail) var(--page-side-rail) var(--bottom-control-rail);margin:auto;object-fit:contain;border-radius:var(--page-radius);box-shadow:inset 0 0 30px rgba(0,0,0,.20),var(--shadow-page)}
 
-.nav-button,.hud-button{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--hud-border);background:linear-gradient(180deg,var(--hud-surface-top),var(--hud-surface-bottom));color:var(--text-main);box-shadow:var(--hud-shadow);backdrop-filter:blur(10px);cursor:pointer;transition:transform var(--motion-fast),background var(--motion-fast),border-color var(--motion-fast),box-shadow var(--motion-fast),opacity var(--motion-fast),visibility 0s linear 220ms}
+.nav-button,.hud-button{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--hud-border);background:linear-gradient(180deg,var(--hud-surface-top),var(--hud-surface-bottom));color:var(--text-main);box-shadow:var(--hud-shadow);backdrop-filter:blur(10px);cursor:pointer;transition:transform var(--motion-hover),background var(--motion-hover),border-color var(--motion-hover),box-shadow var(--motion-hover),opacity var(--motion-overlay),visibility 0s linear var(--duration-overlay)}
 .nav-button:hover,.hud-button:hover{background:linear-gradient(180deg,rgba(25,37,55,.88),rgba(10,14,24,.76));border-color:var(--hud-border-strong);box-shadow:var(--hud-shadow-strong)}
 .nav-button:active,.hud-button:active{transform:scale(.98)}
 .nav-button img,.hud-button img{display:block;width:100%;height:100%;object-fit:contain;pointer-events:none;filter:drop-shadow(0 6px 12px rgba(0,0,0,.34))}
@@ -240,6 +247,7 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .nav-button img{width:var(--nav-size);height:var(--nav-size)}
 .nav-button[disabled]{opacity:.35;cursor:not-allowed;filter:grayscale(1);box-shadow:none}
 .nav-button[disabled]:hover{transform:translateY(-50%)}
+#slideshow.page-turning .nav-button{pointer-events:none}
 
 #viewer-actions{position:absolute;top:var(--corner-offset);left:var(--corner-offset);display:flex;align-items:center;pointer-events:none;z-index:107}
 #viewer-actions-left{display:flex;align-items:center;gap:8px}
@@ -247,8 +255,8 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 #fullscreen-button{position:absolute;top:var(--corner-offset);right:var(--corner-offset);width:auto;height:38px;padding:0 12px;font:700 12px/1 var(--font-ui);letter-spacing:.03em;z-index:10002;pointer-events:auto}
 #mute-button[aria-pressed="true"]{border-color:rgba(155,255,251,.55);background:linear-gradient(180deg,rgba(20,55,64,.92),rgba(8,25,34,.86));color:#eaffff}
 
-.text-wall{position:absolute;top:var(--control-rail);bottom:var(--bottom-control-rail);left:50%;width:min(var(--wall-max-width),calc(100% - (2 * var(--wall-gap))));height:fit-content;max-height:calc(100% - var(--control-rail) - var(--bottom-control-rail));margin:auto 0;overflow:auto;padding:var(--wall-frame-pad);border:1px solid var(--paper-edge);border-radius:var(--panel-radius);background-color:rgba(var(--message-overlay-rgb),var(--message-overlay-surface-opacity));color:var(--message-ink);box-shadow:0 30px 80px var(--paper-shadow),0 12px 28px rgba(0,0,0,.22),inset 0 1px 0 var(--paper-line);backdrop-filter:blur(var(--message-overlay-blur));-webkit-backdrop-filter:blur(var(--message-overlay-blur));z-index:105;opacity:0;visibility:hidden;pointer-events:none;transform:translateX(-50%) translateY(8px);transition:opacity var(--wall-fade-ms) ease,transform var(--motion-medium),visibility 0s linear var(--wall-fade-ms);isolation:isolate;scrollbar-width:thin;scrollbar-color:rgba(92,67,40,.52) rgba(0,0,0,.06);background-image:radial-gradient(circle at 17% 29%,rgba(112,81,44,var(--message-overlay-texture-opacity)) 0 1px,transparent 1.5px),radial-gradient(circle at 73% 64%,rgba(255,255,255,var(--message-overlay-texture-opacity)) 0 1px,transparent 1.5px);background-size:23px 29px,31px 37px}
-.text-wall.is-open{opacity:1;visibility:visible;pointer-events:auto;transform:translateX(-50%) translateY(0);transition:opacity var(--wall-fade-ms) ease,transform var(--motion-medium),visibility 0s}
+.text-wall{position:absolute;top:var(--control-rail);bottom:var(--bottom-control-rail);left:50%;width:min(var(--wall-max-width),calc(100% - (2 * var(--wall-gap))));height:fit-content;max-height:calc(100% - var(--control-rail) - var(--bottom-control-rail));margin:auto 0;overflow:auto;padding:var(--wall-frame-pad);border:1px solid var(--paper-edge);border-radius:var(--panel-radius);background-color:rgba(var(--message-overlay-rgb),var(--message-overlay-surface-opacity));color:var(--message-ink);box-shadow:0 30px 80px var(--paper-shadow),0 12px 28px rgba(0,0,0,.22),inset 0 1px 0 var(--paper-line);backdrop-filter:blur(var(--message-overlay-blur));-webkit-backdrop-filter:blur(var(--message-overlay-blur));z-index:105;opacity:0;visibility:hidden;pointer-events:none;transform:translateX(-50%) scale(.975);transform-origin:center;transition:opacity var(--motion-overlay),transform var(--motion-overlay),visibility 0s linear var(--duration-overlay);will-change:opacity,transform;isolation:isolate;scrollbar-width:thin;scrollbar-color:rgba(92,67,40,.52) rgba(0,0,0,.06);background-image:radial-gradient(circle at 17% 29%,rgba(112,81,44,var(--message-overlay-texture-opacity)) 0 1px,transparent 1.5px),radial-gradient(circle at 73% 64%,rgba(255,255,255,var(--message-overlay-texture-opacity)) 0 1px,transparent 1.5px);background-size:23px 29px,31px 37px}
+.text-wall.is-open{opacity:1;visibility:visible;pointer-events:auto;transform:translateX(-50%) scale(1);transition:opacity var(--motion-overlay),transform var(--motion-overlay),visibility 0s}
 .text-wall::before{content:"";position:absolute;inset:10px;border:1px solid rgba(116,85,47,.16);border-radius:calc(var(--panel-radius) - 4px);box-shadow:inset 0 0 0 1px rgba(255,255,255,.16),inset 0 18px 28px rgba(255,255,255,.08);pointer-events:none}
 .text-wall::after{content:"";position:absolute;inset:0;border-radius:inherit;background:linear-gradient(180deg,rgba(255,255,255,.16),rgba(255,255,255,0) 22%,rgba(0,0,0,.10) 100%);mix-blend-mode:soft-light;pointer-events:none}
 .text-wall-content{position:relative;z-index:1;max-width:44rem;margin:0 auto;padding:var(--wall-block-pad) var(--wall-inline-pad);color:var(--message-ink);font-family:var(--font-letter);font-size:clamp(17px,1.25vw,20px);line-height:1.68;text-rendering:optimizeLegibility}
@@ -259,11 +267,11 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .text-wall-content :where(img,table){height:auto}
 .text-wall-content :is(a[href^="ultralink:"],a[href^="hypernote:"]){font-style:italic;text-decoration:none !important;cursor:help;outline-offset:3px}
 .text-wall-content :is(a[href^="ultralink:"],a[href^="hypernote:"]):focus-visible{outline:2px solid #00d0ff;border-radius:3px}
-.ultralink-tooltip{position:fixed;left:0;top:0;max-width:min(22rem,calc(100vw - 32px));padding:11px 14px;border:1px solid transparent;border-radius:9px;box-shadow:0 18px 42px rgba(0,0,0,.34);font:500 15px/1.45 Georgia,'Times New Roman',serif;white-space:pre-wrap;overflow-wrap:anywhere;z-index:220;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity var(--motion-fast),transform var(--motion-fast),visibility 0s linear 160ms;pointer-events:none}
+.ultralink-tooltip{position:fixed;left:0;top:0;max-width:min(22rem,calc(100vw - 32px));padding:11px 14px;border:1px solid transparent;border-radius:9px;box-shadow:0 18px 42px rgba(0,0,0,.34);font:500 15px/1.45 Georgia,'Times New Roman',serif;white-space:pre-wrap;overflow-wrap:anywhere;z-index:220;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity var(--motion-overlay),transform var(--motion-overlay),visibility 0s linear var(--duration-overlay);pointer-events:none}
 .ultralink-tooltip.theme-paper{border-color:rgba(112,81,44,.42);background:linear-gradient(180deg,#fff8df,#f2e3bd);color:#24170d;box-shadow:0 18px 42px rgba(0,0,0,.32),inset 0 1px 0 rgba(255,255,255,.65)}
 .ultralink-tooltip.theme-dark{border-color:rgba(255,255,255,.24);background:rgba(7,10,16,.94);color:#fff;box-shadow:0 18px 42px rgba(0,0,0,.46),inset 0 1px 0 rgba(255,255,255,.10)}
 .ultralink-tooltip.theme-minimal{border-color:rgba(0,0,0,.30);background:rgba(255,255,255,.20);color:#000;box-shadow:0 10px 28px rgba(0,0,0,.20);backdrop-filter:blur(10px)}
-.ultralink-tooltip.is-visible{opacity:1;visibility:visible;transform:translateY(0);transition:opacity var(--motion-fast),transform var(--motion-fast),visibility 0s}
+.ultralink-tooltip.is-visible{opacity:1;visibility:visible;transform:translateY(0);transition:opacity var(--motion-overlay),transform var(--motion-overlay),visibility 0s}
 .text-wall::-webkit-scrollbar{width:10px}
 .text-wall::-webkit-scrollbar-track{background:rgba(0,0,0,.06);border-radius:999px}
 .text-wall::-webkit-scrollbar-thumb{background:rgba(92,67,40,.52);border-radius:999px}
@@ -278,24 +286,24 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 #close-text{position:sticky;top:0;left:auto;bottom:auto;display:flex;margin:0 0 0 auto;width:var(--close-size);height:var(--close-size);border-radius:14px;font-size:clamp(24px,2.8vw,28px);line-height:1;z-index:3;transform:scale(.96)}
 #close-text.is-visible{transform:scale(1)}
 
-#volume-control{position:absolute;right:var(--corner-offset);bottom:var(--corner-offset);display:flex;align-items:center;gap:10px;padding:6px;border:1px solid rgba(255,255,255,.08);border-radius:var(--pill-radius);background:rgba(42,46,54,.72);box-shadow:var(--hud-shadow);backdrop-filter:blur(10px);z-index:102;opacity:0;visibility:hidden;pointer-events:none;transform:translateY(0);transition:opacity var(--motion-fast),transform var(--motion-medium),visibility 0s linear 220ms}
+#volume-control{position:absolute;right:var(--corner-offset);bottom:var(--corner-offset);display:flex;align-items:center;gap:10px;padding:6px;border:1px solid rgba(255,255,255,.08);border-radius:var(--pill-radius);background:rgba(42,46,54,.72);box-shadow:var(--hud-shadow);backdrop-filter:blur(10px);z-index:102;opacity:0;visibility:hidden;pointer-events:none;transform:translateY(0);transition:opacity var(--motion-overlay),transform var(--motion-major),visibility 0s linear var(--duration-overlay)}
 body.stage-ready #volume-control{opacity:1;visibility:visible;pointer-events:auto;transition-delay:0s}
 #volume-control.slider-open{border-color:rgba(155,255,251,.18);background:rgba(50,55,64,.82)}
 #volume-icon{flex:none}
 #volume-icon-img{width:var(--icon-size);height:var(--icon-size);padding:6px}
-#volume-slider{width:0;min-width:0;-webkit-appearance:none;appearance:none;height:4px;opacity:0;pointer-events:none;background:rgba(255,255,255,.30);border-radius:2px;transform:scaleX(.92);transform-origin:right center;transition:width var(--motion-medium),opacity var(--motion-fast),transform var(--motion-fast)}
+#volume-slider{width:0;min-width:0;-webkit-appearance:none;appearance:none;height:4px;opacity:0;pointer-events:none;background:rgba(255,255,255,.30);border-radius:2px;transform:scaleX(.92);transform-origin:right center;transition:width var(--motion-major),opacity var(--motion-overlay),transform var(--motion-hover)}
 #volume-control.slider-open #volume-slider{width:var(--slider-width);opacity:1;pointer-events:auto;transform:scaleX(1)}
 #volume-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;background:var(--accent-strong);border-radius:50%;cursor:pointer;border:2px solid #fff;box-shadow:0 0 0 4px rgba(0,255,255,.12)}
 #volume-slider::-moz-range-thumb{width:16px;height:16px;background:var(--accent-strong);border:2px solid #fff;border-radius:50%;cursor:pointer;box-shadow:0 0 0 4px rgba(0,255,255,.12)}
 
 #turn{position:absolute;left:0;top:0;width:0;height:0;opacity:0;pointer-events:none;overflow:hidden;border-radius:var(--page-radius);z-index:40;transform-style:preserve-3d;backface-visibility:hidden;will-change:transform,opacity}
-.sheet{position:absolute;inset:0;overflow:hidden;border-radius:var(--page-radius);transform-style:preserve-3d;backface-visibility:hidden;transform-origin:0 50%;--edgeA:0;--glintA:0}
+.sheet{position:absolute;inset:0;overflow:hidden;border-radius:var(--page-radius);transform-style:preserve-3d;backface-visibility:hidden;transform-origin:0 50%;--edgeA:0;--glintA:0;--edgeDirection:90deg;--glintX:92%}
 .sheet img{display:block;width:100%;height:100%;object-fit:contain;border-radius:var(--page-radius)}
 .sheet.hidden{opacity:0;visibility:hidden}
 .sheet.visible{opacity:1;visibility:visible}
-.sheet::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(90deg,rgba(255,255,255,0) 60%,rgba(255,255,255,var(--edgeA)) 86%,rgba(255,255,255,0) 100%);mix-blend-mode:screen}
-.sheet::before{content:"";position:absolute;inset:-10%;pointer-events:none;background:radial-gradient(320px 220px at 92% 45%,rgba(255,255,255,var(--glintA)) 0%,rgba(255,255,255,0) 62%);mix-blend-mode:overlay}
-#turnShadow{position:absolute;left:0;top:0;width:0;height:0;pointer-events:none;z-index:39;opacity:0;border-radius:var(--page-radius);overflow:hidden;--sx:18%;--sd:.28;--sb:14px;background:radial-gradient(140% 90% at var(--sx) 55%,rgba(0,0,0,var(--sd)) 0%,rgba(0,0,0,0) 62%);filter:blur(var(--sb))}
+.sheet::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(var(--edgeDirection),rgba(255,255,255,0) 60%,rgba(255,255,255,var(--edgeA)) 86%,rgba(255,255,255,0) 100%);mix-blend-mode:screen}
+.sheet::before{content:"";position:absolute;inset:-10%;pointer-events:none;background:radial-gradient(320px 220px at var(--glintX) 45%,rgba(255,255,255,var(--glintA)) 0%,rgba(255,255,255,0) 62%);mix-blend-mode:overlay}
+#turnShadow{position:absolute;left:0;top:0;width:0;height:0;pointer-events:none;z-index:39;opacity:0;border-radius:var(--page-radius);overflow:hidden;--sx:88%;--sd:.04;--sb:8px;background:radial-gradient(110% 82% at var(--sx) 55%,rgba(0,0,0,var(--sd)) 0%,rgba(0,0,0,0) 64%);filter:blur(var(--sb));will-change:background,filter}
 
 @media (max-width: 900px){:root{--nav-size:clamp(48px,8vw,66px);--wall-gap:clamp(18px,4vw,30px)}.text-wall-content{font-size:clamp(16px,1.8vw,18px)}}
 @media (max-width: 640px){:root{--nav-offset:4px;--nav-size:34px;--nav-pad:4px;--icon-size:34px;--close-size:38px;--corner-offset:12px;--control-rail:50px;--bottom-control-rail:60px;--page-side-rail:50px}#prev,#next{top:50%}#volume-control{left:var(--corner-offset);right:auto;bottom:calc(5px + env(safe-area-inset-bottom));padding:4px;transform:none}body.stage-ready #volume-control{transform:none}#viewer-actions{top:10px;left:10px}#viewer-actions-left{gap:5px}#viewer-actions .viewer-action,#fullscreen-button{height:32px;padding:0 8px;font-size:10px}#fullscreen-button{top:10px;right:10px}#open-text{left:auto;right:var(--corner-offset);bottom:calc(5px + env(safe-area-inset-bottom));transform:none}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - var(--control-rail) - var(--bottom-control-rail))}#volume-control.slider-open #volume-slider{width:min(28vw,64px)}}
@@ -334,13 +342,37 @@ document.addEventListener('DOMContentLoaded', () => {
   let music       = document.getElementById('bg-music');
   let musicStandby = document.getElementById('bg-music-standby');
   const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  const curtainIntroRevealMs = prefersReducedMotion ? 80 : 520;
-  const curtainFallbackOpenMs = prefersReducedMotion ? 140 : 2600;
+  const motionStyles = getComputedStyle(document.documentElement);
+  function motionDuration(property, fallbackMs){
+    const raw = motionStyles.getPropertyValue(property).trim();
+    const value = Number.parseFloat(raw);
+    if (!raw || !Number.isFinite(value)) return fallbackMs;
+    return raw.endsWith('s') && !raw.endsWith('ms') ? value * 1000 : value;
+  }
+  function motionValue(property, fallback){
+    return motionStyles.getPropertyValue(property).trim() || fallback;
+  }
+  const motion = Object.freeze({
+    duration: Object.freeze({
+      overlay: motionDuration('--duration-overlay', 180),
+      major: motionDuration('--duration-major', 640),
+      curtain: motionDuration('--duration-curtain', 1500),
+    }),
+    easing: Object.freeze({
+      emphasized: motionValue('--ease-emphasized', 'cubic-bezier(.65,0,.35,1)'),
+    }),
+    ease(value){
+      const t = clamp(value, 0, 1);
+      return t * t * t * (t * ((t * 6) - 15) + 10);
+    },
+  });
+  const curtainIntroRevealMs = prefersReducedMotion ? 80 : motion.duration.major;
+  const curtainOpenMs = prefersReducedMotion ? 140 : motion.duration.curtain;
   const curtainCleanupPadMs = prefersReducedMotion ? 20 : 0;
   const glissSafetyPadMs = prefersReducedMotion ? 120 : 450;
   const musicFadeMs = prefersReducedMotion ? 120 : 900;
   const wallRevealDelayMs = prefersReducedMotion ? 80 : 2200;
-  const wallRevealFadeMs = prefersReducedMotion ? 120 : 900;
+  const wallRevealFadeMs = prefersReducedMotion ? 120 : motion.duration.overlay;
 
   const TOTAL = slides.length;
   let started = false;
@@ -865,17 +897,23 @@ document.addEventListener('DOMContentLoaded', () => {
     turn.style.opacity = visible ? '1' : '0';
     turnShadow.style.opacity = visible ? '1' : '0';
   }
-  function setTurnRotation(degrees){
+  function setTurnRotation(degrees, progress, direction){
     turn.style.transformOrigin = '0% 50%';
     turn.style.transform = `rotateY(${degrees}deg)`;
     const amount = clamp(Math.abs(degrees) / 180, 0, 1);
     const edge = Math.pow(Math.sin(amount * Math.PI), 1.2);
     const glint = Math.pow(Math.sin(amount * Math.PI), 2);
+    const shadowProgress = clamp(progress, 0, 1);
+    const shadowX = direction > 0
+      ? 88 - (76 * shadowProgress)
+      : 12 + (76 * shadowProgress);
     sheetFront.style.setProperty('--edgeA', String(0.28 * edge));
     sheetFront.style.setProperty('--glintA', String(0.22 * glint));
-    turnShadow.style.setProperty('--sx', degrees < 0 ? '26%' : '16%');
-    turnShadow.style.setProperty('--sd', String(0.14 + (0.22 * edge)));
-    turnShadow.style.setProperty('--sb', `${10 + (10 * edge)}px`);
+    sheetFront.style.setProperty('--edgeDirection', direction > 0 ? '90deg' : '270deg');
+    sheetFront.style.setProperty('--glintX', direction > 0 ? '92%' : '8%');
+    turnShadow.style.setProperty('--sx', `${shadowX}%`);
+    turnShadow.style.setProperty('--sd', String(0.04 + (0.16 * edge)));
+    turnShadow.style.setProperty('--sb', `${8 + (8 * edge)}px`);
   }
   function finishTurn(currentSlide, targetSlide, targetIndex){
     currentSlide.classList.remove('ghost');
@@ -908,6 +946,7 @@ document.addEventListener('DOMContentLoaded', () => {
     slideshowEl.setAttribute('aria-busy', 'true');
 
     const goingNext = target > idx;
+    const direction = goingNext ? 1 : -1;
     const currentSlide = slides[idx];
     const targetSlide = slides[target];
     prepareImageAnimation(target);
@@ -921,24 +960,22 @@ document.addEventListener('DOMContentLoaded', () => {
     if (goingNext){
       targetSlide.classList.add('peek');
       currentSlide.classList.add('ghost');
-      setTurnRotation(0);
+      setTurnRotation(0, 0, direction);
     } else {
-      setTurnRotation(-180);
+      setTurnRotation(-180, 0, direction);
     }
     setTurnVisible(true);
     playFlip();
 
-    const duration = 620;
+    const duration = motion.duration.major;
     const startedAt = performance.now();
     function animate(now){
       const raw = clamp((now - startedAt) / duration, 0, 1);
-      const eased = raw < 0.5
-        ? 4 * raw * raw * raw
-        : 1 - (Math.pow((-2 * raw) + 2, 3) / 2);
+      const eased = motion.ease(raw);
       const degrees = goingNext
         ? -180 * eased
         : -180 + (180 * eased);
-      setTurnRotation(degrees);
+      setTurnRotation(degrees, eased, direction);
       if (raw < 1){
         requestAnimationFrame(animate);
         return;
@@ -1097,10 +1134,10 @@ document.addEventListener('DOMContentLoaded', () => {
   function glissDurationMs(audioEl){
     const d = audioEl && Number.isFinite(audioEl.duration) ? audioEl.duration : 0;
     if (d > 0.25) return Math.round(d * 1000);
-    return curtainFallbackOpenMs;
+    return curtainOpenMs;
   }
-  function runCurtainMotion(durationMs, onDone){
-    const openMs = prefersReducedMotion ? 140 : Math.max(500, Math.round(durationMs || curtainFallbackOpenMs));
+  function runCurtainMotion(onDone){
+    const openMs = curtainOpenMs;
     overlay.style.opacity = '1';
     overlay.style.animation = 'none';
     overlay.style.background = 'transparent';
@@ -1111,8 +1148,8 @@ document.addEventListener('DOMContentLoaded', () => {
     cLeft.style.animation = 'none';
     cRight.style.animation = 'none';
     void cLeft.offsetWidth;
-    cLeft.style.animation = `curtainLeftOut ${openMs}ms cubic-bezier(.2,.9,.1,1) forwards`;
-    cRight.style.animation = `curtainRightOut ${openMs}ms cubic-bezier(.2,.9,.1,1) forwards`;
+    cLeft.style.animation = `curtainLeftOut ${openMs}ms ${motion.easing.emphasized} forwards`;
+    cRight.style.animation = `curtainRightOut ${openMs}ms ${motion.easing.emphasized} forwards`;
     setTimeout(() => {
       overlay.style.pointerEvents = 'none';
       overlay.setAttribute('aria-hidden', 'true');
@@ -1174,7 +1211,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function beginGlissAndCurtain(g){
       if (introMotionStarted) return;
       introMotionStarted = true;
-      const openMs = runCurtainMotion(glissDurationMs(g), () => {
+      const openMs = runCurtainMotion(() => {
         curtainDone = true;
         tryUnlockIntroControls();
       });
@@ -1182,7 +1219,8 @@ document.addEventListener('DOMContentLoaded', () => {
         g.currentTime = 0;
         g.play().catch(() => startMusicAfterGliss());
       }catch(_){ startMusicAfterGliss(); }
-      safetyTimer = setTimeout(startMusicAfterGliss, openMs + glissSafetyPadMs);
+      const glissWaitMs = Math.max(openMs, glissDurationMs(g));
+      safetyTimer = setTimeout(startMusicAfterGliss, glissWaitMs + glissSafetyPadMs);
     }
     try{
       const g = new Audio(glissSrc);
@@ -1195,7 +1233,7 @@ document.addEventListener('DOMContentLoaded', () => {
       g.load();
       setTimeout(() => beginGlissAndCurtain(g), 250);
     }catch(_){
-      const openMs = runCurtainMotion(curtainFallbackOpenMs, () => { curtainDone = true; tryUnlockIntroControls(); });
+      const openMs = runCurtainMotion(() => { curtainDone = true; tryUnlockIntroControls(); });
       setTimeout(startMusicAfterGliss, openMs);
     }
   }

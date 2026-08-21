@@ -66,6 +66,7 @@ from sound_model import (
 from project_state import ensure_project_identity
 from settings_store import DEFAULT_SETTINGS, SettingsStore, VALID_CURTAIN_STYLES
 from transactional_io import PathTransaction, cleanup_abandoned_staging
+from settings_store import SettingsStore
 from config import (
     SETTINGS_FILE,
     DEFAULT_VOLUME,
@@ -279,14 +280,10 @@ def _read_text_safe(path: Path) -> str:
 
 
 def _load_settings(project_root: Path) -> dict:
-    path = project_root / SETTINGS_FILE
-    if not path.is_file():
-        return {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        return SettingsStore(project_root).snapshot()
+    except (OSError, ValueError):
         return {}
-    return payload if isinstance(payload, dict) else {}
 
 
 def _recipient_from_settings(settings: dict) -> str:

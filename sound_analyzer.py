@@ -6,11 +6,10 @@ from __future__ import annotations
 import base64
 import json
 import math
-import os
-import tempfile
 
 from config import USER_SOUNDS_DIR
 from audio_tools import AudioToolError, decode_mono_pcm16
+from transactional_io import atomic_write_json
 
 import zlib
 from dataclasses import dataclass
@@ -107,18 +106,7 @@ def _beat_from_bass(bass_norm, hop_ms: int) -> List[float]:
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
-    destination = Path(path).resolve()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
-    )
-    os.close(fd)
-    tmp = Path(tmp_name)
-    try:
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        os.replace(tmp, destination)
-    finally:
-        tmp.unlink(missing_ok=True)
+    atomic_write_json(path, payload)
 
 
 @dataclass
@@ -291,7 +279,10 @@ class AudioAnalysisWorker(QtCore.QObject):
         try:
             beat_n = _norm_by_percentiles(beat_n, 0.0, 100.0)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         # Profile summary for visuals
         bass_mean = float(np.mean(bass_n))
@@ -518,14 +509,20 @@ class AudioAnalysisManager(QtCore.QObject):
             if self._worker is not None:
                 self._worker.abort()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
         if self._thread is not None:
             try:
                 self._thread.quit()
                 self._thread.wait(2000)
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
 
         self._worker = None
         self._thread = None

@@ -591,9 +591,16 @@ class SavedLetterRestorer:
             entry.project_id,
             recipient_id=entry.recipient_id,
         )
-        play_dir = self._validated_play_directory(
-            resolved or entry.path
-        )
+        try:
+            play_dir = self._validated_play_directory(resolved or entry.path)
+        except SavedLetterRestoreError:
+            if resolved is None or resolved.resolve() == entry.path.resolve():
+                raise
+            _LOGGER.info(
+                "Editable snapshot is not a viewer bundle; loading generated letter: %s",
+                entry.path,
+            )
+            play_dir = self._validated_play_directory(entry.path)
         pages = _runtime_directory(
             play_dir,
             "gallery/pages",

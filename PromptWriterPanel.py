@@ -19,6 +19,7 @@ from PySide6.QtCore import Qt, QEasingCurve, QUrl
 from PySide6.QtGui import QDesktopServices, QColor
 from PySide6.QtWidgets import QGraphicsDropShadowEffect
 
+from app_paths import resolve_application_root
 from app_icon import apply_qt_window_icon, configure_windows_app_identity
 from settings_store import (
     DEFAULT_VISIONARY_URL,
@@ -457,7 +458,10 @@ class ListManagerDialog(QtWidgets.QDialog):
             try:
                 app.removeEventFilter(self)
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
         super().closeEvent(event)
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
@@ -1311,14 +1315,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
     # Persistence
     # -----------------------
     def _discover_project_root(self) -> Path:
-        here = Path(__file__).resolve()
-        for up in (here.parent, here.parent.parent, here.parent.parent.parent):
-            if (up / "settings.json").exists() or (up / "gallery").exists():
-                return up
-        cwd = Path.cwd()
-        if (cwd / "settings.json").exists() or (cwd / "gallery").exists():
-            return cwd
-        return here.parent
+        return resolve_application_root()
 
     def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.MouseButtonDblClick:
@@ -2736,7 +2733,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._visionary_timer.timeout.connect(self._tick_visionary_pulse)
             self._visionary_timer.start()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     def _tick_visionary_pulse(self):
         try:
@@ -2759,7 +2759,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
         try:
             self.btn_visionary.setStyleSheet(style)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
 
     def popup(self):
         self._hide_timer.stop()
@@ -2834,7 +2837,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
                 event.accept(); return
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
@@ -2849,14 +2855,20 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 self.move(x, y)
                 event.accept(); return
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         try:
             self._drag_pos = None
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
@@ -2866,7 +2878,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 self._toggle_max_restore()
                 event.accept(); return
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         super().mouseDoubleClickEvent(event)
 
     def shutdown(self) -> None:
@@ -2878,7 +2893,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
         try:
             self._persist_state_now()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
         visionary_timer = getattr(self, "_visionary_timer", None)
         if visionary_timer is not None:
             visionary_timer.stop()
@@ -2890,7 +2908,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
             try:
                 dialog.close()
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Best-effort operation failed.",
+                    exc_info=True,
+                )
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.shutdown()

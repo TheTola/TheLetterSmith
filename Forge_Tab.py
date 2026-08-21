@@ -41,6 +41,12 @@ from settings_store import (
     SettingsStore,
     normalize_published_page_url,
 )
+from ui_constants import (
+    CATALOG_REFRESH_DEBOUNCE_MS,
+    FORGE_REFRESH_DEBOUNCE_MS,
+    SHUTDOWN_TIMEOUT_MS,
+    TRANSIENT_STATUS_MS,
+)
 
 
 PREVIEW_MODE_KEY = "forge_preview_mode"
@@ -698,7 +704,7 @@ class ForgeTab(QtWidgets.QWidget):
 
         self._refresh_timer = QtCore.QTimer(self)
         self._refresh_timer.setSingleShot(True)
-        self._refresh_timer.setInterval(120)
+        self._refresh_timer.setInterval(FORGE_REFRESH_DEBOUNCE_MS)
         self._refresh_timer.timeout.connect(self.refresh_project_state)
         self._settings_refresh_requested.connect(self._refresh_timer.start)
         self.settings.changed.connect(self._on_settings_changed)
@@ -709,7 +715,7 @@ class ForgeTab(QtWidgets.QWidget):
 
         self._catalog_refresh_timer = QtCore.QTimer(self)
         self._catalog_refresh_timer.setSingleShot(True)
-        self._catalog_refresh_timer.setInterval(180)
+        self._catalog_refresh_timer.setInterval(CATALOG_REFRESH_DEBOUNCE_MS)
         self._catalog_refresh_timer.timeout.connect(self.refresh_saved_letters)
         self._catalog_watcher = QtCore.QFileSystemWatcher(self)
         self._catalog_watcher.directoryChanged.connect(
@@ -778,6 +784,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._main_layout.addLayout(heading_row)
 
         self.load_saved_btn = self._small_button("Load Letters")
+        self.load_saved_btn.setToolTip("Load Letters (Ctrl+O)")
         self.load_saved_btn.setMinimumSize(150, 36)
         self.load_saved_btn.clicked.connect(self.show_saved_letters)
         saved_holder = QtWidgets.QHBoxLayout()
@@ -996,10 +1003,14 @@ class ForgeTab(QtWidgets.QWidget):
         self.preview_btn = self._action_button(
             "Preview Letter", "#b86600", "#f09b18"
         )
+        self.preview_btn.setToolTip("Preview Letter (Ctrl+P)")
         self.preview_btn.clicked.connect(self.preview_letter)
         actions.addWidget(self.preview_btn, 4)
         self.publish_btn = self._action_button(
             "Publish Letter", "#5a45bb", "#7c67de"
+        )
+        self.publish_btn.setToolTip(
+            "Publish Letter — complete required readiness items first."
         )
         self.publish_btn.clicked.connect(self.publish_letter)
         actions.addWidget(self.publish_btn, 4)
@@ -1172,6 +1183,24 @@ class ForgeTab(QtWidgets.QWidget):
         self._sync_heading_balance()
         self.preview_btn.setEnabled(not self._busy and result.can_preview)
         self.publish_btn.setEnabled(not self._busy and result.can_publish)
+        if result.can_preview:
+            self.preview_btn.setToolTip("Preview Letter (Ctrl+P)")
+        else:
+            missing = next(
+                (item for item in result.missing_items if item.required),
+                None,
+            )
+            hint = missing.detail if missing is not None else "Complete project readiness."
+            self.preview_btn.setToolTip(f"Preview unavailable — {hint}")
+        if result.can_publish:
+            self.publish_btn.setToolTip("Publish Letter")
+        else:
+            missing = next(
+                (item for item in result.missing_items if item.required),
+                None,
+            )
+            hint = missing.detail if missing is not None else "Complete project readiness."
+            self.publish_btn.setToolTip(f"Publish unavailable — {hint}")
         return result
 
     def show_saved_letters(self) -> None:
@@ -2240,7 +2269,7 @@ class ForgeTab(QtWidgets.QWidget):
         if self._busy:
             return
         self._busy = True
-        self._set_busy(True)
+        self._set_busy(True, activity=activity)
         self._set_status(activity, timeout_ms=0)
 
         thread = QtCore.QThread(self)
@@ -2338,7 +2367,7 @@ class ForgeTab(QtWidgets.QWidget):
             self._preview_refresh_requested = False
             QtCore.QTimer.singleShot(0, self.ensure_preview_current)
 
-    def _set_busy(self, busy: bool) -> None:
+    def _set_busy(self, busy: bool, *, activity: str = "") -> None:
         for card in self._saved_cards:
             card.setEnabled(not busy)
         self.saved_archive_recipient.setEnabled(not busy)
@@ -2349,10 +2378,25 @@ class ForgeTab(QtWidgets.QWidget):
         self.preview_mode.setEnabled(not busy)
         self.readiness_btn.setEnabled(not busy)
         if busy:
+            self._busy_button_texts = {
+                self.preview_btn: self.preview_btn.text(),
+                self.publish_btn: self.publish_btn.text(),
+                self.load_saved_btn: self.load_saved_btn.text(),
+            }
+            lowered = activity.casefold()
+            if "publish" in lowered:
+                self.publish_btn.setText("Publishing…")
+            elif "load" in lowered or "restor" in lowered:
+                self.load_saved_btn.setText("Loading…")
+            else:
+                self.preview_btn.setText("Generating…")
             self.preview_btn.setEnabled(False)
             self.publish_btn.setEnabled(False)
             self.open_published_btn.setEnabled(False)
         else:
+            for button, text in getattr(self, "_busy_button_texts", {}).items():
+                button.setText(text)
+            self._busy_button_texts = {}
             self.refresh_readiness()
             self._sync_published_url()
 
@@ -2361,7 +2405,7 @@ class ForgeTab(QtWidgets.QWidget):
         message: str,
         *,
         error: bool = False,
-        timeout_ms: int = 4500,
+        timeout_ms: int = TRANSIENT_STATUS_MS,
     ) -> None:
         self.status.setText(message)
         color = "#ff9a9a" if error else "#a9cbd6"
@@ -2401,7 +2445,7 @@ class ForgeTab(QtWidgets.QWidget):
         self.deactivate_for_tab_change()
         super().hideEvent(event)
 
-    def shutdown_operations(self, timeout_ms: int = 5000) -> bool:
+    def shutdown_operations(self, timeout_ms: int = SHUTDOWN_TIMEOUT_MS) -> bool:
         thread = self._worker_thread
         if thread is None or not thread.isRunning():
             return True

@@ -25,6 +25,8 @@ from html import unescape
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from app_paths import resolve_application_root
+from settings_store import SettingsStore
 from transactional_io import atomic_write_json
 
 
@@ -41,7 +43,7 @@ DEFAULT_AUDIO = "music.mp3"
 
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parent
+    return resolve_application_root()
 
 
 _PROJECT_ROOT = _project_root()
@@ -184,67 +186,13 @@ WINDOWS_RESERVED_FOLDER_NAMES = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_settings(project_root: str | Path) -> Dict:
-    pr = Path(project_root)
-    path = pr / SETTINGS_FILE
-
     try:
-        if path.exists():
-            data = json.loads(
-                path.read_text(encoding="utf-8")
-            )
-        else:
-            data = {}
+        return SettingsStore(project_root).snapshot()
     except Exception:
-        data = {}
+        import logging
 
-    updated = False
-
-    # Starting volume must remain between 0 and 100.
-    try:
-        volume = int(
-            data.get(
-                "starting_volume",
-                DEFAULT_VOLUME,
-            )
-        )
-        volume = max(0, min(100, volume))
-    except Exception:
-        volume = DEFAULT_VOLUME
-
-    if data.get("starting_volume") != volume:
-        data["starting_volume"] = volume
-        updated = True
-
-    # Store only the audio filename rather than a full path.
-    last_audio = data.get(
-        "last_audio",
-        DEFAULT_AUDIO,
-    )
-
-    try:
-        last_audio = Path(
-            str(last_audio)
-        ).name
-    except Exception:
-        last_audio = DEFAULT_AUDIO
-
-    if data.get("last_audio") != last_audio:
-        data["last_audio"] = last_audio
-        updated = True
-
-    if updated:
-        try:
-            path.write_text(
-                json.dumps(
-                    data,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
-
-    return data
+        logging.getLogger(__name__).exception("Configuration settings could not be loaded.")
+        return dict()
 
 
 _SETTINGS = _load_settings(_PROJECT_ROOT)
