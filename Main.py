@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -42,6 +43,35 @@ from startup_check import run_startup_self_check
 # =============================================================================
 # Application identity
 # =============================================================================
+
+_SENSITIVE_QUERY_PATTERN = re.compile(
+    r"(?i)([?&](?:access_token|refresh_token|client_secret|code|code_verifier|"
+    r"code_challenge|device_code|state|user_code)=)[^&#\s]+"
+)
+_SENSITIVE_FIELD_PATTERN = re.compile(
+    r"(?ix)(\b(?:access_token|refresh_token|secret_access_key|access_key_id|"
+    r"client_secret|code_verifier|device_code|user_code)\b\s*[\"']?\s*[:=]\s*[\"']?)"
+    r"[^\"'\s,;&}\]]+"
+)
+_AUTHORIZATION_PATTERN = re.compile(
+    r"(?ix)(\bAuthorization\b\s*[\"']?\s*[:=]\s*[\"']?)"
+    r"(?:Bearer\s+)?[^\"',;\r\n}\]]+"
+)
+_BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[^\s,;\"'}\]]+")
+_GITHUB_TOKEN_PATTERN = re.compile(
+    r"\bgh[a-z]_[A-Za-z0-9]{16,}\b",
+    re.IGNORECASE,
+)
+
+
+def redact_sensitive_diagnostics(value: object) -> str:
+    """Remove authentication material from rendered diagnostic text."""
+    text = str(value)
+    text = _SENSITIVE_QUERY_PATTERN.sub(r"\1[REDACTED]", text)
+    text = _SENSITIVE_FIELD_PATTERN.sub(r"\1[REDACTED]", text)
+    text = _AUTHORIZATION_PATTERN.sub(r"\1[REDACTED]", text)
+    text = _BEARER_PATTERN.sub("Bearer [REDACTED]", text)
+    return _GITHUB_TOKEN_PATTERN.sub("[REDACTED]", text)
 
 # =============================================================================
 # Environment and project root

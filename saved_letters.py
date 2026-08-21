@@ -42,6 +42,15 @@ from recipient_registry import RecipientRegistry
 from readiness import ReadinessResult
 from settings_store import (
     ACTIVE_PLAY_DIR_KEY,
+    PUBLICATION_PROVIDER_KEY,
+    PUBLICATION_VERIFIED_KEY,
+    PUBLISHED_AT_KEY,
+    PUBLISHED_EXPIRES_AT_KEY,
+    PUBLISHED_GITHUB_OWNER_KEY,
+    PUBLISHED_GITHUB_REPOSITORY_KEY,
+    PUBLISHED_PAGE_URL_KEY,
+    PUBLISHED_PUBLIC_PATH_KEY,
+    PUBLISHED_SOURCE_FINGERPRINT_KEY,
     SettingsStore,
     normalize_published_page_url,
 )
@@ -1333,6 +1342,50 @@ def record_saved_letter_activity(
     return timestamp
 
 
+def update_saved_publication_metadata(
+    play_dir: str | Path,
+    project_root: str | Path,
+) -> dict[str, Any]:
+    destination = Path(play_dir).resolve()
+    if not destination.is_dir():
+        raise FileNotFoundError(f"Saved letter does not exist: {destination}")
+    metadata_path = destination / PLAY_METADATA_FILE
+    metadata = _read_metadata(destination)
+    state = SettingsStore(project_root).snapshot()
+    metadata.update(
+        {
+            PUBLISHED_PAGE_URL_KEY: normalize_published_page_url(
+                state.get(PUBLISHED_PAGE_URL_KEY, "")
+            ),
+            PUBLISHED_PUBLIC_PATH_KEY: str(
+                state.get(PUBLISHED_PUBLIC_PATH_KEY, "")
+            ).strip(),
+            PUBLISHED_AT_KEY: str(state.get(PUBLISHED_AT_KEY, "")).strip(),
+            PUBLISHED_EXPIRES_AT_KEY: str(
+                state.get(PUBLISHED_EXPIRES_AT_KEY, "")
+            ).strip(),
+            PUBLICATION_PROVIDER_KEY: str(
+                state.get(PUBLICATION_PROVIDER_KEY, "")
+            ).strip(),
+            PUBLICATION_VERIFIED_KEY: (
+                state.get(PUBLICATION_VERIFIED_KEY) is True
+            ),
+            PUBLISHED_SOURCE_FINGERPRINT_KEY: str(
+                state.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")
+            ).strip(),
+            PUBLISHED_GITHUB_OWNER_KEY: str(
+                state.get(PUBLISHED_GITHUB_OWNER_KEY, "")
+            ).strip(),
+            PUBLISHED_GITHUB_REPOSITORY_KEY: str(
+                state.get(PUBLISHED_GITHUB_REPOSITORY_KEY, "")
+            ).strip(),
+        }
+    )
+    metadata["public_path"] = metadata[PUBLISHED_PUBLIC_PATH_KEY]
+    atomic_write_json(metadata_path, metadata)
+    return metadata
+
+
 __all__ = [
     "METADATA_VERSION",
     "LAST_ACTIVITY_AT_KEY",
@@ -1347,4 +1400,5 @@ __all__ = [
     "record_saved_letter_activity",
     "SavedLetterRestorer",
     "update_saved_metadata",
+    "update_saved_publication_metadata",
 ]

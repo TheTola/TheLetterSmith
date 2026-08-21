@@ -13,12 +13,25 @@ from config import MESSAGE_HTML_FILE, ensure_output_dirs
 from message_html import read_text_normalized
 from publishing import GitHubPagesPublisher, PublishResult
 from publishing.expiration import (
+    GITHUB_PAGES_PROVIDER_ID,
     PUBLISHED_EXPIRES_AT_KEY,
     is_publication_expiration_malformed,
     is_publication_expired,
     publication_expiry_label,
+    publication_status,
 )
+from publishing.github_auth import (
+    GitHubAPI,
+    GitHubAccount,
+    GitHubAuthenticator,
+    GitHubCredentialStore,
+    GitHubDeviceAuthorization,
+    GitHubOperationError,
+    GitHubSession,
+)
+from publishing.github_config import github_application_configuration
 from publishing.github_pages import PUBLIC_WARNING_KEY
+from publishing.github_ui import GitHubAccountDialog, GitHubDeviceFlowDialog
 from readiness import ReadinessResult, evaluate_readiness
 from project_paths import ProjectPathResolver
 from project_state import (
@@ -34,10 +47,18 @@ from saved_letters import (
     SavedLetterRestorer,
     record_saved_letter_activity,
     update_saved_metadata,
+    update_saved_publication_metadata,
 )
 from settings_store import (
     ACTIVE_PLAY_DIR_KEY,
+    PUBLICATION_PROVIDER_KEY,
+    PUBLICATION_VERIFIED_KEY,
+    PUBLISHED_AT_KEY,
+    PUBLISHED_GITHUB_OWNER_KEY,
+    PUBLISHED_GITHUB_REPOSITORY_KEY,
     PUBLISHED_PAGE_URL_KEY,
+    PUBLISHED_PUBLIC_PATH_KEY,
+    PUBLISHED_SOURCE_FINGERPRINT_KEY,
     SettingsStore,
     normalize_published_page_url,
 )
@@ -669,6 +690,15 @@ class ForgeTab(QtWidgets.QWidget):
         self._operation_failure: Optional[Callable[[], None]] = None
         self._operation_error_message = ""
         self._restore_operation_active = False
+        self._github_account: GitHubAccount | None = None
+        self._github_session: GitHubSession | None = None
+        self._github_account_checked = False
+        self._github_account_checking = False
+        self._github_account_error = ""
+        self._github_account_worker: Optional[_TaskWorker] = None
+        self._github_account_thread: Optional[QtCore.QThread] = None
+        self._github_sign_in_cancelled = False
+        self._pending_publish_context: tuple | None = None
         self._selected_saved_letter: Optional[SavedLetter] = None
         self._pending_recipient_entry: Optional[SavedLetter] = None
         self._saved_cards: list[SavedLetterCard] = []
@@ -695,6 +725,17 @@ class ForgeTab(QtWidgets.QWidget):
         self.readiness_window = ReadinessWindow(self.project_root)
         self.readiness_window.correction_requested.connect(
             self.correction_requested.emit
+        )
+        self.github_account_dialog = GitHubAccountDialog(self)
+        self.github_account_dialog.sign_in_requested.connect(
+            self.sign_in_github
+        )
+        self.github_account_dialog.sign_out_requested.connect(
+            self.sign_out_github
+        )
+        self.github_device_dialog = GitHubDeviceFlowDialog(self)
+        self.github_device_dialog.cancel_requested.connect(
+            self._cancel_github_sign_in
         )
         self._init_ui()
 
@@ -736,6 +777,7 @@ class ForgeTab(QtWidgets.QWidget):
 
         self.refresh_saved_letters()
         self.refresh_project_state()
+        QtCore.QTimer.singleShot(0, self._validate_github_account_async)
 
     def _saved_preview_mode(self) -> str:
         value = str(self.settings.get(PREVIEW_MODE_KEY, "portrait")).strip()
@@ -998,6 +1040,30 @@ class ForgeTab(QtWidgets.QWidget):
         )
         format_row.addWidget(self.preview_mode)
 
+        publishing_row = QtWidgets.QHBoxLayout()
+        publishing_row.setContentsMargins(0, 0, 0, 0)
+        publishing_row.setSpacing(9)
+        publishing_row.addWidget(self._muted_label("Online hosting"))
+        self.publishing_provider_label = QtWidgets.QLabel("GitHub Pages")
+        self.publishing_provider_label.setStyleSheet(
+            "color:#e8f9ff;font:600 10pt 'Segoe UI';"
+        )
+        publishing_row.addWidget(self.publishing_provider_label)
+        self.github_account_summary = QtWidgets.QLabel()
+        self.github_account_summary.setStyleSheet(
+            "color:#9fcbd5;font:600 9pt 'Segoe UI';"
+        )
+        publishing_row.addWidget(self.github_account_summary)
+        publishing_row.addStretch(1)
+        self.github_account_btn = self._small_button("GitHub Account")
+        self.github_account_btn.setToolTip(
+            "Sign in with GitHub or review the connected GitHub account."
+        )
+        self.github_account_btn.clicked.connect(self.show_github_account)
+        publishing_row.addWidget(self.github_account_btn)
+        self._main_layout.addLayout(publishing_row)
+        self._sync_publishing_controls()
+
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(10)
         self.preview_btn = self._action_button(
@@ -1097,6 +1163,320 @@ class ForgeTab(QtWidgets.QWidget):
     ) -> None:
         self._settings_refresh_requested.emit()
 
+    def _sync_publishing_controls(self) -> None:
+        configuration = github_application_configuration()
+        if self._github_account_checking:
+            summary = "Checking connection…"
+        elif self._github_account is not None:
+            summary = f"Connected as {self._github_account.login}"
+        elif self._github_account_error:
+            summary = "Connection unavailable"
+        elif not configuration.configured:
+            summary = "Developer setup required"
+        else:
+            summary = "Not connected"
+        self.github_account_summary.setText(summary)
+        self.github_account_dialog.set_account(
+            self._github_account,
+            checking=self._github_account_checking,
+            message=self._github_account_error,
+        )
+
+    def show_github_account(self) -> None:
+        self._sync_publishing_controls()
+        owner = self.window()
+        self.github_account_dialog.show()
+        center = owner.mapToGlobal(owner.rect().center())
+        frame = self.github_account_dialog.frameGeometry()
+        frame.moveCenter(center)
+        self.github_account_dialog.move(frame.topLeft())
+        self.github_account_dialog.raise_()
+        self.github_account_dialog.activateWindow()
+        if not self._github_account_checking:
+            self._validate_github_account_async()
+
+    def _validate_github_account_async(self) -> None:
+        if self._github_account_checking:
+            return
+        thread = self._github_account_thread
+        if thread is not None and thread.isRunning():
+            return
+        try:
+            stored = GitHubCredentialStore().load()
+        except GitHubOperationError as error:
+            self._github_account_validation_failed(
+                error.user_message,
+                error.technical_details,
+                True,
+            )
+            self._sync_publishing_controls()
+            return
+        if stored is None:
+            self._github_session = None
+            self._github_account = None
+            self._github_account_checked = True
+            self._github_account_error = ""
+            self._sync_publishing_controls()
+            return
+        self._github_account_checking = True
+        self._sync_publishing_controls()
+        thread = QtCore.QThread(self)
+        worker = _TaskWorker(
+            lambda: GitHubAuthenticator(
+                api=GitHubAPI(timeout=6.0)
+            ).validate_stored()
+        )
+        worker.moveToThread(thread)
+        self._github_account_thread = thread
+        self._github_account_worker = worker
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(
+            self._github_account_validation_succeeded,
+            Qt.QueuedConnection,
+        )
+        worker.failed.connect(
+            self._github_account_validation_failed,
+            Qt.QueuedConnection,
+        )
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(
+            self._github_account_validation_finished,
+            Qt.QueuedConnection,
+        )
+        thread.start()
+
+    @QtCore.Slot(object)
+    def _github_account_validation_succeeded(self, result: object) -> None:
+        session = result if isinstance(result, GitHubSession) else None
+        self._github_session = session
+        self._github_account = session.account if session is not None else None
+        self._github_account_checked = True
+        self._github_account_error = ""
+
+    @QtCore.Slot(str, str, bool)
+    def _github_account_validation_failed(
+        self,
+        message: str,
+        technical: str,
+        _user_safe: bool,
+    ) -> None:
+        self._github_session = None
+        self._github_account = None
+        self._github_account_checked = True
+        self._github_account_error = (
+            "Could not reach GitHub. Local Letter Smith features remain available."
+        )
+        _LOGGER.warning(
+            "GitHub account validation failed: %s\n%s",
+            message,
+            technical,
+        )
+        self.github_account_dialog.set_account(
+            None,
+            message=self._github_account_error,
+        )
+
+    @QtCore.Slot()
+    def _github_account_validation_finished(self) -> None:
+        thread = self._github_account_thread
+        self._github_account_worker = None
+        self._github_account_thread = None
+        self._github_account_checking = False
+        self._sync_publishing_controls()
+        if thread is not None:
+            thread.deleteLater()
+
+    def _run_github_task(self, task: Callable[[], object]) -> object:
+        try:
+            return task()
+        except GitHubOperationError as error:
+            if error.technical_details:
+                _LOGGER.error(
+                    "GitHub operation failed: code=%s details=%s",
+                    error.code,
+                    error.technical_details,
+                )
+            raise _ForgeOperationError(error.user_message) from error
+
+    @QtCore.Slot()
+    def sign_in_github(self) -> None:
+        if self._busy:
+            return
+        configuration = github_application_configuration()
+        if not configuration.configured:
+            message = (
+                "GitHub publishing is not configured in this Letter Smith build."
+            )
+            self.github_account_dialog.set_account(None, message=message)
+            self._set_status(message, error=True)
+            self.show_github_account()
+            return
+        self._github_sign_in_cancelled = False
+        authenticator = GitHubAuthenticator(configuration)
+        self._start_operation(
+            "Requesting GitHub sign-in…",
+            lambda: self._run_github_task(
+                authenticator.begin_device_authorization
+            ),
+            self._github_device_authorization_ready,
+            "GitHub sign-in could not be started.",
+            on_failure=self._github_sign_in_failed,
+        )
+
+    def _github_device_authorization_ready(self, result: object) -> None:
+        if not isinstance(result, GitHubDeviceAuthorization):
+            raise TypeError("GitHub returned an invalid device authorization.")
+        self.github_device_dialog.set_authorization(result)
+        owner = self.window()
+        self.github_device_dialog.show()
+        center = owner.mapToGlobal(owner.rect().center())
+        frame = self.github_device_dialog.frameGeometry()
+        frame.moveCenter(center)
+        self.github_device_dialog.move(frame.topLeft())
+        self.github_device_dialog.raise_()
+        self.github_device_dialog.activateWindow()
+        self.github_device_dialog.open_github()
+        self._defer_until_idle(
+            lambda: self._poll_github_authorization(result)
+        )
+
+    def _poll_github_authorization(
+        self,
+        authorization: GitHubDeviceAuthorization,
+    ) -> None:
+        authenticator = GitHubAuthenticator()
+        cancelled = lambda: (
+            self._github_sign_in_cancelled
+            or QtCore.QThread.currentThread().isInterruptionRequested()
+        )
+
+        def task() -> tuple[GitHubSession, bool]:
+            session = authenticator.poll_device_authorization(
+                authorization,
+                cancelled=cancelled,
+            )
+            return session, authenticator.installation_present(session)
+
+        self._start_operation(
+            "Waiting for GitHub authorization…",
+            lambda: self._run_github_task(task),
+            self._github_authorization_completed,
+            "GitHub sign-in could not be completed.",
+            on_failure=self._github_sign_in_failed,
+        )
+
+    def _github_authorization_completed(self, result: object) -> None:
+        session, installed = tuple(result)
+        if not isinstance(session, GitHubSession):
+            raise TypeError("GitHub returned an invalid authenticated session.")
+        self._github_session = session
+        self._github_account = session.account
+        self._sync_publishing_controls()
+        if bool(installed):
+            self.github_device_dialog.finish()
+            self._defer_until_idle(
+                lambda: self._finish_github_sign_in(session)
+            )
+            return
+        installation_url = GitHubAuthenticator().installation_url
+        if not installation_url:
+            raise _ForgeOperationError(
+                "GitHub publishing setup is incomplete in this Letter Smith build."
+            )
+        self.github_device_dialog.set_installation_step(installation_url)
+        self.github_device_dialog.open_github()
+        self._defer_until_idle(
+            lambda: self._wait_for_github_installation(session)
+        )
+
+    def _wait_for_github_installation(self, session: GitHubSession) -> None:
+        authenticator = GitHubAuthenticator()
+        cancelled = lambda: (
+            self._github_sign_in_cancelled
+            or QtCore.QThread.currentThread().isInterruptionRequested()
+        )
+        self._start_operation(
+            "Waiting for GitHub setup…",
+            lambda: self._run_github_task(
+                lambda: authenticator.wait_for_installation(
+                    session,
+                    cancelled=cancelled,
+                )
+            ),
+            self._github_installation_completed,
+            "GitHub setup could not be completed.",
+            on_failure=self._github_sign_in_failed,
+        )
+
+    def _github_installation_completed(self, result: object) -> None:
+        if not isinstance(result, GitHubSession):
+            raise TypeError("GitHub returned an invalid authenticated session.")
+        self.github_device_dialog.finish()
+        self._finish_github_sign_in(result)
+
+    def _finish_github_sign_in(self, session: GitHubSession) -> None:
+        self._github_session = session
+        self._github_account = session.account
+        self._github_account_checked = True
+        self._github_account_error = ""
+        self._sync_publishing_controls()
+        self._set_status(f"Connected as {session.account.login}.")
+        resume = getattr(self, "_resume_pending_publish", None)
+        if callable(resume):
+            resume(session)
+
+    def _github_sign_in_failed(self) -> None:
+        self.github_device_dialog.finish()
+        self._sync_publishing_controls()
+        if self._github_account is None:
+            self.github_account_dialog.set_account(
+                None,
+                message="GitHub sign-in was not completed.",
+            )
+
+    @QtCore.Slot()
+    def _cancel_github_sign_in(self) -> None:
+        self._github_sign_in_cancelled = True
+        thread = self._worker_thread
+        if thread is not None and thread.isRunning():
+            thread.requestInterruption()
+        if hasattr(self, "_pending_publish_context"):
+            self._pending_publish_context = None
+
+    @QtCore.Slot()
+    def sign_out_github(self) -> None:
+        if self._busy:
+            return
+        try:
+            GitHubAuthenticator().sign_out()
+        except GitHubOperationError as error:
+            _LOGGER.error(
+                "GitHub sign-out failed: code=%s details=%s",
+                error.code,
+                error.technical_details,
+            )
+            self._set_status(error.user_message, error=True)
+            return
+        self._github_session = None
+        self._github_account = None
+        self._github_account_checked = True
+        self._github_account_error = ""
+        self._pending_publish_context = None
+        self._sync_publishing_controls()
+        self._set_status(
+            "Signed out of GitHub. Published letters and saved links were not changed."
+        )
+
+    def _defer_until_idle(self, callback: Callable[[], None]) -> None:
+        if self._busy:
+            QtCore.QTimer.singleShot(
+                50,
+                lambda: self._defer_until_idle(callback),
+            )
+            return
+        callback()
+
     def _refresh_source_fingerprint(self) -> bool:
         current = _forge_source_fingerprint(self.project_root)
         if current == self._project_fingerprint:
@@ -1113,6 +1493,7 @@ class ForgeTab(QtWidgets.QWidget):
     def refresh_project_state(self) -> None:
         self._refresh_source_fingerprint()
         snapshot = self.settings.snapshot()
+        self._sync_publishing_controls()
         preview_mode = self._saved_preview_mode()
         preview_mode_changed = preview_mode != self._preview_mode
         self._preview_mode = preview_mode
@@ -2013,8 +2394,7 @@ class ForgeTab(QtWidgets.QWidget):
             answer = QtWidgets.QMessageBox.question(
                 self,
                 "Publish Letter",
-                "Publishing may create or update a public GitHub Pages "
-                "repository using GitHub CLI. Continue?",
+                "Publishing makes the finished letter available to anyone who has its link. Continue?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
                 QtWidgets.QMessageBox.Cancel,
             )
@@ -2026,9 +2406,12 @@ class ForgeTab(QtWidgets.QWidget):
         if not self._flush_prompt_writer_state():
             return
 
+        message_path = self.project_root / MESSAGE_HTML_FILE
         try:
-            message = read_text_normalized(
-                self.project_root / MESSAGE_HTML_FILE
+            message = (
+                read_text_normalized(message_path)
+                if message_path.is_file()
+                else ""
             )
         except Exception:
             _LOGGER.exception("Could not read the current message.")
@@ -2038,7 +2421,7 @@ class ForgeTab(QtWidgets.QWidget):
         source_revision = self._source_revision
         requested_fingerprint = self._project_fingerprint
 
-        def task() -> tuple[Path, ReadinessResult, dict, object, int, str, str]:
+        def task() -> tuple:
             try:
                 play_dir, _rebuilt = generate.ensure_play_bundle(
                     self.project_root,
@@ -2058,44 +2441,134 @@ class ForgeTab(QtWidgets.QWidget):
                 self.project_root,
                 readiness,
             )
+            metadata["source_fingerprint"] = requested_fingerprint
             record_saved_letter_activity(play_path)
-            publisher = GitHubPagesPublisher(self.project_root)
-            if not publisher.is_configured():
-                configured = publisher.configure(None)
-                if not configured.configured:
-                    configuration_message = (
-                        "Publishing requires GitHub CLI or a configured Git "
-                        "remote. The local letter was generated successfully."
-                    )
-                    if configured.message:
-                        configuration_message = (
-                            f"{configured.message} "
-                            "The local letter was generated successfully."
-                        )
-                    return (
-                        play_path,
-                        readiness,
-                        metadata,
-                        PublishResult(
-                            False,
-                            message=configuration_message,
-                        ),
-                        source_revision,
-                        requested_fingerprint,
-                        _forge_source_fingerprint(self.project_root),
-                    )
-            publish_result = publisher.publish(play_path, metadata)
+            authenticator = GitHubAuthenticator()
+            session = self._run_github_task(authenticator.validate_stored)
+            installed = (
+                self._run_github_task(
+                    lambda: authenticator.installation_present(session)
+                )
+                if isinstance(session, GitHubSession)
+                else False
+            )
             return (
                 play_path,
                 readiness,
                 metadata,
-                publish_result,
                 source_revision,
                 requested_fingerprint,
                 _forge_source_fingerprint(self.project_root),
+                session,
+                installed,
             )
 
         self.preview_files_release_requested.emit()
+        self._start_operation(
+            "Preparing letter for publishing…",
+            task,
+            self._publish_prepared,
+            "Publishing could not start. The local build was preserved.",
+        )
+
+    def _publish_prepared(self, result: object) -> None:
+        values = tuple(result)
+        if len(values) != 8:
+            raise TypeError("The prepared publication result is invalid.")
+        (
+            play_dir,
+            readiness,
+            metadata,
+            source_revision,
+            requested_fingerprint,
+            completed_fingerprint,
+            session,
+            installed,
+        ) = values
+        self._last_play_dir = Path(play_dir)
+        self._record_active_play_dir(self._last_play_dir)
+        self._project_fingerprint = str(completed_fingerprint)
+        source_changed = (
+            self._source_revision != int(source_revision)
+            or str(completed_fingerprint) != str(requested_fingerprint)
+        )
+        self._preview_refresh_pending = source_changed
+        if source_changed:
+            self._preview_refresh_requested = True
+        else:
+            self.request_preview()
+        self.refresh_saved_letters()
+        self._pending_publish_context = (
+            Path(play_dir),
+            readiness,
+            dict(metadata),
+            int(source_revision),
+            str(requested_fingerprint),
+            str(completed_fingerprint),
+        )
+        if not isinstance(session, GitHubSession):
+            self._set_status("Sign in with GitHub to continue publishing.", timeout_ms=0)
+            self._defer_until_idle(self.sign_in_github)
+            return
+        self._github_session = session
+        self._github_account = session.account
+        self._sync_publishing_controls()
+        if not bool(installed):
+            authenticator = GitHubAuthenticator()
+            installation_url = authenticator.installation_url
+            if not installation_url:
+                raise _ForgeOperationError(
+                    "GitHub publishing setup is incomplete in this Letter Smith build."
+                )
+            self.github_device_dialog.set_installation_step(installation_url)
+            self.github_device_dialog.show()
+            self.github_device_dialog.open_github()
+            self._defer_until_idle(
+                lambda: self._wait_for_github_installation(session)
+            )
+            return
+        self._defer_until_idle(
+            lambda: self._resume_pending_publish(session)
+        )
+
+    def _resume_pending_publish(self, session: GitHubSession) -> None:
+        if self._busy:
+            self._defer_until_idle(
+                lambda: self._resume_pending_publish(session)
+            )
+            return
+        context = self._pending_publish_context
+        if context is None:
+            return
+        self._pending_publish_context = None
+        (
+            play_dir,
+            readiness,
+            metadata,
+            source_revision,
+            requested_fingerprint,
+            _prepared_fingerprint,
+        ) = context
+
+        def task() -> tuple:
+            publisher = GitHubPagesPublisher(
+                self.project_root,
+                session,
+                cancelled=lambda: (
+                    QtCore.QThread.currentThread().isInterruptionRequested()
+                ),
+            )
+            publish_result = publisher.publish(Path(play_dir), dict(metadata))
+            return (
+                Path(play_dir),
+                readiness,
+                dict(metadata),
+                publish_result,
+                int(source_revision),
+                str(requested_fingerprint),
+                _forge_source_fingerprint(self.project_root),
+            )
+
         self._start_operation(
             "Publishing letter…",
             task,
@@ -2105,7 +2578,7 @@ class ForgeTab(QtWidgets.QWidget):
 
     def _publish_completed(self, result: object) -> None:
         values = tuple(result)
-        play_dir, _readiness, _metadata, publish_result = values[:4]
+        play_dir, readiness, metadata, publish_result = values[:4]
         source_changed = False
         if len(values) >= 7:
             source_revision = int(values[4])
@@ -2125,6 +2598,22 @@ class ForgeTab(QtWidgets.QWidget):
             self.request_preview()
         self.refresh_saved_letters()
         if not getattr(publish_result, "success", False):
+            error_code = str(
+                getattr(publish_result, "error_code", "")
+            ).strip()
+            if error_code in {"authentication", "permission"} and len(values) >= 7:
+                self._pending_publish_context = (
+                    Path(play_dir),
+                    readiness,
+                    dict(metadata),
+                    int(values[4]),
+                    str(values[5]),
+                    str(values[6]),
+                )
+                if error_code == "authentication":
+                    self._github_session = None
+                    self._github_account = None
+                    self._sync_publishing_controls()
             details = str(getattr(publish_result, "technical_details", ""))
             if details:
                 _LOGGER.error("Publishing failed: %s", details)
@@ -2133,28 +2622,114 @@ class ForgeTab(QtWidgets.QWidget):
                 or "Publishing failed. The local build was preserved.",
                 error=True,
             )
+            self._show_publish_failure(publish_result)
             return
         url = normalize_published_page_url(
             getattr(publish_result, "url", "")
         )
-        if not url:
-            _LOGGER.error("Publisher returned an invalid public URL.")
+        publication = {
+            PUBLISHED_PAGE_URL_KEY: url,
+            PUBLISHED_PUBLIC_PATH_KEY: str(
+                getattr(publish_result, "public_path", "")
+            ).strip(),
+            PUBLISHED_AT_KEY: str(
+                getattr(publish_result, "published_at", "")
+            ).strip(),
+            PUBLISHED_EXPIRES_AT_KEY: str(
+                getattr(publish_result, "expires_at", "")
+            ).strip(),
+            PUBLICATION_PROVIDER_KEY: str(
+                getattr(publish_result, "provider", "")
+            ).strip(),
+            PUBLICATION_VERIFIED_KEY: (
+                getattr(publish_result, "verified", False) is True
+            ),
+            PUBLISHED_SOURCE_FINGERPRINT_KEY: str(
+                getattr(publish_result, "source_fingerprint", "")
+            ).strip(),
+            PUBLISHED_GITHUB_OWNER_KEY: str(
+                getattr(publish_result, "owner", "")
+            ).strip(),
+            PUBLISHED_GITHUB_REPOSITORY_KEY: str(
+                getattr(publish_result, "repository", "")
+            ).strip(),
+        }
+        if publication_status(publication) != "published":
+            _LOGGER.error("Publisher returned incomplete verification metadata.")
             self._set_status(
-                "Publishing completed without a valid public URL.",
+                "Publishing completed without a verified public page.",
                 error=True,
             )
             return
-        self.settings.update_fields({PUBLISHED_PAGE_URL_KEY: url})
         self.published_url_changed.emit(url)
         self.refresh_project_state()
-        published_readiness = self._readiness_result
+        try:
+            update_saved_publication_metadata(
+                Path(play_dir),
+                self.project_root,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "Verified publication metadata could not be saved for %s",
+                play_dir,
+            )
+            self._set_status(
+                "The letter is online, but its publication details could not be saved.",
+                error=True,
+            )
+            return
         self.refresh_saved_letters()
-        self._update_metadata_silently(
-            Path(play_dir),
-            published_readiness,
-            public_path=str(getattr(publish_result, "public_path", "")),
+        self._sync_publishing_controls()
+        self._set_status(
+            "Published. Publish again to include newer project changes."
+            if source_changed
+            else "The letter is published."
         )
-        self._set_status("The letter has been sealed.")
+
+    def _show_publish_failure(self, publish_result: object) -> None:
+        message = (
+            str(getattr(publish_result, "message", "")).strip()
+            or "Publishing failed. The local letter was preserved."
+        )
+        error_code = str(getattr(publish_result, "error_code", "")).strip()
+        details = str(getattr(publish_result, "technical_details", "")).strip()
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setIcon(QtWidgets.QMessageBox.Warning)
+        dialog.setWindowTitle("Letter Was Not Published")
+        dialog.setText(message)
+        if error_code in {
+            "authentication",
+            "permission",
+        }:
+            dialog.setInformativeText(
+                "Sign in with GitHub to continue. The generated local letter was preserved."
+            )
+            account_button = dialog.addButton(
+                "Sign in with GitHub",
+                QtWidgets.QMessageBox.ActionRole,
+            )
+        elif error_code == "app_not_configured":
+            dialog.setInformativeText(
+                "GitHub publishing must be configured by the Letter Smith developer."
+            )
+            account_button = dialog.addButton(
+                "Open GitHub Account",
+                QtWidgets.QMessageBox.ActionRole,
+            )
+        else:
+            account_button = None
+            dialog.setInformativeText(
+                "The generated local letter was preserved. You can retry publishing."
+            )
+        dialog.addButton(QtWidgets.QMessageBox.Close)
+        if details:
+            dialog.setDetailedText(details)
+        dialog.exec()
+        if account_button is not None and dialog.clickedButton() is account_button:
+            if error_code in {"authentication", "permission"}:
+                self.sign_in_github()
+            else:
+                self.show_github_account()
 
     def _record_active_play_dir(self, play_dir: Path) -> None:
         candidate = Path(play_dir).resolve()
@@ -2377,6 +2952,7 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_delete_toggle.setEnabled(not busy)
         self.preview_mode.setEnabled(not busy)
         self.readiness_btn.setEnabled(not busy)
+        self.github_account_btn.setEnabled(not busy)
         if busy:
             self._busy_button_texts = {
                 self.preview_btn: self.preview_btn.text(),
@@ -2434,6 +3010,7 @@ class ForgeTab(QtWidgets.QWidget):
             return
         self._tab_active = False
         self.saved_panel.hide()
+        self.github_account_dialog.hide()
         self.preview_visibility_changed.emit(False)
         self.preview_files_release_requested.emit()
 
@@ -2446,15 +3023,23 @@ class ForgeTab(QtWidgets.QWidget):
         super().hideEvent(event)
 
     def shutdown_operations(self, timeout_ms: int = SHUTDOWN_TIMEOUT_MS) -> bool:
-        thread = self._worker_thread
-        if thread is None or not thread.isRunning():
-            return True
-        thread.requestInterruption()
-        thread.quit()
-        stopped = thread.wait(timeout_ms)
+        threads = tuple(
+            thread
+            for thread in (
+                self._worker_thread,
+                self._github_account_thread,
+            )
+            if thread is not None and thread.isRunning()
+        )
+        for thread in threads:
+            thread.requestInterruption()
+            thread.quit()
+        stopped = all(thread.wait(timeout_ms) for thread in threads)
         if stopped:
             self._worker = None
             self._worker_thread = None
+            self._github_account_worker = None
+            self._github_account_thread = None
             self._operation_success = None
             self._operation_failure = None
             self._operation_error_message = ""
@@ -2473,5 +3058,7 @@ class ForgeTab(QtWidgets.QWidget):
             return
         self.settings.changed.disconnect(self._on_settings_changed)
         self.saved_panel.close()
+        self.github_account_dialog.close()
+        self.github_device_dialog.finish()
         self.readiness_window.shutdown()
         super().closeEvent(event)

@@ -22,6 +22,14 @@ _LOGGER = logging.getLogger(__name__)
 
 REQUIRED_FEATURES_KEY = "required_features"
 PUBLISHED_PAGE_URL_KEY = "published_page_url"
+PUBLISHED_PUBLIC_PATH_KEY = "published_public_path"
+PUBLISHED_AT_KEY = "published_at"
+PUBLISHED_EXPIRES_AT_KEY = "published_expires_at"
+PUBLICATION_PROVIDER_KEY = "publication_provider"
+PUBLICATION_VERIFIED_KEY = "publication_verified"
+PUBLISHED_SOURCE_FINGERPRINT_KEY = "published_source_fingerprint"
+PUBLISHED_GITHUB_OWNER_KEY = "published_github_owner"
+PUBLISHED_GITHUB_REPOSITORY_KEY = "published_github_repository"
 ACTIVE_PLAY_DIR_KEY = "active_play_dir"
 VISIONARY_URL_KEY = "visionary_url"
 DEFAULT_VISIONARY_URL = (
@@ -36,6 +44,14 @@ DEFAULT_SETTINGS = {
     "curtain_style": "pure_white",
     REQUIRED_FEATURES_KEY: [],
     PUBLISHED_PAGE_URL_KEY: "",
+    PUBLISHED_PUBLIC_PATH_KEY: "",
+    PUBLISHED_AT_KEY: "",
+    PUBLISHED_EXPIRES_AT_KEY: "",
+    PUBLICATION_PROVIDER_KEY: "",
+    PUBLICATION_VERIFIED_KEY: False,
+    PUBLISHED_SOURCE_FINGERPRINT_KEY: "",
+    PUBLISHED_GITHUB_OWNER_KEY: "",
+    PUBLISHED_GITHUB_REPOSITORY_KEY: "",
     ACTIVE_PLAY_DIR_KEY: "",
     VISIONARY_URL_KEY: DEFAULT_VISIONARY_URL,
 }
@@ -708,6 +724,33 @@ class SettingsStore:
                 "",
             )
         )
+        for key in (
+            PUBLISHED_PUBLIC_PATH_KEY,
+            PUBLISHED_AT_KEY,
+            PUBLISHED_EXPIRES_AT_KEY,
+            PUBLICATION_PROVIDER_KEY,
+            PUBLISHED_SOURCE_FINGERPRINT_KEY,
+            PUBLISHED_GITHUB_OWNER_KEY,
+            PUBLISHED_GITHUB_REPOSITORY_KEY,
+        ):
+            value = normalized.get(key, DEFAULT_SETTINGS[key])
+            normalized[key] = value.strip() if isinstance(value, str) else ""
+        normalized[PUBLICATION_VERIFIED_KEY] = (
+            normalized.get(PUBLICATION_VERIFIED_KEY) is True
+        )
+        for obsolete_key in (
+            "r2_account_id",
+            "r2_authentication_mode",
+            "r2_bucket",
+            "r2_current_public_path",
+            "r2_free_tier_limit_bytes",
+            "r2_last_object_count",
+            "r2_last_usage_at",
+            "r2_last_used_bytes",
+            "r2_public_base_url",
+            "r2_public_warning_acknowledged",
+        ):
+            normalized.pop(obsolete_key, None)
 
         # Active generated-letter directory. Path validation remains with the
         # owning workflow because the folder may be moved between sessions.
@@ -774,7 +817,15 @@ __all__ = [
     "DEFAULT_SETTINGS",
     "DEFAULT_VISIONARY_URL",
     "ACTIVE_PLAY_DIR_KEY",
+    "PUBLICATION_PROVIDER_KEY",
+    "PUBLICATION_VERIFIED_KEY",
+    "PUBLISHED_AT_KEY",
+    "PUBLISHED_EXPIRES_AT_KEY",
+    "PUBLISHED_GITHUB_OWNER_KEY",
+    "PUBLISHED_GITHUB_REPOSITORY_KEY",
     "PUBLISHED_PAGE_URL_KEY",
+    "PUBLISHED_PUBLIC_PATH_KEY",
+    "PUBLISHED_SOURCE_FINGERPRINT_KEY",
     "REQUIRED_FEATURES_KEY",
     "VISIONARY_URL_KEY",
     "SETTINGS_FILENAME",
