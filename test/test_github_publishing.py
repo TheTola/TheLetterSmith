@@ -540,6 +540,14 @@ class GitHubAccountUITests(unittest.TestCase):
             "GitHubSignInButton",
         )
         self.assertFalse(dialog.sign_in_button.isHidden())
+        self.assertEqual(
+            dialog.sign_in_button.text(),
+            "Disconnect from GitHub",
+        )
+        self.assertEqual(
+            dialog.sign_in_button.property("accountAction"),
+            "disconnect",
+        )
         self.assertIn("#39d98a", dialog.styleSheet())
         self.assertIn("#ff6b72", dialog.styleSheet())
         dialog.close()
@@ -571,6 +579,23 @@ class GitHubAccountUITests(unittest.TestCase):
                 dialog.status_label.property("connectionState"),
                 "disconnected",
             )
+            self.assertEqual(
+                dialog.sign_in_button.text(),
+                "Sign in with GitHub",
+            )
+        finally:
+            dialog.close()
+
+    def test_account_dialog_routes_its_single_button_by_connection(self) -> None:
+        dialog = GitHubAccountDialog()
+        requests: list[str] = []
+        dialog.sign_in_requested.connect(lambda: requests.append("sign-in"))
+        dialog.sign_out_requested.connect(lambda: requests.append("disconnect"))
+        try:
+            dialog.sign_in_button.click()
+            dialog.set_account(GitHubAccount("ada", 7))
+            dialog.sign_in_button.click()
+            self.assertEqual(requests, ["sign-in", "disconnect"])
         finally:
             dialog.close()
 

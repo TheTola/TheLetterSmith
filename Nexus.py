@@ -957,34 +957,45 @@ class TitleBar(QtWidgets.QWidget):
         for style, row in self._curtain_actions.items():
             self._style_curtain_row(
                 row,
-                style if row.isChecked() else None,
+                style,
+                selected=row.isChecked(),
             )
         for family, row in self._curtain_parent_actions.items():
-            selected_style = (
+            family_selected = (
                 self._current_curtain_style
                 if self._current_curtain_style
                 in self._curtain_family_styles[family]
                 else None
             )
-            self._style_curtain_row(row, selected_style)
+            preview_style = (
+                family_selected
+                or self._curtain_family_styles[family][0]
+            )
+            self._style_curtain_row(
+                row,
+                preview_style,
+                selected=family_selected is not None,
+            )
 
     def _style_curtain_row(
         self,
         row: QtWidgets.QAbstractButton,
-        selected_style: str | None,
+        preview_style: str | None,
+        *,
+        selected: bool = False,
     ) -> None:
         colors = self.theme_service.tokens
         rgb = (
-            self._curtain_preview_colors.get(selected_style)
-            if selected_style is not None
+            self._curtain_preview_colors.get(preview_style)
+            if preview_style is not None
             else None
         )
-        if selected_style is not None and rgb is not None:
+        if preview_style is not None and rgb is not None:
             background = "#{:02x}{:02x}{:02x}".format(*rgb)
-            if selected_style == "pure_white":
+            if preview_style == "pure_white":
                 foreground = "#000000"
             else:
-                paired_style = CURTAIN_TEXT_STYLE_PAIRS.get(selected_style)
+                paired_style = CURTAIN_TEXT_STYLE_PAIRS.get(preview_style)
                 paired_rgb = self._curtain_preview_colors.get(paired_style)
                 foreground = (
                     "#{:02x}{:02x}{:02x}".format(*paired_rgb)
@@ -992,9 +1003,9 @@ class TitleBar(QtWidgets.QWidget):
                     else colors.text
                 )
         else:
-            background = colors.hover if selected_style else colors.panel_background
-            foreground = colors.highlight if selected_style else colors.text
-        border = colors.highlight if selected_style else "transparent"
+            background = colors.hover if selected else colors.panel_background
+            foreground = colors.highlight if selected else colors.text
+        border = colors.highlight if selected else "transparent"
         row.setStyleSheet(
             f"QPushButton,QToolButton{{background:{background};"
             f"color:{foreground};border:2px solid {border};"
@@ -2089,9 +2100,13 @@ class Nexus(QtWidgets.QMainWindow):
         )
         self.tabbar.setCurrentIndex(saved_index)
         self._tab_changed(saved_index)
-        self._schedule_curtain_preparation()
+        self._schedule_curtain_preparation(immediate=True)
 
-    def _schedule_curtain_preparation(self) -> None:
+    def _schedule_curtain_preparation(
+        self,
+        *,
+        immediate: bool = False,
+    ) -> None:
         self._curtain_preparation_generation += 1
         self._curtain_preparation_timer.stop()
         self.title_bar.set_curtain_preview_colors({})
@@ -2103,7 +2118,10 @@ class Nexus(QtWidgets.QMainWindow):
             / "cover.png"
         )
         if cover.is_file():
-            self._curtain_preparation_timer.start()
+            if immediate:
+                self._start_curtain_preparation()
+            else:
+                self._curtain_preparation_timer.start()
 
     def _stop_curtain_preparation(self, timeout_ms: int | None = None) -> bool:
         self._curtain_preparation_generation += 1

@@ -3059,6 +3059,10 @@ class ForgeTab(QtWidgets.QWidget):
         technical: str,
         user_safe: bool,
     ) -> None:
+        sign_in_cancelled = (
+            self._github_sign_in_cancelled
+            and message == "GitHub sign-in was canceled."
+        )
         self._operation_success = None
         failure_callback = self._operation_failure
         self._operation_failure = None
@@ -3069,11 +3073,13 @@ class ForgeTab(QtWidgets.QWidget):
                 _LOGGER.exception(
                     "Forge failure-state recovery failed."
                 )
-        _LOGGER.error(
-            "Forge operation failed: %s\n%s",
-            message,
-            technical,
-        )
+        if sign_in_cancelled:
+            self._github_sign_in_cancelled = False
+            _LOGGER.info("GitHub sign-in canceled by the user.")
+            self._set_status("GitHub sign-in canceled.")
+            self.request_preview()
+            return
+        _LOGGER.error("Forge operation failed: %s\n%s", message, technical)
         error_message = self._operation_error_message
         safe_message = (
             message

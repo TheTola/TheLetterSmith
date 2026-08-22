@@ -45,6 +45,10 @@ class GitHubAccountDialog(QtWidgets.QDialog):
             "QPushButton#GitHubSignInButton{background:#238636;"
             "border-color:#2ea043;color:#ffffff;}"
             "QPushButton#GitHubSignInButton:hover{background:#2ea043;}"
+            "QPushButton#GitHubSignInButton[accountAction='disconnect']{"
+            "background:#b62324;border-color:#da3633;}"
+            "QPushButton#GitHubSignInButton[accountAction='disconnect']:hover{"
+            "background:#da3633;}"
         )
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(26, 22, 26, 20)
@@ -72,7 +76,8 @@ class GitHubAccountDialog(QtWidgets.QDialog):
             self.sign_in_button,
             "Connect a GitHub account so Letter Smith can publish letters.",
         )
-        self.sign_in_button.clicked.connect(self.sign_in_requested)
+        self._connected = False
+        self.sign_in_button.clicked.connect(self._request_account_action)
         actions.addWidget(self.sign_in_button)
         actions.addStretch(1)
         layout.addLayout(actions)
@@ -99,6 +104,7 @@ class GitHubAccountDialog(QtWidgets.QDialog):
                 + (f"\n{message}" if message else "")
             )
             connection_state = "disconnected"
+        self._connected = account is not None and not checking
         self.status_label.setProperty(
             "connectionState",
             connection_state,
@@ -111,6 +117,35 @@ class GitHubAccountDialog(QtWidgets.QDialog):
         )
         self.sign_in_button.setVisible(True)
         self.sign_in_button.setEnabled(not checking)
+        self.sign_in_button.setText(
+            "Disconnect from GitHub"
+            if self._connected
+            else "Sign in with GitHub"
+        )
+        self.sign_in_button.setProperty(
+            "accountAction",
+            "disconnect" if self._connected else "sign-in",
+        )
+        self.sign_in_button.style().unpolish(self.sign_in_button)
+        self.sign_in_button.style().polish(self.sign_in_button)
+        set_control_help(
+            self.sign_in_button,
+            (
+                "Disconnect this GitHub account from Letter Smith."
+                if self._connected
+                else (
+                    "Connect a GitHub account so Letter Smith can publish "
+                    "letters."
+                )
+            ),
+        )
+
+    @QtCore.Slot()
+    def _request_account_action(self) -> None:
+        if self._connected:
+            self.sign_out_requested.emit()
+        else:
+            self.sign_in_requested.emit()
 
     def paintEvent(
         self,

@@ -190,6 +190,61 @@ class SavedLetterActivityOrderTests(unittest.TestCase):
             tab.saved_panel.hide()
             tab.close()
 
+    def test_stock_letters_are_sorted_by_number_not_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stock_root = root / "resources" / "stock" / "letters"
+            now = datetime.now(timezone.utc)
+            activity_offsets = {1: 3, 2: 1, 3: 2}
+            for number in (1, 2, 3):
+                source = _saved_bundle(root, f"Stock Letter {number}")
+                stock = stock_root / f"Stock Letter {number}"
+                stock.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(stock))
+                metadata_path = stock / PLAY_METADATA_FILE
+                metadata = json.loads(
+                    metadata_path.read_text(encoding="utf-8")
+                )
+                metadata["recipient_title"] = f"Stock: Letter {number}"
+                metadata_path.write_text(
+                    json.dumps(metadata),
+                    encoding="utf-8",
+                )
+                record_saved_letter_activity(
+                    stock,
+                    when=now
+                    + timedelta(minutes=activity_offsets[number]),
+                )
+
+            entries = SavedLetterCatalog(root, stock_only=True).list_entries()
+            self.assertEqual(
+                [entry.title for entry in entries],
+                ["Stock: Letter 1", "Stock: Letter 2", "Stock: Letter 3"],
+            )
+
+    def test_cancelled_github_sign_in_is_not_logged_as_a_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tab = ForgeTab(Path(directory))
+            tab._github_sign_in_cancelled = True
+            tab._operation_failure = None
+            tab._operation_error_message = "GitHub sign-in failed."
+            with (
+                mock.patch("Forge_Tab._LOGGER.error") as log_error,
+                mock.patch.object(tab, "_set_status") as set_status,
+                mock.patch.object(tab, "request_preview") as request_preview,
+            ):
+                tab._operation_failed_on_ui(
+                    "GitHub sign-in was canceled.",
+                    "expected cancellation traceback",
+                    True,
+                )
+
+            log_error.assert_not_called()
+            set_status.assert_called_once_with("GitHub sign-in canceled.")
+            request_preview.assert_called_once_with()
+            self.assertFalse(tab._github_sign_in_cancelled)
+            tab.close()
+
     def test_bundled_example_is_first_read_only_and_restores_from_a_copy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
@@ -66,6 +67,14 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                     window._curtain_preparation_pool.maxThreadCount(),
                     1,
                 )
+                window._curtain_preparation_timer.stop()
+                with mock.patch.object(
+                    window,
+                    "_start_curtain_preparation",
+                ) as start_preparation:
+                    window._schedule_curtain_preparation(immediate=True)
+                start_preparation.assert_called_once_with()
+                self.assertFalse(window._curtain_preparation_timer.isActive())
             finally:
                 window.close()
 

@@ -599,8 +599,10 @@ class CommandInteractionTests(unittest.TestCase):
         self.assertIsInstance(normal_row, QtWidgets.QPushButton)
         self.assertIn("background:#0c2238", normal_row.styleSheet())
         self.assertIn("color:#5a6e82", normal_row.styleSheet())
-        self.assertIn("background:#101820", complementary_row.styleSheet())
-        self.assertIn("background:#101820", white_row.styleSheet())
+        self.assertIn("background:#5a6e82", complementary_row.styleSheet())
+        self.assertIn("color:#0c2238", complementary_row.styleSheet())
+        self.assertIn("background:#ffffff", white_row.styleSheet())
+        self.assertIn("color:#000000", white_row.styleSheet())
         self.assertEqual(light_parent.text(), "Light ▾")
         self.assertEqual(dark_parent.text(), "Dark ▾")
         self.assertIs(light_parent.menu(), title_bar.light_curtain_menu)
@@ -608,12 +610,15 @@ class CommandInteractionTests(unittest.TestCase):
         self.assertEqual(len(title_bar.curtain_menu.actions()), 5)
         self.assertEqual(len(title_bar.light_curtain_menu.actions()), 2)
         self.assertEqual(len(title_bar.dark_curtain_menu.actions()), 2)
-        self.assertIn("background:#101820", light_parent.styleSheet())
+        self.assertIn("background:#b4bec8", light_parent.styleSheet())
+        self.assertIn("color:#414b55", light_parent.styleSheet())
+        self.assertIn("background:#19232d", dark_parent.styleSheet())
+        self.assertIn("color:#cdd2d7", dark_parent.styleSheet())
 
         title_bar._set_curtain_style("complementary_average_color")
         self.assertIn("background:#5a6e82", complementary_row.styleSheet())
         self.assertIn("color:#0c2238", complementary_row.styleSheet())
-        self.assertIn("background:#101820", normal_row.styleSheet())
+        self.assertIn("background:#0c2238", normal_row.styleSheet())
 
         title_bar._set_curtain_style("normal_light")
         normal_light_row = title_bar._curtain_actions["normal_light"]
@@ -624,11 +629,9 @@ class CommandInteractionTests(unittest.TestCase):
         self.assertIn("color:#414b55", normal_light_row.styleSheet())
         self.assertIn("background:#b4bec8", light_parent.styleSheet())
         self.assertIn("color:#414b55", light_parent.styleSheet())
-        self.assertIn(
-            "background:#101820",
-            complementary_light_row.styleSheet(),
-        )
-        self.assertIn("background:#101820", dark_parent.styleSheet())
+        self.assertIn("background:#cdd2d7", complementary_light_row.styleSheet())
+        self.assertIn("color:#19232d", complementary_light_row.styleSheet())
+        self.assertIn("background:#19232d", dark_parent.styleSheet())
 
         title_bar._set_curtain_style("complementary_light")
         self.assertIn(
@@ -643,7 +646,7 @@ class CommandInteractionTests(unittest.TestCase):
         self.assertIn("background:#19232d", normal_dark_row.styleSheet())
         self.assertIn("color:#cdd2d7", normal_dark_row.styleSheet())
         self.assertIn("background:#19232d", dark_parent.styleSheet())
-        self.assertIn("background:#101820", light_parent.styleSheet())
+        self.assertIn("background:#b4bec8", light_parent.styleSheet())
 
         title_bar._set_curtain_style("complementary_dark")
         complementary_dark_row = title_bar._curtain_actions[
@@ -652,11 +655,11 @@ class CommandInteractionTests(unittest.TestCase):
         self.assertIn("background:#414b55", complementary_dark_row.styleSheet())
         self.assertIn("color:#b4bec8", complementary_dark_row.styleSheet())
         self.assertIn("background:#414b55", dark_parent.styleSheet())
-        self.assertIn("background:#101820", light_parent.styleSheet())
-        self.assertIn("background:#101820", normal_light_row.styleSheet())
+        self.assertIn("background:#b4bec8", light_parent.styleSheet())
+        self.assertIn("background:#b4bec8", normal_light_row.styleSheet())
 
         title_bar._set_curtain_style("pure_white")
-        self.assertIn("background:#101820", normal_row.styleSheet())
+        self.assertIn("background:#0c2238", normal_row.styleSheet())
         self.assertIn("background:#ffffff", white_row.styleSheet())
         self.assertIn("color:#000000", white_row.styleSheet())
         actions["New Project"].trigger()

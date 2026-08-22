@@ -748,14 +748,22 @@ class SavedLetterCatalog:
                     continue
                 seen.add(path)
                 entries.append(entry)
-        entries.sort(
-            key=lambda entry: (
-                entry.example,
-                entry.modified_at,
-                entry.title.casefold(),
-            ),
-            reverse=True,
-        )
+        if self.stock_only:
+            entries.sort(
+                key=lambda entry: (
+                    self._natural_sort_key(entry.title),
+                    self._natural_sort_key(entry.path.name),
+                )
+            )
+        else:
+            entries.sort(
+                key=lambda entry: (
+                    entry.example,
+                    entry.modified_at,
+                    entry.title.casefold(),
+                ),
+                reverse=True,
+            )
         self._entries = tuple(entries)
         return self._entries
 
@@ -795,6 +803,14 @@ class SavedLetterCatalog:
             entry
             for entry in self.list_entries()
             if needle in f"{entry.recipient} {entry.title}".casefold()
+        )
+
+    @staticmethod
+    def _natural_sort_key(value: str) -> tuple[tuple[int, object], ...]:
+        return tuple(
+            (1, int(part)) if part.isdigit() else (0, part.casefold())
+            for part in re.split(r"(\d+)", str(value))
+            if part
         )
 
     def delete(self, entry: SavedLetter) -> Path:
