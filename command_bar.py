@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -330,15 +331,54 @@ class _ElidingLabel(QtWidgets.QLabel):
 class _CompactRestoreLabel(QtWidgets.QLabel):
     clicked = QtCore.Signal()
 
+    def __init__(self, owner: "CommandBarWindow") -> None:
+        super().__init__(owner)
+        self._owner = owner
+        self._press_global: QtCore.QPoint | None = None
+        self._drag_offset: QtCore.QPoint | None = None
+        self._dragging = False
+
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            self._press_global = event.globalPosition().toPoint()
+            self._drag_offset = (
+                self._press_global - self._owner.frameGeometry().topLeft()
+            )
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if (
+            self._press_global is not None
+            and self._drag_offset is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            global_position = event.globalPosition().toPoint()
+            if (
+                global_position - self._press_global
+            ).manhattanLength() >= QtWidgets.QApplication.startDragDistance():
+                self._dragging = True
+            if self._dragging:
+                self._owner.move_within_screen(
+                    global_position - self._drag_offset,
+                    global_position=global_position,
+                )
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        was_dragging = self._dragging
+        self._press_global = None
+        self._drag_offset = None
+        self._dragging = False
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
         if (
             event.button() == Qt.MouseButton.LeftButton
+            and not was_dragging
             and self.rect().contains(event.position().toPoint())
         ):
             self.clicked.emit()
@@ -384,6 +424,7 @@ class CommandBarWindow(QtWidgets.QWidget):
         self._movie: QtGui.QMovie | None = None
         self._compact_movie: QtGui.QMovie | None = None
         self._compact_mode = False
+        self._reopen_started = False
         self._compact_size = QtCore.QSize(self.COMPACT_HEIGHT, self.COMPACT_HEIGHT)
         self._expanded_position: QtCore.QPoint | None = None
         self._scan_movie: QtGui.QMovie | None = None
@@ -436,15 +477,39 @@ class CommandBarWindow(QtWidgets.QWidget):
             Qt.WidgetAttribute.WA_TranslucentBackground,
             True,
         )
-        self._compact_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._compact_label.setToolTip("Restore Command Bar")
-        self._compact_label.setAccessibleName("Restore Command Bar")
+        self._compact_label.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._compact_label.setToolTip(
+            "Drag to move; click to restore the Command Bar."
+        )
+        self._compact_label.setAccessibleName("Movable Command Bar icon")
         self._compact_label.clicked.connect(self._restore_expanded_mode)
+        self.compact_maximize_button = QtWidgets.QToolButton(
+            self._compact_label
+        )
+        self.compact_maximize_button.setObjectName(
+            "CommandCompactMaximizeButton"
+        )
+        self.compact_maximize_button.setFixedSize(56, 38)
+        self.compact_maximize_button.setAutoRaise(True)
+        self.compact_maximize_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.compact_maximize_button.setToolTip("Reopen Letter Smith")
+        self.compact_maximize_button.setAccessibleName("Reopen Letter Smith")
+        self.compact_maximize_button.setStyleSheet(
+            "QToolButton{background:transparent;border:none;padding:0;}"
+            "QToolButton:hover{background:rgba(255,45,45,0.18);"
+            "border-radius:8px;}"
+            "QToolButton:pressed{background:rgba(90,0,0,0.42);"
+            "border-radius:8px;}"
+        )
+        self.compact_maximize_button.clicked.connect(
+            self._reopen_letter_smith
+        )
         self._compact_label.hide()
 
         self._build_background()
         self._build_scan_overlay()
         self._build_compact_icon()
+        self._build_compact_maximize_button()
         self._build_controls()
         self._set_size_from_background()
         self._position_on_screen()
@@ -537,6 +602,33 @@ class CommandBarWindow(QtWidgets.QWidget):
         self._compact_movie = movie
         if movie.jumpToFrame(0):
             self._update_compact_frame()
+
+    def _build_compact_maximize_button(self) -> None:
+        icon_path = application_paths(self.project_root).app_resource_path(
+            "icons/maximize.png"
+        )
+        pixmap = (
+            QtGui.QPixmap(str(icon_path))
+            if icon_path.is_file()
+            else QtGui.QPixmap()
+        )
+        if pixmap.isNull():
+            self.compact_maximize_button.setText("▢")
+            self.compact_maximize_button.setStyleSheet(
+                self.compact_maximize_button.styleSheet()
+                + "QToolButton{color:#ff5a5f;font:700 18pt 'Segoe UI';}"
+            )
+        else:
+            self.compact_maximize_button.setIcon(QtGui.QIcon(pixmap))
+            self.compact_maximize_button.setIconSize(QtCore.QSize(52, 35))
+        self._layout_compact_controls()
+
+    def _layout_compact_controls(self) -> None:
+        button = self.compact_maximize_button
+        x = max(0, (self._compact_size.width() - button.width()) // 2)
+        y = max(0, self._compact_size.height() - button.height() - 4)
+        button.move(x, y)
+        button.raise_()
 
     def _build_controls(self) -> None:
         layout = QtWidgets.QHBoxLayout(self._surface)
@@ -784,6 +876,46 @@ class CommandBarWindow(QtWidgets.QWidget):
         self.raise_()
         self.activateWindow()
 
+    def _reopen_letter_smith(self) -> None:
+        if self._reopen_started:
+            return
+        paths = application_paths(self.project_root)
+        arguments: list[str] = []
+        if bool(getattr(sys, "frozen", False)):
+            program = sys.executable
+        else:
+            entrypoint = paths.resource_path("Main.py")
+            if not entrypoint.is_file():
+                _LOGGER.error(
+                    "Letter Smith entry point is unavailable: %s",
+                    entrypoint,
+                )
+                QtWidgets.QToolTip.showText(
+                    QtGui.QCursor.pos(),
+                    "Letter Smith could not be reopened.",
+                    self.compact_maximize_button,
+                )
+                return
+            program = sys.executable
+            arguments.append(str(entrypoint))
+        result = QtCore.QProcess.startDetached(
+            program,
+            arguments,
+            str(paths.resource_root),
+        )
+        started = result[0] if isinstance(result, tuple) else bool(result)
+        if not started:
+            _LOGGER.error("Letter Smith could not be restarted.")
+            QtWidgets.QToolTip.showText(
+                QtGui.QCursor.pos(),
+                "Letter Smith could not be reopened.",
+                self.compact_maximize_button,
+            )
+            return
+        self._reopen_started = True
+        self.compact_maximize_button.setEnabled(False)
+        self.close()
+
     def _start_scan_overlay(self) -> None:
         if (
             self._scan_movie is None
@@ -857,6 +989,7 @@ class CommandBarWindow(QtWidgets.QWidget):
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         self._surface.setGeometry(self.rect())
         self._compact_label.setGeometry(self.rect())
+        self._layout_compact_controls()
         self._background.setGeometry(self._surface.rect())
         self._scan_overlay.setGeometry(self._background.rect())
         if self._movie is None and not self._static_background.isNull():

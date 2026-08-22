@@ -422,6 +422,13 @@ class CommandBarTests(unittest.TestCase):
             )
             for name in ("bloodsnow.gif", "scanned.gif", "com.gif"):
                 icons.joinpath(name).write_bytes(animated_gif)
+            maximize = QtGui.QImage(
+                12,
+                8,
+                QtGui.QImage.Format.Format_ARGB32,
+            )
+            maximize.fill(QtGui.QColor("#ff0000"))
+            self.assertTrue(maximize.save(str(icons / "maximize.png")))
             window = CommandBarWindow(
                 CommandBarData("Recipient", "Title", None, ""),
                 root,
@@ -445,6 +452,8 @@ class CommandBarTests(unittest.TestCase):
                 self.assertFalse(window.isMinimized())
                 self.assertFalse(window._surface.isVisible())
                 self.assertTrue(window._compact_label.isVisible())
+                self.assertTrue(window.compact_maximize_button.isVisible())
+                self.assertFalse(window.compact_maximize_button.icon().isNull())
                 self.assertEqual(
                     window.grab().toImage().pixelColor(0, 0).alpha(),
                     0,
@@ -457,6 +466,29 @@ class CommandBarTests(unittest.TestCase):
                 self.assertEqual(
                     compact_movie.state(),
                     QtGui.QMovie.MovieState.Running,
+                )
+
+                compact_position = window.frameGeometry().topLeft()
+                drag_start = QtCore.QPoint(8, 8)
+                QtTest.QTest.mousePress(
+                    window._compact_label,
+                    QtCore.Qt.MouseButton.LeftButton,
+                    pos=drag_start,
+                )
+                QtTest.QTest.mouseMove(
+                    window._compact_label,
+                    drag_start - QtCore.QPoint(24, 24),
+                )
+                QtTest.QTest.mouseRelease(
+                    window._compact_label,
+                    QtCore.Qt.MouseButton.LeftButton,
+                    pos=drag_start - QtCore.QPoint(24, 24),
+                )
+                self.app.processEvents()
+                self.assertTrue(window.is_compact)
+                self.assertNotEqual(
+                    window.frameGeometry().topLeft(),
+                    compact_position,
                 )
 
                 QtTest.QTest.mouseClick(
@@ -482,6 +514,56 @@ class CommandBarTests(unittest.TestCase):
             finally:
                 window.abort_launch()
             self.assertEqual(compact_movie.fileName(), "")
+
+    def test_compact_maximize_button_reopens_letter_smith(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            icons = root / "gallery" / "app" / "icons"
+            icons.mkdir(parents=True)
+            icons.joinpath("com.gif").write_bytes(
+                bytes.fromhex(
+                    "47494638396101000100800000000000ffffff"
+                    "21ff0b4e45545343415045322e300301000000"
+                    "21f904000a0000002c00000000010001000002024401003b"
+                )
+            )
+            maximize = QtGui.QImage(
+                12,
+                8,
+                QtGui.QImage.Format.Format_ARGB32,
+            )
+            maximize.fill(QtGui.QColor("#ff0000"))
+            self.assertTrue(maximize.save(str(icons / "maximize.png")))
+            entrypoint = root / "Main.py"
+            entrypoint.write_text("", encoding="utf-8")
+            window = CommandBarWindow(
+                CommandBarData("Recipient", "Title", None, ""),
+                root,
+            )
+            try:
+                window.show()
+                window._enter_compact_mode()
+                self.app.processEvents()
+                with (
+                    mock.patch.object(
+                        QtCore.QProcess,
+                        "startDetached",
+                        return_value=(True, 42),
+                    ) as start_detached,
+                    mock.patch.object(window, "close") as close_window,
+                ):
+                    window.compact_maximize_button.click()
+
+                start_detached.assert_called_once_with(
+                    sys.executable,
+                    [str(entrypoint.resolve())],
+                    str(root.resolve()),
+                )
+                close_window.assert_called_once_with()
+                self.assertTrue(window._reopen_started)
+                self.assertFalse(window.compact_maximize_button.isEnabled())
+            finally:
+                window.abort_launch()
 
     def test_long_text_is_elided_and_keeps_full_tooltip(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
