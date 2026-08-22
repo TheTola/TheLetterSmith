@@ -134,6 +134,7 @@ class SavedLetterActivityOrderTests(unittest.TestCase):
                 )
 
             tab = ForgeTab(root)
+            tab.refresh_saved_letters()
             self.assertEqual(len(tab._saved_cards), 15)
             self.assertFalse(tab.saved_archive.isHidden())
             self.assertEqual(tab.saved_archive_label.text(), "Archive (3)")

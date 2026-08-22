@@ -33,6 +33,7 @@ from settings_store import (
 )
 from project_state import (
     ApplicationState,
+    ProjectDirtyController,
     ProjectStateController,
 )
 from project_paths import ProjectPathResolver, application_paths
@@ -43,6 +44,12 @@ from curtain_cache import (
     prepare_curtain_variant_cache,
 )
 from ui_help import set_action_help, set_control_help, set_tab_help
+from ui_constants import (
+    HELP_HIDE_DELAY_MS,
+    HELP_HOVER_DELAY_MS,
+    TOAST_DURATION_MS,
+    TRANSIENT_STATUS_MS,
+)
 from ui_theme import ThemeService
 
 # ===================================================================================================================================================================================
@@ -385,6 +392,8 @@ class TitleBar(QtWidgets.QWidget):
             "The Silver-Tongued Lettersmith",
             self,
         )
+        self._project_title = ""
+        self._project_dirty = False
         layout.addWidget(self.title_label)
         layout.addStretch()
 
@@ -693,6 +702,25 @@ class TitleBar(QtWidgets.QWidget):
         self.parent.installEventFilter(self)
         self._sync_max_restore_button()
         self.apply_theme(self.theme_service)
+
+    def set_project_dirty(self, dirty: bool) -> None:
+        self._project_dirty = bool(dirty)
+        self._render_title()
+
+    def set_project_title(self, title: str) -> None:
+        self._project_title = str(title or "").strip()
+        self._render_title()
+
+    def _render_title(self) -> None:
+        title = "The Silver-Tongued Lettersmith"
+        if self._project_title:
+            title = f"{title} — {self._project_title}"
+        if self._project_dirty:
+            title = f"{title} •"
+        self.title_label.setText(title)
+        self.title_label.setToolTip(
+            "Unsaved project changes" if self._project_dirty else "Letter Smith"
+        )
 
     def _sync_curtain_menu(self) -> None:
         current = str(
@@ -1411,6 +1439,8 @@ class Nexus(QtWidgets.QMainWindow):
         self._tray_menu: Optional[QtWidgets.QMenu] = None
         self._command_bar: Optional[QtWidgets.QWidget] = None
         self._setup_system_tray()
+        self.settings_store = SettingsStore(self.project_root)
+        self.project_dirty = ProjectDirtyController()
         self.project_state = ProjectStateController(self.project_root)
         self.project_paths = ProjectPathResolver(self.project_root)
         self.project_save_service = ProjectSaveService(
@@ -1439,6 +1469,7 @@ class Nexus(QtWidgets.QMainWindow):
         ] = None
         self._shutdown_complete = False
         self._shutdown_in_progress = False
+        self._save_in_progress = False
         self.setObjectName("NexusWindow")
 
         # Frameless + QSS
@@ -1459,6 +1490,11 @@ class Nexus(QtWidgets.QMainWindow):
 
         # Title bar
         self.title_bar = TitleBar(self)
+        self.title_bar.set_project_title(
+            str(self.settings_store.get("recipient_title", ""))
+        )
+        self.project_dirty.add_listener(self.title_bar.set_project_dirty)
+        self.settings_store.changed.connect(self._on_project_settings_changed)
         main_layout.addWidget(self.title_bar)
 
         # Tab bar
@@ -1584,7 +1620,6 @@ class Nexus(QtWidgets.QMainWindow):
         # Movies: idle + hover
         self._help_movie_idle: Optional[QMovie] = None
         self._help_movie_hover: Optional[QMovie] = None
-
         help_row.addWidget(self.help_icon, 0, Qt.AlignRight)
         body_layout.addLayout(help_row)
 
@@ -1682,6 +1717,7 @@ class Nexus(QtWidgets.QMainWindow):
         # Initial sizing & tab
         self.setMinimumSize(1180, 820)
         self.resize(WIN_W, WIN_H)
+        self._restore_window_preferences()
 
         # Shortcuts + click effects
         self._install_shortcuts()
@@ -1697,6 +1733,7 @@ class Nexus(QtWidgets.QMainWindow):
         self._apply_current_theme()
         self.project_state.add_listener(self._on_project_state_transition)
         self._apply_application_state(initial_project_state)
+        self.project_dirty.mark_saved()
 
         # Diagnostics after event loop starts
         QtCore.QTimer.singleShot(0, self._post_init_diagnostics)
@@ -2002,6 +2039,18 @@ class Nexus(QtWidgets.QMainWindow):
         self.message_tab.project_changed.connect(
             self.forge_tab.schedule_refresh
         )
+        self.image_tab.images_changed.connect(
+            lambda _reason: self.project_dirty.mark_changed("images")
+        )
+        self.image_tab.animation_settings_changed.connect(
+            lambda _index: self.project_dirty.mark_changed("image-animation")
+        )
+        self.sound_tab.project_sound.changed.connect(
+            lambda: self.project_dirty.mark_changed("sound")
+        )
+        self.message_tab.project_changed.connect(
+            lambda: self.project_dirty.mark_changed("message")
+        )
         self.image_tab.image_selected.connect(
             lambda pixmap: self._show_image_for_tab(0, pixmap)
         )
@@ -2029,8 +2078,17 @@ class Nexus(QtWidgets.QMainWindow):
         )
         self._project_tabs_initialized = True
         self._apply_theme_assets_to_descendants()
-        self.tabbar.setCurrentIndex(0)
-        self._tab_changed(0)
+        saved_tab = str(self.settings_store.get("ui_last_tab", "Images"))
+        saved_index = next(
+            (
+                index
+                for index in range(self.tabbar.count())
+                if self.tabbar.tabText(index) == saved_tab
+            ),
+            0,
+        )
+        self.tabbar.setCurrentIndex(saved_index)
+        self._tab_changed(saved_index)
         self._schedule_curtain_preparation()
 
     def _schedule_curtain_preparation(self) -> None:
@@ -2090,6 +2148,26 @@ class Nexus(QtWidgets.QMainWindow):
         if generation != self._curtain_preparation_generation:
             return
         _LOGGER.warning("Curtain preparation failed: %s", message)
+
+    def _on_project_settings_changed(
+        self,
+        _settings: dict,
+        keys: tuple[str, ...],
+    ) -> None:
+        if "recipient_title" in keys:
+            self.title_bar.set_project_title(
+                str(_settings.get("recipient_title", ""))
+            )
+        ignored = {
+            "active_play_dir",
+            "app_icon",
+            "debug",
+            "last_music_folder",
+            "settings_schema_version",
+            "visionary_url",
+        }
+        if any(not key.startswith("ui_") and key not in ignored for key in keys):
+            self.project_dirty.mark_changed("settings")
 
     def _on_project_state_transition(
         self,
@@ -2315,6 +2393,7 @@ class Nexus(QtWidgets.QMainWindow):
         self.forge_tab.refresh_project_state()
         self.forge_tab.refresh_saved_letters()
         self._show_forge_preview()
+        self.project_dirty.mark_saved()
 
     def _route_forge_correction(self, tab: str, target: str) -> None:
         destinations = {
@@ -2492,6 +2571,7 @@ class Nexus(QtWidgets.QMainWindow):
             self.page_stack.setCurrentIndex(idx)
 
         tab_name = self.tabbar.tabText(idx)
+        self.settings_store.update_fields({"ui_last_tab": tab_name})
         status_message = f"Switched to: {tab_name}"
         if autosave_note:
             status_message = f"{status_message}. {autosave_note}"
@@ -2546,6 +2626,9 @@ class Nexus(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self._update_preview_geometry)
 
     def _autosave_project_on_tab_switch(self) -> str:
+        dirty = getattr(self, "project_dirty", None)
+        if dirty is not None and not dirty.is_dirty:
+            return ""
         eligibility = self.project_save_service.save_eligibility()
         if not eligibility.can_save:
             return f"Project not saved: {eligibility.blocked_reason}"
@@ -2558,6 +2641,8 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception as error:
             _LOGGER.exception("Project tab-switch autosave failed: %s", error)
             return f"Project autosave failed: {error}"
+        if dirty is not None:
+            dirty.mark_saved()
         return "Project autosaved."
 
     def _update_preview_tools_geometry(self) -> None:
@@ -3158,6 +3243,26 @@ class Nexus(QtWidgets.QMainWindow):
             pass
         return ""
 
+    def _restore_window_preferences(self) -> None:
+        encoded = str(self.settings_store.get("ui_window_geometry", ""))
+        if encoded:
+            try:
+                geometry = QtCore.QByteArray.fromBase64(encoded.encode("ascii"))
+                self.restoreGeometry(geometry)
+            except Exception:
+                _LOGGER.exception("Window geometry could not be restored.")
+        if bool(self.settings_store.get("ui_window_maximized", False)):
+            self.setWindowState(self.windowState() | Qt.WindowMaximized)
+
+    def _save_window_preferences(self) -> None:
+        geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
+        self.settings_store.update_fields(
+            {
+                "ui_window_geometry": geometry,
+                "ui_window_maximized": self.isMaximized(),
+            }
+        )
+
     # =============================================================================================
     # Resize/Move: keep preview aspect; keep popover aligned
     # =============================================================================================
@@ -3323,6 +3428,32 @@ class Nexus(QtWidgets.QMainWindow):
                         )
                 except Exception:
                     _LOGGER.exception("Forge operation shutdown failed.")
+            save_preferences = getattr(self, "_save_window_preferences", None)
+            if callable(save_preferences):
+                save_preferences()
+            for timer_name in ("_help_show_timer", "_help_hide_timer"):
+                timer = getattr(self, timer_name, None)
+                if timer is not None:
+                    timer.stop()
+            help_icon = getattr(self, "help_icon", None)
+            if help_icon is not None:
+                help_icon.setMovie(None)
+            for movie in (
+                getattr(self, "_help_movie_idle", None),
+                getattr(self, "_help_movie_hover", None),
+            ):
+                if movie is not None:
+                    movie.stop()
+            settings_store = getattr(self, "settings_store", None)
+            settings_changed = getattr(settings_store, "changed", None)
+            settings_callback = getattr(self, "_on_project_settings_changed", None)
+            if settings_changed is not None and callable(settings_callback):
+                settings_changed.disconnect(settings_callback)
+            project_dirty = getattr(self, "project_dirty", None)
+            title_bar = getattr(self, "title_bar", None)
+            dirty_callback = getattr(title_bar, "set_project_dirty", None)
+            if project_dirty is not None and callable(dirty_callback):
+                project_dirty.remove_listener(dirty_callback)
             self.project_state.remove_listener(
                 self._on_project_state_transition
             )
@@ -3834,14 +3965,20 @@ class Nexus(QtWidgets.QMainWindow):
                 self._help_show_timer.start()
                 # Swap to hover movie while over the icon
                 if self._help_movie_hover:
+                    if self._help_movie_idle:
+                        self._help_movie_idle.stop()
                     self.help_icon.setMovie(self._help_movie_hover)
+                    self._help_movie_hover.start()
             elif t in (QEvent.Leave, QEvent.HoverLeave):
                 self._help_show_timer.stop()
                 # If we immediately entered the popover, it will cancel this timer
                 self._help_hide_timer.start()
                 # Swap back to idle movie when leaving icon
                 if self._help_movie_idle:
+                    if self._help_movie_hover:
+                        self._help_movie_hover.stop()
                     self.help_icon.setMovie(self._help_movie_idle)
+                    self._help_movie_idle.start()
 
         elif pop is not None and watched is pop:
             t = event.type()

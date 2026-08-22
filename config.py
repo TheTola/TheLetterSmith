@@ -75,6 +75,7 @@ USER_PAGES_DIR = f"{GALLERY_USER_DIR}/pages"
 USER_CONTROLS_DIR = f"{GALLERY_USER_DIR}/card/controls"
 USER_MESSAGE_DIR = f"{GALLERY_USER_DIR}/message"
 USER_SOUNDS_DIR = f"{GALLERY_USER_DIR}/sounds"
+MESSAGE_ASSETS_DIR = f"{GALLERY_DIR}/message_assets"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -607,6 +608,70 @@ def _available_named_stock_directory(
     )
 
 
+def _validated_direct_play_bundle(
+    candidate: object,
+    play_root: Path,
+    *,
+    recipient: object,
+    title: object,
+    project_id: str,
+    require_canonical_names: bool = True,
+) -> Optional[Path]:
+    """Return one matching managed bundle without enumerating Play history."""
+    canonical_title = safe_folder_name(title, "Untitled Letter")
+    try:
+        requested = Path(candidate)
+        if ".." in requested.parts or requested.is_symlink():
+            return None
+        resolved = requested.resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if (
+        resolved == play_root
+        or not _is_relative_to(resolved, play_root)
+        or not _is_play_bundle(resolved)
+        or _bundle_project_id(resolved) != project_id
+    ):
+        return None
+    canonical_names = _bundle_case_matches(
+        resolved,
+        play_root,
+        recipient=recipient,
+        title=title,
+    )
+    if not require_canonical_names:
+        if canonical_names:
+            return resolved
+        canonical = (
+            play_root
+            / safe_folder_name(recipient, "Unknown Recipient")
+            / canonical_title
+        )
+        if (
+            canonical.is_dir()
+            and _is_play_bundle(canonical)
+            and _bundle_project_id(canonical) != project_id
+        ):
+            return resolved
+        return None
+    if not canonical_names:
+        return None
+    if (
+        resolved.name != canonical_title
+        and _available_named_play_directory(
+            play_root,
+            recipient,
+            title,
+            project_id=project_id,
+            source=resolved,
+            allow_existing_project=True,
+        )
+        != resolved
+    ):
+        return None
+    return resolved
+
+
 def _write_migrated_metadata(
     play_dir: Path,
     metadata: dict,
@@ -789,6 +854,7 @@ def resolve_play_bundle_directory(
     title: object,
     project_id: object,
     migrate_existing: bool = True,
+    active_play_dir: Optional[str | Path] = None,
 ) -> Path:
     """Resolve the active project's canonical visible folder."""
     stable_id = _valid_project_uuid(project_id)
@@ -801,6 +867,31 @@ def resolve_play_bundle_directory(
     play_root.mkdir(parents=True, exist_ok=True)
     if stock_title:
         stock_root.mkdir(parents=True, exist_ok=True)
+
+    active_value = str(active_play_dir or "").strip()
+    if active_value:
+        direct = _validated_direct_play_bundle(
+            active_value,
+            play_root,
+            recipient=recipient,
+            title=title,
+            project_id=stable_id,
+            require_canonical_names=False,
+        )
+        if direct is not None:
+            return direct
+    elif not stock_title:
+        direct = _validated_direct_play_bundle(
+            play_root
+            / safe_folder_name(recipient, "Unknown Recipient")
+            / safe_folder_name(title, "Untitled Letter"),
+            play_root,
+            recipient=recipient,
+            title=title,
+            project_id=stable_id,
+        )
+        if direct is not None:
+            return direct
 
     candidates = [
         bundle
@@ -1276,6 +1367,7 @@ __all__ = [
     "USER_CONTROLS_DIR",
     "USER_MESSAGE_DIR",
     "USER_SOUNDS_DIR",
+    "MESSAGE_ASSETS_DIR",
 
     # Message assets
     "MESSAGE_HTML_FILE",

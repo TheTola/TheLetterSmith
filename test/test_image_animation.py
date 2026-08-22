@@ -6,19 +6,21 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from config import CONTROL_FILES
 from curtain_color import recolor_banner_to_curtain_color
 import generate
 import image_animation
 from Image_tab import (
+    ImageAssetCard,
     ImageTab,
     StockImageDialog,
     _ResetImagesConfirmationDialog,
@@ -36,6 +38,26 @@ from image_animation import (
 from portable_export import create_single_html
 from Message_tab import MessageTab
 from settings_store import SettingsStore
+
+
+class _FakeMovie:
+    def __init__(self, state: QtGui.QMovie.MovieState) -> None:
+        self._state = state
+        self.start_calls = 0
+
+    def state(self) -> QtGui.QMovie.MovieState:
+        return self._state
+
+    def setPaused(self, paused: bool) -> None:
+        self._state = (
+            QtGui.QMovie.Paused
+            if paused
+            else QtGui.QMovie.Running
+        )
+
+    def start(self) -> None:
+        self.start_calls += 1
+        self._state = QtGui.QMovie.Running
 
 
 class ImageAnimationTests(unittest.TestCase):
@@ -525,6 +547,121 @@ class ImageAnimationTests(unittest.TestCase):
                     )
             finally:
                 image_tab.close()
+
+
+class ImageTabPerformanceTests(unittest.TestCase):
+    @staticmethod
+    def _tab_stub(fingerprint: str = "same") -> SimpleNamespace:
+        return SimpleNamespace(
+            _disk_fingerprint=fingerprint,
+            _project_dir=mock.Mock(return_value="project"),
+            refresh_cards=mock.Mock(return_value=False),
+            _emit_cover_change_if_needed=mock.Mock(return_value=False),
+            images_changed=mock.Mock(),
+        )
+
+    def test_unchanged_sync_skips_card_rebuild_and_second_fingerprint(self) -> None:
+        tab = self._tab_stub()
+
+        with mock.patch(
+            "Image_tab.image_fingerprint",
+            return_value="same",
+        ) as fingerprint:
+            changed = ImageTab.sync_from_disk(tab)
+
+        self.assertFalse(changed)
+        fingerprint.assert_called_once_with("project")
+        tab.refresh_cards.assert_not_called()
+        tab.images_changed.emit.assert_not_called()
+
+    def test_reconciliation_is_the_only_sync_that_refingerprints(self) -> None:
+        tab = self._tab_stub("before")
+        tab.refresh_cards.return_value = True
+
+        with mock.patch(
+            "Image_tab.image_fingerprint",
+            side_effect=("external", "reconciled"),
+        ) as fingerprint:
+            changed = ImageTab.sync_from_disk(tab)
+
+        self.assertTrue(changed)
+        self.assertEqual(fingerprint.call_count, 2)
+        self.assertEqual(tab._disk_fingerprint, "reconciled")
+        tab.refresh_cards.assert_called_once_with()
+        tab.images_changed.emit.assert_called_once_with("disk")
+
+    def test_unchanged_sync_to_disk_skips_card_rebuild(self) -> None:
+        tab = self._tab_stub()
+
+        with mock.patch(
+            "Image_tab.image_fingerprint",
+            return_value="same",
+        ) as fingerprint:
+            changed = ImageTab.sync_to_disk(tab)
+
+        self.assertFalse(changed)
+        fingerprint.assert_called_once_with("project")
+        tab.refresh_cards.assert_not_called()
+        tab.images_changed.emit.assert_not_called()
+
+    def test_movie_pauses_and_resumes_without_reconstruction(self) -> None:
+        movie = _FakeMovie(QtGui.QMovie.Running)
+        card = SimpleNamespace(
+            _movie=movie,
+            _playback_active=True,
+            _resume_movie_on_activation=False,
+        )
+
+        ImageAssetCard.set_playback_active(card, False)
+
+        self.assertEqual(movie.state(), QtGui.QMovie.Paused)
+        self.assertTrue(card._resume_movie_on_activation)
+
+        ImageAssetCard.set_playback_active(card, True)
+
+        self.assertEqual(movie.state(), QtGui.QMovie.Running)
+        self.assertFalse(card._resume_movie_on_activation)
+        self.assertEqual(movie.start_calls, 0)
+
+    def test_completed_movie_is_not_restarted_on_tab_activation(self) -> None:
+        movie = _FakeMovie(QtGui.QMovie.NotRunning)
+        card = SimpleNamespace(
+            _movie=movie,
+            _playback_active=True,
+            _resume_movie_on_activation=False,
+        )
+
+        ImageAssetCard.set_playback_active(card, False)
+        ImageAssetCard.set_playback_active(card, True)
+
+        self.assertEqual(movie.state(), QtGui.QMovie.NotRunning)
+        self.assertEqual(movie.start_calls, 0)
+
+    def test_tab_lifecycle_controls_all_card_movies(self) -> None:
+        cards = {
+            1: mock.Mock(),
+            2: mock.Mock(),
+        }
+        tab = SimpleNamespace(
+            _tab_active=True,
+            cards=cards,
+            sync_from_disk=mock.Mock(),
+            sync_to_disk=mock.Mock(),
+        )
+
+        ImageTab.deactivate_for_tab_change(tab)
+
+        self.assertFalse(tab._tab_active)
+        tab.sync_to_disk.assert_called_once_with()
+        for card in cards.values():
+            card.set_playback_active.assert_called_once_with(False)
+
+        ImageTab.activate_for_tab_change(tab)
+
+        self.assertTrue(tab._tab_active)
+        tab.sync_from_disk.assert_called_once_with()
+        for card in cards.values():
+            card.set_playback_active.assert_called_with(True)
 
 
 if __name__ == "__main__":

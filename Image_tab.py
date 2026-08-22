@@ -739,6 +739,8 @@ class ImageAssetCard(
             QtGui.QPixmap()
         )
         self._movie: QtGui.QMovie | None = None
+        self._playback_active = True
+        self._resume_movie_on_activation = False
 
         self.setObjectName(
             "ImageAssetCard"
@@ -1019,7 +1021,10 @@ class ImageAssetCard(
         )
         self.set_asset_state("ready")
         self._rescale()
-        movie.start()
+        if self._playback_active:
+            movie.start()
+        else:
+            self._resume_movie_on_activation = True
 
     def clear_pixmap(self) -> None:
         self._stop_movie()
@@ -1110,7 +1115,46 @@ class ImageAssetCard(
             scaled_pixmap
         )
 
+    def set_playback_active(
+        self,
+        active: bool,
+    ) -> None:
+        active = bool(active)
+        if active == self._playback_active:
+            return
+
+        self._playback_active = active
+        if self._movie is None:
+            return
+
+        if not active:
+            if (
+                self._movie.state()
+                == QtGui.QMovie.Running
+            ):
+                self._movie.setPaused(True)
+                self._resume_movie_on_activation = True
+            else:
+                self._resume_movie_on_activation = False
+            return
+
+        if not self._resume_movie_on_activation:
+            return
+
+        if (
+            self._movie.state()
+            == QtGui.QMovie.Paused
+        ):
+            self._movie.setPaused(False)
+        elif (
+            self._movie.state()
+            == QtGui.QMovie.NotRunning
+        ):
+            self._movie.start()
+        self._resume_movie_on_activation = False
+
     def _stop_movie(self) -> None:
+        self._resume_movie_on_activation = False
         if self._movie is None:
             return
         self._movie.stop()
@@ -1386,11 +1430,7 @@ class ImageTab(
             for index in self.labels
         }
 
-        self._disk_fingerprint = (
-            image_fingerprint(
-                self._project_dir()
-            )
-        )
+        self._disk_fingerprint: str | None = None
         self._cover_fingerprint = self._cover_file_fingerprint()
 
         self._tab_active = False
@@ -1454,6 +1494,9 @@ class ImageTab(
                 index,
                 title,
                 self,
+            )
+            card.set_playback_active(
+                self._tab_active
             )
 
             card.select_requested.connect(
@@ -1670,6 +1713,9 @@ class ImageTab(
         self.pwrite_fab.hide()
 
         self.refresh_cards()
+        self._disk_fingerprint = image_fingerprint(
+            self._project_dir()
+        )
 
     # ─────────────────────────────────────────────────────────────────────
     # Paths and synchronization
@@ -1755,19 +1801,20 @@ class ImageTab(
         self.cover_changed.emit()
         return True
 
-    def refresh_cards(self) -> None:
-        reconcile_external_image_assets(
-            self._user_pages_dir()
+    def refresh_cards(self) -> bool:
+        pages_directory = self._user_pages_dir()
+        reconciled = reconcile_external_image_assets(
+            pages_directory
         )
         manifest = load_image_manifest(
-            self._user_pages_dir()
+            pages_directory
         )
         for index, (
             _title,
             filename,
         ) in self.labels.items():
             preview_path = os.path.join(
-                self._user_pages_dir(),
+                pages_directory,
                 filename,
             )
             slot = INDEX_TO_SLOT[index]
@@ -1779,7 +1826,7 @@ class ImageTab(
             )
             asset_path = (
                 os.path.join(
-                    self._user_pages_dir(),
+                    pages_directory,
                     f"{slot}.gif",
                 )
                 if animated_gif
@@ -1811,35 +1858,39 @@ class ImageTab(
                 index
             ].clear_pixmap()
 
+        return reconciled
+
     def sync_from_disk(
         self,
         *,
         force: bool = False,
     ) -> bool:
-        before = self._disk_fingerprint
-
-        after = image_fingerprint(
+        current = image_fingerprint(
             self._project_dir()
         )
 
         changed = (
             force
-            or before != after
+            or self._disk_fingerprint
+            != current
         )
 
-        self.refresh_cards()
+        if not changed:
+            return False
 
+        reconciled = self.refresh_cards()
         self._disk_fingerprint = (
             image_fingerprint(
                 self._project_dir()
             )
+            if reconciled
+            else current
         )
         self._emit_cover_change_if_needed()
 
-        if changed:
-            self.images_changed.emit(
-                "disk"
-            )
+        self.images_changed.emit(
+            "disk"
+        )
 
         return changed
 
@@ -1848,25 +1899,23 @@ class ImageTab(
             self._project_dir()
         )
 
-        changed = (
-            current
-            != self._disk_fingerprint
+        if current == self._disk_fingerprint:
+            return False
+
+        reconciled = self.refresh_cards()
+        self._disk_fingerprint = (
+            image_fingerprint(
+                self._project_dir()
+            )
+            if reconciled
+            else current
         )
 
-        if changed:
-            self._disk_fingerprint = (
-                current
-            )
-
-            self.images_changed.emit(
-                "saved"
-            )
-
+        self.images_changed.emit(
+            "saved"
+        )
         self._emit_cover_change_if_needed()
-
-        self.refresh_cards()
-
-        return changed
+        return True
 
     def refresh_from_disk(self) -> None:
         self.sync_from_disk(
@@ -1881,6 +1930,8 @@ class ImageTab(
 
         self._tab_active = True
         self.sync_from_disk()
+        for card in self.cards.values():
+            card.set_playback_active(True)
 
     def deactivate_for_tab_change(
         self,
@@ -1888,10 +1939,12 @@ class ImageTab(
         if not self._tab_active:
             return
 
-        self.sync_to_disk()
         for card in self.cards.values():
             card.release_asset_handle()
         self._tab_active = False
+        for card in self.cards.values():
+            card.set_playback_active(False)
+        self.sync_to_disk()
 
     def focus_asset_slot(
         self,
@@ -2694,12 +2747,16 @@ class ImageTab(
     def shutdown(self) -> None:
         self._status_clear_timer.stop()
         self.pwrite_fab.hide()
-        self.prepare_for_project_restore()
 
         try:
             self.sync_to_disk()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug(
+                "Best-effort operation failed.",
+                exc_info=True,
+            )
+        finally:
+            self.prepare_for_project_restore()
 
     def prepare_for_project_restore(self) -> None:
         for card in self.cards.values():

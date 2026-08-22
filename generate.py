@@ -67,7 +67,12 @@ from sound_model import (
 )
 from project_state import ensure_project_identity
 from project_paths import application_paths
-from settings_store import DEFAULT_SETTINGS, SettingsStore, VALID_CURTAIN_STYLES
+from settings_store import (
+    ACTIVE_PLAY_DIR_KEY,
+    DEFAULT_SETTINGS,
+    SettingsStore,
+    VALID_CURTAIN_STYLES,
+)
 from transactional_io import PathTransaction, cleanup_abandoned_staging
 from config import (
     APP_BANNER_PATH,
@@ -454,15 +459,33 @@ def _seed_sfx_into_build(*, project_root: Path, sounds_dst: Path, seed_sfx: bool
 
 def play_bundle_directory(project_root: str | Path) -> Path:
     root = Path(project_root).resolve()
-    settings = SettingsStore(root).snapshot()
+    settings_store = SettingsStore(root)
+    settings = settings_store.snapshot()
     recipient = _recipient_from_settings(settings)
     title = _title_from_settings(settings, recipient)
-    return resolve_play_bundle_directory(
+    active_value = str(settings.get(ACTIVE_PLAY_DIR_KEY) or "").strip()
+    build = resolve_play_bundle_directory(
         root,
         recipient=recipient,
         title=title,
         project_id=ensure_project_identity(root),
+        active_play_dir=active_value,
     )
+    if (
+        str(build) != active_value
+        and all(
+            (build / name).is_file()
+            for name in ("index.html", "styles.css", "script.js")
+        )
+    ):
+        try:
+            settings_store.update_fields({ACTIVE_PLAY_DIR_KEY: str(build)})
+        except Exception:
+            _LOGGER.exception(
+                "The resolved active Play directory could not be persisted: %s",
+                build,
+            )
+    return build
 
 
 def _curtain_context_for_settings(
@@ -1036,6 +1059,15 @@ def generate_play_bundle(
     except OSError:
         _LOGGER.exception(
             "Play bundle backup cleanup failed for %s",
+            final_play_dir,
+        )
+    try:
+        SettingsStore(pr).update_fields(
+            {ACTIVE_PLAY_DIR_KEY: str(final_play_dir)}
+        )
+    except Exception:
+        _LOGGER.exception(
+            "The active Play directory could not be persisted: %s",
             final_play_dir,
         )
 

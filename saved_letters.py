@@ -687,8 +687,19 @@ class SavedLetterCatalog:
             if self.stock_only
             else (self.play_root, self.recovery_root)
         )
+        self._entries: tuple[SavedLetter, ...] | None = None
 
-    def list_entries(self) -> tuple[SavedLetter, ...]:
+    @property
+    def is_loaded(self) -> bool:
+        return self._entries is not None
+
+    def invalidate(self) -> None:
+        """Require one reconciliation before the catalog is read again."""
+        self._entries = None
+
+    def list_entries(self, *, force_refresh: bool = False) -> tuple[SavedLetter, ...]:
+        if self._entries is not None and not force_refresh:
+            return self._entries
         entries: list[SavedLetter] = []
         seen: set[Path] = set()
         validator = SavedLetterRestorer(self.project_root)
@@ -707,8 +718,15 @@ class SavedLetterCatalog:
             for index in root.rglob("index.html"):
                 path = index.parent.resolve()
                 try:
-                    path.relative_to(root)
+                    relative = path.relative_to(root)
                 except ValueError:
+                    continue
+                if any(
+                    ".build-staging" in part
+                    or ".build-backup" in part
+                    or part.startswith(".letter-load-")
+                    for part in relative.parts
+                ):
                     continue
                 if path in seen:
                     continue
@@ -738,7 +756,36 @@ class SavedLetterCatalog:
             ),
             reverse=True,
         )
-        return tuple(entries)
+        self._entries = tuple(entries)
+        return self._entries
+
+    def refresh_entry(self, path: str | Path) -> tuple[SavedLetter, ...] | None:
+        """Update one known build without re-enumerating historical letters."""
+        if self._entries is None:
+            return None
+        candidate = Path(path).resolve()
+        recovery: bool | None = None
+        for root, is_recovery in (
+            (self.play_root, False),
+            (self.recovery_root, True),
+        ):
+            try:
+                relative = candidate.relative_to(root)
+            except ValueError:
+                continue
+            if relative.parts:
+                recovery = is_recovery
+                break
+
+        entries = [entry for entry in self._entries if entry.path != candidate]
+        if recovery is not None and self._is_valid_candidate(candidate):
+            entries.append(self._entry(candidate, recovery=recovery))
+        entries.sort(
+            key=lambda entry: (entry.modified_at, entry.title.casefold()),
+            reverse=True,
+        )
+        self._entries = tuple(entries)
+        return self._entries
 
     def search(self, query: str) -> tuple[SavedLetter, ...]:
         needle = (query or "").strip().casefold()
@@ -789,6 +836,12 @@ class SavedLetterCatalog:
             raise SavedLetterDeleteError(
                 "The saved letter could not be deleted."
             ) from error
+        if self._entries is not None:
+            self._entries = tuple(
+                candidate
+                for candidate in self._entries
+                if candidate.path != target
+            )
         return target
 
     @staticmethod

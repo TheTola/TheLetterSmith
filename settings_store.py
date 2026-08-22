@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import re
 import shutil
 import threading
@@ -15,6 +16,9 @@ from project_paths import application_paths
 
 
 SETTINGS_FILENAME = "settings.json"
+SETTINGS_SCHEMA_KEY = "settings_schema_version"
+SETTINGS_SCHEMA_VERSION = 1
+_LOGGER = logging.getLogger(__name__)
 
 REQUIRED_FEATURES_KEY = "required_features"
 PUBLISHED_PAGE_URL_KEY = "published_page_url"
@@ -34,6 +38,7 @@ DEFAULT_VISIONARY_URL = (
 
 
 DEFAULT_SETTINGS = {
+    SETTINGS_SCHEMA_KEY: SETTINGS_SCHEMA_VERSION,
     "starting_volume": 31,
     "last_audio": "music.mp3",
     "curtain_style": "pure_white",
@@ -50,6 +55,29 @@ DEFAULT_SETTINGS = {
     ACTIVE_PLAY_DIR_KEY: "",
     VISIONARY_URL_KEY: DEFAULT_VISIONARY_URL,
 }
+
+PUBLICATION_SETTING_KEYS = (
+    PUBLISHED_PAGE_URL_KEY,
+    PUBLISHED_PUBLIC_PATH_KEY,
+    PUBLISHED_AT_KEY,
+    PUBLISHED_EXPIRES_AT_KEY,
+    PUBLICATION_PROVIDER_KEY,
+    PUBLICATION_VERIFIED_KEY,
+    PUBLISHED_SOURCE_FINGERPRINT_KEY,
+    PUBLISHED_GITHUB_OWNER_KEY,
+    PUBLISHED_GITHUB_REPOSITORY_KEY,
+)
+
+
+class UnsupportedSettingsSchemaError(RuntimeError):
+    pass
+
+
+def empty_publication_settings() -> dict[str, object]:
+    return {
+        key: DEFAULT_SETTINGS[key]
+        for key in PUBLICATION_SETTING_KEYS
+    }
 
 
 VALID_CURTAIN_STYLES = {
@@ -261,6 +289,8 @@ class SettingsStore:
         threading.RLock,
     ] = {}
 
+    _signals: dict[str, SettingsChanged] = {}
+
     def __init__(
         self,
         project_root: str | Path,
@@ -273,12 +303,18 @@ class SettingsStore:
             self.project_root
         ).settings_file
 
-        self.changed = SettingsChanged()
+        signal_key = str(self.path).casefold()
+        with self._locks_guard:
+            self.changed = self._signals.setdefault(
+                signal_key,
+                SettingsChanged(),
+            )
 
         self._settings: dict[
             str,
             Any,
         ] = {}
+        self._file_signature: tuple[int, int, int, int, int] | None = None
 
         self.validate_and_migrate()
 
@@ -312,6 +348,23 @@ class SettingsStore:
     ) -> dict[str, Any]:
         return self.snapshot()
 
+    def last_folder(self, picker: str) -> str:
+        key = f"ui_last_folder_{str(picker).strip().casefold()}"
+        value = self.get(key, "")
+        path = Path(str(value)).expanduser() if value else None
+        return str(path) if path is not None and path.is_dir() else ""
+
+    def remember_folder(self, picker: str, selected_path: str | Path) -> str:
+        candidate = Path(selected_path).expanduser()
+        folder = candidate if candidate.is_dir() else candidate.parent
+        try:
+            folder = folder.resolve()
+        except OSError:
+            folder = folder.absolute()
+        key = f"ui_last_folder_{str(picker).strip().casefold()}"
+        self.update_fields({key: str(folder)})
+        return str(folder)
+
     def snapshot(
         self,
     ) -> dict[str, Any]:
@@ -325,9 +378,14 @@ class SettingsStore:
         )
 
         with lock:
-            raw, invalid = (
-                self._read_unlocked()
-            )
+            signature = self._stat_signature_unlocked()
+            if (
+                self._file_signature is not None
+                and signature == self._file_signature
+            ):
+                return dict(self._settings)
+
+            raw, invalid = self._read_unlocked()
 
             normalized = self._normalize(
                 raw
@@ -341,6 +399,8 @@ class SettingsStore:
                 self._write_unlocked(
                     normalized
                 )
+            else:
+                self._file_signature = self._stat_signature_unlocked()
 
             self._settings = normalized
 
@@ -376,9 +436,14 @@ class SettingsStore:
         )
 
         with lock:
-            current, _invalid = (
-                self._read_unlocked()
-            )
+            signature = self._stat_signature_unlocked()
+            if (
+                self._file_signature is not None
+                and signature == self._file_signature
+            ):
+                current = dict(self._settings)
+            else:
+                current, _invalid = self._read_unlocked()
 
             current = self._normalize(
                 current
@@ -410,6 +475,8 @@ class SettingsStore:
                 self._write_unlocked(
                     current
                 )
+            else:
+                self._file_signature = self._stat_signature_unlocked()
 
             self._settings = current
 
@@ -433,9 +500,14 @@ class SettingsStore:
         )
 
         with lock:
-            before, _invalid = (
-                self._read_unlocked()
-            )
+            signature = self._stat_signature_unlocked()
+            if (
+                self._file_signature is not None
+                and signature == self._file_signature
+            ):
+                before = dict(self._settings)
+            else:
+                before, _invalid = self._read_unlocked()
 
             before = self._normalize(
                 before
@@ -554,6 +626,22 @@ class SettingsStore:
             self.path,
             payload,
         )
+        self._file_signature = self._stat_signature_unlocked()
+
+    def _stat_signature_unlocked(
+        self,
+    ) -> tuple[int, int, int, int, int] | None:
+        try:
+            stat_result = self.path.stat()
+        except OSError:
+            return None
+        return (
+            int(stat_result.st_dev),
+            int(stat_result.st_ino),
+            int(stat_result.st_size),
+            int(stat_result.st_mtime_ns),
+            int(stat_result.st_ctime_ns),
+        )
 
     @staticmethod
     def _normalize(
@@ -565,6 +653,23 @@ class SettingsStore:
         normalized = dict(
             settings
         )
+
+        try:
+            source_schema = int(normalized.get(SETTINGS_SCHEMA_KEY, 0))
+        except (TypeError, ValueError):
+            source_schema = 0
+        if source_schema > SETTINGS_SCHEMA_VERSION:
+            raise UnsupportedSettingsSchemaError(
+                "Settings were written by a newer Letter Smith version "
+                f"(schema {source_schema})."
+            )
+        normalized[SETTINGS_SCHEMA_KEY] = SETTINGS_SCHEMA_VERSION
+        if source_schema and source_schema < SETTINGS_SCHEMA_VERSION:
+            _LOGGER.info(
+                "Settings upgraded from schema %d -> %d",
+                source_schema,
+                SETTINGS_SCHEMA_VERSION,
+            )
 
         # Starting volume
         try:
@@ -806,11 +911,16 @@ __all__ = [
     "PUBLISHED_PAGE_URL_KEY",
     "PUBLISHED_PUBLIC_PATH_KEY",
     "PUBLISHED_SOURCE_FINGERPRINT_KEY",
+    "PUBLICATION_SETTING_KEYS",
     "REQUIRED_FEATURES_KEY",
     "VISIONARY_URL_KEY",
     "SETTINGS_FILENAME",
+    "SETTINGS_SCHEMA_KEY",
+    "SETTINGS_SCHEMA_VERSION",
     "SettingsChanged",
     "SettingsStore",
+    "UnsupportedSettingsSchemaError",
+    "empty_publication_settings",
     "VALID_CURTAIN_STYLES",
     "normalize_published_page_url",
 ]

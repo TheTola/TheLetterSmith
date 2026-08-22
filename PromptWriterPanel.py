@@ -3561,6 +3561,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 LOGGER.warning(
                     "Prompt Writer open-time proofreading could not be persisted"
                 )
+        visionary_timer = getattr(self, "_visionary_timer", None)
+        if visionary_timer is not None and not visionary_timer.isActive():
+            visionary_timer.start()
         self._geom_anim.stop()
         self._fade_anim.stop()
         self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
@@ -3596,6 +3599,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def popdown(self):
         if not self.isVisible():
             return
+        visionary_timer = getattr(self, "_visionary_timer", None)
+        if visionary_timer is not None:
+            visionary_timer.stop()
         self._animation_generation += 1
         generation = self._animation_generation
         self._geom_anim.stop()

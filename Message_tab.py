@@ -770,7 +770,13 @@ class MessageTab(QtWidgets.QWidget):
         )
         self._save_settings()
         self._refresh_message_from_disk()
-        if self.current_html.strip():
+        workspace_message_fingerprint = file_fingerprint(self._html_path())
+        if (
+            self.current_html.strip()
+            and not self._project_message_matches_workspace(
+                workspace_message_fingerprint
+            )
+        ):
             try:
                 self.project_save_service.save_message(
                     self.current_html,
@@ -795,6 +801,25 @@ class MessageTab(QtWidgets.QWidget):
         if changed:
             self.project_changed.emit()
         return changed
+
+    def _project_message_matches_workspace(
+        self,
+        workspace_fingerprint: str,
+    ) -> bool:
+        """Avoid rewriting project metadata when Message content is unchanged."""
+        if not self.project_state.is_project_ready:
+            return True
+        try:
+            context = self.project_save_service.current_context()
+            destination = self.project_save_service.project_file(
+                context,
+                Path("message") / "message.html",
+            )
+        except ProjectNotReadyError:
+            return True
+        except Exception:
+            return False
+        return file_fingerprint(destination) == workspace_fingerprint
 
     def activate_for_tab_change(self) -> None:
         if self._tab_active:
@@ -1167,6 +1192,7 @@ class MessageTab(QtWidgets.QWidget):
                 )
             return False
         try:
+            before = self.settings_store.snapshot()
             fields = {
                 key: self.settings[key]
                 for key in (
@@ -1188,13 +1214,18 @@ class MessageTab(QtWidgets.QWidget):
                 if key in self.settings
             }
             self.settings = self.settings_store.update_fields(fields)
+            changed = any(
+                before.get(key) != self.settings.get(key)
+                for key in fields
+            )
             if announce:
                 self.status.setText("Message details saved.")
         except Exception as error:
             if announce:
                 self.status.setText(f"Error saving settings: {error}")
             return False
-        self.project_changed.emit()
+        if changed:
+            self.project_changed.emit()
         return True
 
     def _save_settings(self) -> bool:
@@ -1210,34 +1241,35 @@ class MessageTab(QtWidgets.QWidget):
             self.name_input.setText(current_recipient)
             self.status.setText("Recipient is required.")
             return False
-        try:
-            matching_recipient = (
-                self.project_state.recipient_registry.find_matching_recipient(
-                    recipient
-                )
-            )
-            if matching_recipient is not None and title:
-                conflict = self.project_paths.find_title_conflict(
-                    matching_recipient.recipient_id,
-                    title,
-                    project_id=self.project_state.identity.project_id,
-                )
-                if conflict is not None:
-                    self.name_input.setText(current_recipient)
-                    self.title_input.setText(current_title)
-                    self.status.setText(
-                        f"{matching_recipient.display_name} already has a "
-                        f"letter titled {title!r}. "
-                        "Enter a different letter title."
+        if recipient != current_recipient or title != current_title:
+            try:
+                matching_recipient = (
+                    self.project_state.recipient_registry.find_matching_recipient(
+                        recipient
                     )
-                    return False
-        except Exception as error:
-            self.name_input.setText(current_recipient)
-            self.title_input.setText(current_title)
-            self.status.setText(
-                f"Recipient and letter title could not be checked: {error}"
-            )
-            return False
+                )
+                if matching_recipient is not None and title:
+                    conflict = self.project_paths.find_title_conflict(
+                        matching_recipient.recipient_id,
+                        title,
+                        project_id=self.project_state.identity.project_id,
+                    )
+                    if conflict is not None:
+                        self.name_input.setText(current_recipient)
+                        self.title_input.setText(current_title)
+                        self.status.setText(
+                            f"{matching_recipient.display_name} already has a "
+                            f"letter titled {title!r}. "
+                            "Enter a different letter title."
+                        )
+                        return False
+            except Exception as error:
+                self.name_input.setText(current_recipient)
+                self.title_input.setText(current_title)
+                self.status.setText(
+                    f"Recipient and letter title could not be checked: {error}"
+                )
+                return False
         if recipient != current_recipient:
             try:
                 identity = self.project_state.change_recipient(recipient)

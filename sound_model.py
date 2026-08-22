@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
@@ -24,6 +25,7 @@ PROJECT_SOUND_FILE_NAME = "project_sound.json"
 CURRENT_MANIFEST_NAME = "current.json"
 BUILD_SOUND_MANIFEST_NAME = "lettersmith-sound.json"
 ATOMIC_REPLACE_TIMEOUT_SECONDS = 2.0
+MAX_INVALID_BACKUPS = 8
 _LOGGER = logging.getLogger(__name__)
 _LOGGED_STOCK_ROOTS: set[Path] = set()
 
@@ -103,15 +105,53 @@ def atomic_write_json(path: str | Path, payload: dict) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _backup_invalid_json(path: Path) -> None:
+    if not path.is_file():
+        return
+    backup = path.with_name(
+        f"{path.stem}.invalid.{time.strftime('%Y%m%d-%H%M%S')}."
+        f"{time.time_ns()}{path.suffix}"
+    )
+    try:
+        shutil.copy2(path, backup)
+    except OSError:
+        _LOGGER.exception("Invalid sound data backup failed: %s", backup)
+        return
+    backups = sorted(
+        path.parent.glob(f"{path.stem}.invalid.*{path.suffix}"),
+        key=lambda candidate: candidate.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for stale in backups[MAX_INVALID_BACKUPS:]:
+        try:
+            stale.unlink()
+        except OSError:
+            _LOGGER.exception("Could not remove old sound-data backup: %s", stale)
+
+
+def _replace_invalid_json(path: Path, default: dict) -> dict:
+    _backup_invalid_json(path)
+    replacement = dict(default)
+    try:
+        atomic_write_json(path, replacement)
+    except OSError:
+        _LOGGER.exception("Invalid sound data could not be normalized: %s", path)
+    return replacement
+
+
 def read_json(path: str | Path, default: dict) -> dict:
     source = Path(path)
     if not source.is_file():
         return dict(default)
     try:
         payload = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return dict(default)
-    return payload if isinstance(payload, dict) else dict(default)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        _LOGGER.warning("Sound data could not be read from %s: %s", source, error)
+        return _replace_invalid_json(source, default)
+    if not isinstance(payload, dict):
+        _LOGGER.warning("Sound data root is not an object: %s", source)
+        return _replace_invalid_json(source, default)
+    return payload
 
 
 def hash_file(path: str | Path) -> str:
@@ -218,11 +258,16 @@ class ProjectSoundState:
     @classmethod
     def from_dict(cls, payload: dict) -> "ProjectSoundState":
         playlist = payload.get("playlist", [])
+        playlist_expanded = payload.get("playlist_expanded", True)
         return cls(
             mode=str(payload.get("mode", "single")),
             single_track_id=str(payload.get("single_track_id", "")),
             playlist=[str(item) for item in playlist] if isinstance(playlist, list) else [],
-            playlist_expanded=bool(payload.get("playlist_expanded", True)),
+            playlist_expanded=(
+                playlist_expanded
+                if isinstance(playlist_expanded, bool)
+                else True
+            ),
             selected_track_id=str(payload.get("selected_track_id", "")),
         )
 
@@ -337,22 +382,50 @@ def _stock_track_aliases(project_root: str | Path) -> dict[str, str]:
 
 def load_library(project_root: str | Path) -> dict[str, TrackRecord]:
     ensure_sound_dirs(project_root)
-    payload = read_json(library_path(project_root), {"version": SOUND_MODEL_VERSION, "tracks": {}})
+    path = library_path(project_root)
+    default = {"version": SOUND_MODEL_VERSION, "tracks": {}}
+    payload = read_json(path, default)
+    try:
+        source_version = int(payload.get("version", 0))
+    except (TypeError, ValueError):
+        source_version = -1
+    if source_version < 0 or source_version > SOUND_MODEL_VERSION:
+        payload = _replace_invalid_json(path, default)
+        source_version = SOUND_MODEL_VERSION
     raw_tracks = payload.get("tracks", {})
     if not isinstance(raw_tracks, dict):
-        raw_tracks = {}
+        payload = _replace_invalid_json(path, default)
+        raw_tracks = payload["tracks"]
+        source_version = SOUND_MODEL_VERSION
     records: dict[str, TrackRecord] = {}
+    repaired = source_version != SOUND_MODEL_VERSION
     for key, value in raw_tracks.items():
         if not isinstance(value, dict):
+            repaired = True
             continue
         try:
             record = TrackRecord.from_dict(value)
         except (TypeError, ValueError):
+            repaired = True
             continue
         if not record.track_id:
             record.track_id = str(key)
-        if record.track_id and record.processed_file:
+            repaired = True
+        if (
+            record.track_id
+            and record.processed_file
+            and Path(record.processed_file).name == record.processed_file
+            and (
+                not record.original_file
+                or Path(record.original_file).name == record.original_file
+            )
+        ):
             records[record.track_id] = record
+        else:
+            repaired = True
+    if repaired and path.is_file():
+        _backup_invalid_json(path)
+        save_library(project_root, records)
     stock_records = _load_stock_records(project_root)
     stock_hashes = {
         record.content_hash
@@ -390,7 +463,15 @@ def load_project_state(
     *,
     valid_ids: Optional[set[str]] = None,
 ) -> ProjectSoundState:
-    payload = read_json(project_sound_path(project_root), {"version": SOUND_MODEL_VERSION})
+    path = project_sound_path(project_root)
+    default = {"version": SOUND_MODEL_VERSION}
+    payload = read_json(path, default)
+    try:
+        source_version = int(payload.get("version", 0))
+    except (TypeError, ValueError):
+        source_version = -1
+    if source_version < 0 or source_version > SOUND_MODEL_VERSION:
+        payload = _replace_invalid_json(path, default)
     aliases = _stock_track_aliases(project_root)
     if aliases:
         single_track_id = str(payload.get("single_track_id", "")).strip()
@@ -431,9 +512,16 @@ def resolve_project_tracks(project_root: str | Path) -> tuple[ProjectSoundState,
 
 def build_sound_manifest(state: ProjectSoundState, tracks: Iterable[TrackRecord], filenames: list[str]) -> dict:
     track_list = list(tracks)
+    ordered_ids = state.ordered_track_ids()
+    try:
+        selected_track_index = ordered_ids.index(state.selected_track_id)
+    except ValueError:
+        selected_track_index = 0 if ordered_ids else -1
     return {
         "version": SOUND_MODEL_VERSION,
         "mode": state.mode,
+        "playlist_expanded": bool(state.playlist_expanded),
+        "selected_track_index": selected_track_index,
         "crossfade_ms": 1000 if state.mode == "playlist" and len(track_list) > 1 else 0,
         "tracks": [
             {

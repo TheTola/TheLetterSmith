@@ -4,6 +4,7 @@ import logging
 import traceback
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 from typing import Callable, Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
@@ -14,6 +15,8 @@ from message_html import read_text_normalized
 from publishing import GitHubPagesPublisher, PublishResult
 from publishing.expiration import (
     PUBLISHED_EXPIRES_AT_KEY,
+    is_publication_expiration_malformed,
+    is_publication_expired,
     publication_expiry_label,
     publication_status,
 )
@@ -74,6 +77,32 @@ PREVIEW_MODE_DESCRIPTIONS = {
     "window": "",
 }
 RECENT_SAVED_LETTER_LIMIT = 15
+_CATALOG_INTERNAL_CHANGE_GRACE_SECONDS = 1.0
+_FORGE_RELEVANT_SETTING_KEYS = frozenset(
+    {
+        "recipient_id",
+        "recipient_name",
+        "recipient_title",
+        "project_id",
+        "starting_volume",
+        "music_volume",
+        "music_required",
+        "curtain_style",
+        "message_overlay_preset",
+        "message_overlay_opacity",
+        "required_features",
+        PREVIEW_MODE_KEY,
+        PUBLISHED_PAGE_URL_KEY,
+        PUBLISHED_PUBLIC_PATH_KEY,
+        PUBLISHED_AT_KEY,
+        PUBLISHED_EXPIRES_AT_KEY,
+        PUBLICATION_PROVIDER_KEY,
+        PUBLICATION_VERIFIED_KEY,
+        PUBLISHED_SOURCE_FINGERPRINT_KEY,
+        PUBLISHED_GITHUB_OWNER_KEY,
+        PUBLISHED_GITHUB_REPOSITORY_KEY,
+    }
+)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -725,6 +754,11 @@ class ForgeTab(QtWidgets.QWidget):
         self._archive_groups: dict[str, tuple[SavedLetter, ...]] = {}
         self._saved_delete_mode = False
         self._saved_panel_mode = "saved"
+        self._catalog_dirty = True
+        self._catalog_rendered = False
+        self._rendered_catalog_entries: tuple[SavedLetter, ...] = ()
+        self._rendered_catalog_mode = ""
+        self._catalog_watch_suppressed_until = 0.0
         self._project_fingerprint = _forge_source_fingerprint(self.project_root)
         self._source_revision = 0
         try:
@@ -795,13 +829,15 @@ class ForgeTab(QtWidgets.QWidget):
         self._metadata_timer.setSingleShot(True)
         self._metadata_timer.timeout.connect(self._run_pending_metadata_update)
 
-        self.refresh_saved_letters()
         self.refresh_project_state()
-
         QtCore.QTimer.singleShot(0, self._validate_github_account_async)
 
-    def _saved_preview_mode(self) -> str:
-        value = str(self.settings.get(PREVIEW_MODE_KEY, "portrait")).strip()
+    def _saved_preview_mode(self, snapshot: dict | None = None) -> str:
+        if snapshot is None:
+            value = self.settings.get(PREVIEW_MODE_KEY, "portrait")
+        else:
+            value = snapshot.get(PREVIEW_MODE_KEY, "portrait")
+        value = str(value).strip()
         valid = {mode for _label, mode in PREVIEW_MODES}
         return value if value in valid else "portrait"
 
@@ -1224,9 +1260,10 @@ class ForgeTab(QtWidgets.QWidget):
     def _on_settings_changed(
         self,
         _settings: dict,
-        _keys: tuple[str, ...],
+        keys: tuple[str, ...],
     ) -> None:
-        self._settings_refresh_requested.emit()
+        if _FORGE_RELEVANT_SETTING_KEYS.intersection(keys):
+            self._settings_refresh_requested.emit()
 
     def _sync_publishing_controls(self) -> None:
         configuration = github_application_configuration()
@@ -1551,14 +1588,13 @@ class ForgeTab(QtWidgets.QWidget):
         return True
 
     def schedule_refresh(self) -> None:
-        self._refresh_source_fingerprint()
         self._refresh_timer.start()
 
     def refresh_project_state(self) -> None:
         self._refresh_source_fingerprint()
         snapshot = self.settings.snapshot()
         self._sync_publishing_controls()
-        preview_mode = self._saved_preview_mode()
+        preview_mode = self._saved_preview_mode(snapshot)
         preview_mode_changed = preview_mode != self._preview_mode
         self._preview_mode = preview_mode
         if self.preview_mode.currentData() != preview_mode:
@@ -1573,7 +1609,7 @@ class ForgeTab(QtWidgets.QWidget):
         self.identity_title.setToolTip(title)
         self.identity_recipient.setText(recipient or "No recipient")
         self.identity_recipient.setToolTip(recipient)
-        self.refresh_saved_page_url()
+        self.refresh_saved_page_url(snapshot)
         self.refresh_readiness()
         if preview_mode_changed and not self._preview_refresh_pending:
             self.request_preview()
@@ -1655,7 +1691,7 @@ class ForgeTab(QtWidgets.QWidget):
             "Stock Letters" if stock_mode else "Saved Letters"
         )
         self.saved_delete_toggle.setVisible(not stock_mode)
-        self.refresh_saved_letters()
+        self.refresh_saved_letters(force_reconcile=self._catalog_dirty)
         owner = self.window()
         screen = owner.screen() or QtGui.QGuiApplication.primaryScreen()
         available = (
@@ -1705,11 +1741,13 @@ class ForgeTab(QtWidgets.QWidget):
         )
         if repaired:
             self.catalog = SavedLetterCatalog(self.project_root)
-            self.refresh_saved_letters()
+            self._catalog_dirty = True
+            if self.saved_panel.isVisible():
+                self.refresh_saved_letters(force_reconcile=True)
             self.refresh_project_state()
         return repaired
 
-    def refresh_saved_letters(self) -> None:
+    def refresh_saved_letters(self, *, force_reconcile: bool = False) -> None:
         selected_path = (
             str(self._selected_saved_letter.path)
             if self._selected_saved_letter is not None
@@ -1722,7 +1760,21 @@ class ForgeTab(QtWidgets.QWidget):
             if self._saved_panel_mode == "stock"
             else self.catalog
         )
-        entries = catalog.list_entries()
+        entries = catalog.list_entries(
+            force_refresh=(
+                force_reconcile
+                or (self._catalog_dirty and self._saved_panel_mode != "stock")
+            )
+        )
+        if self._saved_panel_mode != "stock":
+            self._catalog_dirty = False
+        if (
+            self._catalog_rendered
+            and self._rendered_catalog_mode == self._saved_panel_mode
+            and entries == self._rendered_catalog_entries
+        ):
+            self._watch_saved_letter_paths(entries)
+            return
         recent_entries = entries[:RECENT_SAVED_LETTER_LIMIT]
         archived_entries = entries[RECENT_SAVED_LETTER_LIMIT:]
         for card in self._saved_cards:
@@ -1747,8 +1799,24 @@ class ForgeTab(QtWidgets.QWidget):
         self._refresh_saved_archive(archived_entries, selected_path)
         self._layout_saved_cards()
         self._watch_saved_letter_paths(entries)
+        self._rendered_catalog_entries = entries
+        self._rendered_catalog_mode = self._saved_panel_mode
+        self._catalog_rendered = True
         self._pending_scroll_position = (horizontal, vertical)
         self._scroll_restore_timer.start(0)
+
+    def _refresh_catalog_entry(self, play_dir: str | Path) -> None:
+        """Apply a known build change without scanning unrelated letters."""
+        self._catalog_watch_suppressed_until = (
+            monotonic() + _CATALOG_INTERNAL_CHANGE_GRACE_SECONDS
+        )
+        entries = self.catalog.refresh_entry(play_dir)
+        if entries is None:
+            self._catalog_dirty = True
+            return
+        self._catalog_dirty = False
+        if self.saved_panel.isVisible():
+            self.refresh_saved_letters()
 
     def reset_after_project_wipe(self) -> None:
         """Drop live references to project content removed by Command."""
@@ -1767,7 +1835,10 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_page_url = ""
         self.saved_panel.hide()
         self.readiness_window.hide()
-        self.refresh_saved_letters()
+        self._sync_published_url()
+        self.catalog.invalidate()
+        self._catalog_dirty = True
+        self.refresh_saved_letters(force_reconcile=True)
         self.refresh_project_state()
         self.preview_visibility_changed.emit(False)
         self._set_status("Ready.")
@@ -2050,7 +2121,7 @@ class ForgeTab(QtWidgets.QWidget):
         ):
             self._selected_saved_letter = None
         self._set_saved_delete_mode(False)
-        self.refresh_saved_letters()
+        self._refresh_catalog_entry(deleted)
         self._set_status("Saved letter deleted.")
 
     def _layout_saved_cards(self) -> None:
@@ -2122,7 +2193,12 @@ class ForgeTab(QtWidgets.QWidget):
 
     @QtCore.Slot(str)
     def _catalog_path_changed(self, _path: str) -> None:
-        self._catalog_refresh_timer.start()
+        if monotonic() < self._catalog_watch_suppressed_until:
+            return
+        self.catalog.invalidate()
+        self._catalog_dirty = True
+        if self.saved_panel.isVisible():
+            self._catalog_refresh_timer.start()
 
     def _restore_saved_scroll_position(self) -> None:
         horizontal, vertical = self._pending_scroll_position
@@ -2204,7 +2280,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._pending_recipient_entry = None
         self.refresh_project_state()
         self._preview_refresh_pending = True
-        self.refresh_saved_letters()
+        self._refresh_catalog_entry(self._last_play_dir)
         payload = restored.as_payload()
         self.project_restored.emit(payload)
         self.letter_loaded.emit(payload)
@@ -2567,7 +2643,7 @@ class ForgeTab(QtWidgets.QWidget):
             self._preview_refresh_requested = True
         else:
             self.request_preview()
-        self.refresh_saved_letters()
+        self._refresh_catalog_entry(Path(play_dir))
         self._pending_publish_context = (
             Path(play_dir),
             readiness,
@@ -2666,7 +2742,7 @@ class ForgeTab(QtWidgets.QWidget):
             self._preview_refresh_requested = True
         else:
             self.request_preview()
-        self.refresh_saved_letters()
+        self._refresh_catalog_entry(Path(play_dir))
         if not getattr(publish_result, "success", False):
             error_code = str(
                 getattr(publish_result, "error_code", "")
@@ -2748,7 +2824,7 @@ class ForgeTab(QtWidgets.QWidget):
                 error=True,
             )
             return
-        self.refresh_saved_letters()
+        self._refresh_catalog_entry(Path(play_dir))
         self._sync_publishing_controls()
         self._set_status(
             "Published. Publish again to include newer project changes."
@@ -2832,19 +2908,25 @@ class ForgeTab(QtWidgets.QWidget):
             )
             if record_activity:
                 record_saved_letter_activity(play_dir)
-            self.refresh_saved_letters()
+            self._refresh_catalog_entry(play_dir)
         except Exception:
             _LOGGER.exception(
                 "Playable build metadata could not be updated for %s",
                 play_dir,
             )
 
-    def refresh_saved_page_url(self) -> str:
+    def refresh_saved_page_url(self, snapshot: dict | None = None) -> str:
+        if snapshot is None:
+            snapshot = self.settings.snapshot()
         self.saved_page_url = normalize_published_page_url(
-            self.settings.get(PUBLISHED_PAGE_URL_KEY, "")
+            snapshot.get(PUBLISHED_PAGE_URL_KEY, "")
         )
-        self._sync_published_url()
-        return "" if self._published_url_unavailable() else self.saved_page_url
+        self._sync_published_url(snapshot)
+        return (
+            ""
+            if self._published_url_unavailable(snapshot)
+            else self.saved_page_url
+        )
 
     def set_saved_page_url(self, url: str) -> None:
         previous_url = self.saved_page_url
@@ -2864,20 +2946,24 @@ class ForgeTab(QtWidgets.QWidget):
             record_activity=True,
         )
 
-    def _sync_published_url(self) -> None:
-        status = publication_status(self.settings.snapshot())
-        available = bool(self.saved_page_url) and status == "published"
+    def _sync_published_url(self, snapshot: dict | None = None) -> None:
+        if snapshot is None:
+            snapshot = self.settings.snapshot()
+        unavailable = self._published_url_unavailable(snapshot)
+        available = bool(self.saved_page_url) and not unavailable
         self.open_published_btn.setEnabled(available and not self._busy)
         if available:
+            if snapshot is None:
+                snapshot = self.settings.snapshot()
             label = publication_expiry_label(
-                self.settings.get(PUBLISHED_EXPIRES_AT_KEY, "")
+                snapshot.get(PUBLISHED_EXPIRES_AT_KEY, "")
             )
             detail = f" {label}" if label else ""
             set_control_help(
                 self.open_published_btn,
                 f"Open the saved published letter link in your web browser.{detail} {self.saved_page_url}",
             )
-        elif status == "expired":
+        elif is_publication_expired(snapshot.get(PUBLISHED_EXPIRES_AT_KEY, "")):
             set_control_help(
                 self.open_published_btn,
                 "This legacy publication has expired; publish the letter again to open it.",
@@ -2889,8 +2975,11 @@ class ForgeTab(QtWidgets.QWidget):
             )
             set_control_help(self.open_published_btn, disabled)
 
-    def _published_url_unavailable(self) -> bool:
-        return publication_status(self.settings.snapshot()) != "published"
+    def _published_url_unavailable(self, snapshot: dict | None = None) -> bool:
+        if snapshot is None:
+            snapshot = self.settings.snapshot()
+        expiry = snapshot.get(PUBLISHED_EXPIRES_AT_KEY, "")
+        return is_publication_expired(expiry) or is_publication_expiration_malformed(expiry)
 
     def open_published_letter(self) -> None:
         url = self.refresh_saved_page_url()
@@ -3056,7 +3145,8 @@ class ForgeTab(QtWidgets.QWidget):
             return
         self._tab_active = True
         self.refresh_project_state()
-        self.refresh_saved_letters()
+        if not self._github_account_checked and not self._github_account_checking:
+            self._validate_github_account_async()
         self.ensure_preview_current()
         self.preview_visibility_changed.emit(True)
 

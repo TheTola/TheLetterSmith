@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
+import shutil
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -17,6 +20,8 @@ from transactional_io import atomic_write_json
 
 REGISTRY_SCHEMA_VERSION = 1
 RECIPIENT_REGISTRY_FILE = "recipients.json"
+MAX_INVALID_BACKUPS = 8
+_LOGGER = logging.getLogger(__name__)
 
 
 class RecipientRegistryError(RuntimeError):
@@ -221,38 +226,78 @@ class RecipientRegistry:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            self._backup_invalid_unlocked()
             raise RecipientRegistryError(
                 f"Could not read recipient registry: {error}"
             ) from error
         if not isinstance(raw, dict):
+            self._backup_invalid_unlocked()
             raise RecipientRegistryError(
                 "Recipient registry root must be an object."
             )
-        if raw.get("schema_version") != REGISTRY_SCHEMA_VERSION:
+        source_schema = raw.get("schema_version", 0)
+        try:
+            source_schema = int(source_schema)
+        except (TypeError, ValueError):
+            source_schema = -1
+        if source_schema not in {0, REGISTRY_SCHEMA_VERSION}:
+            self._backup_invalid_unlocked()
             raise RecipientRegistryError(
                 "Recipient registry schema is unsupported."
             )
         values = raw.get("recipients", [])
         if not isinstance(values, list):
+            self._backup_invalid_unlocked()
             raise RecipientRegistryError(
                 "Recipient registry records must be a list."
             )
-        records = [
-            RecipientRecord.from_mapping(value)
-            for value in values
-            if isinstance(value, Mapping)
-        ]
-        if len(records) != len(values):
-            raise RecipientRegistryError(
-                "Recipient registry contains an invalid record."
-            )
+        records: list[RecipientRecord] = []
+        try:
+            for value in values:
+                if not isinstance(value, Mapping):
+                    raise RecipientRegistryError(
+                        "Recipient registry contains an invalid record."
+                    )
+                records.append(RecipientRecord.from_mapping(value))
+        except RecipientRegistryError:
+            self._backup_invalid_unlocked()
+            raise
         ids = {record.recipient_id for record in records}
         keys = {record.normalized_key for record in records}
         if len(ids) != len(records) or len(keys) != len(records):
+            self._backup_invalid_unlocked()
             raise RecipientRegistryError(
                 "Recipient registry contains duplicate identities."
             )
+        if source_schema == 0:
+            self._write_unlocked(records)
         return records
+
+    def _backup_invalid_unlocked(self) -> None:
+        if not self.path.is_file():
+            return
+        backup = self.path.with_name(
+            f"recipients.invalid.{time.strftime('%Y%m%d-%H%M%S')}."
+            f"{time.time_ns()}.json"
+        )
+        try:
+            shutil.copy2(self.path, backup)
+        except OSError:
+            _LOGGER.exception("Invalid recipient registry backup failed: %s", backup)
+            return
+        backups = sorted(
+            self.path.parent.glob("recipients.invalid.*.json"),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for stale in backups[MAX_INVALID_BACKUPS:]:
+            try:
+                stale.unlink()
+            except OSError:
+                _LOGGER.exception(
+                    "Could not remove old recipient registry backup: %s",
+                    stale,
+                )
 
     def _write_unlocked(
         self,

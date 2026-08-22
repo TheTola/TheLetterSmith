@@ -30,7 +30,9 @@ from settings_store import (
     PUBLISHED_PAGE_URL_KEY,
     PUBLISHED_PUBLIC_PATH_KEY,
     PUBLISHED_SOURCE_FINGERPRINT_KEY,
+    PUBLICATION_SETTING_KEYS,
     SettingsStore,
+    empty_publication_settings,
 )
 
 PROJECT_ID_KEY = "project_id"
@@ -486,6 +488,7 @@ class ProjectStateController:
         if self.state is not ApplicationState.PROJECT_CLEARING:
             self.transition(ApplicationState.PROJECT_CLEARING)
         updates = dict(additional_settings or {})
+        updates.update(empty_publication_settings())
         updates.update(
             {
                 RECIPIENT_ID_KEY: "",
@@ -495,13 +498,6 @@ class ProjectStateController:
                 PROJECT_ID_KEY: "",
                 PROJECT_SCHEMA_KEY: PROJECT_SCHEMA_VERSION,
                 "recipient_title": "",
-                "published_page_url": "",
-                "published_public_path": "",
-                "published_at": "",
-                "published_expires_at": "",
-                "publication_provider": "",
-                "publication_verified": False,
-                "published_source_fingerprint": "",
                 "active_play_dir": "",
             }
         )
@@ -614,6 +610,7 @@ def adopt_loaded_project(project_root: str | Path, metadata: Mapping[str, Any]) 
     with _lock:
         store = SettingsStore(project_root)
         current = store.snapshot()
+        current.update(empty_publication_settings())
         display_name = _recipient_display_name(metadata)
         normalized_key = _recipient_normalized_key(metadata, display_name)
         current_identity = ProjectIdentity.from_mapping(current)
@@ -635,18 +632,7 @@ def adopt_loaded_project(project_root: str | Path, metadata: Mapping[str, Any]) 
             LEGACY_RECIPIENT_NAME_KEY: display_name,
             "recipient_title": str(metadata.get("recipient_title", "")).strip(),
         })
-        for key in (
-            PUBLISHED_PAGE_URL_KEY,
-            PUBLISHED_PUBLIC_PATH_KEY,
-            PUBLISHED_AT_KEY,
-            PUBLISHED_EXPIRES_AT_KEY,
-            PUBLICATION_PROVIDER_KEY,
-            PUBLISHED_SOURCE_FINGERPRINT_KEY,
-            PUBLISHED_GITHUB_OWNER_KEY,
-            PUBLISHED_GITHUB_REPOSITORY_KEY,
-        ):
-            current[key] = str(metadata.get(key, "")).strip()
-        current[PUBLICATION_VERIFIED_KEY] = (
-            metadata.get(PUBLICATION_VERIFIED_KEY) is True
-        )
+        for key in PUBLICATION_SETTING_KEYS:
+            if key in metadata:
+                current[key] = metadata[key]
         return store.replace_snapshot(current)

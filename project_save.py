@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+import shutil
 
 from config import (
+    MESSAGE_ASSETS_DIR,
     PLAY_METADATA_FILE,
     USER_MESSAGE_DIR,
     USER_PAGES_DIR,
@@ -23,7 +25,7 @@ from readiness import (
 )
 from settings_store import ACTIVE_PLAY_DIR_KEY, SettingsStore
 from sound_model import project_sound_path
-from transactional_io import atomic_write_bytes, atomic_write_json
+from transactional_io import PathTransaction, atomic_write_bytes, atomic_write_json
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -197,60 +199,96 @@ class ProjectSaveService:
         if not eligibility.can_save:
             raise ProjectNotReadyError(eligibility.blocked_reason)
         context = self.current_context()
-        self.resolver.ensure_autosave_storage(context)
-        self._copy_tree_to_context(
-            context,
-            self.project_root / USER_PAGES_DIR,
-            Path("pages"),
+        transaction = PathTransaction(
+            context.autosave_directory,
+            staging_suffix=".snapshot-staging",
+            backup_suffix=".snapshot-backup",
+            unique_staging=True,
         )
-        self._copy_tree_to_context(
-            context,
-            self.project_root / USER_MESSAGE_DIR,
-            Path("message"),
-        )
-        sound_state = project_sound_path(self.project_root)
-        if sound_state.is_file():
-            destination = self.project_file(
-                context,
+        staging = transaction.prepare()
+        try:
+            if context.autosave_directory.is_dir():
+                shutil.copytree(context.autosave_directory, staging)
+            else:
+                staging.mkdir(parents=True)
+            staged_context = ProjectContext(
+                recipient_id=context.recipient_id,
+                recipient_display_name=context.recipient_display_name,
+                recipient_normalized_key=context.recipient_normalized_key,
+                project_id=context.project_id,
+                letter_title=context.letter_title,
+                recipient_directory=context.recipient_directory,
+                autosave_directory=staging,
+            )
+            self._replace_staged_tree(
+                staging,
+                self.project_root / USER_PAGES_DIR,
+                Path("pages"),
+            )
+            self._replace_staged_tree(
+                staging,
+                self.project_root / USER_MESSAGE_DIR,
+                Path("message"),
+            )
+            self._replace_staged_tree(
+                staging,
+                self.project_root / MESSAGE_ASSETS_DIR,
+                Path(MESSAGE_ASSETS_DIR),
+            )
+            self._replace_staged_file(
+                staging,
+                project_sound_path(self.project_root),
                 Path("sounds") / "project_sound.json",
             )
-            atomic_write_bytes(destination, sound_state.read_bytes())
-        prompt_state = self.project_root / "prompt_writer_state.json"
-        if prompt_state.is_file():
-            destination = self.project_file(
-                context,
-                prompt_state.name,
+            prompt_state = self.project_root / "prompt_writer_state.json"
+            self._replace_staged_file(
+                staging,
+                prompt_state,
+                Path(prompt_state.name),
             )
-            atomic_write_bytes(destination, prompt_state.read_bytes())
-        self._finish_save(
-            context,
-            updates={
-                "autosave_reason": str(reason),
-                "completed_tabs": list(eligibility.completed_tabs),
-            },
-        )
-        _LOGGER.info(
-            "Project snapshot saved for project_id=%s.",
-            context.project_id,
-        )
+            self._finish_save(
+                staged_context,
+                updates={
+                    "autosave_reason": str(reason),
+                    "completed_tabs": list(eligibility.completed_tabs),
+                },
+            )
+            transaction.commit(
+                keep_backup=True,
+                validator=lambda directory: (
+                    self.resolver._metadata_project_id(directory)
+                    == context.project_id
+                ),
+            )
+        except Exception:
+            transaction.abort()
+            raise
+        transaction.finalize()
         return context.autosave_directory
 
-    def _copy_tree_to_context(
-        self,
-        context: ProjectContext,
+    @staticmethod
+    def _replace_staged_tree(
+        staging: Path,
         source_root: Path,
         destination_root: Path,
     ) -> None:
-        if not source_root.is_dir():
-            return
-        for source in sorted(source_root.rglob("*")):
-            if not source.is_file():
-                continue
-            destination = self.project_file(
-                context,
-                destination_root / source.relative_to(source_root),
-            )
+        destination = staging / destination_root
+        if destination.exists():
+            shutil.rmtree(destination)
+        if source_root.is_dir():
+            shutil.copytree(source_root, destination)
+
+    @staticmethod
+    def _replace_staged_file(
+        staging: Path,
+        source: Path,
+        destination_relative: Path,
+    ) -> None:
+        destination = staging / destination_relative
+        if source.is_file():
             atomic_write_bytes(destination, source.read_bytes())
+        else:
+            destination.unlink(missing_ok=True)
 
     def _finish_save(
         self,

@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -14,6 +15,43 @@ from transactional_io import _remove_path, recover_stale_transactions
 
 
 class SoundRestoreLockTests(unittest.TestCase):
+    def test_tab_activation_reloads_only_once_while_active(self) -> None:
+        sound_tab = SimpleNamespace(
+            _tab_active=False,
+            _shutdown=False,
+            _preview=mock.Mock(),
+            reload_project_from_disk=mock.Mock(),
+        )
+
+        SoundTab.activate_for_tab_change(sound_tab)
+        SoundTab.activate_for_tab_change(sound_tab)
+
+        self.assertTrue(sound_tab._tab_active)
+        sound_tab._preview.set_tab_active.assert_called_once_with(True)
+        sound_tab.reload_project_from_disk.assert_called_once_with()
+
+    def test_tab_deactivation_runs_only_once_while_inactive(self) -> None:
+        sound_tab = SimpleNamespace(
+            _tab_active=True,
+            player=mock.Mock(),
+            _preview=mock.Mock(),
+            play_btn=mock.Mock(),
+            _save_volume=mock.Mock(),
+            sound_state_changed=mock.Mock(),
+        )
+
+        SoundTab.deactivate_for_tab_change(sound_tab)
+        SoundTab.deactivate_for_tab_change(sound_tab)
+
+        self.assertFalse(sound_tab._tab_active)
+        sound_tab.player.stop.assert_called_once_with(reset_position=True)
+        sound_tab._preview.set_tab_active.assert_called_once_with(False)
+        sound_tab.play_btn.setText.assert_called_once_with("▶")
+        sound_tab._save_volume.assert_called_once_with()
+        sound_tab.sound_state_changed.emit.assert_called_once_with(
+            "sound-tab-deactivated"
+        )
+
     def test_restore_release_stops_sound_workers_and_media(self) -> None:
         sound_tab = SoundTab.__new__(SoundTab)
         analysis = mock.Mock()

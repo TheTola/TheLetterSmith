@@ -98,6 +98,11 @@ ANALYSIS_SETTINGS_KEY = "enable_sound_analysis"
 LAST_MUSIC_FOLDER_KEY = "last_music_folder"
 CROSSFADE_MS = 1000
 LOOP_DELAY_MS = 1200
+_ARTWORK_ALPHA_THRESHOLD = 10
+_VISIBLE_ALPHA_TABLE = bytes(
+    0 if alpha <= _ARTWORK_ALPHA_THRESHOLD else 1
+    for alpha in range(256)
+)
 
 
 def _format_duration(
@@ -490,6 +495,11 @@ class ArtworkButton(QtWidgets.QPushButton):
             self._legacy_artwork_path
         )
 
+        self._scaled_artwork_cache: dict[
+            tuple[int, int],
+            QtGui.QPixmap,
+        ] = {}
+
         self._button_font = QtGui.QFont(
             "Segoe UI",
             self.TEXT_POINT_SIZE,
@@ -617,46 +627,55 @@ class ArtworkButton(QtWidgets.QPushButton):
         if width <= 0 or height <= 0:
             return pixmap
 
+        alpha_mask = bytes(
+            image.constBits()
+        )[3::4].translate(
+            _VISIBLE_ALPHA_TABLE
+        )
+
+        first_visible = alpha_mask.find(
+            b"\x01"
+        )
+
+        if first_visible < 0:
+            return pixmap
+
+        last_visible = alpha_mask.rfind(
+            b"\x01"
+        )
+
+        top = first_visible // width
+        bottom = last_visible // width
         left = width
         right = -1
-        top = height
-        bottom = -1
-
-        alpha_threshold = 10
 
         for y in range(
-            height
+            top,
+            bottom + 1,
         ):
-            for x in range(
-                width
-            ):
-                alpha = image.pixelColor(
-                    x,
-                    y,
-                ).alpha()
+            row = alpha_mask[
+                y * width:
+                (y + 1) * width
+            ]
 
-                if alpha <= alpha_threshold:
-                    continue
+            row_left = row.find(
+                b"\x01"
+            )
 
-                left = min(
-                    left,
-                    x,
-                )
+            if row_left < 0:
+                continue
 
-                right = max(
-                    right,
-                    x,
-                )
+            left = min(
+                left,
+                row_left,
+            )
 
-                top = min(
-                    top,
-                    y,
-                )
-
-                bottom = max(
-                    bottom,
-                    y,
-                )
+            right = max(
+                right,
+                row.rfind(
+                    b"\x01"
+                ),
+            )
 
         if (
             right < left
@@ -736,12 +755,26 @@ class ArtworkButton(QtWidgets.QPushButton):
                 ),
             )
 
-            artwork = self._artwork.scaled(
+            target_size = (
                 artwork_width,
                 artwork_height,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
             )
+
+            artwork = self._scaled_artwork_cache.get(
+                target_size
+            )
+
+            if artwork is None:
+                artwork = self._artwork.scaled(
+                    artwork_width,
+                    artwork_height,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+
+                self._scaled_artwork_cache[
+                    target_size
+                ] = artwork
 
             artwork_rect = QtCore.QRect(
                 button_rect.center().x()
@@ -6381,19 +6414,27 @@ class SoundTab(QtWidgets.QWidget):
     def activate_for_tab_change(self) -> None:
         if self._tab_active or self._shutdown:
             return
+
         self._tab_active = True
 
-        # Reload project_sound.json and purge tracks whose files disappeared.
-        self.reload_project_from_disk()
+        try:
+            self._preview.set_tab_active(
+                True
+            )
 
-        self._preview.set_tab_active(
-            True
-        )
+            # Reload project_sound.json and purge missing track files.
+            self.reload_project_from_disk()
+
+        except Exception:
+            self._tab_active = False
+            self._preview.set_tab_active(
+                False
+            )
+            raise
 
     def deactivate_for_tab_change(self) -> None:
         if not self._tab_active:
             return
-        self._tab_active = False
 
         self._preview.set_tab_active(
             False
@@ -6412,6 +6453,8 @@ class SoundTab(QtWidgets.QWidget):
         self.sound_state_changed.emit(
             "sound-tab-deactivated"
         )
+
+        self._tab_active = False
 
     def release_current_file_handle(self) -> None:
         self.player.stop(

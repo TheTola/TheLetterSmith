@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
+import config
 import generate
 from config import CONTROL_FILES, REQUIRED_SLIDES, USER_CONTROLS_DIR, USER_MESSAGE_DIR, USER_PAGES_DIR
 from project_paths import ProjectPathResolver
@@ -15,12 +19,23 @@ from project_save import ProjectSaveService
 from project_state import ApplicationState, ProjectDirtyController, ProjectStateController
 from readiness import evaluate_readiness
 from saved_letters import SavedLetterCatalog, SavedLetterRestorer, update_saved_metadata
-from settings_store import SettingsStore
+from settings_store import ACTIVE_PLAY_DIR_KEY, SettingsStore
 from startup_check import run_startup_self_check
 from transactional_io import cleanup_abandoned_temp_files
 
 
 class SmallImprovementSmokeTests(unittest.TestCase):
+    @staticmethod
+    def _write_play_bundle(path: Path, project_id: str) -> Path:
+        path.mkdir(parents=True)
+        for name in ("index.html", "styles.css", "script.js"):
+            (path / name).write_text("", encoding="utf-8")
+        (path / config.PLAY_METADATA_FILE).write_text(
+            json.dumps({"project_id": project_id}),
+            encoding="utf-8",
+        )
+        return path.resolve()
+
     def test_settings_notifications_and_picker_folders_are_shared(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -103,6 +118,9 @@ class SmallImprovementSmokeTests(unittest.TestCase):
                 Image.new("RGBA", (8, 8), (80, 120 + index, 160, 255)).save(
                     controls / name
                 )
+            banner = root / config.APP_BANNER_PATH
+            banner.parent.mkdir(parents=True)
+            Image.new("RGBA", (8, 8), (120, 160, 200, 255)).save(banner)
             message.write_text("<p>Round-trip smoke message.</p>", encoding="utf-8")
 
             service = ProjectSaveService(
@@ -137,6 +155,185 @@ class SmallImprovementSmokeTests(unittest.TestCase):
             )
             self.assertTrue(was_rebuilt)
             self.assertTrue((regenerated / "index.html").is_file())
+
+    def test_active_play_path_avoids_historical_bundle_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_id = str(uuid.uuid4())
+            collision = self._write_play_bundle(
+                root / "output" / "Play" / "Ada Lovelace" / "Current Letter",
+                str(uuid.uuid4()),
+            )
+            active = self._write_play_bundle(
+                root
+                / "output"
+                / "Play"
+                / "Ada Lovelace"
+                / "Current Letter (2)",
+                project_id,
+            )
+            duplicate = self._write_play_bundle(
+                root / "output" / "Play" / "Grace Hopper" / "Copied Letter",
+                project_id,
+            )
+            SettingsStore(root).update_fields(
+                {
+                    "project_id": project_id,
+                    "recipient_name": "Ada Lovelace",
+                    "recipient_title": "Current Letter",
+                    ACTIVE_PLAY_DIR_KEY: str(active),
+                }
+            )
+
+            with mock.patch(
+                "config._iter_play_bundles",
+                side_effect=AssertionError("Play history should not be scanned"),
+            ):
+                resolved = generate.play_bundle_directory(root)
+
+            self.assertEqual(resolved, active)
+            self.assertTrue(collision.is_dir())
+            self.assertTrue(duplicate.is_dir())
+
+    def test_canonical_play_path_avoids_scan_and_becomes_active(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_id = str(uuid.uuid4())
+            canonical = self._write_play_bundle(
+                root / "output" / "Play" / "Ada Lovelace" / "Current Letter",
+                project_id,
+            )
+            SettingsStore(root).update_fields(
+                {
+                    "project_id": project_id,
+                    "recipient_name": "Ada Lovelace",
+                    "recipient_title": "Current Letter",
+                }
+            )
+
+            with mock.patch(
+                "config._iter_play_bundles",
+                side_effect=AssertionError("Play history should not be scanned"),
+            ):
+                resolved = generate.play_bundle_directory(root)
+
+            self.assertEqual(resolved, canonical)
+            self.assertEqual(
+                SettingsStore(root).get(ACTIVE_PLAY_DIR_KEY),
+                str(canonical),
+            )
+
+    def test_inconsistent_active_path_falls_back_and_repairs_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_id = str(uuid.uuid4())
+            canonical = self._write_play_bundle(
+                root / "output" / "Play" / "Ada Lovelace" / "Current Letter",
+                project_id,
+            )
+            stale = self._write_play_bundle(
+                root / "output" / "Play" / "Grace Hopper" / "Other Letter",
+                str(uuid.uuid4()),
+            )
+            SettingsStore(root).update_fields(
+                {
+                    "project_id": project_id,
+                    "recipient_name": "Ada Lovelace",
+                    "recipient_title": "Current Letter",
+                    ACTIVE_PLAY_DIR_KEY: str(stale),
+                }
+            )
+
+            with mock.patch(
+                "config._iter_play_bundles",
+                wraps=config._iter_play_bundles,
+            ) as scan:
+                resolved = generate.play_bundle_directory(root)
+
+            self.assertTrue(scan.called)
+            self.assertEqual(resolved, canonical)
+            self.assertEqual(
+                SettingsStore(root).get(ACTIVE_PLAY_DIR_KEY),
+                str(canonical),
+            )
+
+    def test_unneeded_numbered_path_falls_back_to_canonical_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_id = str(uuid.uuid4())
+            numbered = self._write_play_bundle(
+                root
+                / "output"
+                / "Play"
+                / "Ada Lovelace"
+                / "Current Letter (2)",
+                project_id,
+            )
+            SettingsStore(root).update_fields(
+                {
+                    "project_id": project_id,
+                    "recipient_name": "Ada Lovelace",
+                    "recipient_title": "Current Letter",
+                    ACTIVE_PLAY_DIR_KEY: str(numbered),
+                }
+            )
+
+            with mock.patch(
+                "config._iter_play_bundles",
+                wraps=config._iter_play_bundles,
+            ) as scan:
+                resolved = generate.play_bundle_directory(root)
+
+            canonical = (
+                root
+                / "output"
+                / "Play"
+                / "Ada Lovelace"
+                / "Current Letter"
+            ).resolve()
+            self.assertTrue(scan.called)
+            self.assertEqual(resolved, canonical)
+            self.assertFalse(numbered.exists())
+
+    def test_renamed_legacy_bundle_uses_scanning_migration_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_id = str(uuid.uuid4())
+            legacy = self._write_play_bundle(
+                root / "output" / "Play" / "legacy-letter",
+                project_id,
+            )
+            SettingsStore(root).update_fields(
+                {
+                    "project_id": project_id,
+                    "recipient_name": "CON",
+                    "recipient_title": "A/B?",
+                    ACTIVE_PLAY_DIR_KEY: str(legacy),
+                }
+            )
+
+            with mock.patch(
+                "config._iter_play_bundles",
+                wraps=config._iter_play_bundles,
+            ) as scan:
+                resolved = generate.play_bundle_directory(root)
+
+            expected = (
+                root / "output" / "Play" / "_CON" / "A B"
+            ).resolve()
+            self.assertTrue(scan.called)
+            self.assertEqual(resolved, expected)
+            self.assertFalse(legacy.exists())
+            self.assertEqual(
+                SettingsStore(root).get(ACTIVE_PLAY_DIR_KEY),
+                str(expected),
+            )
+            metadata = json.loads(
+                (expected / config.PLAY_METADATA_FILE).read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["project_id"], project_id)
+            self.assertEqual(metadata["recipient_name"], "CON")
+            self.assertEqual(metadata["recipient_title"], "A/B?")
 
 
 if __name__ == "__main__":
