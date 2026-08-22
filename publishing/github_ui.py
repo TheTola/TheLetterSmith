@@ -148,8 +148,12 @@ class GitHubDeviceFlowDialog(QtWidgets.QDialog):
     cancel_requested = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Sign in with GitHub")
+        super().__init__(
+            parent,
+            Qt.Dialog | Qt.FramelessWindowHint,
+        )
+        self.setObjectName("GitHubDeviceFlowDialog")
+        self.setAccessibleName("Sign in with GitHub")
         self.setModal(False)
         self.setMinimumWidth(460)
         self._url = ""

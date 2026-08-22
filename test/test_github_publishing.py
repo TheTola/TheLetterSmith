@@ -32,7 +32,7 @@ from publishing.github_pages import (
     GitHubPagesPublisher,
     _publication_path,
 )
-from publishing.github_ui import GitHubAccountDialog
+from publishing.github_ui import GitHubAccountDialog, GitHubDeviceFlowDialog
 from settings_store import (
     PUBLICATION_PROVIDER_KEY,
     PUBLISHED_GITHUB_OWNER_KEY,
@@ -570,6 +570,20 @@ class GitHubAccountUITests(unittest.TestCase):
             self.assertEqual(
                 dialog.status_label.property("connectionState"),
                 "disconnected",
+            )
+        finally:
+            dialog.close()
+
+    def test_device_flow_dialog_has_no_title_bar(self) -> None:
+        dialog = GitHubDeviceFlowDialog()
+        try:
+            self.assertTrue(
+                dialog.windowFlags() & QtCore.Qt.FramelessWindowHint
+            )
+            self.assertEqual(dialog.windowTitle(), "")
+            self.assertEqual(
+                dialog.accessibleName(),
+                "Sign in with GitHub",
             )
         finally:
             dialog.close()
