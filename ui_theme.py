@@ -1,253 +1,394 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Any, Callable
+from dataclasses import dataclass, fields
+from pathlib import Path, PurePosixPath
+import re
+from types import MappingProxyType
+from typing import Mapping
 from weakref import WeakKeyDictionary
 
+from PySide6 import QtCore, QtGui, QtWidgets
 
-def mix_hex(color_a: str, color_b: str, amount: float) -> str:
-    """Blend two six-digit hexadecimal colors."""
-    amount = max(0.0, min(1.0, amount))
-    a = color_a.lstrip("#")
-    b = color_b.lstrip("#")
+from settings_store import SettingsStore
+from project_paths import application_paths
 
-    if len(a) != 6 or len(b) != 6:
-        raise ValueError("Colors must use six-digit hexadecimal notation.")
 
-    rgb_a = tuple(int(a[i:i + 2], 16) for i in (0, 2, 4))
-    rgb_b = tuple(int(b[i:i + 2], 16) for i in (0, 2, 4))
+THEME_SETTINGS_KEY = "application_theme"
+DEFAULT_THEME_ID = "futuristic"
 
-    mixed = tuple(
-        round(value_a + ((value_b - value_a) * amount))
-        for value_a, value_b in zip(rgb_a, rgb_b)
-    )
-    return "#{:02x}{:02x}{:02x}".format(*mixed)
+_THEME_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
 @dataclass(frozen=True)
-class ColorPool:
-    # Surfaces
-    app_background: str = "#1d1d1d"
-    panel_background: str = "#101821"
-    card_background: str = "#111820"
-    control_background: str = "#14202c"
-    preview_background: str = "#0b1016"
+class ThemeTokens:
+    """Semantic application colors shared by themed widgets and painters."""
 
-    # Borders, tracks, and decorative lines
-    border_default: str = "#34485c"
-    border_muted: str = "#273644"
-    track_background: str = "#20313f"
-    grid_line: str = "#17222d"
+    primary: str
+    secondary: str
+    accent: str
+    background: str
+    panel_background: str
+    card_background: str
+    control_background: str
+    border: str
+    text: str
+    muted_text: str
+    highlight: str
+    hover: str
+    active: str
+    success: str
+    warning: str
+    error: str
 
-    # Text
-    text_primary: str = "#f4f8fb"
-    text_secondary: str = "#91a7ba"
-    text_disabled: str = "#64798b"
-
-    # Shared accent family
-    accent: str = "#00d9f5"
-    accent_hover: str = "#42e8ff"
-    accent_soft: str = "#123b45"
-
-    # Optional destructive role
-    danger: str = "#d85c6a"
-    danger_hover: str = "#ef7380"
+    def __post_init__(self) -> None:
+        for token in fields(self):
+            value = str(getattr(self, token.name) or "").strip()
+            if not QtGui.QColor(value).isValid():
+                raise ValueError(
+                    f"Theme token {token.name!r} is not a valid Qt color: {value!r}"
+                )
+            object.__setattr__(self, token.name, value)
 
 
-class ThemeManager:
-    """
-    Centralized theme manager.
+def _safe_relative_path(value: str | Path, *, label: str) -> str:
+    raw = str(value or "").strip().replace("\\", "/")
+    candidate = PurePosixPath(raw)
+    if (
+        not raw
+        or candidate.is_absolute()
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+        or ":" in candidate.parts[0]
+    ):
+        raise ValueError(f"{label} must be a safe relative path.")
+    return candidate.as_posix()
 
-    Every widget registers against a semantic role. Updating one value in the
-    shared ColorPool restyles all registered widgets across all tabs.
-    """
 
-    def __init__(self, colors: ColorPool | None = None) -> None:
-        self.colors = colors or ColorPool()
-        self._bindings: WeakKeyDictionary[Any, str] = WeakKeyDictionary()
-        self._observers: list[Callable[[ColorPool], None]] = []
+@dataclass(frozen=True)
+class ThemeDefinition:
+    theme_id: str
+    display_name: str
+    tokens: ThemeTokens
+    asset_overrides: Mapping[str, str] = MappingProxyType({})
 
-    def bind(self, widget: Any, role: str) -> Any:
-        self._bindings[widget] = role
-        self.apply(widget, role)
+    def __post_init__(self) -> None:
+        theme_id = str(self.theme_id or "").strip().casefold()
+        if not _THEME_ID_PATTERN.fullmatch(theme_id):
+            raise ValueError(f"Invalid theme identifier: {self.theme_id!r}")
+
+        display_name = str(self.display_name or "").strip()
+        if not display_name:
+            raise ValueError("A theme display name is required.")
+
+        overrides: dict[str, str] = {}
+        for logical_name, relative_path in dict(self.asset_overrides).items():
+            logical = _safe_relative_path(logical_name, label="Asset name")
+            override = _safe_relative_path(relative_path, label="Asset override")
+            overrides[logical] = override
+
+        object.__setattr__(self, "theme_id", theme_id)
+        object.__setattr__(self, "display_name", display_name)
+        object.__setattr__(
+            self,
+            "asset_overrides",
+            MappingProxyType(overrides),
+        )
+
+
+FUTURISTIC_THEME = ThemeDefinition(
+    theme_id="futuristic",
+    display_name="Futuristic",
+    tokens=ThemeTokens(
+        primary="#00b2b2",
+        secondary="#00d0ff",
+        accent="#00e5ff",
+        background="#1e1e1e",
+        panel_background="#101820",
+        card_background="#111820",
+        control_background="#14202c",
+        border="#34485c",
+        text="#f2fbff",
+        muted_text="#91a7ba",
+        highlight="#e0ffff",
+        hover="#18323d",
+        active="#17485a",
+        success="#48b889",
+        warning="#d7a845",
+        error="#d85c6a",
+    ),
+)
+
+
+SOFT_ELEGANT_THEME = ThemeDefinition(
+    theme_id="soft_elegant",
+    display_name="Soft Elegant",
+    tokens=ThemeTokens(
+        primary="#d8b57a",
+        secondary="#a9859b",
+        accent="#c9a76d",
+        background="#241f26",
+        panel_background="#302832",
+        card_background="#382e39",
+        control_background="#443848",
+        border="#685668",
+        text="#f7f0ea",
+        muted_text="#bcaeb7",
+        highlight="#ead4be",
+        hover="#514254",
+        active="#6b5366",
+        success="#77a58a",
+        warning="#d5a55f",
+        error="#c86f78",
+    ),
+)
+
+
+THEMES: Mapping[str, ThemeDefinition] = MappingProxyType(
+    {
+        FUTURISTIC_THEME.theme_id: FUTURISTIC_THEME,
+        SOFT_ELEGANT_THEME.theme_id: SOFT_ELEGANT_THEME,
+    }
+)
+
+
+def normalize_theme_id(
+    value: object,
+    themes: Mapping[str, ThemeDefinition] = THEMES,
+) -> str:
+    candidate = str(value or "").strip().casefold()
+    return candidate if candidate in themes else DEFAULT_THEME_ID
+
+
+class ThemeService(QtCore.QObject):
+    """Own theme selection, Qt styles, and safe decorative asset lookup."""
+
+    theme_changed = QtCore.Signal(str, object)
+
+    def __init__(
+        self,
+        project_root: str | Path,
+        *,
+        settings: SettingsStore | None = None,
+        themes: Mapping[str, ThemeDefinition] | None = None,
+        parent: QtCore.QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.project_root = Path(project_root).resolve()
+        self.settings = settings or SettingsStore(self.project_root)
+        self._themes = self._validated_registry(themes or THEMES)
+        self._bindings: WeakKeyDictionary[
+            QtWidgets.QWidget,
+            str,
+        ] = WeakKeyDictionary()
+
+        stored = self.settings.get(THEME_SETTINGS_KEY, DEFAULT_THEME_ID)
+        self._theme_id = normalize_theme_id(stored, self._themes)
+        if stored != self._theme_id:
+            self.settings.update_fields(
+                **{THEME_SETTINGS_KEY: self._theme_id}
+            )
+
+    @staticmethod
+    def _validated_registry(
+        themes: Mapping[str, ThemeDefinition],
+    ) -> Mapping[str, ThemeDefinition]:
+        registry: dict[str, ThemeDefinition] = {}
+        for key, definition in dict(themes).items():
+            if not isinstance(definition, ThemeDefinition):
+                raise TypeError("Theme registries must contain ThemeDefinition values.")
+            normalized_key = str(key or "").strip().casefold()
+            if normalized_key != definition.theme_id:
+                raise ValueError(
+                    "Theme registry keys must match their theme identifiers."
+                )
+            registry[normalized_key] = definition
+        if DEFAULT_THEME_ID not in registry:
+            raise ValueError(
+                f"Theme registry must include {DEFAULT_THEME_ID!r}."
+            )
+        return MappingProxyType(registry)
+
+    @property
+    def theme_id(self) -> str:
+        return self._theme_id
+
+    @property
+    def current(self) -> ThemeDefinition:
+        return self._themes[self._theme_id]
+
+    @property
+    def tokens(self) -> ThemeTokens:
+        return self.current.tokens
+
+    def available_themes(self) -> tuple[ThemeDefinition, ...]:
+        return tuple(self._themes.values())
+
+    def set_theme(
+        self,
+        theme_id: object,
+        *,
+        persist: bool = True,
+    ) -> ThemeDefinition:
+        selected = normalize_theme_id(theme_id, self._themes)
+        if persist:
+            self.settings.update_fields(
+                **{THEME_SETTINGS_KEY: selected}
+            )
+        if selected == self._theme_id:
+            return self.current
+
+        self._theme_id = selected
+        self._refresh_bindings()
+        definition = self.current
+        self.theme_changed.emit(definition.theme_id, definition)
+        return definition
+
+    def save(self) -> dict[str, object]:
+        """Persist and reapply the selected theme for an explicit Save action."""
+        snapshot = self.settings.update_fields(
+            **{THEME_SETTINGS_KEY: self._theme_id}
+        )
+        self._refresh_bindings()
+        return snapshot
+
+    def build_stylesheet(self) -> str:
+        """Build role-based QSS from the current semantic token set."""
+        c = self.tokens
+        return f"""
+QWidget[themeRole="background"], QMainWindow[themeRole="background"] {{
+    background: {c.background};
+    color: {c.text};
+}}
+QWidget[themeRole="panel"] {{
+    background: {c.panel_background};
+    border: 1px solid {c.border};
+}}
+QWidget[themeRole="card"] {{
+    background: {c.card_background};
+    border: 1px solid {c.border};
+}}
+QLabel[themeRole="text"] {{ color: {c.text}; }}
+QLabel[themeRole="mutedText"] {{ color: {c.muted_text}; }}
+QLabel[themeRole="highlightText"] {{ color: {c.highlight}; }}
+QPushButton[themeRole="button"], QToolButton[themeRole="button"] {{
+    background: {c.control_background};
+    border: 1px solid {c.border};
+    color: {c.text};
+}}
+QPushButton[themeRole="button"]:hover,
+QToolButton[themeRole="button"]:hover {{
+    background: {c.hover};
+    border-color: {c.accent};
+}}
+QPushButton[themeRole="accentButton"],
+QToolButton[themeRole="accentButton"] {{
+    background: {c.control_background};
+    border: 1px solid {c.accent};
+    color: {c.highlight};
+}}
+QPushButton[themeRole="accentButton"]:hover,
+QToolButton[themeRole="accentButton"]:hover {{ background: {c.active}; }}
+QWidget[themeRole="success"] {{ color: {c.success}; }}
+QWidget[themeRole="warning"] {{ color: {c.warning}; }}
+QWidget[themeRole="error"] {{ color: {c.error}; }}
+QLineEdit[themeRole="input"], QComboBox[themeRole="input"] {{
+    background: {c.control_background};
+    border: 1px solid {c.border};
+    color: {c.text};
+    selection-background-color: {c.active};
+}}
+""".strip()
+
+    def apply(
+        self,
+        widget: QtWidgets.QWidget,
+        *,
+        additional_qss: str = "",
+    ) -> QtWidgets.QWidget:
+        if not isinstance(widget, QtWidgets.QWidget):
+            raise TypeError("Themes can only be applied to QWidget instances.")
+        self._bindings[widget] = str(additional_qss or "")
+        self._apply_to_widget(widget)
         return widget
 
-    def subscribe(self, callback: Callable[[ColorPool], None]) -> None:
-        if callback not in self._observers:
-            self._observers.append(callback)
-        callback(self.colors)
+    def unbind(self, widget: QtWidgets.QWidget) -> None:
+        self._bindings.pop(widget, None)
 
-    def unsubscribe(self, callback: Callable[[ColorPool], None]) -> None:
-        if callback in self._observers:
-            self._observers.remove(callback)
+    def _apply_to_widget(self, widget: QtWidgets.QWidget) -> None:
+        additional_qss = self._bindings.get(widget, "")
+        stylesheet = self.build_stylesheet()
+        if additional_qss.strip():
+            stylesheet = f"{stylesheet}\n{additional_qss.strip()}"
+        widget.setProperty("letterSmithTheme", self._theme_id)
+        widget.setStyleSheet(stylesheet)
+        style = widget.style()
+        if style is not None:
+            style.unpolish(widget)
+            style.polish(widget)
+        widget.update()
 
-    def apply(self, widget: Any, role: str | None = None) -> None:
-        role = role or self._bindings.get(widget)
-        if role is None:
-            return
-
-        options = self._role_options(role)
-        try:
-            widget.configure(**options)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Could not apply role {role!r} to {type(widget).__name__}."
-            ) from exc
-
-    def refresh(self) -> None:
-        for widget, role in list(self._bindings.items()):
+    def _refresh_bindings(self) -> None:
+        for widget in tuple(self._bindings.keys()):
             try:
-                if widget.winfo_exists():
-                    self.apply(widget, role)
-            except Exception:
-                continue
+                self._apply_to_widget(widget)
+            except RuntimeError:
+                self._bindings.pop(widget, None)
 
-        for observer in list(self._observers):
-            try:
-                observer(self.colors)
-            except Exception:
-                continue
-
-    def update(self, **changes: str) -> None:
-        try:
-            self.colors = replace(self.colors, **changes)
-        except TypeError as exc:
-            raise ValueError(
-                "One or more supplied names do not exist in ColorPool."
-            ) from exc
-        self.refresh()
-
-    def set_accent(self, accent: str) -> None:
-        """
-        Change the global accent and derive matching hover and muted variants.
-        """
-        hover = mix_hex(accent, "#ffffff", 0.22)
-        soft = mix_hex(self.colors.control_background, accent, 0.18)
-
-        self.colors = replace(
-            self.colors,
-            accent=accent,
-            accent_hover=hover,
-            accent_soft=soft,
+    def resolve_asset(
+        self,
+        logical_name: str | Path,
+        *,
+        fallback: str | Path | None = None,
+    ) -> Path:
+        """Return a themed asset when present, otherwise a safe legacy path."""
+        logical = _safe_relative_path(logical_name, label="Asset name")
+        relative_override = self.current.asset_overrides.get(logical, logical)
+        relative_override = _safe_relative_path(
+            relative_override,
+            label="Asset override",
         )
-        self.refresh()
+        fallback_relative = (
+            _safe_relative_path(fallback, label="Fallback asset")
+            if fallback is not None
+            else None
+        )
+        paths = application_paths(self.project_root)
+        resource_root = paths.resource_root
+        theme_root = (
+            paths.app_resource_path("themes") / self._theme_id
+        ).resolve()
+        themed_path = (theme_root / relative_override).resolve()
+        self._require_within(themed_path, theme_root, label="Themed asset")
+        if themed_path.is_file():
+            return themed_path
 
-    def _role_options(self, role: str) -> dict[str, Any]:
-        c = self.colors
+        if fallback is None:
+            fallback_path = paths.app_resource_path(Path("icons") / logical)
+        else:
+            assert fallback_relative is not None
+            fallback_path = (resource_root / fallback_relative).resolve()
+            self._require_within(
+                fallback_path,
+                resource_root,
+                label="Fallback asset",
+            )
+        return fallback_path
 
-        roles: dict[str, dict[str, Any]] = {
-            "window": {
-                "fg_color": c.app_background,
-            },
-            "transparent": {
-                "fg_color": "transparent",
-            },
-            "panel": {
-                "fg_color": c.panel_background,
-                "border_color": c.border_muted,
-                "border_width": 1,
-                "corner_radius": 8,
-            },
-            # Used by both image cards and the main sound card.
-            "media_card": {
-                "fg_color": c.card_background,
-                "border_color": c.accent,
-                "border_width": 1,
-                "corner_radius": 8,
-            },
-            "media_slot": {
-                "fg_color": c.panel_background,
-                "border_color": c.border_default,
-                "border_width": 1,
-                "corner_radius": 6,
-            },
-            "button": {
-                "fg_color": c.control_background,
-                "hover_color": c.accent_soft,
-                "border_color": c.border_default,
-                "border_width": 1,
-                "text_color": c.text_primary,
-                "corner_radius": 6,
-            },
-            "accent_button": {
-                "fg_color": c.control_background,
-                "hover_color": c.accent_soft,
-                "border_color": c.accent,
-                "border_width": 1,
-                "text_color": c.text_primary,
-                "corner_radius": 6,
-            },
-            "playback_button": {
-                "fg_color": c.control_background,
-                "hover_color": c.accent_soft,
-                "border_color": c.border_default,
-                "border_width": 1,
-                "text_color": c.text_primary,
-                "corner_radius": 6,
-            },
-            "danger_button": {
-                "fg_color": c.control_background,
-                "hover_color": c.danger_hover,
-                "border_color": c.danger,
-                "border_width": 1,
-                "text_color": c.text_primary,
-                "corner_radius": 6,
-            },
-            "heading_text": {
-                "text_color": c.text_primary,
-            },
-            "primary_text": {
-                "text_color": c.text_primary,
-            },
-            "secondary_text": {
-                "text_color": c.text_secondary,
-            },
-            "disabled_text": {
-                "text_color": c.text_disabled,
-            },
-            "accent_text": {
-                "text_color": c.accent,
-            },
-            "active_tab": {
-                "fg_color": "transparent",
-                "hover_color": c.accent_soft,
-                "text_color": c.text_primary,
-                "border_width": 0,
-            },
-            "inactive_tab": {
-                "fg_color": "transparent",
-                "hover_color": c.accent_soft,
-                "text_color": c.text_secondary,
-                "border_width": 0,
-            },
-            "accent_line": {
-                "fg_color": c.accent,
-                "corner_radius": 0,
-            },
-            "progress_bar": {
-                "fg_color": c.track_background,
-                "progress_color": c.accent,
-                "border_color": c.border_muted,
-            },
-            "slider": {
-                "fg_color": c.track_background,
-                "progress_color": c.accent,
-                "button_color": c.accent,
-                "button_hover_color": c.accent_hover,
-            },
-            "entry": {
-                "fg_color": c.panel_background,
-                "border_color": c.border_default,
-                "text_color": c.text_primary,
-                "placeholder_text_color": c.text_secondary,
-            },
-        }
-
+    @staticmethod
+    def _require_within(path: Path, root: Path, *, label: str) -> None:
         try:
-            return roles[role]
-        except KeyError as exc:
-            raise ValueError(f"Unknown theme role: {role!r}") from exc
+            path.relative_to(root)
+        except ValueError as error:
+            raise ValueError(f"{label} escapes its allowed directory.") from error
 
 
-# The entire application imports this same object.
-THEME = ThemeManager()
+__all__ = [
+    "DEFAULT_THEME_ID",
+    "FUTURISTIC_THEME",
+    "SOFT_ELEGANT_THEME",
+    "THEMES",
+    "THEME_SETTINGS_KEY",
+    "ThemeDefinition",
+    "ThemeService",
+    "ThemeTokens",
+    "normalize_theme_id",
+]

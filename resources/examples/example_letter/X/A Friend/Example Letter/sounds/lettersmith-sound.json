@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "mode": "single",
+  "crossfade_ms": 0,
+  "tracks": [
+    {
+      "filename": "music.mp3",
+      "display_title": "Moment of Peace",
+      "duration_seconds": 152.189375,
+      "content_hash": "dd712bb896f787f8f79b81717bf0aa8c00c9b490589fdb78e96e5b36233c78cf",
+      "original_name": "Moment of Peace.mp3"
+    }
+  ]
+}

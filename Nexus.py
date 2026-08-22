@@ -16,13 +16,14 @@ from __future__ import annotations
 
 import logging
 import math
-import os, sys, subprocess
+import os, sys, subprocess, json
 from pathlib import Path
 from typing import Optional
 
 from app_icon import apply_qt_window_icon, canonical_icon_paths
 from settings_store import (
     CURTAIN_STYLE_LABELS,
+    CURTAIN_TEXT_STYLE_PAIRS,
     DEFAULT_SETTINGS,
     DEFAULT_VISIONARY_URL,
     SettingsStore,
@@ -32,18 +33,17 @@ from settings_store import (
 )
 from project_state import (
     ApplicationState,
-    ProjectDirtyController,
     ProjectStateController,
 )
-from project_paths import ProjectPathResolver
+from project_paths import ProjectPathResolver, application_paths
 from project_save import ProjectNotReadyError, ProjectSaveService
 from recipient_page import RecipientPage
-from ui_constants import (
-    HELP_HIDE_DELAY_MS,
-    HELP_HOVER_DELAY_MS,
-    TOAST_DURATION_MS,
-    TRANSIENT_STATUS_MS,
+from curtain_cache import (
+    CurtainVariantCache,
+    prepare_curtain_variant_cache,
 )
+from ui_help import set_action_help, set_control_help, set_tab_help
+from ui_theme import ThemeService
 
 # ===================================================================================================================================================================================
 # Overlay integration
@@ -87,10 +87,24 @@ except Exception:
 # Relative asset hints & sizing
 # ===================================================================================================================================================================================
 
-REL_RETICLE_ICON = "gallery/app/icons/reticle.png"   # optional (title bar icon)
-REL_HELP_GIF     = "gallery/app/icons/Help.gif"      # idle (plays constantly)
-REL_HELP_HOVER   = "gallery/app/icons/HHelp.gif"     # hover variant (plays on hover)
-REL_HELP_PNG     = "gallery/app/icons/Help.png"      # final static fallback
+REL_RETICLE_ICON = "icons/reticle.png"   # optional (title bar icon)
+REL_SETTINGS_PNG = "icons/settings.png"  # title-bar idle image
+REL_SETTINGS_GIF = "icons/Settings.gif"  # hover/open animation
+REL_MINIMIZE_ICON = "icons/mini.png"
+REL_MAXIMIZE_ICON = "icons/maxi.png"
+REL_CLOSE_ICON = "icons/Exi.png"
+REL_HELP_GIF     = "icons/Help.gif"      # idle (plays constantly)
+REL_HELP_HOVER   = "icons/HHelp.gif"     # hover variant (plays on hover)
+REL_HELP_PNG     = "icons/Help.png"      # final static fallback
+
+
+def _app_asset(project_root: str | Path, relative_path: str | Path) -> Path:
+    return application_paths(project_root).app_resource_path(relative_path)
+
+
+def _theme_rgba(color: str, alpha: int) -> str:
+    value = QColor(color)
+    return f"rgba({value.red()},{value.green()},{value.blue()},{alpha})"
 
 WIN_W, WIN_H = 1400, 900
 _PREVIEW_AR = 169 / 253  # preview frame aspect (matches your 169├ù253 scaling)
@@ -98,6 +112,9 @@ _PREVIEW_AR = 169 / 253  # preview frame aspect (matches your 169├ù253 scalin
 # Help icon display size
 HELP_ICON_PX = 125
 HELP_ICON_HALF = HELP_ICON_PX // 2
+TITLE_BAR_ICON_PX = 36
+TITLE_BAR_CONTROL_PX = 40
+SETTINGS_ICON_PX = TITLE_BAR_ICON_PX
 
 # Command deliberately bypasses the normal TabSwitcher slide. Its body-level
 # fade covers the preview, help, and page layout as one stable snapshot.
@@ -126,6 +143,9 @@ class _LoadingSpinner(QtWidgets.QWidget):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self._step = 0
+        self._accent_color = self.palette().color(QtGui.QPalette.Highlight)
+        self._ring_color = QColor(self._accent_color)
+        self._ring_color.setAlpha(70)
         self.setFixedSize(92, 92)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self._timer = QtCore.QTimer(self)
@@ -151,7 +171,7 @@ class _LoadingSpinner(QtWidgets.QWidget):
         center = QtCore.QPointF(self.width() / 2, self.height() / 2)
 
         pulse = 2.0 + 1.5 * (1.0 + math.sin(self._step * math.pi / 6.0))
-        ring = QtGui.QPen(QtGui.QColor(0, 205, 236, 70), pulse)
+        ring = QtGui.QPen(self._ring_color, pulse)
         painter.setPen(ring)
         painter.setBrush(Qt.NoBrush)
         painter.drawEllipse(center, 30, 30)
@@ -159,7 +179,7 @@ class _LoadingSpinner(QtWidgets.QWidget):
         painter.setPen(Qt.NoPen)
         for index in range(12):
             distance = (index - self._step) % 12
-            color = QtGui.QColor(0, 235, 255)
+            color = QColor(self._accent_color)
             color.setAlpha(max(38, 255 - distance * 18))
             painter.setBrush(color)
             angle = math.radians(index * 30 - 90)
@@ -169,6 +189,12 @@ class _LoadingSpinner(QtWidgets.QWidget):
             )
             radius = 4.7 if distance == 0 else 3.4
             painter.drawEllipse(point, radius, radius)
+
+    def apply_theme_assets(self, service: ThemeService) -> None:
+        self._accent_color = QColor(service.tokens.accent)
+        self._ring_color = QColor(service.tokens.secondary)
+        self._ring_color.setAlpha(70)
+        self.update()
 
 
 class _ProjectLoadingOverlay(QtWidgets.QFrame):
@@ -186,13 +212,6 @@ class _ProjectLoadingOverlay(QtWidgets.QFrame):
         self.setObjectName("ProjectLoadingOverlay")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.setStyleSheet(
-            "QFrame#ProjectLoadingOverlay{background:rgba(4,8,12,218);border:none;}"
-            "QFrame#ProjectLoadingPanel{background:#101820;border:1px solid #287080;"
-            "border-radius:12px;}"
-            "QLabel#ProjectLoadingTitle{color:#e9fdff;font:600 15pt 'Segoe UI';}"
-            "QLabel#ProjectLoadingDetail{color:#9fcbd3;font:10pt 'Segoe UI';}"
-        )
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 24)
@@ -229,6 +248,21 @@ class _ProjectLoadingOverlay(QtWidgets.QFrame):
         root.addWidget(panel, 0, Qt.AlignHCenter)
         root.addStretch(1)
         self.hide()
+
+    def apply_theme_assets(self, service: ThemeService) -> None:
+        colors = service.tokens
+        self.spinner.apply_theme_assets(service)
+        self.setStyleSheet(
+            "QFrame#ProjectLoadingOverlay{"
+            f"background:{_theme_rgba(colors.background, 218)};border:none;}}"
+            "QFrame#ProjectLoadingPanel{"
+            f"background:{colors.panel_background};"
+            f"border:1px solid {colors.primary};border-radius:12px;}}"
+            "QLabel#ProjectLoadingTitle{"
+            f"color:{colors.highlight};font:600 15pt 'Segoe UI';}}"
+            "QLabel#ProjectLoadingDetail{"
+            f"color:{colors.muted_text};font:10pt 'Segoe UI';}}"
+        )
 
     def start(self, message: str) -> None:
         activity = str(message or "Loading saved letter…").strip()
@@ -271,6 +305,28 @@ class _ProjectLoadingOverlay(QtWidgets.QFrame):
 # Custom Title Bar
 # =============================================================================
 
+
+class _CurtainPreparationSignals(QtCore.QObject):
+    completed = QtCore.Signal(int, object)
+    failed = QtCore.Signal(int, str)
+
+
+class _CurtainPreparationTask(QtCore.QRunnable):
+    def __init__(self, project_root: str | Path, generation: int) -> None:
+        super().__init__()
+        self.project_root = Path(project_root).resolve()
+        self.generation = generation
+        self.signals = _CurtainPreparationSignals()
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            result = prepare_curtain_variant_cache(self.project_root)
+        except Exception as error:
+            self.signals.failed.emit(self.generation, str(error))
+            return
+        self.signals.completed.emit(self.generation, result)
+
 class TitleBar(QtWidgets.QWidget):
     """
     Custom frameless title bar.
@@ -290,8 +346,15 @@ class TitleBar(QtWidgets.QWidget):
 
         self.parent = parent
         self._drag_start = QtCore.QPoint()
+        self.theme_service = getattr(parent, "theme_service", None)
+        self._owns_theme_service = self.theme_service is None
+        if self.theme_service is None:
+            self.theme_service = ThemeService(
+                self.parent.project_root,
+                parent=self,
+            )
 
-        self.setFixedHeight(40)
+        self.setFixedHeight(TITLE_BAR_CONTROL_PX + 8)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 0, 8, 0)
@@ -303,15 +366,15 @@ class TitleBar(QtWidgets.QWidget):
 
         app_icon = QtWidgets.QLabel(self)
         app_icon.setObjectName("AppIcon")
-        app_icon.setFixedSize(30, 30)
+        app_icon.setFixedSize(TITLE_BAR_CONTROL_PX, TITLE_BAR_CONTROL_PX)
         app_icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         png_path, _ = canonical_icon_paths(self.parent.project_root)
         pixmap = QPixmap(str(png_path))
         if not pixmap.isNull():
             app_icon.setPixmap(
                 pixmap.scaled(
-                    28,
-                    28,
+                    TITLE_BAR_ICON_PX,
+                    TITLE_BAR_ICON_PX,
                     Qt.KeepAspectRatio,
                     Qt.SmoothTransformation,
                 )
@@ -322,19 +385,6 @@ class TitleBar(QtWidgets.QWidget):
             "The Silver-Tongued Lettersmith",
             self,
         )
-
-        self.title_label.setStyleSheet(
-            """
-            QLabel {
-                color: #00ffff;
-                background: transparent;
-                font-family: "Segoe UI Semibold";
-                font-size: 16px;
-                letter-spacing: 1px;
-            }
-            """
-        )
-
         layout.addWidget(self.title_label)
         layout.addStretch()
 
@@ -343,70 +393,216 @@ class TitleBar(QtWidgets.QWidget):
         # ---------------------------------------------------------------------
 
         self.settings_button = QtWidgets.QToolButton(self)
-        self.settings_button.setText("Settings")
-        self.settings_button.setToolTip("Application settings")
-        self.settings_button.setAccessibleName("Application settings")
+        set_control_help(
+            self.settings_button,
+            "Choose the theme, curtain style, and other application settings.",
+            accessible_name="Application settings",
+        )
         self.settings_button.setCursor(Qt.PointingHandCursor)
         self.settings_button.setPopupMode(
             QtWidgets.QToolButton.InstantPopup
         )
-        self.settings_button.setFixedHeight(30)
-        self.settings_button.setStyleSheet(
-            "QToolButton{color:#d7f8ff;background:transparent;"
-            "border:1px solid transparent;border-radius:5px;padding:4px 9px;}"
-            "QToolButton:hover,QToolButton::menu-button:hover{"
-            "background:rgba(0,255,255,0.12);border-color:#2f6672;}"
-            "QToolButton::menu-indicator{image:none;}"
+        self.settings_button.setFixedSize(
+            TITLE_BAR_CONTROL_PX,
+            TITLE_BAR_CONTROL_PX,
+        )
+        self.settings_button.setIconSize(
+            QSize(SETTINGS_ICON_PX, SETTINGS_ICON_PX)
+        )
+        self._settings_static_icon = QIcon()
+        self._settings_movie_path = ""
+        self._settings_movie = QMovie(parent=self)
+        self._settings_icon_animated = False
+        self._settings_menu_open = False
+        self.settings_button.setAttribute(Qt.WA_Hover, True)
+        self.settings_button.installEventFilter(self)
+        self.settings_button.pressed.connect(
+            self._show_animated_settings_icon
         )
         self.settings_menu = QtWidgets.QMenu(self.settings_button)
-        self.settings_menu.setStyleSheet(
-            "QMenu{background:#101820;color:#dff9ff;"
-            "border:1px solid #31515f;padding:5px;}"
-            "QMenu::item{padding:7px 26px 7px 10px;border-radius:4px;}"
-            "QMenu::item:selected{background:#18323d;color:#fff;}"
-            "QMenu::indicator:checked{background:#00b8d4;"
-            "border:1px solid #8cf3ff;}"
+        self.themes_menu = self.settings_menu.addMenu("Themes")
+        set_action_help(
+            self.themes_menu.menuAction(),
+            "Choose a complete visual theme for Letter Smith.",
         )
-        self.curtain_menu = self.settings_menu.addMenu("Curtains")
-        self._curtain_actions: dict[str, QtGui.QAction] = {}
-        self._curtain_group = QtGui.QActionGroup(self)
-        self._curtain_group.setExclusive(True)
-        for style, label in CURTAIN_STYLE_LABELS.items():
-            action = self.curtain_menu.addAction(label)
+        self._theme_group = QtGui.QActionGroup(self)
+        self._theme_group.setExclusive(True)
+        self._theme_actions: dict[str, QtGui.QAction] = {}
+        for definition in self.theme_service.available_themes():
+            action = self.themes_menu.addAction(definition.display_name)
             action.setCheckable(True)
-            action.setData(style)
-            self._curtain_group.addAction(action)
+            action.setData(definition.theme_id)
+            set_action_help(
+                action,
+                f"Apply the {definition.display_name} theme across Letter Smith.",
+            )
             action.triggered.connect(
+                lambda _checked=False, theme_id=definition.theme_id: (
+                    self._set_theme(theme_id)
+                )
+            )
+            self._theme_group.addAction(action)
+            self._theme_actions[definition.theme_id] = action
+
+        self.curtain_menu = self.settings_menu.addMenu("Curtains")
+        set_action_help(
+            self.curtain_menu.menuAction(),
+            "Choose the curtain colors used around the finished letter.",
+        )
+        self._curtain_actions: dict[str, QtWidgets.QPushButton] = {}
+        self._curtain_parent_actions: dict[str, QtWidgets.QToolButton] = {}
+        self._curtain_widget_actions: list[QtWidgets.QWidgetAction] = []
+        self._curtain_family_styles = {
+            "light": ("normal_light", "complementary_light"),
+            "dark": ("normal_dark", "complementary_dark"),
+        }
+        self._current_curtain_style = str(
+            DEFAULT_SETTINGS["curtain_style"]
+        )
+        self._curtain_preview_colors: dict[str, tuple[int, int, int]] = {
+            "pure_white": (255, 255, 255),
+        }
+        self._curtain_group = QtWidgets.QButtonGroup(self)
+        self._curtain_group.setExclusive(True)
+
+        def add_style_row(
+            menu: QtWidgets.QMenu,
+            style: str,
+        ) -> None:
+            row = QtWidgets.QPushButton(CURTAIN_STYLE_LABELS[style], menu)
+            row.setCheckable(True)
+            row.setCursor(Qt.PointingHandCursor)
+            row.setMinimumWidth(230)
+            row.setFixedHeight(34)
+            set_control_help(
+                row,
+                f"Use {CURTAIN_STYLE_LABELS[style]} around the finished letter.",
+                accessible_name=CURTAIN_STYLE_LABELS[style],
+            )
+            row.clicked.connect(
                 lambda _checked=False, value=style: self._set_curtain_style(
                     value
                 )
             )
-            self._curtain_actions[style] = action
+            widget_action = QtWidgets.QWidgetAction(menu)
+            widget_action.setDefaultWidget(row)
+            menu.addAction(widget_action)
+            self._curtain_group.addButton(row)
+            self._curtain_actions[style] = row
+            self._curtain_widget_actions.append(widget_action)
+
+        def add_family_row(
+            family: str,
+            submenu: QtWidgets.QMenu,
+        ) -> None:
+            row = QtWidgets.QToolButton(self.curtain_menu)
+            row.setText(f"{family.title()} ▾")
+            row.setCursor(Qt.PointingHandCursor)
+            row.setMinimumWidth(230)
+            row.setFixedHeight(34)
+            row.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+            row.setMenu(submenu)
+            set_control_help(
+                row,
+                f"Open the {family} curtain color options.",
+                accessible_name=f"{family.title()} curtain options",
+            )
+            widget_action = QtWidgets.QWidgetAction(self.curtain_menu)
+            widget_action.setDefaultWidget(row)
+            self.curtain_menu.addAction(widget_action)
+            self._curtain_parent_actions[family] = row
+            self._curtain_widget_actions.append(widget_action)
+
+        for style in (
+            "pure_white",
+            "average_color",
+            "complementary_average_color",
+        ):
+            add_style_row(self.curtain_menu, style)
+
+        self.light_curtain_menu = QtWidgets.QMenu(
+            "Light",
+            self.curtain_menu,
+        )
+        self.light_curtain_menu.setStyleSheet(self.settings_menu.styleSheet())
+        for style in self._curtain_family_styles["light"]:
+            add_style_row(self.light_curtain_menu, style)
+        add_family_row("light", self.light_curtain_menu)
+
+        self.dark_curtain_menu = QtWidgets.QMenu(
+            "Dark",
+            self.curtain_menu,
+        )
+        self.dark_curtain_menu.setStyleSheet(self.settings_menu.styleSheet())
+        for style in self._curtain_family_styles["dark"]:
+            add_style_row(self.dark_curtain_menu, style)
+        add_family_row("dark", self.dark_curtain_menu)
         self.visionary_location_action = self.settings_menu.addAction(
             "Visionary Location…"
         )
+        set_action_help(
+            self.visionary_location_action,
+            "Set the web address used to open the Visionary assistant.",
+        )
         self.visionary_location_action.triggered.connect(
             self._edit_visionary_location
+        )
+        self.github_account_action = self.settings_menu.addAction(
+            "GitHub Account…"
+        )
+        set_action_help(
+            self.github_account_action,
+            "Sign in, review the connected GitHub account, or sign out.",
+        )
+        self.github_account_action.triggered.connect(
+            self._show_github_account
         )
         self.settings_menu.addSeparator()
         self.repair_music_action = self.settings_menu.addAction(
             "Repair Music Archive"
         )
+        set_action_help(
+            self.repair_music_action,
+            "Repair stored music records without changing the current playlist.",
+        )
         self.repair_music_action.triggered.connect(
             self._repair_music_archive
         )
         self.settings_menu.addSeparator()
+        self.save_settings_action = self.settings_menu.addAction(
+            "Save Settings"
+        )
+        set_action_help(
+            self.save_settings_action,
+            "Save and confirm the settings currently applied to Letter Smith.",
+        )
+        self.save_settings_action.triggered.connect(self._save_settings)
+        self.settings_menu.addSeparator()
         self.new_project_action = self.settings_menu.addAction(
             "New Project"
         )
-        self.new_project_action.setShortcut(QtGui.QKeySequence.New)
+        set_action_help(
+            self.new_project_action,
+            "Clear the active workspace and begin a letter for another recipient.",
+        )
         self.new_project_action.triggered.connect(
             self.parent.start_new_project
         )
         self.exit_action = self.settings_menu.addAction("Exit")
+        set_action_help(
+            self.exit_action,
+            "Close Letter Smith safely.",
+        )
         self.exit_action.triggered.connect(self.parent.close)
         self.settings_menu.aboutToShow.connect(
             self._sync_curtain_menu
+        )
+        self.settings_menu.aboutToShow.connect(self._sync_theme_menu)
+        self.settings_menu.aboutToShow.connect(
+            self._settings_menu_shown
+        )
+        self.settings_menu.aboutToHide.connect(
+            self._settings_menu_hidden
         )
         self.settings_button.setMenu(self.settings_menu)
         layout.addWidget(self.settings_button)
@@ -417,23 +613,13 @@ class TitleBar(QtWidgets.QWidget):
 
         self.btn_target = self._make_button(
             text=self.TARGET_SYMBOL,
-            tooltip="Open Target Browser",
-            hover_background="rgba(0, 255, 255, 0.15)",
+            tooltip="Open the Target Browser to manage recipient projects.",
         )
-
-        target_icon_path = os.path.join(
-            self.parent.project_root,
+        self._apply_button_icon(
+            self.btn_target,
+            "titlebar/target.png",
             REL_RETICLE_ICON,
         )
-
-        if os.path.exists(target_icon_path):
-            self.btn_target.setText("")
-            self.btn_target.setIcon(
-                QIcon(target_icon_path)
-            )
-            self.btn_target.setIconSize(
-                QSize(24, 24)
-            )
 
         self.btn_target.clicked.connect(
             self.parent.open_target_browser
@@ -447,8 +633,12 @@ class TitleBar(QtWidgets.QWidget):
 
         self.btn_minimize = self._make_button(
             text=self.MINIMIZE_SYMBOL,
-            tooltip="Minimize",
-            hover_background="rgba(0, 255, 255, 0.15)",
+            tooltip="Minimize Letter Smith to the taskbar.",
+        )
+        self._apply_button_icon(
+            self.btn_minimize,
+            "titlebar/minimize.png",
+            REL_MINIMIZE_ICON,
         )
 
         self.btn_minimize.clicked.connect(
@@ -463,8 +653,12 @@ class TitleBar(QtWidgets.QWidget):
 
         self.btn_max = self._make_button(
             text=self.MAXIMIZE_SYMBOL,
-            tooltip="Maximize",
-            hover_background="rgba(0, 255, 255, 0.15)",
+            tooltip="Maximize the Letter Smith window.",
+        )
+        self._apply_button_icon(
+            self.btn_max,
+            "titlebar/maximize.png",
+            REL_MAXIMIZE_ICON,
         )
 
         self.btn_max.clicked.connect(
@@ -479,8 +673,13 @@ class TitleBar(QtWidgets.QWidget):
 
         self.btn_close = self._make_button(
             text=self.CLOSE_SYMBOL,
-            tooltip="Close",
-            hover_background="rgba(255, 0, 0, 0.30)",
+            tooltip="Close Letter Smith.",
+            danger=True,
+        )
+        self._apply_button_icon(
+            self.btn_close,
+            "titlebar/close.png",
+            REL_CLOSE_ICON,
         )
 
         self.btn_close.clicked.connect(
@@ -493,13 +692,7 @@ class TitleBar(QtWidgets.QWidget):
         # the window state outside this button.
         self.parent.installEventFilter(self)
         self._sync_max_restore_button()
-
-    def set_project_dirty(self, dirty: bool) -> None:
-        suffix = " •" if dirty else ""
-        self.title_label.setText(f"The Silver-Tongued Lettersmith{suffix}")
-        self.title_label.setToolTip(
-            "Unsaved project changes" if dirty else "Letter Smith"
-        )
+        self.apply_theme(self.theme_service)
 
     def _sync_curtain_menu(self) -> None:
         current = str(
@@ -508,8 +701,280 @@ class TitleBar(QtWidgets.QWidget):
                 DEFAULT_SETTINGS["curtain_style"],
             )
         )
+        self._current_curtain_style = current
         for style, action in self._curtain_actions.items():
             action.setChecked(style == current)
+        self._refresh_curtain_preview_rows()
+
+    def _sync_theme_menu(self) -> None:
+        current = self.theme_service.theme_id
+        for theme_id, action in self._theme_actions.items():
+            action.setChecked(theme_id == current)
+
+    def _set_theme(self, theme_id: str) -> None:
+        try:
+            previous_theme_id = self.theme_service.theme_id
+            definition = self.theme_service.set_theme(theme_id)
+            if (
+                definition.theme_id == previous_theme_id
+                or self._owns_theme_service
+            ):
+                apply_current = getattr(self.parent, "_apply_current_theme", None)
+                if callable(apply_current):
+                    apply_current()
+                else:
+                    self.apply_theme(self.theme_service)
+        except (OSError, RuntimeError, ValueError) as error:
+            _LOGGER.exception("Theme selection failed.")
+            self.parent.status(f"Theme could not be applied: {error}")
+            return
+        self._sync_theme_menu()
+        self.parent.status(f"{definition.display_name} theme applied.")
+        toast = getattr(self.parent, "toast", None)
+        if callable(toast):
+            toast(f"{definition.display_name} theme applied")
+
+    def _save_settings(self) -> None:
+        try:
+            self.theme_service.save()
+            apply_current = getattr(self.parent, "_apply_current_theme", None)
+            if callable(apply_current):
+                apply_current()
+            else:
+                self.apply_theme(self.theme_service)
+        except (OSError, RuntimeError, ValueError) as error:
+            _LOGGER.exception("Settings could not be saved.")
+            self.parent.status(f"Settings could not be saved: {error}")
+            return
+        self.parent.status("Settings saved and applied.")
+        toast = getattr(self.parent, "toast", None)
+        if callable(toast):
+            toast("Settings saved")
+
+    def apply_theme(self, service: ThemeService) -> None:
+        """Refresh title-bar colors, menus, and decorative assets."""
+        colors = service.tokens
+        self.title_label.setStyleSheet(
+            "QLabel{"
+            f"color:{colors.accent};background:transparent;"
+            "font-family:'Segoe UI Semibold';font-size:16px;"
+            "letter-spacing:1px;}"
+        )
+        self.settings_button.setStyleSheet(
+            "QToolButton{"
+            f"color:{colors.text};background:transparent;"
+            "border:1px solid transparent;border-radius:5px;padding:1px;}"
+            "QToolButton:hover,QToolButton::menu-button:hover{"
+            f"background:{_theme_rgba(colors.accent, 31)};"
+            f"border-color:{colors.border};}}"
+            "QToolButton::menu-indicator{image:none;}"
+        )
+        menu_qss = (
+            "QMenu{"
+            f"background:{colors.panel_background};color:{colors.text};"
+            f"border:1px solid {colors.border};padding:5px;}}"
+            "QMenu::item{padding:7px 26px 7px 10px;border-radius:4px;}"
+            "QMenu::item:selected{"
+            f"background:{colors.hover};color:{colors.highlight};}}"
+            "QMenu::indicator:checked{"
+            f"background:{colors.primary};border:1px solid {colors.highlight};}}"
+        )
+        for menu in (
+            self.settings_menu,
+            self.themes_menu,
+            self.curtain_menu,
+            self.light_curtain_menu,
+            self.dark_curtain_menu,
+        ):
+            menu.setToolTipsVisible(True)
+            menu.setStyleSheet(menu_qss)
+        for button in (
+            self.btn_target,
+            self.btn_minimize,
+            self.btn_max,
+            self.btn_close,
+        ):
+            self._style_titlebar_button(button)
+        self._reload_settings_assets()
+        self._apply_button_icon(
+            self.btn_target,
+            "titlebar/target.png",
+            REL_RETICLE_ICON,
+        )
+        self._apply_button_icon(
+            self.btn_minimize,
+            "titlebar/minimize.png",
+            REL_MINIMIZE_ICON,
+        )
+        self._apply_button_icon(
+            self.btn_max,
+            "titlebar/maximize.png",
+            REL_MAXIMIZE_ICON,
+        )
+        self._apply_button_icon(
+            self.btn_close,
+            "titlebar/close.png",
+            REL_CLOSE_ICON,
+        )
+        self._sync_theme_menu()
+        self._refresh_curtain_preview_rows()
+
+    def _resolve_theme_asset(
+        self,
+        logical_name: str,
+        legacy_relative: str,
+    ) -> Path:
+        resolver = getattr(self.parent, "resolve_theme_asset", None)
+        if callable(resolver):
+            return resolver(logical_name, legacy_relative)
+        paths = application_paths(self.parent.project_root)
+        fallback = paths.app_resource_path(legacy_relative).relative_to(
+            paths.resource_root
+        )
+        return self.theme_service.resolve_asset(
+            logical_name,
+            fallback=fallback,
+        )
+
+    def _reload_settings_assets(self) -> None:
+        animated = self._settings_icon_animated or self._settings_menu_open
+        previous_movie = self._settings_movie
+        previous_movie.stop()
+        previous_movie.setFileName("")
+
+        static_path = self._resolve_theme_asset(
+            "settings/idle.png",
+            REL_SETTINGS_PNG,
+        )
+        movie_path = self._resolve_theme_asset(
+            "settings/hover.gif",
+            REL_SETTINGS_GIF,
+        )
+        self._settings_static_icon = QIcon(str(static_path))
+        self._settings_movie_path = str(movie_path)
+        self._settings_movie = QMovie(self._settings_movie_path, parent=self)
+        if self._settings_movie.isValid():
+            self._settings_movie.setCacheMode(QMovie.CacheNone)
+            self._settings_movie.setScaledSize(
+                QSize(SETTINGS_ICON_PX, SETTINGS_ICON_PX)
+            )
+            self._settings_movie.frameChanged.connect(
+                self._update_settings_movie_frame
+            )
+            self._settings_movie.setFileName("")
+        previous_movie.deleteLater()
+
+        if self._settings_static_icon.isNull():
+            self.settings_button.setIcon(QIcon())
+            self.settings_button.setText("Settings")
+        else:
+            self.settings_button.setText("")
+            self.settings_button.setIcon(self._settings_static_icon)
+        if animated:
+            self._show_animated_settings_icon()
+
+    def _update_settings_movie_frame(self, _frame: int) -> None:
+        if not self._settings_icon_animated:
+            return
+        pixmap = self._settings_movie.currentPixmap()
+        if not pixmap.isNull():
+            self.settings_button.setIcon(QIcon(pixmap))
+
+    def _show_animated_settings_icon(self) -> None:
+        if not self._settings_movie.fileName():
+            self._settings_movie.setFileName(self._settings_movie_path)
+        if not self._settings_movie.isValid():
+            return
+        self._settings_icon_animated = True
+        if self._settings_movie.state() == QMovie.NotRunning:
+            self._settings_movie.jumpToFrame(0)
+            self._settings_movie.start()
+
+    def _show_static_settings_icon(self) -> None:
+        self._settings_icon_animated = False
+        self._settings_movie.stop()
+        self._settings_movie.setFileName("")
+        if not self._settings_static_icon.isNull():
+            self.settings_button.setIcon(self._settings_static_icon)
+
+    def _settings_menu_shown(self) -> None:
+        self._settings_menu_open = True
+        self._show_animated_settings_icon()
+
+    def _settings_menu_hidden(self) -> None:
+        self._settings_menu_open = False
+        QtCore.QTimer.singleShot(0, self._sync_settings_icon_state)
+
+    def _sync_settings_icon_state(self) -> None:
+        if self._settings_menu_open or self.settings_button.underMouse():
+            self._show_animated_settings_icon()
+        else:
+            self._show_static_settings_icon()
+
+    def set_curtain_preview_colors(
+        self,
+        colors: dict[str, tuple[int, int, int]],
+    ) -> None:
+        self._curtain_preview_colors = {
+            "pure_white": (255, 255, 255),
+            **{
+                style: tuple(max(0, min(255, int(channel))) for channel in rgb)
+                for style, rgb in colors.items()
+                if style in VALID_CURTAIN_STYLES and len(rgb) == 3
+            },
+        }
+        self._refresh_curtain_preview_rows()
+
+    def _refresh_curtain_preview_rows(self) -> None:
+        for style, row in self._curtain_actions.items():
+            self._style_curtain_row(
+                row,
+                style if row.isChecked() else None,
+            )
+        for family, row in self._curtain_parent_actions.items():
+            selected_style = (
+                self._current_curtain_style
+                if self._current_curtain_style
+                in self._curtain_family_styles[family]
+                else None
+            )
+            self._style_curtain_row(row, selected_style)
+
+    def _style_curtain_row(
+        self,
+        row: QtWidgets.QAbstractButton,
+        selected_style: str | None,
+    ) -> None:
+        colors = self.theme_service.tokens
+        rgb = (
+            self._curtain_preview_colors.get(selected_style)
+            if selected_style is not None
+            else None
+        )
+        if selected_style is not None and rgb is not None:
+            background = "#{:02x}{:02x}{:02x}".format(*rgb)
+            if selected_style == "pure_white":
+                foreground = "#000000"
+            else:
+                paired_style = CURTAIN_TEXT_STYLE_PAIRS.get(selected_style)
+                paired_rgb = self._curtain_preview_colors.get(paired_style)
+                foreground = (
+                    "#{:02x}{:02x}{:02x}".format(*paired_rgb)
+                    if paired_rgb is not None
+                    else colors.text
+                )
+        else:
+            background = colors.hover if selected_style else colors.panel_background
+            foreground = colors.highlight if selected_style else colors.text
+        border = colors.highlight if selected_style else "transparent"
+        row.setStyleSheet(
+            f"QPushButton,QToolButton{{background:{background};"
+            f"color:{foreground};border:2px solid {border};"
+            "border-radius:4px;font:600 10pt 'Segoe UI';"
+            "text-align:left;padding:5px 10px;}"
+            f"QPushButton:hover,QToolButton:hover{{border-color:{colors.accent};}}"
+            "QToolButton::menu-indicator{image:none;}"
+        )
 
     def _set_curtain_style(self, style: str) -> None:
         if style not in VALID_CURTAIN_STYLES:
@@ -521,6 +986,9 @@ class TitleBar(QtWidgets.QWidget):
         self.parent.status(
             f"Curtain style set to {CURTAIN_STYLE_LABELS[style]}."
         )
+        self.light_curtain_menu.close()
+        self.dark_curtain_menu.close()
+        self.curtain_menu.close()
         forge = getattr(self.parent, "forge_tab", None)
         if forge is None:
             return
@@ -559,6 +1027,13 @@ class TitleBar(QtWidgets.QWidget):
         settings.update_fields(**{VISIONARY_URL_KEY: visionary_url})
         self.parent.status("Visionary location updated.")
 
+    def _show_github_account(self) -> None:
+        forge = getattr(self.parent, "forge_tab", None)
+        if forge is None:
+            self.parent.status("GitHub account settings are not available yet.")
+            return
+        forge.show_github_account()
+
     def _repair_music_archive(self) -> None:
         sound_tab = getattr(self.parent, "sound_tab", None)
         if sound_tab is None:
@@ -570,17 +1045,25 @@ class TitleBar(QtWidgets.QWidget):
         self,
         text: str,
         tooltip: str,
-        hover_background: str,
+        danger: bool = False,
     ) -> QtWidgets.QPushButton:
         button = QtWidgets.QPushButton(
             text,
             self,
         )
 
-        button.setFixedSize(32, 32)
+        button.setFixedSize(
+            TITLE_BAR_CONTROL_PX,
+            TITLE_BAR_CONTROL_PX,
+        )
+        button.setIconSize(
+            QSize(TITLE_BAR_ICON_PX, TITLE_BAR_ICON_PX)
+        )
         button.setCursor(Qt.PointingHandCursor)
         button.setToolTip(tooltip)
         button.setAccessibleName(tooltip)
+        button.setProperty("dangerControl", danger)
+        button.setProperty("fallbackSymbol", text)
 
         symbol_font = QFont(
             "Segoe UI Symbol",
@@ -589,49 +1072,68 @@ class TitleBar(QtWidgets.QWidget):
         symbol_font.setBold(False)
         button.setFont(symbol_font)
 
-        button.setStyleSheet(
-            f"""
-            QPushButton {{
-                color: #d0d0d0;
-                background: transparent;
-                border: none;
-                padding: 0;
-                margin: 0;
-            }}
-
-            QPushButton:hover {{
-                color: #ffffff;
-                background: {hover_background};
-            }}
-
-            QPushButton:pressed {{
-                background: rgba(255, 255, 255, 0.12);
-            }}
-            """
-        )
+        self._style_titlebar_button(button)
 
         return button
 
+    def _style_titlebar_button(
+        self,
+        button: QtWidgets.QPushButton,
+    ) -> None:
+        colors = self.theme_service.tokens
+        hover_color = colors.error if button.property("dangerControl") else colors.accent
+        hover_alpha = 77 if button.property("dangerControl") else 38
+        button.setStyleSheet(
+            "QPushButton{"
+            f"color:{colors.muted_text};background:transparent;"
+            "border:none;padding:0;margin:0;}"
+            "QPushButton:hover{"
+            f"color:{colors.highlight};"
+            f"background:{_theme_rgba(hover_color, hover_alpha)};}}"
+            "QPushButton:pressed{"
+            f"background:{_theme_rgba(colors.text, 31)};}}"
+        )
+
+    def _apply_button_icon(
+        self,
+        button: QtWidgets.QPushButton,
+        logical_name: str,
+        legacy_relative: str,
+    ) -> None:
+        path = str(self._resolve_theme_asset(logical_name, legacy_relative))
+        icon = QIcon(path)
+        button.setIcon(QIcon())
+        button.setText(str(button.property("fallbackSymbol") or ""))
+        if icon.isNull():
+            return
+        button.setText("")
+        button.setIcon(icon)
+        button.setIconSize(
+            QSize(TITLE_BAR_ICON_PX, TITLE_BAR_ICON_PX)
+        )
+
     def _sync_max_restore_button(self) -> None:
         if self.parent.isMaximized():
-            self.btn_max.setText(
-                self.RESTORE_SYMBOL
-            )
+            if self.btn_max.icon().isNull():
+                self.btn_max.setText(
+                    self.RESTORE_SYMBOL
+                )
             self.btn_max.setToolTip(
-                "Restore"
+                "Restore Letter Smith to its previous window size."
             )
             self.btn_max.setAccessibleName(
-                "Restore"
+                "Restore window"
             )
         else:
-            self.btn_max.setText(
-                self.MAXIMIZE_SYMBOL
-            )
+            if self.btn_max.icon().isNull():
+                self.btn_max.setText(
+                    self.MAXIMIZE_SYMBOL
+                )
             self.btn_max.setToolTip(
-                "Maximize"
+                "Maximize the Letter Smith window."
             )
             self.btn_max.setAccessibleName(
-                "Maximize"
+                "Maximize window"
             )
 
     def _toggle_max_restore(self) -> None:
@@ -646,6 +1148,12 @@ class TitleBar(QtWidgets.QWidget):
         )
 
     def eventFilter(self, watched, event):
+        if watched is self.settings_button:
+            if event.type() in (QEvent.Enter, QEvent.HoverEnter):
+                self._show_animated_settings_icon()
+            elif event.type() in (QEvent.Leave, QEvent.HoverLeave):
+                if not self._settings_menu_open:
+                    self._show_static_settings_icon()
         if (
             watched is self.parent
             and event.type() == QEvent.WindowStateChange
@@ -727,7 +1235,7 @@ class HelpPopover(QFrame):
         hf.setBold(True)
         self.header.setFont(hf)
         self.header.setWordWrap(True)
-        self.header.setStyleSheet("font-weight:800; color:#e0ffff; background:transparent;")
+        self.header.setStyleSheet("font-weight:800;background:transparent;")
 
         self.body = QLabel("")
         bf = QFont("Segoe UI", 10)
@@ -738,16 +1246,15 @@ class HelpPopover(QFrame):
         lay.addWidget(self.header)
         lay.addWidget(self.body)
 
-        self.setStyleSheet("""
-            QFrame#HelpPopover {
-                background: #101317;
-                border: 2px solid #2f7474;
-                border-radius: 8px;
-            }
-            QFrame#HelpPopover QLabel {
-                color: #e0ffff;
-            }
-        """)
+    def apply_theme(self, service: ThemeService) -> None:
+        colors = service.tokens
+        self.setStyleSheet(
+            "QFrame#HelpPopover{"
+            f"background:{colors.card_background};"
+            f"border:2px solid {colors.primary};border-radius:8px;}}"
+            "QFrame#HelpPopover QLabel{"
+            f"color:{colors.highlight};}}"
+        )
 
     def set_header_text(self, text: str) -> None:
         self.header.setText(text or "")
@@ -859,9 +1366,9 @@ class _ForgePreviewFullscreenWindow(QtWidgets.QWidget):
         )
         self.setObjectName("ForgePreviewFullscreenWindow")
         self.setWindowTitle("Letter Preview")
-        self.setStyleSheet(
-            "QWidget#ForgePreviewFullscreenWindow{background:#0b0c12;}"
-        )
+        service = getattr(owner.window(), "theme_service", None)
+        if service is not None:
+            self.apply_theme_assets(service)
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(0)
@@ -872,6 +1379,12 @@ class _ForgePreviewFullscreenWindow(QtWidgets.QWidget):
         )
         self._escape_shortcut.setContext(Qt.WindowShortcut)
         self._escape_shortcut.activated.connect(self.exit_requested)
+
+    def apply_theme_assets(self, service: ThemeService) -> None:
+        self.setStyleSheet(
+            "QWidget#ForgePreviewFullscreenWindow{"
+            f"background:{service.tokens.background};}}"
+        )
 
     def attach_preview(self, preview: QtWidgets.QWidget) -> None:
         self._layout.addWidget(preview)
@@ -890,14 +1403,14 @@ class Nexus(QtWidgets.QMainWindow):
     def __init__(self, project_root: str | Path):
         super().__init__()
         self.project_root = str(project_root)
+        self.theme_service = ThemeService(self.project_root, parent=self)
+        self.theme_service.theme_changed.connect(self._on_theme_changed)
         self.setWindowTitle("Letter Smith")
         apply_qt_window_icon(self, self.project_root)
         self._tray_icon: Optional[QtWidgets.QSystemTrayIcon] = None
         self._tray_menu: Optional[QtWidgets.QMenu] = None
         self._command_bar: Optional[QtWidgets.QWidget] = None
         self._setup_system_tray()
-        self.settings_store = SettingsStore(self.project_root)
-        self.project_dirty = ProjectDirtyController()
         self.project_state = ProjectStateController(self.project_root)
         self.project_paths = ProjectPathResolver(self.project_root)
         self.project_save_service = ProjectSaveService(
@@ -907,134 +1420,33 @@ class Nexus(QtWidgets.QMainWindow):
         )
         initial_project_state = self.project_state.initialize()
         self._project_tabs_initialized = False
+        self._curtain_preparation_generation = 0
+        self._curtain_preparation_tasks: dict[
+            int,
+            _CurtainPreparationTask,
+        ] = {}
+        self._curtain_preparation_timer = QtCore.QTimer(self)
+        self._curtain_preparation_timer.setSingleShot(True)
+        self._curtain_preparation_timer.setInterval(5000)
+        self._curtain_preparation_timer.timeout.connect(
+            self._start_curtain_preparation
+        )
+        self._curtain_preparation_pool = QtCore.QThreadPool(self)
+        self._curtain_preparation_pool.setMaxThreadCount(1)
         self._forge_fullscreen_active = False
         self._forge_fullscreen_window: Optional[
             _ForgePreviewFullscreenWindow
         ] = None
         self._shutdown_complete = False
         self._shutdown_in_progress = False
-        self._save_in_progress = False
         self.setObjectName("NexusWindow")
 
         # Frameless + QSS
         self.setWindowFlag(QtCore.Qt.FramelessWindowHint)
-        self.setStyleSheet("""
-            /*
-             * Background ownership is deliberately scoped.
-             *
-             * Do not assign a background to every QWidget or QStackedWidget.
-             * Doing so paints Nexus gray through transparent child margins and
-             * creates the rectangular "holes" that were visible in Sound.
-             */
-            QMainWindow#NexusWindow,
-            QWidget#NexusRoot,
-            QWidget#NexusBody {
-                background:#1e1e1e;
-                color:#d0d0d0;
-                font-family:'Segoe UI';
-                font-size:11px;
-            }
-
-            QStackedWidget#FeatureStack,
-            QStackedWidget#PreviewStack,
-            QWidget#PreviewBlank {
-                background:transparent;
-                border:none;
-            }
-
-            /*
-             * Each feature page owns its own surface. Sound uses the dark-blue
-             * surface expected by its interface, so transparent areas reveal
-             * blue rather than Nexus gray.
-             */
-            QWidget#ImagePageSurface,
-            QWidget#MessagePageSurface,
-            QWidget#ForgePageSurface,
-            QWidget#CommandPageSurface {
-                background:#1e1e1e;
-                border:none;
-            }
-
-            QWidget#SoundPageSurface {
-                background:#101820;
-                border:none;
-            }
-
-            QTabBar#MainTabBar {
-                background:#1e1e1e;
-                color:#d0d0d0;
-                font-family:'Segoe UI';
-                font-size:11px;
-            }
-
-            QLabel {
-                color:#b0e0e6;
-                font-weight:600;
-            }
-
-            QPushButton {
-                background-color:transparent;
-                color:#d0d0d0;
-                border:1px solid #444;
-                border-radius:4px;
-                padding:6px 12px;
-                font:11px 'Segoe UI';
-            }
-            QPushButton:hover {
-                background:#2a2a2a;
-                border-color:#00b2b2;
-                color:#e0f7f7;
-            }
-            QPushButton:pressed {
-                background:#353535;
-                border-color:#00a0a0;
-                color:#c0f0f0;
-            }
-
-            QTabBar#MainTabBar::tab {
-                background:transparent;
-                border:none;
-                padding:8px 14px;
-                margin-right:2px;
-                color:#a0a0a0;
-            }
-            QTabBar#MainTabBar::tab:selected {
-                color:#e0fdfd;
-                border-bottom:2px solid #00b2b2;
-            }
-            QTabBar#MainTabBar::tab:hover {
-                color:#e0f7f7;
-            }
-
-            QTabBar#MainTabBar[commandOverlay="true"] {
-                background:transparent;
-            }
-            QTabBar#MainTabBar[commandOverlay="true"]::tab {
-                background:transparent;
-                border:none;
-                color:transparent;
-            }
-            QTabBar#MainTabBar[commandOverlay="true"]::tab:selected {
-                border:none;
-                color:transparent;
-            }
-            QTabBar#MainTabBar[commandOverlay="true"]::tab:hover {
-                background:rgba(11,12,16,0.82);
-                color:#e0fdfd;
-                border-bottom:2px solid #00b2b2;
-            }
-
-            QStatusBar {
-                background:#1e1e1e;
-                color:#d0d0d0;
-            }
-
-            QWidget#PreviewFrame {
-                background:#101317;
-                border:2px solid #444;
-                border-radius:6px;
-            }
-        """)
+        self.theme_service.apply(
+            self,
+            additional_qss=self._build_nexus_theme_stylesheet(),
+        )
 
         # Central layout
         self.main_widget = QtWidgets.QWidget(self)
@@ -1047,17 +1459,32 @@ class Nexus(QtWidgets.QMainWindow):
 
         # Title bar
         self.title_bar = TitleBar(self)
-        self.project_dirty.add_listener(self.title_bar.set_project_dirty)
         main_layout.addWidget(self.title_bar)
 
         # Tab bar
         self.tabbar = QtWidgets.QTabBar()
         self.tabbar.setObjectName("MainTabBar")
-        for name in ("Images", "Sound", "Message", "Forge", "Command"):
-            self.tabbar.addTab(name)
+        tab_help = (
+            ("Images", "Select and prepare the four images for this letter."),
+            ("Sound", "Choose one song or arrange a playlist for this letter."),
+            ("Message", "Write, import, and format the letter's message."),
+            ("Forge", "Review, preview, load, publish, and share the letter."),
+            ("Command", "Open the deliberate reset workspace. Click to activate."),
+        )
+        for name, help_text in tab_help:
+            index = self.tabbar.addTab(name)
+            set_tab_help(self.tabbar, index, help_text)
         self.tabbar.setDrawBase(False)
         self.tabbar.setMouseTracking(True)
         self.tabbar.setAttribute(Qt.WA_Hover, True)
+        self.tabbar.installEventFilter(self)
+        self._readiness_hovered_tab = -1
+        self._image_tab_readiness_hide_timer = QtCore.QTimer(self)
+        self._image_tab_readiness_hide_timer.setSingleShot(True)
+        self._image_tab_readiness_hide_timer.setInterval(1000)
+        self._image_tab_readiness_hide_timer.timeout.connect(
+            self._hide_readiness_after_image_tab_hover
+        )
         self.tabbar.currentChanged.connect(self._tab_changed)
         main_layout.addWidget(self.tabbar)
         self._command_immersive = False
@@ -1091,8 +1518,11 @@ class Nexus(QtWidgets.QMainWindow):
         self.preview_stack.addWidget(self.image_preview)
 
         self.html_preview = QWebEngineView()
-        self.html_preview.setStyleSheet("background-color:#1e1e1e;")
-        self.html_preview.page().setBackgroundColor(QColor("#1e1e1e"))
+        preview_background = self.theme_service.tokens.background
+        self.html_preview.setStyleSheet(
+            f"background-color:{preview_background};"
+        )
+        self.html_preview.page().setBackgroundColor(QColor(preview_background))
         self.html_preview.settings().setAttribute(
             QWebEngineSettings.FullScreenSupportEnabled,
             True,
@@ -1114,7 +1544,8 @@ class Nexus(QtWidgets.QMainWindow):
         self.preview_caption = QLabel("", alignment=Qt.AlignCenter)
         self.preview_caption.setVisible(False)
         self.preview_caption.setStyleSheet(
-            "color:#e0ffff; font:12px 'Segoe UI Semibold'; padding:4px 6px;"
+            f"color:{self.theme_service.tokens.highlight};"
+            "font:12px 'Segoe UI Semibold';padding:4px 6px;"
         )
         body_layout.addWidget(self.preview_caption, alignment=Qt.AlignHCenter)
 
@@ -1143,7 +1574,9 @@ class Nexus(QtWidgets.QMainWindow):
         """)
         self.help_icon.setCursor(Qt.WhatsThisCursor)
         self.help_icon.setAccessibleName("Help ΓÇö instructions for this tab")
-        self.help_icon.setToolTip("Help")
+        self.help_icon.setToolTip(
+            "Show instructions for the current Letter Smith workspace."
+        )
         self.help_icon.setFixedSize(HELP_ICON_PX, HELP_ICON_PX)
         self.help_icon.setMouseTracking(True)
         self.help_icon.setAttribute(Qt.WA_Hover, True)
@@ -1151,34 +1584,6 @@ class Nexus(QtWidgets.QMainWindow):
         # Movies: idle + hover
         self._help_movie_idle: Optional[QMovie] = None
         self._help_movie_hover: Optional[QMovie] = None
-
-        def _abs(rel: str) -> str:
-            return os.path.join(self.project_root, rel)
-
-        def _load_movie(path: str) -> Optional[QMovie]:
-            if os.path.exists(path):
-                mv = QMovie(path)
-                if mv.isValid():
-                    mv.setCacheMode(QMovie.CacheAll)
-                    mv.setSpeed(100)
-                    mv.setScaledSize(QSize(HELP_ICON_PX, HELP_ICON_PX))
-                    mv.start()  # play constantly
-                    return mv
-            return None
-
-        self._help_movie_idle  = _load_movie(_abs(REL_HELP_GIF))
-        self._help_movie_hover = _load_movie(_abs(REL_HELP_HOVER))
-
-        # Initial visual: prefer idle movie ΓåÆ hover movie ΓåÆ PNG fallback ΓåÆ text
-        if self._help_movie_idle:
-            self.help_icon.setMovie(self._help_movie_idle)
-        elif self._help_movie_hover:
-            self.help_icon.setMovie(self._help_movie_hover)
-        else:
-            self._set_help_fallback_icon(_abs(REL_HELP_PNG))
-
-        # Legacy-compat shim (prevents AttributeError in any old slots)
-        self._help_movie = None
 
         help_row.addWidget(self.help_icon, 0, Qt.AlignRight)
         body_layout.addLayout(help_row)
@@ -1189,12 +1594,12 @@ class Nexus(QtWidgets.QMainWindow):
         # Show/hide timers for hover UX
         self._help_show_timer = QtCore.QTimer(self)
         self._help_show_timer.setSingleShot(True)
-        self._help_show_timer.setInterval(HELP_HOVER_DELAY_MS)
+        self._help_show_timer.setInterval(150)  # 120ΓÇô160 ms
         self._help_show_timer.timeout.connect(self._show_help_from_icon)
 
         self._help_hide_timer = QtCore.QTimer(self)
         self._help_hide_timer.setSingleShot(True)
-        self._help_hide_timer.setInterval(HELP_HIDE_DELAY_MS)
+        self._help_hide_timer.setInterval(360)  # 300ΓÇô400 ms
         self._help_hide_timer.timeout.connect(self._hide_help_popover)
 
         # Install event filters to manage hover persistence and GIF swap
@@ -1209,6 +1614,12 @@ class Nexus(QtWidgets.QMainWindow):
         self.recipient_page = RecipientPage(self.main_widget)
         self.recipient_page.recipient_submitted.connect(
             self._accept_recipient
+        )
+        self.recipient_page.load_requested.connect(
+            self._show_saved_letters_from_recipient_page
+        )
+        self.recipient_page.stock_requested.connect(
+            self._show_stock_letters_from_recipient_page
         )
         self.application_stack = QtWidgets.QStackedWidget(self.main_widget)
         self.application_stack.setObjectName("ApplicationStack")
@@ -1226,9 +1637,6 @@ class Nexus(QtWidgets.QMainWindow):
 
         # Toast overlay
         self._toast = QLabel(self)
-        self._toast.setStyleSheet(
-            "QLabel{background:rgba(0,0,0,0.7); color:#e0ffff; border-radius:6px; padding:8px 12px;}"
-        )
         self._toast.setVisible(False)
         self._toast_timer = QtCore.QTimer(self)
         self._toast_timer.setSingleShot(True)
@@ -1274,28 +1682,208 @@ class Nexus(QtWidgets.QMainWindow):
         # Initial sizing & tab
         self.setMinimumSize(1180, 820)
         self.resize(WIN_W, WIN_H)
-        self._restore_window_preferences()
 
         # Shortcuts + click effects
         self._install_shortcuts()
         try:
             install_click_fx(self)
         except Exception:
-            logging.getLogger(__name__).debug(
-                "Best-effort operation failed.",
-                exc_info=True,
-            )
+            pass
 
         # Double-click filter for full message view
         self._dbl_filter = _DoubleClickFilter(self)
         self.html_preview.installEventFilter(self._dbl_filter)
 
+        self._apply_current_theme()
         self.project_state.add_listener(self._on_project_state_transition)
         self._apply_application_state(initial_project_state)
-        self.project_dirty.mark_saved()
 
         # Diagnostics after event loop starts
         QtCore.QTimer.singleShot(0, self._post_init_diagnostics)
+
+    def _build_nexus_theme_stylesheet(self) -> str:
+        """Build the shell stylesheet exclusively from semantic theme tokens."""
+        colors = self.theme_service.tokens
+        overlay = _theme_rgba(colors.panel_background, 209)
+        return f"""
+            /* Background ownership remains deliberately scoped. */
+            QMainWindow#NexusWindow,
+            QWidget#NexusRoot,
+            QWidget#NexusBody {{
+                background:{colors.background};
+                color:{colors.text};
+                font-family:'Segoe UI';
+                font-size:11px;
+            }}
+
+            QStackedWidget#FeatureStack,
+            QStackedWidget#PreviewStack,
+            QWidget#PreviewBlank {{
+                background:transparent;
+                border:none;
+            }}
+
+            QWidget#ImagePageSurface,
+            QWidget#MessagePageSurface,
+            QWidget#ForgePageSurface,
+            QWidget#CommandPageSurface {{
+                background:{colors.background};
+                border:none;
+            }}
+
+            QWidget#SoundPageSurface {{
+                background:{colors.panel_background};
+                border:none;
+            }}
+
+            QTabBar#MainTabBar {{
+                background:{colors.background};
+                color:{colors.text};
+                font-family:'Segoe UI';
+                font-size:11px;
+            }}
+
+            QLabel {{
+                color:{colors.highlight};
+                font-weight:600;
+            }}
+
+            QPushButton {{
+                background-color:transparent;
+                color:{colors.text};
+                border:1px solid {colors.border};
+                border-radius:4px;
+                padding:6px 12px;
+                font:11px 'Segoe UI';
+            }}
+            QPushButton:hover {{
+                background:{colors.hover};
+                border-color:{colors.primary};
+                color:{colors.highlight};
+            }}
+            QPushButton:pressed {{
+                background:{colors.active};
+                border-color:{colors.secondary};
+                color:{colors.highlight};
+            }}
+
+            QTabBar#MainTabBar::tab {{
+                background:transparent;
+                border:none;
+                padding:8px 14px;
+                margin-right:2px;
+                color:{colors.muted_text};
+            }}
+            QTabBar#MainTabBar::tab:selected {{
+                color:{colors.highlight};
+                border-bottom:2px solid {colors.primary};
+            }}
+            QTabBar#MainTabBar::tab:hover {{
+                color:{colors.highlight};
+            }}
+
+            QTabBar#MainTabBar[commandOverlay="true"] {{
+                background:transparent;
+            }}
+            QTabBar#MainTabBar[commandOverlay="true"]::tab {{
+                background:transparent;
+                border:none;
+                color:transparent;
+            }}
+            QTabBar#MainTabBar[commandOverlay="true"]::tab:selected {{
+                border:none;
+                color:transparent;
+            }}
+            QTabBar#MainTabBar[commandOverlay="true"]::tab:hover {{
+                background:{overlay};
+                color:{colors.highlight};
+                border-bottom:2px solid {colors.primary};
+            }}
+
+            QStatusBar {{
+                background:{colors.background};
+                color:{colors.text};
+            }}
+
+            QWidget#PreviewFrame {{
+                background:{colors.card_background};
+                border:2px solid {colors.border};
+                border-radius:6px;
+            }}
+
+            QToolTip {{
+                background:{colors.control_background};
+                color:{colors.text};
+                border:1px solid {colors.border};
+                padding:4px 7px;
+            }}
+        """
+
+    def resolve_theme_asset(
+        self,
+        logical_name: str,
+        legacy_relative: str,
+    ) -> Path:
+        """Resolve a themed asset with the active app-resource path as fallback."""
+        paths = application_paths(self.project_root)
+        fallback_path = paths.app_resource_path(legacy_relative).resolve()
+        fallback = fallback_path.relative_to(paths.resource_root)
+        return self.theme_service.resolve_asset(
+            logical_name,
+            fallback=fallback,
+        )
+
+    @QtCore.Slot(str, object)
+    def _on_theme_changed(self, _theme_id: str, _definition: object) -> None:
+        self._apply_current_theme()
+
+    def _apply_current_theme(self) -> None:
+        """Reapply colors and decorative assets without rebuilding the UI."""
+        self.theme_service.apply(
+            self,
+            additional_qss=self._build_nexus_theme_stylesheet(),
+        )
+        title_bar = getattr(self, "title_bar", None)
+        if title_bar is not None:
+            title_bar.apply_theme(self.theme_service)
+        help_pop = getattr(self, "help_pop", None)
+        if help_pop is not None:
+            help_pop.apply_theme(self.theme_service)
+        html_preview = getattr(self, "html_preview", None)
+        if html_preview is not None:
+            background = self.theme_service.tokens.background
+            html_preview.setStyleSheet(f"background-color:{background};")
+            html_preview.page().setBackgroundColor(QColor(background))
+        preview_caption = getattr(self, "preview_caption", None)
+        if preview_caption is not None:
+            preview_caption.setStyleSheet(
+                f"color:{self.theme_service.tokens.highlight};"
+                "font:12px 'Segoe UI Semibold';padding:4px 6px;"
+            )
+        if hasattr(self, "help_icon"):
+            self._reload_help_theme_assets()
+        if hasattr(self, "_toast"):
+            colors = self.theme_service.tokens
+            self._toast.setStyleSheet(
+                "QLabel{"
+                f"background:{_theme_rgba(colors.panel_background, 230)};"
+                f"color:{colors.highlight};border:1px solid {colors.border};"
+                "border-radius:6px;padding:8px 12px;}"
+            )
+        self._apply_theme_assets_to_descendants()
+
+    def _apply_theme_assets_to_descendants(self) -> None:
+        for widget in self.findChildren(QtWidgets.QWidget):
+            apply_assets = getattr(widget, "apply_theme_assets", None)
+            if not callable(apply_assets):
+                continue
+            try:
+                apply_assets(self.theme_service)
+            except (OSError, RuntimeError, ValueError):
+                _LOGGER.exception(
+                    "Theme assets could not be applied to %s.",
+                    type(widget).__name__,
+                )
 
     def _initialize_project_tabs(self) -> None:
         if self._project_tabs_initialized:
@@ -1399,32 +1987,21 @@ class Nexus(QtWidgets.QMainWindow):
         self.message_tab.published_page_url_changed.connect(
             self.forge_tab.set_saved_page_url
         )
-        self.image_tab.image_selected.connect(
-            lambda _pixmap: self.forge_tab.schedule_refresh()
-        )
-        self.image_tab.animation_settings_changed.connect(
-            lambda _index: self.forge_tab.schedule_refresh()
-        )
-        self.image_tab.clear_preview.connect(self.forge_tab.schedule_refresh)
-        self.sound_tab.project_sound.changed.connect(
-            self.forge_tab.schedule_refresh
-        )
-        self.message_tab.project_changed.connect(
-            self.forge_tab.schedule_refresh
-        )
         self.image_tab.images_changed.connect(
-            lambda _reason: self.project_dirty.mark_changed("images")
+            lambda _reason: self.forge_tab.schedule_refresh()
         )
-        self.image_tab.animation_settings_changed.connect(
-            lambda _index: self.project_dirty.mark_changed("image-animation")
+        self.image_tab.cover_changed.connect(
+            self._schedule_curtain_preparation
         )
-        self.sound_tab.project_sound.changed.connect(
-            lambda: self.project_dirty.mark_changed("sound")
+        self.sound_tab.sound_state_changed.connect(
+            lambda _reason: self.forge_tab.schedule_refresh()
+        )
+        self.sound_tab.volume_changed.connect(
+            lambda _volume: self.forge_tab.schedule_refresh()
         )
         self.message_tab.project_changed.connect(
-            lambda: self.project_dirty.mark_changed("message")
+            self.forge_tab.schedule_refresh
         )
-        self.settings_store.changed.connect(self._on_project_settings_changed)
         self.image_tab.image_selected.connect(
             lambda pixmap: self._show_image_for_tab(0, pixmap)
         )
@@ -1443,38 +2020,76 @@ class Nexus(QtWidgets.QMainWindow):
         self.command_tab.wiped.connect(self._on_command_wiped)
 
         self._tabswitch = (
-            TabSwitcher(self.page_stack)
+            TabSwitcher(
+                self.page_stack,
+                hover_excluded_indices={4},
+            )
             if TabSwitcher is not None
             else None
         )
         self._project_tabs_initialized = True
-        saved_tab = str(self.settings_store.get("ui_last_tab", "Images"))
-        saved_index = next(
-            (
-                index
-                for index in range(self.tabbar.count())
-                if self.tabbar.tabText(index) == saved_tab
-            ),
-            0,
-        )
-        self.tabbar.setCurrentIndex(saved_index)
-        self._tab_changed(saved_index)
+        self._apply_theme_assets_to_descendants()
+        self.tabbar.setCurrentIndex(0)
+        self._tab_changed(0)
+        self._schedule_curtain_preparation()
 
-    def _on_project_settings_changed(
+    def _schedule_curtain_preparation(self) -> None:
+        self._curtain_preparation_generation += 1
+        self._curtain_preparation_timer.stop()
+        self.title_bar.set_curtain_preview_colors({})
+        cover = (
+            Path(self.project_root)
+            / "gallery"
+            / "user"
+            / "pages"
+            / "cover.png"
+        )
+        if cover.is_file():
+            self._curtain_preparation_timer.start()
+
+    def _stop_curtain_preparation(self, timeout_ms: int | None = None) -> bool:
+        self._curtain_preparation_generation += 1
+        self._curtain_preparation_timer.stop()
+        self._curtain_preparation_pool.clear()
+        return bool(
+            self._curtain_preparation_pool.waitForDone()
+            if timeout_ms is None
+            else self._curtain_preparation_pool.waitForDone(
+                max(0, int(timeout_ms))
+            )
+        )
+
+    def _start_curtain_preparation(self) -> None:
+        generation = self._curtain_preparation_generation
+        task = _CurtainPreparationTask(self.project_root, generation)
+        task.signals.completed.connect(self._curtain_preparation_completed)
+        task.signals.failed.connect(self._curtain_preparation_failed)
+        self._curtain_preparation_tasks[generation] = task
+        self._curtain_preparation_pool.start(task)
+
+    @QtCore.Slot(int, object)
+    def _curtain_preparation_completed(
         self,
-        _settings: dict,
-        keys: tuple[str, ...],
+        generation: int,
+        result: object,
     ) -> None:
-        ignored = {
-            "active_play_dir",
-            "app_icon",
-            "debug",
-            "last_music_folder",
-            "settings_schema_version",
-            "visionary_url",
-        }
-        if any(not key.startswith("ui_") and key not in ignored for key in keys):
-            self.project_dirty.mark_changed("settings")
+        self._curtain_preparation_tasks.pop(generation, None)
+        if generation != self._curtain_preparation_generation:
+            return
+        if not isinstance(result, CurtainVariantCache):
+            return
+        self.title_bar.set_curtain_preview_colors(dict(result.colors))
+
+    @QtCore.Slot(int, str)
+    def _curtain_preparation_failed(
+        self,
+        generation: int,
+        message: str,
+    ) -> None:
+        self._curtain_preparation_tasks.pop(generation, None)
+        if generation != self._curtain_preparation_generation:
+            return
+        _LOGGER.warning("Curtain preparation failed: %s", message)
 
     def _on_project_state_transition(
         self,
@@ -1549,6 +2164,32 @@ class Nexus(QtWidgets.QMainWindow):
         except (RuntimeError, ValueError, OSError) as error:
             self.recipient_page.show_error(str(error))
 
+    def _show_saved_letters_from_recipient_page(self) -> None:
+        self._show_letter_menu_from_recipient_page(stock=False)
+
+    def _show_stock_letters_from_recipient_page(self) -> None:
+        self._show_letter_menu_from_recipient_page(stock=True)
+
+    def _show_letter_menu_from_recipient_page(self, *, stock: bool) -> None:
+        try:
+            self._initialize_project_tabs()
+            saved_panel = self.forge_tab.saved_panel
+            if saved_panel.parentWidget() is not self:
+                saved_panel.setParent(
+                    self,
+                    Qt.Popup | Qt.FramelessWindowHint,
+                )
+            saved_panel.setEnabled(True)
+            if stock:
+                self.forge_tab.show_stock_letters()
+            else:
+                self.forge_tab.show_saved_letters()
+        except (ImportError, RuntimeError, OSError) as error:
+            menu_name = "Stock letters" if stock else "Saved letters"
+            self.recipient_page.show_error(
+                f"{menu_name} could not be opened: {error}"
+            )
+
     def _make_page_surface(
         self,
         object_name: str,
@@ -1583,74 +2224,24 @@ class Nexus(QtWidgets.QMainWindow):
     # Shortcuts
     # =============================================================================================
     def _install_shortcuts(self) -> None:
-        self._shortcuts: list[QtGui.QShortcut] = []
-
-        def add(sequence: str | QtGui.QKeySequence, callback) -> None:
-            shortcut = QtGui.QShortcut(QtGui.QKeySequence(sequence), self)
-            shortcut.activated.connect(callback)
-            self._shortcuts.append(shortcut)
-
-        add(QtGui.QKeySequence.Save, self.save_project)
-        add(QtGui.QKeySequence.Open, self.open_saved_letters)
-        add("Ctrl+P", self.preview_project)
-
         # Ctrl+Alt+P opens prompt writer (no button)
-        add("Ctrl+Alt+P", self.open_prompt_writer)
+        sc = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Alt+P"), self)
+        sc.activated.connect(self.open_prompt_writer)
 
         # Ctrl+H toggles help popover
-        add(
-            "Ctrl+H",
-            lambda: (
-                self._show_help_from_icon()
-                if not self.help_pop.isVisible()
-                else self._hide_help_popover()
-            ),
-        )
-
-    def save_project(self) -> None:
-        if self._save_in_progress:
-            return
-        self._save_in_progress = True
-        try:
-            if not self.flush_prompt_writer_state():
-                raise RuntimeError("Prompt Writer state could not be saved.")
-            self.project_save_service.save_workspace_snapshot(reason="manual-save")
-        except ProjectNotReadyError as error:
-            self.status(str(error))
-        except Exception as error:
-            _LOGGER.exception("Project save failed: %s", error)
-            self.status(f"Project could not be saved: {error}")
-        else:
-            self.project_dirty.mark_saved()
-            self.status("Saved.")
-            self.toast("Saved")
-        finally:
-            self._save_in_progress = False
-
-    def open_saved_letters(self) -> None:
-        if not self._project_tabs_initialized or self.forge_tab.operation_in_progress:
-            self.status("Finish the current operation before loading a project.")
-            return
-        self.tabbar.setCurrentIndex(3)
-        self.forge_tab.show_saved_letters()
-
-    def preview_project(self) -> None:
-        if not self._project_tabs_initialized or self.forge_tab.operation_in_progress:
-            self.status("Finish the current operation before previewing.")
-            return
-        self.tabbar.setCurrentIndex(3)
-        self.forge_tab.preview_letter()
+        sc2 = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+H"), self)
+        sc2.activated.connect(lambda: (self._show_help_from_icon() if not self.help_pop.isVisible() else self._hide_help_popover()))
 
     # =============================================================================================
     # Status / Toast utilities
     # =============================================================================================
     def status(self, msg: str) -> None:
         try:
-            self._status.showMessage(msg, TRANSIENT_STATUS_MS)
+            self._status.showMessage(msg, 5000)
         except Exception:
-            _LOGGER.exception("Status message could not be displayed: %s", msg)
+            pass
 
-    def toast(self, msg: str, ms: int = TOAST_DURATION_MS) -> None:
+    def toast(self, msg: str, ms: int = 1200) -> None:
         if not msg:
             return
         try:
@@ -1664,7 +2255,7 @@ class Nexus(QtWidgets.QMainWindow):
             self._toast.raise_()
             self._toast_timer.start(ms)
         except Exception:
-            _LOGGER.exception("Toast could not be displayed: %s", msg)
+            pass
 
     # =============================================================================================
     # Sound preview mounting (widget-based visualizer)
@@ -1724,7 +2315,6 @@ class Nexus(QtWidgets.QMainWindow):
         self.forge_tab.refresh_project_state()
         self.forge_tab.refresh_saved_letters()
         self._show_forge_preview()
-        self.project_dirty.mark_saved()
 
     def _route_forge_correction(self, tab: str, target: str) -> None:
         destinations = {
@@ -1760,8 +2350,13 @@ class Nexus(QtWidgets.QMainWindow):
             if isinstance(url, QUrl):
                 view.setUrl(url)
             else:
-                view.setHtml("<html><body style='background:#1e1e1e; color:#e0ffff; font-family:Segoe UI;'>"
-                             "<h3>No preview URL available</h3></body></html>")
+                colors = self.theme_service.tokens
+                view.setHtml(
+                    "<html><body style='"
+                    f"background:{colors.background};color:{colors.highlight};"
+                    "font-family:Segoe UI;'>"
+                    "<h3>No preview URL available</h3></body></html>"
+                )
 
             self.status("Message preview opened.")
             dlg.exec()
@@ -1855,7 +2450,12 @@ class Nexus(QtWidgets.QMainWindow):
         old_idx = self.page_stack.currentIndex()
         autosave_note = ""
         if old_idx != idx:
-            if old_idx == 2:
+            if old_idx == 0:
+                try:
+                    self.image_tab.deactivate_for_tab_change()
+                except Exception as ex:
+                    self.status(f"Images could not release on exit: {ex}")
+            elif old_idx == 2:
                 try:
                     self.message_tab.deactivate_for_tab_change()
                 except Exception as ex:
@@ -1870,10 +2470,7 @@ class Nexus(QtWidgets.QMainWindow):
             try:
                 self.sound_tab.deactivate_for_tab_change()
             except Exception:
-                logging.getLogger(__name__).debug(
-                    "Best-effort operation failed.",
-                    exc_info=True,
-                )
+                pass
             self._detach_sound_preview()
 
         if old_idx != idx:
@@ -1895,17 +2492,21 @@ class Nexus(QtWidgets.QMainWindow):
             self.page_stack.setCurrentIndex(idx)
 
         tab_name = self.tabbar.tabText(idx)
-        self.settings_store.update_fields({"ui_last_tab": tab_name})
         status_message = f"Switched to: {tab_name}"
         if autosave_note:
             status_message = f"{status_message}. {autosave_note}"
         self.status(status_message)
         self._set_forge_preview_visible(idx == 3)
-        self.forge_tab.set_readiness_context_visible(
-            idx in {0, 1, 2, 3}
-        )
+        if idx == 0:
+            self.forge_tab.dismiss_readiness()
+        else:
+            self.forge_tab.set_readiness_context_visible(idx in {1, 2, 3})
 
         if idx == 0:
+            try:
+                self.image_tab.activate_for_tab_change()
+            except Exception as ex:
+                self.status(f"Images could not refresh: {ex}")
             self.preview_stack.setCurrentIndex(0)
         elif idx == 1:
             try:
@@ -1957,7 +2558,6 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception as error:
             _LOGGER.exception("Project tab-switch autosave failed: %s", error)
             return f"Project autosave failed: {error}"
-        self.project_dirty.mark_saved()
         return "Project autosaved."
 
     def _update_preview_tools_geometry(self) -> None:
@@ -1981,20 +2581,14 @@ class Nexus(QtWidgets.QMainWindow):
                 stop()
                 return
             except Exception:
-                logging.getLogger(__name__).debug(
-                    "Best-effort operation failed.",
-                    exc_info=True,
-                )
+                pass
 
         active = getattr(switcher, "_active", None)
         if active is not None:
             try:
                 active.stop()
             except Exception:
-                logging.getLogger(__name__).debug(
-                    "Best-effort operation failed.",
-                    exc_info=True,
-                )
+                pass
 
     def _grab_body_snapshot(self) -> QPixmap:
         """Capture the body without including temporary transition overlays."""
@@ -2058,10 +2652,7 @@ class Nexus(QtWidgets.QMainWindow):
                 | QtCore.QEventLoop.ExcludeSocketNotifiers
             )
         except Exception:
-            logging.getLogger(__name__).debug(
-                "Best-effort operation failed.",
-                exc_info=True,
-            )
+            pass
 
     def _run_command_transition(self, new_idx: int) -> None:
         """
@@ -2208,43 +2799,58 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _on_command_wiped(self) -> None:
         """Clear every live project surface after one confirmed reset."""
-        try:
-            self.message_tab.sync_from_disk(force=True)
-        except Exception:
-            logging.getLogger(__name__).debug(
-                "Best-effort operation failed.",
-                exc_info=True,
-            )
-        try:
-            self.forge_tab.reset_after_project_wipe()
-        except Exception:
-            logging.getLogger(__name__).debug(
-                "Best-effort operation failed.",
-                exc_info=True,
-            )
+        self._stop_curtain_preparation()
+        panel = getattr(self, "_prompt_writer_win", None)
+        if isinstance(panel, QtWidgets.QWidget):
+            try:
+                if not panel.reload_project_state():
+                    raise RuntimeError("Prompt Writer rejected the empty state")
+                panel.popdown()
+            except Exception:
+                _LOGGER.exception(
+                    "Prompt Writer could not refresh after New Project."
+                )
+        if self._project_tabs_initialized:
+            try:
+                self.image_tab.reset_project_images()
+            except Exception:
+                _LOGGER.exception("Images could not refresh after New Project.")
+            try:
+                self.sound_tab.reset_project_sound()
+            except Exception:
+                _LOGGER.exception("Sound could not refresh after New Project.")
+            try:
+                self.message_tab.reset_project_message()
+            except Exception:
+                _LOGGER.exception("Message could not refresh after New Project.")
+            try:
+                self.forge_tab.reset_after_project_wipe()
+            except Exception:
+                _LOGGER.exception("Forge could not refresh after New Project.")
         try:
             self._release_forge_preview_files()
         except Exception:
-            logging.getLogger(__name__).debug(
-                "Best-effort operation failed.",
-                exc_info=True,
-            )
+            _LOGGER.exception("Forge preview could not be released after New Project.")
+        if self._project_tabs_initialized:
+            self._set_command_immersive(False)
+            tab_blocker = QtCore.QSignalBlocker(self.tabbar)
+            self.tabbar.setCurrentIndex(0)
+            del tab_blocker
+            self.page_stack.setCurrentIndex(0)
+            self._detach_sound_preview()
         self._last_pixmap = None
         self._clear_preview()
         try:
             self.preview_stack.setCurrentIndex(0)
-        except Exception:
-            logging.getLogger(__name__).debug(
-                "Best-effort operation failed.",
-                exc_info=True,
-            )
-        try:
+            self.preview_frame.setVisible(True)
             self.preview_caption.setVisible(False)
+            if self._project_tabs_initialized:
+                self.forge_tab.preview_format_panel.setVisible(False)
+            self.help_icon.setVisible(True)
         except Exception:
-            logging.getLogger(__name__).debug(
-                "Best-effort operation failed.",
-                exc_info=True,
-            )
+            pass
+        self.title_bar._sync_curtain_menu()
+        self.title_bar.set_curtain_preview_colors({})
 
     def _request_message_preview(self) -> None:
         """Ask MessageTab to emit whichever preview it thinks is correct."""
@@ -2259,10 +2865,7 @@ class Nexus(QtWidgets.QMainWindow):
                 self.message_tab._emit_preview()  # type: ignore[attr-defined]
                 return
         except Exception:
-            logging.getLogger(__name__).debug(
-                "Best-effort operation failed.",
-                exc_info=True,
-            )
+            pass
 
     def _show_forge_preview(self) -> None:
         """Show the actual generated viewer, never a static Forge stand-in."""
@@ -2379,10 +2982,7 @@ class Nexus(QtWidgets.QMainWindow):
                 "media => { try { media.pause(); media.currentTime = 0; } catch (_) {} });"
             )
         except Exception:
-            logging.getLogger(__name__).debug(
-                "Best-effort operation failed.",
-                exc_info=True,
-            )
+            pass
         if self.preview_stack.currentWidget() is self.html_preview:
             self.preview_stack.setCurrentIndex(0)
         if self.tabbar.currentIndex() == 3:
@@ -2436,6 +3036,15 @@ class Nexus(QtWidgets.QMainWindow):
             self.sound_tab.prepare_for_project_restore()
         except Exception:
             _LOGGER.exception("Sound files could not be released before restore.")
+
+    def prepare_for_project_reset(self) -> None:
+        """Stop project-owned workers and media before New Project commits."""
+        if not self._stop_curtain_preparation():
+            raise RuntimeError(
+                "Curtain preparation did not stop before New Project."
+            )
+        self._release_forge_preview_files()
+        self._release_project_files_for_restore()
 
     @QtCore.Slot(bool, str)
     def _set_restore_activity(self, active: bool, message: str) -> None:
@@ -2539,32 +3148,15 @@ class Nexus(QtWidgets.QMainWindow):
     def _read_project_title(self) -> str:
         """Read recipient_title from settings.json (best available 'project title' signal)."""
         try:
-            return str(
-                self.settings_store.get("recipient_title", "")
-            ).strip()
+            settings_path = os.path.join(self.project_root, "settings.json")
+            if os.path.exists(settings_path):
+                data = json.loads(Path(settings_path).read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    t = str(data.get("recipient_title", "")).strip()
+                    return t
         except Exception:
-            _LOGGER.exception("Project title could not be read.")
+            pass
         return ""
-
-    def _restore_window_preferences(self) -> None:
-        encoded = str(self.settings_store.get("ui_window_geometry", ""))
-        if encoded:
-            try:
-                geometry = QtCore.QByteArray.fromBase64(encoded.encode("ascii"))
-                self.restoreGeometry(geometry)
-            except Exception:
-                _LOGGER.exception("Window geometry could not be restored.")
-        if bool(self.settings_store.get("ui_window_maximized", False)):
-            self.setWindowState(self.windowState() | Qt.WindowMaximized)
-
-    def _save_window_preferences(self) -> None:
-        geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
-        self.settings_store.update_fields(
-            {
-                "ui_window_geometry": geometry,
-                "ui_window_maximized": self.isMaximized(),
-            }
-        )
 
     # =============================================================================================
     # Resize/Move: keep preview aspect; keep popover aligned
@@ -2690,10 +3282,7 @@ class Nexus(QtWidgets.QMainWindow):
                 )
                 self.image_preview.setPixmap(scaled)
         except Exception:
-            logging.getLogger(__name__).debug(
-                "Best-effort operation failed.",
-                exc_info=True,
-            )
+            pass
 
         # Keep help popover adjacent to the icon if visible
         if self.help_pop.isVisible():
@@ -2717,58 +3306,73 @@ class Nexus(QtWidgets.QMainWindow):
         if self._shutdown_complete or self._shutdown_in_progress:
             return
         self._shutdown_in_progress = True
+        _LOGGER.info("Application resource shutdown started.")
         try:
-            self._save_window_preferences()
-            self.settings_store.changed.disconnect(self._on_project_settings_changed)
-            self.project_dirty.remove_listener(self.title_bar.set_project_dirty)
+            try:
+                if not self._stop_curtain_preparation():
+                    _LOGGER.warning(
+                        "Curtain preparation did not stop before shutdown."
+                    )
+            except Exception:
+                _LOGGER.exception("Curtain preparation shutdown failed.")
+            if self._project_tabs_initialized:
+                try:
+                    if not self.forge_tab.shutdown_operations():
+                        _LOGGER.warning(
+                            "Forge operation did not stop before shutdown."
+                        )
+                except Exception:
+                    _LOGGER.exception("Forge operation shutdown failed.")
             self.project_state.remove_listener(
                 self._on_project_state_transition
             )
-            self.project_state.shutdown()
+            if not self.flush_prompt_writer_state():
+                _LOGGER.warning(
+                    "Prompt Writer state could not be flushed during shutdown."
+                )
+            prompt_writer = getattr(self, "_prompt_writer_win", None)
+            prompt_writer_shutdown = getattr(prompt_writer, "shutdown", None)
+            if callable(prompt_writer_shutdown):
+                try:
+                    prompt_writer_shutdown()
+                except Exception:
+                    _LOGGER.exception(
+                        "Prompt Writer shutdown cleanup failed."
+                    )
             if self._project_tabs_initialized:
                 try:
                     self._release_forge_preview_files()
                 except Exception:
-                    logging.getLogger(__name__).debug(
-                        "Best-effort operation failed.",
-                        exc_info=True,
-                    )
+                    _LOGGER.exception("Forge preview file release failed.")
                 try:
                     self.forge_tab.deactivate_for_tab_change()
                     self.forge_tab.set_readiness_context_visible(False)
                     self.forge_tab.readiness_window.shutdown()
                 except Exception:
-                    logging.getLogger(__name__).debug(
-                        "Best-effort operation failed.",
-                        exc_info=True,
-                    )
+                    _LOGGER.exception("Forge preview shutdown failed.")
                 try:
-                    self.sound_tab.deactivate_for_tab_change()
-                    self.sound_tab.release_current_file_handle()
+                    if not self.sound_tab.shutdown():
+                        _LOGGER.warning("Sound workers did not stop during shutdown.")
                 except Exception:
-                    logging.getLogger(__name__).debug(
-                        "Best-effort operation failed.",
-                        exc_info=True,
-                    )
+                    _LOGGER.exception("Sound shutdown failed.")
                 try:
                     self.message_tab.shutdown()
                 except Exception:
-                    logging.getLogger(__name__).debug(
-                        "Best-effort operation failed.",
-                        exc_info=True,
-                    )
+                    _LOGGER.exception("Message shutdown failed.")
                 try:
                     self.image_tab.shutdown()
                 except Exception:
-                    logging.getLogger(__name__).debug(
-                        "Best-effort operation failed.",
-                        exc_info=True,
-                    )
+                    _LOGGER.exception("Image shutdown failed.")
         finally:
+            try:
+                self.project_state.shutdown()
+            except Exception:
+                _LOGGER.exception("Project state shutdown failed.")
             if self._tray_icon is not None:
                 self._tray_icon.hide()
             self._shutdown_complete = True
             self._shutdown_in_progress = False
+            _LOGGER.info("Application resource shutdown completed.")
 
     def start_new_project(self) -> None:
         """Confirm and clear only the currently active editable project."""
@@ -2778,7 +3382,7 @@ class Nexus(QtWidgets.QMainWindow):
         if forge_tab is not None and forge_tab.operation_in_progress:
             self.status("Finish the current Forge operation before starting a new project.")
             return
-        if self.project_state.is_project_ready and self.project_dirty.is_dirty:
+        if self.project_state.is_project_ready:
             answer = QtWidgets.QMessageBox.question(
                 self,
                 "Start New Project",
@@ -2791,13 +3395,6 @@ class Nexus(QtWidgets.QMainWindow):
             if answer != QtWidgets.QMessageBox.Yes:
                 self.status("New project canceled.")
                 return
-        if not self.reset_prompt_writer_state():
-            QtWidgets.QMessageBox.critical(
-                self,
-                "New Project",
-                "Prompt Writer state could not be cleared. The current project was kept.",
-            )
-            return
         try:
             from command import start_new_project
 
@@ -2816,7 +3413,6 @@ class Nexus(QtWidgets.QMainWindow):
             return
         if completed:
             self._on_command_wiped()
-            self.project_dirty.mark_saved()
             self.status("New project ready. Enter a recipient to begin.")
 
     def open_command_bar_and_close_editor(self, data: object) -> bool:
@@ -2946,9 +3542,18 @@ class Nexus(QtWidgets.QMainWindow):
         if (
             self._project_tabs_initialized
             and forge_tab is not None
-            and not forge_tab.shutdown_operations()
+            and not forge_tab.shutdown_operations(timeout_ms=5000)
         ):
             self.status("Finish the current Forge operation before closing.")
+            event.ignore()
+            return
+        sound_tab = getattr(self, "sound_tab", None)
+        if (
+            self._project_tabs_initialized
+            and sound_tab is not None
+            and not sound_tab.shutdown(timeout_ms=5000)
+        ):
+            self.status("Finish the current Sound operation before closing.")
             event.ignore()
             return
         self.shutdown()
@@ -3032,7 +3637,10 @@ class Nexus(QtWidgets.QMainWindow):
         # In-process overlay panel
         try:
             from PromptWriterPanel import PromptWriterPanel  # local module in project root
-            w = PromptWriterPanel(self)                      # parent=self so it overlays inside the main window
+            w = PromptWriterPanel(
+                self,
+                project_root=self.project_root,
+            )
             self._prompt_writer_win = w
             w.destroyed.connect(self._on_prompt_writer_destroyed)
             w.dismissed.connect(self._on_prompt_writer_dismissed)
@@ -3056,6 +3664,47 @@ class Nexus(QtWidgets.QMainWindow):
     # =============================================================================================
     # Help icon support
     # =============================================================================================
+    def _reload_help_theme_assets(self) -> None:
+        self.help_icon.clear()
+        for attribute in ("_help_movie_idle", "_help_movie_hover"):
+            movie = getattr(self, attribute, None)
+            if movie is None:
+                continue
+            movie.stop()
+            movie.setFileName("")
+            movie.deleteLater()
+            setattr(self, attribute, None)
+
+        def load_movie(path: Path) -> Optional[QMovie]:
+            if not path.is_file():
+                return None
+            movie = QMovie(str(path), parent=self)
+            if not movie.isValid():
+                movie.deleteLater()
+                return None
+            movie.setCacheMode(QMovie.CacheAll)
+            movie.setSpeed(100)
+            movie.setScaledSize(QSize(HELP_ICON_PX, HELP_ICON_PX))
+            movie.start()
+            return movie
+
+        self._help_movie_idle = load_movie(
+            self.resolve_theme_asset("help/idle.gif", REL_HELP_GIF)
+        )
+        self._help_movie_hover = load_movie(
+            self.resolve_theme_asset("help/hover.gif", REL_HELP_HOVER)
+        )
+        if self._help_movie_idle is not None:
+            self.help_icon.setMovie(self._help_movie_idle)
+        elif self._help_movie_hover is not None:
+            self.help_icon.setMovie(self._help_movie_hover)
+        else:
+            fallback = self.resolve_theme_asset(
+                "help/fallback.png",
+                REL_HELP_PNG,
+            )
+            self._set_help_fallback_icon(str(fallback))
+
     def _set_help_fallback_icon(self, png_path: str):
         if os.path.exists(png_path):
             pm = QPixmap(png_path)
@@ -3065,16 +3714,11 @@ class Nexus(QtWidgets.QMainWindow):
                 return
         # Final fallback: small text
         self.help_icon.setText("Help")
-        self.help_icon.setStyleSheet("""
-            QLabel#HelpIcon {
-                background: transparent;
-                border: none;
-                padding: 0;
-                margin: 0;
-                color: #8feaff;
-                font-weight: 800;
-            }
-        """)
+        self.help_icon.setStyleSheet(
+            "QLabel#HelpIcon{background:transparent;border:none;"
+            "padding:0;margin:0;"
+            f"color:{self.theme_service.tokens.accent};font-weight:800;}}"
+        )
 
     def _refresh_help_text(self, idx: int):
         # Header (per tab)
@@ -3138,6 +3782,21 @@ class Nexus(QtWidgets.QMainWindow):
     def _hide_help_popover(self):
         self.help_pop.popdown()
 
+    def _track_readiness_tab_hover(self, index: int) -> None:
+        self._readiness_hovered_tab = index
+        if index == 0:
+            if not self._image_tab_readiness_hide_timer.isActive():
+                self._image_tab_readiness_hide_timer.start()
+            return
+        self._image_tab_readiness_hide_timer.stop()
+
+    def _hide_readiness_after_image_tab_hover(self) -> None:
+        if self._readiness_hovered_tab != 0:
+            return
+        forge_tab = getattr(self, "forge_tab", None)
+        if forge_tab is not None:
+            forge_tab.dismiss_readiness()
+
     # =============================================================================================
     # Global event filter for help hover (robust)
     # =============================================================================================
@@ -3146,6 +3805,16 @@ class Nexus(QtWidgets.QMainWindow):
         icon = getattr(self, "help_icon", None)
         pop  = getattr(self, "help_pop", None)
         web_view = getattr(self, "html_preview", None)
+
+        if watched is getattr(self, "tabbar", None):
+            event_type = event.type()
+            if event_type in (QEvent.MouseMove, QEvent.HoverMove):
+                position = getattr(event, "position", lambda: QtCore.QPointF())()
+                self._track_readiness_tab_hover(
+                    self.tabbar.tabAt(position.toPoint())
+                )
+            elif event_type in (QEvent.Leave, QEvent.HoverLeave):
+                self._track_readiness_tab_hover(-1)
 
         if (
             web_view is not None

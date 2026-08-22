@@ -16,7 +16,8 @@ from transactional_io import _remove_path, recover_stale_transactions
 class SoundRestoreLockTests(unittest.TestCase):
     def test_restore_release_stops_sound_workers_and_media(self) -> None:
         sound_tab = SoundTab.__new__(SoundTab)
-        sound_tab._analysis = mock.Mock()
+        analysis = mock.Mock()
+        sound_tab._analysis = analysis
         sound_tab._analysis_key = "current-track"
         sound_tab.deactivate_for_tab_change = mock.Mock()
         sound_tab._stop_background_threads = mock.Mock()
@@ -26,7 +27,8 @@ class SoundRestoreLockTests(unittest.TestCase):
 
         sound_tab.deactivate_for_tab_change.assert_called_once_with()
         sound_tab._stop_background_threads.assert_called_once_with()
-        sound_tab._analysis.shutdown.assert_called_once_with()
+        analysis.shutdown.assert_called_once_with()
+        self.assertIsNone(sound_tab._analysis)
         sound_tab.release_current_file_handle.assert_called_once_with()
         self.assertEqual(sound_tab._analysis_key, "")
 

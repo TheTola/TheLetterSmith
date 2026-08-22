@@ -3,7 +3,7 @@ from __future__ import annotations
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
 
-from app_paths import resolve_application_root
+from project_paths import application_paths
 from publishing.github_auth import GitHubAccount, GitHubDeviceAuthorization
 from ui_help import set_control_help
 
@@ -23,7 +23,9 @@ class GitHubAccountDialog(QtWidgets.QDialog):
         self.setMinimumSize(520, 300)
         self._watermark = QtGui.QPixmap(
             str(
-                resolve_application_root() / "gallery/app/icons/GitHub-logo.png"
+                application_paths().app_resource_path(
+                    "icons/GitHub-logo.png"
+                )
             )
         )
         self.setStyleSheet(

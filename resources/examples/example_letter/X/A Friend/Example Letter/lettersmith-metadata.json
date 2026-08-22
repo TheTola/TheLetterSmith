@@ -1,0 +1,17 @@
+{
+  "project_schema_version": 2,
+  "project_id": "4928545a-b2e4-45d6-8bd7-2f068be88625",
+  "recipient_id": "78cb0d36-4f6d-4be8-ae79-399e7fcf9880",
+  "recipient_display_name": "A Friend",
+  "recipient_normalized_key": "a friend",
+  "recipient_name": "A Friend",
+  "recipient_title": "Example Letter",
+  "autosave_reason": "tab-switch",
+  "completed_tabs": [
+    "images",
+    "sound",
+    "message",
+    "prompt_writer"
+  ],
+  "last_saved_at": "2026-08-11T23:33:15.814515+00:00"
+}

@@ -1,19 +1,32 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from config import USER_MESSAGE_DIR, USER_PAGES_DIR
+from config import (
+    PLAY_METADATA_FILE,
+    USER_MESSAGE_DIR,
+    USER_PAGES_DIR,
+    resolve_play_bundle_directory,
+)
 from message_history import write_message_with_revision
-from project_paths import ProjectContext, ProjectPathResolver
+from project_paths import (
+    PROJECT_METADATA_SCHEMA_VERSION,
+    ProjectContext,
+    ProjectPathResolver,
+)
 from project_state import ProjectStateController
 from readiness import (
     ProjectSaveEligibility,
     evaluate_project_save_eligibility,
 )
-from settings_store import SettingsStore
+from settings_store import ACTIVE_PLAY_DIR_KEY, SettingsStore
 from sound_model import project_sound_path
-from transactional_io import atomic_write_bytes
+from transactional_io import atomic_write_bytes, atomic_write_json
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProjectSaveError(RuntimeError):
@@ -69,14 +82,14 @@ class ProjectSaveService:
             raise ProjectSaveError(
                 "Project save path must remain inside the project."
             )
-        target = (context.project_directory / relative).resolve()
+        target = (context.autosave_directory / relative).resolve()
         try:
-            target.relative_to(context.project_directory.resolve())
+            target.relative_to(context.autosave_directory.resolve())
         except ValueError as error:
             raise ProjectSaveError(
                 "Project save path escaped the project directory."
             ) from error
-        if target == context.project_directory.resolve():
+        if target == context.autosave_directory.resolve():
             raise ProjectSaveError("Project save path must name a file.")
         return target
 
@@ -96,7 +109,7 @@ class ProjectSaveService:
         if not self.can_save():
             return workspace
         context = self.current_context()
-        self.resolver.ensure_project_storage(context)
+        self.resolver.ensure_autosave_storage(context)
         destination = self.project_file(
             context,
             Path("message") / "message.html",
@@ -123,7 +136,7 @@ class ProjectSaveService:
         if not self.can_save():
             return source
         context = self.current_context()
-        self.resolver.ensure_project_storage(context)
+        self.resolver.ensure_autosave_storage(context)
         destination = self.project_file(
             context,
             project_relative_path,
@@ -143,7 +156,7 @@ class ProjectSaveService:
         if not self.can_save():
             return ()
         context = self.current_context()
-        self.resolver.ensure_project_storage(context)
+        self.resolver.ensure_autosave_storage(context)
         copied: list[Path] = []
         for source in sorted(source_root.rglob("*")):
             if not source.is_file():
@@ -184,7 +197,7 @@ class ProjectSaveService:
         if not eligibility.can_save:
             raise ProjectNotReadyError(eligibility.blocked_reason)
         context = self.current_context()
-        self.resolver.ensure_project_storage(context)
+        self.resolver.ensure_autosave_storage(context)
         self._copy_tree_to_context(
             context,
             self.project_root / USER_PAGES_DIR,
@@ -216,7 +229,11 @@ class ProjectSaveService:
                 "completed_tabs": list(eligibility.completed_tabs),
             },
         )
-        return context.project_directory
+        _LOGGER.info(
+            "Project snapshot saved for project_id=%s.",
+            context.project_id,
+        )
+        return context.autosave_directory
 
     def _copy_tree_to_context(
         self,
@@ -249,7 +266,56 @@ class ProjectSaveService:
         metadata_updates["last_saved_at"] = datetime.now(
             timezone.utc
         ).isoformat()
-        self.resolver.write_project_metadata(context, metadata_updates)
+        self.resolver.write_autosave_metadata(context, metadata_updates)
+        _LOGGER.debug(
+            "Project autosave metadata updated for project_id=%s.",
+            context.project_id,
+        )
+        try:
+            play_directory = resolve_play_bundle_directory(
+                self.project_root,
+                recipient=context.recipient_display_name,
+                title=context.letter_title,
+                project_id=context.project_id,
+            )
+        except (OSError, ValueError) as error:
+            raise ProjectSaveError(
+                "The generated letter could not follow the updated title: "
+                f"{error}"
+            ) from error
+        if (play_directory / "index.html").is_file():
+            metadata_path = play_directory / PLAY_METADATA_FILE
+            existing_metadata: dict = {}
+            if metadata_path.is_file():
+                try:
+                    value = self.resolver._read_metadata(metadata_path)
+                    existing_metadata = dict(value)
+                except Exception as error:
+                    raise ProjectSaveError(
+                        "The generated letter metadata could not be read: "
+                        f"{error}"
+                    ) from error
+            existing_metadata.update(
+                {
+                    "project_id": context.project_id,
+                    "project_schema_version": (
+                        PROJECT_METADATA_SCHEMA_VERSION
+                    ),
+                    "recipient_id": context.recipient_id,
+                    "recipient_display_name": (
+                        context.recipient_display_name
+                    ),
+                    "recipient_normalized_key": (
+                        context.recipient_normalized_key
+                    ),
+                    "recipient_name": context.recipient_display_name,
+                    "recipient_title": context.letter_title,
+                }
+            )
+            atomic_write_json(metadata_path, existing_metadata)
+            self.settings.update_fields(
+                {ACTIVE_PLAY_DIR_KEY: str(play_directory)}
+            )
 
 
 __all__ = [

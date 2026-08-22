@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -7,10 +8,10 @@ from config import MESSAGE_HTML_FILE, REQUIRED_SLIDES, USER_PAGES_DIR
 from message_format import message_plain_text
 from message_html import read_text_normalized
 from project_paths import ProjectPathError, ProjectPathResolver
+from publishing.expiration import publication_status
 from settings_store import (
     REQUIRED_FEATURES_KEY,
     SettingsStore,
-    normalize_published_page_url,
 )
 from sound_model import resolve_project_tracks
 
@@ -68,7 +69,7 @@ class ProjectSaveEligibility:
             return self.title_detail
         return (
             "Complete at least two tabs before saving the project: "
-            "Images, Sound, or Message."
+            "Images, Sound, Message, or Prompt Writer."
         )
 
 
@@ -87,6 +88,25 @@ def _sound_is_complete(root: Path) -> bool:
         return bool(resolve_project_tracks(root)[1])
     except (OSError, ValueError):
         return False
+
+
+def _prompt_writer_is_complete(root: Path) -> bool:
+    try:
+        state = json.loads(
+            (root / "prompt_writer_state.json").read_text(
+                encoding="utf-8-sig"
+            )
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    generated = (
+        state.get("generated_prompts", {})
+        if isinstance(state, dict)
+        else {}
+    )
+    return isinstance(generated, dict) and any(
+        str(prompt).strip() for prompt in generated.values()
+    )
 
 
 def _title_readiness(
@@ -119,19 +139,20 @@ def evaluate_project_save_eligibility(
     root = Path(project_root).resolve()
     settings = SettingsStore(root).snapshot()
     pages = root / USER_PAGES_DIR
+    recipient_ready = bool(str(settings.get("recipient_name", "")).strip())
+    title_ready, title_detail = _title_readiness(root, settings)
     completed_tabs: list[str] = []
     if all((pages / name).is_file() for name in REQUIRED_SLIDES):
         completed_tabs.append("images")
     if _sound_is_complete(root):
         completed_tabs.append("sound")
-    if _message_is_complete(root):
+    if recipient_ready and title_ready:
         completed_tabs.append("message")
-    title_ready, title_detail = _title_readiness(root, settings)
+    if _prompt_writer_is_complete(root):
+        completed_tabs.append("prompt_writer")
     return ProjectSaveEligibility(
         completed_tabs=tuple(completed_tabs),
-        recipient_ready=bool(
-            str(settings.get("recipient_name", "")).strip()
-        ),
+        recipient_ready=recipient_ready,
         title_ready=title_ready,
         title_detail=title_detail,
     )
@@ -219,8 +240,8 @@ def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
             "message",
             "Message",
             has_message,
-            True,
-            "Add or edit the message.",
+            False,
+            "Add a message only if this letter needs one.",
             "message",
             "message",
         ),
@@ -235,16 +256,12 @@ def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
         ),
         (
             "published_url",
-            "Published Page URL",
-            bool(
-                normalize_published_page_url(
-                    settings.get("published_page_url", "")
-                )
-            ),
+            "Published Letter Link",
+            publication_status(settings) == "published",
             False,
-            "Publish the letter or save its public URL.",
-            "message",
-            "published_url",
+            "Enter a valid Published Page URL in Message or publish the letter in Forge.",
+            "forge",
+            "publish",
         ),
     )
     items = tuple(ReadinessItem(*definition) for definition in definitions)

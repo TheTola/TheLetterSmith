@@ -7,6 +7,8 @@ class RecipientPage(QtWidgets.QWidget):
     """Blocking project-entry page shown outside the normal tab interface."""
 
     recipient_submitted = QtCore.Signal(str, bool)
+    load_requested = QtCore.Signal()
+    stock_requested = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -29,10 +31,6 @@ class RecipientPage(QtWidgets.QWidget):
             QLabel#RecipientQuestion {
                 color: #e0ffff;
                 font: 600 24px "Segoe UI";
-            }
-            QLabel#RecipientFieldLabel {
-                color: #b0e0e6;
-                font: 600 12px "Segoe UI";
             }
             QLabel#RecipientError {
                 color: #ff9b9b;
@@ -70,10 +68,6 @@ class RecipientPage(QtWidgets.QWidget):
         question.setObjectName("RecipientQuestion")
         panel_layout.addWidget(question)
 
-        field_label = QtWidgets.QLabel("Recipient", panel)
-        field_label.setObjectName("RecipientFieldLabel")
-        panel_layout.addWidget(field_label)
-
         self.recipient_input = QtWidgets.QLineEdit(panel)
         self.recipient_input.setObjectName("RecipientInput")
         self.recipient_input.setAccessibleName("Recipient")
@@ -87,24 +81,25 @@ class RecipientPage(QtWidgets.QWidget):
         self.error_label.setVisible(False)
         panel_layout.addWidget(self.error_label)
 
-        self.custom_capitalization = QtWidgets.QCheckBox(
-            "Keep capitalization exactly as typed",
-            panel,
-        )
-        self.custom_capitalization.setObjectName(
-            "RecipientCustomCapitalization"
-        )
-        self.custom_capitalization.setStyleSheet(
-            "color: #9fb9bd; font: 11px 'Segoe UI';"
-        )
-        panel_layout.addWidget(self.custom_capitalization)
-
         action_row = QtWidgets.QHBoxLayout()
+        action_row.setSpacing(12)
         action_row.addStretch(1)
-        self.continue_button = QtWidgets.QPushButton("Continue", panel)
-        self.continue_button.setObjectName("RecipientContinue")
-        self.continue_button.clicked.connect(self.submit)
-        action_row.addWidget(self.continue_button)
+        self.load_button = QtWidgets.QPushButton("Load", panel)
+        self.load_button.setObjectName("RecipientLoad")
+        self.load_button.setMinimumSize(120, 40)
+        self.load_button.clicked.connect(self.load_requested.emit)
+        action_row.addWidget(self.load_button)
+        self.stock_button = QtWidgets.QPushButton("Stock", panel)
+        self.stock_button.setObjectName("RecipientStock")
+        self.stock_button.setMinimumSize(120, 40)
+        self.stock_button.clicked.connect(self.stock_requested.emit)
+        action_row.addWidget(self.stock_button)
+        self.begin_button = QtWidgets.QPushButton("Begin", panel)
+        self.begin_button.setObjectName("RecipientContinue")
+        self.begin_button.setMinimumSize(120, 40)
+        self.begin_button.clicked.connect(self.submit)
+        self.continue_button = self.begin_button
+        action_row.addWidget(self.begin_button)
         panel_layout.addLayout(action_row)
 
         outer.addWidget(panel, 0, QtCore.Qt.AlignHCenter)
@@ -113,13 +108,13 @@ class RecipientPage(QtWidgets.QWidget):
     def submit(self) -> None:
         recipient = " ".join(self.recipient_input.text().split())
         if not recipient:
-            self.show_error("Enter a recipient before continuing.")
+            self.show_error("Enter a recipient before beginning.")
             self.recipient_input.setFocus(QtCore.Qt.OtherFocusReason)
             return
         self.recipient_input.setText(recipient)
         self.recipient_submitted.emit(
             recipient,
-            self.custom_capitalization.isChecked(),
+            True,
         )
 
     def show_error(self, message: str) -> None:
@@ -128,7 +123,6 @@ class RecipientPage(QtWidgets.QWidget):
 
     def reset(self) -> None:
         self.recipient_input.clear()
-        self.custom_capitalization.setChecked(False)
         self.show_error("")
         self.focus_recipient()
 

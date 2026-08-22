@@ -2,8 +2,7 @@
 # ===============================
 # File: Generate.py
 # Purpose:
-#   Build the Play viewer bundle at:
-#     output/Play/<recipient>/<title>/
+#   Build the viewer bundle in the configured saved-letter root.
 #       index.html, styles.css, script.js
 #       gallery/
 #         pages/      (cover/letter/wall/back)
@@ -16,9 +15,9 @@
 #     gallery/user/pages
 #     gallery/user/card/controls
 #     gallery/user/message
-#     gallery/user/sounds/appssong/        (archive + project sound manifest)
+#     active-project sound workspace       (project sound manifest)
 #   Viewer SFX:
-#     gallery/app/sounds/ (canonical)
+#     resources/app/sounds/ (canonical)
 #     recognized legacy locations remain readable
 #
 # Improvements applied:
@@ -47,8 +46,10 @@ from typing import Optional
 from urllib.parse import unquote, urlsplit
 
 from Template import TEMPLATE_HTML, TEMPLATE_CSS, TEMPLATE_JS
+from curtain_cache import CurtainVariantCache, load_curtain_variant_cache
 from curtain_color import (
-    curtain_rgb_for_style,
+    curtain_variant_rgbs,
+    write_recolored_banner_image,
     write_tinted_curtain_image,
 )
 from font_export import FontExportError, build_embedded_font_payload
@@ -57,6 +58,7 @@ from image_animation import (
     build_runtime_image_assets,
     validate_runtime_image_manifest,
 )
+from message_format import message_plain_text
 from sound_model import (
     BUILD_SOUND_MANIFEST_NAME,
     build_sound_manifest,
@@ -64,11 +66,11 @@ from sound_model import (
     resolve_track_path,
 )
 from project_state import ensure_project_identity
+from project_paths import application_paths
 from settings_store import DEFAULT_SETTINGS, SettingsStore, VALID_CURTAIN_STYLES
 from transactional_io import PathTransaction, cleanup_abandoned_staging
-from settings_store import SettingsStore
 from config import (
-    SETTINGS_FILE,
+    APP_BANNER_PATH,
     DEFAULT_VOLUME,
     STARTING_VOLUME,
     ensure_output_dirs,
@@ -90,13 +92,14 @@ from config import (
 )
 
 # App-owned SFX live here (relative to project root)
-APP_SOUNDS_DIR = Path("gallery") / "app" / "sounds"
+APP_SOUNDS_DIR = Path("sounds")
+BANNER_FILE = "bannerman.png"
 LEGACY_SFX_DIRS = (
     Path("gallery") / "user" / "sounds",
     Path("gallery") / "app" / "icons" / "Sounds",
 )
 BUILD_STATE_FILE = "lettersmith-build.json"
-BUILD_SCHEMA_VERSION = 9
+BUILD_SCHEMA_VERSION = 12
 CURTAIN_FILES = {"cleft.png", "cright.png"}
 CURTAIN_ANALYSIS_PAGE_ORDER = (
     "cover.png",
@@ -162,13 +165,22 @@ def _copy_control_files(
     names: list[str],
     *,
     curtain_rgb: tuple[int, int, int],
+    curtain_cache_directory: Path | None = None,
 ) -> None:
     dst_dir.mkdir(parents=True, exist_ok=True)
     for name in names:
         source = src_dir / name
         destination = dst_dir / name
         if name in CURTAIN_FILES:
-            write_tinted_curtain_image(source, destination, curtain_rgb)
+            cached = (
+                curtain_cache_directory / name
+                if curtain_cache_directory is not None
+                else None
+            )
+            if cached is not None and cached.is_file():
+                _atomic_copy_file(cached, destination)
+            else:
+                write_tinted_curtain_image(source, destination, curtain_rgb)
         else:
             _atomic_copy_file(source, destination)
 
@@ -279,13 +291,6 @@ def _read_text_safe(path: Path) -> str:
         return ""
 
 
-def _load_settings(project_root: Path) -> dict:
-    try:
-        return SettingsStore(project_root).snapshot()
-    except (OSError, ValueError):
-        return {}
-
-
 def _recipient_from_settings(settings: dict) -> str:
     value = str(settings.get("recipient_name") or "Friend").strip()
     return value or "Friend"
@@ -368,7 +373,9 @@ def _validate_template_placeholders() -> None:
     """
     required = (
         "{{TITLE}}",
+        "{{TITLE_BANNER_TEXT_RGB}}",
         "{{MESSAGE_HTML}}",
+        "{{HAS_MESSAGE_JSON}}",
         "{{INITIAL_VOLUME}}",
         "{{MESSAGE_OVERLAY_STYLE}}",
         "{{MUSIC_PLAYLIST_JSON}}",
@@ -397,8 +404,9 @@ def _sfx_names() -> list[str]:
 
 
 def _resolve_sfx_sources(project_root: Path) -> dict[str, Path]:
+    paths = application_paths(project_root)
     directories = (
-        project_root / APP_SOUNDS_DIR,
+        paths.app_resource_path(APP_SOUNDS_DIR),
         *(project_root / relative for relative in LEGACY_SFX_DIRS),
     )
     resolved: dict[str, Path] = {}
@@ -428,7 +436,7 @@ def _seed_sfx_into_build(*, project_root: Path, sounds_dst: Path, seed_sfx: bool
     missing = [name for name in _sfx_names() if name not in sources]
     if missing:
         searched = (
-            project_root / APP_SOUNDS_DIR,
+            application_paths(project_root).app_resource_path(APP_SOUNDS_DIR),
             *(project_root / relative for relative in LEGACY_SFX_DIRS),
         )
         lines = [
@@ -457,10 +465,14 @@ def play_bundle_directory(project_root: str | Path) -> Path:
     )
 
 
-def _curtain_rgb_for_settings(
+def _curtain_context_for_settings(
     project_root: Path,
     settings: dict,
-) -> tuple[int, int, int]:
+) -> tuple[
+    str,
+    dict[str, tuple[int, int, int]],
+    CurtainVariantCache | None,
+]:
     style = str(
         settings.get(
             "curtain_style",
@@ -469,11 +481,28 @@ def _curtain_rgb_for_settings(
     )
     if style not in VALID_CURTAIN_STYLES:
         style = str(DEFAULT_SETTINGS["curtain_style"])
-    page_paths = [
-        project_root / USER_PAGES_DIR / name
-        for name in CURTAIN_ANALYSIS_PAGE_ORDER
-    ]
-    return curtain_rgb_for_style(page_paths, style)
+    cached = load_curtain_variant_cache(project_root)
+    colors = (
+        dict(cached.colors)
+        if cached is not None
+        else curtain_variant_rgbs(
+            project_root / USER_PAGES_DIR / CURTAIN_ANALYSIS_PAGE_ORDER[0]
+        )
+    )
+    return style, colors, cached
+
+
+def _title_banner_text_rgb_for_settings(
+    curtain_colors: dict[str, tuple[int, int, int]],
+    curtain_rgb: tuple[int, int, int],
+) -> tuple[int, int, int]:
+    normal = curtain_colors["average_color"]
+    complementary = curtain_colors["complementary_average_color"]
+    return normal if curtain_rgb == complementary else complementary
+
+
+def _rgb_css_value(rgb: tuple[int, int, int]) -> str:
+    return ",".join(str(channel) for channel in rgb)
 
 
 def _hash_file(digest: "hashlib._Hash", root: Path, path: Path) -> None:
@@ -493,6 +522,7 @@ def _hash_file(digest: "hashlib._Hash", root: Path, path: Path) -> None:
 def build_source_fingerprint(project_root: str | Path) -> str:
     """Hash only inputs that materially change the generated viewer."""
     root = Path(project_root).resolve()
+    paths = application_paths(root)
     digest = hashlib.sha256()
     settings = SettingsStore(root).snapshot()
     relevant_settings = {
@@ -516,9 +546,9 @@ def build_source_fingerprint(project_root: str | Path) -> str:
         root / USER_PAGES_DIR,
         root / USER_CONTROLS_DIR,
         root / USER_MESSAGE_DIR,
-        root / APP_SOUNDS_DIR,
+        paths.app_resource_path(APP_SOUNDS_DIR),
         root / "gallery/user/fonts",
-        root / "gallery/app/fonts",
+        paths.app_resource_path("fonts"),
     )
     files: set[Path] = set()
     for directory in file_roots:
@@ -528,6 +558,9 @@ def build_source_fingerprint(project_root: str | Path) -> str:
                 for path in directory.rglob("*")
                 if path.is_file() and not path.is_symlink()
             )
+    banner_source = paths.resource_path(APP_BANNER_PATH)
+    if banner_source.is_file() and not banner_source.is_symlink():
+        files.add(banner_source.resolve())
 
     sound_state, sound_tracks = resolve_project_tracks(root)
     digest.update(
@@ -618,6 +651,7 @@ def validate_play_bundle(directory: str | Path) -> Path:
         *(root / "gallery/pages" / name for name in REQUIRED_SLIDES),
         root / "gallery/pages" / IMAGE_MANIFEST_NAME,
         *(root / "gallery/controls" / name for name in CONTROL_FILES),
+        root / "gallery/controls" / BANNER_FILE,
         root / "gallery/message/message.html",
         root / "gallery/sounds" / BUILD_SOUND_MANIFEST_NAME,
         root / BUILD_STATE_FILE,
@@ -633,10 +667,7 @@ def validate_play_bundle(directory: str | Path) -> Path:
         )
 
     try:
-        if not (root / "gallery/message/message.html").read_text(
-            encoding="utf-8"
-        ).strip():
-            raise ValueError("message.html is empty")
+        (root / "gallery/message/message.html").read_text(encoding="utf-8")
         sound_manifest = json.loads(
             (root / "gallery/sounds" / BUILD_SOUND_MANIFEST_NAME).read_text(
                 encoding="utf-8"
@@ -765,6 +796,7 @@ def build_play_bundle_to(
 ) -> Path:
     """Generate and validate a complete Play bundle in ``destination``."""
     pr = Path(project_root).resolve()
+    paths = application_paths(pr)
     target = Path(destination).resolve()
     _validate_template_placeholders()
 
@@ -782,8 +814,8 @@ def build_play_bundle_to(
     msg_html_src = pr / MESSAGE_HTML_FILE
     if message_html is None:
         message_html = _read_text_safe(msg_html_src)
-    if not (message_html or "").strip():
-        raise FileNotFoundError("Message content is required.")
+    message_html = message_html or ""
+    has_message = bool(message_plain_text(message_html).strip())
     embedded_message_html = _prepare_embedded_message_html(
         message_html,
         project_root=pr,
@@ -794,6 +826,19 @@ def build_play_bundle_to(
     settings = SettingsStore(pr).snapshot()
     recipient = _recipient_from_settings(settings)
     title = _title_from_settings(settings, recipient)
+    curtain_style, curtain_colors, curtain_cache = (
+        _curtain_context_for_settings(pr, settings)
+    )
+    curtain_rgb = curtain_colors[curtain_style]
+    title_banner_text_rgb = _title_banner_text_rgb_for_settings(
+        curtain_colors,
+        curtain_rgb,
+    )
+    curtain_cache_directory = (
+        curtain_cache.style_directory(curtain_style)
+        if curtain_cache is not None
+        else None
+    )
     starting_vol = _starting_volume_from_settings(settings)
     project_id = ensure_project_identity(pr)
     bp = plan_build(
@@ -815,13 +860,36 @@ def build_play_bundle_to(
         controls_src,
         bp.play_controls_dir,
         CONTROL_FILES,
-        curtain_rgb=_curtain_rgb_for_settings(pr, settings),
+        curtain_rgb=curtain_rgb,
+        curtain_cache_directory=curtain_cache_directory,
     )
+    banner_source = paths.resource_path(APP_BANNER_PATH)
+    _require_file(
+        banner_source,
+        what="reusable banner asset",
+        expected_rel_hint=APP_BANNER_PATH.as_posix(),
+    )
+    cached_banner = (
+        curtain_cache_directory / BANNER_FILE
+        if curtain_cache_directory is not None
+        else None
+    )
+    if cached_banner is not None and cached_banner.is_file():
+        _atomic_copy_file(
+            cached_banner,
+            bp.play_controls_dir / BANNER_FILE,
+        )
+    else:
+        write_recolored_banner_image(
+            banner_source,
+            bp.play_controls_dir / BANNER_FILE,
+            curtain_rgb,
+        )
     _copy_directory_files(message_src, bp.play_message_dir)
     _atomic_write_text(bp.play_message_dir / "message.html", message_html)
 
     for font_source in (
-        pr / "gallery/app/fonts",
+        paths.app_resource_path("fonts"),
         pr / "gallery/user/fonts",
     ):
         _copy_directory_files(font_source, bp.play_fonts_dir)
@@ -874,7 +942,12 @@ def build_play_bundle_to(
     html = (
         TEMPLATE_HTML
         .replace("{{TITLE}}", _html.escape(title, quote=True))
+        .replace(
+            "{{TITLE_BANNER_TEXT_RGB}}",
+            _rgb_css_value(title_banner_text_rgb),
+        )
         .replace("{{MESSAGE_HTML}}", embedded_message_html)
+        .replace("{{HAS_MESSAGE_JSON}}", json.dumps(has_message))
         .replace("{{INITIAL_VOLUME}}", str(starting_vol))
         .replace(
             "{{MESSAGE_OVERLAY_STYLE}}",

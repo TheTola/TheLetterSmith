@@ -81,11 +81,11 @@ class RecipientRegistry:
 
     def __init__(self, project_root: str | Path) -> None:
         self.project_root = Path(project_root).resolve()
-        self.path = (
+        from project_paths import application_paths
+
+        self.path = application_paths(
             self.project_root
-            / "output"
-            / RECIPIENT_REGISTRY_FILE
-        ).resolve()
+        ).recipient_registry_file.resolve()
         self._lock = RLock()
 
     def list(self) -> tuple[RecipientRecord, ...]:

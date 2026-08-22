@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Optional
 
 from message_html import extract_font_families, rewrite_font_families
+from project_paths import application_paths
 
 
 FONT_EXPORT_EXTENSIONS = {".ttf", ".otf", ".woff", ".woff2"}
 BUNDLED_FONT_DIR_CANDIDATES = (
+    Path("resources/app/fonts"),
     Path("gallery/app/fonts"),
     Path("gallery/user/fonts"),
     Path("gallery/fonts"),
@@ -216,19 +218,21 @@ def _bundled_font_files(project_root: Path, family: str) -> list[Path]:
     family_key = _font_match_key(family)
     matches: list[Path] = []
     seen: set[str] = set()
-    for relative_dir in BUNDLED_FONT_DIR_CANDIDATES:
-        folder = (project_root / relative_dir).resolve()
-        if not folder.is_dir():
-            continue
-        for path in folder.rglob("*"):
-            if not path.is_file() or path.suffix.casefold() not in FONT_EXPORT_EXTENSIONS:
+    paths = application_paths(project_root)
+    for base in dict.fromkeys((paths.resource_root, paths.workspace_root)):
+        for relative_dir in BUNDLED_FONT_DIR_CANDIDATES:
+            folder = (base / relative_dir).resolve()
+            if not folder.is_dir():
                 continue
-            if family_key not in _font_file_match_keys(path):
-                continue
-            identity = str(path.resolve()).casefold()
-            if identity not in seen:
-                seen.add(identity)
-                matches.append(path.resolve())
+            for path in folder.rglob("*"):
+                if not path.is_file() or path.suffix.casefold() not in FONT_EXPORT_EXTENSIONS:
+                    continue
+                if family_key not in _font_file_match_keys(path):
+                    continue
+                identity = str(path.resolve()).casefold()
+                if identity not in seen:
+                    seen.add(identity)
+                    matches.append(path.resolve())
     return matches
 
 

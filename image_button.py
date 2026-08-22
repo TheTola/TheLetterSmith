@@ -3,20 +3,19 @@ from __future__ import annotations
 """Reusable artwork-backed QPushButton with a safe text-button fallback."""
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
-from app_paths import resolve_application_root
+from project_paths import application_paths
+
+
+def resolve_application_root(explicit_root: str | Path | None = None) -> Path:
+    return application_paths(explicit_root).resource_root
 
 
 def button_art_path(project_root: str | Path, filename: str) -> Path:
-    return (
-        resolve_application_root(project_root)
-        / "gallery"
-        / "app"
-        / "icons"
-        / "buttons"
-        / Path(filename).name
+    return application_paths(project_root).app_resource_path(
+        Path("icons") / "buttons" / Path(filename).name,
     )
 
 
@@ -35,15 +34,52 @@ class ArtworkButton(QtWidgets.QPushButton):
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(text, parent)
-        self._artwork_path = button_art_path(project_root, artwork_filename)
-        self._artwork = QtGui.QPixmap(str(self._artwork_path))
+        self._project_root = Path(project_root).resolve()
+        self._artwork_filename = Path(artwork_filename).name
+        self._theme_service: Any = None
+        self._artwork_path = button_art_path(
+            self._project_root,
+            self._artwork_filename,
+        )
+        self._artwork = QtGui.QPixmap()
         self._artwork_fill = False
         self._artwork_stretch = False
+        self._text_word_wrap = False
         self._hovered = False
         self.setCursor(QtCore.Qt.PointingHandCursor)
         font = self.font()
         font.setBold(True)
         self.setFont(font)
+
+        self.apply_theme_assets(self._discover_theme_service())
+
+    def _discover_theme_service(self) -> Any:
+        window = self.window()
+        return getattr(window, "theme_service", None) if window is not None else None
+
+    def apply_theme_assets(self, theme_service: Any = None) -> None:
+        """Reload artwork from the active theme, with the legacy asset fallback."""
+        if theme_service is not None:
+            self._theme_service = theme_service
+        service = self._theme_service
+        fallback_path = button_art_path(
+            self._project_root,
+            self._artwork_filename,
+        )
+        artwork_path = fallback_path
+        if service is not None and hasattr(service, "resolve_asset"):
+            resource_root = application_paths(self._project_root).resource_root
+            try:
+                fallback = fallback_path.resolve().relative_to(resource_root).as_posix()
+                artwork_path = service.resolve_asset(
+                    f"buttons/{self._artwork_filename}",
+                    fallback=fallback,
+                )
+            except (TypeError, ValueError):
+                artwork_path = fallback_path
+
+        self._artwork_path = Path(artwork_path).resolve()
+        self._artwork = QtGui.QPixmap(str(self._artwork_path))
 
         if self.has_artwork:
             self.setAttribute(QtCore.Qt.WA_Hover, True)
@@ -53,7 +89,9 @@ class ArtworkButton(QtWidgets.QPushButton):
                 QtWidgets.QSizePolicy.Policy.Preferred,
                 QtWidgets.QSizePolicy.Policy.Fixed,
             )
-            self.setAccessibleName(text)
+            self.setAccessibleName(self.text())
+        self.updateGeometry()
+        self.update()
 
     @property
     def has_artwork(self) -> bool:
@@ -71,6 +109,10 @@ class ArtworkButton(QtWidgets.QPushButton):
     def set_artwork_stretch(self, enabled: bool) -> None:
         """Fit the complete artwork canvas without cropping its edges."""
         self._artwork_stretch = bool(enabled)
+        self.update()
+
+    def set_text_word_wrap(self, enabled: bool) -> None:
+        self._text_word_wrap = bool(enabled)
         self.update()
 
     def sizeHint(self) -> QtCore.QSize:  # type: ignore[override]
@@ -141,11 +183,14 @@ class ArtworkButton(QtWidgets.QPushButton):
 
         # A restrained shadow keeps labels readable across light and dark art.
         text_rect = target.adjusted(8, 4, -8, -4)
+        text_flags = QtCore.Qt.AlignCenter
+        if self._text_word_wrap:
+            text_flags |= QtCore.Qt.TextWordWrap
         painter.setFont(self.font())
         painter.setPen(QtGui.QColor(0, 0, 0, 190))
-        painter.drawText(text_rect.translated(0, 1), QtCore.Qt.AlignCenter, self.text())
+        painter.drawText(text_rect.translated(0, 1), text_flags, self.text())
         painter.setPen(QtGui.QColor(255, 255, 255, 240 if self.isEnabled() else 145))
-        painter.drawText(text_rect, QtCore.Qt.AlignCenter, self.text())
+        painter.drawText(text_rect, text_flags, self.text())
 
         if self.hasFocus():
             focus_pen = QtGui.QPen(QtGui.QColor(0, 229, 255, 230), 2)

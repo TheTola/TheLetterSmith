@@ -7,8 +7,8 @@ from dataclasses import dataclass
 
 # Public GitHub App identifiers belong here. They are not secrets and may be
 # embedded in Letter Smith releases after the app is registered.
-GITHUB_APP_CLIENT_ID = "Iv23lifdQJYtcYZ2hOGs"
-GITHUB_APP_SLUG = "letter-smith-publisher"
+GITHUB_APP_CLIENT_ID = ""
+GITHUB_APP_SLUG = ""
 
 GITHUB_API_URL = "https://api.github.com"
 GITHUB_API_VERSION = "2026-03-10"

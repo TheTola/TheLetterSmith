@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "mode": "single",
+  "crossfade_ms": 0,
+  "tracks": [
+    {
+      "filename": "music.mp3",
+      "display_title": "Background Music",
+      "duration_seconds": 0.0,
+      "content_hash": "1263ab5f1badfd507eeb5b4ad430fad7f4835f1896e21dacad90cd7968a644f2",
+      "original_name": "stock song Background Music.mp3"
+    }
+  ]
+}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import time
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from config import MUSIC_FILE, USER_SOUNDS_DIR
-from transactional_io import atomic_write_json
+from project_paths import application_paths
 
 SOUND_MODEL_VERSION = 2
 ARCHIVE_DIR_NAME = "appssong"
@@ -23,6 +24,8 @@ PROJECT_SOUND_FILE_NAME = "project_sound.json"
 CURRENT_MANIFEST_NAME = "current.json"
 BUILD_SOUND_MANIFEST_NAME = "lettersmith-sound.json"
 ATOMIC_REPLACE_TIMEOUT_SECONDS = 2.0
+_LOGGER = logging.getLogger(__name__)
+_LOGGED_STOCK_ROOTS: set[Path] = set()
 
 
 def _replace_with_retry(source: Path, destination: Path) -> None:
@@ -47,7 +50,7 @@ def user_sounds_dir(project_root: str | Path) -> Path:
 
 
 def archive_root(project_root: str | Path) -> Path:
-    return user_sounds_dir(project_root) / ARCHIVE_DIR_NAME
+    return application_paths(project_root).music_archive_root
 
 
 def originals_dir(project_root: str | Path) -> Path:
@@ -67,11 +70,11 @@ def library_path(project_root: str | Path) -> Path:
 
 
 def project_sound_path(project_root: str | Path) -> Path:
-    return archive_root(project_root) / PROJECT_SOUND_FILE_NAME
+    return application_paths(project_root).project_sound_state_file
 
 
 def current_manifest_path(project_root: str | Path) -> Path:
-    return archive_root(project_root) / CURRENT_MANIFEST_NAME
+    return application_paths(project_root).current_sound_manifest_file
 
 
 def current_music_path(project_root: str | Path) -> Path:
@@ -83,6 +86,21 @@ def ensure_sound_dirs(project_root: str | Path) -> None:
     originals_dir(project_root).mkdir(parents=True, exist_ok=True)
     processed_dir(project_root).mkdir(parents=True, exist_ok=True)
     analysis_dir(project_root).mkdir(parents=True, exist_ok=True)
+
+
+def atomic_write_json(path: str | Path, payload: dict) -> None:
+    destination = Path(path).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        _replace_with_retry(tmp, destination)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def read_json(path: str | Path, default: dict) -> dict:
@@ -137,6 +155,8 @@ class TrackRecord:
     processed_file: str
     duration_seconds: float = 0.0
     added_at: str = field(default_factory=utc_now_text)
+    source_kind: str = "user"
+    resource_file: str = ""
 
     @classmethod
     def from_dict(cls, payload: dict) -> "TrackRecord":
@@ -149,6 +169,12 @@ class TrackRecord:
             processed_file=str(payload.get("processed_file", "")).strip(),
             duration_seconds=max(0.0, float(payload.get("duration_seconds", 0.0) or 0.0)),
             added_at=str(payload.get("added_at", "")).strip() or utc_now_text(),
+            source_kind=(
+                "stock"
+                if str(payload.get("source_kind", "user")).strip() == "stock"
+                else "user"
+            ),
+            resource_file=str(payload.get("resource_file", "")).strip(),
         )
 
     def to_dict(self) -> dict:
@@ -226,12 +252,95 @@ class ProjectSoundState:
             self.selected_track_id = self.playlist[0] if self.playlist else self.single_track_id
 
 
+def _load_stock_records(project_root: str | Path) -> dict[str, TrackRecord]:
+    paths = application_paths(project_root)
+    manifest = read_json(paths.stock_root / "stock_manifest.json", {})
+    entries = manifest.get("music", [])
+    if not isinstance(entries, list):
+        _LOGGER.warning("Stock manifest music section is invalid.")
+        return {}
+    records: dict[str, TrackRecord] = {}
+    stock_root = paths.stock_root.resolve()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        relative = Path(str(entry.get("filename", "")).strip())
+        path = (stock_root / relative).resolve()
+        try:
+            path.relative_to(stock_root)
+        except ValueError:
+            continue
+        if not path.is_file():
+            _LOGGER.warning("Stock music resource is missing: %s", relative.as_posix())
+            continue
+        try:
+            digest = hash_file(path)
+        except OSError as error:
+            _LOGGER.warning(
+                "Stock music resource could not be read: %s (%s)",
+                relative.as_posix(),
+                error,
+            )
+            continue
+        # Match the content-addressed IDs used by imported tracks.  Early
+        # stock builds used a ``stock:`` prefix; load_project_state remaps
+        # those IDs so existing letters keep their music assignment.
+        track_id = digest[:24]
+        records[track_id] = TrackRecord(
+            track_id=track_id,
+            content_hash=digest,
+            display_title=(
+                " ".join(str(entry.get("title", "")).split()).strip()
+                or display_title_from_name(path.name.removeprefix("stock song "))
+            ),
+            original_name=path.name,
+            original_file="",
+            processed_file=path.name,
+            duration_seconds=0.0,
+            added_at="2000-01-01T00:00:00+00:00",
+            source_kind="stock",
+            resource_file=relative.as_posix(),
+        )
+    if stock_root not in _LOGGED_STOCK_ROOTS:
+        _LOGGED_STOCK_ROOTS.add(stock_root)
+        _LOGGER.info("Stock music loaded: %d track(s).", len(records))
+    return records
+
+
+def _stock_track_aliases(project_root: str | Path) -> dict[str, str]:
+    """Map legacy archive/stock IDs to canonical bundled-track IDs."""
+    stock_records = _load_stock_records(project_root)
+    canonical_by_hash = {
+        record.content_hash: record.track_id
+        for record in stock_records.values()
+    }
+    aliases = {
+        f"stock:{track_id}": track_id
+        for track_id in stock_records
+    }
+    payload = read_json(
+        library_path(project_root),
+        {"version": SOUND_MODEL_VERSION, "tracks": {}},
+    )
+    raw_tracks = payload.get("tracks", {})
+    if not isinstance(raw_tracks, dict):
+        return aliases
+    for key, value in raw_tracks.items():
+        if not isinstance(value, dict):
+            continue
+        content_hash = str(value.get("content_hash", "")).strip()
+        canonical_id = canonical_by_hash.get(content_hash, "")
+        if canonical_id:
+            aliases[str(value.get("track_id", "")).strip() or str(key)] = canonical_id
+    return aliases
+
+
 def load_library(project_root: str | Path) -> dict[str, TrackRecord]:
     ensure_sound_dirs(project_root)
     payload = read_json(library_path(project_root), {"version": SOUND_MODEL_VERSION, "tracks": {}})
     raw_tracks = payload.get("tracks", {})
     if not isinstance(raw_tracks, dict):
-        return {}
+        raw_tracks = {}
     records: dict[str, TrackRecord] = {}
     for key, value in raw_tracks.items():
         if not isinstance(value, dict):
@@ -244,15 +353,34 @@ def load_library(project_root: str | Path) -> dict[str, TrackRecord]:
             record.track_id = str(key)
         if record.track_id and record.processed_file:
             records[record.track_id] = record
+    stock_records = _load_stock_records(project_root)
+    stock_hashes = {
+        record.content_hash
+        for record in stock_records.values()
+    }
+    records = {
+        track_id: record
+        for track_id, record in records.items()
+        if record.content_hash not in stock_hashes
+    }
+    records.update(stock_records)
     return records
 
 
 def save_library(project_root: str | Path, records: dict[str, TrackRecord]) -> None:
+    user_records = {
+        key: record
+        for key, record in records.items()
+        if record.source_kind != "stock"
+    }
     atomic_write_json(
         library_path(project_root),
         {
             "version": SOUND_MODEL_VERSION,
-            "tracks": {key: record.to_dict() for key, record in sorted(records.items())},
+            "tracks": {
+                key: record.to_dict()
+                for key, record in sorted(user_records.items())
+            },
         },
     )
 
@@ -263,6 +391,18 @@ def load_project_state(
     valid_ids: Optional[set[str]] = None,
 ) -> ProjectSoundState:
     payload = read_json(project_sound_path(project_root), {"version": SOUND_MODEL_VERSION})
+    aliases = _stock_track_aliases(project_root)
+    if aliases:
+        single_track_id = str(payload.get("single_track_id", "")).strip()
+        selected_track_id = str(payload.get("selected_track_id", "")).strip()
+        playlist = payload.get("playlist", [])
+        payload["single_track_id"] = aliases.get(single_track_id, single_track_id)
+        payload["selected_track_id"] = aliases.get(selected_track_id, selected_track_id)
+        if isinstance(playlist, list):
+            payload["playlist"] = [
+                aliases.get(str(track_id).strip(), str(track_id).strip())
+                for track_id in playlist
+            ]
     return ProjectSoundState.from_dict(payload).normalize(valid_ids)
 
 
@@ -271,6 +411,14 @@ def save_project_state(project_root: str | Path, state: ProjectSoundState) -> No
 
 
 def resolve_track_path(project_root: str | Path, record: TrackRecord) -> Path:
+    if record.source_kind == "stock" and record.resource_file:
+        stock_root = application_paths(project_root).stock_root.resolve()
+        path = (stock_root / record.resource_file).resolve()
+        try:
+            path.relative_to(stock_root)
+        except ValueError:
+            return stock_root / "__invalid_stock_track__"
+        return path
     return processed_dir(project_root) / Path(record.processed_file).name
 
 
@@ -394,7 +542,11 @@ def sync_current_compatibility(
     atomic_write_json(
         manifest,
         {
-            "current_rel": f"{USER_SOUNDS_DIR}/{ARCHIVE_DIR_NAME}/{PROCESSED_DIR_NAME}/{record.processed_file}",
+            "current_rel": (
+                f"{USER_SOUNDS_DIR}/{MUSIC_FILE}"
+                if record.source_kind == "stock"
+                else f"{USER_SOUNDS_DIR}/{ARCHIVE_DIR_NAME}/{PROCESSED_DIR_NAME}/{record.processed_file}"
+            ),
             "track_id": record.track_id,
             "link_mode": "copy",
         },

@@ -1,0 +1,164 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stock: Letter 3</title>
+  <link rel="stylesheet" href="styles.css">
+
+  <link rel="preload" as="image" href="gallery/pages/cover.png" fetchpriority="high">
+  <link rel="preload" as="image" href="gallery/controls/cleft.png" fetchpriority="high">
+  <link rel="preload" as="image" href="gallery/controls/cright.png" fetchpriority="high">
+  <link rel="preload" as="image" href="gallery/controls/bannerman.png">
+  <link rel="preload" as="audio" href="gallery/sounds/glissando.mp3">
+  <link rel="preload" as="audio" href="gallery/sounds/music.mp3" type="audio/mpeg">
+</head>
+
+<body>
+  <main id="letter-preview">
+  <div id="curtain-overlay" aria-hidden="false" role="dialog" aria-modal="false" aria-labelledby="begin-button">
+    <img id="curtain-left"  src="gallery/controls/cleft.png"  alt="" aria-hidden="true" decoding="async" fetchpriority="high">
+    <img id="curtain-right" src="gallery/controls/cright.png" alt="" aria-hidden="true" decoding="async" fetchpriority="high">
+    <button id="begin-button" type="button">Tap to Begin</button>
+  </div>
+  <div
+    id="title-banner"
+    aria-hidden="true"
+    style="--title-banner-text-rgb:48,149,176"
+  >
+    <img
+      id="title-banner-art"
+      src="gallery/controls/bannerman.png"
+      alt=""
+      aria-hidden="true"
+      decoding="async"
+    >
+    <span>Stock: Letter 3</span>
+  </div>
+
+  <button
+    id="fullscreen-button"
+    class="hud-button viewer-action"
+    type="button"
+    title="Enter fullscreen"
+    aria-label="Enter fullscreen"
+  >Fullscreen</button>
+
+  <div id="slideshow" aria-hidden="true">
+    <div id="turn" aria-hidden="true">
+      <div class="sheet sheet-front visible" id="sheetFront">
+        <img id="turnFrontImg" alt="">
+      </div>
+    </div>
+    <div id="turnShadow" aria-hidden="true"></div>
+
+    <section class="slide active" data-index="0" id="slide-0">
+      <img src="gallery/pages/cover.png" alt="Cover Page" decoding="async" fetchpriority="high">
+    </section>
+
+    <section class="slide" data-index="1" id="slide-1">
+      <img src="gallery/pages/letter.png" alt="Main Letter" decoding="async">
+    </section>
+
+    <section class="slide" data-index="2" id="slide-2">
+      <img src="gallery/pages/wall.png" alt="Text Wall Background" decoding="async">
+      <div class="text-wall" id="textWall" role="dialog" aria-modal="false" aria-label="Message text" aria-hidden="true" tabindex="-1" style="--message-overlay-rgb:245,235,210;--message-overlay-opacity:0.970;--message-overlay-surface-opacity:0.970;--message-overlay-blur:0px;--message-overlay-texture-opacity:0.027;--message-ink:#221710;--wall-fade-ms:900ms;">
+        <button id="close-text" class="hud-button hud-button-close" type="button" title="Close Text" aria-label="Close message" aria-controls="textWall">&times;</button>
+        <div class="text-wall-content" id="textWallContent"><!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0//EN" "http://www.w3.org/TR/REC-html40/strict.dtd">
+<html>
+<!-- lettersmith-message:v2 --><head><meta name="qrichtext" content="1" /><meta charset="utf-8" /><style type="text/css">
+p, li { white-space: pre-wrap; }
+hr { height: 1px; border-width: 0; }
+li.unchecked::marker { content: "\2610"; }
+li.checked::marker { content: "\2612"; }
+</style></head><body style=" font-family:'LetterSmithFont1', 'Papyrus'; font-size:16pt; font-weight:400; font-style:normal;"><div class="ls-linewrap" style="line-height:2.0;">
+<p style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><span style=" font-size:50pt; color:#f80084;">Dear Stock Human,</span></p>
+<p style=" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><span style=" color:#b41b7e;">Salve, Romule,</span></p>
+<p style=" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><span style=" color:#b41b7e;">Nomen mihi Bob est, atque paulisper tibi gratias agere volui quod talis es qualis es. Mirabilis es, atque tibi duos pollices sursum tollo, circiter quingenta milia miliardorum trillionum plausuum manuum mitto, una cum omnibus bonis votis quae in has litteras congerere possum.</span></p>
+<p style=" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><span style=" color:#b41b7e;">Spero te diem vere splendidum agere atque vitam te benigne tractare. Quod si non ita est, memento tamen res magni momenti in hoc mundo esse quibus frui possimus—velut caseum. Caseus praeclarus est. Et tubera cocta atque contrita? Tam deliciosa sunt ut vix verbis describi possint.</span></p>
+<p style=" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><span style=" color:#b41b7e;">Sed serio loquens: perge esse qui es, perge progredi, neque umquam obliviscaris esse homines qui te magni aestiment.</span></p>
+<p style=" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><span style=" color:#b41b7e;">Tui sincerissime,<br />Maxman Mamillion</span></p>
+<p style=" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><span style=" color:#b41b7e;">P. S. Gratias tibi ago pro socolata.</span></p>
+<p style=" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><span style=" color:#b41b7e;">P. P. S. Gratias etiam pro duodecim dollariis.</span></p>
+<p style=" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><span style=" color:#b41b7e;">P. P. P. S. Quid autem litterae “P.S.” significant? Re vera nescio.</span></p>
+<p style=" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><span style=" color:#b41b7e;">Ceterum, nunc a te petere debeo ut abeas.</span></p>
+<p style=" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><span style=" color:#b41b7e;">Bonum diem.</span></p>
+<p style=" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;"><span style=" color:#b41b7e;">DIXI: BONUM DIEM!</span></p></div></body></html></div>
+      </div>
+    </section>
+
+    <section class="slide" data-index="3" id="slide-3">
+      <img src="gallery/pages/back.png" alt="Final Backdrop" decoding="async">
+    </section>
+
+    <button id="prev" class="nav-button" type="button" title="Previous page" aria-label="Previous page">
+      <img src="gallery/controls/ppage.png" alt="" aria-hidden="true">
+    </button>
+    <button id="next" class="nav-button" type="button" title="Next page" aria-label="Next page">
+      <img src="gallery/controls/npage.png" alt="" aria-hidden="true">
+    </button>
+
+    <div id="viewer-actions" aria-label="Letter controls">
+      <div id="viewer-actions-left">
+        <button
+          id="restart-button"
+          class="hud-button viewer-action"
+          type="button"
+          title="Restart letter"
+          aria-label="Restart letter"
+        >Restart</button>
+        <button
+          id="mute-button"
+          class="hud-button viewer-action"
+          type="button"
+          title="Mute letter audio"
+          aria-label="Mute letter audio"
+          aria-pressed="false"
+        >Mute</button>
+      </div>
+    </div>
+
+    <button
+      id="open-text"
+      class="hud-button hud-button-icon"
+      type="button"
+      title="Show Message"
+      aria-label="Show message"
+      aria-controls="textWall"
+      aria-expanded="false"
+      aria-hidden="true"
+    >
+      <img src="gallery/controls/showmessageicon.png" alt="" aria-hidden="true" decoding="async">
+    </button>
+  </div>
+
+  <div id="volume-control" aria-hidden="true">
+    <button
+      id="volume-icon"
+      class="hud-button hud-button-icon"
+      type="button"
+      title="Volume"
+      aria-label="Toggle volume slider"
+      aria-controls="volume-slider"
+      aria-expanded="false"
+    >
+      <img id="volume-icon-img" src="gallery/controls/volon.png" alt="" aria-hidden="true" decoding="async">
+    </button>
+  </div>
+  </main>
+
+  <audio id="bg-music" preload="auto" playsinline></audio>
+  <audio id="bg-music-standby" preload="auto" playsinline></audio>
+
+  <script>
+    const INITIAL_VOLUME = 21;
+    const MUSIC_PLAYLIST = ["gallery/sounds/music.mp3"];
+    const MUSIC_CROSSFADE_MS = 0;
+    const IMAGE_ANIMATIONS = {};
+    const HAS_MESSAGE = true;
+  </script>
+
+  <script src="script.js"></script>
+</body>
+</html>

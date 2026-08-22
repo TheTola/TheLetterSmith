@@ -8,10 +8,12 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtTest, QtWidgets
 
 from command import CommandTab
 from Nexus import Nexus
+from project_state import ProjectStateController
+from settings_store import SettingsStore
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +47,27 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 )
         finally:
             tab.close()
+
+    def test_curtain_preparation_is_delayed_and_uses_a_worker_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cover = root / "gallery" / "user" / "pages" / "cover.png"
+            cover.parent.mkdir(parents=True)
+            cover.write_bytes(b"cover")
+            window = Nexus(root)
+            try:
+                window._schedule_curtain_preparation()
+                self.assertEqual(
+                    window._curtain_preparation_timer.interval(),
+                    5000,
+                )
+                self.assertTrue(window._curtain_preparation_timer.isActive())
+                self.assertEqual(
+                    window._curtain_preparation_pool.maxThreadCount(),
+                    1,
+                )
+            finally:
+                window.close()
 
     def test_immersive_shell_covers_everything_below_title_bar(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -149,6 +172,59 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 backup = root / "preview.build-backup"
                 os.replace(preview, backup)
                 self.assertTrue(backup.is_dir())
+            finally:
+                window.shutdown()
+                window.close()
+                self.app.processEvents()
+
+    def test_image_tab_hover_hides_review_without_switching_tabs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = ProjectStateController(temp_dir)
+            state.initialize()
+            state.establish_project(
+                "Amanda Miller",
+                custom_capitalization=True,
+            )
+            SettingsStore(temp_dir).update_fields(
+                {"recipient_title": "Picture Letter"}
+            )
+            window = Nexus(temp_dir)
+            try:
+                window.resize(1200, 820)
+                window.application_stack.setCurrentWidget(window.body)
+                window.show()
+                window.tabbar.show()
+                window.tabbar.setCurrentIndex(3)
+                window.forge_tab._readiness_requested = True
+                window.forge_tab.readiness_window.show()
+                self.app.processEvents()
+                self.assertTrue(window.forge_tab.readiness_window.isVisible())
+
+                QtTest.QTest.mouseMove(
+                    window.tabbar,
+                    window.tabbar.tabRect(0).center(),
+                )
+                self.assertTrue(
+                    window._image_tab_readiness_hide_timer.isActive()
+                )
+                hover_switch = getattr(
+                    window.tabbar,
+                    "_anima_hover_tab_switch",
+                )
+                hover_switch._cancel()
+                QtTest.QTest.qWait(1050)
+
+                self.assertEqual(window.tabbar.currentIndex(), 3)
+                self.assertFalse(window.forge_tab.readiness_window.isVisible())
+                self.assertFalse(window.forge_tab._readiness_requested)
+
+                window.forge_tab._readiness_requested = True
+                window.forge_tab.readiness_window.show()
+                self.app.processEvents()
+                window.tabbar.setCurrentIndex(0)
+                self.app.processEvents()
+                self.assertFalse(window.forge_tab.readiness_window.isVisible())
+                self.assertFalse(window.forge_tab._readiness_requested)
             finally:
                 window.shutdown()
                 window.close()

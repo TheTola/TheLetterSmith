@@ -18,6 +18,8 @@ output/
 dist/
 build/
 .lettersmith-publishing/
+.lettersmith-publishing-workspaces/
+Quarantine/
 *.bak_*
 editor_error.log
 editor_error.previous.log
@@ -26,6 +28,7 @@ hide/
 # Generated user content
 gallery/user/message/
 gallery/user/pages/
+gallery/user/cache/
 gallery/user/sounds/archive/
 gallery/user/sounds/appssong/
 # Python environment and caches

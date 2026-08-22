@@ -9,14 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
-from app_paths import resolve_application_root
-
-
-PROJECT_ROOT = resolve_application_root()
-TOOLS_DIR = PROJECT_ROOT / "tools"
-FFMPEG_PATH = TOOLS_DIR / "ffmpeg.exe"
-FFPROBE_PATH = TOOLS_DIR / "ffprobe.exe"
-
+from project_paths import application_paths
 
 class AudioToolError(RuntimeError):
     """Raised when the bundled FFmpeg toolchain cannot complete an operation."""
@@ -37,15 +30,19 @@ def _tool_path(path: Path, label: str) -> Path:
 
 
 def ffmpeg_path() -> Path:
-    return _tool_path(FFMPEG_PATH, "FFmpeg")
+    return _tool_path(application_paths().tool_path("ffmpeg.exe"), "FFmpeg")
 
 
 def ffprobe_path() -> Path:
-    return _tool_path(FFPROBE_PATH, "FFprobe")
+    return _tool_path(application_paths().tool_path("ffprobe.exe"), "FFprobe")
 
 
 def toolchain_available() -> bool:
-    return FFMPEG_PATH.is_file() and FFPROBE_PATH.is_file()
+    paths = application_paths()
+    return (
+        paths.tool_path("ffmpeg.exe").is_file()
+        and paths.tool_path("ffprobe.exe").is_file()
+    )
 
 
 def _creation_flags() -> int:
@@ -194,10 +191,7 @@ def convert_to_mp3(
             try:
                 process.wait(timeout=2)
             except Exception:
-                logging.getLogger(__name__).debug(
-                    "Best-effort operation failed.",
-                    exc_info=True,
-                )
+                pass
         tmp.unlink(missing_ok=True)
 
 
@@ -275,9 +269,6 @@ def decode_mono_pcm16(
             try:
                 process.wait(timeout=2)
             except Exception:
-                logging.getLogger(__name__).debug(
-                    "Best-effort operation failed.",
-                    exc_info=True,
-                )
+                pass
         tmp.unlink(missing_ok=True)
 

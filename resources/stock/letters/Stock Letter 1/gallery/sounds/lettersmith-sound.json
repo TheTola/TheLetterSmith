@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "mode": "single",
+  "crossfade_ms": 0,
+  "tracks": [
+    {
+      "filename": "music.mp3",
+      "display_title": "stock song Dark",
+      "duration_seconds": 158.484875,
+      "content_hash": "065025864943abb3d29e96116e550167fce3f330db9f0cb08b237a1d4b2a2d3e",
+      "original_name": "stock song Dark.mp3"
+    }
+  ]
+}

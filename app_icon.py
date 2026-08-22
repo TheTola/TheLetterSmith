@@ -4,15 +4,18 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-
-APP_ICON_PNG_REL = Path("gallery/app/icons/folder/lsmith.png")
-APP_ICON_ICO_REL = Path("gallery/app/icons/folder/lsmith.ico")
-APP_USER_MODEL_ID = "InfiniWorks.LetterSmith"
+from application_identity import APP_USER_MODEL_ID
+from project_paths import application_paths
 
 
+APP_ICON_PNG_REL = Path("icons/folder/lsmith.png")
+APP_ICON_ICO_REL = Path("icons/folder/lsmith.ico")
 def canonical_icon_paths(project_root: str | Path) -> tuple[Path, Path]:
-    root = Path(project_root).resolve()
-    return root / APP_ICON_PNG_REL, root / APP_ICON_ICO_REL
+    paths = application_paths(project_root)
+    return (
+        paths.app_resource_path(APP_ICON_PNG_REL),
+        paths.app_resource_path(APP_ICON_ICO_REL),
+    )
 
 
 def resolve_app_icon(
@@ -26,7 +29,7 @@ def resolve_app_icon(
     if override:
         path = Path(override)
         if not path.is_absolute():
-            path = (root / path).resolve()
+            path = application_paths(root).resource_path(path)
         if path.is_file():
             return path
 

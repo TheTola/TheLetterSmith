@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "slots": {
+    "cover": {
+      "asset_type": "static",
+      "is_animated_gif": false,
+      "source_file": "cover.png",
+      "preview_file": "cover.png"
+    },
+    "letter": {
+      "asset_type": "static",
+      "is_animated_gif": false,
+      "source_file": "letter.png",
+      "preview_file": "letter.png"
+    },
+    "wall": {
+      "asset_type": "static",
+      "is_animated_gif": false,
+      "source_file": "wall.png",
+      "preview_file": "wall.png"
+    },
+    "back": {
+      "asset_type": "static",
+      "is_animated_gif": false,
+      "source_file": "back.png",
+      "preview_file": "back.png"
+    }
+  }
+}

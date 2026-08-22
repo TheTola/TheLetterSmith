@@ -1,0 +1,46 @@
+{
+  "version": 6,
+  "type": "Cel-Shaded Style Illustration",
+  "subject": "Excitement",
+  "color": "Sapphire Prismatic Storm",
+  "global": "Fanatsy, dragons, wizards the world ahead of you",
+  "cover": "Dragon on the montain in the far view the jouny begins.",
+  "letter": "Fantasy road jorny.",
+  "wall": "Looking at a ruined castle wall.",
+  "back": "Continue the jorney.",
+  "checks": {
+    "black": false,
+    "white": false,
+    "frame": false,
+    "vignette": true,
+    "polaroid": false,
+    "cardshadow": false,
+    "real": false,
+    "paint": false,
+    "minimal": false,
+    "forbid_text": false,
+    "clean_composition": false,
+    "strong_focal_point": false,
+    "dynamic_angle": false,
+    "cinematic_framing": true,
+    "close_up_focus": false,
+    "full_body_view": false,
+    "wide_scene": false,
+    "simplified_details": false
+  },
+  "resolved_instructions": {
+    "role": "a high-caliber visual designer skilled in producing four-page image collections with unified art direction and page-specific compositional decisions",
+    "subject_lead_in": [
+      "Create an illustration of"
+    ],
+    "effort": "achieve maximum visual fidelity through sound construction, accurate anatomy and geometry, controlled composition, and clearly distinguished materials and textures.",
+    "format": "Render a portrait image at exactly 2048×3072 pixels. Maintain safe edge spacing, keep all important content fully visible, prevent critical cropping, and ensure all text is legible, complete, and free of unintended symbols."
+  },
+  "generated_prompts": {
+    "cover": "You are a high-caliber visual designer skilled in producing four-page image collections with unified art direction and page-specific compositional decisions. Create an illustration of Excitement.\n\nThe Cover Page is a bold, decorative opening image that captures attention and sets the tone.\n\nUse the Sapphire Prismatic Storm palette.\n\nUse Cel-Shaded Style Illustration as the visual style.\n\nShared visual direction: Fanatsy, dragons, wizards the world ahead of you\n\nPage-specific direction: Dragon on the montain in the far view the jouny begins.\n\nRender with maximum visual fidelity through sound construction, accurate anatomy and geometry, controlled composition, and clearly distinguished materials and textures.\n\nGuidance:\n- add a subtle edge vignette to focus attention.\n- use cinematic framing with deliberate composition and film-like staging.\n- Apply no additional style bias beyond the selected Graphics and Illustration style.\n- Use the framing that best serves the composition; do not force a close-up, full-body, or wide-scene view.\n\nRender a portrait image at exactly 2048×3072 pixels. Maintain safe edge spacing, keep all important content fully visible, prevent critical cropping, and ensure all text is legible, complete, and free of unintended symbols.",
+    "letter": "You are a high-caliber visual designer skilled in producing four-page image collections with unified art direction and page-specific compositional decisions. Create an illustration of Excitement.\n\nThe Letter Page is a subtle, elegant backdrop that frames the main written message without distraction.\n\nUse the Sapphire Prismatic Storm palette.\n\nUse Cel-Shaded Style Illustration as the visual style.\n\nShared visual direction: Fanatsy, dragons, wizards the world ahead of you\n\nPage-specific direction: Fantasy road jorny.\n\nRender with maximum visual fidelity through sound construction, accurate anatomy and geometry, controlled composition, and clearly distinguished materials and textures.\n\nGuidance:\n- add a subtle edge vignette to focus attention.\n- use cinematic framing with deliberate composition and film-like staging.\n- Apply no additional style bias beyond the selected Graphics and Illustration style.\n- Use the framing that best serves the composition; do not force a close-up, full-body, or wide-scene view.\n\nRender a portrait image at exactly 2048×3072 pixels. Maintain safe edge spacing, keep all important content fully visible, prevent critical cropping, and ensure all text is legible, complete, and free of unintended symbols.",
+    "wall": "You are a high-caliber visual designer skilled in producing four-page image collections with unified art direction and page-specific compositional decisions. Create an illustration of Excitement.\n\nThe Wall Page is a calm, minimalist background designed to support large blocks of text.\n\nUse the Sapphire Prismatic Storm palette.\n\nUse Cel-Shaded Style Illustration as the visual style.\n\nShared visual direction: Fanatsy, dragons, wizards the world ahead of you\n\nPage-specific direction: Looking at a ruined castle wall.\n\nRender with maximum visual fidelity through sound construction, accurate anatomy and geometry, controlled composition, and clearly distinguished materials and textures.\n\nGuidance:\n- add a subtle edge vignette to focus attention.\n- use cinematic framing with deliberate composition and film-like staging.\n- Apply no additional style bias beyond the selected Graphics and Illustration style.\n- Use the framing that best serves the composition; do not force a close-up, full-body, or wide-scene view.\n\nRender a portrait image at exactly 2048×3072 pixels. Maintain safe edge spacing, keep all important content fully visible, prevent critical cropping, and ensure all text is legible, complete, and free of unintended symbols.",
+    "back": "You are a high-caliber visual designer skilled in producing four-page image collections with unified art direction and page-specific compositional decisions. Create an illustration of Excitement.\n\nThe Back Page is a simple, graceful closing image that echoes the cover while providing a sense of finality.\n\nUse the Sapphire Prismatic Storm palette.\n\nUse Cel-Shaded Style Illustration as the visual style.\n\nShared visual direction: Fanatsy, dragons, wizards the world ahead of you\n\nPage-specific direction: Continue the jorney.\n\nRender with maximum visual fidelity through sound construction, accurate anatomy and geometry, controlled composition, and clearly distinguished materials and textures.\n\nGuidance:\n- add a subtle edge vignette to focus attention.\n- use cinematic framing with deliberate composition and film-like staging.\n- Apply no additional style bias beyond the selected Graphics and Illustration style.\n- Use the framing that best serves the composition; do not force a close-up, full-body, or wide-scene view.\n\nRender a portrait image at exactly 2048×3072 pixels. Maintain safe edge spacing, keep all important content fully visible, prevent critical cropping, and ensure all text is legible, complete, and free of unintended symbols."
+  },
+  "generated_input_signature": "ac03da385aafac958c0dc314ff4723120831fa2bd57a787008eb3da40f6f39e1"
+}

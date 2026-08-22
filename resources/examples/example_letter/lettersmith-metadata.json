@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.0",
+  "document_type": "saved_letter",
+  "recipient_name": "A Friend",
+  "recipient_title": "Example Letter",
+  "published_page_url": "",
+  "settings": {
+    "starting_volume": 31,
+    "music_volume": 31,
+    "curtain_style": "average_color",
+    "message_overlay_preset": "warm_paper",
+    "message_overlay_opacity": 94,
+    "required_features": ["music"],
+    "forge_preview_mode": "portrait"
+  },
+  "editable_assets": {
+    "pages": {
+      "cover.png": "gallery/pages/cover.png",
+      "letter.png": "gallery/pages/letter.png",
+      "wall.png": "gallery/pages/wall.png",
+      "back.png": "gallery/pages/back.png"
+    },
+    "message": "gallery/message/message.html",
+    "sound_manifest": "gallery/sounds/lettersmith-sound.json",
+    "prompt_writer_state": "prompt_writer_state.json",
+    "image_manifest": "gallery/pages/lettersmith-images.json"
+  },
+  "sound": {
+    "mode": "single",
+    "playlist_order": ["Background Music"],
+    "track_count": 1,
+    "crossfade_ms": 0
+  },
+  "readiness": {
+    "percentage": 100,
+    "status": "Ready"
+  },
+  "cover_thumbnail_path": "gallery/pages/cover.png",
+  "example_master": true
+}

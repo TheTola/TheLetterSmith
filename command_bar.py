@@ -8,7 +8,9 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
 
-from config import canonical_play_root
+from config import canonical_play_root, canonical_stock_letters_root
+from project_paths import application_paths
+from publishing.expiration import publication_status
 from saved_letters import SavedLetter, SavedLetterCatalog
 from settings_store import (
     ACTIVE_PLAY_DIR_KEY,
@@ -19,6 +21,19 @@ from settings_store import (
 
 _LOGGER = logging.getLogger(__name__)
 _COMMAND_BAR_INSTANCE: Optional["CommandBarWindow"] = None
+
+
+def _is_managed_preview_path(path: Path, project_root: str | Path) -> bool:
+    for root in (
+        canonical_play_root(project_root).resolve(),
+        canonical_stock_letters_root(project_root).resolve(),
+    ):
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def _gif_image_rects(path: Path) -> tuple[QtCore.QSize, tuple[QtCore.QRect, ...]]:
@@ -127,9 +142,7 @@ def _valid_preview_path(
         or candidate.is_symlink()
     ):
         return None
-    try:
-        candidate.relative_to(canonical_play_root(project_root).resolve())
-    except ValueError:
+    if not _is_managed_preview_path(candidate, project_root):
         return None
     return candidate
 
@@ -151,6 +164,12 @@ def _metadata_value(metadata: dict[str, object], *keys: str) -> str:
         if value:
             return value
     return ""
+
+
+def _published_link_url(state: dict[str, object]) -> str:
+    if publication_status(state) != "published":
+        return ""
+    return normalize_published_page_url(state.get("published_page_url", ""))
 
 
 def _matching_saved_preview(
@@ -182,21 +201,16 @@ def build_command_bar_data(
     settings = SettingsStore(root).snapshot()
     settings_recipient = str(settings.get("recipient_name", "") or "").strip()
     settings_title = str(settings.get("recipient_title", "") or "").strip()
-    settings_url = normalize_published_page_url(
-        settings.get("published_page_url", "")
-    )
+    settings_url = _published_link_url(settings)
     catalog = SavedLetterCatalog(root)
 
     active_dir = _valid_preview_dir(settings.get(ACTIVE_PLAY_DIR_KEY, ""))
-    if active_dir is not None:
-        try:
-            active_dir.relative_to(canonical_play_root(root).resolve())
-        except ValueError:
-            _LOGGER.warning(
-                "Ignoring active Command Bar path outside output/Play: %s",
-                active_dir,
-            )
-            active_dir = None
+    if active_dir is not None and not _is_managed_preview_path(active_dir, root):
+        _LOGGER.warning(
+            "Ignoring active Command Bar path outside managed letter storage: %s",
+            active_dir,
+        )
+        active_dir = None
     matching_entry = None if active_dir is not None else _matching_saved_preview(
         catalog,
         settings_recipient,
@@ -214,11 +228,14 @@ def build_command_bar_data(
         metadata,
         "recipient_title",
     ) or (matching_entry.title if matching_entry else "") or settings_title
-    published_url = normalize_published_page_url(
-        _metadata_value(metadata, "published_page_url")
-        or (matching_entry.published_url if matching_entry else "")
-        or settings_url
-    )
+    if play_dir is not None:
+        published_url = _published_link_url(metadata) or (
+            matching_entry.published_url
+            if matching_entry is not None and matching_entry.published
+            else ""
+        )
+    else:
+        published_url = settings_url
 
     return CommandBarData(
         recipient_name=recipient or "Recipient unavailable",
@@ -449,7 +466,7 @@ class CommandBarWindow(QtWidgets.QWidget):
         return self._compact_mode
 
     def _build_background(self) -> None:
-        icons_dir = self.project_root / "gallery" / "app" / "icons"
+        icons_dir = application_paths(self.project_root).app_resource_path("icons")
         gif_path = icons_dir / "bloodsnow.gif"
         movie = QtGui.QMovie(str(gif_path))
         if gif_path.is_file() and movie.isValid():
@@ -474,8 +491,8 @@ class CommandBarWindow(QtWidgets.QWidget):
         self._surface.set_fallback_background(True)
 
     def _build_scan_overlay(self) -> None:
-        scan_path = (
-            self.project_root / "gallery" / "app" / "icons" / "scanned.gif"
+        scan_path = application_paths(self.project_root).app_resource_path(
+            "icons/scanned.gif"
         )
         if not scan_path.is_file():
             return
@@ -490,7 +507,9 @@ class CommandBarWindow(QtWidgets.QWidget):
         self._scan_movie = movie
 
     def _build_compact_icon(self) -> None:
-        icon_path = self.project_root / "gallery" / "app" / "icons" / "com.gif"
+        icon_path = application_paths(self.project_root).app_resource_path(
+            "icons/com.gif"
+        )
         if not icon_path.is_file():
             return
         movie = QtGui.QMovie(str(icon_path))
@@ -620,7 +639,9 @@ class CommandBarWindow(QtWidgets.QWidget):
             "QToolButton:pressed{background:rgba(15,45,72,0.55);border-radius:8px;}"
             "QToolButton:disabled{color:#58738b;background:transparent;}"
         )
-        path = self.project_root / "gallery" / "app" / "icons" / asset_name
+        path = application_paths(self.project_root).app_resource_path(
+            Path("icons") / asset_name
+        )
         pixmap = QtGui.QPixmap(str(path)) if path.is_file() else QtGui.QPixmap()
         if not pixmap.isNull():
             button.setIcon(QtGui.QIcon(pixmap))

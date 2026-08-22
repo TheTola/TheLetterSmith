@@ -15,6 +15,7 @@ TEMPLATE_HTML = r"""
   <link rel="preload" as="image" href="gallery/pages/cover.png" fetchpriority="high">
   <link rel="preload" as="image" href="gallery/controls/cleft.png" fetchpriority="high">
   <link rel="preload" as="image" href="gallery/controls/cright.png" fetchpriority="high">
+  <link rel="preload" as="image" href="gallery/controls/bannerman.png">
   <link rel="preload" as="audio" href="gallery/sounds/glissando.mp3">
   {{MUSIC_PRELOAD_HTML}}
 </head>
@@ -25,6 +26,20 @@ TEMPLATE_HTML = r"""
     <img id="curtain-left"  src="gallery/controls/cleft.png"  alt="" aria-hidden="true" decoding="async" fetchpriority="high">
     <img id="curtain-right" src="gallery/controls/cright.png" alt="" aria-hidden="true" decoding="async" fetchpriority="high">
     <button id="begin-button" type="button">Tap to Begin</button>
+  </div>
+  <div
+    id="title-banner"
+    aria-hidden="true"
+    style="--title-banner-text-rgb:{{TITLE_BANNER_TEXT_RGB}}"
+  >
+    <img
+      id="title-banner-art"
+      src="gallery/controls/bannerman.png"
+      alt=""
+      aria-hidden="true"
+      decoding="async"
+    >
+    <span>{{TITLE}}</span>
   </div>
 
   <button
@@ -127,6 +142,7 @@ TEMPLATE_HTML = r"""
     const MUSIC_PLAYLIST = {{MUSIC_PLAYLIST_JSON}};
     const MUSIC_CROSSFADE_MS = {{MUSIC_CROSSFADE_MS}};
     const IMAGE_ANIMATIONS = {{IMAGE_ANIMATIONS_JSON}};
+    const HAS_MESSAGE = {{HAS_MESSAGE_JSON}};
   </script>
 
   <script src="script.js"></script>
@@ -219,10 +235,18 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 #curtain-overlay.curtain-fallback #curtain-left,#curtain-overlay.curtain-fallback #curtain-right{display:none}
 #begin-button{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);min-width:min(80vw,280px);padding:14px 30px;border:1px solid rgba(155,255,251,.42);border-radius:var(--pill-radius);background:linear-gradient(180deg,rgba(15,24,38,.88),rgba(6,10,18,.72));color:var(--text-main);font-size:clamp(22px,3.2vw,42px);font-weight:700;letter-spacing:.02em;cursor:pointer;z-index:10001;animation:pulse var(--duration-attention) infinite;box-shadow:var(--hud-shadow),0 0 0 1px rgba(0,255,255,.14)}
 #curtain-overlay:not(.is-visible) #begin-button{opacity:0}
+#begin-button.is-dismissed{animation:none;opacity:0;visibility:hidden;transition:opacity 160ms ease-out,visibility 0s linear 160ms}
 #begin-button:hover{background:linear-gradient(180deg,rgba(20,31,48,.94),rgba(8,12,20,.84))}
+#title-banner{position:absolute;top:50%;left:50%;z-index:10002;width:min(94vw,1000px,92vh);aspect-ratio:1/1;container-type:inline-size;display:grid;place-items:center;visibility:hidden;opacity:0;pointer-events:none;transform:translate(-50%,-50%) scale(.92);color:rgb(var(--title-banner-text-rgb));filter:drop-shadow(0 12px 20px rgba(0,0,0,.5));will-change:opacity,transform}
+#title-banner-art{grid-area:1/1;width:100%;height:100%;object-fit:contain;pointer-events:none;user-select:none}
+#title-banner span{grid-area:1/1;position:relative;z-index:1;width:68%;max-width:68%;font-family:var(--font-letter);font-size:6.8cqw;font-weight:700;font-style:italic;line-height:1.08;letter-spacing:.025em;text-align:center;overflow-wrap:anywhere;text-shadow:0 1px 0 rgba(255,255,255,.4),0 4px 9px rgba(0,0,0,.72);-webkit-text-stroke:clamp(1px,.18cqw,2px) rgba(0,0,0,.68);paint-order:stroke fill}
+#title-banner.is-showing{visibility:visible;animation:titleBannerFadeIn 280ms cubic-bezier(.18,.82,.2,1) forwards}
+#title-banner.is-hiding{visibility:visible;animation:titleBannerFadeOut 360ms ease-in forwards}
 @keyframes curtainIntroFadeIn{from{opacity:0}to{opacity:1}}
 @keyframes curtainPanelFadeIn{from{opacity:0}to{opacity:1}}
 @keyframes pulse{0%,100%{opacity:.68;transform:translate(-50%,-50%) scale(1)}50%{opacity:1;transform:translate(-50%,-50%) scale(1.04)}}
+@keyframes titleBannerFadeIn{from{opacity:0;transform:translate(-50%,-50%) scale(.92)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
+@keyframes titleBannerFadeOut{from{opacity:1;transform:translate(-50%,-50%) scale(1)}to{opacity:0;transform:translate(-50%,-50%) scale(1.035)}}
 @keyframes curtainLeftOut{from{transform:translateX(0)}to{transform:translateX(-100vw)}}
 @keyframes curtainRightOut{from{transform:translateX(0)}to{transform:translateX(100vw)}}
 
@@ -309,7 +333,7 @@ body.stage-ready #volume-control{opacity:1;visibility:visible;pointer-events:aut
 @media (max-width: 640px){:root{--nav-offset:4px;--nav-size:34px;--nav-pad:4px;--icon-size:34px;--close-size:38px;--corner-offset:12px;--control-rail:50px;--bottom-control-rail:60px;--page-side-rail:50px}#prev,#next{top:50%}#volume-control{left:var(--corner-offset);right:auto;bottom:calc(5px + env(safe-area-inset-bottom));padding:4px;transform:none}body.stage-ready #volume-control{transform:none}#viewer-actions{top:10px;left:10px}#viewer-actions-left{gap:5px}#viewer-actions .viewer-action,#fullscreen-button{height:32px;padding:0 8px;font-size:10px}#fullscreen-button{top:10px;right:10px}#open-text{left:auto;right:var(--corner-offset);bottom:calc(5px + env(safe-area-inset-bottom));transform:none}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - var(--control-rail) - var(--bottom-control-rail))}#volume-control.slider-open #volume-slider{width:min(28vw,64px)}}
 @media (max-width: 220px){:root{--page-side-rail:58px}#viewer-actions .viewer-action,#fullscreen-button{width:34px;padding:0;font-size:0}#restart-button::before{content:"Γå╗";font-size:18px}#mute-button::before{content:"≡ƒöç";font-size:15px}#mute-button[aria-pressed="true"]::before{content:"≡ƒöè"}#fullscreen-button::before{content:"Γ¢╢";font-size:17px}}
 @media (max-height: 420px){:root{--nav-offset:4px;--nav-size:34px;--nav-pad:4px;--icon-size:32px;--close-size:34px;--corner-offset:8px;--control-rail:48px;--bottom-control-rail:52px;--page-side-rail:50px;--wall-gap:10px;--wall-frame-pad:8px;--wall-block-pad:14px;--wall-inline-pad:12px}#viewer-actions{top:8px;left:8px}#viewer-actions-left{gap:5px}#viewer-actions .viewer-action,#fullscreen-button{height:30px;padding:0 8px;font-size:10px}#fullscreen-button{top:8px;right:8px}#volume-control{bottom:6px;padding:3px}#open-text{bottom:6px}.text-wall-content{font-size:15px;line-height:1.45}}
-@media (prefers-reduced-motion: reduce){*,*::before,*::after{scroll-behavior:auto !important}#slideshow,#volume-control,#open-text,#close-text,.text-wall,#volume-slider{transition:none}#begin-button{animation:none}#curtain-overlay.is-visible,#curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{scroll-behavior:auto !important}#slideshow,#volume-control,#open-text,#close-text,.text-wall,#volume-slider{transition:none}#begin-button{animation:none}#curtain-overlay.is-visible,#curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right,#title-banner.is-showing,#title-banner.is-hiding{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
 """
 
 TEMPLATE_JS = r"""
@@ -318,6 +342,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const cLeft     = document.getElementById('curtain-left');
   const cRight    = document.getElementById('curtain-right');
   const beginBtn  = document.getElementById('begin-button');
+  const titleBanner = document.getElementById('title-banner');
 
   const slides    = Array.from(document.querySelectorAll('.slide'));
   const prevBtn   = document.getElementById('prev');
@@ -369,6 +394,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const curtainIntroRevealMs = prefersReducedMotion ? 80 : motion.duration.major;
   const curtainOpenMs = prefersReducedMotion ? 140 : motion.duration.curtain;
   const curtainCleanupPadMs = prefersReducedMotion ? 20 : 0;
+  const titleBannerDelayMs = prefersReducedMotion ? 80 : 500;
+  const titleBannerFadeInMs = prefersReducedMotion ? 10 : 280;
+  const titleBannerHoldMs = 3500;
+  const titleBannerFadeOutMs = prefersReducedMotion ? 10 : 360;
   const glissSafetyPadMs = prefersReducedMotion ? 120 : 450;
   const musicFadeMs = prefersReducedMotion ? 120 : 900;
   const wallRevealDelayMs = prefersReducedMotion ? 80 : 2200;
@@ -386,10 +415,16 @@ document.addEventListener('DOMContentLoaded', () => {
   let slider = null;
   let stageReady = false;
   let introStarted = false;
+  let titleBannerStarted = false;
+  let titleBannerRevealTimer = null;
+  let titleBannerAutoDismissTimer = null;
+  let titleBannerCleanupTimer = null;
   let deferredWarmStarted = false;
   let flipping = false;
   let musicPlaylistIndex = 0;
   let playlistTransitioning = false;
+  let playlistTransitionTimer = null;
+  const musicLoopDelayMs = 1200;
   const muteStorageKey = 'lettersmith.viewerMuted';
   let viewerMuted = loadViewerMuted();
   let currentVolume = loadVolume0to100();
@@ -621,9 +656,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function imageAnimationConfig(slideIndex){
     const config = IMAGE_ANIMATIONS[String(slideIndex)];
-    return config && Array.isArray(config.frames) && config.frames.length > 1
-      ? config
-      : null;
+    if (!config) return null;
+    if (config.render_mode === 'native_gif'){
+      return config.source && config.preview_source ? config : null;
+    }
+    return Array.isArray(config.frames) && config.frames.length > 1 ? config : null;
   }
 
   function cancelImageAnimation(slideIndex){
@@ -631,6 +668,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!state) return;
     state.cancelled = true;
     if (state.timer !== null) clearTimeout(state.timer);
+    if (state.config.render_mode === 'native_gif' && state.config.preview_source){
+      state.image.src = state.config.preview_source;
+    }
     state.timer = null;
     imageAnimationStates.delete(slideIndex);
   }
@@ -714,7 +754,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!config) return;
     cancelImageAnimation(slideIndex);
     const image = slideImageEl(slides[slideIndex]);
-    if (image && config.frames[0]) image.src = config.frames[0];
+    if (!image) return;
+    if (config.render_mode === 'native_gif') image.src = config.preview_source;
+    else if (config.frames[0]) image.src = config.frames[0];
   }
 
   function activateImageAnimation(slideIndex){
@@ -732,6 +774,10 @@ document.addEventListener('DOMContentLoaded', () => {
       totalForwardPlays: effectiveImagePlayCount(config),
     };
     imageAnimationStates.set(slideIndex, state);
+    if (config.render_mode === 'native_gif'){
+      image.src = config.source;
+      return;
+    }
     showImageAnimationFrame(state, 0);
     scheduleImageAnimation(
       state,
@@ -816,6 +862,19 @@ document.addEventListener('DOMContentLoaded', () => {
     }, wallRevealDelayMs);
   }
   function syncWallUI(){
+    if (!HAS_MESSAGE){
+      clearWallRevealTimers();
+      wallRevealLocked = false;
+      wall.classList.remove('is-open');
+      openText.classList.remove('is-visible');
+      closeText.classList.remove('is-visible');
+      setHiddenState(wall, true);
+      setHiddenState(openText, true);
+      setHiddenState(closeText, true);
+      setExpandedState(openText, false);
+      syncButtons();
+      return;
+    }
     if (!isWallPage()){
       clearWallRevealTimers();
       wallRevealLocked = false;
@@ -992,7 +1051,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function go(delta){
     if (!started || introControlsLocked || wallRevealLocked || flipping) return;
-    flipTo(idx + delta);
+    const target = clamp(idx + delta, 0, TOTAL - 1);
+    if (target === idx) return;
+    dismissTitleBanner();
+    flipTo(target);
   }
 
   function ensureSlider(){
@@ -1069,27 +1131,60 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!music.getAttribute('src') || !music.src.endsWith(wanted)) music.src = wanted;
     return true;
   }
+  function nextMusicIndex(sources){
+    if (!sources.length) return -1;
+    return (musicPlaylistIndex + 1) % sources.length;
+  }
   function installPlaylistListeners(audio){
     if (!audio) return;
     audio.addEventListener('timeupdate', () => {
       if (audio !== music || playlistTransitioning) return;
       const sources = musicSources();
-      if (musicPlaylistIndex + 1 >= sources.length) return;
+      const crossfadeMs = Math.max(0, Number(MUSIC_CROSSFADE_MS) || 0);
+      if (sources.length < 2 || crossfadeMs <= 0) return;
       if (!Number.isFinite(audio.duration) || audio.duration <= 0) return;
       const remainingMs = (audio.duration - audio.currentTime) * 1000;
-      if (remainingMs > 0 && remainingMs <= Math.max(120, MUSIC_CROSSFADE_MS || 1000)) crossfadeToNextTrack();
+      if (remainingMs > 0 && remainingMs <= Math.max(120, crossfadeMs)) crossfadeToNextTrack();
     });
     audio.addEventListener('ended', () => {
       if (audio !== music || playlistTransitioning) return;
-      const sources = musicSources();
-      if (musicPlaylistIndex + 1 < sources.length) crossfadeToNextTrack();
+      advanceMusicSequence();
     });
+  }
+  function advanceMusicSequence(){
+    const sources = musicSources();
+    if (playlistTransitioning || !sources.length || !music) return;
+    if (sources.length > 1 && Number(MUSIC_CROSSFADE_MS) > 0){
+      crossfadeToNextTrack();
+      return;
+    }
+    const nextIndex = nextMusicIndex(sources);
+    playlistTransitioning = true;
+    if (playlistTransitionTimer !== null) clearTimeout(playlistTransitionTimer);
+    playlistTransitionTimer = setTimeout(() => {
+      playlistTransitionTimer = null;
+      const currentSources = musicSources();
+      if (!music || !currentSources.length){
+        playlistTransitioning = false;
+        return;
+      }
+      musicPlaylistIndex = nextIndex % currentSources.length;
+      const wanted = currentSources[musicPlaylistIndex];
+      try{
+        if (!music.getAttribute('src') || !music.src.endsWith(wanted)) music.src = wanted;
+        music.currentTime = 0;
+        music.volume = clamp(currentVolume / 100, 0, 1);
+        music.muted = viewerMuted || currentVolume === 0;
+        music.play().catch(()=>{});
+      }catch(_){ }
+      playlistTransitioning = false;
+    }, musicLoopDelayMs);
   }
   function crossfadeToNextTrack(){
     const sources = musicSources();
-    if (playlistTransitioning || musicPlaylistIndex + 1 >= sources.length || !music || !musicStandby) return;
+    if (playlistTransitioning || !sources.length || !music || !musicStandby) return;
     playlistTransitioning = true;
-    const nextIndex = musicPlaylistIndex + 1;
+    const nextIndex = nextMusicIndex(sources);
     const target = clamp(currentVolume / 100, 0, 1);
     const muted = viewerMuted || target === 0;
     musicStandby.src = sources[nextIndex];
@@ -1158,6 +1253,43 @@ document.addEventListener('DOMContentLoaded', () => {
     }, openMs + curtainCleanupPadMs);
     return openMs;
   }
+  function runTitleBanner(){
+    if (titleBannerStarted) return;
+    titleBannerStarted = true;
+    titleBannerRevealTimer = setTimeout(() => {
+      titleBannerRevealTimer = null;
+      beginBtn.classList.add('is-dismissed');
+      titleBanner.setAttribute('aria-hidden', 'false');
+      titleBanner.classList.add('is-showing');
+      titleBannerAutoDismissTimer = setTimeout(() => {
+        titleBannerAutoDismissTimer = null;
+        dismissTitleBanner();
+      }, titleBannerFadeInMs + titleBannerHoldMs);
+    }, titleBannerDelayMs);
+  }
+  function dismissTitleBanner(){
+    if (titleBannerRevealTimer !== null){
+      clearTimeout(titleBannerRevealTimer);
+      titleBannerRevealTimer = null;
+    }
+    if (titleBannerAutoDismissTimer !== null){
+      clearTimeout(titleBannerAutoDismissTimer);
+      titleBannerAutoDismissTimer = null;
+    }
+    if (titleBannerCleanupTimer !== null){
+      clearTimeout(titleBannerCleanupTimer);
+      titleBannerCleanupTimer = null;
+    }
+    beginBtn.classList.add('is-dismissed');
+    titleBanner.classList.remove('is-showing');
+    if (titleBanner.getAttribute('aria-hidden') === 'true') return;
+    titleBanner.classList.add('is-hiding');
+    titleBannerCleanupTimer = setTimeout(() => {
+      titleBannerCleanupTimer = null;
+      titleBanner.classList.remove('is-hiding');
+      titleBanner.setAttribute('aria-hidden', 'true');
+    }, titleBannerFadeOutMs);
+  }
   function openCurtain(){
     if (started) return;
     started = true;
@@ -1166,8 +1298,8 @@ document.addEventListener('DOMContentLoaded', () => {
     revealStage();
     activateImageAnimation(idx);
     beginBtn.disabled = true;
-    beginBtn.style.opacity = '0';
     beginBtn.style.pointerEvents = 'none';
+    runTitleBanner();
 
     let musicStarted = false;
     let glissDone = false;

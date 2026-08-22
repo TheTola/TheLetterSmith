@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 from typing import Iterable, Optional
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 RGB = tuple[int, int, int]
 Lab = tuple[float, float, float]
@@ -32,6 +32,8 @@ _EXTREME_INTERIOR_THRESHOLD = 0.20
 _CURTAIN_LOW_PERCENTILE = 0.02
 _CURTAIN_MID_PERCENTILE = 0.50
 _CURTAIN_HIGH_PERCENTILE = 0.98
+_BANNER_TRANSPARENT_ALPHA = 3
+_BANNER_OPAQUE_ALPHA = 248
 
 
 def extract_deep_dominant_color(image_path: Path, *, hue_shift: float = 0.0) -> RGB:
@@ -63,39 +65,75 @@ def curtain_rgb_for_style(image_paths: Iterable[Path], style: str) -> RGB:
 
     if normalized in {"pure_white", "white", "white_curtain"}:
         return FALLBACK_CURTAIN_RGB
-    source_color = (
-        _representative_cover_color(cover_path)
-        if cover_path is not None
-        else FALLBACK_CURTAIN_RGB
-    )
-    normal = _normal_rgb_from_source(source_color)
+    variants = curtain_variant_rgbs(cover_path)
     if normalized in {
         "complementary",
         "complementary_curtain",
         "complementary_average_color",
     }:
-        return _rotate_rgb_hue(normal, 0.5)
-
+        return variants["complementary_average_color"]
     if normalized in {
         "normal",
         "normal_curtain",
         "inverse_complementary_color",
         "average_color",
     }:
-        return normal
-    if normalized in {"light", "light_curtain", "light_average_color"}:
-        return _relative_hls_variant(
+        return variants["average_color"]
+    if normalized in {
+        "light",
+        "light_curtain",
+        "light_average_color",
+        "normal_light",
+    }:
+        return variants["normal_light"]
+    if normalized in {"complementary_light", "complementary_light_curtain"}:
+        return variants["complementary_light"]
+    if normalized in {
+        "dark",
+        "dark_curtain",
+        "dark_average_color",
+        "normal_dark",
+    }:
+        return variants["normal_dark"]
+    if normalized in {"complementary_dark", "complementary_dark_curtain"}:
+        return variants["complementary_dark"]
+    return FALLBACK_CURTAIN_RGB
+
+
+def curtain_variant_rgbs(cover_path: Path | None) -> dict[str, RGB]:
+    """Analyze one cover once and derive every supported curtain color."""
+    source_color = (
+        _representative_cover_color(Path(cover_path))
+        if cover_path is not None
+        else FALLBACK_CURTAIN_RGB
+    )
+    normal = _normal_rgb_from_source(source_color)
+    complementary = _rotate_rgb_hue(normal, 0.5)
+    return {
+        "pure_white": FALLBACK_CURTAIN_RGB,
+        "average_color": normal,
+        "complementary_average_color": complementary,
+        "normal_light": _relative_hls_variant(
             normal,
             lightness_scale=0.72,
             saturation_scale=0.82,
-        )
-    if normalized in {"dark", "dark_curtain", "dark_average_color"}:
-        return _relative_hls_variant(
+        ),
+        "complementary_light": _relative_hls_variant(
+            complementary,
+            lightness_scale=0.72,
+            saturation_scale=0.82,
+        ),
+        "normal_dark": _relative_hls_variant(
             normal,
             lightness_scale=-0.55,
             saturation_scale=1.42,
-        )
-    return FALLBACK_CURTAIN_RGB
+        ),
+        "complementary_dark": _relative_hls_variant(
+            complementary,
+            lightness_scale=-0.55,
+            saturation_scale=1.42,
+        ),
+    }
 
 
 def _normal_rgb_from_source(rgb: RGB) -> RGB:
@@ -174,6 +212,346 @@ def write_tinted_curtain_image(source_path: Path, target_path: Path, rgb: RGB) -
 
     tinted = Image.merge("RGBA", (channels[0], channels[1], channels[2], alpha))
     tinted.save(target, format="PNG", optimize=True)
+
+
+def is_gold_pixel(red: int, green: int, blue: int, alpha: int) -> bool:
+    """Return whether a visible source pixel belongs to the gold ornament."""
+    if alpha <= 0:
+        return False
+    hue, saturation, value = colorsys.rgb_to_hsv(
+        red / 255.0,
+        green / 255.0,
+        blue / 255.0,
+    )
+    return bool(
+        value >= 0.10
+        and hue <= 0.19
+        and saturation >= 0.55
+    )
+
+
+def is_cream_banner_pixel(
+    red: int,
+    green: int,
+    blue: int,
+    alpha: int,
+) -> bool:
+    """Return whether a source pixel is part of the warm cream banner face."""
+    if alpha <= 0:
+        return False
+    _hue, saturation, value = colorsys.rgb_to_hsv(
+        red / 255.0,
+        green / 255.0,
+        blue / 255.0,
+    )
+    return bool(
+        value >= 0.28
+        and saturation <= 0.48
+        and red - blue >= 3
+        and green - blue >= 2
+    )
+
+
+def is_gray_ribbon_pixel(
+    red: int,
+    green: int,
+    blue: int,
+    alpha: int,
+) -> bool:
+    """Return whether a source pixel belongs to neutral silver artwork."""
+    if alpha <= 0:
+        return False
+    _hue, saturation, value = colorsys.rgb_to_hsv(
+        red / 255.0,
+        green / 255.0,
+        blue / 255.0,
+    )
+    return value >= 0.12 and saturation <= 0.22
+
+
+def get_darker_curtain_color(curtain_rgb: RGB) -> RGB:
+    """Derive the ribbon tint from the selected curtain tint."""
+    return _relative_hls_variant(
+        _clamp_rgb(curtain_rgb),
+        lightness_scale=-0.46,
+        saturation_scale=1.18,
+    )
+
+
+def get_bright_gem_color(curtain_rgb: RGB) -> RGB:
+    """Derive a vivid gemstone highlight from the selected curtain tint."""
+    return _relative_hls_variant(
+        _clamp_rgb(curtain_rgb),
+        lightness_scale=0.38,
+        saturation_scale=1.35,
+    )
+
+
+def recolor_banner_to_curtain_color(
+    image: Image.Image,
+    curtain_rgb: RGB,
+) -> Image.Image:
+    """Theme banner artwork while preserving shading and useful edge alpha."""
+    source = image.convert("RGBA")
+    source.putalpha(
+        source.getchannel("A").point(_clean_banner_alpha)
+    )
+    width, height = source.size
+    source_pixels = list(source.get_flattened_data())
+    gold_seed = Image.new("L", source.size)
+    gold_seed.putdata(
+        [
+            255 if is_gold_pixel(*pixel) else 0
+            for pixel in source_pixels
+        ]
+    )
+    closed_gold_mask = list(
+        gold_seed.filter(ImageFilter.MaxFilter(11))
+        .filter(ImageFilter.MinFilter(11))
+        .get_flattened_data()
+    )
+    gold_mask = [
+        max(seed, closed)
+        for seed, closed in zip(
+            gold_seed.get_flattened_data(),
+            closed_gold_mask,
+        )
+    ]
+    parchment_mask = _connected_banner_parchment_mask(
+        source_pixels,
+        width=width,
+        height=height,
+    )
+    categories = bytearray(len(source_pixels))
+    luminances = bytearray(len(source_pixels))
+    category_luminances: dict[int, list[int]] = {
+        1: [],  # cream banner
+        2: [],  # silver ribbons
+        3: [],  # central gemstones
+    }
+
+    for index, pixel in enumerate(source_pixels):
+        red, green, blue, alpha = pixel
+        if alpha <= 0 or gold_mask[index]:
+            continue
+        x = index % width
+        y = index // width
+        if _is_banner_gemstone_pixel(
+            red,
+            green,
+            blue,
+            alpha,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+        ):
+            if _is_white_gem_sparkle(red, green, blue):
+                continue
+            category = 3
+        elif parchment_mask[index] or is_cream_banner_pixel(
+            red,
+            green,
+            blue,
+            alpha,
+        ):
+            category = 1
+        elif is_gray_ribbon_pixel(red, green, blue, alpha):
+            category = 2
+        else:
+            continue
+
+        luminance = _pixel_luminance(red, green, blue)
+        categories[index] = category
+        luminances[index] = luminance
+        category_luminances[category].append(luminance)
+
+    target_colors = {
+        1: _clamp_rgb(curtain_rgb),
+        2: get_darker_curtain_color(curtain_rgb),
+        3: get_bright_gem_color(curtain_rgb),
+    }
+    category_lookups = {
+        category: _banner_category_lookups(values, target_colors[category])
+        for category, values in category_luminances.items()
+        if values
+    }
+    themed_pixels = list(source_pixels)
+    for index, category in enumerate(categories):
+        if not category:
+            continue
+        red_lookup, green_lookup, blue_lookup = category_lookups[category]
+        luminance = luminances[index]
+        themed_pixels[index] = (
+            red_lookup[luminance],
+            green_lookup[luminance],
+            blue_lookup[luminance],
+            source_pixels[index][3],
+        )
+
+    themed = Image.new("RGBA", source.size)
+    themed.putdata(themed_pixels)
+    return themed
+
+
+def _clean_banner_alpha(alpha: int) -> int:
+    if alpha <= _BANNER_TRANSPARENT_ALPHA:
+        return 0
+    if alpha >= _BANNER_OPAQUE_ALPHA:
+        return 255
+    return alpha
+
+
+def write_recolored_banner_image(
+    source_path: Path,
+    target_path: Path,
+    curtain_rgb: RGB,
+) -> None:
+    """Write the reusable banner themed to the current curtain color."""
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(source_path) as opened:
+        source = ImageOps.exif_transpose(opened).convert("RGBA")
+    themed = recolor_banner_to_curtain_color(source, curtain_rgb)
+    themed.save(target, format="PNG", optimize=True)
+
+
+def _is_banner_gemstone_pixel(
+    red: int,
+    green: int,
+    blue: int,
+    alpha: int,
+    *,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+) -> bool:
+    if alpha <= 0:
+        return False
+    _hue, saturation, value = colorsys.rgb_to_hsv(
+        red / 255.0,
+        green / 255.0,
+        blue / 255.0,
+    )
+    if saturation > 0.25 or value < 0.10:
+        return False
+    normalized_x = x / max(1, width - 1)
+    normalized_y = y / max(1, height - 1)
+    return _inside_normalized_diamond(
+        normalized_x,
+        normalized_y,
+        center_x=0.5,
+        center_y=0.381,
+        radius_x=0.041,
+        radius_y=0.051,
+    ) or _inside_normalized_diamond(
+        normalized_x,
+        normalized_y,
+        center_x=0.5,
+        center_y=0.599,
+        radius_x=0.044,
+        radius_y=0.059,
+    )
+
+
+def _inside_normalized_diamond(
+    x: float,
+    y: float,
+    *,
+    center_x: float,
+    center_y: float,
+    radius_x: float,
+    radius_y: float,
+) -> bool:
+    return (
+        abs(x - center_x) / radius_x
+        + abs(y - center_y) / radius_y
+        <= 1.0
+    )
+
+
+def _is_white_gem_sparkle(red: int, green: int, blue: int) -> bool:
+    return max(red, green, blue) >= 249 and max(red, green, blue) - min(
+        red,
+        green,
+        blue,
+    ) <= 7
+
+
+def _connected_banner_parchment_mask(
+    source_pixels: list[tuple[int, int, int, int]],
+    *,
+    width: int,
+    height: int,
+) -> bytearray:
+    candidate = Image.new("L", (width, height))
+    candidate.putdata(
+        [
+            255 if _is_neutral_parchment_candidate(*pixel) else 0
+            for pixel in source_pixels
+        ]
+    )
+    for normalized_x, normalized_y in (
+        (0.500, 0.500),
+        (0.064, 0.575),
+        (0.080, 0.575),
+        (0.936, 0.575),
+    ):
+        seed = (
+            round(normalized_x * max(0, width - 1)),
+            round(normalized_y * max(0, height - 1)),
+        )
+        if candidate.getpixel(seed) == 255:
+            ImageDraw.floodfill(candidate, seed, 128, thresh=0)
+    return bytearray(
+        1 if value == 128 else 0
+        for value in candidate.get_flattened_data()
+    )
+
+
+def _is_neutral_parchment_candidate(
+    red: int,
+    green: int,
+    blue: int,
+    alpha: int,
+) -> bool:
+    if alpha <= 0:
+        return False
+    _hue, saturation, value = colorsys.rgb_to_hsv(
+        red / 255.0,
+        green / 255.0,
+        blue / 255.0,
+    )
+    return saturation <= 0.28 and value >= 0.25
+
+
+def _pixel_luminance(red: int, green: int, blue: int) -> int:
+    return max(
+        0,
+        min(
+            255,
+            round(0.299 * red + 0.587 * green + 0.114 * blue),
+        ),
+    )
+
+
+def _banner_category_lookups(
+    luminances: list[int],
+    target_rgb: RGB,
+) -> tuple[list[int], list[int], list[int]]:
+    ordered = sorted(luminances)
+
+    def percentile(fraction: float) -> int:
+        index = round((len(ordered) - 1) * fraction)
+        return ordered[max(0, min(len(ordered) - 1, index))]
+
+    return _perceptual_curtain_lookups(
+        target_rgb,
+        low_point=percentile(_CURTAIN_LOW_PERCENTILE),
+        midpoint=percentile(_CURTAIN_MID_PERCENTILE),
+        high_point=percentile(_CURTAIN_HIGH_PERCENTILE),
+    )
 
 
 def _visible_luminance_percentiles(

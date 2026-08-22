@@ -1,0 +1,245 @@
+{
+  "schema_version": "1.0",
+  "product": {
+    "name": "Letter Smith",
+    "version": "1.0.0",
+    "publisher": "Infini Works",
+    "executable": "LetterSmith.exe"
+  },
+  "installer": {
+    "name": "LetterSmith-Setup-1.0.0.exe",
+    "app_id": "{44498786-B309-5F44-9BDB-E2B7250E6304}",
+    "start_menu_name": "Letter Smith",
+    "desktop_shortcut_default": false
+  },
+  "entrypoint": "Main.py",
+  "application_resources": {
+    "controls": [
+      "cleft.png",
+      "cright.png",
+      "npage.png",
+      "ppage.png",
+      "showmessageicon.png",
+      "voloff.png",
+      "volon.png"
+    ],
+    "icons": [
+      "bannerman.png",
+      "bloodsnow.gif",
+      "close.png",
+      "com.gif",
+      "command.png",
+      "copy.png",
+      "Exi.png",
+      "GO.png",
+      "Help.gif",
+      "HHelp.gif",
+      "maxi.png",
+      "mini.png",
+      "minimize.png",
+      "open.png",
+      "preview.png",
+      "Pwrite.png",
+      "reticle.png",
+      "scanned.gif",
+      "Settings.gif",
+      "settings.png"
+    ],
+    "icons/buttons": [
+      "BButton.png",
+      "CButton.png",
+      "DButton.png",
+      "EButton.png",
+      "GButton.png",
+      "IButton.png",
+      "LButton.png",
+      "MButton.png",
+      "PButton.png",
+      "RButton.png",
+      "ROButton.png"
+    ],
+    "icons/folder": [
+      "lsmith.ico",
+      "lsmith.png"
+    ],
+    "pages": [
+      "Dmessage.png"
+    ],
+    "sounds": [
+      "flip1.mp3",
+      "flip2.mp3",
+      "flip3.mp3",
+      "flip4.mp3",
+      "flip5.mp3",
+      "flip6.mp3",
+      "flip7.mp3",
+      "flip8.mp3",
+      "flip9.mp3",
+      "flip10.mp3",
+      "glissando.mp3"
+    ]
+  },
+  "prompt_writer_files": [
+    "color.txt",
+    "effort.txt",
+    "format.txt",
+    "order.txt",
+    "role.txt",
+    "topic.txt",
+    "type.txt"
+  ],
+  "data_directories": [
+    {
+      "source": "resources/stock/images",
+      "destination": "resources/stock/images"
+    },
+    {
+      "source": "resources/stock/music",
+      "destination": "resources/stock/music"
+    },
+    {
+      "source": "resources/stock/letters",
+      "destination": "resources/stock/letters"
+    },
+    {
+      "source": "resources/examples/example_letter",
+      "destination": "resources/examples/example_letter"
+    }
+  ],
+  "data_files": [
+    {
+      "source": "gallery/app/icons/GitHub-logo.png",
+      "destination": "resources/app/icons"
+    },
+    {
+      "source": "resources/stock/stock_manifest.json",
+      "destination": "resources/stock"
+    }
+  ],
+  "binaries": [
+    {
+      "source": "tools/ffmpeg.exe",
+      "destination": "tools"
+    },
+    {
+      "source": "tools/ffprobe.exe",
+      "destination": "tools"
+    }
+  ],
+  "stock_letters": [
+    "Stock Letter 1",
+    "Stock Letter 2",
+    "Stock Letter 3"
+  ],
+  "required_python_modules": [
+    "PIL",
+    "PySide6.QtCore",
+    "PySide6.QtGui",
+    "PySide6.QtWidgets",
+    "PySide6.QtWebEngineCore",
+    "PySide6.QtWebEngineWidgets",
+    "PySide6.QtMultimedia",
+    "numpy",
+    "spellchecker",
+    "mammoth",
+    "docx",
+    "PyPDF2",
+    "keyring"
+  ],
+  "hidden_imports": [
+    "Nexus",
+    "PySide6.QtWebEngineCore",
+    "PySide6.QtWebEngineWidgets",
+    "PySide6.QtMultimedia",
+    "docx",
+    "keyring",
+    "mammoth",
+    "numpy",
+    "PIL",
+    "PyPDF2",
+    "spellchecker"
+  ],
+  "excluded_modules": [
+    "tkinter",
+    "test",
+    "tests",
+    "pytest",
+    "_pytest"
+  ],
+  "forbidden_path_parts": [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "analysis",
+    "cache",
+    "logs",
+    "originals",
+    "processeds",
+    "revisions",
+    "transactions"
+  ],
+  "release_sanitation": {
+    "production_source_roots": [
+      ".",
+      "publishing"
+    ],
+    "distribution_allowed_root_entries": [
+      "LetterSmith.exe",
+      "_internal"
+    ],
+    "distribution_forbidden_path_parts": [
+      ".git",
+      ".pytest_cache",
+      ".venv",
+      "__pycache__",
+      "active project",
+      "build",
+      "dist",
+      "logs",
+      "music archive",
+      "output",
+      "recovery",
+      "release",
+      "revisions",
+      "saved letters",
+      "screenshots",
+      "test",
+      "tests",
+      "transactions"
+    ],
+    "distribution_forbidden_file_names": [
+      ".ds_store",
+      ".env",
+      ".gitignore",
+      "current.json",
+      "editor_error.log",
+      "lettersmith-build.json",
+      "lettersmith-images.json",
+      "lettersmith-metadata.json",
+      "lettersmith-publication.json",
+      "lettersmith-sound.json",
+      "lettersmith.log",
+      "library.json",
+      "playlist.json",
+      "project_sound.json",
+      "prompt_writer_state.json",
+      "recipients.json",
+      "settings.json",
+      "thumbs.db",
+      "user_colors.json",
+      "wrangler.toml"
+    ],
+    "distribution_forbidden_suffixes": [
+      ".bak",
+      ".iss",
+      ".log",
+      ".map",
+      ".pdb",
+      ".ps1",
+      ".pyc",
+      ".pyo",
+      ".spec",
+      ".tmp"
+    ]
+  }
+}

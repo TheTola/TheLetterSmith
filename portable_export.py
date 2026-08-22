@@ -6,7 +6,7 @@ import re
 import zipfile
 from pathlib import Path
 
-from transactions import PathTransaction
+from transactional_io import PathTransaction
 
 
 DEFAULT_SINGLE_HTML_MAX_MB = 60

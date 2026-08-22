@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import logging
 import re
 import shutil
 import threading
@@ -11,14 +10,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
-from transactional_io import atomic_write_json
+from transactional_io import atomic_write_text
+from project_paths import application_paths
 
 
 SETTINGS_FILENAME = "settings.json"
-SETTINGS_SCHEMA_KEY = "settings_schema_version"
-SETTINGS_SCHEMA_VERSION = 1
-MAX_INVALID_BACKUPS = 8
-_LOGGER = logging.getLogger(__name__)
 
 REQUIRED_FEATURES_KEY = "required_features"
 PUBLISHED_PAGE_URL_KEY = "published_page_url"
@@ -38,7 +34,6 @@ DEFAULT_VISIONARY_URL = (
 
 
 DEFAULT_SETTINGS = {
-    SETTINGS_SCHEMA_KEY: SETTINGS_SCHEMA_VERSION,
     "starting_volume": 31,
     "last_audio": "music.mp3",
     "curtain_style": "pure_white",
@@ -61,8 +56,10 @@ VALID_CURTAIN_STYLES = {
     "pure_white",
     "average_color",
     "complementary_average_color",
-    "light",
-    "dark",
+    "normal_light",
+    "complementary_light",
+    "normal_dark",
+    "complementary_dark",
 }
 
 
@@ -72,8 +69,20 @@ CURTAIN_STYLE_LABELS = {
     "complementary_average_color": (
         "Complementary Curtain"
     ),
-    "light": "Light Curtain",
-    "dark": "Dark Curtain",
+    "normal_light": "Normal Light",
+    "complementary_light": "Complementary Light",
+    "normal_dark": "Normal Dark",
+    "complementary_dark": "Complementary Dark",
+}
+
+
+CURTAIN_TEXT_STYLE_PAIRS = {
+    "average_color": "complementary_average_color",
+    "complementary_average_color": "average_color",
+    "normal_light": "complementary_dark",
+    "complementary_light": "normal_dark",
+    "normal_dark": "complementary_light",
+    "complementary_dark": "normal_light",
 }
 
 
@@ -96,13 +105,23 @@ CURTAIN_STYLE_ALIASES = {
         "complementary_average_color"
     ),
 
-    "light curtain": "light",
-    "light_curtain": "light",
-    "lighter": "light",
+    "light": "normal_light",
+    "light curtain": "normal_light",
+    "light_curtain": "normal_light",
+    "lighter": "normal_light",
+    "normal light": "normal_light",
+    "normal light curtain": "normal_light",
+    "complementary light": "complementary_light",
+    "complementary light curtain": "complementary_light",
 
-    "dark curtain": "dark",
-    "dark_curtain": "dark",
-    "darker": "dark",
+    "dark": "normal_dark",
+    "dark curtain": "normal_dark",
+    "dark_curtain": "normal_dark",
+    "darker": "normal_dark",
+    "normal dark": "normal_dark",
+    "normal dark curtain": "normal_dark",
+    "complementary dark": "complementary_dark",
+    "complementary dark curtain": "complementary_dark",
 }
 
 
@@ -227,7 +246,7 @@ class SettingsChanged:
             except Exception:
                 # One failed observer must not prevent
                 # the remaining observers from updating.
-                _LOGGER.exception("Settings observer failed for keys: %s", keys)
+                continue
 
 
 class SettingsStore:
@@ -242,8 +261,6 @@ class SettingsStore:
         threading.RLock,
     ] = {}
 
-    _signals: dict[str, SettingsChanged] = {}
-
     def __init__(
         self,
         project_root: str | Path,
@@ -252,17 +269,11 @@ class SettingsStore:
             project_root
         ).resolve()
 
-        self.path = (
+        self.path = application_paths(
             self.project_root
-            / SETTINGS_FILENAME
-        )
+        ).settings_file
 
-        signal_key = str(self.path).casefold()
-        with self._locks_guard:
-            self.changed = self._signals.setdefault(
-                signal_key,
-                SettingsChanged(),
-            )
+        self.changed = SettingsChanged()
 
         self._settings: dict[
             str,
@@ -300,23 +311,6 @@ class SettingsStore:
         self,
     ) -> dict[str, Any]:
         return self.snapshot()
-
-    def last_folder(self, picker: str) -> str:
-        key = f"ui_last_folder_{str(picker).strip().casefold()}"
-        value = self.get(key, "")
-        path = Path(str(value)).expanduser() if value else None
-        return str(path) if path is not None and path.is_dir() else ""
-
-    def remember_folder(self, picker: str, selected_path: str | Path) -> str:
-        candidate = Path(selected_path).expanduser()
-        folder = candidate if candidate.is_dir() else candidate.parent
-        try:
-            folder = folder.resolve()
-        except OSError:
-            folder = folder.absolute()
-        key = f"ui_last_folder_{str(picker).strip().casefold()}"
-        self.update_fields({key: str(folder)})
-        return str(folder)
 
     def snapshot(
         self,
@@ -509,8 +503,8 @@ class SettingsStore:
             OSError,
             UnicodeError,
             json.JSONDecodeError,
-        ) as error:
-            _LOGGER.warning("Settings could not be read from %s: %s", self.path, error)
+        ):
+            pass
 
         self._backup_invalid_unlocked()
 
@@ -538,19 +532,7 @@ class SettingsStore:
                 backup,
             )
         except OSError:
-            _LOGGER.exception("Invalid settings backup failed: %s", backup)
-            return
-
-        backups = sorted(
-            self.path.parent.glob("settings.invalid.*.json"),
-            key=lambda path: path.stat().st_mtime_ns,
-            reverse=True,
-        )
-        for stale in backups[MAX_INVALID_BACKUPS:]:
-            try:
-                stale.unlink()
-            except OSError:
-                _LOGGER.exception("Could not remove old settings backup: %s", stale)
+            pass
 
     def _write_unlocked(
         self,
@@ -559,9 +541,18 @@ class SettingsStore:
             Any,
         ],
     ) -> None:
-        atomic_write_json(
+        payload = (
+            json.dumps(
+                dict(settings),
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+
+        atomic_write_text(
             self.path,
-            dict(settings),
+            payload,
         )
 
     @staticmethod
@@ -574,18 +565,6 @@ class SettingsStore:
         normalized = dict(
             settings
         )
-
-        try:
-            source_schema = int(normalized.get(SETTINGS_SCHEMA_KEY, 0))
-        except (TypeError, ValueError):
-            source_schema = 0
-        normalized[SETTINGS_SCHEMA_KEY] = SETTINGS_SCHEMA_VERSION
-        if source_schema and source_schema < SETTINGS_SCHEMA_VERSION:
-            _LOGGER.info(
-                "Settings upgraded from schema %d -> %d",
-                source_schema,
-                SETTINGS_SCHEMA_VERSION,
-            )
 
         # Starting volume
         try:
@@ -814,6 +793,7 @@ class SettingsStore:
 __all__ = [
     "CURTAIN_STYLE_ALIASES",
     "CURTAIN_STYLE_LABELS",
+    "CURTAIN_TEXT_STYLE_PAIRS",
     "DEFAULT_SETTINGS",
     "DEFAULT_VISIONARY_URL",
     "ACTIVE_PLAY_DIR_KEY",
@@ -829,8 +809,6 @@ __all__ = [
     "REQUIRED_FEATURES_KEY",
     "VISIONARY_URL_KEY",
     "SETTINGS_FILENAME",
-    "SETTINGS_SCHEMA_KEY",
-    "SETTINGS_SCHEMA_VERSION",
     "SettingsChanged",
     "SettingsStore",
     "VALID_CURTAIN_STYLES",

@@ -45,12 +45,15 @@ class SavedLetterRecipientRestoreTests(unittest.TestCase):
 
             entry = SavedLetterCatalog(root).list_entries()[0]
             restorer = SavedLetterRestorer(root)
-            restored = restorer.ensure_entry_identity(entry)
+            identified = restorer.ensure_entry_identity(entry)
+            restored = restorer.restore(identified)
 
+            self.assertEqual(identified.path, bundle.resolve())
+            self.assertEqual(restored.play_dir, bundle.resolve())
             self.assertEqual(restored.recipient, "Old Recipient")
             self.assertEqual(restored.project_id, project_id)
             self.assertTrue(restored.recipient_id)
-            self.assertEqual(restored.recipient_id, entry.recipient_id)
+            self.assertEqual(restored.recipient_id, identified.recipient_id)
             record = restorer.registry.find_by_id(restored.recipient_id)
             self.assertIsNotNone(record)
             self.assertEqual(record.display_name, "Old Recipient")

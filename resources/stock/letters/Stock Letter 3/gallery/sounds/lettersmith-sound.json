@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "mode": "single",
+  "crossfade_ms": 0,
+  "tracks": [
+    {
+      "filename": "music.mp3",
+      "display_title": "Sigma Music",
+      "duration_seconds": 0.0,
+      "content_hash": "632a4576b992926f5ca934c2919561382a1ec34aea13c0e3a1f1c8a8c481b101",
+      "original_name": "stock song Sigma Music.mp3"
+    }
+  ]
+}

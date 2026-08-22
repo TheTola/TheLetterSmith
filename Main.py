@@ -16,37 +16,48 @@ Responsibilities:
 
 from __future__ import annotations
 
+import json
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 import re
 import sys
+import threading
 import traceback
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
-from app_paths import (
-    APP_NAME,
-    APP_VERSION,
-    ORG_DOMAIN,
-    ORG_NAME,
-    resolve_application_root,
-    resolve_user_data_root,
+from application_identity import (
+    APPLICATION_NAME,
+    APPLICATION_VERSION,
+    ORGANIZATION_DOMAIN,
+    PUBLISHER_NAME,
 )
 from app_icon import configure_windows_app_identity, resolve_app_icon
-from project_paths import PROJECTS_RELATIVE_PATH
-from settings_store import SettingsStore
-from startup_check import run_startup_self_check
+from project_paths import (
+    ApplicationPaths,
+    application_paths,
+    configure_application_paths,
+)
 
 
 # =============================================================================
 # Application identity
 # =============================================================================
 
+APP_NAME: str = APPLICATION_NAME
+APP_VERSION: str = APPLICATION_VERSION
+ORG_NAME: str = PUBLISHER_NAME
+ORG_DOMAIN: str = ORGANIZATION_DOMAIN
+
+SETTINGS_FILE: str = "settings.json"
+LOG_FILE_NAME: str = "lettersmith.log"
+
 _SENSITIVE_QUERY_PATTERN = re.compile(
     r"(?i)([?&](?:access_token|refresh_token|client_secret|code|code_verifier|"
-    r"code_challenge|device_code|state|user_code)=)[^&#\s]+"
+    r"code_challenge|device_code|state|user_code|x-amz-credential|x-amz-signature|"
+    r"x-amz-security-token)=)[^&#\s]+"
 )
 _SENSITIVE_FIELD_PATTERN = re.compile(
     r"(?ix)(\b(?:access_token|refresh_token|secret_access_key|access_key_id|"
@@ -58,10 +69,7 @@ _AUTHORIZATION_PATTERN = re.compile(
     r"(?:Bearer\s+)?[^\"',;\r\n}\]]+"
 )
 _BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[^\s,;\"'}\]]+")
-_GITHUB_TOKEN_PATTERN = re.compile(
-    r"\bgh[a-z]_[A-Za-z0-9]{16,}\b",
-    re.IGNORECASE,
-)
+_GITHUB_TOKEN_PATTERN = re.compile(r"\bgh[a-z]_[A-Za-z0-9]{16,}\b", re.IGNORECASE)
 
 
 def redact_sensitive_diagnostics(value: object) -> str:
@@ -72,6 +80,12 @@ def redact_sensitive_diagnostics(value: object) -> str:
     text = _AUTHORIZATION_PATTERN.sub(r"\1[REDACTED]", text)
     text = _BEARER_PATTERN.sub("Bearer [REDACTED]", text)
     return _GITHUB_TOKEN_PATTERN.sub("[REDACTED]", text)
+
+
+class _RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_sensitive_diagnostics(super().format(record))
+
 
 # =============================================================================
 # Environment and project root
@@ -92,12 +106,12 @@ def resolve_project_root() -> Path:
     Resolve the canonical Letter Smith project directory.
 
     Frozen application:
-        Directory containing the executable.
+        PyInstaller's read-only bundled resource directory.
 
     Source application:
         Directory containing Main.py.
     """
-    return resolve_application_root()
+    return ApplicationPaths.for_runtime().resource_root
 
 
 def set_cwd(
@@ -112,7 +126,7 @@ def set_cwd(
         )
 
     except Exception:
-        logging.getLogger(__name__).exception("Could not set the application directory: %s", root)
+        pass
 
 
 def ensure_root_on_syspath(
@@ -142,10 +156,29 @@ def load_settings(
 
     Missing or invalid settings must not prevent application startup.
     """
+    path = application_paths(root).settings_file
+
+    if not path.exists():
+        return {}
+
     try:
-        return SettingsStore(root).snapshot()
+        value = json.loads(
+            path.read_text(
+                encoding="utf-8",
+                errors="ignore",
+            )
+        )
+
+        return (
+            value
+            if isinstance(
+                value,
+                dict,
+            )
+            else {}
+        )
+
     except Exception:
-        logging.getLogger(__name__).exception("Application settings could not be loaded.")
         return {}
 
 
@@ -155,10 +188,10 @@ def load_settings(
 
 def setup_logging(
     settings: dict,
-    root: Path,
+    log_directory: Path | None = None,
 ) -> None:
     """
-    Configure console logging.
+    Configure console logging and a bounded diagnostic file.
     """
     debug = bool(
         settings.get(
@@ -173,27 +206,42 @@ def setup_logging(
         else logging.INFO
     )
 
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-    try:
-        logs = resolve_user_data_root(root) / "logs"
-        logs.mkdir(parents=True, exist_ok=True)
-        handlers.append(
-            RotatingFileHandler(
-                logs / "lettersmith.log",
-                maxBytes=1_000_000,
-                backupCount=4,
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(_RedactingFormatter("%(message)s"))
+    handlers: list[logging.Handler] = [console_handler]
+    file_error: OSError | None = None
+    if log_directory is not None:
+        try:
+            log_directory.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            file_handler = RotatingFileHandler(
+                log_directory / LOG_FILE_NAME,
+                maxBytes=2 * 1024 * 1024,
+                backupCount=3,
                 encoding="utf-8",
             )
-        )
-    except OSError:
-        logging.getLogger(__name__).exception("Application log file could not be opened.")
+            file_handler.setFormatter(
+                _RedactingFormatter(
+                    "%(asctime)s %(levelname)s %(name)s %(message)s"
+                )
+            )
+            handlers.append(file_handler)
+        except OSError as error:
+            file_error = error
 
     logging.basicConfig(
         level=level,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        format="%(message)s",
         handlers=handlers,
         force=True,
     )
+    if file_error is not None:
+        logging.warning(
+            "[Logging] Diagnostic file is unavailable: %s",
+            file_error,
+        )
 
 
 def configure_qt_logging() -> None:
@@ -206,7 +254,7 @@ def configure_qt_logging() -> None:
         )
 
     except Exception:
-        logging.getLogger(__name__).exception("Qt logging configuration failed.")
+        pass
 
 
 def log_startup(
@@ -244,8 +292,12 @@ def log_startup(
     )
 
     logging.info(
-        f"[Root] {root}"
+        f"[Workspace] {root}"
     )
+
+    paths = application_paths(root)
+    logging.info(f"[Resources] {paths.resource_root}")
+    logging.info(f"[Saved Letters] {paths.saved_letters_root}")
 
     logging.info(
         f"[Icon] "
@@ -259,7 +311,7 @@ def log_startup(
         )
     ):
         logging.info(
-            f"[Projects] {(root / PROJECTS_RELATIVE_PATH).resolve()}"
+            f"[Autosave] {paths.autosave_root}"
         )
         logging.info(
             f"[Args] {' '.join(sys.argv)}"
@@ -328,6 +380,10 @@ def bootstrap_qt(
         APP_NAME
     )
 
+    application.setApplicationVersion(
+        APP_VERSION
+    )
+
     application.setOrganizationName(
         ORG_NAME
     )
@@ -368,15 +424,35 @@ def _show_critical(
         )
 
     except Exception:
-        logging.getLogger(__name__).exception("Critical error dialog could not be displayed.")
+        pass
 
 
 def install_exception_hook(
     app_name: str,
+    log_path: Path | None = None,
 ) -> None:
     """
-    Install a global exception hook for visible Qt callback failures.
+    Record uncaught main-thread, background-thread, and unraisable failures.
     """
+
+    def _record_failure(
+        context: str,
+        exception_type,
+        exception,
+        traceback_object,
+    ) -> None:
+        trace = "".join(
+            traceback.format_exception(
+                exception_type,
+                exception,
+                traceback_object,
+            )
+        )
+        logging.critical(
+            "[Crash] %s\n%s",
+            context,
+            trace.rstrip(),
+        )
 
     def _hook(
         exception_type,
@@ -406,37 +482,52 @@ def install_exception_hook(
                     application.quit()
 
                 except Exception:
-                    logging.getLogger(__name__).exception("Application quit request failed.")
+                    pass
 
             return
 
-        trace = "".join(
-            traceback.format_exception(
-                exception_type,
-                exception,
-                traceback_object,
-            )
+        _record_failure(
+            "Unhandled main-thread exception.",
+            exception_type,
+            exception,
+            traceback_object,
         )
 
-        logging.error(
-            "[Crash] Unhandled exception:"
-        )
-
-        logging.error(
-            trace.rstrip()
+        details = (
+            f"\n\nDetails were written to:\n{log_path}"
+            if log_path is not None
+            else "\n\nDetails were written to the Letter Smith diagnostic log."
         )
 
         _show_critical(
             f"{app_name} — Crash",
-            "An unexpected error occurred:"
+            "An unexpected error occurred. Letter Smith may need to close."
             "\n\n"
-            f"{exception}"
-            "\n\n"
-            "A traceback was printed "
-            "to the console.",
+            f"{type(exception).__name__}: {exception}"
+            f"{details}",
+        )
+
+    def _thread_hook(args: threading.ExceptHookArgs) -> None:
+        thread_name = str(getattr(args.thread, "name", "") or "background")
+        _record_failure(
+            f"Unhandled exception in background thread {thread_name!r}.",
+            args.exc_type,
+            args.exc_value,
+            args.exc_traceback,
+        )
+
+    def _unraisable_hook(args) -> None:
+        context = str(args.err_msg or "Unraisable exception.")
+        _record_failure(
+            context,
+            args.exc_type,
+            args.exc_value,
+            args.exc_traceback,
         )
 
     sys.excepthook = _hook
+    threading.excepthook = _thread_hook
+    sys.unraisablehook = _unraisable_hook
 
 
 # =============================================================================
@@ -448,10 +539,7 @@ def connect_shutdown_handler(
     window: QtWidgets.QWidget,
 ) -> None:
     """
-    Connect Nexus.shutdown when the loaded Nexus implementation provides it.
-
-    This maintains compatibility with older Nexus versions while allowing newer
-    versions to release WebEngine, sound, Forge, and auxiliary-window resources.
+    Connect the authoritative Nexus cleanup path to Qt application shutdown.
     """
     shutdown = getattr(
         window,
@@ -468,16 +556,21 @@ def connect_shutdown_handler(
 
         return
 
+    completed = False
+
     def run_shutdown() -> None:
+        nonlocal completed
+        if completed:
+            return
+        completed = True
+        logging.info("[Shutdown] Cleanup started.")
         try:
             shutdown()
 
-        except Exception as error:
-            logging.error(
-                "[Shutdown] Cleanup failed: "
-                f"{type(error).__name__}: "
-                f"{error}"
-            )
+        except Exception:
+            logging.exception("[Shutdown] Cleanup failed.")
+        else:
+            logging.info("[Shutdown] Cleanup completed.")
 
     application.aboutToQuit.connect(
         run_shutdown
@@ -492,14 +585,24 @@ def main() -> None:
     """
     Launch Letter Smith.
     """
-    root = resolve_project_root()
+    resource_root = resolve_project_root()
+    paths = configure_application_paths(
+        ApplicationPaths.for_runtime(resource_root)
+    )
+    setup_logging({}, paths.logs_root)
+    try:
+        paths.initialize(resource_root)
+    except Exception:
+        logging.exception("[Boot] Writable storage initialization failed.")
+        raise
+    root = paths.workspace_root
 
     set_cwd(
         root
     )
 
     ensure_root_on_syspath(
-        root
+        resource_root
     )
 
     settings = load_settings(
@@ -508,7 +611,11 @@ def main() -> None:
 
     setup_logging(
         settings,
-        root,
+        paths.logs_root,
+    )
+    logging.info(
+        "[Logging] Diagnostic log: %s",
+        paths.logs_root / LOG_FILE_NAME,
     )
 
     configure_qt_logging()
@@ -533,16 +640,9 @@ def main() -> None:
         icon
     )
 
-    startup_issues = run_startup_self_check(root)
-    critical_issues = tuple(issue for issue in startup_issues if issue.critical)
-    if critical_issues:
-        message = "\n".join(issue.message for issue in critical_issues)
-        logging.error("Startup self-check failed:\n%s", message)
-        _show_critical(f"{APP_NAME} — Startup Error", message)
-        raise SystemExit(1)
-
     install_exception_hook(
-        APP_NAME
+        APP_NAME,
+        paths.logs_root / LOG_FILE_NAME,
     )
 
     # Import Nexus only after logging and Qt have been initialized.
@@ -614,9 +714,14 @@ def main() -> None:
         f"minimized={window.isMinimized()}"
     )
 
-    exit_code = (
-        application.exec()
-    )
+    try:
+        exit_code = application.exec()
+    except BaseException:
+        logging.exception("[Crash] Qt event loop failed.")
+        raise
+
+    logging.info("[Shutdown] Qt event loop stopped with code %s.", exit_code)
+    logging.shutdown()
 
     raise SystemExit(
         exit_code
