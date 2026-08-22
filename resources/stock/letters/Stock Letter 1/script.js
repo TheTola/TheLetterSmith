@@ -29,8 +29,32 @@ document.addEventListener('DOMContentLoaded', () => {
   let music       = document.getElementById('bg-music');
   let musicStandby = document.getElementById('bg-music-standby');
   const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  const curtainIntroRevealMs = prefersReducedMotion ? 80 : 520;
-  const curtainFallbackOpenMs = prefersReducedMotion ? 140 : 2600;
+  const motionStyles = getComputedStyle(document.documentElement);
+  function motionDuration(property, fallbackMs){
+    const raw = motionStyles.getPropertyValue(property).trim();
+    const value = Number.parseFloat(raw);
+    if (!raw || !Number.isFinite(value)) return fallbackMs;
+    return raw.endsWith('s') && !raw.endsWith('ms') ? value * 1000 : value;
+  }
+  function motionValue(property, fallback){
+    return motionStyles.getPropertyValue(property).trim() || fallback;
+  }
+  const motion = Object.freeze({
+    duration: Object.freeze({
+      overlay: motionDuration('--duration-overlay', 180),
+      major: motionDuration('--duration-major', 640),
+      curtain: motionDuration('--duration-curtain', 1500),
+    }),
+    easing: Object.freeze({
+      emphasized: motionValue('--ease-emphasized', 'cubic-bezier(.65,0,.35,1)'),
+    }),
+    ease(value){
+      const t = clamp(value, 0, 1);
+      return t * t * t * (t * ((t * 6) - 15) + 10);
+    },
+  });
+  const curtainIntroRevealMs = prefersReducedMotion ? 80 : motion.duration.major;
+  const curtainOpenMs = prefersReducedMotion ? 140 : motion.duration.curtain;
   const curtainCleanupPadMs = prefersReducedMotion ? 20 : 0;
   const titleBannerDelayMs = prefersReducedMotion ? 80 : 500;
   const titleBannerFadeInMs = prefersReducedMotion ? 10 : 280;
@@ -39,7 +63,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const glissSafetyPadMs = prefersReducedMotion ? 120 : 450;
   const musicFadeMs = prefersReducedMotion ? 120 : 900;
   const wallRevealDelayMs = prefersReducedMotion ? 80 : 2200;
-  const wallRevealFadeMs = prefersReducedMotion ? 120 : 900;
+  const wallRevealFadeMs = prefersReducedMotion ? 120 : motion.duration.overlay;
 
   const TOTAL = slides.length;
   let started = false;
@@ -594,17 +618,23 @@ document.addEventListener('DOMContentLoaded', () => {
     turn.style.opacity = visible ? '1' : '0';
     turnShadow.style.opacity = visible ? '1' : '0';
   }
-  function setTurnRotation(degrees){
+  function setTurnRotation(degrees, progress, direction){
     turn.style.transformOrigin = '0% 50%';
     turn.style.transform = `rotateY(${degrees}deg)`;
     const amount = clamp(Math.abs(degrees) / 180, 0, 1);
     const edge = Math.pow(Math.sin(amount * Math.PI), 1.2);
     const glint = Math.pow(Math.sin(amount * Math.PI), 2);
+    const shadowProgress = clamp(progress, 0, 1);
+    const shadowX = direction > 0
+      ? 88 - (76 * shadowProgress)
+      : 12 + (76 * shadowProgress);
     sheetFront.style.setProperty('--edgeA', String(0.28 * edge));
     sheetFront.style.setProperty('--glintA', String(0.22 * glint));
-    turnShadow.style.setProperty('--sx', degrees < 0 ? '26%' : '16%');
-    turnShadow.style.setProperty('--sd', String(0.14 + (0.22 * edge)));
-    turnShadow.style.setProperty('--sb', `${10 + (10 * edge)}px`);
+    sheetFront.style.setProperty('--edgeDirection', direction > 0 ? '90deg' : '270deg');
+    sheetFront.style.setProperty('--glintX', direction > 0 ? '92%' : '8%');
+    turnShadow.style.setProperty('--sx', `${shadowX}%`);
+    turnShadow.style.setProperty('--sd', String(0.04 + (0.16 * edge)));
+    turnShadow.style.setProperty('--sb', `${8 + (8 * edge)}px`);
   }
   function finishTurn(currentSlide, targetSlide, targetIndex){
     currentSlide.classList.remove('ghost');
@@ -637,6 +667,7 @@ document.addEventListener('DOMContentLoaded', () => {
     slideshowEl.setAttribute('aria-busy', 'true');
 
     const goingNext = target > idx;
+    const direction = goingNext ? 1 : -1;
     const currentSlide = slides[idx];
     const targetSlide = slides[target];
     prepareImageAnimation(target);
@@ -650,24 +681,22 @@ document.addEventListener('DOMContentLoaded', () => {
     if (goingNext){
       targetSlide.classList.add('peek');
       currentSlide.classList.add('ghost');
-      setTurnRotation(0);
+      setTurnRotation(0, 0, direction);
     } else {
-      setTurnRotation(-180);
+      setTurnRotation(-180, 0, direction);
     }
     setTurnVisible(true);
     playFlip();
 
-    const duration = 620;
+    const duration = motion.duration.major;
     const startedAt = performance.now();
     function animate(now){
       const raw = clamp((now - startedAt) / duration, 0, 1);
-      const eased = raw < 0.5
-        ? 4 * raw * raw * raw
-        : 1 - (Math.pow((-2 * raw) + 2, 3) / 2);
+      const eased = motion.ease(raw);
       const degrees = goingNext
         ? -180 * eased
         : -180 + (180 * eased);
-      setTurnRotation(degrees);
+      setTurnRotation(degrees, eased, direction);
       if (raw < 1){
         requestAnimationFrame(animate);
         return;
@@ -862,10 +891,10 @@ document.addEventListener('DOMContentLoaded', () => {
   function glissDurationMs(audioEl){
     const d = audioEl && Number.isFinite(audioEl.duration) ? audioEl.duration : 0;
     if (d > 0.25) return Math.round(d * 1000);
-    return curtainFallbackOpenMs;
+    return curtainOpenMs;
   }
-  function runCurtainMotion(durationMs, onDone){
-    const openMs = prefersReducedMotion ? 140 : Math.max(500, Math.round(durationMs || curtainFallbackOpenMs));
+  function runCurtainMotion(onDone){
+    const openMs = curtainOpenMs;
     overlay.style.opacity = '1';
     overlay.style.animation = 'none';
     overlay.style.background = 'transparent';
@@ -876,8 +905,8 @@ document.addEventListener('DOMContentLoaded', () => {
     cLeft.style.animation = 'none';
     cRight.style.animation = 'none';
     void cLeft.offsetWidth;
-    cLeft.style.animation = `curtainLeftOut ${openMs}ms cubic-bezier(.2,.9,.1,1) forwards`;
-    cRight.style.animation = `curtainRightOut ${openMs}ms cubic-bezier(.2,.9,.1,1) forwards`;
+    cLeft.style.animation = `curtainLeftOut ${openMs}ms ${motion.easing.emphasized} forwards`;
+    cRight.style.animation = `curtainRightOut ${openMs}ms ${motion.easing.emphasized} forwards`;
     setTimeout(() => {
       overlay.style.pointerEvents = 'none';
       overlay.setAttribute('aria-hidden', 'true');
@@ -976,7 +1005,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function beginGlissAndCurtain(g){
       if (introMotionStarted) return;
       introMotionStarted = true;
-      const openMs = runCurtainMotion(glissDurationMs(g), () => {
+      const openMs = runCurtainMotion(() => {
         curtainDone = true;
         tryUnlockIntroControls();
       });
@@ -984,7 +1013,8 @@ document.addEventListener('DOMContentLoaded', () => {
         g.currentTime = 0;
         g.play().catch(() => startMusicAfterGliss());
       }catch(_){ startMusicAfterGliss(); }
-      safetyTimer = setTimeout(startMusicAfterGliss, openMs + glissSafetyPadMs);
+      const glissWaitMs = Math.max(openMs, glissDurationMs(g));
+      safetyTimer = setTimeout(startMusicAfterGliss, glissWaitMs + glissSafetyPadMs);
     }
     try{
       const g = new Audio(glissSrc);
@@ -997,7 +1027,7 @@ document.addEventListener('DOMContentLoaded', () => {
       g.load();
       setTimeout(() => beginGlissAndCurtain(g), 250);
     }catch(_){
-      const openMs = runCurtainMotion(curtainFallbackOpenMs, () => { curtainDone = true; tryUnlockIntroControls(); });
+      const openMs = runCurtainMotion(() => { curtainDone = true; tryUnlockIntroControls(); });
       setTimeout(startMusicAfterGliss, openMs);
     }
   }

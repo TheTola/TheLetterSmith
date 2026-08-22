@@ -6,8 +6,16 @@
   "recipient_normalized_key": "stock",
   "recipient_name": "Stock",
   "recipient_title": "Stock: Letter 1",
-  "build_timestamp": "2026-08-12T16:15:24.724353+00:00",
+  "build_timestamp": "2026-08-22T16:32:04.509644+00:00",
   "published_page_url": "",
+  "published_public_path": "",
+  "published_at": "",
+  "published_expires_at": "",
+  "publication_provider": "",
+  "publication_verified": false,
+  "published_source_fingerprint": "",
+  "published_github_owner": "",
+  "published_github_repository": "",
   "settings": {
     "starting_volume": 23,
     "music_volume": 23,
@@ -32,14 +40,14 @@
   "sound": {
     "mode": "single",
     "playlist_order": [
-      "stock song Dark"
+      "Dark"
     ],
     "track_count": 1,
     "crossfade_ms": 0
   },
   "readiness": {
-    "percentage": 100,
-    "status": "Ready"
+    "percentage": 89,
+    "status": "Ready — Missing Optional Features"
   },
   "cover_thumbnail_path": "gallery/pages/cover.png",
   "schema_version": "1.0",
