@@ -20,6 +20,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 
 from audio_tools import (
     AudioToolError,
+    audio_tool_filename,
     convert_to_mp3,
     probe_audio,
     toolchain_available,
@@ -1896,8 +1897,8 @@ class _ImportWorker(
                         if not toolchain_available():
                             raise AudioToolError(
                                 "This file needs conversion, "
-                                "but tools/ffmpeg.exe and "
-                                "tools/ffprobe.exe are missing."
+                                f"but tools/{audio_tool_filename('ffmpeg')} and "
+                                f"tools/{audio_tool_filename('ffprobe')} are missing."
                             )
 
                         convert_to_mp3(

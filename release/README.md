@@ -38,3 +38,34 @@ The installer output is `release\installer\LetterSmith-Setup-1.0.0.exe`. Its
 stable AppId supports upgrades. Installation and uninstall do not remove the
 Letter Smith data under Local AppData or Documents. Installer creation re-runs
 the frozen-distribution sanitation gate before invoking Inno Setup.
+
+## macOS 13+
+
+The native macOS package must be built on macOS with Xcode command-line tools,
+Python 3.13, and the dependencies in `requirements.txt`. Add architecture-matched
+`ffmpeg` and `ffprobe` executables under `tools/macos`, then validate:
+
+```bash
+python3 release/build_macos.py --validate-only
+```
+
+Build an ad-hoc-signed `.app` and DMG for local testing:
+
+```bash
+python3 release/build_macos.py --build --confirm-package
+```
+
+For public distribution, import a Developer ID Application certificate, create
+an `xcrun notarytool` keychain profile, and run:
+
+```bash
+export LETTER_SMITH_MACOS_CODESIGN_IDENTITY="Developer ID Application: Example (TEAMID)"
+export LETTER_SMITH_MACOS_NOTARY_PROFILE="lettersmith-notary"
+export LETTER_SMITH_MACOS_TARGET_ARCH="arm64"
+python3 release/build_macos.py --build --confirm-package --notarize
+```
+
+Valid target architectures are `arm64`, `x86_64`, and `universal2`. A universal
+build requires a universal2 Python installation and universal dependencies. The
+outputs are `release/macos/dist/Letter Smith.app` and
+`release/macos/LetterSmith-1.0.0.dmg`.

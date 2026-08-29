@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -29,19 +30,33 @@ def _tool_path(path: Path, label: str) -> Path:
     return resolved
 
 
+def audio_tool_filename(name: str, *, platform_name: str | None = None) -> str:
+    base = Path(str(name)).name
+    if base != str(name) or base not in {"ffmpeg", "ffprobe"}:
+        raise ValueError("Audio tool name must be ffmpeg or ffprobe.")
+    platform = str(platform_name or sys.platform).casefold()
+    return f"{base}.exe" if platform == "win32" else base
+
+
 def ffmpeg_path() -> Path:
-    return _tool_path(application_paths().tool_path("ffmpeg.exe"), "FFmpeg")
+    return _tool_path(
+        application_paths().tool_path(audio_tool_filename("ffmpeg")),
+        "FFmpeg",
+    )
 
 
 def ffprobe_path() -> Path:
-    return _tool_path(application_paths().tool_path("ffprobe.exe"), "FFprobe")
+    return _tool_path(
+        application_paths().tool_path(audio_tool_filename("ffprobe")),
+        "FFprobe",
+    )
 
 
 def toolchain_available() -> bool:
     paths = application_paths()
     return (
-        paths.tool_path("ffmpeg.exe").is_file()
-        and paths.tool_path("ffprobe.exe").is_file()
+        paths.tool_path(audio_tool_filename("ffmpeg")).is_file()
+        and paths.tool_path(audio_tool_filename("ffprobe")).is_file()
     )
 
 

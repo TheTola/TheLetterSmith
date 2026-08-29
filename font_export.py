@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -109,6 +110,19 @@ def _font_file_match_keys(path: Path) -> set[str]:
 
 
 def _font_search_dirs() -> tuple[Path, ...]:
+    if sys.platform == "darwin":
+        return (
+            Path.home() / "Library" / "Fonts",
+            Path("/Library/Fonts"),
+            Path("/System/Library/Fonts"),
+            Path("/System/Library/Fonts/Supplemental"),
+        )
+    if os.name != "nt":
+        return (
+            Path.home() / ".local" / "share" / "fonts",
+            Path("/usr/local/share/fonts"),
+            Path("/usr/share/fonts"),
+        )
     windows_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
     result = [windows_dir]
     local_app_data = os.environ.get("LOCALAPPDATA")
@@ -135,6 +149,26 @@ def _resolve_font_file_path(value: str) -> Optional[Path]:
 
 @lru_cache(maxsize=1)
 def _load_font_registry() -> tuple[tuple[str, Path], ...]:
+    if os.name != "nt":
+        entries: list[tuple[str, Path]] = []
+        seen: set[str] = set()
+        for directory in _font_search_dirs():
+            if not directory.is_dir():
+                continue
+            for path in directory.rglob("*"):
+                if (
+                    not path.is_file()
+                    or path.suffix.casefold() not in FONT_EXPORT_EXTENSIONS
+                ):
+                    continue
+                resolved = path.resolve()
+                identity = str(resolved).casefold()
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                entries.append((resolved.stem, resolved))
+        return tuple(entries)
+
     try:
         import winreg
     except Exception:

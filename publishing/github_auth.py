@@ -435,7 +435,7 @@ class GitHubCredentialStore:
         except KeyringError as error:
             raise GitHubOperationError(
                 "credential_store",
-                "GitHub sign-in could not be read from Windows secure storage.",
+                "GitHub sign-in could not be read from system secure storage.",
                 technical_details=f"{type(error).__name__}: {error}",
             ) from error
         if not raw:
@@ -527,7 +527,7 @@ class GitHubCredentialStore:
         except KeyringError as error:
             raise GitHubOperationError(
                 "credential_store",
-                "GitHub sign-in could not be saved in Windows secure storage.",
+                "GitHub sign-in could not be saved in system secure storage.",
                 technical_details=f"{type(error).__name__}: {error}",
             ) from error
         _LOGGER.info(
@@ -544,7 +544,7 @@ class GitHubCredentialStore:
         except KeyringError as error:
             raise GitHubOperationError(
                 "credential_store",
-                "GitHub sign-out could not clear Windows secure storage.",
+                "GitHub sign-out could not clear system secure storage.",
                 technical_details=f"{type(error).__name__}: {error}",
             ) from error
         _LOGGER.info("Stored GitHub credential cleared.")

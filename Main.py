@@ -343,7 +343,7 @@ def pick_icon(
             return path
         logging.info("[Icon] Override not found: %s", path)
 
-    path = resolve_app_icon(root, prefer_png=False)
+    path = resolve_app_icon(root, prefer_png=sys.platform != "win32")
     if path is not None:
         logging.info("[Icon] Using canonical taskbar icon: %s", path)
         return path

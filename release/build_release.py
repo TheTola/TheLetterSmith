@@ -71,6 +71,15 @@ class ReleaseValidationError(RuntimeError):
     pass
 
 
+def _release_platform(platform_name: str | None = None) -> str:
+    platform = str(platform_name or sys.platform).casefold()
+    if platform == "win32":
+        return "windows"
+    if platform == "darwin":
+        return "macos"
+    raise ReleaseValidationError(f"Unsupported release platform: {platform}")
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -174,8 +183,15 @@ def _manifest_entries(
 
 def _binary_entries(
     manifest: dict[str, Any],
+    platform_name: str | None = None,
 ) -> Iterator[tuple[Path, str]]:
-    for item in manifest["binaries"]:
+    platform = _release_platform(platform_name)
+    items = (
+        manifest["binaries"]
+        if platform == "windows"
+        else manifest["macos"]["binaries"]
+    )
+    for item in items:
         yield _project_path(item["source"]), str(item["destination"])
 
 
@@ -187,10 +203,14 @@ def _files_under(path: Path) -> Iterator[Path]:
         yield from (candidate for candidate in path.rglob("*") if candidate.is_file())
 
 
-def _all_payload_files(manifest: dict[str, Any]) -> tuple[Path, ...]:
+def _all_payload_files(
+    manifest: dict[str, Any],
+    platform_name: str | None = None,
+) -> tuple[Path, ...]:
     files: dict[Path, None] = {}
     for source, _destination in (
-        list(_manifest_entries(manifest)) + list(_binary_entries(manifest))
+        list(_manifest_entries(manifest))
+        + list(_binary_entries(manifest, platform_name))
     ):
         for path in _files_under(source):
             files[path.resolve()] = None
@@ -222,9 +242,14 @@ def _production_source_files(manifest: dict[str, Any]) -> tuple[Path, ...]:
     return tuple(files)
 
 
-def _expected_payload_destinations(manifest: dict[str, Any]) -> dict[str, Path]:
+def _expected_payload_destinations(
+    manifest: dict[str, Any],
+    platform_name: str | None = None,
+) -> dict[str, Path]:
     expected: dict[str, Path] = {}
-    entries = list(_manifest_entries(manifest)) + list(_binary_entries(manifest))
+    entries = list(_manifest_entries(manifest)) + list(
+        _binary_entries(manifest, platform_name)
+    )
     for source, destination_text in entries:
         destination = _safe_destination(destination_text)
         if source.is_file():
@@ -250,6 +275,10 @@ def _validate_identity(manifest: dict[str, Any]) -> None:
         APPLICATION_NAME,
         APPLICATION_VERSION,
         EXECUTABLE_NAME,
+        MACOS_APP_NAME,
+        MACOS_BUNDLE_IDENTIFIER,
+        MACOS_DISK_IMAGE_NAME,
+        MACOS_EXECUTABLE_NAME,
         PUBLISHER_NAME,
     )
 
@@ -264,6 +293,19 @@ def _validate_identity(manifest: dict[str, Any]) -> None:
     if manifest.get("product") != expected:
         raise ReleaseValidationError(
             "Release manifest product identity differs from application_identity.py."
+        )
+    expected_macos_identity = {
+        "app_name": MACOS_APP_NAME,
+        "executable": MACOS_EXECUTABLE_NAME,
+        "bundle_identifier": MACOS_BUNDLE_IDENTIFIER,
+        "dmg_name": MACOS_DISK_IMAGE_NAME,
+    }
+    macos = manifest.get("macos")
+    if not isinstance(macos, dict) or any(
+        macos.get(key) != value for key, value in expected_macos_identity.items()
+    ):
+        raise ReleaseValidationError(
+            "Release manifest macOS identity differs from application_identity.py."
         )
     entrypoint = _project_path(manifest.get("entrypoint"))
     if entrypoint != (PROJECT_ROOT / "Main.py").resolve() or not entrypoint.is_file():
@@ -287,10 +329,15 @@ def _validate_identity(manifest: dict[str, Any]) -> None:
             )
 
 
-def _validate_allowlist(manifest: dict[str, Any]) -> tuple[Path, ...]:
+def _validate_allowlist(
+    manifest: dict[str, Any],
+    platform_name: str | None = None,
+) -> tuple[Path, ...]:
     blocked = {str(value).casefold() for value in manifest["forbidden_path_parts"]}
     seen_destinations: set[tuple[str, str]] = set()
-    entries = list(_manifest_entries(manifest)) + list(_binary_entries(manifest))
+    entries = list(_manifest_entries(manifest)) + list(
+        _binary_entries(manifest, platform_name)
+    )
     for source, destination in entries:
         _safe_destination(destination)
         if not source.exists():
@@ -307,14 +354,14 @@ def _validate_allowlist(manifest: dict[str, Any]) -> tuple[Path, ...]:
                     f"Release input cannot contain links: {candidate}"
                 )
 
-    payload_files = _all_payload_files(manifest)
+    payload_files = _all_payload_files(manifest, platform_name)
     for path in payload_files:
         relative = path.relative_to(PROJECT_ROOT)
         if any(part.casefold() in blocked for part in relative.parts):
             raise ReleaseValidationError(f"Forbidden release path: {relative}")
         if path.suffix.casefold() in {".pyc", ".pyo"}:
             raise ReleaseValidationError(f"Bytecode cannot be bundled: {relative}")
-    _expected_payload_destinations(manifest)
+    _expected_payload_destinations(manifest, platform_name)
     return payload_files
 
 
@@ -485,9 +532,14 @@ def _run_tool(path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         raise ReleaseValidationError(f"Bundled tool could not run: {path}") from error
 
 
-def _validate_audio_tools() -> None:
-    ffmpeg = PROJECT_ROOT / "tools" / "ffmpeg.exe"
-    ffprobe = PROJECT_ROOT / "tools" / "ffprobe.exe"
+def _validate_audio_tools(platform_name: str | None = None) -> None:
+    platform = _release_platform(platform_name)
+    suffix = ".exe" if platform == "windows" else ""
+    tool_root = PROJECT_ROOT / "tools"
+    if platform == "macos":
+        tool_root /= "macos"
+    ffmpeg = tool_root / f"ffmpeg{suffix}"
+    ffprobe = tool_root / f"ffprobe{suffix}"
     for path in (ffmpeg, ffprobe):
         result = _run_tool(path, "-version")
         expected_banner = f"{path.stem} version"
@@ -638,17 +690,19 @@ def _validate_private_binary_markers(files: Iterable[Path]) -> None:
             ) from error
 
 
-def validate_release_inputs() -> dict[str, int]:
+def validate_release_inputs(
+    platform_name: str | None = None,
+) -> dict[str, int]:
     manifest = _load_json(MANIFEST_PATH)
     _validate_identity(manifest)
     source_files = _production_source_files(manifest)
-    payload_files = _validate_allowlist(manifest)
+    payload_files = _validate_allowlist(manifest, platform_name)
     _validate_application_resources(manifest)
     _validate_prompt_writer(manifest)
     _validate_stock_resources()
     _validate_saved_letter_resources(manifest)
     _validate_images(payload_files)
-    _validate_audio_tools()
+    _validate_audio_tools(platform_name)
     _validate_dependencies(manifest)
     _validate_private_text(
         (*source_files, *payload_files),
@@ -686,8 +740,12 @@ def _files_equal(first: Path, second: Path) -> bool:
                 return True
 
 
-def _validate_frozen_payload(internal: Path, manifest: dict[str, Any]) -> None:
-    expected = _expected_payload_destinations(manifest)
+def _validate_frozen_payload(
+    internal: Path,
+    manifest: dict[str, Any],
+    platform_name: str | None = None,
+) -> None:
+    expected = _expected_payload_destinations(manifest, platform_name)
     managed_roots = {"resources", "tools"}
     expected_paths = {
         relative

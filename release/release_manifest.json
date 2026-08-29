@@ -12,6 +12,29 @@
     "start_menu_name": "Letter Smith",
     "desktop_shortcut_default": false
   },
+  "macos": {
+    "app_name": "Letter Smith.app",
+    "executable": "LetterSmith",
+    "bundle_identifier": "works.infini.lettersmith",
+    "dmg_name": "LetterSmith-1.0.0.dmg",
+    "minimum_system_version": "13.0",
+    "icon": "gallery/app/icons/folder/lsmith.icns",
+    "supported_architectures": [
+      "arm64",
+      "x86_64",
+      "universal2"
+    ],
+    "binaries": [
+      {
+        "source": "tools/macos/ffmpeg",
+        "destination": "tools"
+      },
+      {
+        "source": "tools/macos/ffprobe",
+        "destination": "tools"
+      }
+    ]
+  },
   "entrypoint": "Main.py",
   "application_resources_root": "gallery/app",
   "application_resources": {

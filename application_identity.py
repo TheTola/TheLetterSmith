@@ -9,6 +9,10 @@ APP_USER_MODEL_ID = "InfiniWorks.LetterSmith"
 EXECUTABLE_NAME = "LetterSmith.exe"
 INSTALLER_NAME = "LetterSmith-Setup-1.0.0.exe"
 INSTALLER_APP_ID = "{44498786-B309-5F44-9BDB-E2B7250E6304}"
+MACOS_BUNDLE_IDENTIFIER = "works.infini.lettersmith"
+MACOS_APP_NAME = "Letter Smith.app"
+MACOS_EXECUTABLE_NAME = "LetterSmith"
+MACOS_DISK_IMAGE_NAME = "LetterSmith-1.0.0.dmg"
 
 
 __all__ = [
@@ -20,4 +24,8 @@ __all__ = [
     "EXECUTABLE_NAME",
     "INSTALLER_NAME",
     "INSTALLER_APP_ID",
+    "MACOS_BUNDLE_IDENTIFIER",
+    "MACOS_APP_NAME",
+    "MACOS_EXECUTABLE_NAME",
+    "MACOS_DISK_IMAGE_NAME",
 ]

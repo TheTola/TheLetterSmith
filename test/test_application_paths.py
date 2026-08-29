@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from audio_tools import audio_tool_filename
 from project_paths import ApplicationPaths, application_paths
 from transactional_io import set_path_hidden
 
@@ -55,6 +56,49 @@ class ApplicationPathsTests(unittest.TestCase):
             self.assertTrue(paths.saved_letters_root.is_dir())
             self.assertFalse(paths.stock_root.exists())
 
+    def test_macos_runtime_uses_native_application_support_and_cache_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            home = base / "home"
+            resource_root = base / "bundle"
+
+            paths = ApplicationPaths.for_runtime(
+                resource_root,
+                environ={"HOME": str(home)},
+                platform_name="darwin",
+            )
+
+            self.assertEqual(
+                paths.app_data_root,
+                (
+                    home
+                    / "Library"
+                    / "Application Support"
+                    / "Infini Works"
+                    / "Letter Smith"
+                ).resolve(),
+            )
+            self.assertEqual(
+                paths.cache_root,
+                (
+                    home
+                    / "Library"
+                    / "Caches"
+                    / "Infini Works"
+                    / "Letter Smith"
+                ).resolve(),
+            )
+            self.assertEqual(
+                paths.saved_letters_root,
+                (home / "Documents" / "Letter Smith" / "Saved Letters").resolve(),
+            )
+
+    def test_audio_tool_names_are_platform_native(self) -> None:
+        self.assertEqual(audio_tool_filename("ffmpeg", platform_name="win32"), "ffmpeg.exe")
+        self.assertEqual(audio_tool_filename("ffprobe", platform_name="darwin"), "ffprobe")
+        with self.assertRaises(ValueError):
+            audio_tool_filename("nested/ffmpeg", platform_name="darwin")
+
     def test_explicit_project_layout_remains_self_contained(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -102,6 +146,15 @@ class ApplicationPathsTests(unittest.TestCase):
             Path(summary["payload"]),
             (repository / "release" / "dist" / "LetterSmith").resolve(),
         )
+
+    def test_macos_release_configuration_is_cross_platform_valid(self) -> None:
+        from release.build_macos import validate_macos_configuration
+
+        summary = validate_macos_configuration(require_tools=False)
+
+        self.assertEqual(summary["app"], "Letter Smith.app")
+        self.assertEqual(summary["bundle_identifier"], "works.infini.lettersmith")
+        self.assertEqual(summary["dmg"], "LetterSmith-1.0.0.dmg")
 
     def test_release_rejects_foreign_icu_runtime_dlls(self) -> None:
         from release.build_release import (

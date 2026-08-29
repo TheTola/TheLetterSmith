@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
@@ -12,6 +14,8 @@ RELEASE_ROOT = PROJECT_ROOT / "release"
 MANIFEST = json.loads(
     (RELEASE_ROOT / "release_manifest.json").read_text(encoding="utf-8")
 )
+IS_MACOS = sys.platform == "darwin"
+MACOS = MANIFEST["macos"]
 
 datas = []
 app_relative_root = Path(MANIFEST["application_resources_root"])
@@ -34,9 +38,10 @@ for item in MANIFEST["data_directories"] + MANIFEST["data_files"]:
 
 datas += collect_data_files("spellchecker")
 
+binaries_config = MACOS["binaries"] if IS_MACOS else MANIFEST["binaries"]
 binaries = [
     (str(PROJECT_ROOT / item["source"]), item["destination"])
-    for item in MANIFEST["binaries"]
+    for item in binaries_config
 ]
 
 a = Analysis(
@@ -60,12 +65,34 @@ forbidden_binary_names = {
     name.casefold()
     for name in MANIFEST["release_sanitation"]["distribution_forbidden_file_names"]
 }
-a.binaries = [
-    entry
-    for entry in a.binaries
-    if Path(entry[0]).name.casefold() not in forbidden_binary_names
-]
+if not IS_MACOS:
+    a.binaries = [
+        entry
+        for entry in a.binaries
+        if Path(entry[0]).name.casefold() not in forbidden_binary_names
+    ]
 pyz = PYZ(a.pure)
+
+codesign_identity = (
+    os.environ.get("LETTER_SMITH_MACOS_CODESIGN_IDENTITY", "").strip() or None
+    if IS_MACOS
+    else None
+)
+target_arch = (
+    os.environ.get("LETTER_SMITH_MACOS_TARGET_ARCH", "").strip() or None
+    if IS_MACOS
+    else None
+)
+entitlements_file = (
+    str(RELEASE_ROOT / "macos_entitlements.plist")
+    if IS_MACOS
+    else None
+)
+app_icon = (
+    PROJECT_ROOT / MACOS["icon"]
+    if IS_MACOS
+    else PROJECT_ROOT / "gallery/app/icons/folder/lsmith.ico"
+)
 
 exe = EXE(
     pyz,
@@ -80,11 +107,11 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    icon=str(PROJECT_ROOT / "gallery/app/icons/folder/lsmith.ico"),
-    version=str(RELEASE_ROOT / "version_info.txt"),
+    target_arch=target_arch,
+    codesign_identity=codesign_identity,
+    entitlements_file=entitlements_file,
+    icon=str(app_icon),
+    version=None if IS_MACOS else str(RELEASE_ROOT / "version_info.txt"),
     uac_admin=False,
     uac_uiaccess=False,
     contents_directory="_internal",
@@ -99,3 +126,19 @@ coll = COLLECT(
     upx_exclude=[],
     name="LetterSmith",
 )
+
+if IS_MACOS:
+    app = BUNDLE(
+        coll,
+        name=MACOS["app_name"],
+        icon=str(app_icon),
+        bundle_identifier=MACOS["bundle_identifier"],
+        version=MANIFEST["product"]["version"],
+        info_plist={
+            "CFBundleDisplayName": MANIFEST["product"]["name"],
+            "CFBundleName": MANIFEST["product"]["name"],
+            "LSMinimumSystemVersion": MACOS["minimum_system_version"],
+            "NSHighResolutionCapable": True,
+            "NSSupportsAutomaticGraphicsSwitching": True,
+        },
+    )

@@ -116,30 +116,50 @@ class ApplicationPaths:
         environ: Mapping[str, str] | None = None,
         home: str | Path | None = None,
         temporary_base: str | Path | None = None,
+        platform_name: str | None = None,
     ) -> "ApplicationPaths":
         environment = os.environ if environ is None else environ
+        runtime_platform = str(platform_name or sys.platform).casefold()
         if resource_root is None:
             frozen_root = getattr(sys, "_MEIPASS", None)
             resource_root = frozen_root or Path(__file__).resolve().parent
         resources = _resolved(resource_root)
         home_root = _resolved(
             home
-            or environment.get("USERPROFILE")
+            or environment.get(
+                "USERPROFILE" if runtime_platform == "win32" else "HOME"
+            )
             or Path.home()
-        )
-        local_app_data = _resolved(
-            environment.get("LOCALAPPDATA")
-            or (home_root / "AppData" / "Local")
         )
         documents_base = _resolved(
             environment.get("LETTER_SMITH_DOCUMENTS_ROOT")
             or (home_root / "Documents")
         )
-        app_data = local_app_data / PUBLISHER_NAME / APPLICATION_NAME
+        if runtime_platform == "darwin":
+            app_data = (
+                home_root
+                / "Library"
+                / "Application Support"
+                / PUBLISHER_NAME
+                / APPLICATION_NAME
+            )
+            cache = (
+                home_root
+                / "Library"
+                / "Caches"
+                / PUBLISHER_NAME
+                / APPLICATION_NAME
+            )
+        else:
+            local_app_data = _resolved(
+                environment.get("LOCALAPPDATA")
+                or (home_root / "AppData" / "Local")
+            )
+            app_data = local_app_data / PUBLISHER_NAME / APPLICATION_NAME
+            cache = app_data / "cache"
         documents = documents_base / APPLICATION_NAME
         workspace = app_data / "Active Project"
         sound_workspace = workspace / "gallery" / "user" / "sounds" / "appssong"
-        cache = app_data / "cache"
         temporary = _resolved(
             temporary_base
             or environment.get("LETTER_SMITH_TEMP_ROOT")
