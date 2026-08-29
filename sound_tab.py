@@ -11,6 +11,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+from time import monotonic
 from typing import Callable, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -30,19 +31,25 @@ from config import (
     STARTING_VOLUME,
     USER_SOUNDS_DIR,
 )
-from project_paths import ProjectPathResolver
+from image_button import (
+    ArtworkButton as ThemedArtworkButton,
+    set_control_invisible,
+)
+from project_paths import ProjectPathResolver, application_paths
 from project_save import ProjectSaveService
 from project_state import ProjectStateController
 
 from sound_model import (
     ProjectSoundState,
     TrackRecord,
+    analysis_cache_path,
     analysis_dir,
     atomic_write_json,
     current_music_path,
     display_title_from_name,
     ensure_sound_dirs,
     hash_file,
+    library_path,
     load_library,
     load_project_state,
     originals_dir,
@@ -57,32 +64,56 @@ from sound_model import (
 )
 
 from sound_preview import SoundPreviewWidget
+from performance_trace import performance_timed
+from transactional_io import file_change_token
+from ui_dialogs import (
+    LetterSmithConfirmationDialog,
+    LetterSmithInputDialog,
+    show_lettersmith_message,
+)
+from ui_theme import (
+    ROW_LAYOUT_SPACING,
+    SECTION_LAYOUT_SPACING,
+    SOUND_PAGE_LAYOUT,
+    ButtonTier,
+    apply_button_tier,
+    apply_tab_heading_style,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
+AudioAnalysisManager = None
+_ANALYSIS_RUNTIME_STATUS: Optional[Callable[..., tuple[bool, str]]] = None
+_ANALYSIS_IMPORT_ATTEMPTED = False
+_ANALYSIS_IMPORT_ERROR = ""
 
 
-try:
-    from sound_analyzer import (
-        AudioAnalysisManager,
-        analysis_runtime_status,
-    )
+def analysis_runtime_status(project_root=None) -> tuple[bool, str]:
+    """Load the optional NumPy/FFmpeg analysis stack only when playback needs it."""
+    global AudioAnalysisManager
+    global _ANALYSIS_RUNTIME_STATUS
+    global _ANALYSIS_IMPORT_ATTEMPTED
+    global _ANALYSIS_IMPORT_ERROR
+    if not _ANALYSIS_IMPORT_ATTEMPTED:
+        _ANALYSIS_IMPORT_ATTEMPTED = True
+        try:
+            from sound_analyzer import (
+                AudioAnalysisManager as manager_type,
+                analysis_runtime_status as status_function,
+            )
 
-except Exception as error:
-    logging.getLogger(
-        __name__
-    ).warning(
-        "Sound analysis unavailable: %s",
-        error,
-    )
-
-    AudioAnalysisManager = None
-
-    def analysis_runtime_status(_project_root=None) -> tuple[bool, str]:
+            AudioAnalysisManager = manager_type
+            _ANALYSIS_RUNTIME_STATUS = status_function
+        except Exception as error:
+            _ANALYSIS_IMPORT_ERROR = str(error)
+            _LOGGER.warning("Sound analysis unavailable: %s", error)
+    if _ANALYSIS_RUNTIME_STATUS is None:
         return (
             False,
-            "Sound analysis module could not be imported.",
+            _ANALYSIS_IMPORT_ERROR
+            or "Sound analysis module could not be imported.",
         )
+    return _ANALYSIS_RUNTIME_STATUS(project_root)
 
 
 VALID_AUDIO_EXTS = {
@@ -291,6 +322,7 @@ class CleanSlider(
             Qt.Horizontal,
             parent,
         )
+        self._theme_tokens: object | None = None
 
         self.setAttribute(
             Qt.WA_TranslucentBackground,
@@ -304,6 +336,10 @@ class CleanSlider(
         self.setMouseTracking(
             True
         )
+
+    def apply_theme_assets(self, service: object | None = None) -> None:
+        self._theme_tokens = getattr(service, "tokens", None)
+        self.update()
 
     def sizeHint(
         self,
@@ -383,32 +419,21 @@ class CleanSlider(
             / 2.0
         )
 
+        tokens = self._theme_tokens
         active_color = QtGui.QColor(
-            0,
-            200,
-            255,
-            210
-            if self.isEnabled()
-            else 90,
+            str(getattr(tokens, "primary", "#00c8ff"))
         )
+        active_color.setAlpha(210 if self.isEnabled() else 90)
 
         handle_color = QtGui.QColor(
-            0,
-            229,
-            244,
-            255
-            if self.isEnabled()
-            else 120,
+            str(getattr(tokens, "accent", "#7f9099"))
         )
+        handle_color.setAlpha(255 if self.isEnabled() else 120)
 
         outline_color = QtGui.QColor(
-            7,
-            91,
-            104,
-            255
-            if self.isEnabled()
-            else 110,
+            str(getattr(tokens, "control_border", "#58636a"))
         )
+        outline_color.setAlpha(255 if self.isEnabled() else 110)
 
         if center_x > left:
             pen = QtGui.QPen(
@@ -454,22 +479,7 @@ class CleanSlider(
         )
 
 class ArtworkButton(QtWidgets.QPushButton):
-    """
-    PNG-backed button with direct controls for:
-    - visible button width
-    - visible button height
-    - text size
-    - artwork size
-    """
-
-    # ==========================================================
-    # CHANGE THESE VALUES TO RESIZE THE BUTTONS
-    # ==========================================================
-
-    BUTTON_WIDTH = 150
-    BUTTON_HEIGHT = 50
-    TEXT_POINT_SIZE = 13
-    ARTWORK_ZOOM = 1.00
+    """PNG-backed standard-tier button."""
 
     def __init__(
         self,
@@ -482,17 +492,19 @@ class ArtworkButton(QtWidgets.QPushButton):
             parent,
         )
 
-        self._legacy_artwork_path = Path(
+        requested_path = Path(
             artwork_path
         )
+        self._baseline_artwork_path = requested_path.resolve()
         self._logical_artwork_name = (
             Path("buttons")
-            / self._legacy_artwork_path.name
+            / self._baseline_artwork_path.name
         )
-        self._artwork_path = self._legacy_artwork_path
+        self._artwork_path = self._baseline_artwork_path
         self._artwork = QtGui.QPixmap()
+        self._use_artwork = True
         self._set_artwork(
-            self._legacy_artwork_path
+            self._baseline_artwork_path
         )
 
         self._scaled_artwork_cache: dict[
@@ -500,32 +512,10 @@ class ArtworkButton(QtWidgets.QPushButton):
             QtGui.QPixmap,
         ] = {}
 
-        self._button_font = QtGui.QFont(
-            "Segoe UI",
-            self.TEXT_POINT_SIZE,
-        )
-
-        self._button_font.setBold(
-            True
-        )
-
-        self.setFont(
-            self._button_font
-        )
-
         self.setCursor(
             Qt.PointingHandCursor
         )
-
-        self.setFixedSize(
-            self.BUTTON_WIDTH,
-            self.BUTTON_HEIGHT,
-        )
-
-        self.setSizePolicy(
-            QtWidgets.QSizePolicy.Fixed,
-            QtWidgets.QSizePolicy.Fixed,
-        )
+        apply_button_tier(self, ButtonTier.STANDARD)
 
         self.setStyleSheet(
             """
@@ -566,7 +556,7 @@ class ArtworkButton(QtWidgets.QPushButton):
         self,
         service: object | None = None,
     ) -> Path:
-        """Refresh cloud artwork from the active theme, with legacy fallback."""
+        """Refresh cloud artwork from the active theme."""
         theme_service = service
         if theme_service is None:
             host = self.parentWidget()
@@ -581,7 +571,22 @@ class ArtworkButton(QtWidgets.QPushButton):
                 None,
             )
 
-        artwork_path = self._legacy_artwork_path
+        artwork_path = self._baseline_artwork_path
+        self._use_artwork = bool(
+            getattr(
+                getattr(theme_service, "current", None),
+                "uses_image_buttons",
+                True,
+            )
+        )
+        if not self._use_artwork:
+            self._artwork_path = artwork_path
+            self._artwork = QtGui.QPixmap()
+            self._scaled_artwork_cache.clear()
+            self.setStyleSheet("")
+            self.update()
+            return self._artwork_path
+
         resolver = getattr(
             theme_service,
             "resolve_asset",
@@ -607,6 +612,21 @@ class ArtworkButton(QtWidgets.QPushButton):
         self._set_artwork(
             artwork_path
         )
+        self.setStyleSheet(
+            """
+            QPushButton {
+                background: transparent;
+                border: none;
+                padding: 0px;
+                margin: 0px;
+                color: #f2fbff;
+            }
+            """
+        )
+        return self._artwork_path
+
+    @property
+    def artwork_path(self) -> Path:
         return self._artwork_path
 
     @staticmethod
@@ -701,10 +721,7 @@ class ArtworkButton(QtWidgets.QPushButton):
     def sizeHint(
         self,
     ) -> QtCore.QSize:
-        return QtCore.QSize(
-            self.BUTTON_WIDTH,
-            self.BUTTON_HEIGHT,
-        )
+        return self.minimumSize()
 
     def minimumSizeHint(
         self,
@@ -715,6 +732,9 @@ class ArtworkButton(QtWidgets.QPushButton):
         self,
         event: QtGui.QPaintEvent,
     ) -> None:
+        if not self._use_artwork:
+            super().paintEvent(event)
+            return
         del event
 
         painter = QtGui.QPainter(
@@ -741,18 +761,12 @@ class ArtworkButton(QtWidgets.QPushButton):
         if not self._artwork.isNull():
             artwork_width = max(
                 1,
-                round(
-                    button_rect.width()
-                    * self.ARTWORK_ZOOM
-                ),
+                button_rect.width(),
             )
 
             artwork_height = max(
                 1,
-                round(
-                    button_rect.height()
-                    * self.ARTWORK_ZOOM
-                ),
+                button_rect.height(),
             )
 
             target_size = (
@@ -875,11 +889,7 @@ class ArtworkButton(QtWidgets.QPushButton):
                 9,
             )
 
-        # Explicitly set the painted text font.
-        # Nexus cannot reduce this to its global 11px button font.
-        painter.setFont(
-            self._button_font
-        )
+        painter.setFont(self.font())
 
         painter.setPen(
             QtGui.QColor(
@@ -946,6 +956,10 @@ class ArtworkButton(QtWidgets.QPushButton):
                 9,
             )
 
+# Compatibility export: all live Sound controls use the centralized resolver.
+ArtworkButton = ThemedArtworkButton
+
+
 class SoundLibrary(
     QtCore.QObject
 ):
@@ -974,8 +988,16 @@ class SoundLibrary(
         ] = load_library(
             self.project_root
         )
+        self._available_track_ids_cache: frozenset[str] | None = None
 
         self._migrate_legacy_processed_files()
+
+    def invalidate_availability(self) -> None:
+        self._available_track_ids_cache = None
+
+    def replace_records(self, records: dict[str, TrackRecord]) -> None:
+        self.records = dict(records)
+        self.invalidate_availability()
 
     def _migrate_legacy_processed_files(
         self,
@@ -1060,6 +1082,7 @@ class SoundLibrary(
                 self.project_root,
                 self.records,
             )
+            self.invalidate_availability()
 
     def all_records(
         self,
@@ -1113,43 +1136,42 @@ class SoundLibrary(
         if record is None:
             return None
 
-        path = resolve_track_path(
+        normalized_id = str(track_id)
+        if normalized_id not in self.available_track_ids({normalized_id}):
+            return None
+
+        return resolve_track_path(
             self.project_root,
             record,
         )
 
-        if path.is_file():
-            return path
-
-        return None
-
     def available_track_ids(
         self,
+        track_ids: Optional[set[str]] = None,
     ) -> set[str]:
         """
         Return only archive IDs whose processed audio file still exists.
         """
 
-        return {
-            track_id
-            for track_id, record
-            in self.records.items()
-            if resolve_track_path(
-                self.project_root,
-                record,
-            ).is_file()
-        }
+        if self._available_track_ids_cache is None:
+            self._available_track_ids_cache = frozenset(
+                track_id
+                for track_id, record in self.records.items()
+                if resolve_track_path(self.project_root, record).is_file()
+            )
+        if track_ids is None:
+            return set(self._available_track_ids_cache)
+        return set(
+            self._available_track_ids_cache.intersection(
+                str(track_id) for track_id in track_ids
+            )
+        )
 
     def is_available(
         self,
         track_id: str,
     ) -> bool:
-        return (
-            str(
-                track_id
-            )
-            in self.available_track_ids()
-        )
+        return self.path_for(str(track_id)) is not None
 
     def find_by_hash(
         self,
@@ -1219,6 +1241,8 @@ class SoundLibrary(
                 self.project_root,
                 self.records,
             )
+
+            self.invalidate_availability()
 
             self.changed.emit()
 
@@ -1291,6 +1315,7 @@ class SoundLibrary(
             track_id,
             None,
         )
+        self.invalidate_availability()
 
         original_path: Optional[Path]
 
@@ -1307,13 +1332,9 @@ class SoundLibrary(
         else:
             original_path = None
 
-        analysis_path = (
-            analysis_dir(
-                self.project_root
-            )
-            / (
-                f"{Path(record.processed_file).stem}.json"
-            )
+        analysis_path = analysis_cache_path(
+            self.project_root,
+            record.processed_file,
         )
 
         for path in (
@@ -1362,16 +1383,34 @@ class ProjectSound(
 
         self.library = library
 
-        self.state = load_project_state(
-            self.project_root,
-            valid_ids=(
-                self.library
-                .available_track_ids()
-            ),
+        self.state = load_project_state(self.project_root)
+        self._persisted_state = (
+            self.state.to_dict()
+            if project_sound_path(self.project_root).is_file()
+            else None
         )
+        self._normalize_available_tracks()
 
         self._migrate_legacy_current_track()
         self.save()
+
+    def _referenced_track_ids(self) -> set[str]:
+        return {
+            track_id
+            for track_id in (
+                self.state.single_track_id,
+                self.state.selected_track_id,
+                *self.state.playlist,
+            )
+            if track_id
+        }
+
+    def _normalize_available_tracks(self) -> None:
+        self.state.normalize(
+            self.library.available_track_ids(
+                self._referenced_track_ids()
+            )
+        )
 
     def _migrate_legacy_current_track(
         self,
@@ -1417,23 +1456,29 @@ class ProjectSound(
 
     def save(
         self,
-    ) -> None:
-        self.state.normalize(
-            self.library
-            .available_track_ids()
-        )
-
-        save_project_state(
-            self.project_root,
-            self.state,
-        )
+    ) -> bool:
+        self._normalize_available_tracks()
+        current_state = self.state.to_dict()
+        changed = current_state != self._persisted_state
+        if changed:
+            self.persist_state()
 
         sync_current_compatibility(
             self.project_root,
             self.state,
             self.library.records,
         )
-        self.changed.emit()
+        if changed:
+            self.changed.emit()
+        return changed
+
+    def persist_state(self) -> None:
+        """Persist the current assignment and update the no-op write guard."""
+        save_project_state(
+            self.project_root,
+            self.state,
+        )
+        self._persisted_state = self.state.to_dict()
 
     def reconcile_missing_files(
         self,
@@ -1444,18 +1489,12 @@ class ProjectSound(
 
         before = self.state.to_dict()
 
-        self.state.normalize(
-            self.library
-            .available_track_ids()
-        )
+        self._normalize_available_tracks()
 
         if self.state.to_dict() == before:
             return False
 
-        save_project_state(
-            self.project_root,
-            self.state,
-        )
+        self.persist_state()
 
         sync_current_compatibility(
             self.project_root,
@@ -1464,6 +1503,27 @@ class ProjectSound(
         )
 
         return True
+
+    def reload_from_disk(self) -> bool:
+        previous = self.state.to_dict()
+        loaded = load_project_state(self.project_root)
+        persisted = (
+            loaded.to_dict()
+            if project_sound_path(self.project_root).is_file()
+            else None
+        )
+        self.state = loaded
+        self._normalize_available_tracks()
+        current = self.state.to_dict()
+        if current != persisted:
+            save_project_state(self.project_root, self.state)
+        self._persisted_state = current
+        sync_current_compatibility(
+            self.project_root,
+            self.state,
+            self.library.records,
+        )
+        return current != previous
 
     def set_single(
         self,
@@ -2943,6 +3003,25 @@ QListWidget {{
     color: {text};
     border: 1px solid {border};
 }}
+QTableWidget {{
+    alternate-background-color: {control};
+    gridline-color: {border};
+}}
+QHeaderView::section {{
+    background: {control};
+    color: {highlight};
+    border: none;
+    border-right: 1px solid {border};
+    border-bottom: 1px solid {border};
+    padding: 7px 9px;
+    font-weight: 700;
+}}
+QTableCornerButton::section {{
+    background: {control};
+    border: none;
+    border-right: 1px solid {border};
+    border-bottom: 1px solid {border};
+}}
 QListWidget::item {{
     border-bottom: 1px solid {border};
     padding: 11px 12px;
@@ -2951,6 +3030,14 @@ QListWidget::item:hover,
 QListWidget::item:selected {{
     background: {active};
     color: {highlight};
+}}
+QTableWidget::item {{
+    border-bottom: 1px solid {border};
+    padding: 8px 10px;
+}}
+QTableWidget::item:selected {{
+    background: #1c5275;
+    color: #ffffff;
 }}
 QPushButton {{
     background: {control};
@@ -3165,7 +3252,7 @@ class ArchiveDialog(
             top
         )
 
-        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table = QtWidgets.QTableWidget(0, 3)
         self.table.setToolTip(
             "Select a song to preview it; double-click to use it."
         )
@@ -3175,19 +3262,16 @@ class ArchiveDialog(
                 "Title",
                 "Duration",
                 "Added",
-                "Used",
             ]
         )
-        self.table.horizontalHeaderItem(3).setToolTip(
-            "A checkmark means the song is used in the current project."
-        )
+        self.table.verticalHeader().hide()
 
         self.table.horizontalHeader().setSectionResizeMode(
             0,
             QtWidgets.QHeaderView.Stretch,
         )
 
-        for column in (1, 2, 3):
+        for column in (1, 2):
             self.table.horizontalHeader().setSectionResizeMode(
                 column,
                 QtWidgets.QHeaderView.ResizeToContents,
@@ -3305,6 +3389,11 @@ class ArchiveDialog(
 
         self._previewing_id = ""
 
+        self._filter_refresh_timer = QtCore.QTimer(self)
+        self._filter_refresh_timer.setSingleShot(True)
+        self._filter_refresh_timer.setInterval(150)
+        self._filter_refresh_timer.timeout.connect(self.refresh)
+
         self.search.textChanged.connect(
             lambda _text: self._refresh_after_filter_change()
         )
@@ -3333,7 +3422,7 @@ class ArchiveDialog(
 
         self.apply_theme_assets()
 
-    def _selection_changed(self) -> None:
+    def _selection_changed(self, *, preview: bool = True) -> None:
         selected_ids = self.selected_ids()
         has_selection = bool(selected_ids)
         selected_records = [
@@ -3348,21 +3437,22 @@ class ArchiveDialog(
         self.rename_btn.setEnabled(editable and len(selected_records) == 1)
         self.delete_btn.setEnabled(editable)
         self.choose_btn.setEnabled(has_selection)
-        if has_selection:
+        if has_selection and preview:
             self._preview()
 
     def _refresh_after_filter_change(self) -> None:
         self._stop_preview()
-        self.refresh()
+        self._filter_refresh_timer.start()
 
     def _preview_failed(self, _error: QMediaPlayer.Error, message: str) -> None:
         self._stop_preview()
         detail = str(message or "The selected track could not be previewed.").strip()
-        QtWidgets.QMessageBox.warning(self, "Music Preview", detail)
+        show_lettersmith_message(self, "Music Preview", detail)
 
     def refresh(
         self,
     ) -> None:
+        self._filter_refresh_timer.stop()
         query = (
             self.search
             .text()
@@ -3396,6 +3486,8 @@ class ArchiveDialog(
                 )
             ]
 
+        selection_blocker = QtCore.QSignalBlocker(self.table)
+        self.table.clearContents()
         self.table.setRowCount(
             len(
                 records
@@ -3440,26 +3532,26 @@ class ArchiveDialog(
                 ),
             )
 
-            used_item = QtWidgets.QTableWidgetItem(
-                "✓"
-                if record.track_id in used
-                else ""
-            )
-            used_item.setTextAlignment(
-                Qt.AlignCenter
-            )
-            if record.track_id in used:
-                used_item.setToolTip(
-                    "Used in the current project."
-                )
-            self.table.setItem(
-                row,
-                3,
-                used_item,
-            )
-
         self.table.resizeRowsToContents()
-        self._selection_changed()
+        self.table.clearSelection()
+        selection_model = self.table.selectionModel()
+        model = self.table.model()
+        if selection_model is not None and model is not None:
+            selection = QtCore.QItemSelection()
+            for row, record in enumerate(records):
+                if record.track_id in used:
+                    selection.select(
+                        model.index(row, 0),
+                        model.index(row, self.table.columnCount() - 1),
+                    )
+            if not selection.isEmpty():
+                selection_model.select(
+                    selection,
+                    QtCore.QItemSelectionModel.ClearAndSelect
+                    | QtCore.QItemSelectionModel.Rows,
+                )
+        del selection_blocker
+        self._selection_changed(preview=False)
 
     def selected_ids(
         self,
@@ -3570,14 +3662,12 @@ class ArchiveDialog(
         if record.source_kind == "stock":
             return
 
-        title, accepted = (
-            QtWidgets.QInputDialog
-            .getText(
-                self,
-                "Rename Display Title",
-                "Display title:",
-                text=record.display_title,
-            )
+        title, accepted = LetterSmithInputDialog.get_text(
+            self,
+            "Rename Display Title",
+            "Display title:",
+            text=record.display_title,
+            accept_text="Rename",
         )
 
         if accepted and title.strip():
@@ -3616,6 +3706,7 @@ class ArchiveDialog(
         self,
         event: QtGui.QCloseEvent,
     ) -> None:
+        self._filter_refresh_timer.stop()
         self._stop_preview()
 
         super().closeEvent(
@@ -3623,6 +3714,7 @@ class ArchiveDialog(
         )
 
     def _on_popup_hidden(self) -> None:
+        self._filter_refresh_timer.stop()
         self._stop_preview()
 
 
@@ -3838,11 +3930,7 @@ class StockMusicDialog(
             message
             or "The selected track could not be previewed."
         ).strip()
-        QtWidgets.QMessageBox.warning(
-            self,
-            "Music Preview",
-            detail,
-        )
+        show_lettersmith_message(self, "Music Preview", detail)
 
     def _stop_preview(self) -> None:
         self.preview_player.stop()
@@ -3884,6 +3972,11 @@ class PlaylistItemWidget(
         self.track_id = (
             record.track_id
         )
+        self.record_signature = (
+            record.display_title,
+            record.original_name,
+            float(record.duration_seconds),
+        )
 
         self.setObjectName(
             "playlistRow"
@@ -3894,14 +3987,14 @@ class PlaylistItemWidget(
         )
 
         row.setContentsMargins(
-            9,
-            6,
-            7,
-            6,
+            12,
+            8,
+            10,
+            8,
         )
 
         row.setSpacing(
-            8
+            ROW_LAYOUT_SPACING
         )
 
         drag = QtWidgets.QLabel(
@@ -3961,13 +4054,54 @@ class PlaylistItemWidget(
             remove
         )
 
-        if active:
-            border = "#00c8ff"
-            background = "rgba(0,200,255,28)"
+        self._active: bool | None = None
+        self._theme_tokens: object | None = None
+        self.set_active(active)
 
+    def set_active(self, active: bool) -> None:
+        active = bool(active)
+        if active == self._active:
+            return
+        self._active = active
+        self._apply_theme_style()
+
+    def apply_theme_assets(self, service: object | None = None) -> None:
+        self._theme_tokens = getattr(service, "tokens", None)
+        self._apply_theme_style()
+
+    def _apply_theme_style(self) -> None:
+        tokens = self._theme_tokens
+        active = bool(self._active)
+        if tokens is None:
+            border = "#7f9099" if active else "#41484d"
+            background = "#2d3438" if active else "#1c2226"
+            text = "#e8eff8"
+            muted = "#cfd8e5"
+            error = "#ff7777"
         else:
-            border = "#2b3344"
-            background = "#151a22"
+            border = str(
+                getattr(
+                    tokens,
+                    "secondary_accent" if active else "control_border",
+                    "#00c8ff",
+                )
+            )
+            background = str(
+                getattr(
+                    tokens,
+                    "selected_background" if active else "control_background",
+                    "#151a22",
+                )
+            )
+            text = str(
+                getattr(
+                    tokens,
+                    "selected_text" if active else "text",
+                    "#e8eff8",
+                )
+            )
+            muted = str(getattr(tokens, "muted_text", "#cfd8e5"))
+            error = str(getattr(tokens, "error", "#ff7777"))
 
         self.setStyleSheet(
             f"""
@@ -3978,17 +4112,17 @@ class PlaylistItemWidget(
             }}
 
             QLabel {{
-                color: #e8eff8;
+                color: {text};
             }}
 
             QToolButton {{
-                color: #cfd8e5;
+                color: {muted};
                 border: none;
                 font-size: 18px;
             }}
 
             QToolButton:hover {{
-                color: #ff7777;
+                color: {error};
             }}
             """
         )
@@ -4057,12 +4191,14 @@ class SoundTab(QtWidgets.QWidget):
         self._repair_worker: Optional[
             _RepairWorker
         ] = None
+        self._button_busy = False
 
         self._pending_import_mode = "single"
         self._analysis = None
         self._analysis_key = ""
         self._analysis_disabled = False
         self._shutdown = False
+        self._background_generation = 0
 
         self._preview = SoundPreviewWidget(
             self.player.player,
@@ -4092,11 +4228,12 @@ class SoundTab(QtWidgets.QWidget):
             self._pulse_playback_button
         )
 
-        self._init_analysis()
         self._init_ui()
         self._connect_signals()
         self._reload_player_queue()
-        self._refresh_ui()
+        self._refresh_ui(refresh_playlist=False, refresh_track=False)
+        self._sound_disk_revision = self._current_sound_disk_revision()
+        self._active_sound_revision = self._current_active_sound_revision()
 
         self.preview_widget.emit(
             self._preview
@@ -4117,16 +4254,15 @@ class SoundTab(QtWidgets.QWidget):
             "stock_btn",
             "archive_btn",
             "clear_btn",
+            "single_action_btn",
+            "create_playlist_btn",
         ):
             button = getattr(
                 self,
                 name,
                 None,
             )
-            if isinstance(
-                button,
-                ArtworkButton,
-            ):
+            if isinstance(button, ThemedArtworkButton):
                 button.apply_theme_assets(
                     theme_service
                 )
@@ -4138,7 +4274,6 @@ class SoundTab(QtWidgets.QWidget):
             not _analysis_requested(
                 self.project_root
             )
-            or AudioAnalysisManager is None
         ):
             return
 
@@ -4156,6 +4291,9 @@ class SoundTab(QtWidgets.QWidget):
                 reason,
             )
 
+            return
+
+        if AudioAnalysisManager is None:
             return
 
         try:
@@ -4201,30 +4339,23 @@ class SoundTab(QtWidgets.QWidget):
             self
         )
 
-        root.setContentsMargins(
-            20,
-            16,
-            20,
-            18,
-        )
+        SOUND_PAGE_LAYOUT.apply(root)
 
-        root.setSpacing(
-            12
+        self.heading = QtWidgets.QLabel(
+            "Select music for your letter"
         )
+        apply_tab_heading_style(self.heading)
+        self.heading.setAlignment(Qt.AlignCenter)
+        root.addWidget(self.heading)
 
         header = QtWidgets.QHBoxLayout()
+        header.setContentsMargins(4, 0, 4, 2)
+        header.setSpacing(SECTION_LAYOUT_SPACING)
 
-        button_art_dir = (
-                self.project_root
-                / "gallery"
-                / "app"
-                / "icons"
-                / "buttons"
-        )
-
-        self.stock_btn = ArtworkButton(
+        self.stock_btn = ThemedArtworkButton(
             "Stock",
-            button_art_dir / "MButton.png",
+            self.project_root,
+            "AButton.png",
         )
 
         self.stock_btn.setToolTip(
@@ -4235,9 +4366,10 @@ class SoundTab(QtWidgets.QWidget):
             "Stock Music"
         )
 
-        self.archive_btn = ArtworkButton(
+        self.archive_btn = ThemedArtworkButton(
             "Archive",
-            button_art_dir / "DButton.png",
+            self.project_root,
+            "EButton.png",
         )
 
         self.archive_btn.setToolTip(
@@ -4248,10 +4380,13 @@ class SoundTab(QtWidgets.QWidget):
             "Music Archive"
         )
 
-        self.clear_btn = ArtworkButton(
+        self.clear_btn = ThemedArtworkButton(
             "Clear",
-            button_art_dir / "GButton.png",
+            self.project_root,
+            "DButton.png",
+            broken_artwork_filename="BButton.png",
         )
+        self.clear_btn.setProperty("themeRole", "clearAction")
 
         self.clear_btn.setToolTip(
             "Remove all music assigned to this letter."
@@ -4311,6 +4446,7 @@ class SoundTab(QtWidgets.QWidget):
         self.now_playing.setStyleSheet(
             """
             color: #b7c9dc;
+            font-size: 10pt;
             padding: 2px 4px;
             """
         )
@@ -4320,6 +4456,8 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         transport = QtWidgets.QHBoxLayout()
+        transport.setContentsMargins(4, 4, 4, 4)
+        transport.setSpacing(ROW_LAYOUT_SPACING)
 
         self.prev_btn = QtWidgets.QToolButton()
 
@@ -4368,6 +4506,9 @@ class SoundTab(QtWidgets.QWidget):
         self.elapsed = QtWidgets.QLabel(
             "0:00"
         )
+        self.elapsed.setStyleSheet(
+            "font-size: 10pt;"
+        )
 
         self.timeline = CleanSlider()
         self.timeline.setToolTip(
@@ -4381,6 +4522,9 @@ class SoundTab(QtWidgets.QWidget):
 
         self.total = QtWidgets.QLabel(
             "0:00"
+        )
+        self.total.setStyleSheet(
+            "font-size: 10pt;"
         )
 
         self.mute_btn = QtWidgets.QToolButton()
@@ -4447,6 +4591,7 @@ class SoundTab(QtWidgets.QWidget):
         self.volume.setValue(
             self._load_volume()
         )
+        self._last_saved_volume = self.volume.value()
 
         self.volume.setFixedWidth(
             156
@@ -4507,6 +4652,8 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         status_row = QtWidgets.QHBoxLayout()
+        status_row.setContentsMargins(4, 2, 4, 0)
+        status_row.setSpacing(ROW_LAYOUT_SPACING)
 
         self.status = QtWidgets.QLabel(
             ""
@@ -4587,16 +4734,8 @@ class SoundTab(QtWidgets.QWidget):
             panel
         )
 
-        layout.setContentsMargins(
-            18,
-            20,
-            18,
-            20,
-        )
-
-        layout.setSpacing(
-            12
-        )
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(SECTION_LAYOUT_SPACING + 2)
 
         self.single_title = QtWidgets.QLabel(
             "No music selected"
@@ -4608,7 +4747,7 @@ class SoundTab(QtWidgets.QWidget):
 
         self.single_title.setStyleSheet(
             """
-            font-size: 17px;
+            font-size: 19px;
             font-weight: 650;
             color: #eaf7ff;
             """
@@ -4627,34 +4766,31 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         self.single_detail.setStyleSheet(
-            "color: #93a8bd;"
+            "color: #93a8bd;font-size:11pt;"
         )
 
         button_row = QtWidgets.QHBoxLayout()
+        button_row.setSpacing(ROW_LAYOUT_SPACING + 2)
 
-        self.single_action_btn = QtWidgets.QPushButton(
-            "Add Music"
+        self.single_action_btn = ThemedArtworkButton(
+            "Add Music",
+            self.project_root,
+            "BButton.png",
         )
         self.single_action_btn.setToolTip(
             "Import a song and assign it to this letter."
         )
+        apply_button_tier(self.single_action_btn, ButtonTier.MEDIUM)
 
-        self.single_action_btn.setMinimumSize(
-            132,
-            40,
-        )
-
-        self.create_playlist_btn = QtWidgets.QPushButton(
-            "Create Playlist"
+        self.create_playlist_btn = ThemedArtworkButton(
+            "Create Playlist",
+            self.project_root,
+            "BButton.png",
         )
         self.create_playlist_btn.setToolTip(
             "Keep this song and add more tracks as a playlist."
         )
-
-        self.create_playlist_btn.setMinimumSize(
-            156,
-            40,
-        )
+        apply_button_tier(self.create_playlist_btn, ButtonTier.MEDIUM)
 
         self.create_playlist_btn.hide()
 
@@ -4719,18 +4855,11 @@ class SoundTab(QtWidgets.QWidget):
             panel
         )
 
-        layout.setContentsMargins(
-            12,
-            12,
-            12,
-            12,
-        )
-
-        layout.setSpacing(
-            8
-        )
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(SECTION_LAYOUT_SPACING)
 
         summary = QtWidgets.QHBoxLayout()
+        summary.setSpacing(ROW_LAYOUT_SPACING)
 
         self.playlist_summary = QtWidgets.QLabel(
             "Playlist"
@@ -4804,9 +4933,7 @@ class SoundTab(QtWidgets.QWidget):
             QtWidgets.QAbstractItemView.SingleSelection
         )
 
-        self.playlist_list.setSpacing(
-            4
-        )
+        self.playlist_list.setSpacing(6)
 
         self.playlist_list.model().rowsMoved.connect(
             self._playlist_rows_moved
@@ -4947,9 +5074,7 @@ class SoundTab(QtWidgets.QWidget):
                 )
         )
 
-        self.library.changed.connect(
-            self._refresh_ui
-        )
+        self.library.changed.connect(self._library_state_changed)
 
         self.project_sound.changed.connect(
             self._project_state_changed
@@ -4964,6 +5089,9 @@ class SoundTab(QtWidgets.QWidget):
         self.play_btn.setProperty("pulse", False)
         if playing:
             self._playback_pulse_timer.start()
+            if self._analysis is None and not self._analysis_disabled:
+                self._init_analysis()
+            self._prime_analysis_for_current()
         else:
             self._playback_pulse_timer.stop()
         self._polish_playback_button()
@@ -5015,22 +5143,21 @@ class SoundTab(QtWidgets.QWidget):
     def _save_volume(
         self,
     ) -> None:
+        value = self.volume.value()
+        if value == getattr(self, "_last_saved_volume", None):
+            return
         settings = _read_settings(
             self.project_root
         )
 
-        settings["music_volume"] = (
-            self.volume.value()
-        )
-
-        settings["starting_volume"] = (
-            self.volume.value()
-        )
+        settings["music_volume"] = value
+        settings["starting_volume"] = value
 
         _write_settings(
             self.project_root,
             settings,
         )
+        self._last_saved_volume = value
 
     def _volume_changed(self, value: int) -> None:
         value = max(
@@ -5071,12 +5198,19 @@ class SoundTab(QtWidgets.QWidget):
     def _project_state_changed(self) -> None:
         self._sync_project_sound_autosave()
         self._reload_player_queue()
-        self._refresh_ui()
+        self._refresh_ui(refresh_playlist=False, refresh_track=False)
+        self._sound_disk_revision = self._current_sound_disk_revision()
+        self._active_sound_revision = self._current_active_sound_revision()
 
         # Notify Nexus whenever the selected track or playlist changes.
         self.sound_state_changed.emit(
             "project-sound-changed"
         )
+
+    def _library_state_changed(self) -> None:
+        self._sound_disk_revision = self._current_sound_disk_revision()
+        self._active_sound_revision = self._current_active_sound_revision()
+        self._refresh_ui()
 
     def _sync_project_sound_autosave(self) -> None:
         if not self.project_state.is_project_ready:
@@ -5120,6 +5254,9 @@ class SoundTab(QtWidgets.QWidget):
 
     def _refresh_ui(
         self,
+        *,
+        refresh_playlist: bool = True,
+        refresh_track: bool = True,
     ) -> None:
         state = self.project_sound.state
 
@@ -5130,7 +5267,8 @@ class SoundTab(QtWidgets.QWidget):
                 self.playlist_panel
             )
 
-            self._refresh_playlist()
+            if refresh_playlist:
+                self._refresh_playlist()
 
         else:
             self.mode_stack.setCurrentWidget(
@@ -5186,10 +5324,11 @@ class SoundTab(QtWidgets.QWidget):
 
         self._sync_transport_enabled()
 
-        self._on_track_changed(
-            self.player.current_track_id,
-            persist_selection=False,
-        )
+        if refresh_track:
+            self._on_track_changed(
+                self.player.current_track_id,
+                persist_selection=False,
+            )
 
     def _refresh_playlist(
         self,
@@ -5198,8 +5337,6 @@ class SoundTab(QtWidgets.QWidget):
             True
         )
 
-        self.playlist_list.clear()
-
         active = (
             self.project_sound
             .state
@@ -5207,7 +5344,7 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         total_duration = 0.0
-
+        rows: list[tuple[str, TrackRecord]] = []
         for track_id in (
             self.project_sound
             .state
@@ -5229,36 +5366,49 @@ class SoundTab(QtWidgets.QWidget):
             total_duration += (
                 record.duration_seconds
             )
+            rows.append((track_id, record))
 
-            item = QtWidgets.QListWidgetItem()
+        existing_matches = self.playlist_list.count() == len(rows)
+        existing_widgets: list[PlaylistItemWidget] = []
+        if existing_matches:
+            for index, (track_id, record) in enumerate(rows):
+                item = self.playlist_list.item(index)
+                widget = self.playlist_list.itemWidget(item)
+                signature = (
+                    record.display_title,
+                    record.original_name,
+                    float(record.duration_seconds),
+                )
+                if (
+                    item.data(Qt.UserRole) != track_id
+                    or not isinstance(widget, PlaylistItemWidget)
+                    or widget.record_signature != signature
+                ):
+                    existing_matches = False
+                    break
+                existing_widgets.append(widget)
 
-            item.setData(
-                Qt.UserRole,
-                track_id,
-            )
-
-            widget = PlaylistItemWidget(
-                record,
-                track_id == active,
-            )
-
-            widget.removeRequested.connect(
-                self.project_sound
-                .remove_from_playlist
-            )
-
-            item.setSizeHint(
-                widget.sizeHint()
-            )
-
-            self.playlist_list.addItem(
-                item
-            )
-
-            self.playlist_list.setItemWidget(
-                item,
-                widget,
-            )
+        if existing_matches:
+            for widget in existing_widgets:
+                widget.set_active(widget.track_id == active)
+        else:
+            self.playlist_list.clear()
+            for track_id, record in rows:
+                item = QtWidgets.QListWidgetItem()
+                item.setData(Qt.UserRole, track_id)
+                widget = PlaylistItemWidget(
+                    record,
+                    track_id == active,
+                )
+                widget.apply_theme_assets(
+                    getattr(self.window(), "theme_service", None)
+                )
+                widget.removeRequested.connect(
+                    self.project_sound.remove_from_playlist
+                )
+                item.setSizeHint(widget.sizeHint())
+                self.playlist_list.addItem(item)
+                self.playlist_list.setItemWidget(item, widget)
 
         self.playlist_list.blockSignals(
             False
@@ -5372,36 +5522,58 @@ class SoundTab(QtWidgets.QWidget):
     def _sync_transport_enabled(
         self,
     ) -> None:
-        has_tracks = bool(
-            self.project_sound
-            .ordered_ids()
+        ordered_ids = self.project_sound.ordered_ids()
+        has_tracks = bool(ordered_ids)
+        playlist_mode = self.project_sound.state.mode == "playlist"
+        busy = self._button_busy
+
+        set_control_invisible(
+            self.play_btn,
+            False,
+            available=has_tracks,
         )
 
-        self.play_btn.setEnabled(
-            has_tracks
+        set_control_invisible(
+            self.prev_btn,
+            False,
+            available=has_tracks,
         )
 
-        self.prev_btn.setEnabled(
-            has_tracks
-        )
-
-        self.next_btn.setEnabled(
-            self.project_sound.state.mode
-            == "playlist"
-            and len(
-                self.project_sound
-                .state
-                .playlist
-            )
-            > 1
+        set_control_invisible(
+            self.next_btn,
+            False,
+            available=playlist_mode and len(ordered_ids) > 1,
         )
 
         self.timeline.setEnabled(
             has_tracks
         )
+        self.mute_btn.setEnabled(has_tracks)
+        self.volume.setEnabled(has_tracks)
 
-        self.clear_btn.setEnabled(
-            has_tracks
+        self.clear_btn.set_action_state(
+            broken=not has_tracks,
+            invisible=busy,
+        )
+        for button in (
+            self.single_action_btn,
+            self.create_playlist_btn,
+            self.archive_btn,
+            self.stock_btn,
+        ):
+            button.set_action_state(
+                broken=False,
+                invisible=busy,
+            )
+        set_control_invisible(
+            self.add_track_btn,
+            busy,
+            available=playlist_mode,
+        )
+        set_control_invisible(
+            self.convert_single_btn,
+            busy,
+            available=playlist_mode and has_tracks,
         )
 
     def _choose_new_files(
@@ -5486,7 +5658,7 @@ class SoundTab(QtWidgets.QWidget):
         self,
         paths: list[str],
     ) -> None:
-        if self._import_thread is not None:
+        if self._import_thread is not None or self._repair_thread is not None:
             return
 
         self.player.stop(
@@ -5518,12 +5690,15 @@ class SoundTab(QtWidgets.QWidget):
             worker.run
         )
 
+        generation = self._background_generation
         worker.finished.connect(
-            self._import_finished
+            lambda payload, value=generation:
+                self._accept_import_finished(value, payload)
         )
 
         worker.failed.connect(
-            self._import_failed
+            lambda message, value=generation:
+                self._accept_import_failed(value, message)
         )
 
         worker.finished.connect(
@@ -5567,6 +5742,18 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         thread.start()
+
+    def _accept_import_finished(
+        self,
+        generation: int,
+        payloads: list[dict],
+    ) -> None:
+        if generation == self._background_generation and not self._shutdown:
+            self._import_finished(payloads)
+
+    def _accept_import_failed(self, generation: int, message: str) -> None:
+        if generation == self._background_generation and not self._shutdown:
+            self._import_failed(message)
 
     def _import_finished(
         self,
@@ -5618,11 +5805,7 @@ class SoundTab(QtWidgets.QWidget):
                 persistent=True,
             )
 
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Audio Import Error",
-                message,
-            )
+            show_lettersmith_message(self, "Audio Import Error", message)
 
     def _clear_import_handles(
         self,
@@ -5639,21 +5822,10 @@ class SoundTab(QtWidgets.QWidget):
         busy: bool,
         message: str = "",
     ) -> None:
-        self.single_action_btn.setEnabled(
-            not busy
-        )
+        self._button_busy = bool(busy)
+        self._sync_transport_enabled()
 
-        self.add_track_btn.setEnabled(
-            not busy
-        )
-
-        self.archive_btn.setEnabled(
-            not busy
-        )
-
-        self.stock_btn.setEnabled(
-            not busy
-        )
+        self._set_repair_action_enabled(not busy)
 
         self.cancel_job_btn.setVisible(
             busy
@@ -5699,7 +5871,11 @@ class SoundTab(QtWidgets.QWidget):
             self._archive_tracks_chosen
         )
 
-        dialog.exec()
+        try:
+            dialog.exec()
+        finally:
+            dialog._stop_preview()
+            dialog.deleteLater()
 
     def _open_stock_for_current_mode(
         self,
@@ -5719,7 +5895,11 @@ class SoundTab(QtWidgets.QWidget):
             self._archive_tracks_chosen
         )
 
-        dialog.exec()
+        try:
+            dialog.exec()
+        finally:
+            dialog._stop_preview()
+            dialog.deleteLater()
 
     def _archive_tracks_chosen(
         self,
@@ -5769,45 +5949,31 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         if used:
-            box = QtWidgets.QMessageBox(
-                self
+            confirmation = LetterSmithConfirmationDialog(
+                self,
+                title="Track Is In Use",
+                question=(
+                    f"{record.display_title} is used by this letter. "
+                    "Remove it from the letter, or delete it from the archive?"
+                ),
+                primary_text="Delete From Archive",
+                secondary_text="Remove From This Letter",
+                secondary_accepts=True,
+                cancel_text="Cancel",
+                destructive_primary=True,
+                click_outside_dismiss=False,
+                width=680,
             )
+            confirmation.exec()
 
-            box.setWindowTitle(
-                "Track Is In Use"
-            )
-
-            box.setText(
-                f"{record.display_title} "
-                "is used by this letter."
-            )
-
-            remove_button = box.addButton(
-                "Remove From This Letter",
-                QtWidgets.QMessageBox.ActionRole,
-            )
-
-            delete_button = box.addButton(
-                "Delete From Archive",
-                QtWidgets.QMessageBox.DestructiveRole,
-            )
-
-            box.addButton(
-                QtWidgets.QMessageBox.Cancel
-            )
-
-            box.exec()
-
-            clicked = box.clickedButton()
-
-            if clicked == remove_button:
+            if confirmation.choice == "secondary":
                 self.project_sound.remove_usage(
                     track_id
                 )
 
                 return False
 
-            if clicked != delete_button:
+            if confirmation.choice != "primary":
                 return False
 
             self.project_sound.remove_usage(
@@ -5815,20 +5981,18 @@ class SoundTab(QtWidgets.QWidget):
             )
 
         else:
-            answer = (
-                QtWidgets.QMessageBox
-                .question(
-                    self,
-                    "Delete Track",
-                    (
-                        f"Delete "
-                        f"{record.display_title} "
-                        "from the music archive?"
-                    ),
-                )
+            confirmation = LetterSmithConfirmationDialog(
+                self,
+                title="Delete Track",
+                question=(
+                    f"Delete {record.display_title} from the music archive?"
+                ),
+                primary_text="Yes",
+                secondary_text="No",
+                destructive_primary=True,
+                click_outside_dismiss=False,
             )
-
-            if answer != QtWidgets.QMessageBox.Yes:
+            if confirmation.exec() != QtWidgets.QDialog.Accepted:
                 return False
 
         self.player.release_current_file_handle()
@@ -5854,9 +6018,6 @@ class SoundTab(QtWidgets.QWidget):
 
             return False
 
-        self.project_sound.save()
-        self._reload_player_queue()
-
         return True
 
     def repair_music_archive(self) -> None:
@@ -5872,7 +6033,7 @@ class SoundTab(QtWidgets.QWidget):
     def _start_archive_repair(
         self,
     ) -> None:
-        if self._repair_thread is not None:
+        if self._repair_thread is not None or self._import_thread is not None:
             return
 
         thread = QtCore.QThread(
@@ -5891,12 +6052,15 @@ class SoundTab(QtWidgets.QWidget):
             worker.run
         )
 
+        generation = self._background_generation
         worker.finished.connect(
-            self._repair_finished
+            lambda repaired, issues, value=generation:
+                self._accept_repair_finished(value, repaired, issues)
         )
 
         worker.failed.connect(
-            self._repair_failed
+            lambda message, value=generation:
+                self._accept_repair_failed(value, message)
         )
 
         worker.finished.connect(
@@ -5934,19 +6098,30 @@ class SoundTab(QtWidgets.QWidget):
 
         thread.start()
 
+    def _accept_repair_finished(
+        self,
+        generation: int,
+        repaired: int,
+        issues: list[str],
+    ) -> None:
+        if generation == self._background_generation and not self._shutdown:
+            self._repair_finished(repaired, issues)
+
+    def _accept_repair_failed(self, generation: int, message: str) -> None:
+        if generation == self._background_generation and not self._shutdown:
+            self._repair_failed(message)
+
     def _repair_finished(
         self,
         repaired: int,
         issues: list[str],
     ) -> None:
-        self.library.records = load_library(
-            self.project_root
-        )
+        self.library.replace_records(load_library(self.project_root))
 
         self.library.changed.emit()
 
         if issues:
-            QtWidgets.QMessageBox.warning(
+            show_lettersmith_message(
                 self,
                 "Archive Repair",
                 (
@@ -6029,11 +6204,7 @@ class SoundTab(QtWidgets.QWidget):
             .playlist_expanded
         )
 
-        save_project_state(
-            self.project_root,
-            self.project_sound.state,
-        )
-        self._sync_project_sound_autosave()
+        self._persist_project_sound_state()
 
         self._refresh_playlist()
 
@@ -6043,13 +6214,17 @@ class SoundTab(QtWidgets.QWidget):
         if not self.project_sound.ordered_ids():
             return
 
-        answer = QtWidgets.QMessageBox.question(
+        confirmation = LetterSmithConfirmationDialog(
             self,
-            "Clear Project Sound",
-            "Remove all music from this letter?",
+            title="Clear Music",
+            question="Remove all music from this letter?",
+            primary_text="Yes",
+            secondary_text="No",
+            destructive_primary=True,
+            click_outside_dismiss=False,
         )
 
-        if answer == QtWidgets.QMessageBox.Yes:
+        if confirmation.exec() == QtWidgets.QDialog.Accepted:
             self.player.stop(
                 reset_position=True
             )
@@ -6064,7 +6239,7 @@ class SoundTab(QtWidgets.QWidget):
 
         if self.project_sound.reconcile_missing_files():
             self._reload_player_queue()
-            self._refresh_ui()
+            self._refresh_ui(refresh_playlist=False, refresh_track=False)
 
         if not self.project_sound.ordered_ids():
             return
@@ -6074,7 +6249,6 @@ class SoundTab(QtWidgets.QWidget):
 
         else:
             self.player.play()
-            self._prime_analysis_for_current()
 
     def _on_track_changed(
         self,
@@ -6104,11 +6278,7 @@ class SoundTab(QtWidgets.QWidget):
             )
 
             try:
-                save_project_state(
-                    self.project_root,
-                    self.project_sound.state,
-                )
-                self._sync_project_sound_autosave()
+                self._persist_project_sound_state()
             except OSError as error:
                 self.project_sound.state.selected_track_id = (
                     previous_track_id
@@ -6162,7 +6332,9 @@ class SoundTab(QtWidgets.QWidget):
         else:
             preview_path = ""
 
-        self._analysis_key = ""
+        next_analysis_key = str(path.resolve()) if path is not None else ""
+        if next_analysis_key != self._analysis_key:
+            self._analysis_key = ""
         self._preview.set_audio_file(
             preview_path
         )
@@ -6175,7 +6347,8 @@ class SoundTab(QtWidgets.QWidget):
         ):
             self._refresh_playlist()
 
-        self._prime_analysis_for_current()
+        if self.player.is_playing():
+            self._prime_analysis_for_current()
 
     def _on_position_changed(
         self,
@@ -6256,25 +6429,16 @@ class SoundTab(QtWidgets.QWidget):
             self._analysis_key = ""
             return
 
-        self._analysis_key = str(
-            path.resolve()
-        )
+        path_key = str(path.resolve())
+        if path_key == self._analysis_key:
+            return
+        self._analysis_key = path_key
 
         try:
-            cached = self._analysis.load_cached(
-                path
+            self._analysis.ensure_analyzed(
+                path,
+                priority=True,
             )
-
-            if cached is not None:
-                self._preview.set_analysis_payload(
-                    cached
-                )
-
-            else:
-                self._analysis.ensure_analyzed(
-                    path,
-                    priority=True,
-                )
 
         except Exception as error:
             self._disable_analysis(
@@ -6325,15 +6489,23 @@ class SoundTab(QtWidgets.QWidget):
             message,
         )
 
+        self._shutdown_analysis(timeout_ms=2000)
+
+    def _shutdown_analysis(self, timeout_ms: int | None = None) -> bool:
         manager = self._analysis
-        self._analysis = None
-
+        if manager is None:
+            return True
         try:
-            if manager is not None:
-                manager.shutdown()
-
+            stopped = manager.shutdown(timeout_ms=timeout_ms)
         except Exception:
-            pass
+            _LOGGER.exception("Sound analysis shutdown failed.")
+            return False
+        if not stopped:
+            return False
+        self._analysis = None
+        self._analysis_key = ""
+        manager.deleteLater()
+        return True
 
     def _show_status(
         self,
@@ -6411,6 +6583,37 @@ class SoundTab(QtWidgets.QWidget):
     ) -> QtWidgets.QWidget:
         return self._preview
 
+    @staticmethod
+    def _path_revision(path: Path) -> tuple[int, int, int]:
+        try:
+            stat_result = path.stat()
+        except OSError:
+            return (-1, -1, -1)
+        return (
+            int(stat_result.st_size),
+            int(stat_result.st_mtime_ns),
+            file_change_token(path, stat_result=stat_result),
+        )
+
+    def _current_sound_disk_revision(self) -> tuple[tuple[int, int, int], ...]:
+        return tuple(
+            self._path_revision(path)
+            for path in (
+                library_path(self.project_root),
+                project_sound_path(self.project_root),
+                processed_dir(self.project_root),
+            )
+        )
+
+    def _current_active_sound_revision(self) -> tuple[object, ...]:
+        track_ids = tuple(self.project_sound.ordered_ids())
+        paths = tuple(
+            self._path_revision(path)
+            for track_id in track_ids
+            if (path := self.library.path_for(track_id)) is not None
+        )
+        return (self.project_sound.state.to_dict(), track_ids, paths)
+
     def activate_for_tab_change(self) -> None:
         if self._tab_active or self._shutdown:
             return
@@ -6422,8 +6625,13 @@ class SoundTab(QtWidgets.QWidget):
                 True
             )
 
-            # Reload project_sound.json and purge missing track files.
-            self.reload_project_from_disk()
+            if (
+                self._current_sound_disk_revision()
+                != self._sound_disk_revision
+                or self._current_active_sound_revision()
+                != self._active_sound_revision
+            ):
+                self.reload_project_from_disk()
 
         except Exception:
             self._tab_active = False
@@ -6450,9 +6658,7 @@ class SoundTab(QtWidgets.QWidget):
 
         self._save_volume()
 
-        self.sound_state_changed.emit(
-            "sound-tab-deactivated"
-        )
+        self._status_timer.stop()
 
         self._tab_active = False
 
@@ -6490,15 +6696,19 @@ class SoundTab(QtWidgets.QWidget):
                     exc_info=True,
                 )
 
-    def prepare_for_project_restore(self) -> None:
+    def prepare_for_project_restore(self, timeout_ms: int = 5000) -> None:
         """Detach every Sound-owned reader before restoring project state."""
         self.deactivate_for_tab_change()
-        self._stop_background_threads()
-
-        if self._analysis is not None:
-            self._analysis.shutdown()
-            self._analysis = None
-            self._analysis_key = ""
+        self._background_generation += 1
+        deadline = monotonic() + (max(0, int(timeout_ms)) / 1000.0)
+        if not self._stop_background_threads(
+            max(0, int((deadline - monotonic()) * 1000))
+        ):
+            raise RuntimeError("Sound background work did not stop in time.")
+        if not self._shutdown_analysis(
+            max(0, int((deadline - monotonic()) * 1000))
+        ):
+            raise RuntimeError("Sound analysis did not stop in time.")
 
         self.release_current_file_handle()
 
@@ -6560,7 +6770,8 @@ class SoundTab(QtWidgets.QWidget):
             "project-sound-cleared"
         )
 
-    def reload_project_from_disk(self) -> None:
+    @performance_timed("sound.reload_project_from_disk")
+    def reload_project_from_disk(self) -> bool:
         """
         Reload the archive and active project assignment from disk.
 
@@ -6571,33 +6782,31 @@ class SoundTab(QtWidgets.QWidget):
         self.player.stop(
             reset_position=True
         )
+        previous_active_revision = self._active_sound_revision
 
-        if (
-            self._analysis is None
-            and not self._analysis_disabled
-        ):
-            self._init_analysis()
+        self.library.replace_records(load_library(self.project_root))
 
-        self.library.records = load_library(
-            self.project_root
-        )
-
-        self.project_sound.state = load_project_state(
-            self.project_root,
-            valid_ids=(
-                self.library
-                .available_track_ids()
-            ),
-        )
-
-        self.project_sound.reconcile_missing_files()
+        state_changed = self.project_sound.reload_from_disk()
 
         self._reload_player_queue()
-        self._refresh_ui()
-
-        self.sound_state_changed.emit(
-            "sound-state-reloaded"
+        self._refresh_ui(refresh_playlist=False, refresh_track=False)
+        self._sound_disk_revision = self._current_sound_disk_revision()
+        self._active_sound_revision = self._current_active_sound_revision()
+        active_source_changed = (
+            self._active_sound_revision != previous_active_revision
         )
+
+        if state_changed or active_source_changed:
+            self.sound_state_changed.emit(
+                "sound-state-reloaded"
+            )
+        return state_changed or active_source_changed
+
+    def _persist_project_sound_state(self) -> None:
+        self.project_sound.persist_state()
+        self._sync_project_sound_autosave()
+        self._sound_disk_revision = self._current_sound_disk_revision()
+        self._active_sound_revision = self._current_active_sound_revision()
 
     def refresh_from_disk(self) -> None:
         """
@@ -6653,6 +6862,11 @@ class SoundTab(QtWidgets.QWidget):
         self._cancel_background_job()
 
         stopped = True
+        deadline = (
+            None
+            if timeout_ms is None
+            else monotonic() + (max(0, int(timeout_ms)) / 1000.0)
+        )
         for operation, thread in (
             ("audio import", self._import_thread),
             ("archive repair", self._repair_thread),
@@ -6665,10 +6879,15 @@ class SoundTab(QtWidgets.QWidget):
 
             thread.requestInterruption()
             thread.quit()
+            remaining_ms = (
+                None
+                if deadline is None
+                else max(0, int((deadline - monotonic()) * 1000))
+            )
             finished = (
                 thread.wait()
-                if timeout_ms is None
-                else thread.wait(max(0, int(timeout_ms)))
+                if remaining_ms is None
+                else thread.wait(remaining_ms)
             )
             if not finished:
                 stopped = False
@@ -6693,11 +6912,44 @@ class SoundTab(QtWidgets.QWidget):
     def shutdown(self, timeout_ms: int | None = None) -> bool:
         if self._shutdown:
             return True
-        if not self._stop_background_threads(timeout_ms):
+        deadline = (
+            None
+            if timeout_ms is None
+            else monotonic() + (max(0, int(timeout_ms)) / 1000.0)
+        )
+        remaining_ms = (
+            None
+            if deadline is None
+            else max(0, int((deadline - monotonic()) * 1000))
+        )
+        self._background_generation += 1
+        if not self._stop_background_threads(remaining_ms):
+            return False
+        remaining_ms = (
+            None
+            if deadline is None
+            else max(0, int((deadline - monotonic()) * 1000))
+        )
+        if not self._shutdown_analysis(remaining_ms):
+            _LOGGER.warning(
+                "Sound analysis did not stop within the shutdown timeout."
+            )
             return False
         self._shutdown = True
 
         self._tab_active = False
+        self._status_timer.stop()
+        self._playback_pulse_timer.stop()
+        for dialog in (
+            *self.findChildren(ArchiveDialog),
+            *self.findChildren(StockMusicDialog),
+        ):
+            filter_timer = getattr(dialog, "_filter_refresh_timer", None)
+            if filter_timer is not None:
+                filter_timer.stop()
+            dialog._stop_preview()
+            dialog.close()
+            dialog.deleteLater()
         try:
             self._preview.set_tab_active(False)
         except Exception:
@@ -6716,12 +6968,6 @@ class SoundTab(QtWidgets.QWidget):
         except Exception:
             _LOGGER.exception("Sound preview shutdown failed.")
 
-        if self._analysis is not None:
-            try:
-                self._analysis.shutdown()
-
-            except Exception:
-                _LOGGER.exception("Sound analysis shutdown failed.")
         return True
 
 

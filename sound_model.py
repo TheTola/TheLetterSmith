@@ -6,7 +6,9 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +16,7 @@ from typing import Iterable, Optional
 
 from config import MUSIC_FILE, USER_SOUNDS_DIR
 from project_paths import application_paths
+from transactional_io import file_change_token, set_path_hidden
 
 SOUND_MODEL_VERSION = 2
 ARCHIVE_DIR_NAME = "appssong"
@@ -28,6 +31,11 @@ ATOMIC_REPLACE_TIMEOUT_SECONDS = 2.0
 MAX_INVALID_BACKUPS = 8
 _LOGGER = logging.getLogger(__name__)
 _LOGGED_STOCK_ROOTS: set[Path] = set()
+_HASH_CACHE_LIMIT = 512
+_HASH_CACHE: OrderedDict[
+    tuple[str, int, int, int, int, int], str
+] = OrderedDict()
+_HASH_CACHE_LOCK = threading.RLock()
 
 
 def _replace_with_retry(source: Path, destination: Path) -> None:
@@ -67,16 +75,33 @@ def analysis_dir(project_root: str | Path) -> Path:
     return archive_root(project_root) / ANALYSIS_DIR_NAME
 
 
+def analysis_cache_path(
+    project_root: str | Path,
+    source_path: str | Path,
+) -> Path:
+    path = analysis_dir(project_root) / (
+        Path(source_path).name + ".analysis.json"
+    )
+    set_path_hidden(path)
+    return path
+
+
 def library_path(project_root: str | Path) -> Path:
-    return archive_root(project_root) / LIBRARY_FILE_NAME
+    path = archive_root(project_root) / LIBRARY_FILE_NAME
+    set_path_hidden(path)
+    return path
 
 
 def project_sound_path(project_root: str | Path) -> Path:
-    return application_paths(project_root).project_sound_state_file
+    path = application_paths(project_root).project_sound_state_file
+    set_path_hidden(path)
+    return path
 
 
 def current_manifest_path(project_root: str | Path) -> Path:
-    return application_paths(project_root).current_sound_manifest_file
+    path = application_paths(project_root).current_sound_manifest_file
+    set_path_hidden(path)
+    return path
 
 
 def current_music_path(project_root: str | Path) -> Path:
@@ -100,9 +125,11 @@ def atomic_write_json(path: str | Path, payload: dict) -> None:
     tmp = Path(tmp_name)
     try:
         tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        set_path_hidden(destination, False)
         _replace_with_retry(tmp, destination)
     finally:
         tmp.unlink(missing_ok=True)
+        set_path_hidden(destination)
 
 
 def _backup_invalid_json(path: Path) -> None:
@@ -114,6 +141,7 @@ def _backup_invalid_json(path: Path) -> None:
     )
     try:
         shutil.copy2(path, backup)
+        set_path_hidden(backup)
     except OSError:
         _LOGGER.exception("Invalid sound data backup failed: %s", backup)
         return
@@ -155,14 +183,49 @@ def read_json(path: str | Path, default: dict) -> dict:
 
 
 def hash_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
+    source = Path(path).resolve()
+    for _attempt in range(2):
+        stat_result = source.stat()
+        signature = (
+            os.path.normcase(str(source)),
+            int(stat_result.st_size),
+            int(stat_result.st_mtime_ns),
+            file_change_token(source, stat_result=stat_result),
+            int(stat_result.st_dev),
+            int(stat_result.st_ino),
+        )
+        with _HASH_CACHE_LOCK:
+            cached = _HASH_CACHE.get(signature)
+            if cached is not None:
+                _HASH_CACHE.move_to_end(signature)
+                return cached
+
+        digest = hashlib.sha256()
+        with source.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        value = digest.hexdigest()
+        current = source.stat()
+        current_signature = (
+            os.path.normcase(str(source)),
+            int(current.st_size),
+            int(current.st_mtime_ns),
+            file_change_token(source, stat_result=current),
+            int(current.st_dev),
+            int(current.st_ino),
+        )
+        if current_signature != signature:
+            continue
+        with _HASH_CACHE_LOCK:
+            _HASH_CACHE[signature] = value
+            _HASH_CACHE.move_to_end(signature)
+            while len(_HASH_CACHE) > _HASH_CACHE_LIMIT:
+                _HASH_CACHE.popitem(last=False)
+        return value
+    raise OSError(f"Audio source changed while it was being read: {source}")
 
 
 def safe_filename(name: str) -> str:
@@ -567,12 +630,18 @@ def import_runtime_track(
     original_name: str = "",
     content_hash: str = "",
     duration_seconds: float = 0.0,
+    records: Optional[dict[str, TrackRecord]] = None,
+    persist: bool = True,
 ) -> TrackRecord:
+    if not persist and records is None:
+        raise ValueError(
+            "Non-persisted track imports require a shared library mapping."
+        )
     ensure_sound_dirs(project_root)
     src = Path(source).resolve()
     digest = content_hash or hash_file(src)
-    records = load_library(project_root)
-    for record in records.values():
+    library_records = records if records is not None else load_library(project_root)
+    for record in library_records.values():
         if record.content_hash != digest:
             continue
         processed = resolve_track_path(project_root, record)
@@ -580,7 +649,7 @@ def import_runtime_track(
             atomic_copy_file(src, processed)
         return record
     track_id = digest[:24]
-    while track_id in records:
+    while track_id in library_records:
         track_id = digest[: min(64, len(track_id) + 4)]
     processed_name = f"{track_id}.mp3"
     source_name = safe_filename(original_name or src.name)
@@ -598,8 +667,9 @@ def import_runtime_track(
         duration_seconds=max(0.0, float(duration_seconds or 0.0)),
         added_at=utc_now_text(),
     )
-    records[track_id] = record
-    save_library(project_root, records)
+    library_records[track_id] = record
+    if persist:
+        save_library(project_root, library_records)
     return record
 
 
@@ -607,7 +677,7 @@ def sync_current_compatibility(
     project_root: str | Path,
     state: ProjectSoundState,
     records: dict[str, TrackRecord],
-) -> None:
+) -> bool:
     state.normalize(set(records))
     selected = state.selected_track_id
     ordered = state.ordered_track_ids()
@@ -618,24 +688,54 @@ def sync_current_compatibility(
     manifest = current_manifest_path(project_root)
     record = records.get(selected)
     if record is None:
+        changed = music.exists() or manifest.exists()
         music.unlink(missing_ok=True)
         manifest.unlink(missing_ok=True)
-        return
+        return changed
     source = resolve_track_path(project_root, record)
     if not source.is_file():
+        changed = music.exists() or manifest.exists()
         music.unlink(missing_ok=True)
         manifest.unlink(missing_ok=True)
-        return
+        return changed
+    current_rel = (
+        f"{USER_SOUNDS_DIR}/{MUSIC_FILE}"
+        if record.source_kind == "stock"
+        else (
+            f"{USER_SOUNDS_DIR}/{ARCHIVE_DIR_NAME}/"
+            f"{PROCESSED_DIR_NAME}/{record.processed_file}"
+        )
+    )
+    source_stat = source.stat()
+    existing = read_json(manifest, {})
+    try:
+        music_stat = music.stat()
+    except OSError:
+        music_stat = None
+    if (
+        music_stat is not None
+        and existing.get("track_id") == record.track_id
+        and existing.get("current_rel") == current_rel
+        and existing.get("link_mode") == "copy"
+        and existing.get("source_size") == source_stat.st_size
+        and existing.get("source_mtime_ns") == source_stat.st_mtime_ns
+        and existing.get("destination_size") == music_stat.st_size
+        and existing.get("destination_mtime_ns") == music_stat.st_mtime_ns
+    ):
+        return False
+
     atomic_copy_file(source, music)
+    music_stat = music.stat()
     atomic_write_json(
         manifest,
         {
-            "current_rel": (
-                f"{USER_SOUNDS_DIR}/{MUSIC_FILE}"
-                if record.source_kind == "stock"
-                else f"{USER_SOUNDS_DIR}/{ARCHIVE_DIR_NAME}/{PROCESSED_DIR_NAME}/{record.processed_file}"
-            ),
+            "current_rel": current_rel,
             "track_id": record.track_id,
             "link_mode": "copy",
+            "source_size": source_stat.st_size,
+            "source_mtime_ns": source_stat.st_mtime_ns,
+            "destination_size": music_stat.st_size,
+            "destination_mtime_ns": music_stat.st_mtime_ns,
         },
     )
+    return True

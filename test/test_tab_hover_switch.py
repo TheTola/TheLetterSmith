@@ -124,20 +124,27 @@ class NexusHoverIntegrationTests(unittest.TestCase):
                 self.assertTrue(window.title_bar.save_settings_action.toolTip())
                 self.assertEqual(
                     set(window.title_bar._theme_actions),
-                    {"futuristic", "soft_elegant"},
+                    {
+                        "cyber_forge",
+                        "obsidian_forge",
+                        "velvet_rose",
+                        "celestial_rose",
+                        "dark",
+                        "light",
+                    },
                 )
-                window.title_bar._theme_actions["soft_elegant"].trigger()
+                window.title_bar._theme_actions["velvet_rose"].trigger()
                 self.app.processEvents()
-                self.assertEqual(window.theme_service.theme_id, "soft_elegant")
+                self.assertEqual(window.theme_service.theme_id, "velvet_rose")
                 self.assertEqual(
                     SettingsStore(temp_dir).get(THEME_SETTINGS_KEY),
-                    "soft_elegant",
+                    "velvet_rose",
                 )
                 window.title_bar.save_settings_action.trigger()
                 self.app.processEvents()
                 self.assertEqual(
                     window.property("letterSmithTheme"),
-                    "soft_elegant",
+                    "velvet_rose",
                 )
 
                 window.tabbar.setCurrentIndex(0)

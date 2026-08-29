@@ -11,7 +11,7 @@ stock and example content, dependencies, and bundled media without creating a
 package. A confirmed build also verifies the frozen resource tree byte-for-byte
 and rejects user data, tests, caches, logs, credentials, and development paths.
 
-After packaging is explicitly approved, install `requirements-build.txt` and run:
+After packaging is explicitly approved, install `requirements.txt` and run:
 
 ```powershell
 .\release\build_release.ps1 -Build -ConfirmPackage

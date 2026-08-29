@@ -158,22 +158,28 @@ class SoundArchivePreviewTests(unittest.TestCase):
             self.assertEqual(archive.windowTitle(), "Archive")
             self.assertEqual(archive.heading.text(), "Archive")
             self.assertEqual(archive.table.rowCount(), 1)
-            self.assertEqual(archive.table.columnCount(), 4)
+            self.assertEqual(archive.table.columnCount(), 3)
+            self.assertTrue(archive.table.verticalHeader().isHidden())
             self.assertEqual(
                 [
                     archive.table.horizontalHeaderItem(column).text()
-                    for column in range(4)
+                    for column in range(3)
                 ],
-                ["Title", "Duration", "Added", "Used"],
+                ["Title", "Duration", "Added"],
             )
             self.assertEqual(archive.table.item(0, 0).text(), "Song")
             self.assertEqual(archive.table.item(0, 1).text(), "0:01")
             self.assertEqual(archive.table.item(0, 2).text(), "2026-01-01")
-            self.assertEqual(archive.table.item(0, 3).text(), "✓")
             self.assertEqual(
-                archive.table.item(0, 3).toolTip(),
-                "Used in the current project.",
+                [
+                    index.row()
+                    for index in archive.table.selectionModel().selectedRows()
+                ],
+                [0],
             )
+            self.assertIn("QTableWidget::item:selected", archive.styleSheet())
+            self.assertIn("background: #1c5275", archive.styleSheet())
+            self.assertIn("alternate-background-color", archive.styleSheet())
         finally:
             archive.close()
             stock.close()

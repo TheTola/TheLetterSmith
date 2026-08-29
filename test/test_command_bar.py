@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -21,6 +22,7 @@ from command_bar import (
 )
 from config import CONTROL_FILES, PLAY_METADATA_FILE, REQUIRED_SLIDES
 from settings_store import ACTIVE_PLAY_DIR_KEY, SettingsStore
+from ui_fonts import COMMAND_FONT_FAMILY
 
 
 class CommandBarTests(unittest.TestCase):
@@ -54,21 +56,73 @@ class CommandBarTests(unittest.TestCase):
         pages = play_dir / "gallery" / "pages"
         message = play_dir / "gallery" / "message"
         controls = play_dir / "gallery" / "controls"
-        for directory in (pages, message, controls):
+        sounds = play_dir / "gallery" / "sounds"
+        for directory in (pages, message, controls, sounds):
             directory.mkdir(parents=True, exist_ok=True)
         for name in REQUIRED_SLIDES:
             (pages / name).write_bytes(b"image")
+        (pages / "lettersmith-images.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "slots": {
+                        name.removesuffix(".png"): {
+                            "asset_type": "static",
+                            "is_animated_gif": False,
+                            "source_file": name,
+                            "preview_file": name,
+                        }
+                        for name in REQUIRED_SLIDES
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
         for name in CONTROL_FILES:
             (controls / name).write_bytes(b"control")
         (message / "message.html").write_text("message", encoding="utf-8")
         (play_dir / "index.html").write_text("<html></html>", encoding="utf-8")
         (play_dir / "styles.css").write_text("body{}", encoding="utf-8")
         (play_dir / "script.js").write_text("", encoding="utf-8")
+        (sounds / "lettersmith-sound.json").write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "mode": "single",
+                    "playlist_expanded": True,
+                    "selected_track_index": -1,
+                    "tracks": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (play_dir / "prompt_writer_state.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
         (play_dir / PLAY_METADATA_FILE).write_text(
             json.dumps(
                 {
+                    "schema_version": "1.0",
+                    "document_type": "saved_letter",
+                    "project_id": str(uuid.uuid4()),
+                    "recipient_id": str(uuid.uuid4()),
                     "recipient_name": recipient,
                     "recipient_title": title,
+                    "settings": {},
+                    "sound": {},
+                    "readiness": {},
+                    "editable_assets": {
+                        "pages": {
+                            name: f"gallery/pages/{name}"
+                            for name in REQUIRED_SLIDES
+                        },
+                        "message": "gallery/message/message.html",
+                        "sound_manifest": "gallery/sounds/lettersmith-sound.json",
+                        "prompt_writer_state": "prompt_writer_state.json",
+                        "image_manifest": "gallery/pages/lettersmith-images.json",
+                    },
+                    "cover_thumbnail_path": "gallery/pages/cover.png",
                     **CommandBarTests._verified_publication(
                         published_url,
                         folder,
@@ -113,6 +167,54 @@ class CommandBarTests(unittest.TestCase):
         self.assertEqual(data.recipient_title, "A Letter")
         self.assertEqual(data.published_url, "https://example.com/letter")
         self.assertTrue(data.local_preview_path is not None)
+
+    def test_command_bar_uses_command_font_and_symbol_fallbacks(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        window = CommandBarWindow(
+            CommandBarData("Recipient", "Title", None, ""),
+            project_root,
+        )
+        try:
+            window.show()
+            self.app.processEvents()
+            self.assertEqual(window.font().family(), COMMAND_FONT_FAMILY)
+            self.assertEqual(
+                window.recipient_label.font().family(),
+                COMMAND_FONT_FAMILY,
+            )
+            self.assertEqual(window.recipient_label.font().pointSize(), 12)
+            self.assertEqual(
+                window.title_label.font().family(),
+                COMMAND_FONT_FAMILY,
+            )
+            self.assertEqual(window.title_label.font().pointSize(), 10)
+            for button in (
+                window.preview_button,
+                window.open_button,
+                window.copy_button,
+                window.minimize_button,
+                window.close_button,
+            ):
+                self.assertEqual(button.font().family(), COMMAND_FONT_FAMILY)
+        finally:
+            window.abort_launch()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fallback = CommandBarWindow(
+                CommandBarData("Recipient", "Title", None, ""),
+                temporary,
+            )
+            try:
+                self.assertEqual(
+                    fallback.preview_button.font().families(),
+                    [
+                        COMMAND_FONT_FAMILY,
+                        "Segoe UI Symbol",
+                        "Segoe UI Emoji",
+                    ],
+                )
+            finally:
+                fallback.abort_launch()
 
     def test_valid_manual_url_is_exposed_as_a_published_link(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

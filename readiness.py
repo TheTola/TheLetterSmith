@@ -3,11 +3,20 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
-from config import MESSAGE_HTML_FILE, REQUIRED_SLIDES, USER_PAGES_DIR
+from config import (
+    MESSAGE_HTML_FILE,
+    REQUIRED_SLIDES,
+    USER_PAGES_DIR,
+)
 from message_format import message_plain_text
 from message_html import read_text_normalized
 from project_paths import ProjectPathError, ProjectPathResolver
+from protected_projects import (
+    is_protected_project,
+    reserved_save_reason,
+)
 from publishing.expiration import publication_status
 from settings_store import (
     REQUIRED_FEATURES_KEY,
@@ -46,23 +55,45 @@ class ReadinessResult:
         return self.can_preview
 
 
+def music_is_required(settings: Mapping[str, object]) -> bool:
+    """Return the canonical music-readiness requirement for a settings snapshot."""
+    required_features = settings.get(REQUIRED_FEATURES_KEY, {})
+    if isinstance(required_features, dict):
+        return bool(
+            required_features.get(
+                "music",
+                settings.get("music_required", False),
+            )
+        )
+    if isinstance(required_features, (list, tuple, set)):
+        return "music" in {
+            str(feature).strip().lower()
+            for feature in required_features
+        }
+    return bool(settings.get("music_required", False))
+
+
 @dataclass(frozen=True)
 class ProjectSaveEligibility:
     completed_tabs: tuple[str, ...]
     recipient_ready: bool
     title_ready: bool
     title_detail: str
+    persistent_block_reason: str = ""
 
     @property
     def can_save(self) -> bool:
         return (
-            self.recipient_ready
+            not self.persistent_block_reason
+            and self.recipient_ready
             and self.title_ready
             and len(self.completed_tabs) >= 2
         )
 
     @property
     def blocked_reason(self) -> str:
+        if self.persistent_block_reason:
+            return self.persistent_block_reason
         if not self.recipient_ready:
             return "Add the recipient before saving the project."
         if not self.title_ready:
@@ -141,8 +172,20 @@ def evaluate_project_save_eligibility(
     pages = root / USER_PAGES_DIR
     recipient_ready = bool(str(settings.get("recipient_name", "")).strip())
     title_ready, title_detail = _title_readiness(root, settings)
+    persistent_block_reason = reserved_save_reason(
+        settings.get("recipient_title", ""),
+        settings.get("recipient_name", ""),
+    )
+    if is_protected_project(settings):
+        persistent_block_reason = (
+            "Stock and Example Letters are temporary demonstrations and "
+            "cannot replace their bundled originals."
+        )
     completed_tabs: list[str] = []
-    if all((pages / name).is_file() for name in REQUIRED_SLIDES):
+    if all(
+        (pages / name).is_file()
+        for name in REQUIRED_SLIDES
+    ):
         completed_tabs.append("images")
     if _sound_is_complete(root):
         completed_tabs.append("sound")
@@ -155,28 +198,17 @@ def evaluate_project_save_eligibility(
         recipient_ready=recipient_ready,
         title_ready=title_ready,
         title_detail=title_detail,
+        persistent_block_reason=persistent_block_reason,
     )
 
 
 def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
     root = Path(project_root).resolve()
     settings = SettingsStore(root).snapshot()
+    if is_protected_project(settings):
+        return ReadinessResult((), 0, "")
     pages = root / USER_PAGES_DIR
-    required_features = settings.get(REQUIRED_FEATURES_KEY, {})
-    if isinstance(required_features, dict):
-        music_required = bool(
-            required_features.get(
-                "music",
-                settings.get("music_required", False),
-            )
-        )
-    elif isinstance(required_features, (list, tuple, set)):
-        music_required = "music" in {
-            str(feature).strip().lower()
-            for feature in required_features
-        }
-    else:
-        music_required = bool(settings.get("music_required", False))
+    music_required = music_is_required(settings)
     has_music = _sound_is_complete(root)
     has_message = _message_is_complete(root)
     title_ready, title_detail = _title_readiness(root, settings)

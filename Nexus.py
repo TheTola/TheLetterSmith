@@ -4,7 +4,7 @@
 """
 Nexus ΓÇö main shell for Letter Smith
 Clean placement ΓÇó Robust overlay ΓÇó Sound visualizer ΓÇó Prompt Writer FAB owned by Image_tab
-+ Help.gif (idle, plays constantly) swaps to HHelp.gif on hover
++ Help animates when available; HHelp prefers a static PNG
 + Per-tab Help popover header: The Image tab / The sound tab / The message tab / The forge tab
 
 Notes
@@ -16,18 +16,16 @@ from __future__ import annotations
 
 import logging
 import math
-import os, sys, subprocess, json
+import os, json
 from pathlib import Path
+from time import monotonic
 from typing import Optional
 
 from app_icon import apply_qt_window_icon, canonical_icon_paths
 from settings_store import (
-    CURTAIN_STYLE_LABELS,
-    CURTAIN_TEXT_STYLE_PAIRS,
     DEFAULT_SETTINGS,
     DEFAULT_VISIONARY_URL,
     SettingsStore,
-    VALID_CURTAIN_STYLES,
     VISIONARY_URL_KEY,
     normalize_published_page_url,
 )
@@ -36,21 +34,37 @@ from project_state import (
     ProjectDirtyController,
     ProjectStateController,
 )
+from curtain_color import curtain_variant_rgbs
+from curtain_controls import CurtainStyleController, CurtainStyleMenuSelector
 from project_paths import ProjectPathResolver, application_paths
+from protected_projects import is_protected_project
 from project_save import ProjectNotReadyError, ProjectSaveService
+from performance_trace import performance_timed
 from recipient_page import RecipientPage
 from curtain_cache import (
     CurtainVariantCache,
     prepare_curtain_variant_cache,
 )
 from ui_help import set_action_help, set_control_help, set_tab_help
+from ui_dialogs import (
+    LetterSmithConfirmationDialog,
+    LetterSmithInputDialog,
+    show_lettersmith_message,
+)
 from ui_constants import (
     HELP_HIDE_DELAY_MS,
     HELP_HOVER_DELAY_MS,
     TOAST_DURATION_MS,
     TRANSIENT_STATUS_MS,
 )
-from ui_theme import ThemeService
+from ui_theme import (
+    HELP_THEME_ASSET_CANDIDATES,
+    MAXIMIZE_THEME_ASSET,
+    RESTORE_THEME_ASSET_CANDIDATES,
+    ThemeService,
+)
+from ui_fonts import COMMAND_FONT_FAMILY
+from window_chrome import FramelessWindowController
 
 # ===================================================================================================================================================================================
 # Overlay integration
@@ -70,16 +84,17 @@ from PySide6.QtWidgets import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# WebEngine (used for HTML preview)
-try:
-    from PySide6.QtWebEngineWidgets import QWebEngineView
-    from PySide6.QtWebEngineCore import QWebEngineSettings
-except Exception as e:
-    raise SystemExit(
-        "Qt WebEngine is required for the HTML preview.\n"
-        "Install it with:  pip install PySide6-Addons\n\n"
-        f"Original error:\n{e}"
-    )
+def _webengine_components():
+    """Import WebEngine only when an HTML viewer is actually requested."""
+    try:
+        from PySide6.QtWebEngineCore import QWebEngineSettings
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+    except Exception as error:
+        raise RuntimeError(
+            "Qt WebEngine is required for the HTML preview. "
+            "Install it with: pip install PySide6-Addons"
+        ) from error
+    return QWebEngineView, QWebEngineSettings
 
 # Animations / FX (from anima.py)
 try:
@@ -94,14 +109,6 @@ except Exception:
 # Relative asset hints & sizing
 # ===================================================================================================================================================================================
 
-REL_RETICLE_ICON = "icons/reticle.png"   # optional (title bar icon)
-REL_SETTINGS_PNG = "icons/settings.png"  # title-bar idle image
-REL_SETTINGS_GIF = "icons/Settings.gif"  # hover/open animation
-REL_MINIMIZE_ICON = "icons/mini.png"
-REL_MAXIMIZE_ICON = "icons/maxi.png"
-REL_CLOSE_ICON = "icons/Exi.png"
-REL_HELP_GIF     = "icons/Help.gif"      # idle (plays constantly)
-REL_HELP_HOVER   = "icons/HHelp.gif"     # hover variant (plays on hover)
 REL_HELP_PNG     = "icons/Help.png"      # final static fallback
 
 
@@ -113,8 +120,45 @@ def _theme_rgba(color: str, alpha: int) -> str:
     value = QColor(color)
     return f"rgba({value.red()},{value.green()},{value.blue()},{alpha})"
 
+
+def _blend_color(
+    first: QColor | str,
+    second: QColor | str,
+    second_weight: float,
+) -> QColor:
+    """Blend valid theme colors without introducing a fixed palette."""
+    left = QColor(first)
+    right = QColor(second)
+    weight = max(0.0, min(1.0, float(second_weight)))
+    return QColor(
+        round(left.red() * (1.0 - weight) + right.red() * weight),
+        round(left.green() * (1.0 - weight) + right.green() * weight),
+        round(left.blue() * (1.0 - weight) + right.blue() * weight),
+    )
+
+
+def _neutral_color(color: QColor | str) -> QColor:
+    value = QColor(color)
+    gray = round(
+        value.red() * 0.299
+        + value.green() * 0.587
+        + value.blue() * 0.114
+    )
+    return QColor(gray, gray, gray)
+
+
+def _color_rgba(color: QColor | str, alpha: int) -> str:
+    value = QColor(color)
+    return (
+        f"rgba({value.red()},{value.green()},{value.blue()},"
+        f"{max(0, min(255, int(alpha)))})"
+    )
+
 WIN_W, WIN_H = 1400, 900
 _PREVIEW_AR = 169 / 253  # preview frame aspect (matches your 169├ù253 scaling)
+SHELL_FONT_PX = 13
+SOUND_PREVIEW_MIN_HEIGHT = 220
+SOUND_PREVIEW_MAX_HEIGHT = 253
 
 # Help icon display size
 HELP_ICON_PX = 125
@@ -122,6 +166,9 @@ HELP_ICON_HALF = HELP_ICON_PX // 2
 TITLE_BAR_ICON_PX = 36
 TITLE_BAR_CONTROL_PX = 40
 SETTINGS_ICON_PX = TITLE_BAR_ICON_PX
+NEW_PROJECT_ARTWORK_PX = 200
+NEW_PROJECT_ARTWORK_GAP = 12
+NEW_PROJECT_ARTWORK_RELATIVE = "New/New.png"
 
 # Command deliberately bypasses the normal TabSwitcher slide. Its body-level
 # fade covers the preview, help, and page layout as one stable snapshot.
@@ -150,9 +197,12 @@ class _LoadingSpinner(QtWidgets.QWidget):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self._step = 0
+        self._activity_mode = "restore"
         self._accent_color = self.palette().color(QtGui.QPalette.Highlight)
         self._ring_color = QColor(self._accent_color)
         self._ring_color.setAlpha(70)
+        self._glow_color = QColor(self._accent_color)
+        self._glow_color.setAlpha(0)
         self.setFixedSize(92, 92)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self._timer = QtCore.QTimer(self)
@@ -160,8 +210,9 @@ class _LoadingSpinner(QtWidgets.QWidget):
         self._timer.timeout.connect(self._advance)
 
     def start(self) -> None:
-        self._step = 0
-        self._timer.start()
+        if not self._timer.isActive():
+            self._step = 0
+            self._timer.start()
         self.update()
 
     def stop(self) -> None:
@@ -178,6 +229,11 @@ class _LoadingSpinner(QtWidgets.QWidget):
         center = QtCore.QPointF(self.width() / 2, self.height() / 2)
 
         pulse = 2.0 + 1.5 * (1.0 + math.sin(self._step * math.pi / 6.0))
+        if self._glow_color.alpha() > 0:
+            glow = QtGui.QPen(self._glow_color, pulse + 5.0)
+            painter.setPen(glow)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(center, 33, 33)
         ring = QtGui.QPen(self._ring_color, pulse)
         painter.setPen(ring)
         painter.setBrush(Qt.NoBrush)
@@ -197,15 +253,44 @@ class _LoadingSpinner(QtWidgets.QWidget):
             radius = 4.7 if distance == 0 else 3.4
             painter.drawEllipse(point, radius, radius)
 
+    def set_activity_mode(self, mode: str) -> None:
+        self._activity_mode = str(mode or "restore").strip().casefold()
+
     def apply_theme_assets(self, service: ThemeService) -> None:
-        self._accent_color = QColor(service.tokens.accent)
-        self._ring_color = QColor(service.tokens.secondary)
-        self._ring_color.setAlpha(70)
+        colors = service.tokens
+        if self._activity_mode == "publish":
+            self._accent_color = QColor(colors.highlight)
+            self._ring_color = QColor(colors.accent)
+            self._ring_color.setAlpha(112)
+            self._glow_color = QColor(colors.accent)
+            self._glow_color.setAlpha(42)
+        elif self._activity_mode == "unpublish":
+            self._accent_color = _blend_color(
+                colors.muted_text,
+                colors.warning,
+                0.34,
+            )
+            self._ring_color = _blend_color(
+                colors.secondary,
+                colors.warning,
+                0.22,
+            )
+            self._ring_color.setAlpha(76)
+            self._glow_color = QColor(self._ring_color)
+            self._glow_color.setAlpha(14)
+        else:
+            self._accent_color = QColor(colors.accent)
+            self._ring_color = QColor(colors.secondary)
+            self._ring_color.setAlpha(70)
+            self._glow_color = QColor(self._accent_color)
+            self._glow_color.setAlpha(0)
         self.update()
 
 
 class _ProjectLoadingOverlay(QtWidgets.QFrame):
-    """Animated input shield shown while a saved project is restored."""
+    """Theme-aware activity shield for restore and publication workflows."""
+
+    dismissed = QtCore.Signal()
 
     _BLOCKED_KEYS = {
         QEvent.KeyPress,
@@ -213,27 +298,66 @@ class _ProjectLoadingOverlay(QtWidgets.QFrame):
         QEvent.Shortcut,
         QEvent.ShortcutOverride,
     }
+    _BLOCKED_APPLICATION_INPUT = _BLOCKED_KEYS | {
+        QEvent.MouseButtonPress,
+        QEvent.MouseButtonRelease,
+        QEvent.MouseButtonDblClick,
+        QEvent.MouseMove,
+        QEvent.Wheel,
+        QEvent.ContextMenu,
+        QEvent.DragEnter,
+        QEvent.DragMove,
+        QEvent.Drop,
+        QEvent.TouchBegin,
+        QEvent.TouchUpdate,
+        QEvent.TouchEnd,
+        QEvent.TabletPress,
+        QEvent.TabletMove,
+        QEvent.TabletRelease,
+        QEvent.NativeGesture,
+    }
+    _PUBLICATION_MODES = {"publish", "unpublish"}
 
     def __init__(self, parent: QtWidgets.QWidget) -> None:
         super().__init__(parent)
         self.setObjectName("ProjectLoadingOverlay")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setFocusPolicy(Qt.StrongFocus)
+        self._activity_mode = "restore"
+        self._theme_service: ThemeService | None = None
+        self._filter_installed = False
+        self._stopping = False
+        self._overlay_color = QColor()
+
+        self._opacity_effect = QGraphicsOpacityEffect(self)
+        self._opacity_effect.setOpacity(1.0)
+        self.setGraphicsEffect(self._opacity_effect)
+        self._fade_animation = QtCore.QPropertyAnimation(
+            self._opacity_effect,
+            b"opacity",
+            self,
+        )
+        self._fade_animation.setDuration(180)
+        self._fade_animation.setEasingCurve(QtCore.QEasingCurve.InOutSine)
+        self._fade_animation.finished.connect(self._finish_stop)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 24)
         root.addStretch(1)
 
-        panel = QtWidgets.QFrame(self)
-        panel.setObjectName("ProjectLoadingPanel")
-        panel.setMaximumWidth(460)
-        panel_layout = QtWidgets.QVBoxLayout(panel)
+        self.panel = QtWidgets.QFrame(self)
+        self.panel.setObjectName("ProjectLoadingPanel")
+        self.panel.setMinimumWidth(420)
+        self.panel.setMaximumWidth(460)
+        self.panel.setMinimumHeight(250)
+        panel_layout = QtWidgets.QVBoxLayout(self.panel)
         panel_layout.setContentsMargins(34, 26, 34, 28)
         panel_layout.setSpacing(10)
+        self._panel_layout = panel_layout
 
-        self.spinner = _LoadingSpinner(panel)
+        self.spinner = _LoadingSpinner(self.panel)
         panel_layout.addWidget(self.spinner, 0, Qt.AlignHCenter)
-        self.title = QtWidgets.QLabel("Loading saved letter…", panel)
+        self.title = QtWidgets.QLabel("Loading saved letter…", self.panel)
         self.title.setObjectName("ProjectLoadingTitle")
         self.title.setAlignment(Qt.AlignCenter)
         self.title.setTextFormat(Qt.PlainText)
@@ -241,7 +365,7 @@ class _ProjectLoadingOverlay(QtWidgets.QFrame):
         panel_layout.addWidget(self.title)
         self.detail = QtWidgets.QLabel(
             "Restoring the recipient, images, message, and sound safely.",
-            panel,
+            self.panel,
         )
         self.detail.setObjectName("ProjectLoadingDetail")
         self.detail.setAlignment(Qt.AlignCenter)
@@ -249,48 +373,251 @@ class _ProjectLoadingOverlay(QtWidgets.QFrame):
         self.detail.setWordWrap(True)
         panel_layout.addWidget(self.detail)
 
-        for child in (panel, self.title, self.detail):
+        for child in (self.panel, self.title, self.detail):
             child.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
-        root.addWidget(panel, 0, Qt.AlignHCenter)
+        root.addWidget(self.panel, 0, Qt.AlignHCenter)
         root.addStretch(1)
         self.hide()
 
     def apply_theme_assets(self, service: ThemeService) -> None:
+        self._theme_service = service
         colors = service.tokens
+        self.spinner.set_activity_mode(self._activity_mode)
         self.spinner.apply_theme_assets(service)
+        app_font = service.app_font_family
+        if self._activity_mode == "publish":
+            panel_neutral = _neutral_color(colors.panel_background)
+            bright_level = max(
+                panel_neutral.red(),
+                _neutral_color(colors.highlight).red(),
+                _neutral_color(colors.text).red(),
+            )
+            bright_neutral = QColor(
+                bright_level,
+                bright_level,
+                bright_level,
+            )
+            overlay_color = _blend_color(
+                panel_neutral,
+                bright_neutral,
+                0.72,
+            ).lighter(112)
+            panel_color = _blend_color(
+                colors.panel_background,
+                colors.highlight,
+                0.08,
+            )
+            border_color = colors.accent
+            title_color = colors.highlight
+            detail_color = colors.text
+            overlay_alpha = 205
+        elif self._activity_mode == "unpublish":
+            dark_level = min(
+                _neutral_color(colors.background).red(),
+                _neutral_color(colors.panel_background).red(),
+                _neutral_color(colors.muted_text).red(),
+            )
+            dark_neutral = QColor(
+                dark_level,
+                dark_level,
+                dark_level,
+            ).darker(138)
+            sickly_tint = _blend_color(
+                _neutral_color(colors.warning),
+                colors.warning,
+                0.18,
+            )
+            overlay_color = _blend_color(
+                dark_neutral,
+                sickly_tint,
+                0.16,
+            ).darker(108)
+            panel_neutral = _neutral_color(colors.panel_background)
+            bright_level = max(
+                panel_neutral.red(),
+                _neutral_color(colors.highlight).red(),
+                _neutral_color(colors.text).red(),
+            )
+            publish_reference = _blend_color(
+                panel_neutral,
+                QColor(bright_level, bright_level, bright_level),
+                0.72,
+            ).lighter(112)
+            overlay_color.setHsl(
+                overlay_color.hslHue(),
+                overlay_color.hslSaturation(),
+                min(
+                    overlay_color.lightness(),
+                    max(0, publish_reference.lightness() - 28),
+                ),
+            )
+            panel_color = _blend_color(
+                colors.panel_background,
+                overlay_color,
+                0.28,
+            )
+            border_color = _blend_color(
+                colors.muted_text,
+                colors.warning,
+                0.32,
+            ).name()
+            title_color = _blend_color(
+                colors.text,
+                colors.warning,
+                0.22,
+            ).name()
+            detail_color = colors.muted_text
+            overlay_alpha = 225
+        else:
+            overlay_color = QColor(colors.background)
+            panel_color = QColor(colors.panel_background)
+            border_color = colors.primary
+            title_color = colors.highlight
+            detail_color = colors.muted_text
+            overlay_alpha = 218
+        self._overlay_color = QColor(overlay_color)
         self.setStyleSheet(
             "QFrame#ProjectLoadingOverlay{"
-            f"background:{_theme_rgba(colors.background, 218)};border:none;}}"
+            f"background:{_color_rgba(overlay_color, overlay_alpha)};"
+            "border:none;}"
             "QFrame#ProjectLoadingPanel{"
-            f"background:{colors.panel_background};"
-            f"border:1px solid {colors.primary};border-radius:12px;}}"
+            f"background:{QColor(panel_color).name()};"
+            f"border:1px solid {border_color};border-radius:12px;}}"
             "QLabel#ProjectLoadingTitle{"
-            f"color:{colors.highlight};font:600 15pt 'Segoe UI';}}"
+            f"color:{title_color};font:600 15pt '{app_font}';}}"
             "QLabel#ProjectLoadingDetail{"
-            f"color:{colors.muted_text};font:10pt 'Segoe UI';}}"
+            f"color:{detail_color};font:10pt '{app_font}';}}"
         )
+        self._update_panel_minimum_height()
 
-    def start(self, message: str) -> None:
+    @property
+    def activity_mode(self) -> str:
+        return self._activity_mode
+
+    def start(
+        self,
+        message: str,
+        *,
+        mode: str = "restore",
+        detail: str = "",
+    ) -> None:
+        requested_mode = str(mode or "restore").strip().casefold()
+        if requested_mode not in {"restore", *self._PUBLICATION_MODES}:
+            requested_mode = "restore"
+        self._activity_mode = requested_mode
+        self.setProperty("activityMode", requested_mode)
+        self.spinner.set_activity_mode(requested_mode)
+        if self._theme_service is not None:
+            self.apply_theme_assets(self._theme_service)
         activity = str(message or "Loading saved letter…").strip()
         self.title.setText(activity)
+        descriptions = {
+            "restore": "Restoring the recipient, images, message, and sound safely.",
+            "publish": "Preparing and sending your letter safely. Please keep Letter Smith open.",
+            "unpublish": "Removing the online copy while preserving your local letter.",
+        }
+        self.detail.setText(
+            str(detail or descriptions[requested_mode]).strip()
+        )
+        self._update_panel_minimum_height()
+        self._stopping = False
+        if self._fade_animation.state() == QtCore.QAbstractAnimation.Running:
+            self._fade_animation.stop()
+        self._opacity_effect.setOpacity(1.0)
         application = QtWidgets.QApplication.instance()
-        if application is not None:
+        if application is not None and not self._filter_installed:
             application.installEventFilter(self)
+            self._filter_installed = True
+        if requested_mode in self._PUBLICATION_MODES:
+            parent = self.parentWidget()
+            if parent is not None:
+                self.setGeometry(parent.rect())
         self.show()
         self.raise_()
         self.setFocus(Qt.OtherFocusReason)
         self.spinner.start()
 
-    def stop(self) -> None:
+    def _update_panel_minimum_height(self) -> None:
+        self.panel.ensurePolished()
+        margins = self._panel_layout.contentsMargins()
+        content_width = max(
+            1,
+            self.panel.minimumWidth() - margins.left() - margins.right(),
+        )
+        title_height = max(
+            self.title.sizeHint().height(),
+            self.title.heightForWidth(content_width),
+        )
+        detail_height = max(
+            self.detail.sizeHint().height(),
+            self.detail.heightForWidth(content_width),
+        )
+        required_height = (
+            margins.top()
+            + margins.bottom()
+            + self.spinner.height()
+            + title_height
+            + detail_height
+            + (self._panel_layout.spacing() * 2)
+        )
+        self.panel.setMinimumHeight(max(250, required_height))
+        self._panel_layout.invalidate()
+        self.panel.updateGeometry()
+
+    def stop(self, *, animated: bool = False) -> None:
+        if not self.isVisible() and not self._filter_installed:
+            self.spinner.stop()
+            return
+        if animated:
+            if self._stopping:
+                return
+            self._stopping = True
+            self._fade_animation.stop()
+            self._fade_animation.setStartValue(self._opacity_effect.opacity())
+            self._fade_animation.setEndValue(0.0)
+            self._fade_animation.start()
+            return
+        self._finish_stop()
+
+    @QtCore.Slot()
+    def _finish_stop(self) -> None:
+        if self._fade_animation.state() == QtCore.QAbstractAnimation.Running:
+            self._fade_animation.stop()
+        self._stopping = False
         self.spinner.stop()
         application = QtWidgets.QApplication.instance()
-        if application is not None:
+        if application is not None and self._filter_installed:
             application.removeEventFilter(self)
+        self._filter_installed = False
         self.hide()
+        self._opacity_effect.setOpacity(1.0)
+        self.dismissed.emit()
+
+    @staticmethod
+    def _is_modal_input_target(watched: QtCore.QObject) -> bool:
+        application = QtWidgets.QApplication.instance()
+        modal = application.activeModalWidget() if application is not None else None
+        if modal is None or not isinstance(watched, QtWidgets.QWidget):
+            return False
+        widget: QtWidgets.QWidget | None = watched
+        while widget is not None:
+            if widget is modal:
+                return True
+            widget = widget.parentWidget()
+        return False
 
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
-        if self.isVisible() and event.type() in self._BLOCKED_KEYS:
+        if not self.isVisible():
+            return super().eventFilter(watched, event)
+        blocked = (
+            self._BLOCKED_APPLICATION_INPUT
+            if self._activity_mode in self._PUBLICATION_MODES
+            else self._BLOCKED_KEYS
+        )
+        if event.type() in blocked:
+            if self._is_modal_input_target(watched):
+                return super().eventFilter(watched, event)
             event.accept()
             return True
         return super().eventFilter(watched, event)
@@ -334,6 +661,41 @@ class _CurtainPreparationTask(QtCore.QRunnable):
             return
         self.signals.completed.emit(self.generation, result)
 
+
+class _ProjectAutosaveSignals(QtCore.QObject):
+    completed = QtCore.Signal(int, str)
+    failed = QtCore.Signal(int, str)
+
+
+class _ProjectAutosaveTask(QtCore.QRunnable):
+    def __init__(
+        self,
+        service: ProjectSaveService,
+        revision: int,
+        reason: str,
+    ) -> None:
+        super().__init__()
+        self.service = service
+        self.revision = int(revision)
+        self.reason = str(reason)
+        self.signals = _ProjectAutosaveSignals()
+        self.destination = ""
+        self.error = ""
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            destination = self.service.save_workspace_snapshot(
+                reason=self.reason,
+                defer_play_metadata=True,
+            )
+        except Exception as error:
+            self.error = str(error)
+            self.signals.failed.emit(self.revision, self.error)
+            return
+        self.destination = str(destination)
+        self.signals.completed.emit(self.revision, self.destination)
+
 class TitleBar(QtWidgets.QWidget):
     """
     Custom frameless title bar.
@@ -342,7 +704,6 @@ class TitleBar(QtWidgets.QWidget):
     This prevents UTF-8/CP437 encoding corruption.
     """
 
-    TARGET_SYMBOL = "\uFF0B"      # ＋
     MINIMIZE_SYMBOL = "\u2013"    # –
     MAXIMIZE_SYMBOL = "\u25A1"    # □
     RESTORE_SYMBOL = "\u2750"     # ❐
@@ -352,7 +713,15 @@ class TitleBar(QtWidgets.QWidget):
         super().__init__(parent)
 
         self.parent = parent
-        self._drag_start = QtCore.QPoint()
+        self.setObjectName("NexusTitleBar")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAttribute(Qt.WA_Hover, True)
+        self.setMouseTracking(True)
+        self._normal_window_geometry: Optional[QtCore.QRect] = None
+        self._window_state_generation = 0
+        self._command_mode = False
+        self._command_hovered = False
+        self._title_label_theme_qss = ""
         self.theme_service = getattr(parent, "theme_service", None)
         self._owns_theme_service = self.theme_service is None
         if self.theme_service is None:
@@ -360,6 +729,14 @@ class TitleBar(QtWidgets.QWidget):
                 self.parent.project_root,
                 parent=self,
             )
+        self.curtain_styles = getattr(parent, "curtain_styles", None)
+        self._owns_curtain_styles = self.curtain_styles is None
+        if self.curtain_styles is None:
+            self.curtain_styles = CurtainStyleController(
+                SettingsStore(self.parent.project_root),
+                self,
+            )
+            self.destroyed.connect(self.curtain_styles.close)
 
         self.setFixedHeight(TITLE_BAR_CONTROL_PX + 8)
 
@@ -371,14 +748,15 @@ class TitleBar(QtWidgets.QWidget):
         # Window title
         # ---------------------------------------------------------------------
 
-        app_icon = QtWidgets.QLabel(self)
-        app_icon.setObjectName("AppIcon")
-        app_icon.setFixedSize(TITLE_BAR_CONTROL_PX, TITLE_BAR_CONTROL_PX)
-        app_icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.app_icon = QtWidgets.QLabel(self)
+        self.app_icon.setObjectName("AppIcon")
+        self.app_icon.setFixedSize(TITLE_BAR_CONTROL_PX, TITLE_BAR_CONTROL_PX)
+        self.app_icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         png_path, _ = canonical_icon_paths(self.parent.project_root)
         pixmap = QPixmap(str(png_path))
+        self._app_icon_available = not pixmap.isNull()
         if not pixmap.isNull():
-            app_icon.setPixmap(
+            self.app_icon.setPixmap(
                 pixmap.scaled(
                     TITLE_BAR_ICON_PX,
                     TITLE_BAR_ICON_PX,
@@ -386,7 +764,7 @@ class TitleBar(QtWidgets.QWidget):
                     Qt.SmoothTransformation,
                 )
             )
-            layout.addWidget(app_icon)
+            layout.addWidget(self.app_icon)
 
         self.title_label = QtWidgets.QLabel(
             "The Silver-Tongued Lettersmith",
@@ -429,7 +807,7 @@ class TitleBar(QtWidgets.QWidget):
             self._show_animated_settings_icon
         )
         self.settings_menu = QtWidgets.QMenu(self.settings_button)
-        self.themes_menu = self.settings_menu.addMenu("Themes")
+        self.themes_menu = self.settings_menu.addMenu("App Theme")
         set_action_help(
             self.themes_menu.menuAction(),
             "Choose a complete visual theme for Letter Smith.",
@@ -437,7 +815,11 @@ class TitleBar(QtWidgets.QWidget):
         self._theme_group = QtGui.QActionGroup(self)
         self._theme_group.setExclusive(True)
         self._theme_actions: dict[str, QtGui.QAction] = {}
+        basic_section_started = False
         for definition in self.theme_service.available_themes():
+            if not definition.uses_image_buttons and not basic_section_started:
+                self.themes_menu.addSeparator()
+                basic_section_started = True
             action = self.themes_menu.addAction(definition.display_name)
             action.setCheckable(True)
             action.setData(definition.theme_id)
@@ -453,99 +835,18 @@ class TitleBar(QtWidgets.QWidget):
             self._theme_group.addAction(action)
             self._theme_actions[definition.theme_id] = action
 
-        self.curtain_menu = self.settings_menu.addMenu("Curtains")
+        self.curtain_style_selector = CurtainStyleMenuSelector(
+            "Curtains",
+            self.settings_menu,
+            object_name="SettingsCurtainStyleSelector",
+        )
+        self.curtain_menu = self.curtain_style_selector.menu()
+        self.settings_menu.addMenu(self.curtain_menu)
         set_action_help(
             self.curtain_menu.menuAction(),
             "Choose the curtain colors used around the finished letter.",
         )
-        self._curtain_actions: dict[str, QtWidgets.QPushButton] = {}
-        self._curtain_parent_actions: dict[str, QtWidgets.QToolButton] = {}
-        self._curtain_widget_actions: list[QtWidgets.QWidgetAction] = []
-        self._curtain_family_styles = {
-            "light": ("normal_light", "complementary_light"),
-            "dark": ("normal_dark", "complementary_dark"),
-        }
-        self._current_curtain_style = str(
-            DEFAULT_SETTINGS["curtain_style"]
-        )
-        self._curtain_preview_colors: dict[str, tuple[int, int, int]] = {
-            "pure_white": (255, 255, 255),
-        }
-        self._curtain_group = QtWidgets.QButtonGroup(self)
-        self._curtain_group.setExclusive(True)
-
-        def add_style_row(
-            menu: QtWidgets.QMenu,
-            style: str,
-        ) -> None:
-            row = QtWidgets.QPushButton(CURTAIN_STYLE_LABELS[style], menu)
-            row.setCheckable(True)
-            row.setCursor(Qt.PointingHandCursor)
-            row.setMinimumWidth(230)
-            row.setFixedHeight(34)
-            set_control_help(
-                row,
-                f"Use {CURTAIN_STYLE_LABELS[style]} around the finished letter.",
-                accessible_name=CURTAIN_STYLE_LABELS[style],
-            )
-            row.clicked.connect(
-                lambda _checked=False, value=style: self._set_curtain_style(
-                    value
-                )
-            )
-            widget_action = QtWidgets.QWidgetAction(menu)
-            widget_action.setDefaultWidget(row)
-            menu.addAction(widget_action)
-            self._curtain_group.addButton(row)
-            self._curtain_actions[style] = row
-            self._curtain_widget_actions.append(widget_action)
-
-        def add_family_row(
-            family: str,
-            submenu: QtWidgets.QMenu,
-        ) -> None:
-            row = QtWidgets.QToolButton(self.curtain_menu)
-            row.setText(f"{family.title()} ▾")
-            row.setCursor(Qt.PointingHandCursor)
-            row.setMinimumWidth(230)
-            row.setFixedHeight(34)
-            row.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-            row.setMenu(submenu)
-            set_control_help(
-                row,
-                f"Open the {family} curtain color options.",
-                accessible_name=f"{family.title()} curtain options",
-            )
-            widget_action = QtWidgets.QWidgetAction(self.curtain_menu)
-            widget_action.setDefaultWidget(row)
-            self.curtain_menu.addAction(widget_action)
-            self._curtain_parent_actions[family] = row
-            self._curtain_widget_actions.append(widget_action)
-
-        for style in (
-            "pure_white",
-            "average_color",
-            "complementary_average_color",
-        ):
-            add_style_row(self.curtain_menu, style)
-
-        self.light_curtain_menu = QtWidgets.QMenu(
-            "Light",
-            self.curtain_menu,
-        )
-        self.light_curtain_menu.setStyleSheet(self.settings_menu.styleSheet())
-        for style in self._curtain_family_styles["light"]:
-            add_style_row(self.light_curtain_menu, style)
-        add_family_row("light", self.light_curtain_menu)
-
-        self.dark_curtain_menu = QtWidgets.QMenu(
-            "Dark",
-            self.curtain_menu,
-        )
-        self.dark_curtain_menu.setStyleSheet(self.settings_menu.styleSheet())
-        for style in self._curtain_family_styles["dark"]:
-            add_style_row(self.dark_curtain_menu, style)
-        add_family_row("dark", self.dark_curtain_menu)
+        self.curtain_styles.bind(self.curtain_style_selector)
         self.visionary_location_action = self.settings_menu.addAction(
             "Visionary Location…"
         )
@@ -597,6 +898,16 @@ class TitleBar(QtWidgets.QWidget):
         self.new_project_action.triggered.connect(
             self.parent.start_new_project
         )
+        self.delete_project_action = self.settings_menu.addAction(
+            "Delete Project"
+        )
+        set_action_help(
+            self.delete_project_action,
+            "Permanently remove the active draft, saved letter, and recovery copies.",
+        )
+        self.delete_project_action.triggered.connect(
+            self.parent.delete_project
+        )
         self.exit_action = self.settings_menu.addAction("Exit")
         set_action_help(
             self.exit_action,
@@ -607,6 +918,7 @@ class TitleBar(QtWidgets.QWidget):
             self._sync_curtain_menu
         )
         self.settings_menu.aboutToShow.connect(self._sync_theme_menu)
+        self.settings_menu.aboutToShow.connect(self._sync_project_actions)
         self.settings_menu.aboutToShow.connect(
             self._settings_menu_shown
         )
@@ -616,25 +928,35 @@ class TitleBar(QtWidgets.QWidget):
         self.settings_button.setMenu(self.settings_menu)
         layout.addWidget(self.settings_button)
 
-        # ---------------------------------------------------------------------
-        # Target Browser
-        # ---------------------------------------------------------------------
-
-        self.btn_target = self._make_button(
-            text=self.TARGET_SYMBOL,
-            tooltip="Open the Target Browser to manage recipient projects.",
+        half_button_gap = TITLE_BAR_CONTROL_PX // 2
+        divider_inner_gap = max(0, half_button_gap - layout.spacing())
+        self.settings_window_divider_container = QtWidgets.QWidget(self)
+        self.settings_window_divider_container.setFixedSize(
+            (divider_inner_gap * 2) + 1,
+            TITLE_BAR_CONTROL_PX,
         )
-        self._apply_button_icon(
-            self.btn_target,
-            "titlebar/target.png",
-            REL_RETICLE_ICON,
+        divider_layout = QHBoxLayout(self.settings_window_divider_container)
+        divider_layout.setContentsMargins(
+            divider_inner_gap,
+            0,
+            divider_inner_gap,
+            0,
         )
-
-        self.btn_target.clicked.connect(
-            self.parent.open_target_browser
+        divider_layout.setSpacing(0)
+        self.settings_window_divider = QFrame(
+            self.settings_window_divider_container
         )
-
-        layout.addWidget(self.btn_target)
+        self.settings_window_divider.setObjectName("SettingsWindowDivider")
+        self.settings_window_divider.setFixedSize(
+            1,
+            (TITLE_BAR_CONTROL_PX * 3) // 5,
+        )
+        divider_layout.addWidget(
+            self.settings_window_divider,
+            0,
+            Qt.AlignVCenter,
+        )
+        layout.addWidget(self.settings_window_divider_container)
 
         # ---------------------------------------------------------------------
         # Minimize
@@ -647,7 +969,6 @@ class TitleBar(QtWidgets.QWidget):
         self._apply_button_icon(
             self.btn_minimize,
             "titlebar/minimize.png",
-            REL_MINIMIZE_ICON,
         )
 
         self.btn_minimize.clicked.connect(
@@ -667,7 +988,6 @@ class TitleBar(QtWidgets.QWidget):
         self._apply_button_icon(
             self.btn_max,
             "titlebar/maximize.png",
-            REL_MAXIMIZE_ICON,
         )
 
         self.btn_max.clicked.connect(
@@ -688,7 +1008,6 @@ class TitleBar(QtWidgets.QWidget):
         self._apply_button_icon(
             self.btn_close,
             "titlebar/close.png",
-            REL_CLOSE_ICON,
         )
 
         self.btn_close.clicked.connect(
@@ -723,21 +1042,19 @@ class TitleBar(QtWidgets.QWidget):
         )
 
     def _sync_curtain_menu(self) -> None:
-        current = str(
-            SettingsStore(self.parent.project_root).get(
-                "curtain_style",
-                DEFAULT_SETTINGS["curtain_style"],
-            )
-        )
-        self._current_curtain_style = current
-        for style, action in self._curtain_actions.items():
-            action.setChecked(style == current)
-        self._refresh_curtain_preview_rows()
+        self.curtain_styles.sync_from_settings()
 
     def _sync_theme_menu(self) -> None:
         current = self.theme_service.theme_id
         for theme_id, action in self._theme_actions.items():
             action.setChecked(theme_id == current)
+
+    def _sync_project_actions(self) -> None:
+        settings = SettingsStore(self.parent.project_root).snapshot()
+        self.delete_project_action.setEnabled(
+            bool(str(settings.get("project_id", "")).strip())
+            and not is_protected_project(settings)
+        )
 
     def _set_theme(self, theme_id: str) -> None:
         try:
@@ -782,87 +1099,103 @@ class TitleBar(QtWidgets.QWidget):
     def apply_theme(self, service: ThemeService) -> None:
         """Refresh title-bar colors, menus, and decorative assets."""
         colors = service.tokens
-        self.title_label.setStyleSheet(
+        app_font = service.app_font_family
+        self._title_label_theme_qss = (
             "QLabel{"
             f"color:{colors.accent};background:transparent;"
-            "font-family:'Segoe UI Semibold';font-size:16px;"
+            f"font-family:'{app_font}';font-size:16px;"
             "letter-spacing:1px;}"
         )
-        self.settings_button.setStyleSheet(
-            "QToolButton{"
-            f"color:{colors.text};background:transparent;"
-            "border:1px solid transparent;border-radius:5px;padding:1px;}"
-            "QToolButton:hover,QToolButton::menu-button:hover{"
-            f"background:{_theme_rgba(colors.accent, 31)};"
-            f"border-color:{colors.border};}}"
-            "QToolButton::menu-indicator{image:none;}"
+        self.title_label.setStyleSheet(self._title_label_theme_qss)
+        self.settings_window_divider.setStyleSheet(
+            f"background:{colors.border};border:none;"
         )
+        if service.current.uses_image_buttons:
+            settings_qss = (
+                "QToolButton{"
+                f"color:{colors.text};background:transparent;"
+                "border:1px solid transparent;border-radius:5px;padding:1px;}"
+                "QToolButton:hover,QToolButton::menu-button:hover{"
+                f"background:{_theme_rgba(colors.accent, 31)};"
+                f"border-color:{colors.border};}}"
+                "QToolButton::menu-indicator{image:none;}"
+            )
+        else:
+            settings_qss = (
+                "QToolButton{"
+                f"color:{colors.text};background:{colors.control_background};"
+                f"border:1px solid {colors.border};border-radius:5px;padding:1px;}}"
+                "QToolButton:hover,QToolButton::menu-button:hover{"
+                f"color:{colors.highlight};background:{colors.hover};"
+                f"border-color:{colors.primary};}}"
+                "QToolButton:pressed{"
+                f"background:{colors.active};border-color:{colors.secondary};}}"
+                "QToolButton:disabled{"
+                f"color:{colors.muted_text};background:{colors.card_background};}}"
+                "QToolButton::menu-indicator{image:none;}"
+            )
+        self.settings_button.setStyleSheet(settings_qss)
         menu_qss = (
             "QMenu{"
             f"background:{colors.panel_background};color:{colors.text};"
-            f"border:1px solid {colors.border};padding:5px;}}"
+            f"border:1px solid {colors.border};padding:5px;"
+            f"font-family:'{app_font}';}}"
             "QMenu::item{padding:7px 26px 7px 10px;border-radius:4px;}"
             "QMenu::item:selected{"
             f"background:{colors.hover};color:{colors.highlight};}}"
             "QMenu::indicator:checked{"
             f"background:{colors.primary};border:1px solid {colors.highlight};}}"
+            "QMenu::separator{height:1px;"
+            f"background:{colors.border};margin:5px 8px;}}"
         )
         for menu in (
             self.settings_menu,
             self.themes_menu,
             self.curtain_menu,
-            self.light_curtain_menu,
-            self.dark_curtain_menu,
         ):
             menu.setToolTipsVisible(True)
             menu.setStyleSheet(menu_qss)
+        self.curtain_style_selector.apply_theme_tokens(colors)
         for button in (
-            self.btn_target,
             self.btn_minimize,
             self.btn_max,
             self.btn_close,
         ):
             self._style_titlebar_button(button)
         self._reload_settings_assets()
-        self._apply_button_icon(
-            self.btn_target,
-            "titlebar/target.png",
-            REL_RETICLE_ICON,
-        )
-        self._apply_button_icon(
-            self.btn_minimize,
-            "titlebar/minimize.png",
-            REL_MINIMIZE_ICON,
-        )
-        self._apply_button_icon(
-            self.btn_max,
-            "titlebar/maximize.png",
-            REL_MAXIMIZE_ICON,
-        )
-        self._apply_button_icon(
-            self.btn_close,
-            "titlebar/close.png",
-            REL_CLOSE_ICON,
-        )
+        if service.current.uses_image_buttons:
+            self._apply_button_icon(
+                self.btn_minimize,
+                "titlebar/minimize.png",
+            )
+            self._apply_button_icon(
+                self.btn_max,
+                "titlebar/maximize.png",
+            )
+            self._apply_button_icon(
+                self.btn_close,
+                "titlebar/close.png",
+            )
+        else:
+            for button in (
+                self.btn_minimize,
+                self.btn_max,
+                self.btn_close,
+            ):
+                button.setIcon(QIcon())
+                button.setText(str(button.property("fallbackSymbol") or ""))
+        self._sync_max_restore_button()
         self._sync_theme_menu()
-        self._refresh_curtain_preview_rows()
+        self._apply_command_presentation()
 
     def _resolve_theme_asset(
         self,
         logical_name: str,
-        legacy_relative: str,
     ) -> Path:
         resolver = getattr(self.parent, "resolve_theme_asset", None)
         if callable(resolver):
-            return resolver(logical_name, legacy_relative)
-        paths = application_paths(self.parent.project_root)
-        fallback = paths.app_resource_path(legacy_relative).relative_to(
-            paths.resource_root
-        )
-        return self.theme_service.resolve_asset(
-            logical_name,
-            fallback=fallback,
-        )
+            return resolver(logical_name)
+        return self.theme_service.resolve_asset(logical_name)
 
     def _reload_settings_assets(self) -> None:
         animated = self._settings_icon_animated or self._settings_menu_open
@@ -870,13 +1203,24 @@ class TitleBar(QtWidgets.QWidget):
         previous_movie.stop()
         previous_movie.setFileName("")
 
+        if not self.theme_service.current.uses_image_buttons:
+            self._settings_static_icon = QIcon()
+            self._settings_movie_path = ""
+            self._settings_movie = QMovie(parent=self)
+            self._settings_icon_animated = False
+            self.settings_button.setIcon(QIcon())
+            self.settings_button.setText("\u2699")
+            gear_font = QFont("Segoe UI Symbol", 17)
+            gear_font.setBold(False)
+            self.settings_button.setFont(gear_font)
+            previous_movie.deleteLater()
+            return
+
         static_path = self._resolve_theme_asset(
             "settings/idle.png",
-            REL_SETTINGS_PNG,
         )
         movie_path = self._resolve_theme_asset(
             "settings/hover.gif",
-            REL_SETTINGS_GIF,
         )
         self._settings_static_icon = QIcon(str(static_path))
         self._settings_movie_path = str(movie_path)
@@ -909,6 +1253,8 @@ class TitleBar(QtWidgets.QWidget):
             self.settings_button.setIcon(QIcon(pixmap))
 
     def _show_animated_settings_icon(self) -> None:
+        if not self.theme_service.current.uses_image_buttons:
+            return
         if not self._settings_movie.fileName():
             self._settings_movie.setFileName(self._settings_movie_path)
         if not self._settings_movie.isValid():
@@ -938,102 +1284,64 @@ class TitleBar(QtWidgets.QWidget):
             self._show_animated_settings_icon()
         else:
             self._show_static_settings_icon()
+        if self._command_mode and not self.underMouse():
+            self._command_hovered = False
+            self._apply_command_presentation()
+
+    def set_command_mode(self, active: bool) -> None:
+        """Make the title bar black and reveal its contents only on hover."""
+        self._command_mode = bool(active)
+        self._command_hovered = self._command_mode and self.underMouse()
+        self._apply_command_presentation()
+
+    def _apply_command_presentation(self) -> None:
+        reveal = (
+            not self._command_mode
+            or self._command_hovered
+            or self._settings_menu_open
+        )
+        self.setStyleSheet(
+            "QWidget#NexusTitleBar{background:#000000;color:#000000;}"
+            if self._command_mode
+            else ""
+        )
+        if self._command_mode and not reveal:
+            self.title_label.setStyleSheet(
+                f"{self._title_label_theme_qss}QLabel{{color:#000000;}}"
+            )
+        else:
+            self.title_label.setStyleSheet(self._title_label_theme_qss)
+
+        self.app_icon.setVisible(self._app_icon_available and reveal)
+        for widget in (
+            self.settings_button,
+            self.settings_window_divider_container,
+            self.btn_minimize,
+            self.btn_max,
+            self.btn_close,
+        ):
+            widget.setVisible(reveal)
+
+    def enterEvent(self, event: QtCore.QEvent) -> None:
+        if self._command_mode:
+            self._command_hovered = True
+            self._apply_command_presentation()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        if self._command_mode and not self._settings_menu_open:
+            self._command_hovered = False
+            self._apply_command_presentation()
+        super().leaveEvent(event)
 
     def set_curtain_preview_colors(
         self,
         colors: dict[str, tuple[int, int, int]],
     ) -> None:
-        self._curtain_preview_colors = {
-            "pure_white": (255, 255, 255),
-            **{
-                style: tuple(max(0, min(255, int(channel))) for channel in rgb)
-                for style, rgb in colors.items()
-                if style in VALID_CURTAIN_STYLES and len(rgb) == 3
-            },
-        }
-        self._refresh_curtain_preview_rows()
-
-    def _refresh_curtain_preview_rows(self) -> None:
-        for style, row in self._curtain_actions.items():
-            self._style_curtain_row(
-                row,
-                style,
-                selected=row.isChecked(),
-            )
-        for family, row in self._curtain_parent_actions.items():
-            family_selected = (
-                self._current_curtain_style
-                if self._current_curtain_style
-                in self._curtain_family_styles[family]
-                else None
-            )
-            preview_style = (
-                family_selected
-                or self._curtain_family_styles[family][0]
-            )
-            self._style_curtain_row(
-                row,
-                preview_style,
-                selected=family_selected is not None,
-            )
-
-    def _style_curtain_row(
-        self,
-        row: QtWidgets.QAbstractButton,
-        preview_style: str | None,
-        *,
-        selected: bool = False,
-    ) -> None:
-        colors = self.theme_service.tokens
-        rgb = (
-            self._curtain_preview_colors.get(preview_style)
-            if preview_style is not None
-            else None
-        )
-        if preview_style is not None and rgb is not None:
-            background = "#{:02x}{:02x}{:02x}".format(*rgb)
-            if preview_style == "pure_white":
-                foreground = "#000000"
-            else:
-                paired_style = CURTAIN_TEXT_STYLE_PAIRS.get(preview_style)
-                paired_rgb = self._curtain_preview_colors.get(paired_style)
-                foreground = (
-                    "#{:02x}{:02x}{:02x}".format(*paired_rgb)
-                    if paired_rgb is not None
-                    else colors.text
-                )
-        else:
-            background = colors.hover if selected else colors.panel_background
-            foreground = colors.highlight if selected else colors.text
-        border = colors.highlight if selected else "transparent"
-        row.setStyleSheet(
-            f"QPushButton,QToolButton{{background:{background};"
-            f"color:{foreground};border:2px solid {border};"
-            "border-radius:4px;font:600 10pt 'Segoe UI';"
-            "text-align:left;padding:5px 10px;}"
-            f"QPushButton:hover,QToolButton:hover{{border-color:{colors.accent};}}"
-            "QToolButton::menu-indicator{image:none;}"
-        )
+        self.curtain_styles.set_preview_colors(colors)
 
     def _set_curtain_style(self, style: str) -> None:
-        if style not in VALID_CURTAIN_STYLES:
-            style = str(DEFAULT_SETTINGS["curtain_style"])
-        SettingsStore(self.parent.project_root).update_fields(
-            curtain_style=style
-        )
-        self._sync_curtain_menu()
-        self.parent.status(
-            f"Curtain style set to {CURTAIN_STYLE_LABELS[style]}."
-        )
-        self.light_curtain_menu.close()
-        self.dark_curtain_menu.close()
-        self.curtain_menu.close()
-        forge = getattr(self.parent, "forge_tab", None)
-        if forge is None:
-            return
-        forge.schedule_refresh()
-        if forge.isVisible():
-            forge.ensure_preview_current()
+        self.curtain_styles.set_style(style)
 
     def _edit_visionary_location(self) -> None:
         settings = SettingsStore(self.parent.project_root)
@@ -1043,12 +1351,12 @@ class TitleBar(QtWidgets.QWidget):
                 DEFAULT_VISIONARY_URL,
             )
         )
-        entered, accepted = QtWidgets.QInputDialog.getText(
+        entered, accepted = LetterSmithInputDialog.get_text(
             self,
             "Visionary Location",
             "URL:",
-            QtWidgets.QLineEdit.Normal,
-            current,
+            text=current,
+            accept_text="Save",
         )
         if not accepted:
             return
@@ -1056,7 +1364,7 @@ class TitleBar(QtWidgets.QWidget):
         candidate = QUrl.fromUserInput(entered.strip()).toString()
         visionary_url = normalize_published_page_url(candidate)
         if not visionary_url:
-            QtWidgets.QMessageBox.warning(
+            show_lettersmith_message(
                 self,
                 "Invalid Visionary Location",
                 "Enter a valid http:// or https:// URL.",
@@ -1122,6 +1430,20 @@ class TitleBar(QtWidgets.QWidget):
         colors = self.theme_service.tokens
         hover_color = colors.error if button.property("dangerControl") else colors.accent
         hover_alpha = 77 if button.property("dangerControl") else 38
+        if not self.theme_service.current.uses_image_buttons:
+            button.setStyleSheet(
+                "QPushButton{"
+                f"color:{colors.text};background:{colors.control_background};"
+                f"border:1px solid {colors.border};border-radius:5px;padding:0;}}"
+                "QPushButton:hover{"
+                f"color:{colors.highlight};background:{colors.hover};"
+                f"border-color:{hover_color};}}"
+                "QPushButton:pressed{"
+                f"background:{colors.active};border-color:{colors.secondary};}}"
+                "QPushButton:disabled{"
+                f"color:{colors.muted_text};background:{colors.card_background};}}"
+            )
+            return
         button.setStyleSheet(
             "QPushButton{"
             f"color:{colors.muted_text};background:transparent;"
@@ -1137,9 +1459,16 @@ class TitleBar(QtWidgets.QWidget):
         self,
         button: QtWidgets.QPushButton,
         logical_name: str,
-        legacy_relative: str,
     ) -> None:
-        path = str(self._resolve_theme_asset(logical_name, legacy_relative))
+        self._apply_first_button_icon(button, (logical_name,))
+
+    def _apply_first_button_icon(
+        self,
+        button: QtWidgets.QPushButton,
+        logical_names: tuple[str, ...],
+    ) -> None:
+        resolver = getattr(self.theme_service, "resolve_first_asset")
+        path = str(resolver(logical_names))
         icon = QIcon(path)
         button.setIcon(QIcon())
         button.setText(str(button.property("fallbackSymbol") or ""))
@@ -1152,7 +1481,16 @@ class TitleBar(QtWidgets.QWidget):
         )
 
     def _sync_max_restore_button(self) -> None:
-        if self.parent.isMaximized():
+        maximized = self.parent.isMaximized()
+        if self.theme_service.current.uses_image_buttons:
+            candidates = (
+                RESTORE_THEME_ASSET_CANDIDATES
+                if maximized
+                else (MAXIMIZE_THEME_ASSET,)
+            )
+            self._apply_first_button_icon(self.btn_max, candidates)
+
+        if maximized:
             if self.btn_max.icon().isNull():
                 self.btn_max.setText(
                     self.RESTORE_SYMBOL
@@ -1176,15 +1514,50 @@ class TitleBar(QtWidgets.QWidget):
             )
 
     def _toggle_max_restore(self) -> None:
+        self._window_state_generation += 1
+        generation = self._window_state_generation
         if self.parent.isMaximized():
+            target = self._normal_window_geometry
+            if target is None or not target.isValid():
+                normal = self.parent.normalGeometry()
+                target = QtCore.QRect(normal) if normal.isValid() else None
+            self.parent.setWindowState(
+                self.parent.windowState() & ~Qt.WindowMaximized
+            )
             self.parent.showNormal()
+            if target is not None:
+                QtCore.QTimer.singleShot(
+                    0,
+                    lambda: self._finish_restore_geometry(
+                        generation,
+                        QtCore.QRect(target),
+                    ),
+                )
         else:
+            current = self.parent.geometry()
+            if current.isValid() and not self.parent.isFullScreen():
+                self._normal_window_geometry = QtCore.QRect(current)
             self.parent.showMaximized()
 
         QtCore.QTimer.singleShot(
             0,
             self._sync_max_restore_button,
         )
+
+    def _finish_restore_geometry(
+        self,
+        generation: int,
+        target: QtCore.QRect,
+    ) -> None:
+        if generation != self._window_state_generation or not target.isValid():
+            return
+        self.parent.setWindowState(
+            self.parent.windowState() & ~Qt.WindowMaximized
+        )
+        self.parent.showNormal()
+        self.parent.setGeometry(target)
+        self._normal_window_geometry = QtCore.QRect(target)
+        self._sync_max_restore_button()
 
     def eventFilter(self, watched, event):
         if watched is self.settings_button:
@@ -1217,40 +1590,17 @@ class TitleBar(QtWidgets.QWidget):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
-            self._drag_start = (
-                event.globalPosition().toPoint()
-            )
-            event.accept()
-            return
+            controller = getattr(self.parent, "_window_controller", None)
+            if controller is not None and controller.start_system_move():
+                event.accept()
+                return
 
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        if (
-            event.buttons() & Qt.LeftButton
-            and not self.parent.isMaximized()
-        ):
-            current_position = (
-                event.globalPosition().toPoint()
-            )
-
-            delta = (
-                current_position
-                - self._drag_start
-            )
-
-            self.parent.move(
-                self.parent.pos() + delta
-            )
-
-            self._drag_start = current_position
-            event.accept()
-            return
-
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
-        self._drag_start = QtCore.QPoint()
         super().mouseReleaseEvent(event)
 
 # ===================================================================================================================================================================================
@@ -1287,6 +1637,10 @@ class HelpPopover(QFrame):
 
     def apply_theme(self, service: ThemeService) -> None:
         colors = service.tokens
+        header_font = QFont(service.app_font_family, 13)
+        header_font.setBold(True)
+        self.header.setFont(header_font)
+        self.body.setFont(QFont(service.app_font_family, 10))
         self.setStyleSheet(
             "QFrame#HelpPopover{"
             f"background:{colors.card_background};"
@@ -1405,6 +1759,7 @@ class _ForgePreviewFullscreenWindow(QtWidgets.QWidget):
         )
         self.setObjectName("ForgePreviewFullscreenWindow")
         self.setWindowTitle("Letter Preview")
+        self._allow_close = False
         service = getattr(owner.window(), "theme_service", None)
         if service is not None:
             self.apply_theme_assets(service)
@@ -1434,8 +1789,76 @@ class _ForgePreviewFullscreenWindow(QtWidgets.QWidget):
         self._layout.removeWidget(preview)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self._allow_close:
+            event.accept()
+            return
         self.exit_requested.emit()
         event.ignore()
+
+    def shutdown(self) -> None:
+        self._allow_close = True
+        self._escape_shortcut.setEnabled(False)
+        self.hide()
+        self.close()
+        self.deleteLater()
+
+
+class _ThemedNewProjectButton(QtWidgets.QToolButton):
+    """Stock/example exit control backed by per-theme New Project artwork."""
+
+    def __init__(self, project_root: str | Path, parent: QtWidgets.QWidget) -> None:
+        super().__init__(parent)
+        self._project_root = Path(project_root).resolve()
+        self._artwork_path = Path()
+        self.setObjectName("ProtectedNewProjectButton")
+        self.setProperty("themeRole", "button")
+        self.setAccessibleName("New Project")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(NEW_PROJECT_ARTWORK_PX, NEW_PROJECT_ARTWORK_PX)
+        self.setIconSize(self.size())
+
+    @property
+    def artwork_path(self) -> Path:
+        return self._artwork_path
+
+    def apply_theme_assets(self, service: ThemeService) -> None:
+        fallback = _app_asset(
+            self._project_root,
+            f"themes/cyber_forge/{NEW_PROJECT_ARTWORK_RELATIVE}",
+        )
+        try:
+            path = service.resolve_asset(
+                NEW_PROJECT_ARTWORK_RELATIVE,
+            )
+        except (TypeError, ValueError):
+            path = fallback
+
+        self._artwork_path = Path(path).resolve()
+        icon = QIcon(str(self._artwork_path))
+        if not icon.isNull():
+            self.setText("")
+            self.setIcon(icon)
+            self.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            self.setStyleSheet(
+                "QToolButton#ProtectedNewProjectButton{"
+                "background:transparent;border:none;padding:0;}"
+            )
+            return
+
+        colors = service.tokens
+        self.setIcon(QIcon())
+        self.setText("New Project")
+        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.setStyleSheet(
+            "QToolButton#ProtectedNewProjectButton{"
+            f"background:{colors.control_background};color:{colors.text};"
+            f"border:1px solid {colors.border};border-radius:12px;"
+            f"font:700 18px '{service.app_font_family}';}}"
+            "QToolButton#ProtectedNewProjectButton:hover{"
+            f"background:{colors.hover};border-color:{colors.accent};}}"
+            "QToolButton#ProtectedNewProjectButton:pressed{"
+            f"background:{colors.active};}}"
+        )
 
 
 class Nexus(QtWidgets.QMainWindow):
@@ -1451,6 +1874,13 @@ class Nexus(QtWidgets.QMainWindow):
         self._command_bar: Optional[QtWidgets.QWidget] = None
         self._setup_system_tray()
         self.settings_store = SettingsStore(self.project_root)
+        self.curtain_styles = CurtainStyleController(
+            self.settings_store,
+            self,
+        )
+        self.curtain_styles.previewColorsRequested.connect(
+            self._refresh_curtain_preview_colors
+        )
         self.project_dirty = ProjectDirtyController()
         self.project_state = ProjectStateController(self.project_root)
         self.project_paths = ProjectPathResolver(self.project_root)
@@ -1474,6 +1904,11 @@ class Nexus(QtWidgets.QMainWindow):
         )
         self._curtain_preparation_pool = QtCore.QThreadPool(self)
         self._curtain_preparation_pool.setMaxThreadCount(1)
+        self._autosave_pool = QtCore.QThreadPool(self)
+        self._autosave_pool.setMaxThreadCount(1)
+        self._autosave_active_revision: int | None = None
+        self._autosave_pending_revision: int | None = None
+        self._autosave_tasks: dict[int, _ProjectAutosaveTask] = {}
         self._forge_fullscreen_active = False
         self._forge_fullscreen_window: Optional[
             _ForgePreviewFullscreenWindow
@@ -1481,10 +1916,20 @@ class Nexus(QtWidgets.QMainWindow):
         self._shutdown_complete = False
         self._shutdown_in_progress = False
         self._save_in_progress = False
+        self._protected_change_count = 0
+        self._protected_warning_shown = False
+        self._protected_change_tracking_suspended = False
         self.setObjectName("NexusWindow")
 
         # Frameless + QSS
-        self.setWindowFlag(QtCore.Qt.FramelessWindowHint)
+        self.setWindowFlags(
+            self.windowFlags()
+            | QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.WindowSystemMenuHint
+            | QtCore.Qt.WindowMinimizeButtonHint
+            | QtCore.Qt.WindowMaximizeButtonHint
+            | QtCore.Qt.WindowCloseButtonHint
+        )
         self.theme_service.apply(
             self,
             additional_qss=self._build_nexus_theme_stylesheet(),
@@ -1501,6 +1946,10 @@ class Nexus(QtWidgets.QMainWindow):
 
         # Title bar
         self.title_bar = TitleBar(self)
+        # Keep maximize/restore on the ordinary Qt click path. Advertising the
+        # custom button as HTMAXBUTTON makes Windows consume the click for its
+        # Snap Layout flyout before QPushButton can toggle the window state.
+        self._window_controller = FramelessWindowController(self)
         self.title_bar.set_project_title(
             str(self.settings_store.get("recipient_title", ""))
         )
@@ -1564,25 +2013,10 @@ class Nexus(QtWidgets.QMainWindow):
         self.image_preview.setStyleSheet("background:transparent;")
         self.preview_stack.addWidget(self.image_preview)
 
-        self.html_preview = QWebEngineView()
-        preview_background = self.theme_service.tokens.background
-        self.html_preview.setStyleSheet(
-            f"background-color:{preview_background};"
-        )
-        self.html_preview.page().setBackgroundColor(QColor(preview_background))
-        self.html_preview.settings().setAttribute(
-            QWebEngineSettings.FullScreenSupportEnabled,
-            True,
-        )
-        self.html_preview.settings().setAttribute(
-            QWebEngineSettings.LocalContentCanAccessFileUrls,
-            True,
-        )
-        self.html_preview.page().fullScreenRequested.connect(
-            self._on_web_fullscreen_requested
-        )
-        self.html_preview.installEventFilter(self)
-        self.preview_stack.addWidget(self.html_preview)
+        # Chromium is only needed after Forge has a playable viewer. Keeping
+        # the view absent until then avoids starting WebEngine for Image,
+        # Sound, Message, and recipient-selection sessions.
+        self.html_preview: Optional[QtWidgets.QWidget] = None
 
         pf_layout.addWidget(self.preview_stack)
         body_layout.addWidget(self.preview_frame, alignment=Qt.AlignHCenter)
@@ -1597,12 +2031,22 @@ class Nexus(QtWidgets.QMainWindow):
         body_layout.addWidget(self.preview_caption, alignment=Qt.AlignHCenter)
 
         # =============================================================================================
-        # Help (top-right above the feature panel) ΓÇö dual-GIF swap
-        # Idle = Help.gif (plays constantly), Hover = HHelp.gif
+        # Help (top-right above the feature panel) — dual-state media swap
+        # Idle = Help and prefers GIF; Hover = HHelp and prefers PNG.
         # =============================================================================================
         help_row = QHBoxLayout()
         help_row.setContentsMargins(0, 0, 0, 0)
         help_row.setSpacing(0)
+        self.protected_new_project_btn = _ThemedNewProjectButton(
+            self.project_root,
+            self,
+        )
+        self.protected_new_project_btn.setVisible(False)
+        self.protected_new_project_btn.clicked.connect(self.start_new_project)
+        set_control_help(
+            self.protected_new_project_btn,
+            "Leave this demonstration and begin your own letter.",
+        )
         help_row.addStretch(1)
         self.preview_tools_layout = help_row
 
@@ -1628,9 +2072,13 @@ class Nexus(QtWidgets.QMainWindow):
         self.help_icon.setMouseTracking(True)
         self.help_icon.setAttribute(Qt.WA_Hover, True)
 
-        # Movies: idle + hover
+        # Each state may be animated or static; candidate order selects the default.
         self._help_movie_idle: Optional[QMovie] = None
         self._help_movie_hover: Optional[QMovie] = None
+        self._help_movie_idle_path = ""
+        self._help_movie_hover_path = ""
+        self._help_static_idle_path = ""
+        self._help_static_hover_path = ""
         help_row.addWidget(self.help_icon, 0, Qt.AlignRight)
         body_layout.addLayout(help_row)
 
@@ -1674,7 +2122,13 @@ class Nexus(QtWidgets.QMainWindow):
         main_layout.addWidget(self.application_stack)
         self.setCentralWidget(self.main_widget)
         self._project_loading_overlay = _ProjectLoadingOverlay(
-            self.main_widget
+            self
+        )
+        self._publication_activity_active = False
+        self._publication_interaction_locked = False
+        self._publication_tabbar_was_enabled = True
+        self._project_loading_overlay.dismissed.connect(
+            self._restore_publication_interaction
         )
 
         # Status bar
@@ -1739,7 +2193,6 @@ class Nexus(QtWidgets.QMainWindow):
 
         # Double-click filter for full message view
         self._dbl_filter = _DoubleClickFilter(self)
-        self.html_preview.installEventFilter(self._dbl_filter)
 
         self._apply_current_theme()
         self.project_state.add_listener(self._on_project_state_transition)
@@ -1752,6 +2205,7 @@ class Nexus(QtWidgets.QMainWindow):
     def _build_nexus_theme_stylesheet(self) -> str:
         """Build the shell stylesheet exclusively from semantic theme tokens."""
         colors = self.theme_service.tokens
+        app_font = self.theme_service.app_font_family
         overlay = _theme_rgba(colors.panel_background, 209)
         return f"""
             /* Background ownership remains deliberately scoped. */
@@ -1760,8 +2214,8 @@ class Nexus(QtWidgets.QMainWindow):
             QWidget#NexusBody {{
                 background:{colors.background};
                 color:{colors.text};
-                font-family:'Segoe UI';
-                font-size:11px;
+                font-family:'{app_font}';
+                font-size:{SHELL_FONT_PX}px;
             }}
 
             QStackedWidget#FeatureStack,
@@ -1773,9 +2227,13 @@ class Nexus(QtWidgets.QMainWindow):
 
             QWidget#ImagePageSurface,
             QWidget#MessagePageSurface,
-            QWidget#ForgePageSurface,
-            QWidget#CommandPageSurface {{
+            QWidget#ForgePageSurface {{
                 background:{colors.background};
+                border:none;
+            }}
+
+            QWidget#CommandPageSurface {{
+                background:transparent;
                 border:none;
             }}
 
@@ -1787,32 +2245,8 @@ class Nexus(QtWidgets.QMainWindow):
             QTabBar#MainTabBar {{
                 background:{colors.background};
                 color:{colors.text};
-                font-family:'Segoe UI';
-                font-size:11px;
-            }}
-
-            QLabel {{
-                color:{colors.highlight};
-                font-weight:600;
-            }}
-
-            QPushButton {{
-                background-color:transparent;
-                color:{colors.text};
-                border:1px solid {colors.border};
-                border-radius:4px;
-                padding:6px 12px;
-                font:11px 'Segoe UI';
-            }}
-            QPushButton:hover {{
-                background:{colors.hover};
-                border-color:{colors.primary};
-                color:{colors.highlight};
-            }}
-            QPushButton:pressed {{
-                background:{colors.active};
-                border-color:{colors.secondary};
-                color:{colors.highlight};
+                font-family:'{app_font}';
+                font-size:{SHELL_FONT_PX}px;
             }}
 
             QTabBar#MainTabBar::tab {{
@@ -1821,6 +2255,7 @@ class Nexus(QtWidgets.QMainWindow):
                 padding:8px 14px;
                 margin-right:2px;
                 color:{colors.muted_text};
+                font-weight:700;
             }}
             QTabBar#MainTabBar::tab:selected {{
                 color:{colors.highlight};
@@ -1828,6 +2263,10 @@ class Nexus(QtWidgets.QMainWindow):
             }}
             QTabBar#MainTabBar::tab:hover {{
                 color:{colors.highlight};
+            }}
+
+            QTabBar#MainTabBar::tab:last {{
+                font-family:'{COMMAND_FONT_FAMILY}';
             }}
 
             QTabBar#MainTabBar[commandOverlay="true"] {{
@@ -1855,7 +2294,7 @@ class Nexus(QtWidgets.QMainWindow):
 
             QWidget#PreviewFrame {{
                 background:{colors.card_background};
-                border:2px solid {colors.border};
+                border:2px solid {colors.preview_frame_border};
                 border-radius:6px;
             }}
 
@@ -1870,15 +2309,12 @@ class Nexus(QtWidgets.QMainWindow):
     def resolve_theme_asset(
         self,
         logical_name: str,
-        legacy_relative: str,
+        fallback_relative: str | None = None,
     ) -> Path:
-        """Resolve a themed asset with the active app-resource path as fallback."""
-        paths = application_paths(self.project_root)
-        fallback_path = paths.app_resource_path(legacy_relative).resolve()
-        fallback = fallback_path.relative_to(paths.resource_root)
+        """Resolve active-theme artwork through the central theme service."""
         return self.theme_service.resolve_asset(
             logical_name,
-            fallback=fallback,
+            fallback=fallback_relative,
         )
 
     @QtCore.Slot(str, object)
@@ -1906,7 +2342,8 @@ class Nexus(QtWidgets.QMainWindow):
         if preview_caption is not None:
             preview_caption.setStyleSheet(
                 f"color:{self.theme_service.tokens.highlight};"
-                "font:12px 'Segoe UI Semibold';padding:4px 6px;"
+                f"font:12px '{self.theme_service.app_font_family}';"
+                "padding:4px 6px;"
             )
         if hasattr(self, "help_icon"):
             self._reload_help_theme_assets()
@@ -1919,6 +2356,7 @@ class Nexus(QtWidgets.QMainWindow):
                 "border-radius:6px;padding:8px 12px;}"
             )
         self._apply_theme_assets_to_descendants()
+        self._apply_theme_styles_to_ordinary_ui()
 
     def _apply_theme_assets_to_descendants(self) -> None:
         for widget in self.findChildren(QtWidgets.QWidget):
@@ -1933,6 +2371,27 @@ class Nexus(QtWidgets.QMainWindow):
                     type(widget).__name__,
                 )
 
+    def _apply_theme_styles_to_ordinary_ui(self) -> None:
+        for name in (
+            "recipient_page",
+            "image_tab",
+            "sound_tab",
+            "message_tab",
+            "forge_tab",
+            "_prompt_writer_win",
+        ):
+            widget = getattr(self, name, None)
+            if not isinstance(widget, QtWidgets.QWidget):
+                continue
+            try:
+                self.theme_service.apply_semantic_styles(widget)
+            except (RuntimeError, TypeError, ValueError):
+                _LOGGER.exception(
+                    "Theme styles could not be applied to %s.",
+                    type(widget).__name__,
+                )
+
+    @performance_timed("startup.project_tabs")
     def _initialize_project_tabs(self) -> None:
         if self._project_tabs_initialized:
             return
@@ -1964,11 +2423,13 @@ class Nexus(QtWidgets.QMainWindow):
             self.project_root,
             project_state=self.project_state,
             project_paths=self.project_paths,
+            curtain_styles=self.curtain_styles,
         )
         self.command_tab = CommandTab(
             self.project_root,
             project_state=self.project_state,
         )
+        self.command_tab.setProperty("themeIndependent", True)
 
         self.preview_tools_layout.insertWidget(
             0,
@@ -1998,6 +2459,7 @@ class Nexus(QtWidgets.QMainWindow):
             "CommandPageSurface",
             self.command_tab,
         )
+        self.command_page.setProperty("themeIndependent", True)
         for page in (
             self.image_page,
             self.sound_page,
@@ -2025,6 +2487,13 @@ class Nexus(QtWidgets.QMainWindow):
         self.forge_tab.restore_activity_changed.connect(
             self._set_restore_activity
         )
+        publication_activity = getattr(
+            self.forge_tab,
+            "publication_activity_changed",
+            None,
+        )
+        if publication_activity is not None:
+            publication_activity.connect(self._set_publication_activity)
         self.forge_tab.published_url_changed.connect(
             lambda url: self.message_tab.set_published_page_url(
                 url,
@@ -2053,14 +2522,26 @@ class Nexus(QtWidgets.QMainWindow):
         self.image_tab.images_changed.connect(
             lambda _reason: self.project_dirty.mark_changed("images")
         )
+        self.image_tab.images_changed.connect(
+            lambda _reason: self._record_protected_edit()
+        )
         self.image_tab.animation_settings_changed.connect(
             lambda _index: self.project_dirty.mark_changed("image-animation")
+        )
+        self.image_tab.animation_settings_changed.connect(
+            lambda _index: self._record_protected_edit()
         )
         self.sound_tab.project_sound.changed.connect(
             lambda: self.project_dirty.mark_changed("sound")
         )
+        self.sound_tab.project_sound.changed.connect(
+            self._record_protected_edit
+        )
         self.message_tab.project_changed.connect(
             lambda: self.project_dirty.mark_changed("message")
+        )
+        self.message_tab.project_changed.connect(
+            self._record_protected_edit
         )
         self.image_tab.image_selected.connect(
             lambda pixmap: self._show_image_for_tab(0, pixmap)
@@ -2089,17 +2570,10 @@ class Nexus(QtWidgets.QMainWindow):
         )
         self._project_tabs_initialized = True
         self._apply_theme_assets_to_descendants()
-        saved_tab = str(self.settings_store.get("ui_last_tab", "Images"))
-        saved_index = next(
-            (
-                index
-                for index in range(self.tabbar.count())
-                if self.tabbar.tabText(index) == saved_tab
-            ),
-            0,
-        )
-        self.tabbar.setCurrentIndex(saved_index)
-        self._tab_changed(saved_index)
+        self._apply_theme_styles_to_ordinary_ui()
+        self.tabbar.setCurrentIndex(0)
+        self._tab_changed(0)
+        self._sync_protected_project_ui()
         self._schedule_curtain_preparation(immediate=True)
 
     def _schedule_curtain_preparation(
@@ -2109,7 +2583,7 @@ class Nexus(QtWidgets.QMainWindow):
     ) -> None:
         self._curtain_preparation_generation += 1
         self._curtain_preparation_timer.stop()
-        self.title_bar.set_curtain_preview_colors({})
+        self._refresh_curtain_preview_colors()
         cover = (
             Path(self.project_root)
             / "gallery"
@@ -2117,11 +2591,20 @@ class Nexus(QtWidgets.QMainWindow):
             / "pages"
             / "cover.png"
         )
-        if cover.is_file():
-            if immediate:
-                self._start_curtain_preparation()
-            else:
-                self._curtain_preparation_timer.start()
+        if not cover.is_file():
+            return
+        if immediate:
+            self._start_curtain_preparation()
+        else:
+            self._curtain_preparation_timer.start()
+
+    @QtCore.Slot()
+    def _refresh_curtain_preview_colors(self) -> None:
+        root = Path(self.project_root)
+        cover = root / "gallery" / "user" / "pages" / "cover.png"
+        self.curtain_styles.set_preview_colors(
+            curtain_variant_rgbs(cover if cover.is_file() else None)
+        )
 
     def _stop_curtain_preparation(self, timeout_ms: int | None = None) -> bool:
         self._curtain_preparation_generation += 1
@@ -2153,8 +2636,9 @@ class Nexus(QtWidgets.QMainWindow):
         if generation != self._curtain_preparation_generation:
             return
         if not isinstance(result, CurtainVariantCache):
+            self._refresh_curtain_preview_colors()
             return
-        self.title_bar.set_curtain_preview_colors(dict(result.colors))
+        self.curtain_styles.set_preview_colors(dict(result.colors))
 
     @QtCore.Slot(int, str)
     def _curtain_preparation_failed(
@@ -2166,12 +2650,14 @@ class Nexus(QtWidgets.QMainWindow):
         if generation != self._curtain_preparation_generation:
             return
         _LOGGER.warning("Curtain preparation failed: %s", message)
+        self._refresh_curtain_preview_colors()
 
     def _on_project_settings_changed(
         self,
         _settings: dict,
         keys: tuple[str, ...],
     ) -> None:
+        self._sync_protected_project_ui(_settings)
         if "recipient_title" in keys:
             self.title_bar.set_project_title(
                 str(_settings.get("recipient_title", ""))
@@ -2217,6 +2703,7 @@ class Nexus(QtWidgets.QMainWindow):
             self._initialize_project_tabs()
             self.body.setEnabled(True)
             self.application_stack.setCurrentWidget(self.body)
+            self._show_help_asset("idle")
             self.status("Ready.")
             self.toast("Welcome to Letter Smith")
             return
@@ -2233,6 +2720,7 @@ class Nexus(QtWidgets.QMainWindow):
             return
 
         self.body.setEnabled(False)
+        self._stop_help_movies()
         self.application_stack.setCurrentWidget(self.recipient_page)
         self.recipient_page.focus_recipient()
         self.status("A recipient is required before editing.")
@@ -2328,6 +2816,14 @@ class Nexus(QtWidgets.QMainWindow):
         sc2 = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+H"), self)
         sc2.activated.connect(lambda: (self._show_help_from_icon() if not self.help_pop.isVisible() else self._hide_help_popover()))
 
+        self._developer_mode_shortcut = QtGui.QShortcut(
+            QtGui.QKeySequence("Ctrl+Alt+Shift+D"),
+            self,
+        )
+        self._developer_mode_shortcut.activated.connect(
+            self.open_developer_mode
+        )
+
     # =============================================================================================
     # Status / Toast utilities
     # =============================================================================================
@@ -2390,6 +2886,7 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _on_project_restored(self, _payload: Optional[dict] = None) -> None:
         """Coordinate public refresh contracts after an atomic restore."""
+        self._protected_change_tracking_suspended = True
         panel = getattr(self, "_prompt_writer_win", None)
         if isinstance(panel, QtWidgets.QWidget):
             try:
@@ -2408,10 +2905,97 @@ class Nexus(QtWidgets.QMainWindow):
                 refresh()
             except Exception as error:
                 self.status(f"{owner} could not refresh: {error}")
+        self._schedule_curtain_preparation(immediate=True)
         self.forge_tab.refresh_project_state()
         self.forge_tab.refresh_saved_letters()
         self._show_forge_preview()
         self.project_dirty.mark_saved()
+        self._protected_change_count = 0
+        self._protected_warning_shown = False
+        self._protected_change_tracking_suspended = False
+        self._sync_protected_project_ui()
+
+    def _sync_protected_project_ui(
+        self,
+        snapshot: dict | None = None,
+    ) -> None:
+        button = getattr(self, "protected_new_project_btn", None)
+        if button is None:
+            return
+        settings = (
+            snapshot
+            if snapshot is not None
+            else self.settings_store.snapshot()
+        )
+        visible = (
+            is_protected_project(settings)
+            and not bool(getattr(self, "_command_immersive", False))
+        )
+        button.setVisible(visible)
+        if visible:
+            QtCore.QTimer.singleShot(
+                0,
+                self._position_protected_new_project_button,
+            )
+
+    def _position_protected_new_project_button(self) -> None:
+        button = getattr(self, "protected_new_project_btn", None)
+        if button is None or not button.isVisible():
+            return
+        image_tab = getattr(self, "image_tab", None)
+        prompt_button = getattr(image_tab, "pwrite_fab", None)
+        if prompt_button is None:
+            return
+
+        x_position = prompt_button.x()
+        y_position = (
+            prompt_button.y()
+            + prompt_button.height()
+            + NEW_PROJECT_ARTWORK_GAP
+        )
+        button.move(
+            max(0, min(x_position, self.width() - button.width())),
+            max(0, min(y_position, self.height() - button.height())),
+        )
+        button.raise_()
+
+    def _record_protected_edit(self) -> None:
+        if self._protected_change_tracking_suspended:
+            return
+        forge_tab = getattr(self, "forge_tab", None)
+        if forge_tab is None or not forge_tab.is_protected_project():
+            return
+        self._protected_change_count += 1
+        if self._protected_warning_shown or self._protected_change_count < 5:
+            return
+        self._protected_warning_shown = True
+        self._show_protected_letter_warning()
+
+    def _show_protected_letter_warning(self) -> None:
+        dialog = QDialog(self, Qt.Popup | Qt.FramelessWindowHint)
+        dialog.setObjectName("ProtectedLetterWarning")
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
+        message = QLabel(
+            "This is a Stock or Example Letter. Changes are temporary and "
+            "cannot replace the original. Start a New Project when you are "
+            "ready to create your own letter.",
+            dialog,
+        )
+        message.setWordWrap(True)
+        message.setMaximumWidth(430)
+        layout.addWidget(message)
+        action = QtWidgets.QPushButton("New Project", dialog)
+        action.clicked.connect(dialog.accept)
+        action.clicked.connect(self.start_new_project)
+        layout.addWidget(action, 0, Qt.AlignRight)
+        dialog.adjustSize()
+        center = self.mapToGlobal(self.rect().center())
+        frame = dialog.frameGeometry()
+        frame.moveCenter(center)
+        dialog.move(frame.topLeft())
+        dialog.exec()
 
     def _route_forge_correction(self, tab: str, target: str) -> None:
         destinations = {
@@ -2434,12 +3018,13 @@ class Nexus(QtWidgets.QMainWindow):
     # =============================================================================================
     def _on_message_double_click(self):
         try:
+            web_view_type, _settings_type = _webengine_components()
             dlg = QDialog(self)
             dlg.setWindowTitle("Message Preview")
             dlg.resize(900, 700)
 
             lay = QVBoxLayout(dlg)
-            view = QWebEngineView(dlg)
+            view = web_view_type(dlg)
             lay.addWidget(view)
 
             # Clone current html from main view
@@ -2493,12 +3078,15 @@ class Nexus(QtWidgets.QMainWindow):
     def _set_command_immersive(self, active: bool) -> None:
         """Let Command cover all app content while retaining hover navigation."""
         active = bool(active)
+        self.title_bar.set_command_mode(active)
         if self._command_immersive == active:
+            self._sync_protected_project_ui()
             if active:
                 self._position_command_tabbar()
             return
 
         self._command_immersive = active
+        self._sync_protected_project_ui()
         if active:
             self._command_status_was_visible = self.statusBar().isVisible()
             self.statusBar().hide()
@@ -2634,6 +3222,10 @@ class Nexus(QtWidgets.QMainWindow):
             self.preview_stack.setCurrentIndex(0)
 
         self.help_icon.setVisible(idx != 4)
+        if idx == 4:
+            self._stop_help_movies()
+        else:
+            self._show_help_asset("idle")
         if self.help_pop.isVisible():
             if idx == 4:
                 self._hide_help_popover()
@@ -2647,9 +3239,29 @@ class Nexus(QtWidgets.QMainWindow):
         dirty = getattr(self, "project_dirty", None)
         if dirty is not None and not dirty.is_dirty:
             return ""
+        forge_tab = getattr(self, "forge_tab", None)
+        if forge_tab is not None and forge_tab.is_protected_project():
+            if dirty is not None:
+                dirty.mark_saved()
+            return "Demonstration changes saved for this session."
+        flush_prompt_writer = getattr(
+            self,
+            "flush_prompt_writer_state",
+            None,
+        )
+        if callable(flush_prompt_writer) and not flush_prompt_writer():
+            return "Project not saved: Prompt Writer state could not be saved."
         eligibility = self.project_save_service.save_eligibility()
         if not eligibility.can_save:
             return f"Project not saved: {eligibility.blocked_reason}"
+        autosave_pool = getattr(self, "_autosave_pool", None)
+        if autosave_pool is not None and dirty is not None:
+            revision = dirty.revision
+            if self._autosave_active_revision is not None:
+                self._autosave_pending_revision = revision
+                return "Project autosave queued."
+            self._start_project_autosave(revision)
+            return "Project autosave started."
         try:
             self.project_save_service.save_workspace_snapshot(
                 reason="tab-switch",
@@ -2662,6 +3274,144 @@ class Nexus(QtWidgets.QMainWindow):
         if dirty is not None:
             dirty.mark_saved()
         return "Project autosaved."
+
+    def _start_project_autosave(self, revision: int) -> None:
+        task = _ProjectAutosaveTask(
+            self.project_save_service,
+            revision,
+            "tab-switch",
+        )
+        task.signals.completed.connect(self._project_autosave_completed)
+        task.signals.failed.connect(self._project_autosave_failed)
+        self._autosave_active_revision = int(revision)
+        self._autosave_tasks[int(revision)] = task
+        self._autosave_pool.start(task)
+
+    @QtCore.Slot(int, str)
+    def _project_autosave_completed(
+        self,
+        revision: int,
+        _destination: str,
+    ) -> None:
+        if self._autosave_active_revision != int(revision):
+            self._autosave_tasks.pop(int(revision), None)
+            return
+        try:
+            self.project_save_service.finish_deferred_workspace_snapshot()
+        except Exception as error:
+            self._project_autosave_failed(int(revision), str(error))
+            return
+
+        self._autosave_active_revision = None
+        self._autosave_tasks.pop(int(revision), None)
+        saved = self.project_dirty.mark_saved(
+            expected_revision=int(revision)
+        )
+        self._autosave_pending_revision = None
+        if (
+            self.project_dirty.is_dirty
+            and self.project_dirty.revision != int(revision)
+            and not self._shutdown_in_progress
+            and not self._shutdown_complete
+        ):
+            self._start_project_autosave(self.project_dirty.revision)
+            return
+        if (
+            saved
+            and not self._shutdown_in_progress
+            and not self._shutdown_complete
+        ):
+            self.status("Project autosaved.")
+
+    @QtCore.Slot(int, str)
+    def _project_autosave_failed(self, revision: int, message: str) -> None:
+        if self._autosave_active_revision == int(revision):
+            self._autosave_active_revision = None
+        self._autosave_tasks.pop(int(revision), None)
+        self._autosave_pending_revision = None
+        if (
+            self.project_dirty.is_dirty
+            and self.project_dirty.revision != int(revision)
+            and not self._shutdown_in_progress
+            and not self._shutdown_complete
+        ):
+            self._start_project_autosave(self.project_dirty.revision)
+            return
+        _LOGGER.error("Project tab-switch autosave failed: %s", message)
+        if not self._shutdown_in_progress and not self._shutdown_complete:
+            self.status(f"Project autosave failed: {message}")
+
+    def _finish_project_autosave_for_shutdown(
+        self,
+        timeout_ms: int = 5000,
+    ) -> bool:
+        pool = getattr(self, "_autosave_pool", None)
+        if pool is None:
+            return True
+        deadline = monotonic() + (max(0, int(timeout_ms)) / 1000.0)
+
+        while True:
+            revision = self._autosave_active_revision
+            if revision is None:
+                if not self.project_dirty.is_dirty:
+                    self._autosave_pending_revision = None
+                    return True
+                forge_tab = getattr(self, "forge_tab", None)
+                is_protected = getattr(forge_tab, "is_protected_project", None)
+                if callable(is_protected) and is_protected():
+                    self._autosave_pending_revision = None
+                    return True
+                eligibility = self.project_save_service.save_eligibility()
+                if not eligibility.can_save:
+                    return True
+                if monotonic() >= deadline:
+                    return False
+                revision = self.project_dirty.revision
+                self._autosave_pending_revision = revision
+                self._start_project_autosave(revision)
+
+            remaining_seconds = deadline - monotonic()
+            if remaining_seconds <= 0:
+                return False
+            remaining_ms = max(1, int(remaining_seconds * 1000.0))
+            if not pool.waitForDone(remaining_ms):
+                return False
+
+            revision = self._autosave_active_revision
+            if revision is None:
+                continue
+            task = self._autosave_tasks.get(int(revision))
+            if task is None or task.error or not task.destination:
+                self._autosave_active_revision = None
+                self._autosave_tasks.pop(int(revision), None)
+                if (
+                    self.project_dirty.is_dirty
+                    and self.project_dirty.revision != int(revision)
+                ):
+                    self._autosave_pending_revision = (
+                        self.project_dirty.revision
+                    )
+                    continue
+                return False
+            try:
+                self.project_save_service.finish_deferred_workspace_snapshot()
+            except Exception:
+                _LOGGER.exception(
+                    "Deferred autosave finalization failed during shutdown."
+                )
+                self._autosave_active_revision = None
+                self._autosave_tasks.pop(int(revision), None)
+                return False
+
+            self._autosave_active_revision = None
+            self._autosave_tasks.pop(int(revision), None)
+            saved = self.project_dirty.mark_saved(
+                expected_revision=int(revision)
+            )
+            self._autosave_pending_revision = None
+            if saved:
+                return True
+            self._autosave_pending_revision = self.project_dirty.revision
 
     def _update_preview_tools_geometry(self) -> None:
         forge_visible = self.tabbar.currentIndex() == 3
@@ -2843,6 +3593,34 @@ class Nexus(QtWidgets.QMainWindow):
     # =============================================================================================
     # Preview rendering (image/html) + fade behavior
     # =============================================================================================
+    def _ensure_forge_preview(self) -> QtWidgets.QWidget:
+        """Construct the shared WebEngine view on first actual viewer use."""
+        view = self.html_preview
+        if view is not None:
+            return view
+
+        web_view_type, settings_type = _webengine_components()
+        view = web_view_type()
+        preview_background = self.theme_service.tokens.background
+        view.setStyleSheet(f"background-color:{preview_background};")
+        view.page().setBackgroundColor(QColor(preview_background))
+        view.settings().setAttribute(
+            settings_type.FullScreenSupportEnabled,
+            True,
+        )
+        view.settings().setAttribute(
+            settings_type.LocalContentCanAccessFileUrls,
+            True,
+        )
+        view.page().fullScreenRequested.connect(
+            self._on_web_fullscreen_requested
+        )
+        view.installEventFilter(self)
+        view.installEventFilter(self._dbl_filter)
+        self.preview_stack.addWidget(view)
+        self.html_preview = view
+        return view
+
     def _show_image_for_tab(self, tab_index: int, pixmap: QPixmap) -> None:
         """Ignore delayed preview work after its source tab has been left."""
         if self.tabbar.currentIndex() != tab_index:
@@ -2868,9 +3646,10 @@ class Nexus(QtWidgets.QMainWindow):
         self._fade_timer.start(30000)
 
     def _show_html(self, html: str):
+        view = self._ensure_forge_preview()
         self._clear_preview()
-        self.html_preview.setHtml(html or "<p></p>")
-        self.preview_stack.setCurrentWidget(self.html_preview)
+        view.setHtml(html or "<p></p>")
+        self.preview_stack.setCurrentWidget(view)
         self.status("HTML preview updated.")
 
     def _fade_preview(self):
@@ -2952,8 +3731,8 @@ class Nexus(QtWidgets.QMainWindow):
             self.help_icon.setVisible(True)
         except Exception:
             pass
-        self.title_bar._sync_curtain_menu()
-        self.title_bar.set_curtain_preview_colors({})
+        self.curtain_styles.sync_from_settings()
+        self.curtain_styles.set_preview_colors({})
 
     def _request_message_preview(self) -> None:
         """Ask MessageTab to emit whichever preview it thinks is correct."""
@@ -3018,6 +3797,7 @@ class Nexus(QtWidgets.QMainWindow):
         if not index.is_file():
             self.status("The playable letter is missing. Preview it again.")
             return
+        view = self._ensure_forge_preview()
         self._forge_preview_mode = (
             mode if mode in {"portrait", "landscape", "window"} else "portrait"
         )
@@ -3028,7 +3808,7 @@ class Nexus(QtWidgets.QMainWindow):
         except OSError:
             modified = None
 
-        current_url = self.html_preview.url()
+        current_url = view.url()
         current_path = Path(current_url.toLocalFile()) if current_url.isLocalFile() else None
         same_build = False
         if current_path is not None:
@@ -3043,7 +3823,7 @@ class Nexus(QtWidgets.QMainWindow):
 
         self._clear_preview()
         self.preview_caption.setVisible(False)
-        self.preview_stack.setCurrentWidget(self.html_preview)
+        self.preview_stack.setCurrentWidget(view)
         if same_build:
             self.status(
                 f"Interactive letter preview: "
@@ -3061,7 +3841,7 @@ class Nexus(QtWidgets.QMainWindow):
         viewer_url.setQuery(
             f"lettersmith={cache_token}-{self._forge_preview_generation}"
         )
-        self.html_preview.setUrl(viewer_url)
+        view.setUrl(viewer_url)
         self.status(
             f"Interactive letter preview: "
             f"{self._forge_preview_mode.replace('-', ' ')}"
@@ -3070,34 +3850,40 @@ class Nexus(QtWidgets.QMainWindow):
     def _set_forge_preview_visible(self, visible: bool) -> None:
         if visible:
             return
-        self.html_preview.page().runJavaScript(
+        view = self.html_preview
+        if view is None:
+            return
+        view.page().runJavaScript(
             "document.querySelectorAll('audio,video').forEach("
             "media => { try { media.pause(); } catch (_) {} });"
         )
 
     def _release_forge_preview_files(self) -> None:
         """Stop playback and release the generated viewer's file handles."""
+        view = self.html_preview
+        if view is None:
+            return
         if self._forge_fullscreen_active:
             self._restore_forge_preview_from_fullscreen()
         try:
-            self.html_preview.page().runJavaScript(
+            view.page().runJavaScript(
                 "document.querySelectorAll('audio,video').forEach("
                 "media => { try { media.pause(); media.currentTime = 0; } catch (_) {} });"
             )
         except Exception:
             pass
-        if self.preview_stack.currentWidget() is self.html_preview:
+        if self.preview_stack.currentWidget() is view:
             self.preview_stack.setCurrentIndex(0)
         if self.tabbar.currentIndex() == 3:
             self.preview_caption.setText("Preparing interactive preview…")
             self.preview_caption.setVisible(True)
         else:
             self.preview_caption.setVisible(False)
-        previous_url = self.html_preview.url()
-        self.html_preview.stop()
+        previous_url = view.url()
+        view.stop()
         blank_url = QUrl("about:blank")
         if not previous_url.isLocalFile():
-            self.html_preview.setUrl(blank_url)
+            view.setUrl(blank_url)
             return
 
         unload_loop = QtCore.QEventLoop()
@@ -3107,20 +3893,20 @@ class Nexus(QtWidgets.QMainWindow):
 
         def finish_unload(ok: bool) -> None:
             nonlocal unloaded
-            if ok and self.html_preview.url() == blank_url:
+            if ok and view.url() == blank_url:
                 unloaded = True
                 unload_loop.quit()
 
-        self.html_preview.loadFinished.connect(finish_unload)
+        view.loadFinished.connect(finish_unload)
         unload_timeout.timeout.connect(unload_loop.quit)
         try:
-            self.html_preview.setUrl(blank_url)
+            view.setUrl(blank_url)
             unload_timeout.start(1500)
             unload_loop.exec(QtCore.QEventLoop.ExcludeUserInputEvents)
         finally:
             unload_timeout.stop()
             try:
-                self.html_preview.loadFinished.disconnect(finish_unload)
+                view.loadFinished.disconnect(finish_unload)
             except (RuntimeError, TypeError):
                 pass
         if not unloaded:
@@ -3129,31 +3915,55 @@ class Nexus(QtWidgets.QMainWindow):
                 previous_url.toLocalFile(),
             )
 
-    def _release_project_files_for_restore(self) -> None:
+    def _release_project_files_for_restore(self) -> bool:
         """Release project-owned media handles before an atomic restore."""
+        errors: list[str] = []
+        if getattr(self, "_autosave_active_revision", None) is not None:
+            errors.append("project autosave is still running")
+        try:
+            self.message_tab.prepare_for_project_restore()
+        except Exception as error:
+            _LOGGER.exception("Message files could not be released before restore.")
+            errors.append(str(error) or "message rendering is still busy")
         try:
             self.image_tab.prepare_for_project_restore()
-        except Exception:
+        except Exception as error:
             _LOGGER.exception("Image files could not be released before restore.")
+            errors.append(str(error) or "image resources are still busy")
         try:
             self.sound_tab.prepare_for_project_restore()
-        except Exception:
+        except Exception as error:
             _LOGGER.exception("Sound files could not be released before restore.")
+            errors.append(str(error) or "sound resources are still busy")
+        if errors:
+            forge_tab = getattr(self, "forge_tab", None)
+            report_failure = getattr(
+                forge_tab,
+                "report_project_file_release_failure",
+                None,
+            )
+            if callable(report_failure):
+                report_failure("; ".join(errors))
+            return False
+        return True
 
     def prepare_for_project_reset(self) -> None:
         """Stop project-owned workers and media before New Project commits."""
         if not self._stop_curtain_preparation():
             raise RuntimeError(
                 "Curtain preparation did not stop before New Project."
-            )
+        )
         self._release_forge_preview_files()
-        self._release_project_files_for_restore()
+        if not self._release_project_files_for_restore():
+            raise RuntimeError(
+                "Project media could not be stopped before New Project."
+            )
 
     @QtCore.Slot(bool, str)
     def _set_restore_activity(self, active: bool, message: str) -> None:
         if active:
+            self._project_loading_overlay.start(message, mode="restore")
             self._position_project_loading_overlay()
-            self._project_loading_overlay.start(message)
             QtWidgets.QApplication.processEvents(
                 QtCore.QEventLoop.ExcludeUserInputEvents
                 | QtCore.QEventLoop.ExcludeSocketNotifiers
@@ -3161,16 +3971,71 @@ class Nexus(QtWidgets.QMainWindow):
             return
         self._project_loading_overlay.stop()
 
+    @QtCore.Slot(bool, str, str)
+    def _set_publication_activity(
+        self,
+        active: bool,
+        operation: str,
+        message: str,
+    ) -> None:
+        operation_name = str(operation or "publish").strip().casefold()
+        mode = "unpublish" if operation_name.startswith("un") else "publish"
+        overlay = self._project_loading_overlay
+        if active:
+            self._publication_activity_active = True
+            if not self._publication_interaction_locked:
+                self._publication_tabbar_was_enabled = self.tabbar.isEnabled()
+                self._publication_interaction_locked = True
+            self.tabbar.setEnabled(False)
+            forge_tab = getattr(self, "forge_tab", None)
+            dismiss_readiness = getattr(forge_tab, "dismiss_readiness", None)
+            if callable(dismiss_readiness):
+                dismiss_readiness()
+            self._hide_help_popover()
+            title = (
+                "Unpublishing Letter…"
+                if mode == "unpublish"
+                else "Publishing Letter…"
+            )
+            detail = str(message or "").strip()
+            if detail.casefold() == title.casefold():
+                detail = ""
+            overlay.start(title, mode=mode, detail=detail)
+            self._position_project_loading_overlay()
+            return
+        self._publication_activity_active = False
+        overlay.stop(animated=True)
+
+    @QtCore.Slot()
+    def _restore_publication_interaction(self) -> None:
+        if (
+            self._publication_activity_active
+            or not self._publication_interaction_locked
+        ):
+            return
+        self.tabbar.setEnabled(self._publication_tabbar_was_enabled)
+        self._publication_interaction_locked = False
+
     def _position_project_loading_overlay(self) -> None:
         overlay = getattr(self, "_project_loading_overlay", None)
         if overlay is None:
             return
-        top = self.title_bar.geometry().bottom() + 1
+        if overlay.activity_mode in overlay._PUBLICATION_MODES:
+            overlay.setGeometry(self.rect())
+            if overlay.isVisible():
+                overlay.raise_()
+            return
+        origin = self.main_widget.mapTo(self, QtCore.QPoint(0, 0))
+        top = origin.y() + self.title_bar.geometry().bottom() + 1
         overlay.setGeometry(
-            0,
+            origin.x(),
             top,
             self.main_widget.width(),
-            max(0, self.main_widget.height() - top),
+            max(
+                0,
+                self.main_widget.height()
+                - (top - origin.y()),
+            ),
         )
 
     def restart_forge_preview(self, _reason: str = "") -> None:
@@ -3194,6 +4059,7 @@ class Nexus(QtWidgets.QMainWindow):
     def _enter_forge_fullscreen(self) -> None:
         if self._forge_fullscreen_active:
             return
+        view = self._ensure_forge_preview()
         window = self._forge_fullscreen_window
         if window is None:
             window = _ForgePreviewFullscreenWindow(self)
@@ -3203,23 +4069,27 @@ class Nexus(QtWidgets.QMainWindow):
             self._forge_fullscreen_window = window
 
         self._forge_fullscreen_active = True
-        self.preview_stack.removeWidget(self.html_preview)
-        window.attach_preview(self.html_preview)
+        self.preview_stack.removeWidget(view)
+        window.attach_preview(view)
         screen = self.screen()
         if screen is not None:
             window.setGeometry(screen.geometry())
         window.showFullScreen()
-        self.html_preview.show()
+        view.show()
         window.layout().activate()
         window.raise_()
         window.activateWindow()
-        self.html_preview.setFocus()
+        view.setFocus()
 
     def _request_forge_fullscreen_exit(self) -> None:
         if not self._forge_fullscreen_active:
             return
+        view = self.html_preview
+        if view is None:
+            self._restore_forge_preview_from_fullscreen()
+            return
         try:
-            self.html_preview.page().runJavaScript(
+            view.page().runJavaScript(
                 "if (document.fullscreenElement) document.exitFullscreen();"
             )
         except RuntimeError:
@@ -3238,15 +4108,18 @@ class Nexus(QtWidgets.QMainWindow):
         if not self._forge_fullscreen_active:
             return
         self._forge_fullscreen_active = False
+        view = self.html_preview
+        if view is None:
+            return
         window = self._forge_fullscreen_window
         if window is not None:
             window.hide()
-            window.detach_preview(self.html_preview)
-        if self.preview_stack.indexOf(self.html_preview) < 0:
-            self.preview_stack.addWidget(self.html_preview)
-        self.preview_stack.setCurrentWidget(self.html_preview)
+            window.detach_preview(view)
+        if self.preview_stack.indexOf(view) < 0:
+            self.preview_stack.addWidget(view)
+        self.preview_stack.setCurrentWidget(view)
         QtCore.QTimer.singleShot(0, self._update_preview_geometry)
-        self.html_preview.setFocus()
+        view.setFocus()
 
     def _read_project_title(self) -> str:
         """Read recipient_title from settings.json (best available 'project title' signal)."""
@@ -3285,7 +4158,7 @@ class Nexus(QtWidgets.QMainWindow):
     # Resize/Move: keep preview aspect; keep popover aligned
     # =============================================================================================
     def _update_preview_geometry(self) -> None:
-        """Keep Sound usable in normal windows without changing full-screen layout."""
+        """Keep Sound controls usable across window states without shrinking other tabs."""
         if self._forge_fullscreen_active:
             return
         window_height = max(1, self.height())
@@ -3296,12 +4169,6 @@ class Nexus(QtWidgets.QMainWindow):
             current_tab = self.tabbar.currentIndex()
         except Exception:
             current_tab = -1
-
-        sound_in_normal_window = (
-            current_tab == 1
-            and not self.isMaximized()
-            and not self.isFullScreen()
-        )
 
         if current_tab == 2:
             message_tab = getattr(self, "message_tab", None)
@@ -3364,21 +4231,32 @@ class Nexus(QtWidgets.QMainWindow):
                 min(body_height, max(1, h + 12)),
             )
             return
-        if sound_in_normal_window:
-            # The preview content is naturally 169 x 253. Capping it near that
-            # native height returns roughly 60-75 px to the Sound controls.
-            h = max(220, min(253, int(window_height * 0.30)))
+        if current_tab == 1:
+            # The visualizer is naturally 169 x 253. Enlarging it in maximized
+            # windows steals the height needed by the Sound controls below.
+            h = max(
+                SOUND_PREVIEW_MIN_HEIGHT,
+                min(SOUND_PREVIEW_MAX_HEIGHT, int(window_height * 0.30)),
+            )
         else:
-            # Preserve the existing appearance in maximized/full-screen mode
-            # and on every other tab.
+            # Preserve the existing appearance on every other tab.
             h = int(window_height * 0.35)
 
         w = int(h * _PREVIEW_AR)
         self.preview_frame.setFixedSize(max(160, w + 12), max(120, h + 12))
 
+    def nativeEvent(self, event_type, message):
+        controller = getattr(self, "_window_controller", None)
+        if controller is not None:
+            handled, result = controller.native_event(event_type, message)
+            if handled:
+                return True, result
+        return super().nativeEvent(event_type, message)
+
     def resizeEvent(self, event):
         self._update_preview_geometry()
         self._update_preview_tools_geometry()
+        self._position_protected_new_project_button()
         self._position_command_tabbar()
         self._position_project_loading_overlay()
         if (
@@ -3432,27 +4310,62 @@ class Nexus(QtWidgets.QMainWindow):
         _LOGGER.info("Application resource shutdown started.")
         try:
             try:
-                if not self._stop_curtain_preparation():
+                if not self._stop_curtain_preparation(timeout_ms=5000):
                     _LOGGER.warning(
                         "Curtain preparation did not stop before shutdown."
                     )
             except Exception:
                 _LOGGER.exception("Curtain preparation shutdown failed.")
+            autosave_deadline = monotonic() + 5.0
+            try:
+                if not self.flush_prompt_writer_state():
+                    _LOGGER.warning(
+                        "Prompt Writer state could not be flushed during shutdown."
+                    )
+            except Exception:
+                _LOGGER.exception("Prompt Writer shutdown flush failed.")
+            try:
+                autosave_remaining_ms = max(
+                    0,
+                    int((autosave_deadline - monotonic()) * 1000.0),
+                )
+                if not self._finish_project_autosave_for_shutdown(
+                    autosave_remaining_ms
+                ):
+                    _LOGGER.warning(
+                        "Project autosave did not finish cleanly before shutdown."
+                    )
+            except Exception:
+                _LOGGER.exception("Project autosave shutdown failed.")
             if self._project_tabs_initialized:
                 try:
-                    if not self.forge_tab.shutdown_operations():
+                    if not self.forge_tab.shutdown(timeout_ms=5000):
                         _LOGGER.warning(
-                            "Forge operation did not stop before shutdown."
+                            "Forge resources did not stop before shutdown."
                         )
                 except Exception:
-                    _LOGGER.exception("Forge operation shutdown failed.")
+                    _LOGGER.exception("Forge resource shutdown failed.")
             save_preferences = getattr(self, "_save_window_preferences", None)
             if callable(save_preferences):
                 save_preferences()
-            for timer_name in ("_help_show_timer", "_help_hide_timer"):
+            for timer_name in (
+                "_image_tab_readiness_hide_timer",
+                "_help_show_timer",
+                "_help_hide_timer",
+                "_toast_timer",
+            ):
                 timer = getattr(self, timer_name, None)
                 if timer is not None:
                     timer.stop()
+            clear_preview = getattr(self, "_clear_preview", None)
+            if callable(clear_preview):
+                clear_preview()
+            cancel_command_fade = getattr(self, "_cancel_command_fade", None)
+            if callable(cancel_command_fade):
+                cancel_command_fade()
+            loading_overlay = getattr(self, "_project_loading_overlay", None)
+            if loading_overlay is not None:
+                loading_overlay.stop()
             help_icon = getattr(self, "help_icon", None)
             if help_icon is not None:
                 help_icon.setMovie(None)
@@ -3462,23 +4375,29 @@ class Nexus(QtWidgets.QMainWindow):
             ):
                 if movie is not None:
                     movie.stop()
+            title_bar = getattr(self, "title_bar", None)
+            stop_settings_movie = getattr(
+                title_bar,
+                "_show_static_settings_icon",
+                None,
+            )
+            if callable(stop_settings_movie):
+                stop_settings_movie()
             settings_store = getattr(self, "settings_store", None)
             settings_changed = getattr(settings_store, "changed", None)
             settings_callback = getattr(self, "_on_project_settings_changed", None)
             if settings_changed is not None and callable(settings_callback):
                 settings_changed.disconnect(settings_callback)
+            curtain_styles = getattr(self, "curtain_styles", None)
+            if curtain_styles is not None:
+                curtain_styles.close()
             project_dirty = getattr(self, "project_dirty", None)
-            title_bar = getattr(self, "title_bar", None)
             dirty_callback = getattr(title_bar, "set_project_dirty", None)
             if project_dirty is not None and callable(dirty_callback):
                 project_dirty.remove_listener(dirty_callback)
             self.project_state.remove_listener(
                 self._on_project_state_transition
             )
-            if not self.flush_prompt_writer_state():
-                _LOGGER.warning(
-                    "Prompt Writer state could not be flushed during shutdown."
-                )
             prompt_writer = getattr(self, "_prompt_writer_win", None)
             prompt_writer_shutdown = getattr(prompt_writer, "shutdown", None)
             if callable(prompt_writer_shutdown):
@@ -3494,13 +4413,7 @@ class Nexus(QtWidgets.QMainWindow):
                 except Exception:
                     _LOGGER.exception("Forge preview file release failed.")
                 try:
-                    self.forge_tab.deactivate_for_tab_change()
-                    self.forge_tab.set_readiness_context_visible(False)
-                    self.forge_tab.readiness_window.shutdown()
-                except Exception:
-                    _LOGGER.exception("Forge preview shutdown failed.")
-                try:
-                    if not self.sound_tab.shutdown():
+                    if not self.sound_tab.shutdown(timeout_ms=5000):
                         _LOGGER.warning("Sound workers did not stop during shutdown.")
                 except Exception:
                     _LOGGER.exception("Sound shutdown failed.")
@@ -3512,6 +4425,10 @@ class Nexus(QtWidgets.QMainWindow):
                     self.image_tab.shutdown()
                 except Exception:
                     _LOGGER.exception("Image shutdown failed.")
+            try:
+                self._dispose_forge_preview()
+            except Exception:
+                _LOGGER.exception("Forge WebEngine disposal failed.")
         finally:
             try:
                 self.project_state.shutdown()
@@ -3523,6 +4440,44 @@ class Nexus(QtWidgets.QMainWindow):
             self._shutdown_in_progress = False
             _LOGGER.info("Application resource shutdown completed.")
 
+    def _dispose_forge_preview(self) -> None:
+        """Close the fullscreen host and the view-owned WebEngine page."""
+        fullscreen = getattr(self, "_forge_fullscreen_window", None)
+        if fullscreen is not None:
+            shutdown = getattr(fullscreen, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+            self._forge_fullscreen_window = None
+
+        view = getattr(self, "html_preview", None)
+        if view is None:
+            return
+        try:
+            view.page().fullScreenRequested.disconnect(
+                self._on_web_fullscreen_requested
+            )
+        except (RuntimeError, TypeError):
+            pass
+        for event_filter in (
+            self,
+            getattr(self, "_dbl_filter", None),
+        ):
+            if event_filter is None:
+                continue
+            try:
+                view.removeEventFilter(event_filter)
+            except RuntimeError:
+                pass
+        preview_stack = getattr(self, "preview_stack", None)
+        if preview_stack is not None and preview_stack.indexOf(view) >= 0:
+            preview_stack.removeWidget(view)
+        view.stop()
+        view.hide()
+        view.close()
+        view.setParent(None)
+        view.deleteLater()
+        self.html_preview = None
+
     def start_new_project(self) -> None:
         """Confirm and clear only the currently active editable project."""
         if self._shutdown_complete or self._shutdown_in_progress:
@@ -3531,17 +4486,25 @@ class Nexus(QtWidgets.QMainWindow):
         if forge_tab is not None and forge_tab.operation_in_progress:
             self.status("Finish the current Forge operation before starting a new project.")
             return
-        if self.project_state.is_project_ready:
-            answer = QtWidgets.QMessageBox.question(
+        protected = bool(
+            forge_tab is not None and forge_tab.is_protected_project()
+        )
+        if self.project_state.is_project_ready and not protected:
+            confirmation = LetterSmithConfirmationDialog(
                 self,
-                "Start New Project",
-                "Discard the current active project and start a new one? "
-                "Saved letters, backups, Prompt Writer libraries, palettes, "
-                "and application preferences will be kept.",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
-                QtWidgets.QMessageBox.Cancel,
+                title="Start New Project",
+                question=(
+                    "Discard the current active project and start a new one? "
+                    "Saved letters, backups, Prompt Writer libraries, palettes, "
+                    "and application preferences will be kept."
+                ),
+                primary_text="Yes",
+                secondary_text="No",
+                destructive_primary=True,
+                click_outside_dismiss=False,
+                width=560,
             )
-            if answer != QtWidgets.QMessageBox.Yes:
+            if confirmation.exec() != QtWidgets.QDialog.Accepted:
                 self.status("New project canceled.")
                 return
         try:
@@ -3554,7 +4517,7 @@ class Nexus(QtWidgets.QMainWindow):
             )
         except Exception as error:
             _LOGGER.exception("New Project failed: %s", error)
-            QtWidgets.QMessageBox.critical(
+            show_lettersmith_message(
                 self,
                 "New Project",
                 f"The active project could not be cleared: {error}",
@@ -3562,7 +4525,73 @@ class Nexus(QtWidgets.QMainWindow):
             return
         if completed:
             self._on_command_wiped()
+            self._protected_change_count = 0
+            self._protected_warning_shown = False
+            self._sync_protected_project_ui()
             self.status("New project ready. Enter a recipient to begin.")
+
+    def delete_project(self) -> None:
+        """Confirm and permanently remove the active editable project."""
+        if self._shutdown_complete or self._shutdown_in_progress:
+            return
+        forge_tab = getattr(self, "forge_tab", None)
+        if forge_tab is not None and forge_tab.operation_in_progress:
+            self.status("Finish the current Forge operation before deleting the project.")
+            return
+        if not self.project_state.is_project_ready:
+            self.status("There is no active project to delete.")
+            return
+        if forge_tab is not None and forge_tab.is_protected_project():
+            self.status("Stock and Example Letters cannot be deleted.")
+            return
+
+        settings = SettingsStore(self.project_root).snapshot()
+        recipient = str(settings.get("recipient_name", "")).strip()
+        title = str(settings.get("recipient_title", "")).strip()
+        project_name = title or "Untitled Letter"
+        owner = f" for {recipient}" if recipient else ""
+        confirmation = LetterSmithConfirmationDialog(
+            self,
+            title="Delete Project",
+            question=(
+                f'Permanently delete "{project_name}"{owner}?\n\n'
+                "The active draft, saved letter, and recovery copies will be "
+                "removed from this device. Shared Prompt Writer libraries, "
+                "palettes, music, application preferences, and published "
+                "copies will be kept.\n\nThis cannot be undone."
+            ),
+            primary_text="Yes",
+            secondary_text="No",
+            destructive_primary=True,
+            click_outside_dismiss=False,
+            width=620,
+        )
+        if confirmation.exec() != QtWidgets.QDialog.Accepted:
+            self.status("Project deletion canceled.")
+            return
+
+        try:
+            from command import delete_project
+
+            completed = delete_project(
+                self,
+                project_root=self.project_root,
+                project_state=self.project_state,
+            )
+        except Exception as error:
+            _LOGGER.exception("Delete Project failed: %s", error)
+            show_lettersmith_message(
+                self,
+                "Delete Project",
+                f"The active project could not be deleted: {error}",
+            )
+            return
+        if completed:
+            self._on_command_wiped()
+            self._protected_change_count = 0
+            self._protected_warning_shown = False
+            self._sync_protected_project_ui()
+            self.status("Project deleted. Enter a recipient to begin.")
 
     def open_command_bar_and_close_editor(self, data: object) -> bool:
         """Transfer the completed-letter snapshot to the post-reset controller."""
@@ -3709,29 +4738,23 @@ class Nexus(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
     # =============================================================================================
-    # Target Browser (title-bar button)
-    # =============================================================================================
-    def open_target_browser(self):
-        try:
-            script = os.path.join(self.project_root, "target.py")
-            if not os.path.exists(script):
-                self.status("Γ¥î target.py not found")
-                self.toast("target.py missing")
-                return
-            pos = QtGui.QCursor.pos()
-            subprocess.Popen(
-                [sys.executable, script, "--x", str(pos.x()), "--y", str(pos.y())],
-                close_fds=True
-            )
-            self.status("Target Browser opened.")
-            self.toast("Target Browser launched")
-        except Exception as ex:
-            self.status(f"Γ¥î Could not open Target Browser: {ex}")
-            self.toast("Target launch failed")
-
-    # =============================================================================================
     # Prompt Writer opener (used by Image_tab FAB and Ctrl+Alt+P shortcut)
     # =============================================================================================
+    def open_developer_mode(self) -> None:
+        """Open the guarded developer reset dialog."""
+        if getattr(self, "_developer_mode_active", False):
+            return
+        self._developer_mode_active = True
+        try:
+            from developermode import run_developer_mode
+
+            run_developer_mode(
+                project_root=self.project_root,
+                parent=self,
+            )
+        finally:
+            self._developer_mode_active = False
+
     def reset_prompt_writer_state(self) -> bool:
         """Reset the owned Prompt Writer without constructing it just to clear state."""
         try:
@@ -3791,6 +4814,11 @@ class Nexus(QtWidgets.QMainWindow):
                 project_root=self.project_root,
             )
             self._prompt_writer_win = w
+            self.theme_service.apply_semantic_styles(w)
+            w.project_changed.connect(
+                lambda: self.project_dirty.mark_changed("prompt-writer")
+            )
+            w.project_changed.connect(self._record_protected_edit)
             w.destroyed.connect(self._on_prompt_writer_destroyed)
             w.dismissed.connect(self._on_prompt_writer_dismissed)
             w.open_with_anim()
@@ -3824,43 +4852,105 @@ class Nexus(QtWidgets.QMainWindow):
             movie.deleteLater()
             setattr(self, attribute, None)
 
-        def load_movie(path: Path) -> Optional[QMovie]:
-            if not path.is_file():
-                return None
-            movie = QMovie(str(path), parent=self)
-            if not movie.isValid():
-                movie.deleteLater()
-                return None
-            movie.setCacheMode(QMovie.CacheAll)
-            movie.setSpeed(100)
-            movie.setScaledSize(QSize(HELP_ICON_PX, HELP_ICON_PX))
-            movie.start()
-            return movie
-
-        self._help_movie_idle = load_movie(
-            self.resolve_theme_asset("help/idle.gif", REL_HELP_GIF)
-        )
-        self._help_movie_hover = load_movie(
-            self.resolve_theme_asset("help/hover.gif", REL_HELP_HOVER)
-        )
-        if self._help_movie_idle is not None:
-            self.help_icon.setMovie(self._help_movie_idle)
-        elif self._help_movie_hover is not None:
-            self.help_icon.setMovie(self._help_movie_hover)
-        else:
-            fallback = self.resolve_theme_asset(
-                "help/fallback.png",
+        resolver = getattr(self.theme_service, "resolve_first_asset")
+        for kind, candidates in HELP_THEME_ASSET_CANDIDATES.items():
+            selected = resolver(candidates, fallback=REL_HELP_PNG)
+            selected_path = str(selected) if selected.is_file() else ""
+            movie_path = selected_path if selected.suffix.casefold() == ".gif" else ""
+            static_candidate = next(
+                candidate for candidate in candidates if candidate.endswith(".png")
+            )
+            static_path = self.resolve_theme_asset(
+                static_candidate,
                 REL_HELP_PNG,
             )
-            self._set_help_fallback_icon(str(fallback))
+            setattr(self, f"_help_movie_{kind}_path", movie_path)
+            setattr(
+                self,
+                f"_help_static_{kind}_path",
+                str(static_path) if static_path.is_file() else "",
+            )
 
-    def _set_help_fallback_icon(self, png_path: str):
+        project_ready = bool(
+            getattr(getattr(self, "project_state", None), "is_project_ready", False)
+        )
+        command_active = (
+            getattr(self, "tabbar", None) is not None
+            and self.tabbar.currentIndex() == 4
+        )
+        if project_ready and not command_active:
+            if self._show_help_asset("idle"):
+                return
+        fallback = self.resolve_theme_asset(
+            "help/fallback.png",
+            REL_HELP_PNG,
+        )
+        self._set_help_fallback_icon(str(fallback))
+
+    def _ensure_help_movie(self, kind: str) -> Optional[QMovie]:
+        """Create one help animation only when that state becomes visible."""
+        if kind not in {"idle", "hover"}:
+            raise ValueError(f"Unknown help movie kind: {kind}")
+        attribute = f"_help_movie_{kind}"
+        movie = getattr(self, attribute)
+        if movie is not None:
+            return movie
+        path = getattr(self, f"{attribute}_path", "")
+        if not path:
+            return None
+        movie = QMovie(path, parent=self)
+        if not movie.isValid():
+            movie.deleteLater()
+            setattr(self, f"{attribute}_path", "")
+            return None
+        movie.setCacheMode(QMovie.CacheAll)
+        movie.setSpeed(100)
+        movie.setScaledSize(QSize(HELP_ICON_PX, HELP_ICON_PX))
+        setattr(self, attribute, movie)
+        return movie
+
+    def _show_help_movie(self, kind: str) -> bool:
+        movie = self._ensure_help_movie(kind)
+        if movie is None:
+            return False
+        for candidate in (
+            self._help_movie_idle,
+            self._help_movie_hover,
+        ):
+            if candidate is not None and candidate is not movie:
+                candidate.stop()
+        self.help_icon.setMovie(movie)
+        if movie.state() == QMovie.NotRunning:
+            movie.start()
+        return True
+
+    def _show_help_asset(self, kind: str) -> bool:
+        if kind not in {"idle", "hover"}:
+            raise ValueError(f"Unknown help asset kind: {kind}")
+        if self._show_help_movie(kind):
+            return True
+        path = getattr(self, f"_help_static_{kind}_path", "")
+        if not path:
+            return False
+        self._stop_help_movies()
+        self.help_icon.setMovie(None)
+        return self._set_help_fallback_icon(path)
+
+    def _stop_help_movies(self) -> None:
+        for movie in (
+            self._help_movie_idle,
+            self._help_movie_hover,
+        ):
+            if movie is not None:
+                movie.stop()
+
+    def _set_help_fallback_icon(self, png_path: str) -> bool:
         if os.path.exists(png_path):
             pm = QPixmap(png_path)
             if not pm.isNull():
                 pm = pm.scaled(HELP_ICON_PX, HELP_ICON_PX, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.help_icon.setPixmap(pm)
-                return
+                return True
         # Final fallback: small text
         self.help_icon.setText("Help")
         self.help_icon.setStyleSheet(
@@ -3868,6 +4958,7 @@ class Nexus(QtWidgets.QMainWindow):
             "padding:0;margin:0;"
             f"color:{self.theme_service.tokens.accent};font-weight:800;}}"
         )
+        return False
 
     def _refresh_help_text(self, idx: int):
         # Header (per tab)
@@ -3982,21 +5073,13 @@ class Nexus(QtWidgets.QMainWindow):
                 self._help_hide_timer.stop()
                 self._help_show_timer.start()
                 # Swap to hover movie while over the icon
-                if self._help_movie_hover:
-                    if self._help_movie_idle:
-                        self._help_movie_idle.stop()
-                    self.help_icon.setMovie(self._help_movie_hover)
-                    self._help_movie_hover.start()
+                self._show_help_asset("hover")
             elif t in (QEvent.Leave, QEvent.HoverLeave):
                 self._help_show_timer.stop()
                 # If we immediately entered the popover, it will cancel this timer
                 self._help_hide_timer.start()
                 # Swap back to idle movie when leaving icon
-                if self._help_movie_idle:
-                    if self._help_movie_hover:
-                        self._help_movie_hover.stop()
-                    self.help_icon.setMovie(self._help_movie_idle)
-                    self._help_movie_idle.start()
+                self._show_help_asset("idle")
 
         elif pop is not None and watched is pop:
             t = event.type()

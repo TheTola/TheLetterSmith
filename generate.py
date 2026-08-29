@@ -17,11 +17,10 @@
 #     gallery/user/message
 #     active-project sound workspace       (project sound manifest)
 #   Viewer SFX:
-#     resources/app/sounds/ (canonical)
-#     recognized legacy locations remain readable
+#     gallery/app/sounds/ (canonical)
 #
 # Improvements applied:
-#   1) Seed required SFX from canonical or recognized legacy sources
+#   1) Seed required SFX from canonical application resources
 #   2) Atomic copy on Windows (copy -> tmp -> os.replace) for robustness
 #   3) Strict template placeholder validation (fail fast if Template drift occurs)
 #
@@ -38,17 +37,19 @@ import json
 import logging
 import os
 import re
-import shutil
 import tempfile
+import threading
 import webbrowser
+from collections import OrderedDict
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import unquote, urlsplit
 
 from Template import TEMPLATE_HTML, TEMPLATE_CSS, TEMPLATE_JS
 from curtain_cache import CurtainVariantCache, load_curtain_variant_cache
 from curtain_color import (
     curtain_variant_rgbs,
+    get_curtain_display_colors,
     write_recolored_banner_image,
     write_tinted_curtain_image,
 )
@@ -58,7 +59,11 @@ from image_animation import (
     build_runtime_image_assets,
     validate_runtime_image_manifest,
 )
+from letter_page import letter_page_style_from_settings
 from message_format import message_plain_text
+from performance_trace import performance_timed
+from readiness import evaluate_readiness
+from saved_letters import update_saved_metadata
 from sound_model import (
     BUILD_SOUND_MANIFEST_NAME,
     build_sound_manifest,
@@ -67,13 +72,21 @@ from sound_model import (
 )
 from project_state import ensure_project_identity
 from project_paths import application_paths
+from protected_projects import demo_preview_directory, is_protected_project
 from settings_store import (
     ACTIVE_PLAY_DIR_KEY,
     DEFAULT_SETTINGS,
     SettingsStore,
-    VALID_CURTAIN_STYLES,
+    normalize_curtain_style,
 )
-from transactional_io import PathTransaction, cleanup_abandoned_staging
+from transactional_io import (
+    PathTransaction,
+    atomic_copy_file as _transactional_atomic_copy_file,
+    atomic_write_json as _transactional_atomic_write_json,
+    cleanup_abandoned_staging,
+    enforce_internal_tree_visibility,
+    file_change_token,
+)
 from config import (
     APP_BANNER_PATH,
     DEFAULT_VOLUME,
@@ -87,6 +100,7 @@ from config import (
     USER_CONTROLS_DIR,
     REQUIRED_SLIDES,
     CONTROL_FILES,
+    MESSAGE_ASSETS_DIR,
     MESSAGE_HTML_FILE,
     MESSAGE_IMAGE_FILE,
     MUSIC_FILE,
@@ -96,15 +110,11 @@ from config import (
     FLIP_COUNT,
 )
 
-# App-owned SFX live here (relative to project root)
+# App-owned SFX live here (relative to the application resource root).
 APP_SOUNDS_DIR = Path("sounds")
 BANNER_FILE = "bannerman.png"
-LEGACY_SFX_DIRS = (
-    Path("gallery") / "user" / "sounds",
-    Path("gallery") / "app" / "icons" / "Sounds",
-)
 BUILD_STATE_FILE = "lettersmith-build.json"
-BUILD_SCHEMA_VERSION = 12
+BUILD_SCHEMA_VERSION = 14
 CURTAIN_FILES = {"cleft.png", "cright.png"}
 CURTAIN_ANALYSIS_PAGE_ORDER = (
     "cover.png",
@@ -119,6 +129,11 @@ _FINGERPRINT_SETTING_KEYS = (
     "message_overlay_opacity",
 )
 _LOGGER = logging.getLogger(__name__)
+_FILE_DIGEST_CACHE_LIMIT = 2048
+_FILE_DIGEST_CACHE: OrderedDict[
+    tuple[str, int, int, int, int, int], bytes
+] = OrderedDict()
+_FILE_DIGEST_CACHE_LOCK = threading.RLock()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,17 +166,165 @@ def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
 
 
 def _atomic_copy_file(src: Path, dst: Path) -> None:
-    source = Path(src).resolve()
-    destination = Path(dst).resolve()
-    if not source.is_file():
-        raise FileNotFoundError(f"Missing required asset: {source}")
+    _transactional_atomic_copy_file(src, dst)
 
-    tmp = _unique_temp_path(destination)
-    try:
-        shutil.copy2(source, tmp)
-        os.replace(tmp, destination)
-    finally:
-        tmp.unlink(missing_ok=True)
+
+class _BuildAssetCopier:
+    """Reuse unchanged generated copies from the current validated bundle."""
+
+    def __init__(
+        self,
+        destination: Path,
+        reuse_directory: Path | None,
+    ) -> None:
+        self.destination = destination.resolve()
+        self.reuse_directory = (
+            reuse_directory.resolve()
+            if reuse_directory is not None and reuse_directory.is_dir()
+            else None
+        )
+        self.previous: dict[str, dict[str, object]] = {}
+        self.records: dict[str, dict[str, object]] = {}
+        if self.reuse_directory is None:
+            return
+        try:
+            state = json.loads(
+                (self.reuse_directory / BUILD_STATE_FILE).read_text(
+                    encoding="utf-8"
+                )
+            )
+            assets = state.get("asset_sources")
+            if isinstance(assets, dict):
+                self.previous = {
+                    str(key): dict(value)
+                    for key, value in assets.items()
+                    if isinstance(key, str) and isinstance(value, dict)
+                }
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            self.previous = {}
+
+    def _reusable_file(self, relative: str) -> Path | None:
+        if self.reuse_directory is None:
+            return None
+        candidate = self.reuse_directory / relative
+        cursor = self.reuse_directory
+        for part in Path(relative).parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                return None
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(self.reuse_directory)
+        except (OSError, ValueError):
+            return None
+        return resolved if resolved.is_file() else None
+
+    def copy(self, source: Path, destination: Path) -> None:
+        source = source.resolve()
+        destination = destination.resolve()
+        try:
+            relative = destination.relative_to(self.destination).as_posix()
+        except ValueError:
+            _atomic_copy_file(source, destination)
+            return
+        source_stat = source.stat()
+        digest = _file_content_digest(source).hex()
+        previous = self.previous.get(relative, {})
+        existing = self._reusable_file(relative)
+        reusable = False
+        if existing is not None:
+            existing_stat = existing.stat()
+            recorded = (
+                previous.get("source_digest") == digest
+                and previous.get("source_size") == int(source_stat.st_size)
+                and previous.get("output_digest") == digest
+                and previous.get("output_size") == int(existing_stat.st_size)
+                and previous.get("output_mtime_ns")
+                == int(existing_stat.st_mtime_ns)
+                and previous.get("output_change_token")
+                == file_change_token(existing, stat_result=existing_stat)
+                and previous.get("output_device") == int(existing_stat.st_dev)
+                and previous.get("output_inode") == int(existing_stat.st_ino)
+            )
+            if recorded:
+                reusable = True
+            elif _file_content_digest(existing).hex() == digest:
+                # Older build records did not include a strong output identity.
+                # Verify their bytes once before promoting them to the new record.
+                reusable = True
+        if reusable and existing is not None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.unlink(missing_ok=True)
+            try:
+                os.link(existing, destination)
+            except OSError:
+                _atomic_copy_file(existing, destination)
+        else:
+            _atomic_copy_file(source, destination)
+        output_stat = destination.stat()
+        self.records[relative] = {
+            "source_digest": digest,
+            "source_size": int(source_stat.st_size),
+            "output_digest": digest,
+            "output_size": int(output_stat.st_size),
+            "output_mtime_ns": int(output_stat.st_mtime_ns),
+            "output_change_token": file_change_token(
+                destination,
+                stat_result=output_stat,
+            ),
+            "output_device": int(output_stat.st_dev),
+            "output_inode": int(output_stat.st_ino),
+        }
+
+
+def _refresh_build_asset_identities(directory: Path) -> None:
+    """Refresh output identities after transaction cleanup removes old links."""
+    root = Path(directory).resolve()
+    state_path = root / BUILD_STATE_FILE
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assets = state.get("asset_sources") if isinstance(state, dict) else None
+    if not isinstance(assets, dict):
+        return
+    changed = False
+    for relative, raw_record in assets.items():
+        if not isinstance(relative, str) or not isinstance(raw_record, dict):
+            continue
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            continue
+        candidate = root / relative_path
+        cursor = root
+        unsafe = False
+        for part in relative_path.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                unsafe = True
+                break
+        if unsafe:
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(root)
+            output_stat = resolved.stat()
+        except (OSError, ValueError):
+            continue
+        if not resolved.is_file():
+            continue
+        identity = {
+            "output_size": int(output_stat.st_size),
+            "output_mtime_ns": int(output_stat.st_mtime_ns),
+            "output_change_token": file_change_token(
+                resolved,
+                stat_result=output_stat,
+            ),
+            "output_device": int(output_stat.st_dev),
+            "output_inode": int(output_stat.st_ino),
+        }
+        if any(raw_record.get(key) != value for key, value in identity.items()):
+            raw_record.update(identity)
+            changed = True
+    if changed:
+        _transactional_atomic_write_json(state_path, state)
 
 
 def _copy_control_files(
@@ -171,6 +334,7 @@ def _copy_control_files(
     *,
     curtain_rgb: tuple[int, int, int],
     curtain_cache_directory: Path | None = None,
+    copy_file: Callable[[Path, Path], None] = _atomic_copy_file,
 ) -> None:
     dst_dir.mkdir(parents=True, exist_ok=True)
     for name in names:
@@ -183,22 +347,31 @@ def _copy_control_files(
                 else None
             )
             if cached is not None and cached.is_file():
-                _atomic_copy_file(cached, destination)
+                copy_file(cached, destination)
             else:
                 write_tinted_curtain_image(source, destination, curtain_rgb)
         else:
-            _atomic_copy_file(source, destination)
+            copy_file(source, destination)
 
 
-def _copy_directory_files(source: Path, destination: Path) -> None:
+def _copy_directory_files(
+    source: Path,
+    destination: Path,
+    *,
+    excluded_relative_paths: tuple[str, ...] = (),
+    copy_file: Callable[[Path, Path], None] = _atomic_copy_file,
+) -> None:
     """Copy regular files recursively without following directory symlinks."""
     if not source.is_dir():
         return
+    excluded = {Path(value).as_posix() for value in excluded_relative_paths}
     for path in sorted(source.rglob("*"), key=lambda item: item.as_posix()):
         if path.is_symlink() or not path.is_file():
             continue
         relative = path.relative_to(source)
-        _atomic_copy_file(path, destination / relative)
+        if relative.as_posix() in excluded:
+            continue
+        copy_file(path, destination / relative)
 
 
 _MESSAGE_ATTRIBUTE_ASSET = re.compile(
@@ -314,55 +487,8 @@ def _starting_volume_from_settings(settings: dict) -> int:
     return max(0, min(100, v))
 
 
-MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
-MESSAGE_OVERLAY_OPACITY_KEY = "message_overlay_opacity"
-DEFAULT_MESSAGE_OVERLAY_PRESET = "paper"
-DEFAULT_MESSAGE_OVERLAY_OPACITY = 68
-TRANSPARENT_MESSAGE_SURFACE_OPACITY = 0.18
-TRANSPARENT_MESSAGE_BLUR_PX = 14
-MESSAGE_OVERLAY_PRESETS: dict[str, tuple[tuple[int, int, int], str]] = {
-    "black": ((0, 0, 0), "#ffffff"),
-    "white": ((255, 255, 255), "#221710"),
-    "paper": ((245, 235, 210), "#221710"),
-    "clear": ((255, 255, 255), "#221710"),
-}
-
-
 def _message_overlay_style_from_settings(settings: dict) -> str:
-    preset = str(settings.get(MESSAGE_OVERLAY_PRESET_KEY, DEFAULT_MESSAGE_OVERLAY_PRESET)).strip().lower()
-    if preset not in MESSAGE_OVERLAY_PRESETS:
-        preset = DEFAULT_MESSAGE_OVERLAY_PRESET
-
-    try:
-        opacity = int(settings.get(MESSAGE_OVERLAY_OPACITY_KEY, DEFAULT_MESSAGE_OVERLAY_OPACITY))
-    except (TypeError, ValueError):
-        opacity = DEFAULT_MESSAGE_OVERLAY_OPACITY
-    opacity = max(0, min(100, opacity))
-    if preset == "clear":
-        opacity = 0
-
-    (r, g, b), ink = MESSAGE_OVERLAY_PRESETS[preset]
-    alpha = max(0.0, min(1.0, opacity / 100.0))
-    surface_alpha = (
-        TRANSPARENT_MESSAGE_SURFACE_OPACITY
-        if preset == "clear"
-        else alpha
-    )
-    blur_px = (
-        TRANSPARENT_MESSAGE_BLUR_PX
-        if preset == "clear"
-        else 0
-    )
-    texture_alpha = 0.028 * alpha if preset == "paper" else 0.0
-    return (
-        f"--message-overlay-rgb:{r},{g},{b};"
-        f"--message-overlay-opacity:{alpha:.3f};"
-        f"--message-overlay-surface-opacity:{surface_alpha:.3f};"
-        f"--message-overlay-blur:{blur_px}px;"
-        f"--message-overlay-texture-opacity:{texture_alpha:.3f};"
-        f"--message-ink:{ink};"
-        f"--wall-fade-ms:900ms;"
-    )
+    return letter_page_style_from_settings(settings)
 
 
 def _require_file(path: Path, *, what: str, expected_rel_hint: Optional[str] = None) -> None:
@@ -410,10 +536,7 @@ def _sfx_names() -> list[str]:
 
 def _resolve_sfx_sources(project_root: Path) -> dict[str, Path]:
     paths = application_paths(project_root)
-    directories = (
-        paths.app_resource_path(APP_SOUNDS_DIR),
-        *(project_root / relative for relative in LEGACY_SFX_DIRS),
-    )
+    directories = (paths.app_resource_path(APP_SOUNDS_DIR),)
     resolved: dict[str, Path] = {}
     for directory in directories:
         if not directory.is_dir():
@@ -432,8 +555,14 @@ def _resolve_sfx_sources(project_root: Path) -> dict[str, Path]:
     return resolved
 
 
-def _seed_sfx_into_build(*, project_root: Path, sounds_dst: Path, seed_sfx: bool) -> None:
-    """Copy required sound effects from canonical or recognized legacy sources."""
+def _seed_sfx_into_build(
+    *,
+    project_root: Path,
+    sounds_dst: Path,
+    seed_sfx: bool,
+    copy_file: Callable[[Path, Path], None] = _atomic_copy_file,
+) -> None:
+    """Copy required sound effects from canonical application resources."""
     if not seed_sfx:
         return
 
@@ -442,7 +571,6 @@ def _seed_sfx_into_build(*, project_root: Path, sounds_dst: Path, seed_sfx: bool
     if missing:
         searched = (
             application_paths(project_root).app_resource_path(APP_SOUNDS_DIR),
-            *(project_root / relative for relative in LEGACY_SFX_DIRS),
         )
         lines = [
             "Missing required app sound effects:",
@@ -454,13 +582,18 @@ def _seed_sfx_into_build(*, project_root: Path, sounds_dst: Path, seed_sfx: bool
         raise FileNotFoundError("\n".join(lines))
 
     for name in _sfx_names():
-        _atomic_copy_file(sources[name], sounds_dst / name)
+        copy_file(sources[name], sounds_dst / name)
 
 
 def play_bundle_directory(project_root: str | Path) -> Path:
     root = Path(project_root).resolve()
     settings_store = SettingsStore(root)
     settings = settings_store.snapshot()
+    if is_protected_project(settings):
+        return demo_preview_directory(
+            root,
+            ensure_project_identity(root),
+        )
     recipient = _recipient_from_settings(settings)
     title = _title_from_settings(settings, recipient)
     active_value = str(settings.get(ACTIVE_PLAY_DIR_KEY) or "").strip()
@@ -496,14 +629,7 @@ def _curtain_context_for_settings(
     dict[str, tuple[int, int, int]],
     CurtainVariantCache | None,
 ]:
-    style = str(
-        settings.get(
-            "curtain_style",
-            DEFAULT_SETTINGS["curtain_style"],
-        )
-    )
-    if style not in VALID_CURTAIN_STYLES:
-        style = str(DEFAULT_SETTINGS["curtain_style"])
+    style = normalize_curtain_style(settings.get("curtain_style"))
     cached = load_curtain_variant_cache(project_root)
     colors = (
         dict(cached.colors)
@@ -515,17 +641,49 @@ def _curtain_context_for_settings(
     return style, colors, cached
 
 
-def _title_banner_text_rgb_for_settings(
-    curtain_colors: dict[str, tuple[int, int, int]],
-    curtain_rgb: tuple[int, int, int],
-) -> tuple[int, int, int]:
-    normal = curtain_colors["average_color"]
-    complementary = curtain_colors["complementary_average_color"]
-    return normal if curtain_rgb == complementary else complementary
-
-
 def _rgb_css_value(rgb: tuple[int, int, int]) -> str:
     return ",".join(str(channel) for channel in rgb)
+
+
+def _file_signature(path: Path) -> tuple[str, int, int, int, int, int]:
+    resolved = path.resolve()
+    stat_result = resolved.stat()
+    return (
+        os.path.normcase(str(resolved)),
+        int(stat_result.st_size),
+        int(stat_result.st_mtime_ns),
+        file_change_token(resolved, stat_result=stat_result),
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+    )
+
+
+def _file_content_digest(path: Path) -> bytes:
+    """Return a bounded, stat-invalidated digest for one build input."""
+    resolved = path.resolve()
+    for _attempt in range(2):
+        signature = _file_signature(resolved)
+        with _FILE_DIGEST_CACHE_LOCK:
+            cached = _FILE_DIGEST_CACHE.get(signature)
+            if cached is not None:
+                _FILE_DIGEST_CACHE.move_to_end(signature)
+                return cached
+
+        digest = hashlib.sha256()
+        with resolved.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        content_digest = digest.digest()
+        if _file_signature(resolved) != signature:
+            continue
+
+        with _FILE_DIGEST_CACHE_LOCK:
+            _FILE_DIGEST_CACHE[signature] = content_digest
+            _FILE_DIGEST_CACHE.move_to_end(signature)
+            while len(_FILE_DIGEST_CACHE) > _FILE_DIGEST_CACHE_LIMIT:
+                _FILE_DIGEST_CACHE.popitem(last=False)
+        return content_digest
+    raise OSError(f"Build input changed while it was being read: {resolved}")
 
 
 def _hash_file(digest: "hashlib._Hash", root: Path, path: Path) -> None:
@@ -536,17 +694,17 @@ def _hash_file(digest: "hashlib._Hash", root: Path, path: Path) -> None:
         relative = f"external/{resolved.name}"
     digest.update(relative.encode("utf-8"))
     digest.update(b"\0")
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
+    digest.update(_file_content_digest(resolved))
     digest.update(b"\0")
 
 
+@performance_timed("forge.source_fingerprint")
 def build_source_fingerprint(project_root: str | Path) -> str:
     """Hash only inputs that materially change the generated viewer."""
     root = Path(project_root).resolve()
     paths = application_paths(root)
     digest = hashlib.sha256()
+    digest.update(b"lettersmith-source-fingerprint-v2\0")
     settings = SettingsStore(root).snapshot()
     relevant_settings = {
         key: settings.get(key)
@@ -569,6 +727,7 @@ def build_source_fingerprint(project_root: str | Path) -> str:
         root / USER_PAGES_DIR,
         root / USER_CONTROLS_DIR,
         root / USER_MESSAGE_DIR,
+        root / MESSAGE_ASSETS_DIR,
         paths.app_resource_path(APP_SOUNDS_DIR),
         root / "gallery/user/fonts",
         paths.app_resource_path("fonts"),
@@ -584,7 +743,6 @@ def build_source_fingerprint(project_root: str | Path) -> str:
     banner_source = paths.resource_path(APP_BANNER_PATH)
     if banner_source.is_file() and not banner_source.is_symlink():
         files.add(banner_source.resolve())
-
     sound_state, sound_tracks = resolve_project_tracks(root)
     digest.update(
         json.dumps(
@@ -592,6 +750,8 @@ def build_source_fingerprint(project_root: str | Path) -> str:
                 "mode": sound_state.mode,
                 "single_track_id": sound_state.single_track_id,
                 "playlist": list(sound_state.playlist),
+                "playlist_expanded": bool(sound_state.playlist_expanded),
+                "selected_track_id": sound_state.selected_track_id,
                 "crossfade_ms": (
                     1000
                     if sound_state.mode == "playlist"
@@ -795,13 +955,22 @@ def validate_play_bundle(directory: str | Path) -> Path:
     return root
 
 
-def is_play_bundle_current(project_root: str | Path) -> bool:
+def is_play_bundle_current(
+    project_root: str | Path,
+    *,
+    source_fingerprint: Optional[str] = None,
+) -> bool:
     root = Path(project_root).resolve()
     build = play_bundle_directory(root)
     try:
         validate_play_bundle(build)
         state = json.loads((build / BUILD_STATE_FILE).read_text(encoding="utf-8"))
-        return state.get("source_fingerprint") == build_source_fingerprint(root)
+        fingerprint = (
+            build_source_fingerprint(root)
+            if source_fingerprint is None
+            else source_fingerprint
+        )
+        return state.get("source_fingerprint") == fingerprint
     except (OSError, UnicodeError, ValueError, RuntimeError, json.JSONDecodeError):
         return False
 
@@ -816,6 +985,8 @@ def build_play_bundle_to(
     message_html: Optional[str] = None,
     seed_sfx: bool = True,
     source_fingerprint: Optional[str] = None,
+    validate_output: bool = True,
+    reuse_play_directory: str | Path | None = None,
 ) -> Path:
     """Generate and validate a complete Play bundle in ``destination``."""
     pr = Path(project_root).resolve()
@@ -852,11 +1023,12 @@ def build_play_bundle_to(
     curtain_style, curtain_colors, curtain_cache = (
         _curtain_context_for_settings(pr, settings)
     )
-    curtain_rgb = curtain_colors[curtain_style]
-    title_banner_text_rgb = _title_banner_text_rgb_for_settings(
+    curtain_display = get_curtain_display_colors(
+        curtain_style,
         curtain_colors,
-        curtain_rgb,
     )
+    curtain_rgb = curtain_display.background
+    title_banner_text_rgb = curtain_display.foreground
     curtain_cache_directory = (
         curtain_cache.style_directory(curtain_style)
         if curtain_cache is not None
@@ -871,6 +1043,12 @@ def build_play_bundle_to(
         project_id=project_id,
         play_dir_override=target,
     )
+    reuse_root = (
+        Path(reuse_play_directory).resolve()
+        if reuse_play_directory is not None
+        else None
+    )
+    asset_copier = _BuildAssetCopier(bp.play_dir, reuse_root)
 
     pages_src = pr / USER_PAGES_DIR
     controls_src = pr / USER_CONTROLS_DIR
@@ -878,6 +1056,13 @@ def build_play_bundle_to(
     runtime_images = build_runtime_image_assets(
         pages_src,
         bp.play_pages_dir,
+        reconcile_source=False,
+        reuse_pages_directory=(
+            Path(reuse_play_directory) / "gallery" / "pages"
+            if reuse_play_directory is not None
+            else None
+        ),
+        copy_file=asset_copier.copy,
     )
     _copy_control_files(
         controls_src,
@@ -885,6 +1070,7 @@ def build_play_bundle_to(
         CONTROL_FILES,
         curtain_rgb=curtain_rgb,
         curtain_cache_directory=curtain_cache_directory,
+        copy_file=asset_copier.copy,
     )
     banner_source = paths.resource_path(APP_BANNER_PATH)
     _require_file(
@@ -898,7 +1084,7 @@ def build_play_bundle_to(
         else None
     )
     if cached_banner is not None and cached_banner.is_file():
-        _atomic_copy_file(
+        asset_copier.copy(
             cached_banner,
             bp.play_controls_dir / BANNER_FILE,
         )
@@ -908,18 +1094,37 @@ def build_play_bundle_to(
             bp.play_controls_dir / BANNER_FILE,
             curtain_rgb,
         )
-    _copy_directory_files(message_src, bp.play_message_dir)
+    _copy_directory_files(
+        message_src,
+        bp.play_message_dir,
+        excluded_relative_paths=("message.html",),
+        copy_file=asset_copier.copy,
+    )
+    _copy_directory_files(
+        pr / MESSAGE_ASSETS_DIR,
+        bp.play_dir / MESSAGE_ASSETS_DIR,
+        copy_file=asset_copier.copy,
+    )
     _atomic_write_text(bp.play_message_dir / "message.html", message_html)
 
     for font_source in (
         paths.app_resource_path("fonts"),
         pr / "gallery/user/fonts",
     ):
-        _copy_directory_files(font_source, bp.play_fonts_dir)
+        _copy_directory_files(
+            font_source,
+            bp.play_fonts_dir,
+            copy_file=asset_copier.copy,
+        )
     font_result = build_embedded_font_payload(
         pr,
         embedded_message_html,
         bp.play_fonts_dir,
+        reuse_fonts_dir=(
+            reuse_root / "gallery" / "fonts"
+            if reuse_root is not None
+            else None
+        ),
     )
     embedded_message_html = font_result.html
 
@@ -928,7 +1133,7 @@ def build_play_bundle_to(
         runtime_name = MUSIC_FILE if index == 0 else f"music-{index + 1:03d}.mp3"
         source = resolve_track_path(pr, record)
         _require_file(source, what=f"processed music for {record.display_title}")
-        _atomic_copy_file(source, bp.play_sounds_dir / runtime_name)
+        asset_copier.copy(source, bp.play_sounds_dir / runtime_name)
         runtime_music_files.append(runtime_name)
 
     sound_manifest = build_sound_manifest(
@@ -944,6 +1149,7 @@ def build_play_bundle_to(
         project_root=pr,
         sounds_dst=bp.play_sounds_dir,
         seed_sfx=seed_sfx,
+        copy_file=asset_copier.copy,
     )
 
     styles_css = (
@@ -993,7 +1199,11 @@ def build_play_bundle_to(
             source,
         )
     _atomic_write_text(bp.play_dir / "index.html", html)
-    fingerprint = source_fingerprint or build_source_fingerprint(pr)
+    fingerprint = (
+        build_source_fingerprint(pr)
+        if source_fingerprint is None
+        else source_fingerprint
+    )
     _atomic_write_text(
         bp.play_dir / BUILD_STATE_FILE,
         json.dumps(
@@ -1005,20 +1215,48 @@ def build_play_bundle_to(
                     key: list(values)
                     for key, values in font_result.report.items()
                 },
+                "asset_sources": asset_copier.records,
             },
             indent=2,
             ensure_ascii=False,
         ),
     )
-    return validate_play_bundle(bp.play_dir)
+    enforce_internal_tree_visibility(bp.play_dir)
+    if validate_output:
+        return validate_play_bundle(bp.play_dir)
+    return bp.play_dir
 
 
+def _verify_committed_play_bundle(
+    directory: str | Path,
+    *,
+    source_fingerprint: str,
+) -> Path:
+    """Verify the atomic commit without repeating full staged validation."""
+    root = Path(directory).resolve()
+    for relative in ("index.html", "styles.css", "script.js", BUILD_STATE_FILE):
+        if not (root / relative).is_file():
+            raise RuntimeError(
+                f"The committed Play bundle is missing {relative}."
+            )
+    state = json.loads((root / BUILD_STATE_FILE).read_text(encoding="utf-8"))
+    if not isinstance(state, dict):
+        raise RuntimeError("The committed Play bundle state is invalid.")
+    if state.get("schema_version") != BUILD_SCHEMA_VERSION:
+        raise RuntimeError("The committed Play bundle schema is invalid.")
+    if state.get("source_fingerprint") != source_fingerprint:
+        raise RuntimeError("The committed Play bundle fingerprint is invalid.")
+    return root
+
+
+@performance_timed("forge.generate_play_bundle")
 def generate_play_bundle(
     project_root: str,
     *,
     message_html: Optional[str] = None,
     open_in_browser: bool = False,
     seed_sfx: bool = True,
+    source_fingerprint: Optional[str] = None,
 ) -> Path:
     """Transactionally replace the active recipient/title Play bundle."""
     pr = Path(project_root).resolve()
@@ -1035,7 +1273,11 @@ def generate_play_bundle(
         backup_suffix=".build-backup",
         unique_staging=True,
     )
-    source_fingerprint = build_source_fingerprint(pr)
+    fingerprint = (
+        build_source_fingerprint(pr)
+        if source_fingerprint is None
+        else source_fingerprint
+    )
     try:
         staging = transaction.prepare()
         build_play_bundle_to(
@@ -1043,13 +1285,25 @@ def generate_play_bundle(
             staging,
             message_html=message_html,
             seed_sfx=seed_sfx,
-            source_fingerprint=source_fingerprint,
+            source_fingerprint=fingerprint,
+            validate_output=False,
+            reuse_play_directory=(
+                final_play_dir if final_play_dir.is_dir() else None
+            ),
+        )
+        update_saved_metadata(
+            staging,
+            pr,
+            evaluate_readiness(pr),
         )
         transaction.commit(
             keep_backup=True,
             validator=lambda directory: bool(validate_play_bundle(directory)),
         )
-        validate_play_bundle(final_play_dir)
+        _verify_committed_play_bundle(
+            final_play_dir,
+            source_fingerprint=fingerprint,
+        )
     except Exception:
         _LOGGER.exception("Play bundle generation failed for %s", pr)
         transaction.abort()
@@ -1059,6 +1313,15 @@ def generate_play_bundle(
     except OSError:
         _LOGGER.exception(
             "Play bundle backup cleanup failed for %s",
+            final_play_dir,
+        )
+    try:
+        _refresh_build_asset_identities(final_play_dir)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        # The existing records remain safe: the next build will verify bytes
+        # before reuse when its recorded identity no longer matches.
+        _LOGGER.exception(
+            "Play bundle asset identities could not be refreshed for %s",
             final_play_dir,
         )
     try:
@@ -1082,11 +1345,25 @@ def ensure_play_bundle(
     message_html: Optional[str] = None,
     seed_sfx: bool = True,
     force: bool = False,
+    source_fingerprint: Optional[str] = None,
 ) -> tuple[Path, bool]:
     """Return a validated build, rebuilding only when its inputs are stale."""
     root = Path(project_root).resolve()
     build = play_bundle_directory(root)
-    if not force and is_play_bundle_current(root):
+    fingerprint = (
+        build_source_fingerprint(root)
+        if source_fingerprint is None
+        else source_fingerprint
+    )
+    if not force and is_play_bundle_current(
+        root,
+        source_fingerprint=fingerprint,
+    ):
+        update_saved_metadata(
+            build,
+            root,
+            evaluate_readiness(root),
+        )
         return build, False
     return (
         generate_play_bundle(
@@ -1094,6 +1371,7 @@ def ensure_play_bundle(
             message_html=message_html,
             open_in_browser=False,
             seed_sfx=seed_sfx,
+            source_fingerprint=fingerprint,
         ),
         True,
     )

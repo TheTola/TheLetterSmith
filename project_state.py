@@ -20,7 +20,15 @@ from recipient_identity import (
     normalize_recipient_display_name,
 )
 from recipient_registry import RecipientRegistry
+from project_timestamps import (
+    PROJECT_CREATED_AT_KEY,
+    PROJECT_PUBLISHED_AT_KEY,
+    current_project_timestamp,
+    parse_project_timestamp,
+    valid_project_timestamp,
+)
 from settings_store import (
+    DEFAULT_CURTAIN_STYLE,
     PUBLICATION_PROVIDER_KEY,
     PUBLICATION_VERIFIED_KEY,
     PUBLISHED_AT_KEY,
@@ -207,6 +215,7 @@ class ProjectDirtyController:
     def __init__(self) -> None:
         self._lock = RLock()
         self._dirty = False
+        self._revision = 0
         self._sources: set[str] = set()
         self._listeners: list[Callable[[bool], None]] = []
 
@@ -219,6 +228,11 @@ class ProjectDirtyController:
     def sources(self) -> tuple[str, ...]:
         with self._lock:
             return tuple(sorted(self._sources))
+
+    @property
+    def revision(self) -> int:
+        with self._lock:
+            return self._revision
 
     def add_listener(self, listener: Callable[[bool], None]) -> None:
         with self._lock:
@@ -234,6 +248,7 @@ class ProjectDirtyController:
 
     def mark_changed(self, source: str = "project") -> None:
         with self._lock:
+            self._revision += 1
             self._sources.add(str(source or "project"))
             changed = not self._dirty
             self._dirty = True
@@ -241,14 +256,20 @@ class ProjectDirtyController:
         for listener in listeners:
             listener(True)
 
-    def mark_saved(self) -> None:
+    def mark_saved(self, *, expected_revision: int | None = None) -> bool:
         with self._lock:
+            if (
+                expected_revision is not None
+                and self._revision != int(expected_revision)
+            ):
+                return False
             changed = self._dirty
             self._dirty = False
             self._sources.clear()
             listeners = tuple(self._listeners) if changed else ()
         for listener in listeners:
             listener(False)
+        return True
 
 
 class ProjectStateController:
@@ -426,16 +447,17 @@ class ProjectStateController:
             or _valid_uuid(current.get(PROJECT_ID_KEY))
             or _new_uuid()
         )
-        updated = SettingsStore(self.project_root).update_fields(
-            {
-                RECIPIENT_ID_KEY: stable_recipient_id,
-                RECIPIENT_DISPLAY_NAME_KEY: display_name,
-                RECIPIENT_NORMALIZED_KEY: normalized_key,
-                LEGACY_RECIPIENT_NAME_KEY: display_name,
-                PROJECT_ID_KEY: stable_project_id,
-                PROJECT_SCHEMA_KEY: PROJECT_SCHEMA_VERSION,
-            }
-        )
+        project_updates: dict[str, Any] = {
+            RECIPIENT_ID_KEY: stable_recipient_id,
+            RECIPIENT_DISPLAY_NAME_KEY: display_name,
+            RECIPIENT_NORMALIZED_KEY: normalized_key,
+            LEGACY_RECIPIENT_NAME_KEY: display_name,
+            PROJECT_ID_KEY: stable_project_id,
+            PROJECT_SCHEMA_KEY: PROJECT_SCHEMA_VERSION,
+        }
+        if not parse_project_timestamp(current.get(PROJECT_CREATED_AT_KEY)):
+            project_updates[PROJECT_CREATED_AT_KEY] = current_project_timestamp()
+        updated = SettingsStore(self.project_root).update_fields(project_updates)
         identity = require_project_identity(updated)
         self.transition(ApplicationState.PROJECT_READY, identity=identity)
         return identity
@@ -488,6 +510,7 @@ class ProjectStateController:
         if self.state is not ApplicationState.PROJECT_CLEARING:
             self.transition(ApplicationState.PROJECT_CLEARING)
         updates = dict(additional_settings or {})
+        updates.setdefault("curtain_style", DEFAULT_CURTAIN_STYLE)
         updates.update(empty_publication_settings())
         updates.update(
             {
@@ -499,6 +522,8 @@ class ProjectStateController:
                 PROJECT_SCHEMA_KEY: PROJECT_SCHEMA_VERSION,
                 "recipient_title": "",
                 "active_play_dir": "",
+                PROJECT_CREATED_AT_KEY: current_project_timestamp(),
+                PROJECT_PUBLISHED_AT_KEY: "",
             }
         )
         SettingsStore(self.project_root).update_fields(updates)
@@ -567,6 +592,18 @@ def load_project_settings(project_root: str | Path, *, ensure_identity: bool = T
         if not ensure_identity:
             return data
         updates = _identity_updates(data)
+        if _recipient_display_name(data):
+            if not parse_project_timestamp(data.get(PROJECT_CREATED_AT_KEY)):
+                updates[PROJECT_CREATED_AT_KEY] = current_project_timestamp()
+            if (
+                not parse_project_timestamp(
+                    data.get(PROJECT_PUBLISHED_AT_KEY)
+                )
+                and parse_project_timestamp(data.get(PUBLISHED_AT_KEY))
+            ):
+                updates[PROJECT_PUBLISHED_AT_KEY] = str(
+                    data.get(PUBLISHED_AT_KEY, "")
+                ).strip()
         if any(data.get(key) != value for key, value in updates.items()):
             data = store.update_fields(updates)
         return data
@@ -598,6 +635,8 @@ def autosave_project_settings(
             if preserve_project_id and key == PROJECT_ID_KEY:
                 continue
             if preserve_recipient_id and key == RECIPIENT_ID_KEY:
+                continue
+            if key == PROJECT_CREATED_AT_KEY:
                 continue
             accepted[key] = value
         accepted.update(identity_updates)
@@ -631,6 +670,19 @@ def adopt_loaded_project(project_root: str | Path, metadata: Mapping[str, Any]) 
             RECIPIENT_NORMALIZED_KEY: normalized_key,
             LEGACY_RECIPIENT_NAME_KEY: display_name,
             "recipient_title": str(metadata.get("recipient_title", "")).strip(),
+            PROJECT_CREATED_AT_KEY: (
+                str(metadata.get(PROJECT_CREATED_AT_KEY, "")).strip()
+                if parse_project_timestamp(
+                    metadata.get(PROJECT_CREATED_AT_KEY)
+                )
+                else current_project_timestamp()
+            ),
+            PROJECT_PUBLISHED_AT_KEY: str(
+                valid_project_timestamp(
+                    metadata.get(PROJECT_PUBLISHED_AT_KEY)
+                )
+                or valid_project_timestamp(metadata.get(PUBLISHED_AT_KEY))
+            ),
         })
         for key in PUBLICATION_SETTING_KEYS:
             if key in metadata:

@@ -38,10 +38,19 @@ from typing import Callable, Mapping, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from command_bar import CommandBarData, build_command_bar_data
-from project_paths import ProjectPathResolver, application_paths
+from protected_projects import (
+    PROTECTED_PROJECT_KIND_KEY,
+    PROTECTED_PROJECT_MASTER_PATH_KEY,
+)
+from project_paths import (
+    PROJECT_METADATA_FILE,
+    ProjectPathResolver,
+    application_paths,
+)
 from project_state import ApplicationState, ProjectStateController
-from settings_store import DEFAULT_SETTINGS, SettingsStore
+from settings_store import DEFAULT_CURTAIN_STYLE, DEFAULT_SETTINGS, SettingsStore
 from sound_model import (
     ProjectSoundState,
     current_manifest_path,
@@ -49,12 +58,19 @@ from sound_model import (
     project_sound_path,
 )
 from transactional_io import PathTransaction, atomic_write_json
+from ui_fonts import (
+    COMMAND_FONT_FAMILY,
+    load_application_fonts,
+    resolve_registered_family,
+)
 from ui_help import set_control_help
 
 __all__ = [
     "CommandTab",
     "confirm_and_reset",
+    "delete_project",
     "reset_everything",
+    "start_developer_reset",
     "start_new_project",
 ]
 
@@ -64,18 +80,20 @@ __all__ = [
 # ─────────────────────────────────────────────────────────────────────────────
 try:
     from config import (
+        MESSAGE_ASSETS_DIR,
         USER_PAGES_DIR,
         USER_MESSAGE_DIR,
         MUSIC_FILE,
     )
 except Exception:
+    MESSAGE_ASSETS_DIR = "gallery/message_assets"
     USER_PAGES_DIR = "gallery/user/pages"
     USER_MESSAGE_DIR = "gallery/user/message"
     MUSIC_FILE = "music.mp3"
 
 
 PROJECT_RESET_SETTINGS = {
-    "curtain_style": DEFAULT_SETTINGS["curtain_style"],
+    "curtain_style": DEFAULT_CURTAIN_STYLE,
     "message_overlay_preset": "paper",
     "message_overlay_opacity": 68,
     "forge_preview_mode": "portrait",
@@ -100,6 +118,8 @@ PROJECT_RESET_SETTINGS = {
     "published_github_owner": "",
     "published_github_repository": "",
     "last_sealed_path": "",
+    PROTECTED_PROJECT_KIND_KEY: "",
+    PROTECTED_PROJECT_MASTER_PATH_KEY: "",
 }
 
 RESET_SETTINGS = dict(PROJECT_RESET_SETTINGS)
@@ -110,7 +130,24 @@ NEW_PROJECT_SETTINGS = {
     if key not in {"starting_volume", "music_volume"}
 }
 
+DEVELOPER_RESET_SETTINGS = {
+    **NEW_PROJECT_SETTINGS,
+    "application_theme": "",
+    "theme_family": "",
+}
+
 LOGGER = logging.getLogger(__name__)
+
+
+def _command_font_family() -> str:
+    return resolve_registered_family(COMMAND_FONT_FAMILY)
+
+
+def _apply_command_font(widget: QtWidgets.QWidget) -> None:
+    font = QtGui.QFont(widget.font())
+    font.setFamily(_command_font_family())
+    widget.setFont(font)
+    widget.setProperty("themeIndependent", True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,12 +184,18 @@ def _empty_prompt_writer_state() -> dict:
 def _active_autosave_directories(
     root: Path,
     settings: Mapping[str, object],
+    *,
+    all_recipients: bool = False,
 ) -> tuple[Path, ...]:
     project_id = str(settings.get("project_id", "")).strip()
     if not project_id:
         return ()
     resolver = ProjectPathResolver(root)
-    recipient_id = str(settings.get("recipient_id", "")).strip()
+    recipient_id = (
+        ""
+        if all_recipients
+        else str(settings.get("recipient_id", "")).strip()
+    )
     paths = resolver.find_autosave_directories(
         project_id,
         recipient_id=recipient_id or None,
@@ -169,6 +212,53 @@ def _active_autosave_directories(
         if resolved != resolver.autosave_root:
             safe_paths.append(resolved)
     return tuple(dict.fromkeys(safe_paths))
+
+
+def _saved_project_paths(
+    root: Path,
+    settings: Mapping[str, object],
+) -> tuple[object | None, tuple[Path, ...]]:
+    """Resolve only managed saved-letter copies owned by the active project."""
+    project_id = str(settings.get("project_id", "")).strip()
+    if not project_id:
+        return None, ()
+
+    from saved_letters import SavedLetterCatalog
+
+    catalog = SavedLetterCatalog(root)
+    resolver = ProjectPathResolver(root)
+    paths = application_paths(root)
+    matches: list[Path] = []
+    for managed_root in (
+        paths.saved_letters_root.resolve(),
+        paths.recovery_root.resolve(),
+    ):
+        if not managed_root.is_dir():
+            continue
+        for metadata_path in managed_root.rglob(PROJECT_METADATA_FILE):
+            candidate = metadata_path.parent.resolve()
+            try:
+                relative = candidate.relative_to(managed_root)
+            except ValueError:
+                continue
+            if (
+                not relative.parts
+                or metadata_path.is_symlink()
+                or metadata_path.parent.is_symlink()
+                or resolver._directory_project_id(candidate) != project_id
+            ):
+                continue
+            matches.append(candidate)
+
+    selected: list[Path] = []
+    for candidate in sorted(
+        dict.fromkeys(matches),
+        key=lambda path: len(path.parts),
+    ):
+        if any(candidate.is_relative_to(parent) for parent in selected):
+            continue
+        selected.append(candidate)
+    return catalog, tuple(selected)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,18 +365,34 @@ def _reset_active_paths(
     settings_before: Mapping[str, object],
     controller: ProjectStateController,
     settings_updates: Mapping[str, object],
+    delete_saved_project: bool = False,
 ) -> Tuple[int, int]:
     directory_targets = [
         (root / USER_PAGES_DIR).resolve(),
         (root / USER_MESSAGE_DIR).resolve(),
+        (root / MESSAGE_ASSETS_DIR).resolve(),
     ]
+    saved_catalog: object | None = None
+    saved_project_paths: tuple[Path, ...] = ()
+    if delete_saved_project:
+        saved_catalog, saved_project_paths = _saved_project_paths(
+            root,
+            settings_before,
+        )
+
     deletion_targets = [
         current_music_path(root).resolve(),
         (root / "gallery" / "sounds" / MUSIC_FILE).resolve(),
         current_manifest_path(root).resolve(),
         (root / "gallery" / "user" / "cache" / "curtains").resolve(),
-        *_active_autosave_directories(root, settings_before),
+        *_active_autosave_directories(
+            root,
+            settings_before,
+            all_recipients=delete_saved_project,
+        ),
+        *saved_project_paths,
     ]
+    deletion_targets = list(dict.fromkeys(deletion_targets))
     json_targets = [
         (
             project_sound_path(root).resolve(),
@@ -375,6 +481,19 @@ def _reset_active_paths(
                 )
         raise
 
+    if saved_catalog is not None:
+        refresh_entry = getattr(saved_catalog, "refresh_entry", None)
+        if callable(refresh_entry):
+            for path in saved_project_paths:
+                try:
+                    refresh_entry(path)
+                except Exception:
+                    LOGGER.exception(
+                        "Could not refresh the saved-letter catalog after "
+                        "deleting %s.",
+                        path,
+                    )
+
     for transaction, _replace in transactions:
         try:
             transaction.finalize()
@@ -395,6 +514,7 @@ def reset_everything(
     parent: Optional[QtWidgets.QWidget] = None,
     project_state: ProjectStateController | None = None,
     settings_updates: Mapping[str, object] | None = None,
+    delete_saved_project: bool = False,
 ) -> Tuple[int, int]:
     root = (
         Path(project_root).resolve()
@@ -425,6 +545,7 @@ def reset_everything(
             if settings_updates is None
             else settings_updates
         ),
+        delete_saved_project=delete_saved_project,
     )
     return total_files, total_dirs
 
@@ -442,6 +563,8 @@ class _ConfirmDialog(
         super().__init__(
             parent
         )
+
+        _apply_command_font(self)
 
         self.setWindowFlags(
             Qt.Dialog
@@ -545,6 +668,7 @@ class _ConfirmDialog(
         label.setObjectName(
             "question"
         )
+        _apply_command_font(label)
 
         label.setWordWrap(
             True
@@ -571,6 +695,8 @@ class _ConfirmDialog(
         yes_button.setObjectName(
             "danger"
         )
+        _apply_command_font(no_button)
+        _apply_command_font(yes_button)
 
         set_control_help(
             no_button,
@@ -625,6 +751,8 @@ def _toast(
         parent
     )
 
+    _apply_command_font(toast)
+
     toast.setWindowFlags(
         Qt.FramelessWindowHint
         | Qt.ToolTip
@@ -667,6 +795,7 @@ def _toast(
     label = QtWidgets.QLabel(
         text
     )
+    _apply_command_font(label)
 
     layout = QtWidgets.QVBoxLayout(
         body
@@ -726,6 +855,7 @@ def _perform_confirmed_reset(
     project_state: ProjectStateController | None = None,
     announce: bool = True,
     settings_updates: Mapping[str, object] | None = None,
+    delete_saved_project: bool = False,
 ) -> bool:
     previous_state = (
         project_state.state
@@ -750,6 +880,7 @@ def _perform_confirmed_reset(
             parent=parent,
             project_state=project_state,
             settings_updates=settings_updates,
+            delete_saved_project=delete_saved_project,
         )
     except Exception:
         if project_state is not None and previous_state is not None:
@@ -811,6 +942,55 @@ def start_new_project(
     )
 
 
+def delete_project(
+    parent: Optional[QtWidgets.QWidget] = None,
+    *,
+    project_root: str | Path | None = None,
+    project_state: ProjectStateController | None = None,
+) -> bool:
+    """Delete every managed local copy of the active editable project."""
+    root = (
+        Path(project_root).resolve()
+        if project_root is not None
+        else app_root()
+    )
+    settings = SettingsStore(root).snapshot()
+    if project_state is not None and not project_state.is_project_ready:
+        raise RuntimeError("There is no active project to delete.")
+    if not str(settings.get("project_id", "")).strip():
+        raise RuntimeError("There is no active project to delete.")
+
+    from protected_projects import is_protected_project
+
+    if is_protected_project(settings):
+        raise RuntimeError("Stock and Example Letters cannot be deleted.")
+
+    return _perform_confirmed_reset(
+        parent,
+        project_root=root,
+        project_state=project_state,
+        announce=False,
+        settings_updates=NEW_PROJECT_SETTINGS,
+        delete_saved_project=True,
+    )
+
+
+def start_developer_reset(
+    parent: Optional[QtWidgets.QWidget] = None,
+    *,
+    project_root: str | Path | None = None,
+    project_state: ProjectStateController | None = None,
+) -> bool:
+    """Clear active-project data and restore first-run theme selection."""
+    return _perform_confirmed_reset(
+        parent,
+        project_root=project_root,
+        project_state=project_state,
+        announce=False,
+        settings_updates=DEVELOPER_RESET_SETTINGS,
+    )
+
+
 def confirm_and_reset(
     parent: Optional[QtWidgets.QWidget] = None,
     *,
@@ -818,6 +998,8 @@ def confirm_and_reset(
     project_state: ProjectStateController | None = None,
     before_reset: Optional[Callable[[], bool]] = None,
 ) -> bool:
+    if project_root is not None:
+        load_application_fonts(project_root)
     dialog = _ConfirmDialog(
         parent
     )
@@ -873,6 +1055,8 @@ class _PressGoLabel(
     def __init__(
         self,
         parent: Optional[QtWidgets.QWidget] = None,
+        *,
+        countdown_sound_path: Optional[Path] = None,
     ):
         super().__init__(
             parent
@@ -940,6 +1124,57 @@ class _PressGoLabel(
             self._complete_hold
         )
 
+        self._countdown_timer = QtCore.QTimer(
+            self
+        )
+        self._countdown_timer.timeout.connect(
+            self._advance_countdown
+        )
+
+        self._countdown_label = QtWidgets.QLabel(
+            self
+        )
+        self._countdown_label.setObjectName(
+            "GoHoldCountdown"
+        )
+        self._countdown_label.setAlignment(
+            Qt.AlignCenter
+        )
+        self._countdown_label.setAttribute(
+            Qt.WA_TransparentForMouseEvents,
+            True,
+        )
+        self._countdown_label.setStyleSheet(
+            "color: #ffb0bb; background: transparent; "
+            f"font: 900 92px '{_command_font_family()}';"
+        )
+        self._countdown_label.hide()
+
+        self._countdown_player: Optional[QMediaPlayer] = None
+        self._countdown_output: Optional[QAudioOutput] = None
+        if countdown_sound_path is not None:
+            sound_path = Path(
+                countdown_sound_path
+            ).resolve()
+            if sound_path.is_file():
+                self._countdown_output = QAudioOutput(
+                    self
+                )
+                self._countdown_output.setVolume(
+                    1.0
+                )
+                self._countdown_player = QMediaPlayer(
+                    self
+                )
+                self._countdown_player.setAudioOutput(
+                    self._countdown_output
+                )
+                self._countdown_player.setSource(
+                    QtCore.QUrl.fromLocalFile(
+                        str(sound_path)
+                    )
+                )
+
         self._burst_anim = QtCore.QVariantAnimation(
             self
         )
@@ -991,6 +1226,7 @@ class _PressGoLabel(
         self._holding = False
         self._hold_completed = False
         self._use_gray = False
+        self._countdown_value = 0
 
     def set_base(
         self,
@@ -1198,6 +1434,7 @@ class _PressGoLabel(
         self._hold_timer.start(
             int(self.HOLD_DURATION_MS)
         )
+        self._start_countdown()
 
         if self._animations_enabled:
             self._scale_anim.stop()
@@ -1211,17 +1448,68 @@ class _PressGoLabel(
             self._scale_anim.setEndValue(0.38)
             self._scale_anim.start()
 
+    def _start_countdown(self) -> None:
+        self._countdown_timer.stop()
+        self._countdown_timer.setInterval(
+            max(
+                1,
+                int(self.HOLD_DURATION_MS) // 3,
+            )
+        )
+        self._show_countdown_step(
+            3,
+            play_sound=False,
+        )
+        self._countdown_timer.start()
+
+    def _advance_countdown(self) -> None:
+        next_value = self._countdown_value - 1
+        if next_value <= 0:
+            self._countdown_timer.stop()
+            return
+        self._show_countdown_step(next_value)
+
+    def _show_countdown_step(
+        self,
+        value: int,
+        *,
+        play_sound: bool = True,
+    ) -> None:
+        self._countdown_value = int(value)
+        self._countdown_label.setText(
+            str(self._countdown_value)
+        )
+        self._countdown_label.setAccessibleName(
+            f"Go countdown {self._countdown_value}"
+        )
+        self._countdown_label.show()
+        self._countdown_label.raise_()
+        if play_sound:
+            self._play_countdown_sound()
+
+    def _play_countdown_sound(self) -> None:
+        if self._countdown_player is None:
+            return
+        self._countdown_player.stop()
+        self._countdown_player.setPosition(
+            0
+        )
+        self._countdown_player.play()
+
     def cancel_hold(
         self,
         *,
         animate: bool = True,
     ) -> None:
         self._hold_timer.stop()
+        self._countdown_timer.stop()
         self._scale_anim.stop()
         self._burst_anim.stop()
         self._holding = False
         self._hold_completed = False
         self._use_gray = False
+        self._countdown_value = 0
+        self._countdown_label.hide()
         self._stop_blink()
         if animate and self._animations_enabled:
             self._animate_to(
@@ -1235,6 +1523,10 @@ class _PressGoLabel(
         if not self._holding:
             return
         self._scale_anim.stop()
+        self._countdown_timer.stop()
+        self._play_countdown_sound()
+        self._countdown_value = 0
+        self._countdown_label.hide()
         self._holding = False
         self._hold_completed = True
         self._use_gray = False
@@ -1256,6 +1548,17 @@ class _PressGoLabel(
         self._burst_anim.setKeyValueAt(0.68, 1.24)
         self._burst_anim.setEndValue(1.0)
         self._burst_anim.start()
+
+    def resizeEvent(
+        self,
+        event: QtGui.QResizeEvent,
+    ) -> None:
+        super().resizeEvent(
+            event
+        )
+        self._countdown_label.setGeometry(
+            self.rect()
+        )
 
     def _emit_held(self) -> None:
         if not self._hold_completed:
@@ -1318,6 +1621,297 @@ class _PressGoLabel(
 # ─────────────────────────────────────────────────────────────────────────────
 # Command tab
 # ─────────────────────────────────────────────────────────────────────────────
+class _CommandEntryNotice(
+    QtWidgets.QWidget
+):
+    AUTO_DISMISS_MS = 10_000
+    FADE_DURATION_MS = 4_000
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget,
+    ) -> None:
+        super().__init__(
+            parent
+        )
+        self.setObjectName(
+            "CommandEntryNotice"
+        )
+        self.setAttribute(
+            Qt.WA_StyledBackground,
+            True,
+        )
+        self.setStyleSheet(
+            "QWidget#CommandEntryNotice { background: transparent; }"
+        )
+
+        self.panel = QtWidgets.QFrame(
+            self
+        )
+        self.panel.setObjectName(
+            "CommandEntryNoticePanel"
+        )
+        self.panel.setAttribute(
+            Qt.WA_StyledBackground,
+            True,
+        )
+        self.panel.setAttribute(
+            Qt.WA_TransparentForMouseEvents,
+            True,
+        )
+        self.panel.setStyleSheet(
+            "QFrame#CommandEntryNoticePanel {"
+            "background: #4a090c; border: 2px solid #b72330; "
+            "border-radius: 16px; }"
+        )
+        layout = QtWidgets.QVBoxLayout(
+            self.panel
+        )
+        layout.setContentsMargins(
+            34,
+            28,
+            34,
+            28,
+        )
+        layout.setSpacing(18)
+
+        self.completion_message = QtWidgets.QLabel(
+            "WHEN YOU ARE COMPLETELY DONE",
+            self.panel,
+        )
+        self.completion_message.setObjectName(
+            "CommandEntryNoticeCompletionText"
+        )
+        self.completion_message.setAlignment(
+            Qt.AlignCenter
+        )
+        self.completion_message.setWordWrap(
+            True
+        )
+        self.completion_message.setAttribute(
+            Qt.WA_TransparentForMouseEvents,
+            True,
+        )
+        self.completion_message.setStyleSheet(
+            "QLabel#CommandEntryNoticeCompletionText { color: #ffb0bb; "
+            "background: transparent; "
+            f"font: 600 30px '{_command_font_family()}'; }}"
+        )
+        layout.addWidget(
+            self.completion_message
+        )
+
+        self.message = QtWidgets.QLabel(
+            "Hold Go for 3 seconds to save this finished letter and clear "
+            "the workspace for your next project.\n\n"
+            "The saved letter remains available in Command Bar. You can "
+            "preview it, open its published letter, and copy its published "
+            "link.\n\n"
+            "Only do this when you are ready to send the letter and begin "
+            "your next project.\n\n"
+            "Click anywhere to dismiss.",
+            self.panel,
+        )
+        self.message.setObjectName(
+            "CommandEntryNoticeText"
+        )
+        self.message.setAlignment(
+            Qt.AlignHCenter | Qt.AlignTop
+        )
+        self.message.setWordWrap(
+            True
+        )
+        self.message.setAttribute(
+            Qt.WA_TransparentForMouseEvents,
+            True,
+        )
+        self.message.setStyleSheet(
+            "QLabel#CommandEntryNoticeText { color: #ffb0bb; "
+            "background: transparent; "
+            f"font: 600 15px '{_command_font_family()}'; }}"
+        )
+        self.message_scroll = QtWidgets.QScrollArea(
+            self.panel
+        )
+        self.message_scroll.setObjectName(
+            "CommandEntryNoticeScroll"
+        )
+        self.message_scroll.setWidgetResizable(
+            True
+        )
+        self.message_scroll.setFrameShape(
+            QtWidgets.QFrame.NoFrame
+        )
+        self.message_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff
+        )
+        self.message_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAsNeeded
+        )
+        self.message_scroll.setStyleSheet(
+            "QScrollArea#CommandEntryNoticeScroll, "
+            "QScrollArea#CommandEntryNoticeScroll > QWidget > QWidget {"
+            "background: transparent; border: none;}"
+        )
+        self.message_scroll.setWidget(
+            self.message
+        )
+        layout.addWidget(
+            self.message_scroll,
+            1,
+        )
+
+        self._opacity_effect = QtWidgets.QGraphicsOpacityEffect(
+            self
+        )
+        self._opacity_effect.setOpacity(
+            1.0
+        )
+        self.setGraphicsEffect(
+            self._opacity_effect
+        )
+
+        self._fade_animation = QtCore.QPropertyAnimation(
+            self._opacity_effect,
+            b"opacity",
+            self,
+        )
+        self._fade_animation.setDuration(
+            self.FADE_DURATION_MS
+        )
+        self._fade_animation.setStartValue(
+            1.0
+        )
+        self._fade_animation.setEndValue(
+            0.0
+        )
+        self._fade_animation.setEasingCurve(
+            QtCore.QEasingCurve.InOutSine
+        )
+        self._fade_animation.finished.connect(
+            self.dismiss
+        )
+
+        self._fade_timer = QtCore.QTimer(
+            self
+        )
+        self._fade_timer.setSingleShot(
+            True
+        )
+        self._fade_timer.setInterval(
+            self.AUTO_DISMISS_MS - self.FADE_DURATION_MS
+        )
+        self._fade_timer.timeout.connect(
+            self._begin_fade
+        )
+
+        self._dismiss_timer = QtCore.QTimer(
+            self
+        )
+        self._dismiss_timer.setSingleShot(
+            True
+        )
+        self._dismiss_timer.setInterval(
+            self.AUTO_DISMISS_MS
+        )
+        self._dismiss_timer.timeout.connect(
+            self.dismiss
+        )
+        self.hide()
+
+    def present(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        self.setGeometry(
+            parent.rect()
+        )
+        self._position_panel()
+        self.show()
+        self.raise_()
+        self._fade_animation.stop()
+        self._opacity_effect.setOpacity(1.0)
+        self._fade_timer.start()
+        self._dismiss_timer.start()
+
+    def dismiss(self) -> None:
+        self._fade_timer.stop()
+        self._dismiss_timer.stop()
+        self._fade_animation.stop()
+        self._opacity_effect.setOpacity(1.0)
+        self.hide()
+
+    def _begin_fade(self) -> None:
+        if not self.isVisible():
+            return
+        self._fade_animation.stop()
+        self._fade_animation.setStartValue(
+            self._opacity_effect.opacity()
+        )
+        self._fade_animation.start()
+
+    def _position_panel(self) -> None:
+        panel_width = max(
+            1,
+            min(920, self.width() - 64),
+        )
+        self.panel.setFixedWidth(
+            panel_width
+        )
+        content_width = max(1, panel_width - 68)
+
+        def wrapped_text_height(label: QtWidgets.QLabel) -> int:
+            document = QtGui.QTextDocument()
+            document.setDefaultFont(label.font())
+            document.setDocumentMargin(0)
+            document.setPlainText(label.text())
+            document.setTextWidth(content_width)
+            return max(
+                label.fontMetrics().lineSpacing(),
+                int(document.size().height() + 0.999),
+            )
+
+        completion_height = wrapped_text_height(self.completion_message)
+        message_height = wrapped_text_height(self.message)
+        completion_widget_height = completion_height + 8
+        message_widget_height = message_height + 8
+        self.completion_message.setMinimumHeight(completion_widget_height)
+        self.message.setMinimumHeight(message_widget_height)
+        desired_height = (
+            28
+            + completion_widget_height
+            + 18
+            + message_widget_height
+            + 28
+            + 4
+        )
+        panel_height = max(
+            1,
+            min(desired_height, self.height() - 64),
+        )
+        self.panel.setFixedHeight(panel_height)
+        self.panel.move(
+            max(0, (self.width() - self.panel.width()) // 2),
+            max(0, (self.height() - self.panel.height()) // 2),
+        )
+
+    def resizeEvent(
+        self,
+        event: QtGui.QResizeEvent,
+    ) -> None:
+        super().resizeEvent(
+            event
+        )
+        self._position_panel()
+
+    def mousePressEvent(
+        self,
+        event: QtGui.QMouseEvent,
+    ) -> None:
+        self.dismiss()
+        event.accept()
+
+
 class _ShockwaveWidget(
     QtWidgets.QWidget
 ):
@@ -1487,6 +2081,8 @@ class CommandTab(
         self.project_root = Path(
             project_root
         ).resolve()
+        load_application_fonts(self.project_root)
+        _apply_command_font(self)
         self.project_state = project_state
         self._reset_in_progress = False
 
@@ -1502,7 +2098,15 @@ class CommandTab(
             """
         )
 
-        icons_dir = application_paths(self.project_root).app_resource_path("icons")
+        app_paths = application_paths(
+            self.project_root
+        )
+        icons_dir = app_paths.app_resource_path(
+            "icons"
+        )
+        countdown_sound_path = app_paths.app_resource_path(
+            "sounds/Blip.mp3"
+        )
 
         self._bg_path = (
             icons_dir / "command.png"
@@ -1540,11 +2144,10 @@ class CommandTab(
             Qt.WA_TransparentForMouseEvents,
             True,
         )
-
         self.go_btn = _PressGoLabel(
-            self
+            self,
+            countdown_sound_path=countdown_sound_path,
         )
-
         set_control_help(
             self.go_btn,
             "Hold Go for three seconds to finish this letter and clear the workspace for a new project.",
@@ -1559,7 +2162,35 @@ class CommandTab(
             self._do_reset
         )
 
+        self._entry_notice = _CommandEntryNotice(
+            self
+        )
+
         self._relayout()
+
+    def showEvent(
+        self,
+        event: QtGui.QShowEvent,
+    ) -> None:
+        super().showEvent(
+            event
+        )
+        QtCore.QTimer.singleShot(
+            0,
+            self._entry_notice.present,
+        )
+
+    def hideEvent(
+        self,
+        event: QtGui.QHideEvent,
+    ) -> None:
+        self._entry_notice.dismiss()
+        self.go_btn.cancel_hold(
+            animate=False
+        )
+        super().hideEvent(
+            event
+        )
 
     def _do_reset(
         self,
@@ -1771,6 +2402,11 @@ class CommandTab(
         )
 
         self.go_btn.raise_()
+        if self._entry_notice.isVisible():
+            self._entry_notice.setGeometry(
+                self.rect()
+            )
+            self._entry_notice.raise_()
 
 
 def main() -> None:

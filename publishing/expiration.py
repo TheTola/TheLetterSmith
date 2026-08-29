@@ -144,7 +144,7 @@ def publication_status(
     }:
         return "invalid"
     public_path = values[PUBLISHED_PUBLIC_PATH_KEY]
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,80}", public_path):
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?", public_path):
         return "invalid"
     parsed_url = urlsplit(values[PUBLISHED_PAGE_URL_KEY])
     if (

@@ -152,7 +152,7 @@ def validate_installer_configuration() -> dict[str, str]:
         "DefaultGroupName": "{#MyAppName}",
         "OutputDir": "installer",
         "OutputBaseFilename": "{#MyInstallerBaseName}",
-        "SetupIconFile": r"..\resources\app\icons\folder\lsmith.ico",
+        "SetupIconFile": r"..\gallery\app\icons\folder\lsmith.ico",
         "CloseApplications": "yes",
         "RestartApplications": "no",
         "PrivilegesRequired": "admin",
@@ -222,7 +222,7 @@ def validate_installer_configuration() -> dict[str, str]:
 
     icon_path = (RELEASE_ROOT / _directive(text, "SetupIconFile")).resolve()
     expected_icon = (
-        PROJECT_ROOT / "resources" / "app" / "icons" / "folder" / "lsmith.ico"
+        PROJECT_ROOT / "gallery" / "app" / "icons" / "folder" / "lsmith.ico"
     ).resolve()
     if icon_path != expected_icon or not icon_path.is_file():
         raise InstallerValidationError("The installer icon is missing or unsafe.")

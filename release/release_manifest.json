@@ -13,6 +13,7 @@
     "desktop_shortcut_default": false
   },
   "entrypoint": "Main.py",
+  "application_resources_root": "gallery/app",
   "application_resources": {
     "controls": [
       "cleft.png",
@@ -30,34 +31,16 @@
       "com.gif",
       "command.png",
       "copy.png",
-      "Exi.png",
+      "Dev.png",
+      "GitHub-logo.png",
       "GO.png",
-      "Help.gif",
-      "HHelp.gif",
-      "maxi.png",
       "maximize.png",
-      "mini.png",
       "minimize.png",
+      "mal.png",
+      "fem.png",
       "open.png",
       "preview.png",
-      "Pwrite.png",
-      "reticle.png",
-      "scanned.gif",
-      "Settings.gif",
-      "settings.png"
-    ],
-    "icons/buttons": [
-      "BButton.png",
-      "CButton.png",
-      "DButton.png",
-      "EButton.png",
-      "GButton.png",
-      "IButton.png",
-      "LButton.png",
-      "MButton.png",
-      "PButton.png",
-      "RButton.png",
-      "ROButton.png"
+      "scanned.gif"
     ],
     "icons/folder": [
       "lsmith.ico",
@@ -67,6 +50,7 @@
       "Dmessage.png"
     ],
     "sounds": [
+      "Blip.mp3",
       "flip1.mp3",
       "flip2.mp3",
       "flip3.mp3",
@@ -91,6 +75,14 @@
   ],
   "data_directories": [
     {
+      "source": "resources/app/fonts",
+      "destination": "resources/app/fonts"
+    },
+    {
+      "source": "resources/app/themes",
+      "destination": "resources/app/themes"
+    },
+    {
       "source": "resources/stock/images",
       "destination": "resources/stock/images"
     },
@@ -108,10 +100,6 @@
     }
   ],
   "data_files": [
-    {
-      "source": "gallery/app/icons/GitHub-logo.png",
-      "destination": "resources/app/icons"
-    },
     {
       "source": "resources/stock/stock_manifest.json",
       "destination": "resources/stock"
@@ -214,6 +202,8 @@
       ".gitignore",
       "current.json",
       "editor_error.log",
+      "icudt78.dll",
+      "icuuc.dll",
       "lettersmith-build.json",
       "lettersmith-images.json",
       "lettersmith-metadata.json",

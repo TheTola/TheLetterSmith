@@ -7,6 +7,8 @@
       "source_file": "cover.gif",
       "preview_file": "cover.png",
       "settings": {
+        "animation_enabled": true,
+        "speed_percent": 100,
         "playback_mode": "original",
         "play_count": "forever",
         "start_delay_ms": 2000,

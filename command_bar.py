@@ -18,10 +18,39 @@ from settings_store import (
     SettingsStore,
     normalize_published_page_url,
 )
+from ui_fonts import (
+    COMMAND_FONT_FAMILY,
+    load_application_fonts,
+    resolve_registered_family,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
 _COMMAND_BAR_INSTANCE: Optional["CommandBarWindow"] = None
+
+
+def _command_font_family() -> str:
+    return resolve_registered_family(COMMAND_FONT_FAMILY)
+
+
+def _apply_command_font(widget: QtWidgets.QWidget) -> None:
+    font = QtGui.QFont(widget.font())
+    font.setFamily(_command_font_family())
+    widget.setFont(font)
+    widget.setProperty("themeIndependent", True)
+
+
+def _apply_symbol_fallback_font(widget: QtWidgets.QWidget) -> QtGui.QFont:
+    font = QtGui.QFont(widget.font())
+    font.setFamilies(
+        [
+            _command_font_family(),
+            "Segoe UI Symbol",
+            "Segoe UI Emoji",
+        ]
+    )
+    widget.setFont(font)
+    return font
 
 
 def _is_managed_preview_path(path: Path, project_root: str | Path) -> bool:
@@ -412,6 +441,8 @@ class CommandBarWindow(QtWidgets.QWidget):
             published_url=normalize_published_page_url(data.published_url),
         )
         self.project_root = Path(project_root).resolve()
+        load_application_fonts(self.project_root)
+        _apply_command_font(self)
         self._screen_hint = screen
         self._closing = False
         self._quit_on_close = True
@@ -614,9 +645,15 @@ class CommandBarWindow(QtWidgets.QWidget):
         )
         if pixmap.isNull():
             self.compact_maximize_button.setText("▢")
+            fallback_font = _apply_symbol_fallback_font(
+                self.compact_maximize_button
+            )
+            fallback_font.setPointSize(18)
+            fallback_font.setWeight(QtGui.QFont.Weight.Bold)
+            self.compact_maximize_button.setFont(fallback_font)
             self.compact_maximize_button.setStyleSheet(
                 self.compact_maximize_button.styleSheet()
-                + "QToolButton{color:#ff5a5f;font:700 18pt 'Segoe UI';}"
+                + "QToolButton{color:#ff5a5f;}"
             )
         else:
             self.compact_maximize_button.setIcon(QtGui.QIcon(pixmap))
@@ -644,12 +681,12 @@ class CommandBarWindow(QtWidgets.QWidget):
         info_layout.setSpacing(0)
 
         self.recipient_label = _ElidingLabel(self.data.recipient_name, info)
-        recipient_font = QtGui.QFont("Segoe UI", 12)
+        recipient_font = QtGui.QFont(_command_font_family(), 12)
         recipient_font.setWeight(QtGui.QFont.Weight.DemiBold)
         self.recipient_label.setFont(recipient_font)
         self.recipient_label.setStyleSheet("color:#f0fbff;")
         self.title_label = _ElidingLabel(self.data.recipient_title, info)
-        self.title_label.setFont(QtGui.QFont("Segoe UI", 10))
+        self.title_label.setFont(QtGui.QFont(_command_font_family(), 10))
         self.title_label.setStyleSheet("color:#a6c2d7;")
         for label in (self.recipient_label, self.title_label):
             label.setAttribute(
@@ -731,6 +768,7 @@ class CommandBarWindow(QtWidgets.QWidget):
             "QToolButton:pressed{background:rgba(15,45,72,0.55);border-radius:8px;}"
             "QToolButton:disabled{color:#58738b;background:transparent;}"
         )
+        _apply_command_font(button)
         path = application_paths(self.project_root).app_resource_path(
             Path("icons") / asset_name
         )
@@ -740,6 +778,7 @@ class CommandBarWindow(QtWidgets.QWidget):
             button.setIconSize(QtCore.QSize(27, 27))
         else:
             button.setText(unicode_fallback or text_fallback)
+            _apply_symbol_fallback_font(button)
             button.setToolTip(tooltip)
         button.clicked.connect(callback)
         return button

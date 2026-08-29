@@ -4,6 +4,7 @@ import argparse
 import importlib
 import importlib.util
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -21,6 +22,8 @@ BUILD_ROOT = RELEASE_ROOT / "build"
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from button_artwork import application_resource_names
 
 TEXT_SUFFIXES = {
     ".cfg",
@@ -152,10 +155,13 @@ def _sanitation_settings(manifest: dict[str, Any]) -> dict[str, Any]:
 def _manifest_entries(
     manifest: dict[str, Any],
 ) -> Iterator[tuple[Path, str]]:
-    app_root = PROJECT_ROOT / "resources" / "app"
+    app_relative_root = _safe_destination(
+        manifest.get("application_resources_root")
+    )
+    app_root = _project_path(app_relative_root)
     for relative_dir, names in manifest["application_resources"].items():
-        destination = str(Path("resources/app") / relative_dir)
-        for name in names:
+        destination = str(app_relative_root / relative_dir)
+        for name in application_resource_names(app_root, relative_dir, names):
             yield (app_root / relative_dir / name).resolve(), destination
 
     prompt_root = PROJECT_ROOT / "resources" / "prompt_writer"
@@ -313,22 +319,34 @@ def _validate_allowlist(manifest: dict[str, Any]) -> tuple[Path, ...]:
 
 
 def _validate_application_resources(manifest: dict[str, Any]) -> None:
-    app_root = PROJECT_ROOT / "resources" / "app"
-    expected = {
-        (Path(relative_dir) / name).as_posix()
-        for relative_dir, names in manifest["application_resources"].items()
-        for name in names
-    }
-    actual = {
-        path.relative_to(app_root).as_posix()
-        for path in app_root.rglob("*")
-        if path.is_file()
-    }
-    if actual != expected:
-        missing = sorted(expected - actual)
-        unexpected = sorted(actual - expected)
+    gallery_root = _project_path(manifest.get("application_resources_root"))
+    if gallery_root != (PROJECT_ROOT / "gallery" / "app").resolve():
         raise ReleaseValidationError(
-            f"Application resource allowlist mismatch; missing={missing}, "
+            "Application controls, icons, pages, and sounds must be owned by gallery/app."
+        )
+
+    resources_root = PROJECT_ROOT / "resources" / "app"
+    allowed_resource_families = {"fonts", "themes"}
+    actual_resource_families = {
+        path.name.casefold()
+        for path in resources_root.iterdir()
+        if path.is_dir()
+    }
+    if actual_resource_families != allowed_resource_families:
+        raise ReleaseValidationError(
+            "resources/app must contain exactly fonts and themes; "
+            f"actual={sorted(actual_resource_families)}"
+        )
+    unexpected = sorted(
+        path.relative_to(resources_root).as_posix()
+        for path in resources_root.rglob("*")
+        if path.is_file()
+        and path.relative_to(resources_root).parts[0].casefold()
+        not in allowed_resource_families
+    )
+    if unexpected:
+        raise ReleaseValidationError(
+            "Only fonts and themes may remain in resources/app; "
             f"unexpected={unexpected}"
         )
 
@@ -416,6 +434,12 @@ def _validate_saved_letter_resources(manifest: dict[str, Any]) -> None:
             raise ReleaseValidationError(f"{title} is not schema 1.0.")
         if metadata.get("recipient_title") != f"Stock: Letter {title[-1]}":
             raise ReleaseValidationError(f"{title} has an invalid visible title.")
+        if (
+            metadata.get("recipient_display_name") != "NONE"
+            or metadata.get("recipient_name") != "NONE"
+            or metadata.get("recipient_normalized_key") != "none"
+        ):
+            raise ReleaseValidationError(f"{title} must use recipient NONE.")
         if str(metadata.get("published_page_url", "")).strip():
             raise ReleaseValidationError(f"{title} contains a publication URL.")
 
@@ -473,7 +497,7 @@ def _validate_audio_tools() -> None:
     stock_manifest = _load_json(
         PROJECT_ROOT / "resources" / "stock" / "stock_manifest.json"
     )
-    audio_files = list((PROJECT_ROOT / "resources/app/sounds").glob("*.mp3"))
+    audio_files = list((PROJECT_ROOT / "gallery/app/sounds").glob("*.mp3"))
     audio_files.extend(
         PROJECT_ROOT / "resources" / "stock" / item["filename"]
         for item in stock_manifest["music"]
@@ -781,7 +805,7 @@ def _validate_distribution(manifest: dict[str, Any]) -> Path:
     for relative in (
         "resources/stock/stock_manifest.json",
         "resources/examples/example_letter/lettersmith-metadata.json",
-        "resources/app/icons/folder/lsmith.ico",
+        "gallery/app/icons/folder/lsmith.ico",
         "tools/ffmpeg.exe",
         "tools/ffprobe.exe",
     ):
@@ -803,12 +827,49 @@ def validate_distribution() -> Path:
     return _validate_distribution(manifest)
 
 
+def _pyinstaller_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    environment_by_name = {
+        key.casefold(): value
+        for key, value in environment.items()
+    }
+    python_root = Path(sys.base_prefix).resolve()
+    windows_root = Path(
+        environment_by_name.get("systemroot")
+        or environment_by_name.get("windir")
+        or r"C:\Windows"
+    ).resolve()
+    candidates = (
+        Path(sys.executable).resolve().parent,
+        python_root,
+        python_root / "DLLs",
+        python_root / "Scripts",
+        windows_root / "System32",
+        windows_root,
+    )
+    trusted: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate.is_dir():
+            continue
+        normalized = os.path.normcase(os.path.normpath(str(candidate)))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        trusted.append(str(candidate))
+    for key in tuple(environment):
+        if key.casefold() == "path":
+            del environment[key]
+    environment["PATH"] = os.pathsep.join(trusted)
+    return environment
+
+
 def build_release() -> Path:
     if sys.platform != "win32":
         raise ReleaseValidationError("Letter Smith release builds require Windows.")
     if importlib.util.find_spec("PyInstaller") is None:
         raise ReleaseValidationError(
-            "PyInstaller is not installed. Install requirements-build.txt only "
+            "PyInstaller is not installed. Install requirements.txt only "
             "after packaging is approved."
         )
     _clean_build_directory(BUILD_ROOT)
@@ -825,7 +886,12 @@ def build_release() -> Path:
         str(BUILD_ROOT),
         str(SPEC_PATH),
     ]
-    result = subprocess.run(command, cwd=PROJECT_ROOT, check=False)
+    result = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        check=False,
+        env=_pyinstaller_environment(),
+    )
     if result.returncode != 0:
         raise ReleaseValidationError(
             f"PyInstaller failed with exit code {result.returncode}."

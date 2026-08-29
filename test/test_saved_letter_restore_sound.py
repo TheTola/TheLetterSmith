@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import stat
 import tempfile
 import unittest
 import uuid
 from pathlib import Path
 from unittest import mock
 
-from config import CONTROL_FILES, REQUIRED_SLIDES
+import saved_letters
+import sound_model
+
+from config import CONTROL_FILES, MESSAGE_ASSETS_DIR, REQUIRED_SLIDES
 from recipient_registry import RecipientRegistry
 from publishing.expiration import publication_status
 from readiness import ReadinessResult
+from save_schema import (
+    PROMPT_WRITER_STATE_VERSION,
+    validate_prompt_writer_state_payload,
+)
 from saved_letters import (
     PROMPT_WRITER_STATE_FILE,
     SavedLetterCatalog,
@@ -22,6 +32,7 @@ from settings_store import ACTIVE_PLAY_DIR_KEY, SettingsStore
 from sound_model import (
     ProjectSoundState,
     archive_root,
+    current_manifest_path,
     current_music_path,
     import_runtime_track,
     load_library,
@@ -30,6 +41,7 @@ from sound_model import (
     save_project_state,
     sync_current_compatibility,
 )
+from transactional_io import atomic_write_json
 
 
 class SavedLetterSoundRestoreTests(unittest.TestCase):
@@ -38,9 +50,11 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
         pages = bundle / "gallery" / "pages"
         message = bundle / "gallery" / "message"
         controls = bundle / "gallery" / "controls"
+        sounds = bundle / "gallery" / "sounds"
         pages.mkdir(parents=True)
         message.mkdir(parents=True)
         controls.mkdir(parents=True)
+        sounds.mkdir(parents=True)
         for name in REQUIRED_SLIDES:
             (pages / name).write_bytes(name.encode("ascii"))
         (pages / "lettersmith-images.json").write_text(
@@ -63,6 +77,19 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
         for name in CONTROL_FILES:
             (controls / name).write_bytes(b"control")
         (message / "message.html").write_text("<p>Saved letter</p>", encoding="utf-8")
+        (sounds / "lettersmith-sound.json").write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "mode": "single",
+                    "playlist_expanded": True,
+                    "selected_track_index": -1,
+                    "tracks": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (bundle / PROMPT_WRITER_STATE_FILE).write_text("{}", encoding="utf-8")
         (bundle / "index.html").write_text(f"<title>{title}</title>", encoding="utf-8")
         (bundle / "styles.css").write_text("", encoding="utf-8")
         (bundle / "script.js").write_text("", encoding="utf-8")
@@ -71,10 +98,26 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
         (bundle / "lettersmith-metadata.json").write_text(
             json.dumps(
                 {
+                    "schema_version": "1.0",
+                    "document_type": "saved_letter",
                     "project_id": str(uuid.uuid4()),
                     "recipient_id": record.recipient_id,
                     "recipient_name": recipient,
                     "recipient_title": title,
+                    "settings": {},
+                    "sound": {},
+                    "readiness": {},
+                    "editable_assets": {
+                        "pages": {
+                            name: f"gallery/pages/{name}"
+                            for name in REQUIRED_SLIDES
+                        },
+                        "message": "gallery/message/message.html",
+                        "sound_manifest": "gallery/sounds/lettersmith-sound.json",
+                        "prompt_writer_state": PROMPT_WRITER_STATE_FILE,
+                        "image_manifest": "gallery/pages/lettersmith-images.json",
+                    },
+                    "cover_thumbnail_path": "gallery/pages/cover.png",
                 }
             ),
             encoding="utf-8",
@@ -93,30 +136,145 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             unrelated_record = import_runtime_track(root, unrelated, display_title="Unrelated")
             bundle = self._bundle(root)
             sounds = bundle / "gallery" / "sounds"
-            sounds.mkdir()
             tracks = []
             for index, content in enumerate((b"one", b"two", b"three"), start=1):
                 filename = f"music{'-' + str(index).zfill(3) if index > 1 else ''}.mp3"
                 (sounds / filename).write_bytes(content)
                 tracks.append({"filename": filename, "display_title": f"Track {index}"})
             (sounds / "lettersmith-sound.json").write_text(
-                json.dumps({"version": 2, "mode": "playlist", "crossfade_ms": 1000, "tracks": tracks}),
+                json.dumps(
+                    {
+                        "version": 2,
+                        "mode": "playlist",
+                        "playlist_expanded": False,
+                        "selected_track_index": 1,
+                        "crossfade_ms": 1000,
+                        "tracks": tracks,
+                    }
+                ),
                 encoding="utf-8",
             )
 
-            self._restore(root, bundle)
+            with (
+                mock.patch(
+                    "saved_letters.load_library",
+                    wraps=saved_letters.load_library,
+                ) as load_once,
+                mock.patch(
+                    "saved_letters.save_library",
+                    wraps=saved_letters.save_library,
+                ) as save_once,
+                mock.patch(
+                    "saved_letters.shutil.copytree",
+                    wraps=shutil.copytree,
+                ) as copytree,
+            ):
+                self._restore(root, bundle)
+
+            self.assertEqual(load_once.call_count, 1)
+            self.assertEqual(save_once.call_count, 1)
+            self.assertEqual(copytree.call_count, 2)
 
             state = load_project_state(root)
             library = load_library(root)
             self.assertEqual(state.mode, "playlist")
             self.assertEqual(len(state.playlist), 3)
+            self.assertFalse(state.playlist_expanded)
+            self.assertEqual(state.selected_track_id, state.playlist[1])
             self.assertIn(unrelated_record.track_id, library)
             self.assertEqual(len(library), 4)
-            self.assertEqual(current_music_path(root).read_bytes(), b"one")
+            self.assertEqual(current_music_path(root).read_bytes(), b"two")
             self.assertFalse((root / "gallery" / "user" / "sounds.load-backup").exists())
 
-            self._restore(root, bundle)
+            with (
+                mock.patch(
+                    "saved_letters.load_library",
+                    wraps=saved_letters.load_library,
+                ) as reload_once,
+                mock.patch(
+                    "saved_letters.save_library",
+                    wraps=saved_letters.save_library,
+                ) as no_save,
+            ):
+                self._restore(root, bundle)
+            self.assertEqual(reload_once.call_count, 1)
+            self.assertEqual(no_save.call_count, 0)
             self.assertEqual(len(load_library(root)), 4)
+
+    def test_message_assets_replace_the_active_projects_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            message = bundle / "gallery" / "message" / "message.html"
+            message.write_text(
+                '<p>Saved letter<img src="gallery/message_assets/saved.png"></p>',
+                encoding="utf-8",
+            )
+            saved_assets = bundle / MESSAGE_ASSETS_DIR
+            saved_assets.mkdir(parents=True)
+            (saved_assets / "saved.png").write_bytes(b"saved asset")
+
+            active_assets = root / MESSAGE_ASSETS_DIR
+            active_assets.mkdir(parents=True)
+            (active_assets / "old.png").write_bytes(b"old asset")
+
+            self._restore(root, bundle)
+
+            self.assertEqual(
+                (active_assets / "saved.png").read_bytes(),
+                b"saved asset",
+            )
+            self.assertFalse((active_assets / "old.png").exists())
+
+    def test_compatibility_copy_is_skipped_until_destination_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "selected.mp3"
+            source.write_bytes(b"selected audio")
+            record = import_runtime_track(root, source, display_title="Selected")
+            records = load_library(root)
+            state = ProjectSoundState(
+                mode="single",
+                single_track_id=record.track_id,
+                selected_track_id=record.track_id,
+            )
+
+            save_project_state(root, state)
+            self.assertTrue(sync_current_compatibility(root, state, records))
+            if os.name == "nt":
+                hidden = stat.FILE_ATTRIBUTE_HIDDEN
+                self.assertTrue(
+                    project_sound_path(root).stat().st_file_attributes & hidden
+                )
+                self.assertTrue(
+                    current_manifest_path(root).stat().st_file_attributes & hidden
+                )
+            with mock.patch.object(
+                sound_model,
+                "atomic_copy_file",
+                wraps=sound_model.atomic_copy_file,
+            ) as copy_file:
+                self.assertFalse(
+                    sync_current_compatibility(root, state, records)
+                )
+                copy_file.assert_not_called()
+
+                current_music_path(root).unlink()
+                self.assertTrue(
+                    sync_current_compatibility(root, state, records)
+                )
+                copy_file.assert_called_once()
+
+    def test_nonpersisted_runtime_import_requires_shared_library(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "selected.mp3"
+            source.write_bytes(b"selected audio")
+
+            with self.assertRaisesRegex(ValueError, "shared library mapping"):
+                import_runtime_track(root, source, persist=False)
+
+            self.assertFalse(sound_model.processed_dir(root).exists())
 
     def test_manifestless_required_sound_bundle_is_not_listed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -127,38 +285,47 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             metadata["settings"] = {"required_features": {"music": True}}
             metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
             sounds = bundle / "gallery" / "sounds"
-            sounds.mkdir()
+            (sounds / "lettersmith-sound.json").unlink()
             (sounds / "music.mp3").write_bytes(b"retired-format")
 
             self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
 
-    def test_manifestless_optional_music_is_migrated_once(self) -> None:
+    def test_canonical_required_music_rejects_a_silent_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            metadata_path = bundle / "lettersmith-metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["settings"] = {"required_features": ["music"]}
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+
+    def test_manifestless_optional_music_bundle_is_not_listed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundle = self._bundle(root)
             sounds = bundle / "gallery" / "sounds"
-            sounds.mkdir()
+            (sounds / "lettersmith-sound.json").unlink()
             (sounds / "flip1.mp3").write_bytes(b"page turn")
-            (sounds / "music.mp3").write_bytes(b"legacy music")
+            (sounds / "music.mp3").write_bytes(b"manifestless music")
             manifest = sounds / "lettersmith-sound.json"
 
-            self.assertEqual(len(SavedLetterCatalog(root).list_entries()), 1)
+            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
             self.assertFalse(manifest.exists())
 
-            self._restore(root, bundle)
+    def test_saved_bundle_user_workspace_layout_is_not_listed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            gallery = bundle / "gallery"
+            user = gallery / "user"
+            (user / "card").mkdir(parents=True)
+            (gallery / "pages").replace(user / "pages")
+            (gallery / "message").replace(user / "message")
+            (gallery / "controls").replace(user / "card" / "controls")
 
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-            self.assertEqual(payload["mode"], "single")
-            self.assertEqual(
-                [track["filename"] for track in payload["tracks"]],
-                ["music.mp3"],
-            )
-            self.assertEqual(current_music_path(root).read_bytes(), b"legacy music")
-            modified_at = manifest.stat().st_mtime_ns
-
-            self._restore(root, bundle)
-
-            self.assertEqual(manifest.stat().st_mtime_ns, modified_at)
+            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
 
     def test_silent_letter_clears_project_sound_without_deleting_archive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -198,10 +365,12 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 "published_page_url": "https://letters.example.com/letters/saved/",
                 "published_public_path": "saved",
                 "published_at": "2026-08-13T12:00:00+00:00",
-                "published_expires_at": "2099-09-12T12:00:00+00:00",
-                "publication_provider": "cloudflare_r2",
+                "published_expires_at": "",
+                "publication_provider": "github_pages",
                 "publication_verified": True,
                 "published_source_fingerprint": "saved-fingerprint",
+                "published_github_owner": "ada",
+                "published_github_repository": "LetterSmith-Published",
             }
             identity = json.loads(
                 (bundle / "lettersmith-metadata.json").read_text(encoding="utf-8")
@@ -242,6 +411,11 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             self.assertEqual(publication_status(current), "published")
             self.assertEqual(restored.published_public_path, "saved")
             self.assertTrue(restored.publication_verified)
+            self.assertEqual(restored.published_github_owner, "ada")
+            self.assertEqual(
+                restored.as_payload()["published_github_repository"],
+                "LetterSmith-Published",
+            )
 
     def test_local_letter_restore_clears_another_letters_publication_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -413,6 +587,14 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 PROMPT_WRITER_STATE_FILE,
             )
             self.assertEqual(
+                saved_metadata["prompt_writer"],
+                {
+                    "snapshot_schema_version": 1,
+                    "state_file": PROMPT_WRITER_STATE_FILE,
+                    "state": prompt_state,
+                },
+            )
+            self.assertEqual(
                 json.loads((bundle / PROMPT_WRITER_STATE_FILE).read_text(encoding="utf-8")),
                 prompt_state,
             )
@@ -426,16 +608,79 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 json.loads((root / PROMPT_WRITER_STATE_FILE).read_text(encoding="utf-8")),
                 prompt_state,
             )
+            (bundle / PROMPT_WRITER_STATE_FILE).unlink()
+            atomic_write_json(
+                root / PROMPT_WRITER_STATE_FILE,
+                {"subject": "Another active project"},
+            )
             self._restore(root, bundle)
             self.assertEqual(
                 json.loads((root / PROMPT_WRITER_STATE_FILE).read_text(encoding="utf-8")),
                 prompt_state,
             )
 
-    def test_legacy_letter_without_prompt_writer_state_loads_defaults(self) -> None:
+    def test_prompt_writer_state_accepts_backward_compatible_versions(self) -> None:
+        for payload in (
+            {},
+            {"version": 1},
+            {"version": str(PROMPT_WRITER_STATE_VERSION)},
+            {"version": PROMPT_WRITER_STATE_VERSION},
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    validate_prompt_writer_state_payload(payload),
+                    payload,
+                )
+
+    def test_invalid_prompt_writer_state_is_rejected_before_restore(self) -> None:
+        invalid_payloads = (
+            {"version": True},
+            {"version": "invalid"},
+            {"version": PROMPT_WRITER_STATE_VERSION + 1},
+        )
+        for payload in invalid_payloads:
+            with (
+                self.subTest(payload=payload),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                bundle = self._bundle(root)
+                entry = SavedLetterCatalog(root).list_entries()[0]
+                active_state = {"version": 1, "subject": "Current project"}
+                atomic_write_json(root / PROMPT_WRITER_STATE_FILE, active_state)
+
+                metadata_path = bundle / "lettersmith-metadata.json"
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata["prompt_writer"] = {
+                    "snapshot_schema_version": 1,
+                    "state_file": PROMPT_WRITER_STATE_FILE,
+                    "state": payload,
+                }
+                atomic_write_json(metadata_path, metadata)
+
+                self.assertEqual(
+                    SavedLetterCatalog(root).list_entries(force_refresh=True),
+                    (),
+                )
+                with self.assertRaisesRegex(
+                    SavedLetterRestoreError,
+                    "Prompt Writer state is invalid",
+                ):
+                    SavedLetterRestorer(root).restore(entry)
+
+                self.assertEqual(
+                    json.loads(
+                        (root / PROMPT_WRITER_STATE_FILE).read_text(encoding="utf-8")
+                    ),
+                    active_state,
+                )
+                self.assertFalse((root / "gallery" / "user" / "pages").exists())
+
+    def test_letter_without_prompt_writer_state_is_not_listed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundle = self._bundle(root)
+            (bundle / PROMPT_WRITER_STATE_FILE).unlink()
             (root / PROMPT_WRITER_STATE_FILE).write_text(
                 json.dumps(
                     {
@@ -446,20 +691,13 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            self._restore(root, bundle)
-
-            restored = json.loads(
-                (root / PROMPT_WRITER_STATE_FILE).read_text(encoding="utf-8")
-            )
-            self.assertEqual(restored["subject"], "")
-            self.assertEqual(restored["generated_prompts"], {})
+            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+            self.assertFalse((bundle / PROMPT_WRITER_STATE_FILE).exists())
             self.assertEqual(
                 json.loads(
-                    (bundle / PROMPT_WRITER_STATE_FILE).read_text(
-                        encoding="utf-8"
-                    )
-                ),
-                restored,
+                    (root / PROMPT_WRITER_STATE_FILE).read_text(encoding="utf-8")
+                )["subject"],
+                "Current project",
             )
 
     def test_recovery_letter_is_listed_and_loadable(self) -> None:
@@ -492,9 +730,12 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             active_message = root / "gallery" / "user" / "message"
             active_pages.mkdir(parents=True)
             active_message.mkdir(parents=True)
+            active_assets = root / MESSAGE_ASSETS_DIR
+            active_assets.mkdir(parents=True)
             for name in REQUIRED_SLIDES:
                 (active_pages / name).write_bytes(b"current")
             (active_message / "message.html").write_text("<p>current</p>", encoding="utf-8")
+            (active_assets / "current.png").write_bytes(b"current asset")
             settings = SettingsStore(root)
             existing = root / "existing.mp3"
             existing.write_bytes(b"current")
@@ -513,9 +754,21 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 if path.is_file()
             }
             bundle = self._bundle(root)
+            bundle_assets = bundle / MESSAGE_ASSETS_DIR
+            bundle_assets.mkdir(parents=True)
+            (bundle_assets / "new.png").write_bytes(b"new asset")
             sounds = bundle / "gallery" / "sounds"
-            sounds.mkdir()
             (sounds / "music.mp3").write_bytes(b"new")
+            (sounds / "lettersmith-sound.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "mode": "single",
+                        "tracks": [{"filename": "music.mp3"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             restorer = SavedLetterRestorer(root)
             restorer._verify_committed_state = lambda: (_ for _ in ()).throw(RuntimeError("injected"))
@@ -525,6 +778,11 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
 
             self.assertEqual((active_pages / "letter.png").read_bytes(), b"current")
             self.assertEqual((active_message / "message.html").read_text(encoding="utf-8"), "<p>current</p>")
+            self.assertEqual(
+                (active_assets / "current.png").read_bytes(),
+                b"current asset",
+            )
+            self.assertFalse((active_assets / "new.png").exists())
             self.assertEqual(settings.snapshot().get("recipient_name"), old_settings.get("recipient_name"))
             self.assertEqual(current_music_path(root).read_bytes(), b"current")
             self.assertEqual(load_project_state(root).single_track_id, record.track_id)

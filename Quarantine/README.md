@@ -17,6 +17,8 @@ Quarantined candidates:
 - `test/test_publishing_workspace.py`
 - `test/__pycache__/`
 - `gallery/app/icons/Sounds/Wave/__pycache__/`
+- `gallery/app/icons/Sounds/Blip.mp3`
+- `gallery/app/icons/folder/lsmith.ico`
 - `tmpv45wyh26/`
 
 The seven `.theme-test-*` directories identified by the Scout were already absent when quarantine began.

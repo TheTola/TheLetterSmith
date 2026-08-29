@@ -20,9 +20,13 @@ from message_html import ultralink_message_from_href
 from Forge_Tab import ForgeTab, ReadinessWindow
 from config import (
     CONTROL_FILES,
+    MESSAGE_ASSETS_DIR,
     REQUIRED_SLIDES,
-    canonical_stock_letters_root,
     resolve_play_bundle_directory,
+)
+from protected_projects import (
+    PROTECTED_PROJECT_KIND_KEY,
+    STOCK_PROJECT_KIND,
 )
 from project_paths import ProjectPathError, ProjectPathResolver, application_paths
 from project_save import ProjectNotReadyError, ProjectSaveService
@@ -40,6 +44,7 @@ from sound_model import (
     save_project_state,
 )
 from sound_tab import ArchiveDialog
+from ui_theme import THEMES, ThemeService
 
 
 class FakeLanguageService:
@@ -101,6 +106,10 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.assertTrue(panel.windowFlags() & QtCore.Qt.FramelessWindowHint)
             self.assertGreater(panel.maximumWidth(), 520)
             panel.refresh(evaluate_readiness(directory))
+            self.assertIn(
+                "text-align:center",
+                panel._missing_buttons["recipient"].styleSheet(),
+            )
             self.assertGreater(panel.height(), panel.minimumHeight())
             self.assertFalse(panel.isVisible())
             panel.show()
@@ -148,7 +157,10 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             with mock.patch.object(tab, "refresh_readiness", return_value=ready):
                 tab.show_readiness_window()
             self.assertFalse(tab.readiness_window.isVisible())
-            self.assertIn("#dffbff", tab.preview_format_label.styleSheet())
+            self.assertIn(
+                THEMES["cyber_forge"].tokens.highlight,
+                tab.preview_format_label.styleSheet(),
+            )
             self.assertGreaterEqual(
                 tab.preview_mode.itemDelegate().sizeHint(
                     QtWidgets.QStyleOptionViewItem(),
@@ -189,6 +201,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
 
     def test_forge_does_not_retry_a_preview_after_leaving_the_tab(self) -> None:
         forge = SimpleNamespace(
+            _shutdown=False,
             _worker_thread=None,
             _worker=object(),
             _operation_error_message="error",
@@ -207,10 +220,14 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
         single_shot.assert_not_called()
         self.assertFalse(forge._preview_refresh_requested)
 
-    def test_forge_deactivation_releases_preview_and_cancels_retry(self) -> None:
+    def test_forge_deactivation_pauses_preview_without_releasing_files(self) -> None:
         forge = SimpleNamespace(
             _tab_active=True,
             _preview_refresh_requested=True,
+            _refresh_timer=mock.Mock(),
+            _catalog_refresh_timer=mock.Mock(),
+            _card_layout_timer=mock.Mock(),
+            _scroll_restore_timer=mock.Mock(),
             saved_panel=mock.Mock(),
             preview_visibility_changed=mock.Mock(),
             preview_files_release_requested=mock.Mock(),
@@ -220,9 +237,112 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
 
         self.assertFalse(forge._tab_active)
         self.assertFalse(forge._preview_refresh_requested)
+        forge._refresh_timer.stop.assert_called_once_with()
+        forge._catalog_refresh_timer.stop.assert_called_once_with()
+        forge._card_layout_timer.stop.assert_called_once_with()
+        forge._scroll_restore_timer.stop.assert_called_once_with()
         forge.saved_panel.hide.assert_called_once_with()
         forge.preview_visibility_changed.emit.assert_called_once_with(False)
+        forge.preview_files_release_requested.emit.assert_not_called()
+
+    def test_forge_restore_fails_closed_when_media_release_reports_error(self) -> None:
+        forge = SimpleNamespace(
+            _project_release_error="",
+            preview_files_release_requested=mock.Mock(),
+            project_files_release_requested=mock.Mock(),
+            _set_status=mock.Mock(),
+        )
+        forge.project_files_release_requested.emit.side_effect = lambda: setattr(
+            forge,
+            "_project_release_error",
+            "sound worker is still active",
+        )
+
+        released = ForgeTab._release_project_files_for_restore(forge)
+
+        self.assertFalse(released)
         forge.preview_files_release_requested.emit.assert_called_once_with()
+        forge.project_files_release_requested.emit.assert_called_once_with()
+        forge._set_status.assert_called_once_with(
+            "Background media work must finish before this letter can load.",
+            error=True,
+            timeout_ms=0,
+        )
+
+    def test_hidden_forge_defers_scheduled_refresh_until_activation(self) -> None:
+        refresh_timer = mock.Mock()
+
+        ForgeTab.schedule_refresh(
+            SimpleNamespace(
+                _shutdown=False,
+                _tab_active=False,
+                _refresh_timer=refresh_timer,
+            )
+        )
+
+        refresh_timer.start.assert_not_called()
+
+    def test_forge_shutdown_stops_owned_resources_once(self) -> None:
+        timers = [mock.Mock() for _index in range(6)]
+        watcher = mock.Mock()
+        watcher.directories.return_value = ["watched-directory"]
+        watcher.files.return_value = ["watched-file"]
+        forge = SimpleNamespace(
+            _shutdown=False,
+            shutdown_operations=mock.Mock(return_value=True),
+            deactivate_for_tab_change=mock.Mock(),
+            _card_layout_timer=timers[0],
+            _refresh_timer=timers[1],
+            _status_timer=timers[2],
+            _catalog_refresh_timer=timers[3],
+            _scroll_restore_timer=timers[4],
+            _metadata_timer=timers[5],
+            _pending_metadata_update=None,
+            _run_pending_metadata_update=mock.Mock(),
+            _preview_refresh_requested=True,
+            _pending_publish_context=(object(),),
+            _operation_success=mock.Mock(),
+            _operation_failure=mock.Mock(),
+            _operation_error_message="error",
+            _finish_restore_activity=mock.Mock(),
+            _catalog_watcher=watcher,
+            settings=SimpleNamespace(changed=mock.Mock()),
+            _on_settings_changed=mock.Mock(),
+            _settings_refresh_requested=mock.Mock(),
+            schedule_refresh=mock.Mock(),
+            saved_panel=mock.Mock(),
+            github_account_dialog=mock.Mock(),
+            github_device_dialog=mock.Mock(),
+            readiness_window=mock.Mock(),
+        )
+
+        self.assertTrue(ForgeTab.shutdown(forge, timeout_ms=25))
+        self.assertTrue(ForgeTab.shutdown(forge, timeout_ms=25))
+
+        forge.shutdown_operations.assert_called_once_with(timeout_ms=25)
+        forge.deactivate_for_tab_change.assert_called_once_with()
+        for timer in timers:
+            timer.stop.assert_called_once_with()
+        watcher.removePaths.assert_called_once_with(
+            ["watched-directory", "watched-file"]
+        )
+        watcher.blockSignals.assert_called_once_with(True)
+        forge.saved_panel.close.assert_called_once_with()
+        forge.github_account_dialog.close.assert_called_once_with()
+        forge.github_device_dialog.finish.assert_called_once_with()
+        forge.readiness_window.shutdown.assert_called_once_with()
+
+    def test_forge_shutdown_timeout_preserves_live_resources(self) -> None:
+        timer = mock.Mock()
+        forge = SimpleNamespace(
+            _shutdown=False,
+            shutdown_operations=mock.Mock(return_value=False),
+            _card_layout_timer=timer,
+        )
+
+        self.assertFalse(ForgeTab.shutdown(forge, timeout_ms=1))
+        self.assertFalse(forge._shutdown)
+        timer.stop.assert_not_called()
 
     def test_duplicate_project_ids_are_reported_and_repaired_without_merging(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -352,7 +472,59 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.assertFalse(title_item.ready)
             self.assertIn("different letter title", title_item.detail)
 
-    def test_stock_prefixed_title_routes_outside_saved_letters(self) -> None:
+    def test_snapshot_staging_directory_does_not_conflict_with_title(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = ProjectStateController(root)
+            state.initialize()
+            identity = state.establish_project(
+                "Amanda Miller",
+                custom_capitalization=True,
+            )
+            SettingsStore(root).update_fields(
+                {"recipient_title": "Morning Joy"}
+            )
+            resolver = ProjectPathResolver(root)
+            recipient_dir = resolver.resolve_autosave_recipient_directory(
+                identity.recipient_id
+            )
+            current = recipient_dir / "Morning Joy"
+            staging = recipient_dir / (
+                "Morning Joy.snapshot-staging."
+                f"{uuid.uuid4().hex}"
+            )
+            for path, project_id in (
+                (current, identity.project_id),
+                (staging, str(uuid.uuid4())),
+            ):
+                path.mkdir(parents=True)
+                (path / "lettersmith-metadata.json").write_text(
+                    json.dumps(
+                        {
+                            "project_id": project_id,
+                            "recipient_id": identity.recipient_id,
+                            "recipient_name": "Amanda Miller",
+                            "recipient_title": "Morning Joy",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            self.assertIsNone(
+                resolver.find_title_conflict(
+                    identity.recipient_id,
+                    "Morning Joy",
+                    project_id=identity.project_id,
+                )
+            )
+            title_item = next(
+                item
+                for item in evaluate_readiness(root).items
+                if item.key == "title"
+            )
+            self.assertTrue(title_item.ready)
+
+    def test_stock_prefixed_title_routes_to_disposable_preview(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project_id = str(uuid.uuid4())
@@ -380,10 +552,14 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
 
             self.assertEqual(
                 stock,
-                canonical_stock_letters_root(root) / "Stock Letter",
+                (
+                    application_paths(root).temporary_root
+                    / "Demo Preview"
+                    / project_id
+                ).resolve(),
             )
-            self.assertTrue(stock.is_dir())
-            self.assertFalse(source.exists())
+            self.assertFalse(stock.exists())
+            self.assertTrue(source.is_dir())
 
             play = resolve_play_bundle_directory(
                 root,
@@ -402,8 +578,154 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                     / "Regular Letter"
                 ).resolve(),
             )
-            self.assertTrue(play.is_dir())
-            self.assertFalse(stock.exists())
+            self.assertNotEqual(play, source.resolve())
+            self.assertTrue(source.is_dir())
+
+    def test_reserved_stock_and_example_identities_cannot_be_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = SettingsStore(root)
+            cases = (
+                ("Stock 1.0", "Davis"),
+                ("Stock Real", "Davis"),
+                ("A Stock Letter 2", "Davis"),
+                ("NONE", "Davis"),
+                ("Ordinary Letter", "Stock"),
+                ("Ordinary Letter", "Davis Stock 3"),
+                ("Example Letter", "Davis"),
+                ("Ordinary Letter", "A Friend"),
+                ("Ordinary Letter", "None"),
+            )
+            for title, recipient in cases:
+                settings.update_fields(
+                    {
+                        "recipient_title": title,
+                        "recipient_name": recipient,
+                    }
+                )
+                eligibility = evaluate_project_save_eligibility(root)
+                self.assertFalse(eligibility.can_save)
+                self.assertTrue(eligibility.persistent_block_reason)
+
+            for recipient in (
+                "Stock Davis",
+                "Friend",
+                "My Friend",
+                "None Davis",
+            ):
+                settings.update_fields(
+                    {
+                        "recipient_title": "Ordinary Letter",
+                        "recipient_name": recipient,
+                    }
+                )
+                eligibility = evaluate_project_save_eligibility(root)
+                self.assertFalse(eligibility.persistent_block_reason)
+
+    def test_protected_readiness_is_blank_and_publish_is_local(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            SettingsStore(root).update_fields(
+                {PROTECTED_PROJECT_KIND_KEY: STOCK_PROJECT_KIND}
+            )
+            tab = ForgeTab(root)
+            result = tab.refresh_readiness()
+            self.assertEqual(result.items, ())
+            self.assertEqual(result.status, "")
+            self.assertEqual(tab.readiness_summary.text(), "")
+            self.assertTrue(tab._readiness_controls.isHidden())
+            with mock.patch.object(tab, "_prepare_preview") as prepare:
+                tab.publish_letter()
+            prepare.assert_called_once_with(
+                open_in_browser=False,
+                protected_publish=True,
+            )
+            tab.close()
+
+    def test_forge_actions_and_preview_format_follow_each_theme(self) -> None:
+        def contrast_ratio(foreground: str, background: str) -> float:
+            def luminance(value: str) -> float:
+                color = QtGui.QColor(value)
+
+                def linear(channel: int) -> float:
+                    normalized = channel / 255.0
+                    return (
+                        normalized / 12.92
+                        if normalized <= 0.04045
+                        else ((normalized + 0.055) / 1.055) ** 2.4
+                    )
+
+                return (
+                    0.2126 * linear(color.red())
+                    + 0.7152 * linear(color.green())
+                    + 0.0722 * linear(color.blue())
+                )
+
+            foreground_luminance = luminance(foreground)
+            background_luminance = luminance(background)
+            lighter = max(foreground_luminance, background_luminance)
+            darker = min(foreground_luminance, background_luminance)
+            return (lighter + 0.05) / (darker + 0.05)
+
+        with tempfile.TemporaryDirectory() as directory:
+            tab = ForgeTab(Path(directory))
+            service = ThemeService(directory, parent=tab)
+            backgrounds_by_action = {
+                "preview": set(),
+                "publish": set(),
+                "open": set(),
+            }
+            buttons = {
+                "preview": tab.preview_btn,
+                "publish": tab.publish_btn,
+                "open": tab.open_published_btn,
+            }
+
+            for theme_id, definition in THEMES.items():
+                service.set_theme(theme_id, persist=False)
+                tab.apply_theme_assets(service)
+
+                colors = definition.tokens
+                self.assertIn(colors.border, tab.preview_format_panel.styleSheet())
+                self.assertIn(colors.highlight, tab.preview_format_label.styleSheet())
+                self.assertIn(colors.text, tab.preview_mode.styleSheet())
+                self.assertIn(colors.accent, tab.preview_mode.styleSheet())
+                delegate = tab.preview_mode.itemDelegate()
+                self.assertEqual(
+                    delegate._normal_background,
+                    QtGui.QColor(colors.panel_background),
+                )
+                self.assertEqual(
+                    delegate._selected_background,
+                    QtGui.QColor(colors.active),
+                )
+
+                service.apply_semantic_styles(tab)
+                self.assertEqual(
+                    tab.unpublish_btn.size(),
+                    tab.github_account_btn.size(),
+                )
+                theme_backgrounds = set()
+                for action, button in buttons.items():
+                    background = str(button.property("forgeActionBackground"))
+                    hover = str(button.property("forgeActionHover"))
+                    foreground = str(button.property("forgeActionText"))
+                    backgrounds_by_action[action].add(background)
+                    theme_backgrounds.add(background)
+                    self.assertIn(background, button.styleSheet())
+                    self.assertGreaterEqual(
+                        contrast_ratio(foreground, background),
+                        4.5,
+                    )
+                    self.assertGreaterEqual(
+                        contrast_ratio(foreground, hover),
+                        4.5,
+                    )
+                self.assertEqual(len(theme_backgrounds), 3)
+
+            for backgrounds in backgrounds_by_action.values():
+                self.assertEqual(len(backgrounds), len(THEMES))
+            tab.close()
 
     def test_project_save_requires_two_completed_tabs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -442,6 +764,9 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             for name in REQUIRED_SLIDES:
                 if not (pages / name).exists():
                     (pages / name).write_bytes(name.encode("ascii"))
+            message_asset = root / MESSAGE_ASSETS_DIR / "inline.png"
+            message_asset.parent.mkdir(parents=True)
+            message_asset.write_bytes(b"inline asset")
             eligibility = evaluate_project_save_eligibility(root)
             self.assertEqual(
                 eligibility.completed_tabs,
@@ -460,6 +785,10 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
 
             self.assertEqual(saved, context.autosave_directory)
             self.assertTrue((saved / "pages" / "cover.png").is_file())
+            self.assertEqual(
+                (saved / MESSAGE_ASSETS_DIR / "inline.png").read_bytes(),
+                b"inline asset",
+            )
             self.assertFalse((saved / "message" / "message.html").exists())
             metadata = json.loads(
                 (saved / "lettersmith-metadata.json").read_text(
@@ -706,6 +1035,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
         preset: str,
         *,
         language_service=None,
+        theme_service=None,
     ) -> tuple[Editor, tempfile.TemporaryDirectory[str]]:
         holder = tempfile.TemporaryDirectory()
         root = Path(holder.name)
@@ -715,6 +1045,8 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
         )
         host = QtWidgets.QWidget()
         host.project_root = root
+        if theme_service is not None:
+            host.theme_service = theme_service
         editor = Editor(
             "<p>Letter</p>",
             parent=host,
@@ -722,6 +1054,40 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
         )
         editor._host_for_test = host
         return editor, holder
+
+    def test_editor_uses_themed_close_only_title_bar(self) -> None:
+        theme_service = SimpleNamespace(
+            tokens=SimpleNamespace(
+                accent="#123456",
+                muted_text="#789abc",
+                highlight="#ffffff",
+                error="#ff0000",
+                text="#eeeeee",
+            ),
+            app_font_family="Segoe UI",
+            resolve_asset=lambda _name: Path("missing-theme-asset.png"),
+        )
+        editor, holder = self._make_editor(
+            "black",
+            theme_service=theme_service,
+        )
+        try:
+            editor.show()
+            self.app.processEvents()
+
+            self.assertEqual(editor.windowTitle(), "Letter Editor")
+            self.assertTrue(
+                editor.windowFlags() & QtCore.Qt.FramelessWindowHint
+            )
+            self.assertIs(editor.title_bar._theme_service, theme_service)
+            self.assertFalse(editor.title_bar.btn_minimize.isVisible())
+            self.assertFalse(editor.title_bar.btn_maximize.isVisible())
+            self.assertTrue(editor.title_bar.btn_close.isVisible())
+        finally:
+            editor.deleteLater()
+            editor._host_for_test.deleteLater()
+            self.app.processEvents()
+            holder.cleanup()
 
     def test_editor_background_and_font_controls_stay_open(self) -> None:
         editor, holder = self._make_editor("black")
@@ -780,7 +1146,11 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             )
             self.assertFalse(hasattr(editor, "font_size_down"))
             self.assertFalse(hasattr(editor, "font_size_up"))
-            self.assertIn("background-color:#000000", editor.editor.styleSheet())
+            self.assertIn(
+                "stop:1 rgb(15,15,15)",
+                editor.editor.styleSheet(),
+            )
+            self.assertIn("color:#f1eee8", editor.editor.styleSheet())
             editor.editor.selectAll()
             editor.set_font_size(24)
             self.assertEqual(round(editor.editor.textCursor().charFormat().fontPointSize()), 24)
@@ -1399,7 +1769,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
     def test_editor_toolbar_failures_are_contained(self) -> None:
         editor, holder = self._make_editor("paper")
         try:
-            with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning:
+            with mock.patch("Editor.show_lettersmith_message") as warning:
                 editor._run_editor_action(
                     "Injected failure",
                     lambda: (_ for _ in ()).throw(RuntimeError("injected")),
@@ -1469,8 +1839,21 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.assertIn("font-family:'LetterSmithFont1', 'Arcane'", index)
             self.assertEqual(state["font_export"]["embedded"], ["Arcane"])
             self.assertEqual(len(exported_files), 1)
-            self.assertTrue(
-                (play_dir / "gallery/fonts" / exported_files[0]).is_file()
+            exported_font = play_dir / "gallery/fonts" / exported_files[0]
+            self.assertTrue(exported_font.is_file())
+            exported_font.write_bytes(b"X" * exported_font.stat().st_size)
+
+            regenerated = generate.generate_play_bundle(
+                str(root),
+                message_html=(
+                    '<span style="font-family:\'Arcane\';font-size:24pt">'
+                    "Letter</span>"
+                ),
+                seed_sfx=False,
+            )
+            self.assertEqual(
+                (regenerated / "gallery/fonts" / exported_files[0]).read_bytes(),
+                font_path.read_bytes(),
             )
 
     def test_generated_viewer_allows_an_empty_message(self) -> None:
@@ -1514,6 +1897,53 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 "",
             )
 
+    def test_generated_viewer_copies_and_fingerprints_message_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pages = root / "gallery/user/pages"
+            controls = root / "gallery/user/card/controls"
+            pages.mkdir(parents=True)
+            controls.mkdir(parents=True)
+            image = QtGui.QImage(8, 8, QtGui.QImage.Format_RGBA8888)
+            image.fill(QtGui.QColor("white"))
+            for name in REQUIRED_SLIDES:
+                self.assertTrue(image.save(str(pages / name)))
+            for name in CONTROL_FILES:
+                self.assertTrue(image.save(str(controls / name)))
+            banner = root / generate.APP_BANNER_PATH
+            banner.parent.mkdir(parents=True, exist_ok=True)
+            self.assertTrue(image.save(str(banner)))
+            SettingsStore(root).update_fields(
+                {
+                    "recipient_name": "Amanda Miller",
+                    "recipient_title": "Picture Letter",
+                }
+            )
+            asset = root / MESSAGE_ASSETS_DIR / "inline.png"
+            asset.parent.mkdir(parents=True)
+            asset.write_bytes(b"first inline asset")
+            message_html = (
+                '<p><img src="gallery/message_assets/inline.png"></p>'
+            )
+
+            first_fingerprint = generate.build_source_fingerprint(root)
+            play_dir = generate.generate_play_bundle(
+                root,
+                message_html=message_html,
+                seed_sfx=False,
+            )
+
+            generate.validate_play_bundle(play_dir)
+            self.assertEqual(
+                (play_dir / MESSAGE_ASSETS_DIR / "inline.png").read_bytes(),
+                b"first inline asset",
+            )
+            asset.write_bytes(b"changed inline asset")
+            self.assertNotEqual(
+                generate.build_source_fingerprint(root),
+                first_fingerprint,
+            )
+
     def test_ultralink_button_requires_safe_selected_text(self) -> None:
         editor, holder = self._make_editor("paper")
         try:
@@ -1538,7 +1968,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.assertFalse(editor.btn_ultralink.isEnabled())
             self.assertIn("Remove the web link", editor.btn_ultralink.toolTip())
 
-            with mock.patch.object(QtWidgets.QMessageBox, "information") as info:
+            with mock.patch("Editor.show_lettersmith_message") as info:
                 editor.open_ultralink_dialog()
             info.assert_called_once()
         finally:

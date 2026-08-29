@@ -11,7 +11,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 import command
 
@@ -272,7 +272,7 @@ class CommandInteractionTests(unittest.TestCase):
         from project_paths import ProjectPathResolver
         from project_state import ApplicationState
         from project_state import ProjectStateController
-        from settings_store import SettingsStore
+        from settings_store import DEFAULT_CURTAIN_STYLE, SettingsStore
 
         root = Path(self.temp_dir.name) / "new-project"
         active_page = root / "gallery" / "user" / "pages" / "cover.png"
@@ -328,7 +328,7 @@ class CommandInteractionTests(unittest.TestCase):
             {
                 "starting_volume": 21,
                 "music_volume": 34,
-                "curtain_style": "average_color",
+                "curtain_style": "complementary_dark",
                 "message_overlay_preset": "black",
                 "message_overlay_opacity": 97,
                 "forge_preview_mode": "window",
@@ -383,7 +383,10 @@ class CommandInteractionTests(unittest.TestCase):
         self.assertEqual(current["starting_volume"], 21)
         self.assertEqual(current["music_volume"], 34)
         self.assertEqual(current["last_music_folder"], "C:/Music")
-        self.assertEqual(current["curtain_style"], "pure_white")
+        self.assertEqual(
+            current["curtain_style"],
+            DEFAULT_CURTAIN_STYLE,
+        )
         self.assertEqual(current["message_overlay_preset"], "paper")
         self.assertEqual(current["message_overlay_opacity"], 68)
         self.assertEqual(current["forge_preview_mode"], "portrait")
@@ -402,6 +405,131 @@ class CommandInteractionTests(unittest.TestCase):
         self.assertEqual(
             list(root.rglob("*.new-project-backup")),
             [],
+        )
+
+    def test_command_reset_restores_normal_curtains(self) -> None:
+        from project_state import ProjectStateController
+        from settings_store import DEFAULT_CURTAIN_STYLE, SettingsStore
+
+        root = Path(self.temp_dir.name) / "command-reset-curtain"
+        settings = SettingsStore(root)
+        settings.update_fields(curtain_style="pure_white")
+        controller = ProjectStateController(root)
+        controller.initialize()
+        controller.establish_project("Amanda Miller")
+
+        command.reset_everything(
+            project_root=root,
+            project_state=controller,
+        )
+
+        self.assertEqual(
+            settings.snapshot()["curtain_style"],
+            DEFAULT_CURTAIN_STYLE,
+        )
+
+    def test_delete_project_removes_all_active_local_copies_only(self) -> None:
+        from project_paths import ProjectPathResolver
+        from project_state import ApplicationState, ProjectStateController
+        from settings_store import SettingsStore
+
+        root = Path(self.temp_dir.name) / "delete-project"
+        page = root / "gallery" / "user" / "pages" / "cover.png"
+        page.parent.mkdir(parents=True)
+        page.write_bytes(b"active")
+        shared = root / "Prompter" / "modules" / "role.txt"
+        shared.parent.mkdir(parents=True)
+        shared.write_text("keep", encoding="utf-8")
+
+        settings = SettingsStore(root)
+        controller = ProjectStateController(root)
+        controller.initialize()
+        identity = controller.establish_project("Amanda Miller")
+        settings.update_fields({"recipient_title": "Temporary Letter"})
+        resolver = ProjectPathResolver(root)
+        autosave = resolver.ensure_autosave_storage(
+            resolver.context_from_settings(settings.snapshot())
+        )
+        (autosave / "draft.txt").write_text("delete", encoding="utf-8")
+
+        saved = root / "output" / "Play" / "Amanda Miller" / "Temporary Letter"
+        recovery = root / "output" / "Recovery" / "Amanda Miller" / "Temporary Letter"
+        unrelated = root / "output" / "Play" / "Amanda Miller" / "Keep Letter"
+        for path in (saved, recovery, unrelated):
+            path.mkdir(parents=True)
+            (path / "index.html").write_text(path.name, encoding="utf-8")
+            (path / "lettersmith-metadata.json").write_text(
+                json.dumps(
+                    {
+                        "project_id": (
+                            identity.project_id
+                            if path != unrelated
+                            else "fdb11045-b56b-4778-b1dd-c96b8f34bba5"
+                        )
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        catalog = mock.Mock()
+        with mock.patch(
+            "saved_letters.SavedLetterCatalog",
+            return_value=catalog,
+        ):
+            self.assertTrue(
+                command.delete_project(
+                    project_root=root,
+                    project_state=controller,
+                )
+            )
+
+        self.assertFalse(page.exists())
+        self.assertFalse(autosave.exists())
+        self.assertFalse(saved.exists())
+        self.assertFalse(recovery.exists())
+        self.assertTrue(unrelated.is_dir())
+        self.assertEqual(shared.read_text(encoding="utf-8"), "keep")
+        self.assertEqual(controller.state, ApplicationState.RECIPIENT_REQUIRED)
+        self.assertFalse(controller.identity.is_valid)
+        self.assertEqual(settings.get("project_id"), "")
+        self.assertEqual(catalog.refresh_entry.call_count, 2)
+        catalog.refresh_entry.assert_has_calls(
+            [mock.call(recovery.resolve()), mock.call(saved.resolve())],
+            any_order=True,
+        )
+        self.assertTrue(identity.is_valid)
+
+    def test_saved_project_paths_match_only_the_active_project_id(self) -> None:
+        from project_paths import PROJECT_METADATA_FILE
+
+        root = Path(self.temp_dir.name) / "saved-project-paths"
+        active_play = root / "output" / "Play" / "Recipient" / "Active"
+        active_recovery = root / "output" / "Recovery" / "Active"
+        other = root / "output" / "Play" / "Recipient" / "Other"
+        example = root / "resources" / "examples" / "Example"
+        active_id = "8e0a0fb8-fe43-46e7-b81a-12458235660b"
+        other_id = "79e08d8b-89af-41e4-a638-dc88f2074aa4"
+        for path, project_id in (
+            (active_play, active_id),
+            (active_recovery, active_id),
+            (other, other_id),
+            (example, active_id),
+        ):
+            path.mkdir(parents=True)
+            (path / PROJECT_METADATA_FILE).write_text(
+                json.dumps({"project_id": project_id}),
+                encoding="utf-8",
+            )
+
+        resolved_catalog, paths = command._saved_project_paths(
+            root,
+            {"project_id": active_id},
+        )
+
+        self.assertIsNotNone(resolved_catalog)
+        self.assertEqual(
+            paths,
+            (active_recovery.resolve(), active_play.resolve()),
         )
 
     def test_new_project_rolls_back_every_active_path_on_failure(self) -> None:
@@ -478,20 +606,21 @@ class CommandInteractionTests(unittest.TestCase):
         )
 
     def test_settings_menu_exposes_new_project_and_normal_exit(self) -> None:
-        from Nexus import TitleBar
+        from Nexus import TITLE_BAR_CONTROL_PX, TITLE_BAR_ICON_PX, TitleBar
 
         class Host(QtWidgets.QMainWindow):
             def __init__(self, project_root: Path):
                 super().__init__()
                 self.project_root = str(project_root)
                 self.new_project_calls = 0
+                self.delete_project_calls = 0
                 self.close_events = 0
 
             def start_new_project(self) -> None:
                 self.new_project_calls += 1
 
-            def open_target_browser(self) -> None:
-                pass
+            def delete_project(self) -> None:
+                self.delete_project_calls += 1
 
             def status(self, _message: str) -> None:
                 pass
@@ -501,32 +630,65 @@ class CommandInteractionTests(unittest.TestCase):
                 event.accept()
 
         host = Host(Path(self.temp_dir.name))
-        source_icons = Path(__file__).resolve().parents[1] / "gallery/app/icons"
-        target_icons = Path(host.project_root) / "gallery/app/icons"
-        target_icons.mkdir(parents=True)
-        for name in (
-            "settings.png",
-            "Settings.gif",
-            "reticle.png",
-            "mini.png",
-            "maxi.png",
-            "Exi.png",
-        ):
-            shutil.copy2(source_icons / name, target_icons)
+        source_theme = (
+            Path(__file__).resolve().parents[1]
+            / "resources/app/themes/cyber_forge"
+        )
+        target_theme = (
+            Path(host.project_root)
+            / "resources/app/themes/cyber_forge"
+        )
+        shutil.copytree(source_theme, target_theme)
         title_bar = TitleBar(host)
         actions = {action.text(): action for action in title_bar.settings_menu.actions()}
 
+        self.assertIn("App Theme", actions)
         self.assertIn("New Project", actions)
+        self.assertIn("Delete Project", actions)
         self.assertIn("Exit", actions)
+        project_actions = [
+            action.text()
+            for action in title_bar.settings_menu.actions()
+            if not action.isSeparator()
+        ]
+        self.assertEqual(
+            project_actions[project_actions.index("New Project") + 1],
+            "Delete Project",
+        )
+        theme_entries = [
+            None if action.isSeparator() else action.text()
+            for action in title_bar.themes_menu.actions()
+        ]
+        self.assertEqual(
+            theme_entries,
+            [
+                "Cyber Forge",
+                "Obsidian Forge",
+                "Velvet Rose",
+                "Celestial Rose",
+                None,
+                "Dark",
+                "Light",
+            ],
+        )
+        self.assertFalse(hasattr(title_bar, "btn_target"))
+        self.assertEqual(title_bar.settings_window_divider.width(), 1)
+        self.assertEqual(
+            title_bar.settings_window_divider.height(),
+            (TITLE_BAR_CONTROL_PX * 3) // 5,
+        )
+        divider_container = title_bar.settings_window_divider.parentWidget()
+        self.assertEqual(
+            ((divider_container.width() - 1) // 2)
+            + title_bar.layout().spacing(),
+            TITLE_BAR_CONTROL_PX // 2,
+        )
         self.assertEqual(title_bar.settings_button.text(), "")
         self.assertFalse(title_bar.settings_button.icon().isNull())
         self.assertTrue(Path(title_bar._settings_movie_path).is_file())
         self.assertFalse(title_bar._settings_icon_animated)
-        from Nexus import TITLE_BAR_CONTROL_PX, TITLE_BAR_ICON_PX
-
         for button in (
             title_bar.settings_button,
-            title_bar.btn_target,
             title_bar.btn_minimize,
             title_bar.btn_max,
             title_bar.btn_close,
@@ -546,6 +708,21 @@ class CommandInteractionTests(unittest.TestCase):
         ):
             self.assertEqual(button.text(), "")
             self.assertFalse(button.icon().isNull())
+
+        title_bar.theme_service.set_theme("dark", persist=False)
+        title_bar.apply_theme(title_bar.theme_service)
+        self.assertEqual(title_bar.settings_button.text(), "\u2699")
+        self.assertTrue(title_bar.settings_button.icon().isNull())
+        for button in (
+            title_bar.btn_minimize,
+            title_bar.btn_max,
+            title_bar.btn_close,
+        ):
+            self.assertFalse(button.text() == "")
+            self.assertTrue(button.icon().isNull())
+
+        title_bar.theme_service.set_theme("cyber_forge", persist=False)
+        title_bar.apply_theme(title_bar.theme_service)
 
         title_bar._show_animated_settings_icon()
         animated_after_click = title_bar._settings_icon_animated
@@ -573,97 +750,347 @@ class CommandInteractionTests(unittest.TestCase):
         title_bar._show_static_settings_icon()
         self.assertTrue(animated_while_open)
         self.assertFalse(title_bar._settings_icon_animated)
-        from settings_store import SettingsStore
-
-        SettingsStore(host.project_root).update_fields(
-            curtain_style="average_color"
+        from curtain_color import curtain_display_palette
+        from curtain_controls import (
+            CURTAIN_BACKGROUND_ROLE,
+            CURTAIN_FOREGROUND_ROLE,
+            CURTAIN_STYLE_ROLE,
+            CurtainStyleComboBox,
+            CurtainStyleMenuSelector,
         )
-        title_bar._sync_curtain_menu()
-        title_bar.set_curtain_preview_colors(
-            {
-                "average_color": (12, 34, 56),
-                "complementary_average_color": (90, 110, 130),
-                "normal_light": (180, 190, 200),
-                "complementary_light": (205, 210, 215),
-                "normal_dark": (25, 35, 45),
-                "complementary_dark": (65, 75, 85),
-            }
+        from Forge_Tab import ForgeTab
+        from settings_store import CURTAIN_STYLE_OPTIONS
+
+        curtain_styles = title_bar.curtain_styles
+        curtain_styles.set_style("average_color")
+        forge = ForgeTab(
+            host.project_root,
+            curtain_styles=curtain_styles,
         )
-        normal_row = title_bar._curtain_actions["average_color"]
-        complementary_row = title_bar._curtain_actions[
-            "complementary_average_color"
-        ]
-        white_row = title_bar._curtain_actions["pure_white"]
-        light_parent = title_bar._curtain_parent_actions["light"]
-        dark_parent = title_bar._curtain_parent_actions["dark"]
-        self.assertIsInstance(normal_row, QtWidgets.QPushButton)
-        self.assertIn("background:#0c2238", normal_row.styleSheet())
-        self.assertIn("color:#5a6e82", normal_row.styleSheet())
-        self.assertIn("background:#5a6e82", complementary_row.styleSheet())
-        self.assertIn("color:#0c2238", complementary_row.styleSheet())
-        self.assertIn("background:#ffffff", white_row.styleSheet())
-        self.assertIn("color:#000000", white_row.styleSheet())
-        self.assertEqual(light_parent.text(), "Light ▾")
-        self.assertEqual(dark_parent.text(), "Dark ▾")
-        self.assertIs(light_parent.menu(), title_bar.light_curtain_menu)
-        self.assertIs(dark_parent.menu(), title_bar.dark_curtain_menu)
-        self.assertEqual(len(title_bar.curtain_menu.actions()), 5)
-        self.assertEqual(len(title_bar.light_curtain_menu.actions()), 2)
-        self.assertEqual(len(title_bar.dark_curtain_menu.actions()), 2)
-        self.assertIn("background:#b4bec8", light_parent.styleSheet())
-        self.assertIn("color:#414b55", light_parent.styleSheet())
-        self.assertIn("background:#19232d", dark_parent.styleSheet())
-        self.assertIn("color:#cdd2d7", dark_parent.styleSheet())
+        settings_selector = title_bar.curtain_style_selector
+        forge_selector = forge.curtain_style_selector
+        self.assertEqual(forge.preview_format_label.text(), "Preview Format")
+        self.assertEqual(forge.curtain_style_label.text(), "Choose Curtains")
+        self.assertIs(forge.curtain_styles, curtain_styles)
+        self.assertIsInstance(settings_selector, CurtainStyleMenuSelector)
+        self.assertIsInstance(forge_selector, CurtainStyleComboBox)
+        self.assertIs(settings_selector.model(), curtain_styles.model)
+        self.assertIs(forge_selector.model(), curtain_styles.model)
 
-        title_bar._set_curtain_style("complementary_average_color")
-        self.assertIn("background:#5a6e82", complementary_row.styleSheet())
-        self.assertIn("color:#0c2238", complementary_row.styleSheet())
-        self.assertIn("background:#0c2238", normal_row.styleSheet())
-
-        title_bar._set_curtain_style("normal_light")
-        normal_light_row = title_bar._curtain_actions["normal_light"]
-        complementary_light_row = title_bar._curtain_actions[
-            "complementary_light"
-        ]
-        self.assertIn("background:#b4bec8", normal_light_row.styleSheet())
-        self.assertIn("color:#414b55", normal_light_row.styleSheet())
-        self.assertIn("background:#b4bec8", light_parent.styleSheet())
-        self.assertIn("color:#414b55", light_parent.styleSheet())
-        self.assertIn("background:#cdd2d7", complementary_light_row.styleSheet())
-        self.assertIn("color:#19232d", complementary_light_row.styleSheet())
-        self.assertIn("background:#19232d", dark_parent.styleSheet())
-
-        title_bar._set_curtain_style("complementary_light")
-        self.assertIn(
-            "background:#cdd2d7",
-            complementary_light_row.styleSheet(),
+        expected_options = (
+            ("pure_white", "White Curtains"),
+            ("average_color", "Normal Curtains"),
+            ("complementary_average_color", "Complementary Curtains"),
+            ("normal_light", "Normal Light Curtains"),
+            ("complementary_light", "Complementary Light Curtains"),
+            ("normal_dark", "Normal Dark Curtains"),
+            ("complementary_dark", "Complementary Dark Curtains"),
         )
-        self.assertIn("color:#19232d", complementary_light_row.styleSheet())
-        self.assertIn("background:#cdd2d7", light_parent.styleSheet())
+        self.assertEqual(CURTAIN_STYLE_OPTIONS, expected_options)
+        self.assertEqual(curtain_styles.model.rowCount(), 7)
+        for row, (style, label) in enumerate(expected_options):
+            index = curtain_styles.model.index(row, 0)
+            self.assertEqual(index.data(), label)
+            self.assertEqual(index.data(CURTAIN_STYLE_ROLE), style)
 
-        title_bar._set_curtain_style("normal_dark")
-        normal_dark_row = title_bar._curtain_actions["normal_dark"]
-        self.assertIn("background:#19232d", normal_dark_row.styleSheet())
-        self.assertIn("color:#cdd2d7", normal_dark_row.styleSheet())
-        self.assertIn("background:#19232d", dark_parent.styleSheet())
-        self.assertIn("background:#b4bec8", light_parent.styleSheet())
+        settings_curtain_menu = settings_selector.menu()
+        forge_curtain_menu = forge_selector.popup_menu()
 
-        title_bar._set_curtain_style("complementary_dark")
-        complementary_dark_row = title_bar._curtain_actions[
-            "complementary_dark"
+        def menu_signature(menu: QtWidgets.QMenu) -> list[object]:
+            return [
+                None
+                if action.isSeparator()
+                else (action.text(), action.menu() is not None)
+                for action in menu.actions()
+            ]
+
+        expected_hierarchy = [
+            ("White Curtains", False),
+            ("Normal Curtains", False),
+            ("Complementary Curtains", False),
+            None,
+            ("Light Curtains", True),
+            ("Dark Curtains", True),
         ]
-        self.assertIn("background:#414b55", complementary_dark_row.styleSheet())
-        self.assertIn("color:#b4bec8", complementary_dark_row.styleSheet())
-        self.assertIn("background:#414b55", dark_parent.styleSheet())
-        self.assertIn("background:#b4bec8", light_parent.styleSheet())
-        self.assertIn("background:#b4bec8", normal_light_row.styleSheet())
+        for selector, menu in (
+            (settings_selector, settings_curtain_menu),
+            (forge_selector, forge_curtain_menu),
+        ):
+            self.assertEqual(selector.count(), 7)
+            self.assertEqual(selector.current_style(), "average_color")
+            self.assertEqual(
+                selector.currentData(CURTAIN_STYLE_ROLE),
+                "average_color",
+            )
+            self.assertEqual(menu_signature(menu), expected_hierarchy)
+            self.assertEqual(
+                [
+                    (action.data(), action.text())
+                    for action in menu.light_menu.actions()
+                ],
+                list(expected_options[3:5]),
+            )
+            self.assertEqual(
+                [
+                    (action.data(), action.text())
+                    for action in menu.dark_menu.actions()
+                ],
+                list(expected_options[5:]),
+            )
+            for style, label in expected_options:
+                action = menu.leaf_action(style)
+                widget = menu.leaf_widget(style)
+                self.assertIsNotNone(action)
+                self.assertIsNotNone(widget)
+                self.assertEqual(action.data(), style)
+                self.assertEqual(action.text(), label)
+                self.assertIs(action.defaultWidget(), widget)
+                self.assertEqual(widget.curtain_style, style)
+                self.assertEqual(widget.accessibleName(), label)
 
-        title_bar._set_curtain_style("pure_white")
-        self.assertIn("background:#0c2238", normal_row.styleSheet())
-        self.assertIn("background:#ffffff", white_row.styleSheet())
-        self.assertIn("color:#000000", white_row.styleSheet())
+        self.assertIsNot(settings_curtain_menu, forge_curtain_menu)
+        self.assertIsNot(
+            settings_curtain_menu.light_menu,
+            forge_curtain_menu.light_menu,
+        )
+        self.assertIsNot(
+            settings_curtain_menu.dark_menu,
+            forge_curtain_menu.dark_menu,
+        )
+        for style, _label in expected_options:
+            self.assertIsNot(
+                settings_curtain_menu.leaf_action(style),
+                forge_curtain_menu.leaf_action(style),
+            )
+            self.assertIsNot(
+                settings_curtain_menu.leaf_widget(style),
+                forge_curtain_menu.leaf_widget(style),
+            )
+
+        curtain_colors = {
+            "pure_white": (255, 255, 255),
+            "average_color": (12, 34, 56),
+            "complementary_average_color": (90, 110, 130),
+            "normal_light": (180, 190, 200),
+            "complementary_light": (200, 180, 160),
+            "normal_dark": (25, 35, 45),
+            "complementary_dark": (60, 25, 80),
+        }
+        curtain_styles.set_preview_colors(curtain_colors)
+        expected_palette = curtain_display_palette(curtain_colors)
+
+        def model_palette(
+            expected: dict[str, object],
+        ) -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
+            rows = []
+            for row, (style, _label) in enumerate(expected_options):
+                index = curtain_styles.model.index(row, 0)
+                background = index.data(CURTAIN_BACKGROUND_ROLE)
+                foreground = index.data(CURTAIN_FOREGROUND_ROLE)
+                self.assertTrue(background.isValid())
+                self.assertTrue(foreground.isValid())
+                self.assertEqual(
+                    background.getRgb()[:3],
+                    expected[style].background,
+                )
+                self.assertEqual(
+                    foreground.getRgb()[:3],
+                    expected[style].foreground,
+                )
+                rows.append((background.getRgb(), foreground.getRgb()))
+            return tuple(rows)
+
+        model_palette(expected_palette)
+
+        def exact_color_pixels(
+            widget: QtWidgets.QWidget,
+            color: tuple[int, int, int],
+        ) -> int:
+            widget.resize(widget.sizeHint())
+            image = widget.grab().toImage()
+            return sum(
+                1
+                for y in range(image.height())
+                for x in range(image.width())
+                if image.pixelColor(x, y).getRgb()[:3] == color
+            )
+
+        for menu in (settings_curtain_menu, forge_curtain_menu):
+            for style, _label in expected_options:
+                self.assertGreater(
+                    exact_color_pixels(
+                        menu.leaf_widget(style),
+                        expected_palette[style].background,
+                    ),
+                    100,
+                )
+
+        self.assertEqual(
+            settings_selector.current_display_colors(),
+            expected_palette["average_color"],
+        )
+        self.assertEqual(
+            forge_selector.current_display_colors(),
+            expected_palette["average_color"],
+        )
+        committed: list[str] = []
+        curtain_styles.styleCommitted.connect(committed.append)
+        with (
+            mock.patch.object(
+                curtain_styles.settings,
+                "update_fields",
+                wraps=curtain_styles.settings.update_fields,
+            ) as update_fields,
+            mock.patch.object(
+                forge,
+                "_refresh_source_fingerprint",
+                return_value=True,
+            ),
+        ):
+            forge_curtain_menu.leaf_widget("complementary_light").click()
+            self.app.processEvents()
+            self.assertEqual(
+                settings_selector.current_style(),
+                "complementary_light",
+            )
+            self.assertEqual(
+                forge_selector.current_style(),
+                "complementary_light",
+            )
+
+            settings_curtain_menu.leaf_widget(
+                "complementary_dark"
+            ).click()
+            self.app.processEvents()
+            self.assertEqual(
+                settings_selector.current_style(),
+                "complementary_dark",
+            )
+            self.assertEqual(
+                forge_selector.current_style(),
+                "complementary_dark",
+            )
+
+        self.assertEqual(
+            update_fields.call_args_list,
+            [
+                mock.call(curtain_style="complementary_light"),
+                mock.call(curtain_style="complementary_dark"),
+            ],
+        )
+        self.assertEqual(
+            committed,
+            ["complementary_light", "complementary_dark"],
+        )
+
+        refreshed_colors = {
+            "pure_white": (255, 255, 255),
+            "average_color": (42, 82, 122),
+            "complementary_average_color": (174, 134, 94),
+            "normal_light": (192, 212, 232),
+            "complementary_light": (232, 212, 192),
+            "normal_dark": (18, 38, 58),
+            "complementary_dark": (58, 38, 18),
+        }
+        popup_was_visible: list[bool] = []
+
+        def refresh_popup_colors() -> None:
+            popup_was_visible.append(forge_curtain_menu.isVisible())
+            curtain_styles.set_preview_colors(refreshed_colors)
+
+        curtain_styles.previewColorsRequested.connect(refresh_popup_colors)
+        forge_curtain_menu.aboutToShow.emit()
+        self.assertEqual(popup_was_visible, [False])
+        normal_index = curtain_styles.model.index(1, 0)
+        self.assertEqual(
+            normal_index.data(CURTAIN_BACKGROUND_ROLE).getRgb()[:3],
+            refreshed_colors["average_color"],
+        )
+        refreshed_palette = curtain_display_palette(refreshed_colors)
+        self.assertEqual(
+            settings_selector.current_display_colors(),
+            refreshed_palette["complementary_dark"],
+        )
+        self.assertEqual(
+            forge_selector.current_display_colors(),
+            refreshed_palette["complementary_dark"],
+        )
+
+        palette_before_theme = model_palette(refreshed_palette)
+        for theme_id in (
+            "cyber_forge",
+            "obsidian_forge",
+            "velvet_rose",
+            "celestial_rose",
+        ):
+            with self.subTest(theme_id=theme_id):
+                definition = title_bar.theme_service.set_theme(
+                    theme_id,
+                    persist=False,
+                )
+                title_bar.apply_theme(title_bar.theme_service)
+                forge.apply_theme_assets(title_bar.theme_service)
+                self.assertEqual(
+                    model_palette(refreshed_palette),
+                    palette_before_theme,
+                )
+                self.assertIn(
+                    definition.tokens.border,
+                    settings_curtain_menu.styleSheet(),
+                )
+                self.assertIn(
+                    definition.tokens.accent,
+                    forge_selector.styleSheet(),
+                )
+                selected = refreshed_palette["complementary_dark"]
+                self.assertIn(
+                    QtGui.QColor(*selected.background).name(),
+                    forge_selector.styleSheet(),
+                )
+                self.assertIn(
+                    QtGui.QColor(*selected.foreground).name(),
+                    forge_selector.styleSheet(),
+                )
+
+        selected_background = refreshed_colors["complementary_dark"]
+        selected_image = forge_selector.grab().toImage()
+        selected_pixel_count = sum(
+            1
+            for y in range(selected_image.height())
+            for x in range(selected_image.width())
+            if selected_image.pixelColor(x, y).getRgb()[:3]
+            == selected_background
+        )
+        self.assertGreater(selected_pixel_count, 100)
+
+        forge.shutdown_operations()
+        forge.close()
+        with mock.patch.object(
+            curtain_styles.settings,
+            "update_fields",
+            wraps=curtain_styles.settings.update_fields,
+        ) as update_after_forge_close:
+            curtain_styles.set_style("pure_white")
+            self.app.processEvents()
+        update_after_forge_close.assert_called_once_with(
+            curtain_style="pure_white"
+        )
+        self.assertEqual(settings_selector.current_style(), "pure_white")
+
+        curtain_styles.close()
+        with mock.patch.object(
+            curtain_styles.settings,
+            "update_fields",
+            wraps=curtain_styles.settings.update_fields,
+        ) as update_after_close:
+            settings_curtain_menu.leaf_widget("normal_light").click()
+            self.app.processEvents()
+        update_after_close.assert_not_called()
+
         actions["New Project"].trigger()
         self.assertEqual(host.new_project_calls, 1)
+        actions["Delete Project"].trigger()
+        self.assertEqual(host.delete_project_calls, 1)
         host.show()
         actions["Exit"].trigger()
         self.app.processEvents()
@@ -699,10 +1126,8 @@ class CommandInteractionTests(unittest.TestCase):
             reset_after_project_wipe=mock.Mock(),
             preview_format_panel=preview_format_panel,
         )
-        title_bar = types.SimpleNamespace(
-            _sync_curtain_menu=mock.Mock(),
-            set_curtain_preview_colors=mock.Mock(),
-        )
+        curtain_styles = mock.Mock()
+        curtain_styles.sync_from_settings.return_value = "average_color"
         harness = types.SimpleNamespace(
             _curtain_preparation_generation=1,
             _stop_curtain_preparation=mock.Mock(return_value=True),
@@ -723,7 +1148,7 @@ class CommandInteractionTests(unittest.TestCase):
             preview_frame=QtWidgets.QWidget(),
             preview_caption=QtWidgets.QLabel(),
             help_icon=QtWidgets.QLabel(),
-            title_bar=title_bar,
+            curtain_styles=curtain_styles,
         )
 
         Nexus._on_command_wiped(harness)
@@ -736,7 +1161,86 @@ class CommandInteractionTests(unittest.TestCase):
         self.assertEqual(page_stack.currentIndex(), 0)
         self.assertIsNone(harness._last_pixmap)
         self.assertFalse(preview_format_panel.isVisible())
-        title_bar.set_curtain_preview_colors.assert_called_once_with({})
+        curtain_styles.sync_from_settings.assert_called_once_with()
+        curtain_styles.set_preview_colors.assert_called_once_with({})
+
+    def test_curtain_setting_invalidates_source_before_preview(self) -> None:
+        from Forge_Tab import ForgeTab
+
+        calls: list[str] = []
+        harness = types.SimpleNamespace(
+            _sync_curtain_style=mock.Mock(
+                side_effect=lambda: calls.append("sync")
+            ),
+            _refresh_source_fingerprint=mock.Mock(
+                side_effect=lambda: calls.append("source")
+            ),
+            ensure_preview_current=mock.Mock(
+                side_effect=lambda: calls.append("preview")
+            ),
+            _tab_active=True,
+            _shutdown=False,
+            _settings_refresh_requested=types.SimpleNamespace(
+                emit=mock.Mock(side_effect=lambda: calls.append("scheduled"))
+            ),
+        )
+        harness._curtain_style_refresh_requested = types.SimpleNamespace(
+            emit=mock.Mock(
+                side_effect=lambda: ForgeTab._curtain_style_changed(harness)
+            )
+        )
+
+        ForgeTab._on_settings_changed(
+            harness,
+            {"curtain_style": "normal_dark"},
+            ("curtain_style",),
+        )
+
+        self.assertEqual(calls, ["sync", "source", "preview", "scheduled"])
+        harness._sync_curtain_style.assert_called_once_with()
+        harness._refresh_source_fingerprint.assert_called_once_with()
+        harness.ensure_preview_current.assert_called_once_with()
+
+    def test_frameless_resize_hit_regions_cover_edges_and_corners(self) -> None:
+        from window_chrome import native_resize_hit_test, resize_edges_at_point
+
+        size = QtCore.QSize(640, 480)
+        self.assertEqual(
+            resize_edges_at_point(size, QtCore.QPoint(0, 0)),
+            QtCore.Qt.TopEdge | QtCore.Qt.LeftEdge,
+        )
+        self.assertEqual(
+            resize_edges_at_point(size, QtCore.QPoint(639, 0)),
+            QtCore.Qt.TopEdge | QtCore.Qt.RightEdge,
+        )
+        self.assertEqual(
+            resize_edges_at_point(size, QtCore.QPoint(0, 479)),
+            QtCore.Qt.BottomEdge | QtCore.Qt.LeftEdge,
+        )
+        self.assertEqual(
+            resize_edges_at_point(size, QtCore.QPoint(639, 479)),
+            QtCore.Qt.BottomEdge | QtCore.Qt.RightEdge,
+        )
+        self.assertEqual(
+            resize_edges_at_point(size, QtCore.QPoint(320, 0)),
+            QtCore.Qt.TopEdge,
+        )
+        self.assertFalse(
+            resize_edges_at_point(size, QtCore.QPoint(320, 240))
+        )
+        expected_native_hits = {
+            QtCore.Qt.LeftEdge: 10,
+            QtCore.Qt.RightEdge: 11,
+            QtCore.Qt.TopEdge: 12,
+            QtCore.Qt.TopEdge | QtCore.Qt.LeftEdge: 13,
+            QtCore.Qt.TopEdge | QtCore.Qt.RightEdge: 14,
+            QtCore.Qt.BottomEdge: 15,
+            QtCore.Qt.BottomEdge | QtCore.Qt.LeftEdge: 16,
+            QtCore.Qt.BottomEdge | QtCore.Qt.RightEdge: 17,
+        }
+        for edges, expected in expected_native_hits.items():
+            with self.subTest(edges=edges):
+                self.assertEqual(native_resize_hit_test(edges), expected)
 
 
 if __name__ == "__main__":

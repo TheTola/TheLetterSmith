@@ -27,6 +27,10 @@ from typing import Dict, List, Optional
 
 from transactional_io import atomic_write_json
 from project_paths import application_paths
+from protected_projects import (
+    demo_preview_directory,
+    is_reserved_save_identity,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -39,6 +43,9 @@ PLAY_METADATA_FILE = "lettersmith-metadata.json"
 
 DEFAULT_VOLUME = 31
 DEFAULT_AUDIO = "music.mp3"
+
+# Prompt again only when the saved theme-family preference is missing or invalid.
+FORCE_THEME_FAMILY_PROMPT = False
 
 
 def _project_root() -> Path:
@@ -53,7 +60,7 @@ _PROJECT_ROOT = _project_root()
 # ─────────────────────────────────────────────────────────────────────────────
 
 GALLERY_DIR = "gallery"
-APP_BANNER_PATH = Path("resources") / "app" / "icons" / "bannerman.png"
+APP_BANNER_PATH = Path("gallery") / "app" / "icons" / "bannerman.png"
 
 PAGES_DIR = "pages"
 CONTROLS_DIR = "controls"
@@ -146,23 +153,6 @@ USER_AUDIO_PLAYLIST_FILE = (
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Curtain styles
-# ─────────────────────────────────────────────────────────────────────────────
-
-CURTAIN_STYLE_WHITE = "white"
-CURTAIN_STYLE_BLACK = "black"
-CURTAIN_STYLE_DARK = "dark"
-CURTAIN_STYLE_LIGHT = "light"
-CURTAIN_STYLE_RED = "red"
-CURTAIN_STYLE_BLUE = "blue"
-CURTAIN_STYLE_GOLD = "gold"
-CURTAIN_STYLE_SILVER = "silver"
-
-CURTAIN_STYLE_DEFAULT = CURTAIN_STYLE_WHITE
-DEFAULT_CURTAIN_STYLE = CURTAIN_STYLE_DEFAULT
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Output layout
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -187,66 +177,11 @@ WINDOWS_RESERVED_FOLDER_NAMES = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_settings(project_root: str | Path) -> Dict:
-    path = application_paths(project_root).settings_file
+    # Import lazily so configuration constants remain available while the
+    # canonical settings service initializes.
+    from settings_store import SettingsStore
 
-    try:
-        if path.exists():
-            data = json.loads(
-                path.read_text(encoding="utf-8")
-            )
-        else:
-            data = {}
-    except Exception:
-        data = {}
-
-    updated = False
-
-    # Starting volume must remain between 0 and 100.
-    try:
-        volume = int(
-            data.get(
-                "starting_volume",
-                DEFAULT_VOLUME,
-            )
-        )
-        volume = max(0, min(100, volume))
-    except Exception:
-        volume = DEFAULT_VOLUME
-
-    if data.get("starting_volume") != volume:
-        data["starting_volume"] = volume
-        updated = True
-
-    # Store only the audio filename rather than a full path.
-    last_audio = data.get(
-        "last_audio",
-        DEFAULT_AUDIO,
-    )
-
-    try:
-        last_audio = Path(
-            str(last_audio)
-        ).name
-    except Exception:
-        last_audio = DEFAULT_AUDIO
-
-    if data.get("last_audio") != last_audio:
-        data["last_audio"] = last_audio
-        updated = True
-
-    if updated:
-        try:
-            path.write_text(
-                json.dumps(
-                    data,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
-
-    return data
+    return SettingsStore(project_root).snapshot()
 
 
 _SETTINGS = _load_settings(_PROJECT_ROOT)
@@ -310,7 +245,7 @@ def canonical_stock_letters_root(project_root: str | Path) -> Path:
 
 
 def is_stock_letter_title(title: object) -> bool:
-    return str(title or "").strip().casefold().startswith("stock:")
+    return str(title or "").strip().casefold().startswith("stock")
 
 
 def safe_folder_name(
@@ -369,6 +304,14 @@ def _bundle_project_id(play_dir: Path) -> str:
     if not isinstance(payload, dict):
         return ""
     return _valid_project_uuid(payload.get("project_id"))
+
+
+def _bundle_has_reserved_save_identity(play_dir: Path) -> bool:
+    metadata = _read_play_metadata(play_dir)
+    return is_reserved_save_identity(
+        metadata.get("recipient_title", ""),
+        metadata.get("recipient_name", ""),
+    )
 
 
 def _is_play_bundle(play_dir: Path) -> bool:
@@ -860,6 +803,10 @@ def resolve_play_bundle_directory(
     stable_id = _valid_project_uuid(project_id)
     if not stable_id:
         raise ValueError("project_id must be a UUID string")
+    if is_reserved_save_identity(title, recipient):
+        destination = demo_preview_directory(project_root, stable_id)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        return destination
     play_root = canonical_play_root(project_root)
     stock_root = canonical_stock_letters_root(project_root)
     stock_title = is_stock_letter_title(title)
@@ -898,6 +845,7 @@ def resolve_play_bundle_directory(
         for root in (play_root, stock_root)
         for bundle in _iter_play_bundles(root)
         if _bundle_project_id(bundle) == stable_id
+        and not _bundle_has_reserved_save_identity(bundle)
     ]
     candidates.sort(
         key=lambda path: (
@@ -1232,13 +1180,12 @@ def validate_required_images(
 
     reconcile_external_image_assets(base)
 
-    return [
-        filename
-        for filename in REQUIRED_SLIDES
-        if not (
-            base / filename
-        ).is_file()
-    ]
+    missing: list[str] = []
+    for filename in REQUIRED_SLIDES:
+        if (base / filename).is_file():
+            continue
+        missing.append(filename)
+    return missing
 
 
 def validate_controls(
@@ -1392,21 +1339,10 @@ __all__ = [
     "USER_AUDIO_CURRENT_MANIFEST",
     "USER_AUDIO_PLAYLIST_FILE",
 
-    # Curtain styles
-    "CURTAIN_STYLE_WHITE",
-    "CURTAIN_STYLE_BLACK",
-    "CURTAIN_STYLE_DARK",
-    "CURTAIN_STYLE_LIGHT",
-    "CURTAIN_STYLE_RED",
-    "CURTAIN_STYLE_BLUE",
-    "CURTAIN_STYLE_GOLD",
-    "CURTAIN_STYLE_SILVER",
-    "CURTAIN_STYLE_DEFAULT",
-    "DEFAULT_CURTAIN_STYLE",
-
     # Output
     "OUTPUT_DIR",
     "OUTPUT_PLAY_DIR",
+    "FORCE_THEME_FAMILY_PROMPT",
 
     # Helpers
     "canonical_output_root",

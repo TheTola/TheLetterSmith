@@ -21,7 +21,8 @@ from saved_letters import (
     cleanup_stale_letter_load_workspaces,
 )
 from settings_store import SettingsStore, VISIONARY_URL_KEY
-from transactional_io import safe_write_json
+from transactional_io import safe_write_json, set_path_hidden
+from ui_theme import ThemeService
 
 
 class _FakeLanguageService:
@@ -84,6 +85,98 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.panel.cb_close_up_focus.setChecked(True)
         self.assertNotIn(HIDDEN_STYLE_DEFAULT, self.panel._collect_guidance())
         self.assertNotIn(HIDDEN_FRAMING_DEFAULT, self.panel._collect_guidance())
+
+    def test_action_buttons_follow_their_own_prerequisites_and_busy_state(self):
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+        self.panel.cmb_subject.setCurrentIndex(-1)
+
+        self.assertFalse(self.panel.btn_generate.isEnabled())
+        self.assertFalse(self.panel.btn_copy.isEnabled())
+        self.assertFalse(self.panel.btn_erase.isEnabled())
+
+        self.panel.cmb_subject.setCurrentText("Subject")
+        self.assertTrue(self.panel.btn_generate.isEnabled())
+        self.assertTrue(self.panel.btn_erase.isEnabled())
+        self.assertFalse(self.panel.btn_copy.isEnabled())
+
+        self.panel._set_generation_busy(True)
+        for button in (
+            self.panel.btn_generate,
+            self.panel.btn_copy,
+            self.panel.btn_erase,
+        ):
+            self.assertFalse(button.isEnabled())
+            effect = button.graphicsEffect()
+            self.assertIsInstance(effect, QtWidgets.QGraphicsOpacityEffect)
+            self.assertAlmostEqual(effect.opacity(), 0.52)
+
+        self.panel._set_generation_busy(False)
+        self.assertTrue(self.panel.btn_generate.isEnabled())
+        self.assertTrue(self.panel.btn_erase.isEnabled())
+        self.panel._on_generate()
+        self.assertTrue(self.panel.btn_copy.isEnabled())
+        self.assertTrue(
+            all(
+                page.copy_button is not None and page.copy_button.isEnabled()
+                for page in self.panel._page_specs
+            )
+        )
+
+        self.panel.cmb_subject.setCurrentIndex(-1)
+        self.assertFalse(self.panel.btn_generate.isEnabled())
+        self.assertFalse(self.panel.btn_copy.isEnabled())
+
+    def test_titlebar_uses_minimize_artwork_as_its_only_close_control(self):
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+        title_bar = self.panel.title_bar
+
+        self.assertTrue(title_bar.btn_minimize.isHidden())
+        self.assertTrue(title_bar.btn_maximize.isHidden())
+        self.assertFalse(title_bar.btn_close.isHidden())
+        self.assertEqual(title_bar.btn_close.objectName(), "windowControlButton")
+        self.assertEqual(title_bar.btn_close.property("fallbackSymbol"), "\u2212")
+        self.assertEqual(title_bar._close_icon_asset, "titlebar/minimize.png")
+
+        dismissed = QtTest.QSignalSpy(self.panel.dismissed)
+        title_bar.btn_close.click()
+        self.assertEqual(dismissed.count(), 1)
+
+    def test_input_change_signals_dirty_before_debounced_persist(self):
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+        changed = QtTest.QSignalSpy(self.panel.project_changed)
+
+        self.panel.txt_global.setPlainText("Unsaved prompt direction")
+
+        self.assertEqual(changed.count(), 1)
+        self.assertTrue(self.panel._persist_timer.isActive())
+
+    def test_malformed_state_is_backed_up_before_repair(self):
+        state_path = self.project_root / "prompt_writer_state.json"
+        malformed = b"{not-json"
+        state_path.write_bytes(malformed)
+
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+
+        backups = list(
+            self.project_root.glob("prompt_writer_state.invalid.*.json")
+        )
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), malformed)
+        self.assertTrue(self.panel.persist_project_state())
+
+    def test_future_state_schema_is_not_overwritten(self):
+        state_path = self.project_root / "prompt_writer_state.json"
+        state_path.write_text(
+            json.dumps({"version": 99, "subject": "Future subject"}),
+            encoding="utf-8",
+        )
+        original = state_path.read_bytes()
+
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+
+        self.assertTrue(self.panel._state_write_blocked)
+        self.assertFalse(self.panel.persist_project_state())
+        self.assertEqual(state_path.read_bytes(), original)
 
     def test_generate_proofreads_all_free_text_and_persists_exact_prompts(self):
         raw_fields = {
@@ -407,6 +500,40 @@ class PromptWriterHardeningTests(unittest.TestCase):
         )
         self.assertEqual(len(PROMPT_COLORS), len(set(PROMPT_COLORS.values())))
 
+    def test_neutral_prompt_preview_text_follows_light_and_dark_polarity(self):
+        service = ThemeService(self.project_root)
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+        self.panel.cmb_subject.setCurrentText("Subject")
+        self.panel.txt_global.setPlainText("Shared direction")
+
+        service.set_theme("light", persist=False)
+        self.panel.apply_theme_assets(service)
+        self.panel._on_generate()
+        light_text = service.tokens.text.casefold()
+        self.assertEqual(
+            self.panel.lbl_global.palette()
+            .color(QtGui.QPalette.WindowText)
+            .name()
+            .casefold(),
+            light_text,
+        )
+        for page in self.panel._page_specs:
+            self.assertIn(light_text, page.preview_widget.toHtml().casefold())
+
+        service.set_theme("dark", persist=False)
+        self.panel.apply_theme_assets(service)
+        dark_text = self.panel._display_prompt_color("global").casefold()
+        self.assertGreater(QtGui.QColor(dark_text).lightness(), 160)
+        self.assertEqual(
+            self.panel.lbl_global.palette()
+            .color(QtGui.QPalette.WindowText)
+            .name()
+            .casefold(),
+            dark_text,
+        )
+        for page in self.panel._page_specs:
+            self.assertIn(dark_text, page.preview_widget.toHtml().casefold())
+
     def test_reset_clears_prompt_writer_but_preserves_user_options(self):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
         self.panel.cmb_subject.setCurrentText("Subject")
@@ -494,7 +621,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
         clipboard.setText.side_effect = RuntimeError("clipboard unavailable")
         with (
             mock.patch.object(QtWidgets.QApplication, "clipboard", return_value=clipboard),
-            mock.patch.object(QtWidgets.QMessageBox, "warning"),
+            mock.patch("PromptWriterPanel.show_lettersmith_message"),
         ):
             self.assertEqual(self.panel._copy_all_prompts_text(), "")
 
@@ -688,6 +815,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
         state_path = self.project_root / "prompt_writer_state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
         state["generated_prompts"]["cover"] = "{{unresolved}}"
+        set_path_hidden(state_path, False)
         state_path.write_text(json.dumps(state), encoding="utf-8")
 
         self.panel.deleteLater()

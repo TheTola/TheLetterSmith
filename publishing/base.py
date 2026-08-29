@@ -18,3 +18,7 @@ class Publisher(ABC):
     @abstractmethod
     def publish(self, build_dir: Path, metadata: dict) -> PublishResult:
         raise NotImplementedError
+
+    @abstractmethod
+    def unpublish(self, metadata: dict) -> PublishResult:
+        raise NotImplementedError

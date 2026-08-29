@@ -175,11 +175,15 @@ TEMPLATE_CSS = r"""
   --paper-line:rgba(255,255,255,.42);
   --paper-shadow:rgba(0,0,0,.54);
   --message-overlay-rgb:245,235,210;
+  --message-overlay-center-rgb:248,240,220;
+  --message-overlay-edge-rgb:241,228,198;
   --message-overlay-opacity:.68;
   --message-overlay-surface-opacity:.68;
-  --message-overlay-blur:0px;
-  --message-overlay-texture-opacity:0;
+  --message-overlay-border:rgba(104,76,43,.18);
+  --message-overlay-inner-border:rgba(104,76,43,.10);
+  --message-overlay-shadow:0 18px 52px rgba(0,0,0,.20),inset 0 1px 0 rgba(255,255,255,.32);
   --message-ink:#221710;
+  --adaptive-max-lightness:.03;
   --duration-hover:150ms;
   --duration-overlay:180ms;
   --duration-major:640ms;
@@ -279,10 +283,9 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 #fullscreen-button{position:absolute;top:var(--corner-offset);right:var(--corner-offset);width:auto;height:38px;padding:0 12px;font:700 12px/1 var(--font-ui);letter-spacing:.03em;z-index:10002;pointer-events:auto}
 #mute-button[aria-pressed="true"]{border-color:rgba(155,255,251,.55);background:linear-gradient(180deg,rgba(20,55,64,.92),rgba(8,25,34,.86));color:#eaffff}
 
-.text-wall{position:absolute;top:var(--control-rail);bottom:var(--bottom-control-rail);left:50%;width:min(var(--wall-max-width),calc(100% - (2 * var(--wall-gap))));height:fit-content;max-height:calc(100% - var(--control-rail) - var(--bottom-control-rail));margin:auto 0;overflow:auto;padding:var(--wall-frame-pad);border:1px solid var(--paper-edge);border-radius:var(--panel-radius);background-color:rgba(var(--message-overlay-rgb),var(--message-overlay-surface-opacity));color:var(--message-ink);box-shadow:0 30px 80px var(--paper-shadow),0 12px 28px rgba(0,0,0,.22),inset 0 1px 0 var(--paper-line);backdrop-filter:blur(var(--message-overlay-blur));-webkit-backdrop-filter:blur(var(--message-overlay-blur));z-index:105;opacity:0;visibility:hidden;pointer-events:none;transform:translateX(-50%) scale(.975);transform-origin:center;transition:opacity var(--motion-overlay),transform var(--motion-overlay),visibility 0s linear var(--duration-overlay);will-change:opacity,transform;isolation:isolate;scrollbar-width:thin;scrollbar-color:rgba(92,67,40,.52) rgba(0,0,0,.06);background-image:radial-gradient(circle at 17% 29%,rgba(112,81,44,var(--message-overlay-texture-opacity)) 0 1px,transparent 1.5px),radial-gradient(circle at 73% 64%,rgba(255,255,255,var(--message-overlay-texture-opacity)) 0 1px,transparent 1.5px);background-size:23px 29px,31px 37px}
+.text-wall{position:absolute;top:var(--control-rail);bottom:var(--bottom-control-rail);left:50%;width:min(var(--wall-max-width),calc(100% - (2 * var(--wall-gap))));height:fit-content;max-height:calc(100% - var(--control-rail) - var(--bottom-control-rail));margin:auto 0;overflow:auto;padding:var(--wall-frame-pad);border:1px solid var(--message-overlay-border);border-radius:var(--panel-radius);background:radial-gradient(ellipse at 50% 43%,rgba(var(--message-overlay-center-rgb),var(--message-overlay-surface-opacity)),rgba(var(--message-overlay-edge-rgb),var(--message-overlay-surface-opacity)));color:var(--message-ink);box-shadow:var(--message-overlay-shadow);z-index:105;opacity:0;visibility:hidden;pointer-events:none;transform:translateX(-50%) scale(.975);transform-origin:center;transition:opacity var(--motion-overlay),transform var(--motion-overlay),visibility 0s linear var(--duration-overlay);will-change:opacity,transform;isolation:isolate;scrollbar-width:thin;scrollbar-color:rgba(92,67,40,.52) rgba(0,0,0,.06)}
 .text-wall.is-open{opacity:1;visibility:visible;pointer-events:auto;transform:translateX(-50%) scale(1);transition:opacity var(--motion-overlay),transform var(--motion-overlay),visibility 0s}
-.text-wall::before{content:"";position:absolute;inset:10px;border:1px solid rgba(116,85,47,.16);border-radius:calc(var(--panel-radius) - 4px);box-shadow:inset 0 0 0 1px rgba(255,255,255,.16),inset 0 18px 28px rgba(255,255,255,.08);pointer-events:none}
-.text-wall::after{content:"";position:absolute;inset:0;border-radius:inherit;background:linear-gradient(180deg,rgba(255,255,255,.16),rgba(255,255,255,0) 22%,rgba(0,0,0,.10) 100%);mix-blend-mode:soft-light;pointer-events:none}
+.text-wall::before{content:"";position:absolute;inset:10px;border:1px solid var(--message-overlay-inner-border);border-radius:calc(var(--panel-radius) - 4px);pointer-events:none}
 .text-wall-content{position:relative;z-index:1;max-width:44rem;margin:0 auto;padding:var(--wall-block-pad) var(--wall-inline-pad);color:var(--message-ink);font-family:var(--font-letter);font-size:clamp(17px,1.25vw,20px);line-height:1.68;text-rendering:optimizeLegibility}
 .text-wall-content,.text-wall-content *{max-width:100%;overflow-wrap:anywhere}
 .text-wall-content > :first-child{margin-top:0 !important}
@@ -463,6 +466,247 @@ document.addEventListener('DOMContentLoaded', () => {
       handler(e);
     });
   }
+
+  function installAdaptiveMicroContrast(){
+    const content = document.getElementById('textWallContent');
+    const wallImage = document.querySelector('#slide-2 > img');
+    if (!content || !wallImage){
+      return { schedule(){} };
+    }
+
+    const textNodes = [];
+    const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()){
+      if (walker.currentNode.nodeValue && walker.currentNode.nodeValue.trim()){
+        textNodes.push(walker.currentNode);
+      }
+    }
+    const segmenter = typeof Intl.Segmenter === 'function'
+      ? new Intl.Segmenter(undefined, {granularity:'grapheme'})
+      : null;
+    const supportsHighlights=!!(window.CSS && CSS.highlights && typeof Highlight!=='undefined');
+    const fallbackGlyphs=[];
+    function graphemeParts(text){
+      let fallbackOffset=0;
+      return segmenter
+        ? Array.from(segmenter.segment(text),(entry)=>[entry.segment,entry.index])
+        : Array.from(text,(character)=>{ const entry=[character,fallbackOffset]; fallbackOffset+=character.length; return entry; });
+    }
+    if (!supportsHighlights){
+      for(const node of textNodes){
+        const fragment=document.createDocumentFragment();
+        const intended=getComputedStyle(node.parentElement).color;
+        for(const [character] of graphemeParts(node.nodeValue||'')){
+          if (!character.trim()){
+            fragment.appendChild(document.createTextNode(character));
+            continue;
+          }
+          const glyph=document.createElement('span');
+          glyph.className='ls-amc-glyph';
+          glyph.dataset.intendedColor=intended;
+          glyph.textContent=character;
+          fragment.appendChild(glyph);
+          fallbackGlyphs.push(glyph);
+        }
+        node.replaceWith(fragment);
+      }
+    }
+    content.dataset.adaptiveContrastMode=supportsHighlights?'highlights':'glyph-spans';
+    const style = document.createElement('style');
+    style.id = 'lettersmith-adaptive-micro-contrast';
+    document.head.appendChild(style);
+    let highlightNames = [];
+    let imageSample = null;
+    let frame = 0;
+
+    function cssRgb(name, fallback){
+      const raw = getComputedStyle(wall).getPropertyValue(name).match(/[\d.]+/g);
+      return raw && raw.length >= 3 ? raw.slice(0, 3).map(Number) : fallback;
+    }
+    function parseColor(raw){
+      const values = String(raw || '').match(/[\d.]+/g);
+      if (!values || values.length < 3) return [238,234,226,1];
+      return [Number(values[0]),Number(values[1]),Number(values[2]),values[3] === undefined ? 1 : Number(values[3])];
+    }
+    function linear(value){
+      const channel = clamp(value, 0, 255) / 255;
+      return channel <= .04045 ? channel / 12.92 : Math.pow((channel + .055) / 1.055, 2.4);
+    }
+    function luminance(rgb){
+      return (.2126 * linear(rgb[0])) + (.7152 * linear(rgb[1])) + (.0722 * linear(rgb[2]));
+    }
+    function ratio(first, second){
+      const a = luminance(first), b = luminance(second);
+      return (Math.max(a,b) + .05) / (Math.min(a,b) + .05);
+    }
+    function rgbToHsl(rgb){
+      const r=rgb[0]/255,g=rgb[1]/255,b=rgb[2]/255,max=Math.max(r,g,b),min=Math.min(r,g,b);
+      let h=0,s=0;
+      const l=(max+min)/2, delta=max-min;
+      if (delta){
+        s=delta/(1-Math.abs((2*l)-1));
+        if (max===r) h=((g-b)/delta)%6;
+        else if (max===g) h=((b-r)/delta)+2;
+        else h=((r-g)/delta)+4;
+        h=(h*60+360)%360;
+      }
+      return [h,s,l];
+    }
+    function hslToRgb(hsl){
+      const h=hsl[0],s=hsl[1],l=hsl[2],c=(1-Math.abs((2*l)-1))*s;
+      const x=c*(1-Math.abs(((h/60)%2)-1)),m=l-(c/2);
+      let rgb;
+      if (h<60) rgb=[c,x,0]; else if (h<120) rgb=[x,c,0]; else if (h<180) rgb=[0,c,x];
+      else if (h<240) rgb=[0,x,c]; else if (h<300) rgb=[x,0,c]; else rgb=[c,0,x];
+      return rgb.map((value)=>Math.round((value+m)*255));
+    }
+    function adjustedColor(intended, background, maximum){
+      const original = intended.slice(0,3);
+      const currentRatio = ratio(original, background);
+      if (currentRatio >= 7 || maximum <= 0) return original;
+      let shift = Math.min(.05, maximum) * clamp((7-currentRatio)/6,0,1);
+      shift = Math.floor((shift+1e-12)/.0025)*.0025;
+      if (shift <= 0) return original;
+      const hsl = rgbToHsl(original);
+      hsl[2] = luminance(original) <= luminance(background)
+        ? Math.max(0,hsl[2]-shift)
+        : Math.min(1,hsl[2]+shift);
+      const candidate = hslToRgb(hsl);
+      return ratio(candidate,background)+1e-9 < currentRatio ? original : candidate;
+    }
+    function prepareImage(){
+      if (!wallImage.complete || !wallImage.naturalWidth || !wallImage.naturalHeight) return null;
+      if (imageSample && imageSample.src === wallImage.currentSrc) return imageSample;
+      const scale = Math.min(1,1024/wallImage.naturalWidth,1024/wallImage.naturalHeight);
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1,Math.round(wallImage.naturalWidth*scale));
+      canvas.height = Math.max(1,Math.round(wallImage.naturalHeight*scale));
+      const context = canvas.getContext('2d',{willReadFrequently:true});
+      try{
+        context.drawImage(wallImage,0,0,canvas.width,canvas.height);
+        imageSample = {src:wallImage.currentSrc,width:canvas.width,height:canvas.height,data:context.getImageData(0,0,canvas.width,canvas.height).data};
+      }catch(_error){ imageSample = null; }
+      return imageSample;
+    }
+    function clearHighlights(){
+      if (supportsHighlights){
+        highlightNames.forEach((name)=>CSS.highlights.delete(name));
+      }
+      highlightNames=[];
+      style.textContent='';
+    }
+    function run(){
+      frame=0;
+      if (!wall.classList.contains('is-open')) return;
+      const sampleImage=prepareImage();
+      if (!sampleImage) return;
+      const imageRect=wallImage.getBoundingClientRect(), wallRect=wall.getBoundingClientRect();
+      if (!imageRect.width || !imageRect.height || !wallRect.width || !wallRect.height) return;
+      const resolved=getComputedStyle(wall);
+      const alpha=clamp(Number.parseFloat(resolved.getPropertyValue('--message-overlay-surface-opacity'))||0,0,1);
+      const maximum=clamp(Number.parseFloat(resolved.getPropertyValue('--adaptive-max-lightness'))||0,0,.05);
+      const center=cssRgb('--message-overlay-center-rgb',[0,0,0]);
+      const edge=cssRgb('--message-overlay-edge-rgb',center);
+      const groups=new Map();
+
+      function pixelAt(clientX,clientY){
+        const inside=clientX>=imageRect.left && clientX<=imageRect.right && clientY>=imageRect.top && clientY<=imageRect.bottom;
+        let artwork=[14,14,18];
+        if (inside){
+          const px=clamp(Math.round(((clientX-imageRect.left)/imageRect.width)*(sampleImage.width-1)),0,sampleImage.width-1);
+          const py=clamp(Math.round(((clientY-imageRect.top)/imageRect.height)*(sampleImage.height-1)),0,sampleImage.height-1);
+          const offset=((py*sampleImage.width)+px)*4;
+          artwork=[sampleImage.data[offset],sampleImage.data[offset+1],sampleImage.data[offset+2]];
+        }
+        if (alpha<=0) return artwork;
+        const nx=clamp((clientX-wallRect.left)/wallRect.width,0,1),ny=clamp((clientY-wallRect.top)/wallRect.height,0,1);
+        const distance=Math.min(1,Math.hypot(nx-.5,ny-.43)/.76);
+        const surface=center.map((value,index)=>value+((edge[index]-value)*distance));
+        return artwork.map((value,index)=>Math.round(value+((surface[index]-value)*alpha)));
+      }
+      function localBackground(rect){
+        const expandX=Math.max(2,rect.width*.15),expandY=Math.max(2,rect.height*.10),samples=[];
+        for(let row=0;row<5;row++) for(let column=0;column<5;column++){
+          const x=(rect.left-expandX)+((rect.width+(2*expandX))*(column/4));
+          const y=(rect.top-expandY)+((rect.height+(2*expandY))*(row/4));
+          const rgb=pixelAt(x,y); samples.push([luminance(rgb),rgb]);
+        }
+        samples.sort((a,b)=>a[0]-b[0]);
+        const middle=samples.slice(5,-5);
+        return [0,1,2].map((channel)=>Math.round(middle.reduce((sum,item)=>sum+item[1][channel],0)/middle.length));
+      }
+      function textBackgroundLayers(node){
+        const layers=[];
+        let element=node.parentElement;
+        while(element && element!==content.parentElement){
+          const color=parseColor(getComputedStyle(element).backgroundColor);
+          if (color[3]>0) layers.push(color);
+          if (element===content) break;
+          element=element.parentElement;
+        }
+        return layers.reverse();
+      }
+      function compositeLayers(background,layers){
+        return layers.reduce((current,layer)=>current.map(
+          (value,index)=>Math.round(value+((layer[index]-value)*clamp(layer[3],0,1)))
+        ),background);
+      }
+      if (!supportsHighlights){
+        for(const glyph of fallbackGlyphs){
+          const rect=glyph.getBoundingClientRect();
+          if (!rect.width || !rect.height || rect.bottom<wallRect.top || rect.top>wallRect.bottom) continue;
+          const intended=parseColor(glyph.dataset.intendedColor);
+          const background=compositeLayers(
+            localBackground(rect),
+            textBackgroundLayers(glyph),
+          );
+          const adjusted=adjustedColor(intended,background,maximum);
+          glyph.style.color=`rgba(${adjusted[0]},${adjusted[1]},${adjusted[2]},${intended[3]})`;
+        }
+        return;
+      }
+      for(const node of textNodes){
+        const text=node.nodeValue||'';
+        const intended=parseColor(getComputedStyle(node.parentElement).color);
+        const formatBackgrounds=textBackgroundLayers(node);
+        const parts=graphemeParts(text);
+        for(let partIndex=0;partIndex<parts.length;partIndex++){
+          const character=parts[partIndex][0],start=parts[partIndex][1];
+          if (!character.trim()) continue;
+          const end=start+character.length, range=document.createRange();
+          range.setStart(node,start); range.setEnd(node,end);
+          const rect=range.getBoundingClientRect();
+          if (!rect.width || !rect.height || rect.bottom<wallRect.top || rect.top>wallRect.bottom) continue;
+          const background=compositeLayers(localBackground(rect),formatBackgrounds);
+          const adjusted=adjustedColor(intended,background,maximum);
+          if (adjusted[0]===intended[0] && adjusted[1]===intended[1] && adjusted[2]===intended[2]) continue;
+          const color=`rgba(${adjusted[0]},${adjusted[1]},${adjusted[2]},${intended[3]})`;
+          if (!groups.has(color)) groups.set(color,[]);
+          groups.get(color).push(range);
+        }
+      }
+      clearHighlights();
+      const rules=[];
+      let index=0;
+      for(const [color,ranges] of groups){
+        const name=`lettersmith-amc-${index++}`;
+        CSS.highlights.set(name,new Highlight(...ranges));
+        highlightNames.push(name);
+        rules.push(`.text-wall-content::highlight(${name}){color:${color}}`);
+      }
+      style.textContent=rules.join('\n');
+    }
+    function schedule(){
+      if (frame) cancelAnimationFrame(frame);
+      frame=requestAnimationFrame(run);
+    }
+    wall.addEventListener('scroll',schedule,{passive:true});
+    window.addEventListener('resize',schedule,{passive:true});
+    wallImage.addEventListener('load',()=>{ imageSample=null; schedule(); });
+    return {schedule};
+  }
+
+  const adaptiveMicroContrast = installAdaptiveMicroContrast();
 
   function installUltralinks(){
     const content = document.getElementById('textWallContent');
@@ -683,7 +927,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function imageFrameDuration(state, frameIndex){
     const value = Number(state.config.durations_ms?.[frameIndex]);
-    return Number.isFinite(value) && value > 0 ? value : 100;
+    const authoredDuration = Number.isFinite(value) && value > 0 ? value : 100;
+    const requestedSpeed = Number(state.config.speed_percent);
+    const speedPercent = Number.isFinite(requestedSpeed)
+      ? Math.min(400, Math.max(25, requestedSpeed))
+      : 100;
+    return Math.max(1, Math.round(authoredDuration * 100 / speedPercent));
   }
 
   function scheduleImageAnimation(state, delayMs, callback){
@@ -765,6 +1014,11 @@ document.addEventListener('DOMContentLoaded', () => {
     cancelImageAnimation(slideIndex);
     const image = slideImageEl(slides[slideIndex]);
     if (!image) return;
+    if (config.animation_enabled === false){
+      if (config.render_mode === 'native_gif') image.src = config.preview_source;
+      else if (config.frames[0]) image.src = config.frames[0];
+      return;
+    }
     const state = {
       cancelled: false,
       timer: null,
@@ -832,6 +1086,10 @@ document.addEventListener('DOMContentLoaded', () => {
     closeText.classList.toggle('is-visible', open);
     setHiddenState(closeText, !open);
     setExpandedState(openText, open);
+    if (open){
+      adaptiveMicroContrast.schedule();
+      setTimeout(()=>adaptiveMicroContrast.schedule(),motion.duration.overlay+24);
+    }
   }
   function hideWallDuringRevealDelay(){
     wall.classList.remove('is-open');

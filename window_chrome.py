@@ -1,15 +1,265 @@
 from __future__ import annotations
 
+import sys
 from typing import Callable, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
+from ui_theme import MAXIMIZE_THEME_ASSET, RESTORE_THEME_ASSET_CANDIDATES
 
 
 MINIMIZE_SYMBOL = "\u2212"
 MAXIMIZE_SYMBOL = "\u25a1"
 RESTORE_SYMBOL = "\u2750"
 CLOSE_SYMBOL = "\u00d7"
+TITLE_BAR_CONTROL_PX = 40
+TITLE_BAR_ICON_PX = 36
+FRAME_RESIZE_MARGIN_PX = 8
+
+_WM_NCHITTEST = 0x0084
+_HTMAXBUTTON = 9
+_HTLEFT = 10
+_HTRIGHT = 11
+_HTTOP = 12
+_HTTOPLEFT = 13
+_HTTOPRIGHT = 14
+_HTBOTTOM = 15
+_HTBOTTOMLEFT = 16
+_HTBOTTOMRIGHT = 17
+
+
+def resize_edges_at_point(
+    size: QtCore.QSize,
+    point: QtCore.QPoint,
+    margin: int = FRAME_RESIZE_MARGIN_PX,
+) -> Qt.Edge:
+    """Return the adjacent window edges represented by a local point."""
+    width = max(0, int(size.width()))
+    height = max(0, int(size.height()))
+    x = int(point.x())
+    y = int(point.y())
+    margin = max(1, int(margin))
+    if not (0 <= x < width and 0 <= y < height):
+        return Qt.Edge(0)
+
+    edges = Qt.Edge(0)
+    if x < margin:
+        edges |= Qt.LeftEdge
+    elif x >= width - margin:
+        edges |= Qt.RightEdge
+    if y < margin:
+        edges |= Qt.TopEdge
+    elif y >= height - margin:
+        edges |= Qt.BottomEdge
+    return edges
+
+
+def _cursor_for_edges(edges: Qt.Edge) -> Qt.CursorShape:
+    if edges in (
+        Qt.TopEdge | Qt.LeftEdge,
+        Qt.BottomEdge | Qt.RightEdge,
+    ):
+        return Qt.SizeFDiagCursor
+    if edges in (
+        Qt.TopEdge | Qt.RightEdge,
+        Qt.BottomEdge | Qt.LeftEdge,
+    ):
+        return Qt.SizeBDiagCursor
+    if edges & (Qt.LeftEdge | Qt.RightEdge):
+        return Qt.SizeHorCursor
+    return Qt.SizeVerCursor
+
+
+def native_resize_hit_test(edges: Qt.Edge) -> int:
+    """Translate Qt resize edges into the corresponding Windows hit-test."""
+    return {
+        Qt.LeftEdge: _HTLEFT,
+        Qt.RightEdge: _HTRIGHT,
+        Qt.TopEdge: _HTTOP,
+        Qt.TopEdge | Qt.LeftEdge: _HTTOPLEFT,
+        Qt.TopEdge | Qt.RightEdge: _HTTOPRIGHT,
+        Qt.BottomEdge: _HTBOTTOM,
+        Qt.BottomEdge | Qt.LeftEdge: _HTBOTTOMLEFT,
+        Qt.BottomEdge | Qt.RightEdge: _HTBOTTOMRIGHT,
+    }.get(edges, 0)
+
+
+class FramelessWindowController(QtCore.QObject):
+    """Give a custom-framed QWidget native move, resize, and Snap behavior."""
+
+    def __init__(
+        self,
+        window: QtWidgets.QWidget,
+        maximize_button: Optional[QtWidgets.QWidget] = None,
+        *,
+        resize_margin: int = FRAME_RESIZE_MARGIN_PX,
+    ) -> None:
+        super().__init__(window)
+        self._window = window
+        self._maximize_button = maximize_button
+        self._resize_margin = max(1, int(resize_margin))
+        self._cursor_target: Optional[QtWidgets.QWidget] = None
+        self._cursor_was_explicit = False
+        self._cursor_before_resize = QtGui.QCursor()
+
+        application = QtWidgets.QApplication.instance()
+        if application is not None:
+            application.installEventFilter(self)
+        self._enable_mouse_tracking(window)
+
+    def _enable_mouse_tracking(self, widget: QtWidgets.QWidget) -> None:
+        widget.setMouseTracking(True)
+        for child in widget.findChildren(QtWidgets.QWidget):
+            child.setMouseTracking(True)
+
+    def start_system_move(self) -> bool:
+        handle = self._window.windowHandle()
+        return bool(handle is not None and handle.startSystemMove())
+
+    def start_system_resize(self, edges: Qt.Edge) -> bool:
+        if not edges or self._window.isMaximized() or self._window.isFullScreen():
+            return False
+        handle = self._window.windowHandle()
+        return bool(handle is not None and handle.startSystemResize(edges))
+
+    def _restore_cursor(self) -> None:
+        target = self._cursor_target
+        self._cursor_target = None
+        if target is None:
+            return
+        try:
+            if self._cursor_was_explicit:
+                target.setCursor(self._cursor_before_resize)
+            else:
+                target.unsetCursor()
+        except RuntimeError:
+            pass
+
+    def _show_resize_cursor(
+        self,
+        target: QtWidgets.QWidget,
+        edges: Qt.Edge,
+    ) -> None:
+        if self._cursor_target is not target:
+            self._restore_cursor()
+            self._cursor_target = target
+            self._cursor_was_explicit = target.testAttribute(Qt.WA_SetCursor)
+            self._cursor_before_resize = QtGui.QCursor(target.cursor())
+        target.setCursor(_cursor_for_edges(edges))
+
+    def _event_edges(self, event: QtGui.QMouseEvent) -> Qt.Edge:
+        global_point = event.globalPosition().toPoint()
+        local_point = self._window.mapFromGlobal(global_point)
+        return resize_edges_at_point(
+            self._window.size(),
+            local_point,
+            self._resize_margin,
+        )
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if isinstance(watched, QtWidgets.QWidget):
+            if event.type() == QtCore.QEvent.ChildAdded:
+                child = event.child()
+                if (
+                    isinstance(child, QtWidgets.QWidget)
+                    and child.window() is self._window
+                ):
+                    self._enable_mouse_tracking(child)
+
+            if watched.window() is self._window:
+                if event.type() == QtCore.QEvent.MouseMove:
+                    edges = self._event_edges(event)
+                    if (
+                        edges
+                        and not self._window.isMaximized()
+                        and not self._window.isFullScreen()
+                    ):
+                        self._show_resize_cursor(watched, edges)
+                    else:
+                        self._restore_cursor()
+                elif event.type() == QtCore.QEvent.MouseButtonPress:
+                    if event.button() == Qt.LeftButton:
+                        edges = self._event_edges(event)
+                        if self.start_system_resize(edges):
+                            self._restore_cursor()
+                            event.accept()
+                            return True
+                elif event.type() in (
+                    QtCore.QEvent.Hide,
+                    QtCore.QEvent.WindowStateChange,
+                ):
+                    self._restore_cursor()
+        return super().eventFilter(watched, event)
+
+    def native_event(self, event_type: object, message: object) -> tuple[bool, int]:
+        """Expose native resize borders and an optional Windows Snap target."""
+        if sys.platform != "win32" or bytes(event_type) != b"windows_generic_MSG":
+            return False, 0
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            native_message = wintypes.MSG.from_address(int(message))
+            if int(native_message.message) != _WM_NCHITTEST:
+                return False, 0
+            if int(native_message.hWnd or 0) != int(self._window.winId()):
+                return False, 0
+
+            packed_position = int(native_message.lParam)
+            screen_point = wintypes.POINT(
+                ctypes.c_short(packed_position & 0xFFFF).value,
+                ctypes.c_short((packed_position >> 16) & 0xFFFF).value,
+            )
+            ctypes.windll.user32.MapWindowPoints(
+                None,
+                native_message.hWnd,
+                ctypes.byref(screen_point),
+                1,
+            )
+            scale = max(1.0, float(self._window.devicePixelRatioF()))
+            local_point = QtCore.QPoint(
+                round(screen_point.x / scale),
+                round(screen_point.y / scale),
+            )
+            if not self._window.isMaximized() and not self._window.isFullScreen():
+                resize_hit = native_resize_hit_test(
+                    resize_edges_at_point(
+                        self._window.size(),
+                        local_point,
+                        self._resize_margin,
+                    )
+                )
+                if resize_hit:
+                    return True, resize_hit
+
+            button = self._maximize_button
+            if button is not None and button.isVisible() and button.isEnabled():
+                button_top_left = button.mapTo(self._window, QtCore.QPoint())
+                button_rect = QtCore.QRect(button_top_left, button.size())
+                if button_rect.contains(local_point):
+                    return True, _HTMAXBUTTON
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False, 0
+        return False, 0
+
+
+def _theme_rgba(color: object, alpha: int) -> str:
+    value = QtGui.QColor(str(color or ""))
+    if not value.isValid():
+        value = QtGui.QColor("#7f9099")
+    return f"rgba({value.red()},{value.green()},{value.blue()},{alpha})"
+
+
+def _service_font_family(service: object) -> str:
+    family = getattr(service, "app_font_family", "Segoe UI")
+    if callable(family):
+        family = family()
+    return str(family or "Segoe UI").strip() or "Segoe UI"
+
+
+def _qss_font_family(family: object) -> str:
+    return str(family or "Segoe UI").replace("\\", "\\\\").replace("'", "\\'")
 
 
 class StandardTitleBar(QtWidgets.QFrame):
@@ -23,6 +273,9 @@ class StandardTitleBar(QtWidgets.QFrame):
         on_minimize: Optional[Callable[[], None]] = None,
         on_toggle_maximize: Optional[Callable[[], None]] = None,
         is_maximized: Optional[Callable[[], bool]] = None,
+        close_icon_asset: str = "titlebar/close.png",
+        close_fallback_symbol: str = CLOSE_SYMBOL,
+        close_danger: bool = True,
     ) -> None:
         super().__init__(window)
         self._window = window
@@ -30,22 +283,23 @@ class StandardTitleBar(QtWidgets.QFrame):
         self._on_minimize = on_minimize or window.showMinimized
         self._on_toggle_maximize = on_toggle_maximize
         self._is_maximized = is_maximized or (lambda: False)
-        self._drag_offset: Optional[QtCore.QPoint] = None
+        self._close_icon_asset = str(close_icon_asset)
+        self._theme_service: object | None = None
 
         self.setObjectName("standardTitleBar")
-        self.setFixedHeight(40)
+        self.setFixedHeight(TITLE_BAR_CONTROL_PX + 8)
 
         self._layout = QtWidgets.QHBoxLayout(self)
-        self._layout.setContentsMargins(6, 0, 6, 0)
-        self._layout.setSpacing(8)
+        self._layout.setContentsMargins(8, 0, 8, 0)
+        self._layout.setSpacing(6)
 
         self.icon_label = QtWidgets.QLabel(self)
         self.icon_label.setObjectName("windowIconLabel")
-        self.icon_label.setFixedSize(30, 30)
+        self.icon_label.setFixedSize(TITLE_BAR_CONTROL_PX, TITLE_BAR_CONTROL_PX)
         self.icon_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         icon = window.windowIcon()
         if not icon.isNull():
-            self.icon_label.setPixmap(icon.pixmap(28, 28))
+            self.icon_label.setPixmap(icon.pixmap(TITLE_BAR_ICON_PX, TITLE_BAR_ICON_PX))
             self._layout.addWidget(self.icon_label)
 
         self.title_label = QtWidgets.QLabel(title, self)
@@ -84,64 +338,26 @@ class StandardTitleBar(QtWidgets.QFrame):
         self._controls_layout.addWidget(self.btn_maximize)
 
         self.btn_close = self._make_button(
-            CLOSE_SYMBOL,
+            close_fallback_symbol,
             "Close",
-            "windowCloseButton",
+            "windowCloseButton" if close_danger else "windowControlButton",
             self._handle_close,
         )
         self._controls_layout.addWidget(self.btn_close)
 
-        self.setStyleSheet(
-            """
-            QFrame#standardTitleBar {
-                background: transparent;
-            }
-            QLabel#windowTitleLabel {
-                color: #eef4ff;
-                font-family: 'Segoe UI Semibold';
-                font-size: 14px;
-                font-weight: 700;
-                letter-spacing: 0.2px;
-            }
-            QPushButton#windowControlButton,
-            QPushButton#windowCloseButton,
-            QPushButton#windowHelpButton {
-                min-width: 30px;
-                max-width: 30px;
-                min-height: 30px;
-                max-height: 30px;
-                padding: 0;
-                border-radius: 7px;
-                border: 1px solid transparent;
-                background: transparent;
-                color: #d7dee8;
-                font-family: 'Segoe UI Symbol';
-                font-size: 14px;
-                font-weight: 600;
-            }
-            QPushButton#windowControlButton:hover {
-                background: rgba(60, 85, 120, 0.24);
-                border-color: rgba(109, 131, 163, 0.34);
-                color: #ffffff;
-            }
-            QPushButton#windowHelpButton {
-                border-radius: 15px;
-                border-color: rgba(109, 131, 163, 0.28);
-                background: rgba(24, 28, 35, 0.92);
-                font-family: 'Segoe UI Semibold';
-                font-size: 15px;
-            }
-            QPushButton#windowHelpButton:hover {
-                background: rgba(60, 85, 120, 0.24);
-                border-color: rgba(109, 131, 163, 0.42);
-                color: #ffffff;
-            }
-            QPushButton#windowCloseButton:hover {
-                background: rgba(255, 59, 48, 0.18);
-                border-color: rgba(255, 59, 48, 0.34);
-                color: #ffffff;
-            }
-            """
+        self._apply_style(
+            title_color="#7f9099",
+            muted_color="#68747a",
+            highlight_color="#f1f3f4",
+            accent_color="#7f9099",
+            error_color="#d85c6a",
+            pressed_color="#f2fbff",
+            font_family="Segoe UI",
+        )
+        window.installEventFilter(self)
+        self.window_controller = FramelessWindowController(
+            window,
+            self.btn_maximize,
         )
         self.sync_window_state()
 
@@ -155,9 +371,93 @@ class StandardTitleBar(QtWidgets.QFrame):
         button = QtWidgets.QPushButton(text, self)
         button.setObjectName(object_name)
         button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
         button.setCursor(Qt.PointingHandCursor)
+        button.setFixedSize(TITLE_BAR_CONTROL_PX, TITLE_BAR_CONTROL_PX)
+        button.setIconSize(QtCore.QSize(TITLE_BAR_ICON_PX, TITLE_BAR_ICON_PX))
+        button.setProperty("fallbackSymbol", text)
+        symbol_font = QtGui.QFont("Segoe UI Symbol", 15)
+        symbol_font.setBold(False)
+        button.setFont(symbol_font)
         button.clicked.connect(slot)
         return button
+
+    def _apply_style(
+        self,
+        *,
+        title_color: str,
+        muted_color: str,
+        highlight_color: str,
+        accent_color: str,
+        error_color: str,
+        pressed_color: str,
+        font_family: str,
+    ) -> None:
+        family = _qss_font_family(font_family)
+        self.setStyleSheet(
+            "QFrame#standardTitleBar{background:transparent;}"
+            "QLabel#windowTitleLabel{"
+            f"color:{title_color};background:transparent;"
+            f"font-family:'{family}';font-size:16px;font-weight:700;"
+            "letter-spacing:1px;}"
+            "QPushButton#windowControlButton,"
+            "QPushButton#windowCloseButton,"
+            "QPushButton#windowHelpButton{"
+            f"color:{muted_color};background:transparent;"
+            "border:none;padding:0;margin:0;}"
+            "QPushButton#windowControlButton:hover,"
+            "QPushButton#windowHelpButton:hover{"
+            f"color:{highlight_color};"
+            f"background:{_theme_rgba(accent_color, 38)};}}"
+            "QPushButton#windowCloseButton:hover{"
+            f"color:{highlight_color};"
+            f"background:{_theme_rgba(error_color, 77)};}}"
+            "QPushButton#windowControlButton:pressed,"
+            "QPushButton#windowCloseButton:pressed,"
+            "QPushButton#windowHelpButton:pressed{"
+            f"background:{_theme_rgba(pressed_color, 31)};}}"
+        )
+
+    def apply_theme_assets(self, service: object) -> None:
+        """Apply the same title-bar artwork and semantic styling as Nexus."""
+        self._theme_service = service
+        tokens = getattr(service, "tokens", None)
+        self._apply_style(
+            title_color=str(getattr(tokens, "accent", "#7f9099")),
+            muted_color=str(getattr(tokens, "muted_text", "#68747a")),
+            highlight_color=str(getattr(tokens, "highlight", "#f1f3f4")),
+            accent_color=str(getattr(tokens, "accent", "#7f9099")),
+            error_color=str(getattr(tokens, "error", "#d85c6a")),
+            pressed_color=str(getattr(tokens, "text", "#f2fbff")),
+            font_family=_service_font_family(service),
+        )
+        for button, logical_name in (
+            (self.btn_minimize, "titlebar/minimize.png"),
+            (self.btn_maximize, "titlebar/maximize.png"),
+            (self.btn_close, self._close_icon_asset),
+        ):
+            self._apply_button_icon(button, logical_name)
+        self.sync_window_state()
+
+    def _apply_button_icon(
+        self,
+        button: QtWidgets.QPushButton,
+        logical_name: str,
+    ) -> None:
+        resolver = getattr(self._theme_service, "resolve_asset", None)
+        icon = QtGui.QIcon()
+        if callable(resolver):
+            try:
+                icon = QtGui.QIcon(str(resolver(logical_name)))
+            except (OSError, RuntimeError, TypeError, ValueError):
+                icon = QtGui.QIcon()
+        button.setIcon(QtGui.QIcon())
+        button.setText(str(button.property("fallbackSymbol") or ""))
+        if icon.isNull():
+            return
+        button.setText("")
+        button.setIcon(icon)
+        button.setIconSize(QtCore.QSize(TITLE_BAR_ICON_PX, TITLE_BAR_ICON_PX))
 
     def insert_control_button(
         self,
@@ -188,8 +488,24 @@ class StandardTitleBar(QtWidgets.QFrame):
         if not self.btn_maximize.isVisible():
             return
         maximized = bool(self._is_maximized())
-        self.btn_maximize.setText(RESTORE_SYMBOL if maximized else MAXIMIZE_SYMBOL)
+        if self._theme_service is not None and not self.btn_maximize.icon().isNull():
+            resolver = getattr(self._theme_service, "resolve_first_asset", None)
+            if callable(resolver):
+                candidates = (
+                    RESTORE_THEME_ASSET_CANDIDATES
+                    if maximized
+                    else (MAXIMIZE_THEME_ASSET,)
+                )
+                icon = QtGui.QIcon(str(resolver(candidates)))
+                if not icon.isNull():
+                    self.btn_maximize.setIcon(icon)
+                    self.btn_maximize.setText("")
+        if self.btn_maximize.icon().isNull():
+            self.btn_maximize.setText(RESTORE_SYMBOL if maximized else MAXIMIZE_SYMBOL)
         self.btn_maximize.setToolTip("Restore" if maximized else "Maximize")
+        self.btn_maximize.setAccessibleName(
+            "Restore window" if maximized else "Maximize window"
+        )
 
     def _handle_close(self) -> None:
         self._on_close()
@@ -203,26 +519,22 @@ class StandardTitleBar(QtWidgets.QFrame):
         self._on_toggle_maximize()
         self.sync_window_state()
 
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if watched is self._window and event.type() == QtCore.QEvent.WindowStateChange:
+            QtCore.QTimer.singleShot(0, self.sync_window_state)
+        return super().eventFilter(watched, event)
+
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == Qt.LeftButton:
-            self._drag_offset = event.globalPosition().toPoint() - self._window.frameGeometry().topLeft()
-            event.accept()
-            return
+            if self.window_controller.start_system_move():
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
-        if (
-            self._drag_offset is not None
-            and event.buttons() & Qt.LeftButton
-            and not bool(self._is_maximized())
-        ):
-            self._window.move(event.globalPosition().toPoint() - self._drag_offset)
-            event.accept()
-            return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
-        self._drag_offset = None
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:

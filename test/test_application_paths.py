@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from project_paths import ApplicationPaths, application_paths
+from transactional_io import set_path_hidden
 
 
 class ApplicationPathsTests(unittest.TestCase):
@@ -67,6 +69,111 @@ class ApplicationPathsTests(unittest.TestCase):
                 root / "gallery" / "user" / "sounds" / "appssong",
             )
             self.assertEqual(paths.temporary_root, root / "output")
+
+    def test_app_resources_follow_gallery_and_resources_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            gallery_icon = root / "gallery/app/icons/app.png"
+            gallery_icon.parent.mkdir(parents=True)
+            gallery_icon.write_bytes(b"gallery icon")
+            resource_icon = root / "resources/app/icons/app.png"
+            resource_icon.parent.mkdir(parents=True)
+            resource_icon.write_bytes(b"compatibility icon")
+            resource_font = root / "resources/app/fonts/app.ttf"
+            resource_font.parent.mkdir(parents=True)
+            resource_font.write_bytes(b"resource font")
+            gallery_font = root / "gallery/app/fonts/app.ttf"
+            gallery_font.parent.mkdir(parents=True)
+            gallery_font.write_bytes(b"compatibility font")
+
+            paths = ApplicationPaths.for_project(root)
+
+            self.assertEqual(paths.app_resource_path("icons/app.png"), gallery_icon)
+            self.assertEqual(paths.app_resource_path("fonts/app.ttf"), resource_font)
+
+    def test_installer_configuration_accepts_canonical_gallery_icon(self) -> None:
+        from release.build_installer import validate_installer_configuration
+
+        summary = validate_installer_configuration()
+        repository = Path(__file__).resolve().parents[1]
+
+        self.assertEqual(summary["name"], "LetterSmith-Setup-1.0.0.exe")
+        self.assertEqual(
+            Path(summary["payload"]),
+            (repository / "release" / "dist" / "LetterSmith").resolve(),
+        )
+
+    def test_release_rejects_foreign_icu_runtime_dlls(self) -> None:
+        from release.build_release import (
+            MANIFEST_PATH,
+            ReleaseValidationError,
+            _load_json,
+            _validate_distribution_sanitation,
+        )
+
+        manifest = _load_json(MANIFEST_PATH)
+        for name in ("icuuc.dll", "icudt78.dll"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                distribution = Path(directory)
+                (distribution / "LetterSmith.exe").write_bytes(b"executable")
+                internal = distribution / "_internal"
+                internal.mkdir()
+                (internal / name).write_bytes(b"foreign runtime")
+
+                with self.assertRaisesRegex(
+                    ReleaseValidationError,
+                    "Forbidden development or user-data file",
+                ):
+                    _validate_distribution_sanitation(distribution, manifest)
+
+    def test_release_build_uses_only_trusted_runtime_paths(self) -> None:
+        from release import build_release
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            python_root = root / "Python"
+            executable = python_root / "python.exe"
+            windows_root = root / "Windows"
+            foreign = root / "foreign" / "poppler"
+            for path in (
+                python_root / "DLLs",
+                python_root / "Scripts",
+                windows_root / "System32",
+                foreign,
+            ):
+                path.mkdir(parents=True)
+            executable.write_bytes(b"python")
+
+            with (
+                mock.patch.object(build_release.sys, "executable", str(executable)),
+                mock.patch.object(build_release.sys, "base_prefix", str(python_root)),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "PATH": str(foreign),
+                        "SystemRoot": str(windows_root),
+                        "LETTERSMITH_ENV_PROBE": "preserved",
+                    },
+                ),
+            ):
+                environment = build_release._pyinstaller_environment()
+
+            path_entries = {
+                Path(value).resolve()
+                for value in environment["PATH"].split(os.pathsep)
+            }
+            self.assertNotIn(foreign.resolve(), path_entries)
+            self.assertEqual(
+                path_entries,
+                {
+                    python_root.resolve(),
+                    (python_root / "DLLs").resolve(),
+                    (python_root / "Scripts").resolve(),
+                    (windows_root / "System32").resolve(),
+                    windows_root.resolve(),
+                },
+            )
+            self.assertEqual(environment["LETTERSMITH_ENV_PROBE"], "preserved")
 
     def test_frozen_runtime_uses_bundle_only_for_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -178,6 +285,7 @@ class ApplicationPathsTests(unittest.TestCase):
             )
             self.assertTrue((paths.prompt_writer_content_root / "type.txt").is_file())
             self.assertTrue((paths.custom_palette_root / "user_colors.json").is_file())
+            set_path_hidden(paths.settings_file, False)
             paths.settings_file.write_text('{"starting_volume": 77}', encoding="utf-8")
             paths.initialize(legacy)
             self.assertEqual(

@@ -8,26 +8,26 @@ from typing import Mapping
 
 from config import APP_BANNER_PATH, USER_CONTROLS_DIR, USER_PAGES_DIR
 from curtain_color import (
-    FALLBACK_CURTAIN_RGB,
     RGB,
+    curtain_display_palette,
     curtain_variant_rgbs,
     write_recolored_banner_image,
     write_tinted_curtain_image,
 )
 from project_paths import application_paths
+from settings_store import (
+    CURTAIN_STYLE_OPTIONS,
+    CURTAIN_STYLE_WHITE,
+    normalize_curtain_style,
+)
 from transactional_io import PathTransaction, atomic_write_json
 
 
-CURTAIN_CACHE_SCHEMA_VERSION = 2
-CURTAIN_DYNAMIC_STYLES = (
-    "average_color",
-    "complementary_average_color",
-    "normal_light",
-    "complementary_light",
-    "normal_dark",
-    "complementary_dark",
+CURTAIN_CACHE_SCHEMA_VERSION = 4
+CURTAIN_CACHE_STYLES = tuple(style for style, _label in CURTAIN_STYLE_OPTIONS)
+CURTAIN_DYNAMIC_STYLES = tuple(
+    style for style in CURTAIN_CACHE_STYLES if style != CURTAIN_STYLE_WHITE
 )
-CURTAIN_CACHE_STYLES = ("pure_white", *CURTAIN_DYNAMIC_STYLES)
 CURTAIN_CACHE_FILES = (
     "cleft.png",
     "cright.png",
@@ -44,7 +44,7 @@ class CurtainVariantCache:
     colors: Mapping[str, RGB]
 
     def style_directory(self, style: str) -> Path | None:
-        normalized = str(style or "").strip()
+        normalized = normalize_curtain_style(style)
         if normalized not in CURTAIN_CACHE_STYLES:
             return None
         directory = self.directory / normalized
@@ -116,12 +116,16 @@ def prepare_curtain_variant_cache(
         cover = root / USER_PAGES_DIR / "cover.png"
         controls = root / USER_CONTROLS_DIR
         banner = paths.resource_path(APP_BANNER_PATH)
-        colors = curtain_variant_rgbs(cover)
+        palette = curtain_display_palette(curtain_variant_rgbs(cover))
+        colors = {
+            style: display.background
+            for style, display in palette.items()
+        }
 
         for style in CURTAIN_CACHE_STYLES:
             style_directory = staging / style
             style_directory.mkdir(parents=True, exist_ok=True)
-            rgb = colors.get(style, FALLBACK_CURTAIN_RGB)
+            rgb = colors[style]
             for filename in ("cleft.png", "cright.png"):
                 write_tinted_curtain_image(
                     controls / filename,
@@ -140,7 +144,7 @@ def prepare_curtain_variant_cache(
                 "schema_version": CURTAIN_CACHE_SCHEMA_VERSION,
                 "source_fingerprint": fingerprint,
                 "colors": {
-                    style: list(colors.get(style, FALLBACK_CURTAIN_RGB))
+                    style: list(colors[style])
                     for style in CURTAIN_CACHE_STYLES
                 },
             },

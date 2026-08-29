@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from button_artwork import application_resource_names
 
 
 PROJECT_ROOT = Path.cwd().resolve()
@@ -13,10 +14,11 @@ MANIFEST = json.loads(
 )
 
 datas = []
-app_root = PROJECT_ROOT / "resources" / "app"
+app_relative_root = Path(MANIFEST["application_resources_root"])
+app_root = PROJECT_ROOT / app_relative_root
 for relative_dir, names in MANIFEST["application_resources"].items():
-    destination = str(Path("resources/app") / relative_dir)
-    for name in names:
+    destination = str(app_relative_root / relative_dir)
+    for name in application_resource_names(app_root, relative_dir, names):
         datas.append((str(app_root / relative_dir / name), destination))
 
 prompt_root = PROJECT_ROOT / "resources" / "prompt_writer"
@@ -45,11 +47,24 @@ a = Analysis(
     hiddenimports=MANIFEST["hidden_imports"] + collect_submodules("keyring.backends"),
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(RELEASE_ROOT / "qt_runtime_hook.py")],
     excludes=MANIFEST["excluded_modules"],
     noarchive=False,
     optimize=1,
 )
+
+# PyInstaller searches the inherited PATH for dependent DLLs. Apply the
+# distribution denylist here so unrelated native runtimes cannot shadow the
+# Windows DLLs that Qt expects at startup.
+forbidden_binary_names = {
+    name.casefold()
+    for name in MANIFEST["release_sanitation"]["distribution_forbidden_file_names"]
+}
+a.binaries = [
+    entry
+    for entry in a.binaries
+    if Path(entry[0]).name.casefold() not in forbidden_binary_names
+]
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -68,7 +83,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(PROJECT_ROOT / "resources/app/icons/folder/lsmith.ico"),
+    icon=str(PROJECT_ROOT / "gallery/app/icons/folder/lsmith.ico"),
     version=str(RELEASE_ROOT / "version_info.txt"),
     uac_admin=False,
     uac_uiaccess=False,

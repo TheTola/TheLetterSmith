@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import shutil
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -11,6 +10,7 @@ from typing import Optional
 
 from message_html import extract_font_families, rewrite_font_families
 from project_paths import application_paths
+from transactional_io import atomic_copy_file
 
 
 FONT_EXPORT_EXTENSIONS = {".ttf", ".otf", ".woff", ".woff2"}
@@ -290,10 +290,15 @@ def _font_face_format(path: Path) -> str:
 
 
 def _atomic_copy_file(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    shutil.copy2(source, temporary)
-    os.replace(temporary, destination)
+    atomic_copy_file(source, destination)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _clean_exported_fonts(fonts_dir: Path) -> None:
@@ -307,6 +312,8 @@ def build_embedded_font_payload(
     project_root: Path,
     message_html: str,
     fonts_dir: Path,
+    *,
+    reuse_fonts_dir: Path | None = None,
 ) -> FontExportResult:
     families = extract_font_families(message_html)
     inspections = [inspect_font_family(Path(project_root), family) for family in families]
@@ -335,12 +342,33 @@ def build_embedded_font_payload(
         alias = f"LetterSmithFont{family_index}"
         aliases[inspection.family] = alias
         for face_index, face in enumerate(inspection.faces, start=1):
-            digest = hashlib.sha256(face.source_path.read_bytes()).hexdigest()[:12]
+            source_digest = _file_sha256(face.source_path)
+            digest = source_digest[:12]
             output_name = (
                 f"ls-font-{family_index}-{face_index}-{digest}"
                 f"{face.source_path.suffix.casefold()}"
             )
-            _atomic_copy_file(face.source_path, Path(fonts_dir) / output_name)
+            destination = Path(fonts_dir) / output_name
+            reusable = (
+                Path(reuse_fonts_dir) / output_name
+                if reuse_fonts_dir is not None
+                else None
+            )
+            if (
+                reusable is not None
+                and not reusable.is_symlink()
+                and reusable.is_file()
+                and reusable.stat().st_size == face.source_path.stat().st_size
+                and _file_sha256(reusable) == source_digest
+            ):
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.unlink(missing_ok=True)
+                try:
+                    os.link(reusable, destination)
+                except OSError:
+                    _atomic_copy_file(reusable, destination)
+            else:
+                _atomic_copy_file(face.source_path, destination)
             copied_files.append(output_name)
             css_rules.append(
                 "@font-face{"

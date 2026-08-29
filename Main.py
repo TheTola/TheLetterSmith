@@ -40,6 +40,7 @@ from project_paths import (
     application_paths,
     configure_application_paths,
 )
+from performance_trace import PerformanceTimer
 
 
 # =============================================================================
@@ -581,6 +582,43 @@ def connect_shutdown_handler(
 # Main
 # =============================================================================
 
+def _resolve_startup_choices(
+    root: Path,
+    *,
+    force_theme_prompt: bool,
+) -> tuple[str, str]:
+    from publishing.github_ui import prompt_for_github_startup
+    from startup_theme import ensure_startup_theme_preference
+
+    github_action = prompt_for_github_startup()
+    startup_theme = ensure_startup_theme_preference(
+        root,
+        force_prompt=force_theme_prompt,
+    )
+    return github_action, startup_theme
+
+
+def _upgrade_saved_letters_at_startup(project_root: Path) -> None:
+    """Convert pre-release saved letters before the strict catalog opens."""
+    try:
+        from tools.upgrade_saved_letters import upgrade_saved_letter_library
+
+        migrated, skipped = upgrade_saved_letter_library(project_root)
+    except Exception:
+        logging.exception("[Boot] Saved-letter schema upgrade failed.")
+        return
+    if migrated:
+        logging.info(
+            "[Boot] Upgraded %d saved letter(s) to the current schema.",
+            migrated,
+        )
+    if skipped:
+        logging.warning(
+            "[Boot] Skipped %d incomplete or malformed saved letter(s).",
+            skipped,
+        )
+
+
 def main() -> None:
     """
     Launch Letter Smith.
@@ -640,10 +678,39 @@ def main() -> None:
         icon
     )
 
+    from ui_fonts import load_application_fonts
+
+    load_application_fonts(root)
+
     install_exception_hook(
         APP_NAME,
         paths.logs_root / LOG_FILE_NAME,
     )
+
+    _upgrade_saved_letters_at_startup(root)
+
+    # GitHub connection is resolved before the theme prompt. Stored secure
+    # credentials bypass the modal; disconnected users must connect or cancel.
+    try:
+        from config import FORCE_THEME_FAMILY_PROMPT
+
+        _github_startup_action, startup_theme = _resolve_startup_choices(
+            root,
+            force_theme_prompt=FORCE_THEME_FAMILY_PROMPT,
+        )
+    except Exception as error:
+        logging.exception("[Boot] Startup setup failed.")
+        _show_critical(
+            f"{APP_NAME} — Startup Error",
+            f"Startup setup could not be completed: {error}",
+        )
+        raise
+    if not startup_theme:
+        logging.info("[Boot] Startup theme selection was canceled.")
+        logging.shutdown()
+        return
+
+    nexus_startup_timer = PerformanceTimer("startup.nexus_visible")
 
     # Import Nexus only after logging and Qt have been initialized.
     try:
@@ -702,6 +769,11 @@ def main() -> None:
         raise
 
     window.show()
+    nexus_startup_timer.finish(
+        project_ready=bool(
+            getattr(getattr(window, "project_state", None), "is_project_ready", False)
+        )
+    )
 
     connect_shutdown_handler(
         application,

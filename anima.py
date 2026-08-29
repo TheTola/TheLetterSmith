@@ -595,7 +595,26 @@ class _HoverGlowFilter(QtCore.QObject):
         self._alpha_hover = int(alpha_hover)
         self._blur = int(blur)
 
-    def _ensure_effect(self, w: QtWidgets.QWidget) -> Optional[QtWidgets.QGraphicsDropShadowEffect]:
+    def set_color(self, color: QtGui.QColor, root: QtWidgets.QWidget) -> None:
+        """Apply a new glow color to current and future button effects."""
+        candidate = QtGui.QColor(color)
+        if not candidate.isValid():
+            return
+        self._color = candidate
+        for button in root.findChildren(QtWidgets.QAbstractButton):
+            effect = button.graphicsEffect()
+            if (
+                isinstance(effect, QtWidgets.QGraphicsDropShadowEffect)
+                and bool(button.property("anima._hover_glow_installed"))
+            ):
+                self._set_alpha(effect, effect.color().alpha())
+
+    def _ensure_effect(
+        self,
+        w: QtWidgets.QWidget,
+        *,
+        initial_alpha: int | None = None,
+    ) -> Optional[QtWidgets.QGraphicsDropShadowEffect]:
         if w.graphicsEffect() is not None:
             return None
 
@@ -603,14 +622,18 @@ class _HoverGlowFilter(QtCore.QObject):
         eff.setOffset(0, 0)
         eff.setBlurRadius(self._blur)
         c = QtGui.QColor(self._color)
-        c.setAlpha(self._alpha_rest)
+        c.setAlpha(
+            self._alpha_rest
+            if initial_alpha is None
+            else int(initial_alpha)
+        )
         eff.setColor(c)
         w.setGraphicsEffect(eff)
         w.setProperty("anima._hover_glow_installed", True)
         return eff
 
     def _set_alpha(self, eff: QtWidgets.QGraphicsDropShadowEffect, alpha: int) -> None:
-        c = QtGui.QColor(eff.color())
+        c = QtGui.QColor(self._color)
         c.setAlpha(int(alpha))
         eff.setColor(c)
 
@@ -1231,13 +1254,31 @@ def install_click_fx(root: QtWidgets.QWidget, *, include_toolbuttons: bool = Tru
     - Stores strong references on `root` so filters won't get GC'd.
     """
 
+    def _theme_glow_color() -> QtGui.QColor:
+        service = getattr(root, "theme_service", None)
+        tokens = getattr(service, "tokens", None)
+        candidate = QtGui.QColor(str(getattr(tokens, "accent", "")))
+        return (
+            candidate
+            if candidate.isValid()
+            else QtGui.QColor(FX.HOVER_GLOW_COLOR)
+        )
+
     press = ButtonPulseFilter()
     glow = _HoverGlowFilter(
-        color=FX.HOVER_GLOW_COLOR,
+        color=_theme_glow_color(),
         alpha_rest=FX.HOVER_GLOW_ALPHA_REST,
         alpha_hover=FX.HOVER_GLOW_ALPHA_HOVER,
         blur=FX.HOVER_GLOW_BLUR,
     )
+
+    def _refresh_theme_glow(*_args: Any) -> None:
+        glow.set_color(_theme_glow_color(), root)
+
+    theme_service = getattr(root, "theme_service", None)
+    theme_changed = getattr(theme_service, "theme_changed", None)
+    if theme_changed is not None and hasattr(theme_changed, "connect"):
+        theme_changed.connect(_refresh_theme_glow)
 
     def _should_wire(btn: QtWidgets.QAbstractButton) -> bool:
         if not include_toolbuttons and isinstance(btn, QtWidgets.QToolButton):
@@ -1257,6 +1298,10 @@ def install_click_fx(root: QtWidgets.QWidget, *, include_toolbuttons: bool = Tru
             return
         btn.installEventFilter(press)
         btn.installEventFilter(glow)
+        if not bool(btn.property("anima.NoHoverGlow")):
+            # Install the transparent effect before the first interaction so
+            # Qt does not expand the painted frame on the first hover/click.
+            glow._ensure_effect(btn, initial_alpha=0)
         btn.setProperty("anima.fxInstalled", True)
         _dbg(f"[anima] wired button: {btn.__class__.__name__} {btn.objectName()!r}")
 
@@ -1309,6 +1354,7 @@ def install_click_fx(root: QtWidgets.QWidget, *, include_toolbuttons: bool = Tru
     setattr(root, "_anima_press_filter", press)
     setattr(root, "_anima_glow_filter", glow)
     setattr(root, "_anima_tree_filter", tree)
+    setattr(root, "_anima_theme_glow_refresh", _refresh_theme_glow)
 
     # Install watcher broadly (root + all widget containers)
     _ensure_watch(root)

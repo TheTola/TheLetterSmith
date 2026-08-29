@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import traceback
-from datetime import datetime
+import weakref
+from collections import OrderedDict
+from datetime import date, datetime
 from pathlib import Path
 from time import monotonic
 from typing import Callable, Optional
@@ -10,6 +12,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
 
 import generate
+from curtain_controls import CurtainStyleComboBox, CurtainStyleController
+from image_button import ArtworkButton
 from config import MESSAGE_HTML_FILE, ensure_output_dirs
 from message_html import read_text_normalized
 from publishing import GitHubPagesPublisher, PublishResult
@@ -21,19 +25,25 @@ from publishing.expiration import (
     publication_status,
 )
 from publishing.github_auth import (
-    GitHubAPI,
     GitHubAccount,
-    GitHubAuthenticator,
-    GitHubCredentialStore,
-    GitHubDeviceAuthorization,
+    GitHubConnectionService,
+    GitHubConnectionSnapshot,
+    GitHubConnectionState,
     GitHubOperationError,
+    GitHubPublishingAccess,
     GitHubSession,
+    github_connection_service,
 )
 from publishing.github_config import github_application_configuration
 from publishing.github_pages import PUBLIC_WARNING_KEY
-from publishing.github_ui import GitHubAccountDialog, GitHubDeviceFlowDialog
+from publishing.github_ui import GitHubAccountDialog, GitHubAuthenticationDialog
 from readiness import ReadinessResult, evaluate_readiness
 from project_paths import ProjectPathResolver, application_paths
+from project_timestamps import PROJECT_PUBLISHED_AT_KEY
+from protected_projects import (
+    PROTECTED_PROJECT_KIND_KEY,
+    is_protected_project as settings_is_protected_project,
+)
 from project_state import (
     ApplicationState,
     ProjectIdentity,
@@ -51,6 +61,7 @@ from saved_letters import (
 )
 from settings_store import (
     ACTIVE_PLAY_DIR_KEY,
+    CURTAIN_STYLE_LABELS,
     PUBLICATION_PROVIDER_KEY,
     PUBLICATION_VERIFIED_KEY,
     PUBLISHED_AT_KEY,
@@ -62,10 +73,22 @@ from settings_store import (
     SettingsStore,
     normalize_published_page_url,
 )
+from ui_dialogs import LetterSmithConfirmationDialog, LetterSmithMessageDialog
 from ui_help import set_control_help
+from ui_theme import (
+    CYBER_FORGE_THEME,
+    BUTTON_FULL_TIER_GEOMETRY_PROPERTY,
+    ButtonTier,
+    ThemeService,
+    ThemeTokens,
+    apply_button_tier,
+    apply_tab_heading_style,
+)
+from transactional_io import file_change_token
 
 
 PREVIEW_MODE_KEY = "forge_preview_mode"
+FORGE_ACTION_FONT_POINT_SIZE = 13.0
 PREVIEW_MODES = (
     ("Portrait", "portrait"),
     ("Landscape", "landscape"),
@@ -101,9 +124,235 @@ _FORGE_RELEVANT_SETTING_KEYS = frozenset(
         PUBLISHED_SOURCE_FINGERPRINT_KEY,
         PUBLISHED_GITHUB_OWNER_KEY,
         PUBLISHED_GITHUB_REPOSITORY_KEY,
+        PROTECTED_PROJECT_KIND_KEY,
     }
 )
 _LOGGER = logging.getLogger(__name__)
+_COVER_PIXMAP_CACHE_LIMIT = 64
+_MAX_GITHUB_OPERATION_RETRIES = 3
+_COVER_PIXMAP_CACHE: OrderedDict[
+    tuple[str, int, int, int, int, int],
+    QtGui.QPixmap,
+] = OrderedDict()
+
+
+def _cover_cache_identity(
+    path: Path | None,
+    width: int,
+    height: int,
+) -> tuple[Path, tuple[str, int, int, int, int, int]] | None:
+    if path is None:
+        return None
+    try:
+        resolved = path.resolve()
+        stat_result = resolved.stat()
+    except OSError:
+        return None
+    return (
+        resolved,
+        (
+            str(resolved).casefold(),
+            int(stat_result.st_size),
+            int(stat_result.st_mtime_ns),
+            file_change_token(resolved, stat_result=stat_result),
+            int(width),
+            int(height),
+        ),
+    )
+
+
+def _cached_cover_pixmap(
+    key: tuple[str, int, int, int, int, int],
+) -> QtGui.QPixmap | None:
+    cached = _COVER_PIXMAP_CACHE.get(key)
+    if cached is None:
+        return None
+    _COVER_PIXMAP_CACHE.move_to_end(key)
+    return QtGui.QPixmap(cached)
+
+
+def _cache_cover_image(
+    key: tuple[str, int, int, int, int, int],
+    image: QtGui.QImage,
+) -> QtGui.QPixmap:
+    pixmap = QtGui.QPixmap.fromImage(image)
+    _COVER_PIXMAP_CACHE[key] = QtGui.QPixmap(pixmap)
+    _COVER_PIXMAP_CACHE.move_to_end(key)
+    while len(_COVER_PIXMAP_CACHE) > _COVER_PIXMAP_CACHE_LIMIT:
+        _COVER_PIXMAP_CACHE.popitem(last=False)
+    return pixmap
+
+
+def _decode_scaled_cover_image(
+    path: Path,
+    width: int,
+    height: int,
+) -> QtGui.QImage:
+    reader = QtGui.QImageReader(str(path))
+    reader.setAutoTransform(True)
+    source_size = reader.size()
+    if source_size.isValid() and not source_size.isEmpty():
+        source_size.scale(width, height, Qt.KeepAspectRatio)
+        reader.setScaledSize(source_size)
+    image = reader.read()
+    if not image.isNull() and (
+        image.width() > width or image.height() > height
+    ):
+        image = image.scaled(
+            width,
+            height,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+    return image
+
+
+def _scaled_cover_pixmap(
+    path: Path | None,
+    width: int,
+    height: int,
+) -> QtGui.QPixmap:
+    identity = _cover_cache_identity(path, width, height)
+    if identity is None:
+        return QtGui.QPixmap()
+    resolved, key = identity
+    cached = _cached_cover_pixmap(key)
+    if cached is not None:
+        return cached
+    return _cache_cover_image(
+        key,
+        _decode_scaled_cover_image(resolved, width, height),
+    )
+
+
+class _CoverDecodeTask(QtCore.QRunnable):
+    """Decode one scaled saved-letter cover without blocking the GUI thread."""
+
+    def __init__(
+        self,
+        completed: object,
+        generation: int,
+        key: tuple[str, int, int, int, int, int],
+        path: Path,
+        width: int,
+        height: int,
+    ) -> None:
+        super().__init__()
+        self._completed = completed
+        self._generation = int(generation)
+        self._key = key
+        self._path = path
+        self._width = int(width)
+        self._height = int(height)
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            image = _decode_scaled_cover_image(
+                self._path,
+                self._width,
+                self._height,
+            )
+        except Exception:
+            image = QtGui.QImage()
+        self._completed.emit(self._generation, self._key, image)
+
+
+class _CatalogReconcileTask(QtCore.QRunnable):
+    """Perform a full saved-letter reconciliation away from the GUI thread."""
+
+    def __init__(
+        self,
+        completed: object,
+        generation: int,
+        mode: str,
+        project_root: Path,
+        stock_only: bool,
+    ) -> None:
+        super().__init__()
+        self._completed = completed
+        self._generation = int(generation)
+        self._mode = str(mode)
+        self._project_root = project_root
+        self._stock_only = bool(stock_only)
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            entries = SavedLetterCatalog(
+                self._project_root,
+                stock_only=self._stock_only,
+            ).list_entries(force_refresh=True)
+            error = ""
+        except Exception:
+            entries = None
+            error = traceback.format_exc()
+        self._completed.emit(
+            self._generation,
+            self._mode,
+            entries,
+            error,
+        )
+
+
+def _color_name(value: str) -> str:
+    return QtGui.QColor(value).name()
+
+
+def _darker(value: str, factor: int) -> str:
+    return QtGui.QColor(value).darker(factor).name()
+
+
+def _lighter(value: str, factor: int) -> str:
+    return QtGui.QColor(value).lighter(factor).name()
+
+
+def _rgba(value: str, alpha: int) -> str:
+    color = QtGui.QColor(value)
+    return f"rgba({color.red()},{color.green()},{color.blue()},{alpha})"
+
+
+def _relative_luminance(value: str) -> float:
+    color = QtGui.QColor(value)
+
+    def linear(channel: int) -> float:
+        normalized = channel / 255.0
+        return (
+            normalized / 12.92
+            if normalized <= 0.04045
+            else ((normalized + 0.055) / 1.055) ** 2.4
+        )
+
+    return (
+        0.2126 * linear(color.red())
+        + 0.7152 * linear(color.green())
+        + 0.0722 * linear(color.blue())
+    )
+
+
+def _contrast_ratio(foreground: str, background: str) -> float:
+    foreground_luminance = _relative_luminance(foreground)
+    background_luminance = _relative_luminance(background)
+    lighter = max(foreground_luminance, background_luminance)
+    darker = min(foreground_luminance, background_luminance)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _readable_text(backgrounds: tuple[str, ...], preferred: str) -> str:
+    preferred_contrast = min(
+        _contrast_ratio(preferred, background)
+        for background in backgrounds
+    )
+    if preferred_contrast >= 4.5:
+        return preferred
+    candidates = ("#fffefc", "#080a0d")
+    return max(
+        candidates,
+        key=lambda candidate: min(
+            _contrast_ratio(candidate, background)
+            for background in backgrounds
+        ),
+    )
 
 
 def _forge_source_fingerprint(project_root: Path) -> str:
@@ -144,6 +393,18 @@ class _TaskWorker(QtCore.QObject):
 class _PreviewModeDelegate(QtWidgets.QStyledItemDelegate):
     """Two-line, high-contrast entries for the Preview format menu."""
 
+    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
+        super().__init__(parent)
+        self.apply_theme_tokens(CYBER_FORGE_THEME.tokens)
+
+    def apply_theme_tokens(self, colors: ThemeTokens) -> None:
+        self._normal_background = QtGui.QColor(colors.panel_background)
+        self._hover_background = QtGui.QColor(colors.hover)
+        self._selected_background = QtGui.QColor(colors.active)
+        self._text_color = QtGui.QColor(colors.text)
+        self._detail_color = QtGui.QColor(colors.muted_text)
+        self._selected_detail_color = QtGui.QColor(colors.highlight)
+
     def sizeHint(
         self,
         option: QtWidgets.QStyleOptionViewItem,
@@ -166,16 +427,20 @@ class _PreviewModeDelegate(QtWidgets.QStyledItemDelegate):
             option.state & QtWidgets.QStyle.State_MouseOver
         )
         background = (
-            QtGui.QColor("#0fcbe8")
+            self._selected_background
             if selected
-            else QtGui.QColor("#17303b")
+            else self._hover_background
             if hovered
-            else QtGui.QColor("#0d1a22")
+            else self._normal_background
         )
         painter.fillRect(option.rect.adjusted(2, 2, -2, -2), background)
 
-        text_color = QtGui.QColor("#061217" if selected else "#f1fdff")
-        detail_color = QtGui.QColor("#163943" if selected else "#9bcbd5")
+        text_color = self._text_color
+        detail_color = (
+            self._selected_detail_color
+            if selected
+            else self._detail_color
+        )
         title_font = QtGui.QFont(option.font)
         title_font.setBold(True)
         title_font.setPointSizeF(max(9.5, title_font.pointSizeF()))
@@ -215,21 +480,39 @@ class _PreviewModeCombo(QtWidgets.QComboBox):
         self._arrow.setObjectName("PreviewFormatArrow")
         self._arrow.setAlignment(Qt.AlignCenter)
         self._arrow.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.apply_theme_tokens(CYBER_FORGE_THEME.tokens)
+
+    def apply_theme_assets(self, service: ThemeService) -> None:
+        self.apply_theme_tokens(service.tokens)
+
+    def apply_theme_tokens(self, colors: ThemeTokens) -> None:
+        background_top = _lighter(colors.control_background, 112)
+        background_bottom = _darker(colors.control_background, 112)
         self.setStyleSheet(
             "QComboBox#PreviewFormatSelector{"
-            "background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #183747,stop:1 #102631);"
-            "color:#f3fdff;border:1px solid #4fe5ff;border-radius:8px;"
+            "background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            f"stop:0 {background_top},stop:1 {background_bottom});"
+            f"color:{colors.text};border:1px solid {colors.accent};border-radius:8px;"
             "padding:7px 38px 7px 12px;font:600 10pt 'Segoe UI';}"
-            "QComboBox#PreviewFormatSelector:hover{background:#1a4050;border-color:#9af3ff;}"
-            "QComboBox#PreviewFormatSelector:focus{border:2px solid #d0faff;padding:6px 37px 6px 11px;}"
+            "QComboBox#PreviewFormatSelector:hover{"
+            f"background:{colors.hover};border-color:{colors.highlight};}}"
+            "QComboBox#PreviewFormatSelector:focus{"
+            f"border:2px solid {colors.accent};padding:6px 37px 6px 11px;}}"
             "QComboBox#PreviewFormatSelector::drop-down{width:34px;border:none;"
-            "border-left:1px solid rgba(118,230,247,.45);}"
+            f"border-left:1px solid {_rgba(colors.border, 170)};}}"
             "QComboBox#PreviewFormatSelector::down-arrow{image:none;width:0;height:0;}"
-            "QListView#PreviewFormatMenu{background:#0d1a22;color:#f1fdff;"
-            "border:1px solid #4fe5ff;border-radius:8px;padding:4px;outline:0;}"
-            "QLabel#PreviewFormatArrow{color:#bff8ff;background:transparent;"
+            "QListView#PreviewFormatMenu{"
+            f"background:{colors.panel_background};color:{colors.text};"
+            f"border:1px solid {colors.accent};"
+            "border-radius:8px;padding:4px;outline:0;}"
+            f"QLabel#PreviewFormatArrow{{color:{colors.accent};background:transparent;"
             "font:700 15pt 'Segoe UI Symbol';}"
         )
+        delegate = self.itemDelegate()
+        if isinstance(delegate, _PreviewModeDelegate):
+            delegate.apply_theme_tokens(colors)
+        self.setProperty("previewFormatTheme", colors.accent)
+        self.update()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         self._arrow.setGeometry(self.width() - 33, 1, 31, self.height() - 2)
@@ -248,9 +531,20 @@ class SavedLetterCard(QtWidgets.QFrame):
     activated = QtCore.Signal(object)
     delete_requested = QtCore.Signal(object)
 
-    def __init__(self, entry: SavedLetter, parent=None) -> None:
+    def __init__(
+        self,
+        entry: SavedLetter,
+        parent=None,
+        *,
+        cover_requester: Callable[..., None] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.entry = entry
+        self._delete_mode = False
+        self._cover_requester = cover_requester
+        self._cover_request_generation = 0
+        self._cover_request_path = ""
+        self._cover_cache_key: tuple[str, int, int, int, int, int] | None = None
         self.setObjectName("SavedLetterCard")
         self.setProperty("selected", False)
         self.setCursor(Qt.PointingHandCursor)
@@ -290,22 +584,7 @@ class SavedLetterCard(QtWidgets.QFrame):
         self.cover.setFixedHeight(96)
         self.cover.setAlignment(Qt.AlignCenter)
         self.cover.setAttribute(Qt.WA_TransparentForMouseEvents)
-        pixmap = (
-            QtGui.QPixmap(str(entry.cover_path))
-            if entry.cover_path is not None
-            else QtGui.QPixmap()
-        )
-        if pixmap.isNull():
-            self.cover.setText("No cover")
-        else:
-            self.cover.setPixmap(
-                pixmap.scaled(
-                    168,
-                    92,
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation,
-                )
-            )
+        self.cover.setText("No cover")
         layout.addWidget(self.cover)
 
         display_name = f"{entry.title} — {entry.recipient}"
@@ -331,27 +610,11 @@ class SavedLetterCard(QtWidgets.QFrame):
         self.recipient_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         layout.addWidget(self.recipient_label)
 
-        publication_label = (
-            "Example"
-            if entry.example
-            else "Published"
-            if entry.published
-            else "Expired"
-            if entry.expired
-            else "Local"
+        publication_label, publication_status_name = (
+            self._publication_presentation(entry)
         )
         self.status_label = QtWidgets.QLabel(publication_label)
-        self.status_label.setObjectName(
-            (
-                "ExampleStatus"
-                if entry.example
-                else "PublishedStatus"
-                if entry.published
-                else "ExpiredStatus"
-                if entry.expired
-                else "LocalStatus"
-            )
-        )
+        self.status_label.setObjectName(publication_status_name)
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setFixedHeight(20)
         self.status_label.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -390,7 +653,23 @@ class SavedLetterCard(QtWidgets.QFrame):
             "QLabel#ExampleStatus{color:#ffe6a0;background:#2d2512;"
             "border:1px solid #8d7330;border-radius:8px;"
             "font:600 8pt 'Segoe UI';}"
+            "QLabel#StockStatus{color:#e6d4ff;background:#271b38;"
+            "border:1px solid #7b52a8;border-radius:8px;"
+            "font:600 8pt 'Segoe UI';}"
         )
+        self._request_cover(entry.cover_path)
+
+    @staticmethod
+    def _publication_presentation(entry: SavedLetter) -> tuple[str, str]:
+        if entry.example:
+            return "Example", "ExampleStatus"
+        if entry.stock:
+            return "published", "StockStatus"
+        if entry.published:
+            return "Published", "PublishedStatus"
+        if entry.expired:
+            return "Expired", "ExpiredStatus"
+        return "Local", "LocalStatus"
 
     @staticmethod
     def _shorten(text: str, limit: int) -> str:
@@ -406,7 +685,110 @@ class SavedLetterCard(QtWidgets.QFrame):
         self.update()
 
     def set_delete_mode(self, enabled: bool) -> None:
-        self.delete_button.setVisible(bool(enabled) and not self.entry.example)
+        self._delete_mode = bool(enabled)
+        self.delete_button.setVisible(self._delete_mode and not self.entry.example)
+
+    @staticmethod
+    def _cover_path_identity(path: Path | None) -> str:
+        if path is None:
+            return ""
+        try:
+            return str(path.resolve()).casefold()
+        except (OSError, RuntimeError, ValueError):
+            return str(path).casefold()
+
+    def _request_cover(self, path: Path | None) -> None:
+        previous_path = self._cover_request_path
+        expected_path = self._cover_path_identity(path)
+        self._cover_request_generation += 1
+        request_generation = self._cover_request_generation
+        self._cover_request_path = expected_path
+        if expected_path != previous_path:
+            self._cover_cache_key = None
+            self.cover.clear()
+            if not expected_path:
+                self.cover.setText("No cover")
+        if self._cover_requester is not None:
+            self._cover_requester(
+                self,
+                path,
+                request_generation,
+                expected_path,
+            )
+            return
+        pixmap = _scaled_cover_pixmap(path, 168, 92)
+        self.apply_cover_result(
+            request_generation,
+            expected_path,
+            None,
+            pixmap,
+        )
+
+    def has_current_cover(
+        self,
+        request_generation: int,
+        expected_path: str,
+        key: tuple[str, int, int, int, int, int],
+    ) -> bool:
+        return (
+            request_generation == self._cover_request_generation
+            and expected_path == self._cover_request_path
+            and key == self._cover_cache_key
+        )
+
+    def apply_cover_result(
+        self,
+        request_generation: int,
+        expected_path: str,
+        key: tuple[str, int, int, int, int, int] | None,
+        pixmap: QtGui.QPixmap,
+    ) -> bool:
+        if (
+            request_generation != self._cover_request_generation
+            or expected_path != self._cover_request_path
+        ):
+            return False
+        self._cover_cache_key = key
+        self.cover.clear()
+        if pixmap.isNull():
+            self.cover.setText("No cover")
+        else:
+            self.cover.setPixmap(pixmap)
+        return True
+
+    def cancel_cover_request(self) -> None:
+        self._cover_request_generation += 1
+        self._cover_request_path = ""
+
+    def update_entry(self, entry: SavedLetter) -> None:
+        """Refresh one retained card after its saved metadata changes."""
+        self.entry = entry
+        self.setToolTip(
+            f"{entry.title} — {entry.recipient}\n"
+            f"{entry.path}\n"
+            + (
+                "Bundled example master. Double-click or press Enter to load."
+                if entry.example
+                else "Double-click or press Enter to load."
+            )
+        )
+        self._request_cover(entry.cover_path)
+        display_name = f"{entry.title} — {entry.recipient}"
+        self.name_label.setText(display_name)
+        self.name_label.setToolTip(display_name)
+        self.title_label.setText(f"Title: {self._shorten(entry.title, 25)}")
+        self.title_label.setToolTip(entry.title)
+        self.recipient_label.setText(
+            f"Recipient: {self._shorten(entry.recipient, 21)}"
+        )
+        self.recipient_label.setToolTip(entry.recipient)
+        publication_label, status_name = self._publication_presentation(entry)
+        self.status_label.setText(publication_label)
+        if self.status_label.objectName() != status_name:
+            self.status_label.setObjectName(status_name)
+            self.status_label.style().unpolish(self.status_label)
+            self.status_label.style().polish(self.status_label)
+        self.set_delete_mode(self._delete_mode)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         self.delete_button.move(self.width() - 30, 7)
@@ -446,6 +828,8 @@ class ReadinessWindow(QtWidgets.QFrame):
         self._owner = parent
         self._allow_close = False
         self._drag_offset: Optional[QtCore.QPoint] = None
+        self._theme_tokens = CYBER_FORGE_THEME.tokens
+        self._last_result: ReadinessResult | None = None
         self.user_closed = False
         self.setObjectName("ProjectReadiness")
         self.setWindowTitle("")
@@ -456,22 +840,12 @@ class ReadinessWindow(QtWidgets.QFrame):
             QtWidgets.QSizePolicy.Preferred,
             QtWidgets.QSizePolicy.Preferred,
         )
-        self.setStyleSheet(
-            "QFrame#ProjectReadiness{background:#101820;border:1px solid #2e596a;"
-            "border-radius:9px;}"
-            "QLabel{background:transparent;}"
-            "QPushButton{font:500 10pt 'Segoe UI';}"
-        )
-
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(6)
 
         top = QtWidgets.QHBoxLayout()
         self.percentage = QtWidgets.QLabel()
-        self.percentage.setStyleSheet(
-            "color:#dffcff;font:700 13px 'Segoe UI';"
-        )
         top.addWidget(self.percentage)
         top.addStretch(1)
         self.status = QtWidgets.QLabel()
@@ -479,10 +853,9 @@ class ReadinessWindow(QtWidgets.QFrame):
         top.addWidget(self.status)
         layout.addLayout(top)
 
-        divider = QtWidgets.QFrame()
-        divider.setFrameShape(QtWidgets.QFrame.HLine)
-        divider.setStyleSheet("color:#284451;")
-        layout.addWidget(divider)
+        self.divider = QtWidgets.QFrame()
+        self.divider.setFrameShape(QtWidgets.QFrame.HLine)
+        layout.addWidget(self.divider)
 
         self.items = QtWidgets.QWidget(self)
         self.items_layout = QtWidgets.QVBoxLayout(self.items)
@@ -493,13 +866,6 @@ class ReadinessWindow(QtWidgets.QFrame):
         self.items_scroll.setWidgetResizable(True)
         self.items_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         self.items_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.items_scroll.setStyleSheet(
-            "QScrollArea#ReadinessItemsScroll{background:transparent;border:none;}"
-            "QScrollArea#ReadinessItemsScroll>QWidget>QWidget{background:transparent;}"
-            "QScrollBar:vertical{background:#101820;width:9px;margin:0;}"
-            "QScrollBar::handle:vertical{background:#315a68;border-radius:4px;"
-            "min-height:24px;}"
-        )
         self.items_scroll.setWidget(self.items)
         layout.addWidget(self.items_scroll, 1)
 
@@ -514,17 +880,59 @@ class ReadinessWindow(QtWidgets.QFrame):
             )
             self.items_layout.addWidget(button)
             self._missing_buttons[item.key] = button
+        self._apply_theme_base()
+
+    def apply_theme_assets(self, service: ThemeService) -> None:
+        self.apply_theme_tokens(service.tokens)
+
+    def apply_theme_tokens(self, colors: ThemeTokens) -> None:
+        self._theme_tokens = colors
+        self._apply_theme_base()
+        if self._last_result is not None:
+            self.refresh(self._last_result)
+
+    def _apply_theme_base(self) -> None:
+        colors = self._theme_tokens
+        self.setStyleSheet(
+            "QFrame#ProjectReadiness{"
+            f"background:{colors.panel_background};"
+            f"border:1px solid {colors.border};border-radius:9px;}}"
+            "QLabel{background:transparent;font-weight:700;}"
+            "QPushButton{font-weight:700;}"
+        )
+        self.percentage.setStyleSheet(
+            f"color:{colors.text};font:700 13px 'Segoe UI';"
+        )
+        self.divider.setStyleSheet(f"color:{colors.border};")
+        self.items_scroll.setStyleSheet(
+            "QScrollArea#ReadinessItemsScroll{background:transparent;border:none;}"
+            "QScrollArea#ReadinessItemsScroll>QWidget>QWidget{background:transparent;}"
+            f"QScrollBar:vertical{{background:{colors.panel_background};"
+            "width:9px;margin:0;}"
+            f"QScrollBar::handle:vertical{{background:{colors.border};"
+            "border-radius:4px;min-height:24px;}"
+        )
 
     def _request_correction(self, tab: str, target: str) -> None:
         self.hide()
         self.correction_requested.emit(tab, target)
 
     def refresh(self, result: ReadinessResult) -> None:
+        self._last_result = result
+        colors = self._theme_tokens
         self.percentage.setText(f"{result.completion_percentage}%")
+        percentage_color = (
+            colors.success
+            if result.completion_percentage >= 100
+            else colors.text
+        )
+        self.percentage.setStyleSheet(
+            f"color:{percentage_color};font:700 13px 'Segoe UI';"
+        )
         self.status.setText(result.status)
         self.status.setStyleSheet(
-            f"color:{'#7fe29a' if result.status != 'Not Ready' else '#ff8585'};"
-            "font:600 10pt 'Segoe UI';"
+            f"color:{colors.success if result.status != 'Not Ready' else colors.error};"
+            "font:700 10pt 'Segoe UI';"
         )
 
         missing = {item.key: item for item in result.missing_items}
@@ -533,16 +941,16 @@ class ReadinessWindow(QtWidgets.QFrame):
             button.setVisible(item is not None)
             if item is None:
                 continue
-            color = "#ff9b9b" if item.required else "#dcc979"
-            border = "#6b3f49" if item.required else "#625b38"
+            color = colors.error if item.required else colors.warning
             button.setText(item.label)
             set_control_help(button, item.detail)
             button.setStyleSheet(
-                "QPushButton{text-align:left;padding:6px 8px;"
-                f"border:1px solid {border};border-radius:5px;"
-                f"background:#131e26;color:{color};}}"
-                "QPushButton:hover{background:#182a35;border-color:#00cdec;}"
-                "QPushButton:focus{border:1px solid #00d5f5;}"
+                "QPushButton{text-align:center;padding:6px 8px;font-weight:700;"
+                f"border:1px solid {color};border-radius:5px;"
+                f"background:{colors.control_background};color:{color};}}"
+                f"QPushButton:hover{{background:{colors.hover};"
+                f"border-color:{colors.accent};}}"
+                f"QPushButton:focus{{border:1px solid {colors.accent};}}"
             )
 
         self.items_scroll.setVisible(bool(missing))
@@ -695,9 +1103,14 @@ class ForgeTab(QtWidgets.QWidget):
     preview_files_release_requested = QtCore.Signal()
     project_files_release_requested = QtCore.Signal()
     restore_activity_changed = QtCore.Signal(bool, str)
+    publication_activity_changed = QtCore.Signal(bool, str, str)
     preview_visibility_changed = QtCore.Signal(bool)
     published_url_changed = QtCore.Signal(str)
     _settings_refresh_requested = QtCore.Signal()
+    _curtain_style_refresh_requested = QtCore.Signal()
+    _cover_decode_completed = QtCore.Signal(int, object, object)
+    _catalog_reconcile_completed = QtCore.Signal(int, str, object, str)
+    _github_state_changed = QtCore.Signal(object)
 
     def __init__(
         self,
@@ -705,10 +1118,17 @@ class ForgeTab(QtWidgets.QWidget):
         *,
         project_state: ProjectStateController | None = None,
         project_paths: ProjectPathResolver | None = None,
+        curtain_styles: CurtainStyleController | None = None,
+        github_service: GitHubConnectionService | None = None,
     ) -> None:
         super().__init__()
         self.project_root = Path(project_root).resolve()
         self.settings = SettingsStore(self.project_root)
+        self._owns_curtain_styles = curtain_styles is None
+        self.curtain_styles = curtain_styles or CurtainStyleController(
+            self.settings,
+            self,
+        )
         self.project_state = project_state
         if self.project_state is None:
             self.project_state = ProjectStateController(
@@ -731,15 +1151,26 @@ class ForgeTab(QtWidgets.QWidget):
         self._last_play_dir: Optional[Path] = None
         self._preview_mode = self._saved_preview_mode()
         self._readiness_result = evaluate_readiness(self.project_root)
+        self._review_complete = False
         self._busy = False
+        self._busy_operation = ""
+        self._shutdown = False
         self._worker: Optional[_TaskWorker] = None
         self._worker_thread: Optional[QtCore.QThread] = None
         self._operation_success: Optional[Callable[[object], None]] = None
         self._operation_failure: Optional[Callable[[], None]] = None
         self._operation_error_message = ""
         self._restore_operation_active = False
-        self._github_account: GitHubAccount | None = None
-        self._github_session: GitHubSession | None = None
+        self._publication_operation = ""
+        self._project_release_error = ""
+        self._github_service = github_service or github_connection_service()
+        self._github_snapshot = self._github_service.snapshot
+        self._github_account: GitHubAccount | None = (
+            self._github_snapshot.account
+            if self._github_snapshot.state == GitHubConnectionState.CONNECTED
+            else None
+        )
+        self._github_session: GitHubSession | None = self._github_snapshot.session
         self._github_account_checked = False
         self._github_account_checking = False
         self._github_account_error = ""
@@ -747,6 +1178,9 @@ class ForgeTab(QtWidgets.QWidget):
         self._github_account_thread: Optional[QtCore.QThread] = None
         self._github_sign_in_cancelled = False
         self._pending_publish_context: tuple | None = None
+        self._pending_unpublish_context: tuple[dict, Path | None] | None = None
+        self._pending_publish_retry_attempt = 0
+        self._pending_unpublish_retry_attempt = 0
         self._selected_saved_letter: Optional[SavedLetter] = None
         self._pending_recipient_entry: Optional[SavedLetter] = None
         self._saved_cards: list[SavedLetterCard] = []
@@ -754,21 +1188,45 @@ class ForgeTab(QtWidgets.QWidget):
         self._archive_groups: dict[str, tuple[SavedLetter, ...]] = {}
         self._saved_delete_mode = False
         self._saved_panel_mode = "saved"
-        self._catalog_dirty = True
+        # A persisted catalog is already reconciled by explicit app operations;
+        # watcher events and invalidation paths mark it dirty when needed.
+        self._catalog_dirty = False
         self._catalog_rendered = False
         self._rendered_catalog_entries: tuple[SavedLetter, ...] = ()
         self._rendered_catalog_mode = ""
         self._catalog_watch_suppressed_until = 0.0
+        self._cover_decode_pool = QtCore.QThreadPool(self)
+        self._cover_decode_pool.setMaxThreadCount(2)
+        self._cover_decode_pool.setExpiryTimeout(10_000)
+        self._cover_decode_generation = 0
+        self._cover_decode_waiters: dict[tuple, list[tuple]] = {}
+        self._cover_decode_jobs: set[tuple] = set()
+        self._cover_decode_completed.connect(self._cover_decode_finished)
+        self._catalog_reconcile_pool = QtCore.QThreadPool(self)
+        self._catalog_reconcile_pool.setMaxThreadCount(1)
+        self._catalog_reconcile_pool.setExpiryTimeout(10_000)
+        self._catalog_reconcile_generation = 0
+        self._catalog_reconcile_active = False
+        self._catalog_reconcile_mode = ""
+        self._catalog_refresh_queued = False
+        self._catalog_reconcile_completed.connect(
+            self._catalog_reconcile_finished
+        )
+        self._github_state_changed.connect(self._apply_github_state)
+        self._github_state_listener = self._github_state_changed.emit
+        self._github_service.subscribe(self._github_state_listener)
         self._project_fingerprint = _forge_source_fingerprint(self.project_root)
         self._source_revision = 0
         try:
             self._preview_refresh_pending = not generate.is_play_bundle_current(
-                self.project_root
+                self.project_root,
+                source_fingerprint=self._project_fingerprint or None,
             )
         except Exception:
             _LOGGER.exception("Forge build currency could not be determined.")
             self._preview_refresh_pending = True
         self._preview_refresh_requested = False
+        self._protected_published = False
         self._readiness_requested = False
         self._tab_active = False
         self._pending_scroll_position = (0, 0)
@@ -787,8 +1245,15 @@ class ForgeTab(QtWidgets.QWidget):
         self.github_account_dialog.sign_out_requested.connect(
             self.sign_out_github
         )
-        self.github_device_dialog = GitHubDeviceFlowDialog(self)
-        self.github_device_dialog.cancel_requested.connect(
+        self.github_auth_dialog = GitHubAuthenticationDialog(self)
+        self.github_device_dialog = self.github_auth_dialog
+        self.github_auth_dialog.connected.connect(
+            self._finish_github_sign_in
+        )
+        self.github_auth_dialog.authentication_failed.connect(
+            self._github_sign_in_failed
+        )
+        self.github_auth_dialog.cancel_requested.connect(
             self._cancel_github_sign_in
         )
         self._init_ui()
@@ -801,12 +1266,24 @@ class ForgeTab(QtWidgets.QWidget):
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(120)
         self._refresh_timer.timeout.connect(self.refresh_project_state)
-        self._settings_refresh_requested.connect(self._refresh_timer.start)
+        self._settings_refresh_requested.connect(self.schedule_refresh)
+        self._curtain_style_refresh_requested.connect(
+            self._curtain_style_changed
+        )
+        self.curtain_styles.styleCommitted.connect(
+            self._curtain_style_committed
+        )
         self.settings.changed.connect(self._on_settings_changed)
 
         self._status_timer = QtCore.QTimer(self)
         self._status_timer.setSingleShot(True)
         self._status_timer.timeout.connect(self.status.clear)
+
+        self._github_reconnect_timer = QtCore.QTimer(self)
+        self._github_reconnect_timer.setSingleShot(True)
+        self._github_reconnect_timer.timeout.connect(
+            self._validate_github_account_async
+        )
 
         self._catalog_refresh_timer = QtCore.QTimer(self)
         self._catalog_refresh_timer.setSingleShot(True)
@@ -829,7 +1306,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._metadata_timer.setSingleShot(True)
         self._metadata_timer.timeout.connect(self._run_pending_metadata_update)
 
-        self.refresh_project_state()
+        self.refresh_project_state(refresh_source=False)
         QtCore.QTimer.singleShot(0, self._validate_github_account_async)
 
     def _saved_preview_mode(self, snapshot: dict | None = None) -> str:
@@ -852,8 +1329,8 @@ class ForgeTab(QtWidgets.QWidget):
         )
 
         self._main_layout = QtWidgets.QVBoxLayout(self)
-        self._main_layout.setContentsMargins(72, 20, 72, 12)
-        self._main_layout.setSpacing(8)
+        self._main_layout.setContentsMargins(72, 22, 72, 18)
+        self._main_layout.setSpacing(12)
 
         heading_row = QtWidgets.QHBoxLayout()
         heading_row.setContentsMargins(0, 0, 0, 6)
@@ -861,11 +1338,9 @@ class ForgeTab(QtWidgets.QWidget):
         self._heading_balance = QtWidgets.QWidget()
         heading_row.addWidget(self._heading_balance)
         heading_row.addStretch(1)
-        self.heading_title = QtWidgets.QLabel("Forge")
+        self.heading_title = QtWidgets.QLabel("Review and forge your letter")
+        apply_tab_heading_style(self.heading_title)
         self.heading_title.setAlignment(Qt.AlignCenter)
-        self.heading_title.setStyleSheet(
-            "color:#00d4f4;font:700 18pt 'Segoe UI';"
-        )
         heading_row.addWidget(self.heading_title)
         heading_row.addStretch(1)
 
@@ -876,7 +1351,17 @@ class ForgeTab(QtWidgets.QWidget):
         self.readiness_summary = QtWidgets.QLabel()
         self.readiness_summary.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         readiness_row.addWidget(self.readiness_summary)
-        self.readiness_btn = self._small_button("Review")
+        self.readiness_btn = self._tier_button(
+            "Review",
+            ButtonTier.SMALL,
+            "BButton.png",
+            bold=True,
+        )
+        self.readiness_btn.setProperty(
+            BUTTON_FULL_TIER_GEOMETRY_PROPERTY,
+            True,
+        )
+        self.readiness_btn.set_preserve_visual_when_disabled(True)
         set_control_help(
             self.readiness_btn,
             "Review missing or optional letter items before previewing or publishing.",
@@ -886,26 +1371,62 @@ class ForgeTab(QtWidgets.QWidget):
         heading_row.addWidget(self._readiness_controls)
         self._main_layout.addLayout(heading_row)
 
-        self.load_saved_btn = self._small_button("Load Letters")
-        self.load_saved_btn.setMinimumSize(150, 36)
+        self.load_saved_btn = self._tier_button(
+            "Load Letters",
+            ButtonTier.STANDARD,
+            "AButton.png",
+        )
         set_control_help(
             self.load_saved_btn,
             "Open your saved-letter library and load a previous project.",
         )
         self.load_saved_btn.clicked.connect(self.show_saved_letters)
-        self.load_stock_btn = self._small_button("Stock")
-        self.load_stock_btn.setMinimumSize(150, 36)
+        self.load_stock_btn = self._tier_button(
+            "Stock",
+            ButtonTier.STANDARD,
+            "AButton.png",
+        )
         set_control_help(
             self.load_stock_btn,
             "Open the bundled stock letters and load one as a new working project.",
         )
         self.load_stock_btn.clicked.connect(self.show_stock_letters)
+        self.unpublish_btn = self._tier_button(
+            "",
+            ButtonTier.SMALL,
+            "BButton.png",
+            bold=True,
+        )
+        self.unpublish_btn.setProperty(
+            BUTTON_FULL_TIER_GEOMETRY_PROPERTY,
+            True,
+        )
+        self.unpublish_btn.set_theme_artwork_path("Unpub/Unpub.png")
+        self.unpublish_btn.setAccessibleName("Unpublish Letter")
+        self.unpublish_btn.hide()
+        set_control_help(
+            self.unpublish_btn,
+            "Remove the online copy while preserving the local letter.",
+        )
+        self.unpublish_btn.clicked.connect(self.unpublish_letter)
+        self._unpublish_balance = QtWidgets.QWidget()
+        self._unpublish_controls = QtWidgets.QWidget()
+        unpublish_controls_layout = QtWidgets.QHBoxLayout(
+            self._unpublish_controls
+        )
+        unpublish_controls_layout.setContentsMargins(0, 0, 0, 0)
+        unpublish_controls_layout.addWidget(
+            self.unpublish_btn,
+            alignment=Qt.AlignCenter,
+        )
         saved_holder = QtWidgets.QHBoxLayout()
         saved_holder.setContentsMargins(0, 0, 0, 0)
+        saved_holder.addWidget(self._unpublish_balance)
         saved_holder.addStretch(1)
         saved_holder.addWidget(self.load_saved_btn)
         saved_holder.addWidget(self.load_stock_btn)
         saved_holder.addStretch(1)
+        saved_holder.addWidget(self._unpublish_controls)
         self._main_layout.addLayout(saved_holder)
 
         self.saved_panel = QtWidgets.QFrame(
@@ -1100,7 +1621,7 @@ class ForgeTab(QtWidgets.QWidget):
 
         self.preview_format_panel = QtWidgets.QFrame(self)
         self.preview_format_panel.setObjectName("ForgePreviewFormat")
-        self.preview_format_panel.setFixedWidth(350)
+        self.preview_format_panel.setFixedWidth(680)
         self.preview_format_panel.setStyleSheet(
             "QFrame#ForgePreviewFormat{background:rgba(13,31,40,.86);"
             "border:1px solid #315c69;border-radius:10px;}"
@@ -1108,11 +1629,14 @@ class ForgeTab(QtWidgets.QWidget):
         format_row = QtWidgets.QHBoxLayout(self.preview_format_panel)
         format_row.setContentsMargins(12, 7, 10, 7)
         format_row.setSpacing(12)
-        self.preview_format_label = QtWidgets.QLabel("Preview format")
+        preview_format_controls = QtWidgets.QVBoxLayout()
+        preview_format_controls.setContentsMargins(0, 0, 0, 0)
+        preview_format_controls.setSpacing(4)
+        self.preview_format_label = QtWidgets.QLabel("Preview Format")
         self.preview_format_label.setStyleSheet(
             "color:#dffbff;font:600 10pt 'Segoe UI';"
         )
-        format_row.addWidget(self.preview_format_label)
+        preview_format_controls.addWidget(self.preview_format_label)
         self.preview_mode = _PreviewModeCombo()
         set_control_help(
             self.preview_mode,
@@ -1130,7 +1654,31 @@ class ForgeTab(QtWidgets.QWidget):
         self.preview_mode.currentIndexChanged.connect(
             self._preview_mode_changed
         )
-        format_row.addWidget(self.preview_mode)
+        preview_format_controls.addWidget(self.preview_mode)
+        format_row.addLayout(preview_format_controls, 1)
+
+        curtain_controls = QtWidgets.QVBoxLayout()
+        curtain_controls.setContentsMargins(0, 0, 0, 0)
+        curtain_controls.setSpacing(4)
+        self.curtain_style_label = QtWidgets.QLabel("Choose Curtains")
+        self.curtain_style_label.setStyleSheet(
+            "color:#dffbff;font:600 10pt 'Segoe UI';"
+        )
+        curtain_controls.addWidget(self.curtain_style_label)
+        self.curtain_style_selector = CurtainStyleComboBox(
+            self,
+            object_name="ForgeCurtainStyleSelector",
+        )
+        set_control_help(
+            self.curtain_style_selector,
+            "Choose white, normal, complementary, or normal/complementary "
+            "light or dark curtains.",
+            accessible_name="Choose Curtains",
+        )
+        self.curtain_styles.bind(self.curtain_style_selector)
+        curtain_controls.addWidget(self.curtain_style_selector)
+        format_row.addLayout(curtain_controls, 1)
+        self._sync_curtain_style()
 
         publishing_row = QtWidgets.QHBoxLayout()
         publishing_row.setContentsMargins(0, 0, 0, 0)
@@ -1147,46 +1695,81 @@ class ForgeTab(QtWidgets.QWidget):
         )
         publishing_row.addWidget(self.github_account_summary)
         publishing_row.addStretch(1)
-        self.github_account_btn = self._small_button("GitHub Account")
+        self.github_account_btn = self._tier_button(
+            "GitHub Account",
+            ButtonTier.SMALL,
+            "BButton.png",
+        )
+        self.github_account_btn.setProperty(
+            BUTTON_FULL_TIER_GEOMETRY_PROPERTY,
+            True,
+        )
         set_control_help(
             self.github_account_btn,
             "Sign in with GitHub or review the connected GitHub account.",
+            accessible_name="GitHub Account",
         )
         self.github_account_btn.clicked.connect(self.show_github_account)
         publishing_row.addWidget(self.github_account_btn)
         self._main_layout.addLayout(publishing_row)
-        self._sync_publishing_controls()
 
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(10)
         self.preview_btn = self._action_button(
-            "Preview Letter", "#b86600", "#f09b18"
+            "Preview Letter", "ForgePreviewAction", "ALbutton.png"
         )
         set_control_help(
             self.preview_btn,
             "Build and open a local preview of the finished letter.",
         )
         self.preview_btn.clicked.connect(self.preview_letter)
-        actions.addWidget(self.preview_btn, 4)
+        actions.addWidget(self.preview_btn, 10)
         self.publish_btn = self._action_button(
-            "Publish Letter", "#5a45bb", "#7c67de"
+            "Publish Letter", "ForgePublishAction", "BLbutton.png"
         )
         set_control_help(
             self.publish_btn,
             "Publish the finished letter and create its shareable link.",
         )
         self.publish_btn.clicked.connect(self.publish_letter)
-        actions.addWidget(self.publish_btn, 4)
+        actions.addWidget(self.publish_btn, 10)
         self.open_published_btn = self._action_button(
-            "Open Letter", "#17232d", "#426070"
+            "Open Letter", "ForgeOpenAction", "CLbutton.png"
         )
         set_control_help(
             self.open_published_btn,
             "Open the verified published letter in your web browser.",
         )
         self.open_published_btn.clicked.connect(self.open_published_letter)
-        actions.addWidget(self.open_published_btn, 3)
-        self._main_layout.addLayout(actions)
+        actions.addWidget(self.open_published_btn, 9)
+        self._long_action_artwork = (
+            (self.preview_btn, "ALbutton.png"),
+            (self.publish_btn, "BLbutton.png"),
+            (self.open_published_btn, "CLbutton.png"),
+        )
+        long_action_ratio = self._artwork_aspect_ratio(
+            self.preview_btn.artwork_path
+        )
+        self._long_action_aspect_ratios = {
+            button: long_action_ratio
+            for button, _filename in self._long_action_artwork
+        }
+        self._long_action_width_scales = {
+            self.preview_btn: 1.0,
+            self.publish_btn: 1.0,
+            self.open_published_btn: 0.9,
+        }
+        for button, _filename in self._long_action_artwork:
+            button.set_artwork_stretch(True)
+        self._long_action_row = QtWidgets.QHBoxLayout()
+        self._long_action_row.setContentsMargins(0, 0, 0, 0)
+        self._long_action_row.setSpacing(0)
+        # Keep the centered action group 10% narrower than its previous share.
+        self._long_action_row.addStretch(209)
+        self._long_action_row.addLayout(actions, 832)
+        self._long_action_row.addStretch(209)
+        self._main_layout.addLayout(self._long_action_row)
+        self._sync_publishing_controls()
 
         self.status = QtWidgets.QLabel()
         self.status.setObjectName("ForgeStatus")
@@ -1199,24 +1782,33 @@ class ForgeTab(QtWidgets.QWidget):
         )
         self._main_layout.addWidget(self.status)
         self._main_layout.addStretch(1)
+        self._apply_forge_theme(CYBER_FORGE_THEME.tokens)
 
     def _sync_heading_balance(self) -> None:
+        self.unpublish_btn.setAccessibleName("Unpublish Letter")
         self._heading_balance.setFixedWidth(
             self._readiness_controls.sizeHint().width()
         )
+        unpublish_width = self.unpublish_btn.sizeHint().width()
+        self._unpublish_balance.setFixedWidth(unpublish_width)
+        self._unpublish_controls.setFixedWidth(unpublish_width)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        for button, _filename in getattr(self, "_long_action_artwork", ()):
+            button.setMinimumWidth(0)
+            button.setMaximumWidth(16_777_215)
         side_margin = min(104, max(24, int(self.width() * 0.055)))
         self._main_layout.setContentsMargins(
             side_margin,
-            20,
+            22,
             side_margin,
-            12,
+            18,
         )
         self._layout_saved_cards()
         self._card_layout_timer.start(0)
         self._sync_heading_balance()
         super().resizeEvent(event)
+        QtCore.QTimer.singleShot(0, self._sync_long_action_button_aspect_ratios)
 
     @staticmethod
     def _muted_label(text: str) -> QtWidgets.QLabel:
@@ -1224,65 +1816,445 @@ class ForgeTab(QtWidgets.QWidget):
         label.setStyleSheet("color:#839da8;font:9pt 'Segoe UI';")
         return label
 
-    @staticmethod
-    def _small_button(text: str) -> QtWidgets.QPushButton:
-        button = QtWidgets.QPushButton(text)
-        button.setCursor(Qt.PointingHandCursor)
-        button.setStyleSheet(
-            "QPushButton{background:#15212b;color:#dff8ff;"
-            "border:1px solid #365365;border-radius:6px;padding:6px 10px;}"
-            "QPushButton:hover{border-color:#00d4f4;background:#192a35;}"
-            "QPushButton:focus{border:1px solid #00d4f4;}"
-            "QPushButton:disabled{color:#61727a;border-color:#293942;}"
+    def _tier_button(
+        self,
+        text: str,
+        tier: ButtonTier,
+        artwork_filename: str,
+        *,
+        bold: bool | None = None,
+    ) -> QtWidgets.QPushButton:
+        button = ArtworkButton(
+            text,
+            self.project_root,
+            artwork_filename,
+            tier=tier,
         )
+        button.setCursor(Qt.PointingHandCursor)
+        button.setProperty("themeRole", "button")
+        apply_button_tier(button, tier, bold=bold)
+        return button
+
+    def _action_button(
+        self,
+        text: str,
+        object_name: str,
+        artwork_filename: str,
+    ) -> QtWidgets.QPushButton:
+        button = ArtworkButton(
+            text,
+            self.project_root,
+            artwork_filename,
+            broken_artwork_filename=artwork_filename,
+            long_form=True,
+            tier=None,
+        )
+        button.setObjectName(object_name)
+        button.setMinimumHeight(70)
+        button.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Fixed,
+        )
+        button.set_artwork_stretch(True)
+        button.setCursor(Qt.PointingHandCursor)
         return button
 
     @staticmethod
-    def _action_button(
-        text: str,
-        background: str,
-        hover: str,
-    ) -> QtWidgets.QPushButton:
-        button = QtWidgets.QPushButton(text)
-        button.setMinimumHeight(42)
-        button.setCursor(Qt.PointingHandCursor)
-        button.setStyleSheet(
-            f"QPushButton{{background:{background};color:white;"
-            "border:1px solid #566d79;border-radius:7px;"
-            "font:700 10pt 'Segoe UI';padding:8px 14px;}"
-            f"QPushButton:hover{{background:{hover};}}"
-            "QPushButton:focus{border:2px solid #d9faff;}"
-            "QPushButton:disabled{background:#182129;color:#64747c;"
-            "border-color:#2d3b43;}"
+    def _artwork_aspect_ratio(path: str | Path) -> float:
+        size = QtGui.QImageReader(str(path)).size()
+        if not size.isValid() or size.width() <= 0 or size.height() <= 0:
+            return 0.0
+        return size.width() / size.height()
+
+    def _sync_long_action_button_aspect_ratios(self) -> None:
+        buttons = tuple(
+            button
+            for button, _filename in self._long_action_artwork
+            if not button.isHidden()
         )
-        return button
+        if not buttons:
+            return
+        scales = self._long_action_width_scales
+        primary_buttons = tuple(
+            button
+            for button in buttons
+            if scales.get(button, 1.0) == 1.0
+        )
+        if primary_buttons:
+            base_width = min(button.width() for button in primary_buttons)
+        else:
+            base_width = min(
+                button.width() / max(0.01, scales.get(button, 1.0))
+                for button in buttons
+            )
+        if base_width > 0:
+            for button in buttons:
+                button.setFixedWidth(
+                    round(base_width * scales.get(button, 1.0))
+                )
+        for button in buttons:
+            ratio = self._long_action_aspect_ratios.get(button, 0.0)
+            if ratio <= 0:
+                button.setFixedHeight(70)
+                continue
+            content_width = max(1, button.width() - 4)
+            button.setFixedHeight(round(content_width / ratio) + 4)
+
+    def apply_theme_assets(self, service: ThemeService) -> None:
+        self._apply_forge_theme(
+            service.tokens,
+            app_font_family=service.app_font_family,
+        )
+        self.github_auth_dialog.apply_theme_assets(service)
+        self.github_account_dialog.apply_theme_assets(service)
+        for button in (
+            self.readiness_btn,
+            self.load_saved_btn,
+            self.load_stock_btn,
+            self.github_account_btn,
+            self.preview_btn,
+            self.publish_btn,
+            self.unpublish_btn,
+            self.open_published_btn,
+        ):
+            button.apply_theme_assets(service)
+        self._sync_publishing_controls()
+        ratio = 0.0
+        if service.current.uses_image_buttons:
+            artwork = service.resolve_button_asset(
+                "ALbutton.png",
+                long_form=True,
+                allow_baseline=False,
+            )
+            ratio = self._artwork_aspect_ratio(artwork)
+        for button, _filename in self._long_action_artwork:
+            self._long_action_aspect_ratios[button] = ratio
+        QtCore.QTimer.singleShot(0, self._sync_heading_balance)
+        QtCore.QTimer.singleShot(0, self._sync_long_action_button_aspect_ratios)
+
+    def _apply_forge_theme(
+        self,
+        colors: ThemeTokens,
+        *,
+        app_font_family: str = "Segoe UI",
+    ) -> None:
+        self._theme_tokens = colors
+        self.preview_format_panel.setStyleSheet(
+            "QFrame#ForgePreviewFormat{"
+            f"background:{_rgba(colors.panel_background, 235)};"
+            f"border:1px solid {colors.border};border-radius:10px;}}"
+        )
+        self.preview_format_label.setStyleSheet(
+            f"color:{colors.highlight};font:600 10pt 'Segoe UI';"
+        )
+        self.curtain_style_label.setStyleSheet(
+            f"color:{colors.highlight};font:600 10pt 'Segoe UI';"
+        )
+        self.preview_mode.apply_theme_tokens(colors)
+        self.curtain_style_selector.apply_theme_tokens(colors)
+        self.readiness_window.apply_theme_tokens(colors)
+
+        uses_dark_text = _relative_luminance(colors.text) < 0.5
+        if uses_dark_text:
+            action_specs = (
+                (
+                    self.preview_btn,
+                    _color_name(colors.primary),
+                    _lighter(colors.primary, 112),
+                    _color_name(colors.active),
+                    colors.primary,
+                ),
+                (
+                    self.publish_btn,
+                    _color_name(colors.secondary),
+                    _lighter(colors.secondary, 108),
+                    _color_name(colors.active),
+                    colors.secondary,
+                ),
+                (
+                    self.open_published_btn,
+                    _color_name(colors.control_background),
+                    _color_name(colors.hover),
+                    _color_name(colors.active),
+                    colors.accent,
+                ),
+            )
+        else:
+            action_specs = (
+                (
+                    self.preview_btn,
+                    _darker(colors.primary, 190),
+                    _darker(colors.primary, 160),
+                    _darker(colors.primary, 228),
+                    colors.primary,
+                ),
+                (
+                    self.publish_btn,
+                    _darker(colors.secondary, 190),
+                    _darker(colors.secondary, 165),
+                    _darker(colors.secondary, 228),
+                    colors.secondary,
+                ),
+                (
+                    self.open_published_btn,
+                    _color_name(colors.control_background),
+                    _color_name(colors.hover),
+                    _darker(colors.control_background, 120),
+                    colors.accent,
+                ),
+            )
+        for button, background, hover, pressed, border in action_specs:
+            foreground = _readable_text(
+                (background, hover, pressed),
+                colors.text,
+            )
+            name = button.objectName()
+            button.setStyleSheet(
+                f"QPushButton#{name}{{background:{background};color:{foreground};"
+                f"border:1px solid {border};border-radius:9px;"
+                f"font:700 {FORGE_ACTION_FONT_POINT_SIZE:g}pt '{app_font_family}';"
+                "padding:10px 18px;}"
+                f"QPushButton#{name}:hover{{background:{hover};"
+                f"border-color:{colors.highlight};}}"
+                f"QPushButton#{name}:pressed{{background:{pressed};}}"
+                f"QPushButton#{name}:focus{{border:2px solid {colors.accent};}}"
+                f"QPushButton#{name}:disabled{{background:{colors.card_background};"
+                f"color:{colors.muted_text};border-color:{colors.border};}}"
+            )
+            font = QtGui.QFont(button.font())
+            font.setFamily(app_font_family)
+            font.setPointSizeF(FORGE_ACTION_FONT_POINT_SIZE)
+            font.setWeight(QtGui.QFont.Weight.Bold)
+            button.setFont(font)
+            button.setProperty("forgeActionBackground", background)
+            button.setProperty("forgeActionHover", hover)
+            button.setProperty("forgeActionText", foreground)
 
     def _on_settings_changed(
         self,
-        _settings: dict,
+        settings: dict,
         keys: tuple[str, ...],
     ) -> None:
+        if "curtain_style" in keys:
+            self._curtain_style_refresh_requested.emit()
         if _FORGE_RELEVANT_SETTING_KEYS.intersection(keys):
             self._settings_refresh_requested.emit()
 
+    def _sync_curtain_style(self, settings: dict | None = None) -> None:
+        snapshot = self.settings.snapshot() if settings is None else settings
+        self.curtain_styles.sync_from_settings(snapshot)
+
+    def set_curtain_preview_colors(
+        self,
+        colors: dict[str, tuple[int, int, int]],
+    ) -> None:
+        self.curtain_styles.set_preview_colors(colors)
+
+    def _set_curtain_style(self, style: str) -> None:
+        self.curtain_styles.set_style(style)
+
+    @QtCore.Slot()
+    def _curtain_style_changed(self) -> None:
+        self._sync_curtain_style()
+        self._refresh_source_fingerprint()
+        if self._tab_active and not self._shutdown:
+            self.ensure_preview_current()
+
+    @QtCore.Slot(str)
+    def _curtain_style_committed(self, style: str) -> None:
+        self._set_status(
+            f"Curtain style set to {CURTAIN_STYLE_LABELS[style]}."
+        )
+
     def _sync_publishing_controls(self) -> None:
         configuration = github_application_configuration()
-        if self._github_account_checking:
+        snapshot = self._github_snapshot
+        state = snapshot.state
+        account = snapshot.account
+        if state == GitHubConnectionState.CONNECTING or self._github_account_checking:
             summary = "Checking connection…"
-        elif self._github_account is not None:
-            summary = f"Connected as {self._github_account.login}"
-        elif self._github_account_error:
+        elif state == GitHubConnectionState.AUTHORIZING:
+            summary = "Connecting…"
+        elif state == GitHubConnectionState.CONNECTED and account is not None:
+            summary = f"Connected as {account.login}"
+        elif state == GitHubConnectionState.RECONNECTING and account is not None:
+            summary = f"{account.login} — Reconnecting automatically…"
+        elif state == GitHubConnectionState.INSTALL_REQUIRED and account is not None:
+            summary = f"{account.login} — Installation Required"
+        elif state == GitHubConnectionState.ACTION_REQUIRED and account is not None:
+            summary = f"{account.login} — Action Required"
+        elif state == GitHubConnectionState.GITHUB_UNAVAILABLE or self._github_account_error:
             summary = "Connection unavailable"
         elif not configuration.configured:
             summary = "Developer setup required"
         else:
             summary = "Not connected"
         self.github_account_summary.setText(summary)
-        self.github_account_dialog.set_account(
-            self._github_account,
-            checking=self._github_account_checking,
-            message=self._github_account_error,
+        connected = bool(
+            account is not None
+            and state in {
+                GitHubConnectionState.CONNECTED,
+                GitHubConnectionState.RECONNECTING,
+            }
         )
+        theme_definition = getattr(
+            getattr(self.github_account_btn, "_theme_service", None),
+            "current",
+            None,
+        )
+        image_theme = bool(
+            getattr(theme_definition, "uses_image_buttons", True)
+        )
+        basic_connected_artwork = bool(connected and not image_theme)
+        if basic_connected_artwork:
+            self.github_account_btn.set_presentation_artwork(None)
+            self.github_account_btn.set_theme_artwork_path(
+                "git/ConnectButton.png"
+            )
+        else:
+            self.github_account_btn.set_theme_artwork_path(None)
+            self.github_account_btn.set_presentation_artwork(
+                "ConnectButton.png" if connected and image_theme else None,
+                broken=connected and image_theme,
+            )
+        uses_artwork = self.github_account_btn.uses_artwork_presentation
+        self.github_account_btn.setText(
+            ""
+            if connected or uses_artwork
+            else "GitHub Connected"
+            if state == GitHubConnectionState.CONNECTED
+            else "GitHub Reconnecting"
+            if state == GitHubConnectionState.RECONNECTING and account is not None
+            else "Connect GitHub"
+        )
+        self.github_account_btn.setEnabled(
+            not self._busy
+            and state not in {
+                GitHubConnectionState.CONNECTING,
+                GitHubConnectionState.AUTHORIZING,
+            }
+        )
+        self.github_account_btn.setAccessibleName(
+            "GitHub Account — connected"
+            if connected
+            else "GitHub Account — not connected"
+        )
+        self.github_account_dialog.set_connection(snapshot)
+        if hasattr(self, "publish_btn"):
+            self._update_letter_action_button_states()
+
+    @QtCore.Slot(object)
+    def _apply_github_state(self, result: object) -> None:
+        if self._shutdown or not isinstance(result, GitHubConnectionSnapshot):
+            return
+        self._github_snapshot = result
+        self._github_session = result.session
+        self._github_account = (
+            result.account
+            if result.state in {
+                GitHubConnectionState.CONNECTED,
+                GitHubConnectionState.RECONNECTING,
+            }
+            else None
+        )
+        self._github_account_error = (
+            result.message
+            if result.state == GitHubConnectionState.GITHUB_UNAVAILABLE
+            else ""
+        )
+        retry_timer = getattr(self, "_github_reconnect_timer", None)
+        if result.state == GitHubConnectionState.RECONNECTING:
+            self._schedule_github_reconnect(result)
+        elif retry_timer is not None:
+            retry_timer.stop()
+        if (
+            result.state == GitHubConnectionState.CONNECTED
+            and (
+                self._pending_publish_context is not None
+                or self._pending_unpublish_context is not None
+            )
+            and result.session is not None
+        ):
+            QtCore.QTimer.singleShot(
+                0,
+                lambda session=result.session: self._defer_until_idle(
+                    lambda: self._resume_pending_github_operations(session)
+                ),
+            )
+        elif result.state == GitHubConnectionState.GITHUB_UNAVAILABLE:
+            if self._pending_publish_context is not None:
+                self._abort_publication_activity("publish")
+            elif self._pending_unpublish_context is not None:
+                self._abort_publication_activity("unpublish")
+        elif (
+            result.state
+            in {
+                GitHubConnectionState.DISCONNECTED,
+                GitHubConnectionState.INSTALL_REQUIRED,
+                GitHubConnectionState.ACTION_REQUIRED,
+            }
+            and not self._busy
+            and (
+                self._pending_publish_context is not None
+                or self._pending_unpublish_context is not None
+            )
+        ):
+            self._update_publication_activity(
+                "Waiting for GitHub authorization…"
+            )
+            QtCore.QTimer.singleShot(
+                0,
+                lambda: self._defer_until_idle(self.sign_in_github),
+            )
+        self._sync_publishing_controls()
+
+    def _schedule_github_reconnect(
+        self,
+        snapshot: GitHubConnectionSnapshot,
+    ) -> None:
+        timer = getattr(self, "_github_reconnect_timer", None)
+        if self._shutdown or timer is None or timer.isActive():
+            return
+        delay_ms = max(1, round(snapshot.retry_after_seconds * 1000))
+        _LOGGER.info(
+            "[GitHub] Qt reconnect timer armed: retry=%s delay_ms=%s",
+            snapshot.retry_attempt,
+            delay_ms,
+        )
+        timer.start(delay_ms)
+
+    def _queue_github_operation_retry(self, operation: str) -> bool:
+        snapshot = self._github_service.snapshot
+        if (
+            snapshot.state != GitHubConnectionState.RECONNECTING
+            or snapshot.session is None
+        ):
+            return False
+        if operation == "publishing":
+            if self._pending_publish_context is None:
+                return False
+            attempt = self._pending_publish_retry_attempt + 1
+            self._pending_publish_retry_attempt = attempt
+        elif operation == "unpublishing":
+            if self._pending_unpublish_context is None:
+                return False
+            attempt = self._pending_unpublish_retry_attempt + 1
+            self._pending_unpublish_retry_attempt = attempt
+        else:
+            raise ValueError(f"Unsupported GitHub operation: {operation}")
+        if attempt > _MAX_GITHUB_OPERATION_RETRIES:
+            return False
+        self._set_status(
+            "GitHub is temporarily unavailable. "
+            f"Retrying {operation} automatically "
+            f"({attempt}/{_MAX_GITHUB_OPERATION_RETRIES})…",
+            timeout_ms=0,
+        )
+        self._update_publication_activity(
+            "GitHub paused briefly; reconnecting automatically…"
+        )
+        self._schedule_github_reconnect(snapshot)
+        return True
 
     def show_github_account(self) -> None:
         self._sync_publishing_controls()
@@ -1298,35 +2270,16 @@ class ForgeTab(QtWidgets.QWidget):
             self._validate_github_account_async()
 
     def _validate_github_account_async(self) -> None:
-        if self._github_account_checking:
+        if self._shutdown or self._github_account_checking:
             return
         thread = self._github_account_thread
         if thread is not None and thread.isRunning():
-            return
-        try:
-            stored = GitHubCredentialStore().load()
-        except GitHubOperationError as error:
-            self._github_account_validation_failed(
-                error.user_message,
-                error.technical_details,
-                True,
-            )
-            self._sync_publishing_controls()
-            return
-        if stored is None:
-            self._github_session = None
-            self._github_account = None
-            self._github_account_checked = True
-            self._github_account_error = ""
-            self._sync_publishing_controls()
             return
         self._github_account_checking = True
         self._sync_publishing_controls()
         thread = QtCore.QThread(self)
         worker = _TaskWorker(
-            lambda: GitHubAuthenticator(
-                api=GitHubAPI(timeout=6.0)
-            ).validate_stored()
+            self._github_service.restore
         )
         worker.moveToThread(thread)
         self._github_account_thread = thread
@@ -1350,11 +2303,12 @@ class ForgeTab(QtWidgets.QWidget):
 
     @QtCore.Slot(object)
     def _github_account_validation_succeeded(self, result: object) -> None:
-        session = result if isinstance(result, GitHubSession) else None
-        self._github_session = session
-        self._github_account = session.account if session is not None else None
+        if self._shutdown:
+            return
+        if not isinstance(result, GitHubConnectionSnapshot):
+            raise TypeError("GitHub returned invalid connection state.")
+        self._apply_github_state(result)
         self._github_account_checked = True
-        self._github_account_error = ""
 
     @QtCore.Slot(str, str, bool)
     def _github_account_validation_failed(
@@ -1363,8 +2317,8 @@ class ForgeTab(QtWidgets.QWidget):
         technical: str,
         _user_safe: bool,
     ) -> None:
-        self._github_session = None
-        self._github_account = None
+        if self._shutdown:
+            return
         self._github_account_checked = True
         self._github_account_error = (
             "Could not reach GitHub. Local Letter Smith features remain available."
@@ -1374,18 +2328,21 @@ class ForgeTab(QtWidgets.QWidget):
             message,
             technical,
         )
-        self.github_account_dialog.set_account(
-            None,
-            message=self._github_account_error,
-        )
+        self.github_account_dialog.set_connection(self._github_snapshot)
+        if self._publication_operation:
+            self._abort_publication_activity(self._publication_operation)
 
     @QtCore.Slot()
     def _github_account_validation_finished(self) -> None:
+        if self._shutdown:
+            return
         thread = self._github_account_thread
         self._github_account_worker = None
         self._github_account_thread = None
         self._github_account_checking = False
         self._sync_publishing_controls()
+        if self._github_snapshot.state == GitHubConnectionState.RECONNECTING:
+            self._schedule_github_reconnect(self._github_snapshot)
         if thread is not None:
             thread.deleteLater()
 
@@ -1403,7 +2360,7 @@ class ForgeTab(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def sign_in_github(self) -> None:
-        if self._busy:
+        if self._busy or self.github_auth_dialog.isVisible():
             return
         configuration = github_application_configuration()
         if not configuration.configured:
@@ -1412,146 +2369,123 @@ class ForgeTab(QtWidgets.QWidget):
             )
             self.github_account_dialog.set_account(None, message=message)
             self._set_status(message, error=True)
+            if self._publication_operation:
+                self._abort_publication_activity(self._publication_operation)
             self.show_github_account()
             return
         self._github_sign_in_cancelled = False
-        authenticator = GitHubAuthenticator(configuration)
-        self._start_operation(
-            "Requesting GitHub sign-in…",
-            lambda: self._run_github_task(
-                authenticator.begin_device_authorization
-            ),
-            self._github_device_authorization_ready,
-            "GitHub sign-in could not be started.",
-            on_failure=self._github_sign_in_failed,
-        )
-
-    def _github_device_authorization_ready(self, result: object) -> None:
-        if not isinstance(result, GitHubDeviceAuthorization):
-            raise TypeError("GitHub returned an invalid device authorization.")
-        self.github_device_dialog.set_authorization(result)
-        owner = self.window()
-        self.github_device_dialog.show()
-        center = owner.mapToGlobal(owner.rect().center())
-        frame = self.github_device_dialog.frameGeometry()
-        frame.moveCenter(center)
-        self.github_device_dialog.move(frame.topLeft())
-        self.github_device_dialog.raise_()
-        self.github_device_dialog.activateWindow()
-        self.github_device_dialog.open_github()
-        self._defer_until_idle(
-            lambda: self._poll_github_authorization(result)
-        )
-
-    def _poll_github_authorization(
-        self,
-        authorization: GitHubDeviceAuthorization,
-    ) -> None:
-        authenticator = GitHubAuthenticator()
-        cancelled = lambda: (
-            self._github_sign_in_cancelled
-            or QtCore.QThread.currentThread().isInterruptionRequested()
-        )
-
-        def task() -> tuple[GitHubSession, bool]:
-            session = authenticator.poll_device_authorization(
-                authorization,
-                cancelled=cancelled,
+        snapshot = self._github_service.snapshot
+        if snapshot.state == GitHubConnectionState.RECONNECTING:
+            self._set_status(
+                snapshot.message or "GitHub is reconnecting automatically…",
+                error=False,
+                timeout_ms=0,
             )
-            return session, authenticator.installation_present(session)
-
-        self._start_operation(
-            "Waiting for GitHub authorization…",
-            lambda: self._run_github_task(task),
-            self._github_authorization_completed,
-            "GitHub sign-in could not be completed.",
-            on_failure=self._github_sign_in_failed,
-        )
-
-    def _github_authorization_completed(self, result: object) -> None:
-        session, installed = tuple(result)
-        if not isinstance(session, GitHubSession):
-            raise TypeError("GitHub returned an invalid authenticated session.")
-        self._github_session = session
-        self._github_account = session.account
-        self._sync_publishing_controls()
-        if bool(installed):
-            self.github_device_dialog.finish()
-            self._defer_until_idle(
-                lambda: self._finish_github_sign_in(session)
+            self._schedule_github_reconnect(snapshot)
+            return
+        if (
+            snapshot.state == GitHubConnectionState.GITHUB_UNAVAILABLE
+            and snapshot.session is not None
+        ):
+            self._validate_github_account_async()
+            return
+        if snapshot.state in {
+            GitHubConnectionState.INSTALL_REQUIRED,
+            GitHubConnectionState.ACTION_REQUIRED,
+        }:
+            access = snapshot.access
+            if access is None:
+                self._set_status("Restoring GitHub authorization…", timeout_ms=0)
+                self.github_auth_dialog.begin_authentication(self._github_service)
+                return
+            if access is not None and not access.setup_url:
+                message = access.message or (
+                    "GitHub publishing setup is incomplete in this Letter Smith build."
+                )
+                self.github_account_dialog.set_connection(snapshot)
+                self._set_status(message, error=True, timeout_ms=0)
+                if self._publication_operation:
+                    self._abort_publication_activity(
+                        self._publication_operation
+                    )
+                return
+            self._set_status("Restoring GitHub access…", timeout_ms=0)
+            self.github_auth_dialog.begin_publishing_access(
+                self._github_service,
+                snapshot,
             )
             return
-        installation_url = GitHubAuthenticator().installation_url
-        if not installation_url:
+        self._set_status("Requesting GitHub sign-in…", timeout_ms=0)
+        self.github_auth_dialog.begin_authentication(self._github_service)
+
+    def _begin_github_access_setup(
+        self,
+        session: GitHubSession,
+        access: GitHubPublishingAccess,
+    ) -> bool:
+        snapshot = self._github_service.snapshot
+        if snapshot.session != session:
             raise _ForgeOperationError(
                 "GitHub publishing setup is incomplete in this Letter Smith build."
             )
-        self.github_device_dialog.set_installation_step(installation_url)
-        self.github_device_dialog.open_github()
-        self._defer_until_idle(
-            lambda: self._wait_for_github_installation(session)
+        if not access.setup_url:
+            message = access.message or (
+                "GitHub publishing setup is incomplete in this Letter Smith build."
+            )
+            self.github_account_dialog.set_connection(snapshot)
+            self._set_status(message, error=True, timeout_ms=0)
+            return False
+        self._update_publication_activity(
+            "Waiting for GitHub publishing access…"
         )
-
-    def _wait_for_github_installation(self, session: GitHubSession) -> None:
-        authenticator = GitHubAuthenticator()
-        cancelled = lambda: (
-            self._github_sign_in_cancelled
-            or QtCore.QThread.currentThread().isInterruptionRequested()
+        self.github_auth_dialog.begin_publishing_access(
+            self._github_service,
+            snapshot,
         )
-        self._start_operation(
-            "Waiting for GitHub setup…",
-            lambda: self._run_github_task(
-                lambda: authenticator.wait_for_installation(
-                    session,
-                    cancelled=cancelled,
-                )
-            ),
-            self._github_installation_completed,
-            "GitHub setup could not be completed.",
-            on_failure=self._github_sign_in_failed,
-        )
-
-    def _github_installation_completed(self, result: object) -> None:
-        if not isinstance(result, GitHubSession):
-            raise TypeError("GitHub returned an invalid authenticated session.")
-        self.github_device_dialog.finish()
-        self._finish_github_sign_in(result)
+        return True
 
     def _finish_github_sign_in(self, session: GitHubSession) -> None:
-        self._github_session = session
-        self._github_account = session.account
+        self._apply_github_state(self._github_service.snapshot)
         self._github_account_checked = True
         self._github_account_error = ""
         self._sync_publishing_controls()
         self._set_status(f"Connected as {session.account.login}.")
-        resume = getattr(self, "_resume_pending_publish", None)
-        if callable(resume):
-            resume(session)
 
-    def _github_sign_in_failed(self) -> None:
-        self.github_device_dialog.finish()
+    def _github_sign_in_failed(self, message: str = "") -> None:
         self._sync_publishing_controls()
         if self._github_account is None:
             self.github_account_dialog.set_account(
                 None,
-                message="GitHub sign-in was not completed.",
+                message=message or "GitHub sign-in was not completed.",
             )
+        self._set_status(
+            message or "GitHub sign-in was not completed.",
+            error=True,
+            timeout_ms=0,
+        )
+        operation = self._publication_operation
+        if operation:
+            self._abort_publication_activity(operation)
 
     @QtCore.Slot()
     def _cancel_github_sign_in(self) -> None:
         self._github_sign_in_cancelled = True
-        thread = self._worker_thread
-        if thread is not None and thread.isRunning():
-            thread.requestInterruption()
         if hasattr(self, "_pending_publish_context"):
             self._pending_publish_context = None
+            self._pending_publish_retry_attempt = 0
+        if hasattr(self, "_pending_unpublish_context"):
+            self._pending_unpublish_context = None
+            self._pending_unpublish_retry_attempt = 0
+        self._finish_publication_activity()
+        self._sync_publishing_controls()
+        self._set_status("GitHub sign-in canceled.")
 
     @QtCore.Slot()
     def sign_out_github(self) -> None:
-        if self._busy:
+        if self._busy or self._publication_operation:
             return
         try:
-            GitHubAuthenticator().sign_out()
+            self._github_service.sign_out()
         except GitHubOperationError as error:
             _LOGGER.error(
                 "GitHub sign-out failed: code=%s details=%s",
@@ -1560,17 +2494,22 @@ class ForgeTab(QtWidgets.QWidget):
             )
             self._set_status(error.user_message, error=True)
             return
-        self._github_session = None
-        self._github_account = None
+        self._apply_github_state(self._github_service.snapshot)
         self._github_account_checked = True
         self._github_account_error = ""
         self._pending_publish_context = None
+        self._pending_unpublish_context = None
+        self._pending_publish_retry_attempt = 0
+        self._pending_unpublish_retry_attempt = 0
+        self._finish_publication_activity()
         self._sync_publishing_controls()
         self._set_status(
             "Signed out of GitHub. Published letters and saved links were not changed."
         )
 
     def _defer_until_idle(self, callback: Callable[[], None]) -> None:
+        if self._shutdown:
+            return
         if self._busy:
             QtCore.QTimer.singleShot(
                 50,
@@ -1588,11 +2527,15 @@ class ForgeTab(QtWidgets.QWidget):
         return True
 
     def schedule_refresh(self) -> None:
+        if self._shutdown or not self._tab_active:
+            return
         self._refresh_timer.start()
 
-    def refresh_project_state(self) -> None:
-        self._refresh_source_fingerprint()
+    def refresh_project_state(self, *, refresh_source: bool = True) -> None:
+        if refresh_source:
+            self._refresh_source_fingerprint()
         snapshot = self.settings.snapshot()
+        self._sync_curtain_style(snapshot)
         self._sync_publishing_controls()
         preview_mode = self._saved_preview_mode(snapshot)
         preview_mode_changed = preview_mode != self._preview_mode
@@ -1614,7 +2557,19 @@ class ForgeTab(QtWidgets.QWidget):
         if preview_mode_changed and not self._preview_refresh_pending:
             self.request_preview()
 
+    def is_protected_project(self, snapshot: dict | None = None) -> bool:
+        return settings_is_protected_project(
+            snapshot if snapshot is not None else self.settings.snapshot()
+        )
+
     def show_readiness_window(self) -> None:
+        if self.is_protected_project():
+            self._readiness_requested = False
+            self.readiness_window.hide()
+            self._set_status(
+                "Readiness does not apply to Stock or Example Letters."
+            )
+            return
         if self.readiness_window.isVisible():
             self._readiness_requested = False
             self.readiness_window.hide()
@@ -1659,20 +2614,157 @@ class ForgeTab(QtWidgets.QWidget):
         self._readiness_result = evaluate_readiness(self.project_root)
         self.readiness_window.refresh(self._readiness_result)
         result = self._readiness_result
-        color = "#7fe29a" if result.status != "Not Ready" else "#ff8585"
+        protected = self.is_protected_project()
+        self._readiness_controls.setVisible(not protected)
+        self._update_review_button_state(result)
+        if protected:
+            self.readiness_summary.clear()
+            self._readiness_requested = False
+            self.readiness_window.hide()
+            self._sync_heading_balance()
+            self._update_letter_action_button_states(result)
+            return result
+        colors = getattr(self, "_theme_tokens", CYBER_FORGE_THEME.tokens)
+        color = colors.success if result.status != "Not Ready" else colors.error
         self.readiness_summary.setText(
             f"{result.completion_percentage}%  {result.status}"
         )
         self.readiness_summary.setStyleSheet(
-            f"color:{color};font:600 10pt 'Segoe UI';"
+            f"color:{color};font:700 10pt 'Segoe UI';"
         )
         if result.completion_percentage >= 100:
             self._readiness_requested = False
             self.readiness_window.hide()
         self._sync_heading_balance()
-        self.preview_btn.setEnabled(not self._busy and result.can_preview)
-        self.publish_btn.setEnabled(not self._busy and result.can_publish)
+        self._update_letter_action_button_states(result)
         return result
+
+    def _update_review_button_state(self, result: ReadinessResult) -> None:
+        complete = bool(
+            not self.is_protected_project()
+            and result.completion_percentage >= 100
+        )
+        changed = complete != self._review_complete
+        self._review_complete = complete
+        self.readiness_btn.setAccessibleName(
+            "Project readiness complete" if complete else "Review project readiness"
+        )
+        set_control_help(
+            self.readiness_btn,
+            "Every readiness item is complete."
+            if complete
+            else "Review missing or optional letter items before previewing or publishing.",
+        )
+        self.readiness_btn.set_presentation_artwork(
+            "git/CompButton.png" if complete else "git/ReviewButton.png",
+            animate=changed,
+            theme_relative=True,
+        )
+        self.readiness_btn.setText(
+            ""
+            if self.readiness_btn.has_artwork
+            else "Complete"
+            if complete
+            else "Review"
+        )
+        self.readiness_btn.setEnabled(not complete)
+
+    def _update_letter_action_button_states(
+        self,
+        result: ReadinessResult | None = None,
+    ) -> None:
+        readiness = result or self._readiness_result
+        snapshot = self.settings.snapshot()
+        protected = self.is_protected_project(snapshot)
+        publication_valid = self._known_valid_publication(snapshot)
+        published = not protected and publication_valid
+        published_fingerprint = str(
+            snapshot.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")
+        ).strip()
+        current_fingerprint = str(self._project_fingerprint).strip()
+        publication_changed = bool(
+            published
+            and (
+                not published_fingerprint
+                or not current_fingerprint
+                or published_fingerprint != current_fingerprint
+            )
+        )
+        self.publish_btn.setText(
+            "Update Published Letter"
+            if publication_changed
+            else "Published"
+            if published
+            else "Publish Letter"
+        )
+        self.publish_btn.setAccessibleName(self.publish_btn.text())
+        set_control_help(
+            self.publish_btn,
+            "Update the existing online letter without changing its public link."
+            if publication_changed
+            else "This letter is published and matches the current local version."
+            if published
+            else "Publish the finished letter and create its shareable link.",
+        )
+        self.preview_btn.set_action_state(
+            broken=not protected and not readiness.can_preview,
+            invisible=self._busy,
+        )
+        self.publish_btn.set_action_state(
+            broken=not protected and not readiness.can_publish,
+            invisible=self._busy,
+        )
+        self.open_published_btn.set_action_state(
+            broken=not publication_valid,
+            invisible=self._busy,
+        )
+        publishing_active = bool(
+            self._pending_publish_context is not None
+            or self._busy_operation
+            in {
+                "Preparing letter for publishing…",
+                "Publishing letter…",
+            }
+        )
+        primary_visibility_changed = any(
+            button.isHidden() != publishing_active
+            for button in (
+                self.preview_btn,
+                self.publish_btn,
+                self.open_published_btn,
+            )
+        )
+        for button in (
+            self.preview_btn,
+            self.publish_btn,
+            self.open_published_btn,
+        ):
+            button.setVisible(not publishing_active)
+        self.unpublish_btn.setVisible(published)
+        self.unpublish_btn.setAccessibleName("Unpublish Letter")
+        self.unpublish_btn.set_action_state(
+            broken=not published,
+            invisible=self._busy,
+        )
+        if primary_visibility_changed:
+            QtCore.QTimer.singleShot(0, self._sync_long_action_button_aspect_ratios)
+
+    def _known_valid_publication(self, snapshot: dict | None = None) -> bool:
+        state = self.settings.snapshot() if snapshot is None else snapshot
+        if self.is_protected_project(state):
+            index = self._current_play_index()
+            return bool(
+                self._protected_published
+                and index is not None
+                and index.is_file()
+            )
+        return bool(
+            publication_status(state) == "published"
+            and normalize_published_page_url(
+                state.get(PUBLISHED_PAGE_URL_KEY, "")
+            )
+            and not self._published_url_unavailable(state)
+        )
 
     def show_saved_letters(self) -> None:
         self._saved_panel_mode = "saved"
@@ -1691,7 +2783,9 @@ class ForgeTab(QtWidgets.QWidget):
             "Stock Letters" if stock_mode else "Saved Letters"
         )
         self.saved_delete_toggle.setVisible(not stock_mode)
-        self.refresh_saved_letters(force_reconcile=self._catalog_dirty)
+        self.refresh_saved_letters(
+            force_reconcile=not stock_mode or self._catalog_dirty
+        )
         owner = self.window()
         screen = owner.screen() or QtGui.QGuiApplication.primaryScreen()
         available = (
@@ -1748,6 +2842,51 @@ class ForgeTab(QtWidgets.QWidget):
         return repaired
 
     def refresh_saved_letters(self, *, force_reconcile: bool = False) -> None:
+        mode = self._saved_panel_mode
+        catalog = self.stock_catalog if mode == "stock" else self.catalog
+        needs_reconcile = bool(
+            force_reconcile
+            or (self._catalog_dirty and mode != "stock")
+            or catalog.requires_reconciliation
+        )
+        if self._catalog_reconcile_active:
+            if needs_reconcile or mode != self._catalog_reconcile_mode:
+                self._catalog_refresh_queued = True
+            return
+
+        if needs_reconcile:
+            self._start_catalog_reconciliation(catalog, mode)
+            return
+
+        if catalog.is_loaded:
+            entries = catalog.list_entries()
+        elif catalog.stock_only:
+            self._start_catalog_reconciliation(catalog, mode)
+            return
+        else:
+            # Loading a valid persistent index is bounded JSON/stat work. If it
+            # is absent or corrupt, defer the fallback directory scan instead
+            # of allowing list_entries() to perform it on the GUI thread.
+            try:
+                entries = catalog.load_persisted_entries()
+            except Exception:
+                entries = None
+                _LOGGER.exception("The saved-letter index could not be loaded.")
+            if entries is None:
+                self._start_catalog_reconciliation(catalog, mode)
+                return
+
+        if mode != "stock":
+            self._catalog_dirty = False
+        self._render_saved_letter_entries(entries, mode)
+
+    def _render_saved_letter_entries(
+        self,
+        entries: tuple[SavedLetter, ...],
+        mode: str,
+    ) -> None:
+        if mode != self._saved_panel_mode:
+            return
         selected_path = (
             str(self._selected_saved_letter.path)
             if self._selected_saved_letter is not None
@@ -1755,61 +2894,258 @@ class ForgeTab(QtWidgets.QWidget):
         )
         horizontal = self.saved_scroll.horizontalScrollBar().value()
         vertical = self.saved_scroll.verticalScrollBar().value()
-        catalog = (
-            self.stock_catalog
-            if self._saved_panel_mode == "stock"
-            else self.catalog
-        )
-        entries = catalog.list_entries(
-            force_refresh=(
-                force_reconcile
-                or (self._catalog_dirty and self._saved_panel_mode != "stock")
-            )
-        )
-        if self._saved_panel_mode != "stock":
-            self._catalog_dirty = False
         if (
             self._catalog_rendered
-            and self._rendered_catalog_mode == self._saved_panel_mode
+            and self._rendered_catalog_mode == mode
             and entries == self._rendered_catalog_entries
         ):
             self._watch_saved_letter_paths(entries)
             return
         recent_entries = entries[:RECENT_SAVED_LETTER_LIMIT]
         archived_entries = entries[RECENT_SAVED_LETTER_LIMIT:]
-        for card in self._saved_cards:
-            card.hide()
-            self.saved_cards_layout.removeWidget(card)
-            card.deleteLater()
+        retained_cards = {
+            card.entry.path: card
+            for card in self._saved_cards
+        }
         self._saved_cards = []
         self._selected_saved_letter = None
 
         for entry in recent_entries:
-            card = SavedLetterCard(entry, self.saved_cards_widget)
+            card = retained_cards.pop(entry.path, None)
+            if card is None:
+                card = SavedLetterCard(
+                    entry,
+                    self.saved_cards_widget,
+                    cover_requester=self._request_saved_card_cover,
+                )
+                card.selected.connect(self._select_saved_letter)
+                card.activated.connect(self._activate_saved_letter)
+                card.delete_requested.connect(self._delete_saved_letter)
+            else:
+                card.update_entry(entry)
             card.setEnabled(not self._busy)
             card.set_delete_mode(self._saved_delete_mode)
-            card.selected.connect(self._select_saved_letter)
-            card.activated.connect(self._activate_saved_letter)
-            card.delete_requested.connect(self._delete_saved_letter)
             if str(entry.path) == selected_path:
                 self._selected_saved_letter = entry
                 card.set_selected(True)
+            else:
+                card.set_selected(False)
+            card.show()
             self._saved_cards.append(card)
 
-        self._refresh_saved_archive(archived_entries, selected_path)
+        for card in retained_cards.values():
+            card.cancel_cover_request()
+            card.hide()
+            self.saved_cards_layout.removeWidget(card)
+            card.deleteLater()
+
+        self._refresh_saved_archive(
+            archived_entries,
+            selected_path,
+            all_entries=entries,
+        )
         self._layout_saved_cards()
         self._watch_saved_letter_paths(entries)
         self._rendered_catalog_entries = entries
-        self._rendered_catalog_mode = self._saved_panel_mode
+        self._rendered_catalog_mode = mode
         self._catalog_rendered = True
         self._pending_scroll_position = (horizontal, vertical)
         self._scroll_restore_timer.start(0)
+
+    def _start_catalog_reconciliation(
+        self,
+        catalog: SavedLetterCatalog,
+        mode: str,
+    ) -> None:
+        if self._shutdown or self._catalog_reconcile_active:
+            return
+        self._catalog_reconcile_generation += 1
+        self._catalog_reconcile_active = True
+        self._catalog_reconcile_mode = mode
+        self._catalog_refresh_queued = False
+        self._set_catalog_interaction_enabled(False)
+        self._catalog_reconcile_pool.start(
+            _CatalogReconcileTask(
+                self._catalog_reconcile_completed,
+                self._catalog_reconcile_generation,
+                mode,
+                catalog.project_root,
+                catalog.stock_only,
+            )
+        )
+
+    @QtCore.Slot(int, str, object, str)
+    def _catalog_reconcile_finished(
+        self,
+        generation: int,
+        mode: str,
+        entries: tuple[SavedLetter, ...] | None,
+        error: str,
+    ) -> None:
+        if self._shutdown or generation != self._catalog_reconcile_generation:
+            return
+        self._catalog_reconcile_active = False
+        queued_refresh = self._catalog_refresh_queued
+        self._catalog_refresh_queued = False
+        if error or entries is None:
+            self._catalog_dirty = mode != "stock"
+            _LOGGER.error(
+                "Saved-letter reconciliation failed.%s",
+                f"\n{error}" if error else "",
+            )
+            self._set_status(
+                "Saved letters could not be refreshed.",
+                error=True,
+            )
+        else:
+            catalog = (
+                self.stock_catalog if mode == "stock" else self.catalog
+            )
+            entries = catalog.accept_reconciled_entries(entries)
+            if mode != "stock" and not queued_refresh:
+                self._catalog_dirty = False
+            if mode == self._saved_panel_mode and not queued_refresh:
+                self._render_saved_letter_entries(entries, mode)
+        if queued_refresh and not self._shutdown:
+            QtCore.QTimer.singleShot(
+                0,
+                lambda: self.refresh_saved_letters(force_reconcile=True),
+            )
+            return
+        self._set_catalog_interaction_enabled(True)
+
+    def _stop_catalog_reconcile_tasks(self, timeout_ms: int | None) -> bool:
+        self._catalog_reconcile_generation += 1
+        self._catalog_reconcile_active = False
+        self._catalog_reconcile_mode = ""
+        self._catalog_refresh_queued = False
+        self._catalog_reconcile_pool.clear()
+        self._set_catalog_interaction_enabled(True)
+        if timeout_ms is None:
+            return bool(self._catalog_reconcile_pool.waitForDone())
+        return bool(
+            self._catalog_reconcile_pool.waitForDone(max(0, int(timeout_ms)))
+        )
+
+    def _set_catalog_interaction_enabled(self, enabled: bool) -> None:
+        active = bool(enabled) and not self._busy
+        for card in self._saved_cards:
+            card.setEnabled(active)
+        for widget in (
+            self.saved_delete_toggle,
+            self.saved_archive_recipient,
+            self.saved_archive_list,
+            self.saved_archive_delete,
+        ):
+            widget.setEnabled(active)
+
+    def _request_saved_card_cover(
+        self,
+        card: SavedLetterCard,
+        path: Path | None,
+        request_generation: int,
+        expected_path: str,
+    ) -> None:
+        if self._shutdown:
+            return
+        identity = _cover_cache_identity(path, 168, 92)
+        if identity is None:
+            card.apply_cover_result(
+                request_generation,
+                expected_path,
+                None,
+                QtGui.QPixmap(),
+            )
+            return
+        resolved, key = identity
+        if card.has_current_cover(request_generation, expected_path, key):
+            return
+        cached = _cached_cover_pixmap(key)
+        if cached is not None:
+            card.apply_cover_result(
+                request_generation,
+                expected_path,
+                key,
+                cached,
+            )
+            return
+
+        waiters = self._cover_decode_waiters.setdefault(key, [])
+        waiters[:] = [
+            waiter
+            for waiter in waiters
+            if waiter[0]() is not card
+        ]
+        waiters.append(
+            (
+                weakref.ref(card),
+                int(request_generation),
+                expected_path,
+            )
+        )
+        if key in self._cover_decode_jobs:
+            return
+        self._cover_decode_jobs.add(key)
+        self._cover_decode_pool.start(
+            _CoverDecodeTask(
+                self._cover_decode_completed,
+                self._cover_decode_generation,
+                key,
+                resolved,
+                168,
+                92,
+            )
+        )
+
+    @QtCore.Slot(int, object, object)
+    def _cover_decode_finished(
+        self,
+        generation: int,
+        key: tuple[str, int, int, int, int, int],
+        image: QtGui.QImage,
+    ) -> None:
+        if self._shutdown or generation != self._cover_decode_generation:
+            return
+        self._cover_decode_jobs.discard(key)
+        waiters = self._cover_decode_waiters.pop(key, ())
+        pixmap = _cache_cover_image(key, image)
+        for card_reference, request_generation, expected_path in waiters:
+            card = card_reference()
+            if card is None:
+                continue
+            try:
+                card.apply_cover_result(
+                    request_generation,
+                    expected_path,
+                    key,
+                    pixmap,
+                )
+            except RuntimeError:
+                # The Qt card may have been deleted after the worker started.
+                continue
+
+    def _stop_cover_decode_tasks(self, timeout_ms: int | None) -> bool:
+        self._cover_decode_generation += 1
+        self._cover_decode_waiters.clear()
+        self._cover_decode_jobs.clear()
+        for card in self._saved_cards:
+            card.cancel_cover_request()
+        self._cover_decode_pool.clear()
+        if timeout_ms is None:
+            return bool(self._cover_decode_pool.waitForDone())
+        return bool(
+            self._cover_decode_pool.waitForDone(max(0, int(timeout_ms)))
+        )
 
     def _refresh_catalog_entry(self, play_dir: str | Path) -> None:
         """Apply a known build change without scanning unrelated letters."""
         self._catalog_watch_suppressed_until = (
             monotonic() + _CATALOG_INTERNAL_CHANGE_GRACE_SECONDS
         )
+        if self._catalog_reconcile_active:
+            self._catalog_dirty = True
+            self._catalog_refresh_queued = True
+            return
         entries = self.catalog.refresh_entry(play_dir)
         if entries is None:
             self._catalog_dirty = True
@@ -1832,6 +3168,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._source_revision += 1
         self._preview_refresh_pending = True
         self._preview_refresh_requested = False
+        self._protected_published = False
         self.saved_page_url = ""
         self.saved_panel.hide()
         self.readiness_window.hide()
@@ -1868,6 +3205,8 @@ class ForgeTab(QtWidgets.QWidget):
         self,
         entries: tuple[SavedLetter, ...],
         selected_path: str,
+        *,
+        all_entries: tuple[SavedLetter, ...] | None = None,
     ) -> None:
         selected_recipient = self.saved_archive_recipient.currentText()
         groups: dict[str, list[SavedLetter]] = {}
@@ -1881,6 +3220,17 @@ class ForgeTab(QtWidgets.QWidget):
             if str(entry.path) == selected_path:
                 selected_group = key
 
+        recipient_first_dates: dict[str, date] = {}
+        for entry in all_entries or entries:
+            if entry.example:
+                continue
+            recipient = " ".join(entry.recipient.split()) or "Unknown recipient"
+            key = recipient.casefold()
+            current = recipient_first_dates.get(key)
+            created = entry.created_sort_date
+            if current is None or created < current:
+                recipient_first_dates[key] = created
+
         self._archive_groups = {
             key: tuple(group)
             for key, group in groups.items()
@@ -1888,7 +3238,14 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_archive_recipient.blockSignals(True)
         self.saved_archive_recipient.clear()
         self.saved_archive_recipient.addItem("Choose recipient…", "")
-        for key in groups:
+        ordered_keys = sorted(
+            groups,
+            key=lambda key: (
+                -recipient_first_dates[key].toordinal(),
+                display_names[key].casefold(),
+            ),
+        )
+        for key in ordered_keys:
             self.saved_archive_recipient.addItem(display_names[key], key)
         target_key = selected_group
         if not target_key and selected_recipient:
@@ -1927,18 +3284,9 @@ class ForgeTab(QtWidgets.QWidget):
             )
             item.setSizeHint(QtCore.QSize(0, 56))
             if entry.cover_path is not None:
-                cover = QtGui.QPixmap(str(entry.cover_path))
+                cover = _scaled_cover_pixmap(entry.cover_path, 38, 48)
                 if not cover.isNull():
-                    item.setIcon(
-                        QtGui.QIcon(
-                            cover.scaled(
-                                38,
-                                48,
-                                Qt.KeepAspectRatio,
-                                Qt.SmoothTransformation,
-                            )
-                        )
-                    )
+                    item.setIcon(QtGui.QIcon(cover))
             self.saved_archive_list.addItem(item)
             if str(entry.path) == selected_path:
                 selected_row = row
@@ -1998,7 +3346,9 @@ class ForgeTab(QtWidgets.QWidget):
         previous_identity = self.project_state.identity
         activity = "Loading saved letter…"
         self._begin_restore_activity(activity)
-        self._release_project_files_for_restore()
+        if not self._release_project_files_for_restore():
+            self._finish_restore_activity()
+            return
         self.project_state.transition(
             ApplicationState.PROJECT_LOADING
         )
@@ -2034,7 +3384,10 @@ class ForgeTab(QtWidgets.QWidget):
             )
         activity = "Assigning recipient and loading saved letter…"
         self._begin_restore_activity(activity)
-        self._release_project_files_for_restore()
+        if not self._release_project_files_for_restore():
+            self._finish_restore_activity()
+            self._restore_recipient_requirement()
+            return False
         self.project_state.transition(
             ApplicationState.PROJECT_LOADING
         )
@@ -2080,17 +3433,19 @@ class ForgeTab(QtWidgets.QWidget):
                 error=True,
             )
             return
-        answer = QtWidgets.QMessageBox.question(
+        confirmation = LetterSmithConfirmationDialog(
             self.saved_panel,
-            "Delete Saved Letter",
-            (
+            title="Delete Saved Letter",
+            question=(
                 f'Delete "{entry.title}" for {entry.recipient}?\n\n'
                 "This cannot be undone."
             ),
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
-            QtWidgets.QMessageBox.Cancel,
+            primary_text="Yes",
+            secondary_text="No",
+            destructive_primary=True,
+            click_outside_dismiss=False,
         )
-        if answer != QtWidgets.QMessageBox.Yes:
+        if confirmation.exec() != QtWidgets.QDialog.Accepted:
             return
         try:
             deleted = self.catalog.delete(entry)
@@ -2193,7 +3548,13 @@ class ForgeTab(QtWidgets.QWidget):
 
     @QtCore.Slot(str)
     def _catalog_path_changed(self, _path: str) -> None:
+        if self._shutdown:
+            return
         if monotonic() < self._catalog_watch_suppressed_until:
+            return
+        if self._catalog_reconcile_active:
+            self._catalog_dirty = True
+            self._catalog_refresh_queued = True
             return
         self.catalog.invalidate()
         self._catalog_dirty = True
@@ -2205,10 +3566,49 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_scroll.horizontalScrollBar().setValue(horizontal)
         self.saved_scroll.verticalScrollBar().setValue(vertical)
 
-    def _release_project_files_for_restore(self) -> None:
+    def report_project_file_release_failure(self, message: str) -> None:
+        self._project_release_error = str(message or "").strip()
+
+    def _release_project_files_for_restore(self) -> bool:
         """Release live viewers and media before replacing project folders."""
+        self._project_release_error = ""
+        stop_cover_tasks = getattr(self, "_stop_cover_decode_tasks", None)
+        covers_released = (
+            bool(stop_cover_tasks(timeout_ms=1200))
+            if callable(stop_cover_tasks)
+            else True
+        )
+        stop_catalog_tasks = getattr(
+            self,
+            "_stop_catalog_reconcile_tasks",
+            None,
+        )
+        catalog_released = (
+            bool(stop_catalog_tasks(timeout_ms=1200))
+            if callable(stop_catalog_tasks)
+            else True
+        )
         self.preview_files_release_requested.emit()
         self.project_files_release_requested.emit()
+        if (
+            (not covers_released or not catalog_released)
+            and not self._project_release_error
+        ):
+            self._project_release_error = (
+                "Saved-letter background work did not stop before restore."
+            )
+        if self._project_release_error:
+            _LOGGER.error(
+                "Project files could not be released for restore: %s",
+                self._project_release_error,
+            )
+            self._set_status(
+                "Background media work must finish before this letter can load.",
+                error=True,
+                timeout_ms=0,
+            )
+            return False
+        return True
 
     def _begin_restore_activity(self, activity: str) -> None:
         self._restore_operation_active = True
@@ -2219,6 +3619,102 @@ class ForgeTab(QtWidgets.QWidget):
             return
         self._restore_operation_active = False
         self.restore_activity_changed.emit(False, "")
+
+    def _begin_publication_activity(
+        self,
+        operation: str,
+        detail: str,
+    ) -> None:
+        normalized = str(operation).strip().lower()
+        if normalized not in {"publish", "unpublish"}:
+            raise ValueError(f"Unsupported publication operation: {operation}")
+        self._publication_operation = normalized
+        self.publication_activity_changed.emit(True, normalized, str(detail))
+
+    def _update_publication_activity(self, detail: str) -> None:
+        operation = self._publication_operation
+        if not operation:
+            return
+        self.publication_activity_changed.emit(True, operation, str(detail))
+
+    def _finish_publication_activity(self, operation: str = "") -> None:
+        active_operation = self._publication_operation
+        if not active_operation:
+            return
+        expected = str(operation).strip().lower()
+        if expected and expected != active_operation:
+            return
+        self._publication_operation = ""
+        self.publication_activity_changed.emit(False, active_operation, "")
+
+    def _abort_publication_activity(self, operation: str) -> None:
+        normalized = str(operation).strip().lower()
+        if normalized == "publish":
+            self._pending_publish_context = None
+            self._pending_publish_retry_attempt = 0
+        elif normalized == "unpublish":
+            self._pending_unpublish_context = None
+            self._pending_unpublish_retry_attempt = 0
+        self._finish_publication_activity(normalized)
+
+    def _publication_connection_snapshot(self) -> GitHubConnectionSnapshot:
+        snapshot = self._github_service.snapshot
+        if (
+            snapshot.state == GitHubConnectionState.CONNECTED
+            and snapshot.session is not None
+            and snapshot.access is not None
+            and snapshot.access.ready
+        ):
+            return snapshot
+        return self._github_service.restore()
+
+    def _ready_publication_session(
+        self,
+        operation: str,
+    ) -> GitHubSession | None:
+        snapshot = self._github_service.snapshot
+        if snapshot.state == GitHubConnectionState.RECONNECTING:
+            self._update_publication_activity(
+                "Reconnecting to GitHub automatically…"
+            )
+            self._schedule_github_reconnect(snapshot)
+            return None
+        if snapshot.state == GitHubConnectionState.GITHUB_UNAVAILABLE:
+            self._abort_publication_activity(operation)
+            return None
+        if snapshot.state in {
+            GitHubConnectionState.DISCONNECTED,
+            GitHubConnectionState.INSTALL_REQUIRED,
+            GitHubConnectionState.ACTION_REQUIRED,
+        }:
+            self._update_publication_activity(
+                "Waiting for GitHub authorization…"
+            )
+            self._defer_until_idle(self.sign_in_github)
+            return None
+        if snapshot.state in {
+            GitHubConnectionState.CONNECTING,
+            GitHubConnectionState.AUTHORIZING,
+        }:
+            self._update_publication_activity(
+                "Waiting for GitHub authorization…"
+            )
+            return None
+        if (
+            snapshot.state != GitHubConnectionState.CONNECTED
+            or snapshot.session is None
+            or snapshot.access is None
+            or not snapshot.access.ready
+        ):
+            self._set_status(
+                snapshot.message
+                or "GitHub publishing access changed. Please try again.",
+                error=True,
+                timeout_ms=0,
+            )
+            self._abort_publication_activity(operation)
+            return None
+        return snapshot.session
 
     def _start_restore_operation(
         self,
@@ -2271,8 +3767,12 @@ class ForgeTab(QtWidgets.QWidget):
                 error=True,
             )
             return
-        self._last_play_dir = Path(restored.play_dir).resolve()
-        self._record_active_play_dir(self._last_play_dir)
+        if self.is_protected_project():
+            self._last_play_dir = None
+            self._protected_published = False
+        else:
+            self._last_play_dir = Path(restored.play_dir).resolve()
+            self._record_active_play_dir(self._last_play_dir)
         self.project_state.transition(
             ApplicationState.PROJECT_READY,
             identity=restored.identity,
@@ -2280,7 +3780,8 @@ class ForgeTab(QtWidgets.QWidget):
         self._pending_recipient_entry = None
         self.refresh_project_state()
         self._preview_refresh_pending = True
-        self._refresh_catalog_entry(self._last_play_dir)
+        if self._last_play_dir is not None:
+            self._refresh_catalog_entry(self._last_play_dir)
         payload = restored.as_payload()
         self.project_restored.emit(payload)
         self.letter_loaded.emit(payload)
@@ -2401,10 +3902,15 @@ class ForgeTab(QtWidgets.QWidget):
             return
         self._prepare_preview(open_in_browser=False)
 
-    def _prepare_preview(self, *, open_in_browser: bool) -> None:
+    def _prepare_preview(
+        self,
+        *,
+        open_in_browser: bool,
+        protected_publish: bool = False,
+    ) -> None:
         if self._busy:
             return
-        readiness = self._required_gate()
+        readiness = self._required_gate(for_publish=protected_publish)
         if readiness is None:
             return
         if not self._flush_prompt_writer_state():
@@ -2431,6 +3937,7 @@ class ForgeTab(QtWidgets.QWidget):
                     self.project_root,
                     message_html=message,
                     force=False,
+                    source_fingerprint=requested_fingerprint or None,
                 )
             except generate.FontExportError as error:
                 raise _ForgeOperationError(str(error)) from error
@@ -2454,9 +3961,13 @@ class ForgeTab(QtWidgets.QWidget):
             "Preparing preview…",
             task,
             (
-                self._preview_completed
-                if open_in_browser
-                else self._embedded_preview_completed
+                self._protected_publish_completed
+                if protected_publish
+                else (
+                    self._preview_completed
+                    if open_in_browser
+                    else self._embedded_preview_completed
+                )
             ),
             "Preview could not be updated. The previous preview was preserved.",
         )
@@ -2519,6 +4030,23 @@ class ForgeTab(QtWidgets.QWidget):
         if index.is_file():
             self._set_status("Preview updated.")
 
+    def _protected_publish_completed(self, result: object) -> None:
+        _play_dir, index = self._finish_preview(
+            result,
+            record_activity=False,
+        )
+        self._protected_published = index.is_file()
+        self._sync_published_url()
+        if self._protected_published:
+            self._set_status(
+                "Published for this demonstration. Open Letter is ready."
+            )
+        else:
+            self._set_status(
+                "The demonstration preview could not be opened.",
+                error=True,
+            )
+
     def _run_pending_metadata_update(self) -> None:
         pending = self._pending_metadata_update
         self._pending_metadata_update = None
@@ -2531,26 +4059,36 @@ class ForgeTab(QtWidgets.QWidget):
             )
 
     def publish_letter(self) -> None:
-        if self._busy:
+        if self._busy or self._publication_operation:
             return
+        if self.is_protected_project():
+            self._prepare_preview(
+                open_in_browser=False,
+                protected_publish=True,
+            )
+            return
+        if not self._flush_prompt_writer_state():
+            return
+        self._refresh_source_fingerprint()
         readiness = self._required_gate(for_publish=True)
         if readiness is None:
             return
         if not bool(self.settings.get(PUBLIC_WARNING_KEY, False)):
-            answer = QtWidgets.QMessageBox.question(
+            confirmation = LetterSmithConfirmationDialog(
                 self,
-                "Publish Letter",
-                "Publishing makes the finished letter available to anyone who has its link. Continue?",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
-                QtWidgets.QMessageBox.Cancel,
+                title="Publish Letter",
+                question=(
+                    "Publishing makes the finished letter available to anyone "
+                    "who has its link. Continue?"
+                ),
+                primary_text="Yes",
+                secondary_text="No",
+                click_outside_dismiss=False,
             )
-            if answer != QtWidgets.QMessageBox.Yes:
+            if confirmation.exec() != QtWidgets.QDialog.Accepted:
                 self._set_status("Publishing canceled.")
                 return
             self.settings.update_fields({PUBLIC_WARNING_KEY: True})
-
-        if not self._flush_prompt_writer_state():
-            return
 
         message_path = self.project_root / MESSAGE_HTML_FILE
         try:
@@ -2572,7 +4110,8 @@ class ForgeTab(QtWidgets.QWidget):
                 play_dir, _rebuilt = generate.ensure_play_bundle(
                     self.project_root,
                     message_html=message,
-                    force=True,
+                    force=False,
+                    source_fingerprint=requested_fingerprint or None,
                 )
             except generate.FontExportError as error:
                 raise _ForgeOperationError(str(error)) from error
@@ -2589,15 +4128,9 @@ class ForgeTab(QtWidgets.QWidget):
             )
             metadata["source_fingerprint"] = requested_fingerprint
             record_saved_letter_activity(play_path)
-            authenticator = GitHubAuthenticator()
-            session = self._run_github_task(authenticator.validate_stored)
-            installed = (
-                self._run_github_task(
-                    lambda: authenticator.installation_present(session)
-                )
-                if isinstance(session, GitHubSession)
-                else False
-            )
+            snapshot = self._publication_connection_snapshot()
+            session = snapshot.session
+            access = snapshot.access
             return (
                 play_path,
                 readiness,
@@ -2606,15 +4139,20 @@ class ForgeTab(QtWidgets.QWidget):
                 requested_fingerprint,
                 _forge_source_fingerprint(self.project_root),
                 session,
-                installed,
+                access,
             )
 
         self.preview_files_release_requested.emit()
+        self._begin_publication_activity(
+            "publish",
+            "Preparing the finished letter…",
+        )
         self._start_operation(
             "Preparing letter for publishing…",
             task,
             self._publish_prepared,
             "Publishing could not start. The local build was preserved.",
+            on_failure=lambda: self._abort_publication_activity("publish"),
         )
 
     def _publish_prepared(self, result: object) -> None:
@@ -2629,7 +4167,7 @@ class ForgeTab(QtWidgets.QWidget):
             requested_fingerprint,
             completed_fingerprint,
             session,
-            installed,
+            access,
         ) = values
         self._last_play_dir = Path(play_dir)
         self._record_active_play_dir(self._last_play_dir)
@@ -2652,41 +4190,59 @@ class ForgeTab(QtWidgets.QWidget):
             str(requested_fingerprint),
             str(completed_fingerprint),
         )
+        self._pending_publish_retry_attempt = 0
         if not isinstance(session, GitHubSession):
             self._set_status("Sign in with GitHub to continue publishing.", timeout_ms=0)
+            self._update_publication_activity("Waiting for GitHub sign-in…")
             self._defer_until_idle(self.sign_in_github)
             return
         self._github_session = session
-        self._github_account = session.account
-        self._sync_publishing_controls()
-        if not bool(installed):
-            authenticator = GitHubAuthenticator()
-            installation_url = authenticator.installation_url
-            if not installation_url:
-                raise _ForgeOperationError(
-                    "GitHub publishing setup is incomplete in this Letter Smith build."
-                )
-            self.github_device_dialog.set_installation_step(installation_url)
-            self.github_device_dialog.show()
-            self.github_device_dialog.open_github()
-            self._defer_until_idle(
-                lambda: self._wait_for_github_installation(session)
+        snapshot = self._github_service.snapshot
+        self._apply_github_state(snapshot)
+        if snapshot.state == GitHubConnectionState.RECONNECTING:
+            self._set_status(
+                "GitHub is temporarily unavailable. Reconnecting automatically…",
+                timeout_ms=0,
             )
+            self._update_publication_activity(
+                "Reconnecting to GitHub automatically…"
+            )
+            self._schedule_github_reconnect(snapshot)
             return
-        self._defer_until_idle(
-            lambda: self._resume_pending_publish(session)
-        )
+        if snapshot.state == GitHubConnectionState.GITHUB_UNAVAILABLE:
+            self._set_status(
+                snapshot.message or "GitHub is temporarily unavailable.",
+                error=True,
+                timeout_ms=0,
+            )
+            self._abort_publication_activity("publish")
+            return
+        if not isinstance(access, GitHubPublishingAccess):
+            raise TypeError("GitHub returned invalid publishing access details.")
+        if not access.ready:
+            if not self._begin_github_access_setup(session, access):
+                self._abort_publication_activity("publish")
+            return
+        self._update_publication_activity("Starting the secure upload…")
+
+    def _resume_pending_github_operations(self, session: GitHubSession) -> None:
+        if self._pending_publish_context is not None:
+            self._resume_pending_publish(session)
+            return
+        if self._pending_unpublish_context is not None:
+            self._resume_pending_unpublish(session)
 
     def _resume_pending_publish(self, session: GitHubSession) -> None:
         if self._busy:
-            self._defer_until_idle(
-                lambda: self._resume_pending_publish(session)
-            )
             return
         context = self._pending_publish_context
         if context is None:
+            self._finish_publication_activity("publish")
             return
-        self._pending_publish_context = None
+        current_session = self._ready_publication_session("publish")
+        if current_session is None:
+            return
+        session = current_session
         (
             play_dir,
             readiness,
@@ -2697,9 +4253,15 @@ class ForgeTab(QtWidgets.QWidget):
         ) = context
 
         def task() -> tuple:
+            api = self._github_service.authorized_api(session)
+            connection_snapshot = self._github_service.snapshot
+            effective_session = connection_snapshot.session or session
             publisher = GitHubPagesPublisher(
                 self.project_root,
-                session,
+                effective_session,
+                api=api,
+                auth_service=self._github_service,
+                connection_generation=connection_snapshot.generation,
                 cancelled=lambda: (
                     QtCore.QThread.currentThread().isInterruptionRequested()
                 ),
@@ -2715,11 +4277,15 @@ class ForgeTab(QtWidgets.QWidget):
                 _forge_source_fingerprint(self.project_root),
             )
 
+        self._update_publication_activity(
+            "Uploading files and verifying the public page…"
+        )
         self._start_operation(
             "Publishing letter…",
             task,
             self._publish_completed,
             "Publishing failed. The local build was preserved.",
+            on_failure=lambda: self._abort_publication_activity("publish"),
         )
 
     def _publish_completed(self, result: object) -> None:
@@ -2744,22 +4310,16 @@ class ForgeTab(QtWidgets.QWidget):
             self.request_preview()
         self._refresh_catalog_entry(Path(play_dir))
         if not getattr(publish_result, "success", False):
+            if (
+                not source_changed
+                and self._queue_github_operation_retry("publishing")
+            ):
+                return
+            self._pending_publish_context = None
+            self._pending_publish_retry_attempt = 0
             error_code = str(
                 getattr(publish_result, "error_code", "")
             ).strip()
-            if error_code in {"authentication", "permission"} and len(values) >= 7:
-                self._pending_publish_context = (
-                    Path(play_dir),
-                    readiness,
-                    dict(metadata),
-                    int(values[4]),
-                    str(values[5]),
-                    str(values[6]),
-                )
-                if error_code == "authentication":
-                    self._github_session = None
-                    self._github_account = None
-                    self._sync_publishing_controls()
             details = str(getattr(publish_result, "technical_details", ""))
             if details:
                 _LOGGER.error("Publishing failed: %s", details)
@@ -2768,8 +4328,11 @@ class ForgeTab(QtWidgets.QWidget):
                 or "Publishing failed. The local build was preserved.",
                 error=True,
             )
+            self._finish_publication_activity("publish")
             self._show_publish_failure(publish_result)
             return
+        self._pending_publish_context = None
+        self._pending_publish_retry_attempt = 0
         url = normalize_published_page_url(
             getattr(publish_result, "url", "")
         )
@@ -2800,13 +4363,16 @@ class ForgeTab(QtWidgets.QWidget):
                 getattr(publish_result, "repository", "")
             ).strip(),
         }
+        publication[PROJECT_PUBLISHED_AT_KEY] = publication[PUBLISHED_AT_KEY]
         if publication_status(publication) != "published":
             _LOGGER.error("Publisher returned incomplete verification metadata.")
             self._set_status(
                 "Publishing completed without a verified public page.",
                 error=True,
             )
+            self._finish_publication_activity("publish")
             return
+        self.settings.update_fields(publication)
         self.published_url_changed.emit(url)
         self.refresh_project_state()
         try:
@@ -2823,6 +4389,7 @@ class ForgeTab(QtWidgets.QWidget):
                 "The letter is online, but its publication details could not be saved.",
                 error=True,
             )
+            self._finish_publication_activity("publish")
             return
         self._refresh_catalog_entry(Path(play_dir))
         self._sync_publishing_controls()
@@ -2831,6 +4398,200 @@ class ForgeTab(QtWidgets.QWidget):
             if source_changed
             else "The letter is published."
         )
+        self._finish_publication_activity("publish")
+
+    def unpublish_letter(self) -> None:
+        if (
+            self._busy
+            or self._publication_operation
+            or self.is_protected_project()
+        ):
+            return
+        metadata = self.settings.snapshot()
+        if publication_status(metadata) != "published":
+            self._set_status("This letter is not published.")
+            return
+        confirmation = LetterSmithConfirmationDialog(
+            self,
+            title="Unpublish Letter",
+            question=(
+                "Remove this letter from the web? The local letter and all of "
+                "its files will remain untouched."
+            ),
+            primary_text="Yes",
+            secondary_text="No",
+            destructive_primary=True,
+            click_outside_dismiss=False,
+        )
+        if confirmation.exec() != QtWidgets.QDialog.Accepted:
+            self._set_status("Unpublishing canceled.")
+            return
+        index = self._current_play_index()
+        play_dir = index.parent if index is not None else None
+
+        def task() -> tuple:
+            snapshot = self._publication_connection_snapshot()
+            return dict(metadata), play_dir, snapshot.session, snapshot.access
+
+        self._begin_publication_activity(
+            "unpublish",
+            "Preparing to withdraw the online copy…",
+        )
+        self._start_operation(
+            "Preparing to remove the online copy…",
+            task,
+            self._unpublish_prepared,
+            "Unpublishing could not start. The local letter was preserved.",
+            on_failure=lambda: self._abort_publication_activity("unpublish"),
+        )
+
+    def _unpublish_prepared(self, result: object) -> None:
+        metadata, play_dir, session, access = tuple(result)
+        self._pending_unpublish_context = (
+            dict(metadata),
+            Path(play_dir) if play_dir is not None else None,
+        )
+        self._pending_unpublish_retry_attempt = 0
+        if not isinstance(session, GitHubSession):
+            self._set_status("Sign in with GitHub to unpublish this letter.", timeout_ms=0)
+            self._update_publication_activity("Waiting for GitHub sign-in…")
+            self._defer_until_idle(self.sign_in_github)
+            return
+        snapshot = self._github_service.snapshot
+        self._apply_github_state(snapshot)
+        if snapshot.state == GitHubConnectionState.RECONNECTING:
+            self._set_status(
+                "GitHub is temporarily unavailable. Reconnecting automatically…",
+                timeout_ms=0,
+            )
+            self._update_publication_activity(
+                "Reconnecting to GitHub automatically…"
+            )
+            self._schedule_github_reconnect(snapshot)
+            return
+        if snapshot.state == GitHubConnectionState.GITHUB_UNAVAILABLE:
+            self._set_status(
+                snapshot.message or "GitHub is temporarily unavailable.",
+                error=True,
+                timeout_ms=0,
+            )
+            self._abort_publication_activity("unpublish")
+            return
+        if not isinstance(access, GitHubPublishingAccess):
+            raise TypeError("GitHub returned invalid publishing access details.")
+        if not access.ready:
+            if not self._begin_github_access_setup(session, access):
+                self._abort_publication_activity("unpublish")
+            return
+        self._update_publication_activity("Starting the secure withdrawal…")
+
+    def _resume_pending_unpublish(self, session: GitHubSession) -> None:
+        if self._busy:
+            return
+        context = self._pending_unpublish_context
+        if context is None:
+            self._finish_publication_activity("unpublish")
+            return
+        current_session = self._ready_publication_session("unpublish")
+        if current_session is None:
+            return
+        session = current_session
+        metadata, play_dir = context
+
+        def task() -> tuple:
+            api = self._github_service.authorized_api(session)
+            connection_snapshot = self._github_service.snapshot
+            effective_session = connection_snapshot.session or session
+            publisher = GitHubPagesPublisher(
+                self.project_root,
+                effective_session,
+                api=api,
+                auth_service=self._github_service,
+                connection_generation=connection_snapshot.generation,
+                cancelled=lambda: (
+                    QtCore.QThread.currentThread().isInterruptionRequested()
+                ),
+            )
+            return play_dir, publisher.unpublish(dict(metadata))
+
+        self._update_publication_activity(
+            "Removing the public copy and verifying withdrawal…"
+        )
+        self._start_operation(
+            "Removing online copy…",
+            task,
+            self._unpublish_completed,
+            "Unpublishing failed. The local letter was preserved.",
+            on_failure=lambda: self._abort_publication_activity("unpublish"),
+        )
+
+    def _unpublish_completed(self, result: object) -> None:
+        play_dir, unpublish_result = tuple(result)
+        if not getattr(unpublish_result, "success", False):
+            if self._queue_github_operation_retry("unpublishing"):
+                return
+            self._pending_unpublish_context = None
+            self._pending_unpublish_retry_attempt = 0
+            details = str(
+                getattr(unpublish_result, "technical_details", "")
+            ).strip()
+            if details:
+                _LOGGER.error("Unpublishing failed: %s", details)
+            self._set_status(
+                str(getattr(unpublish_result, "message", ""))
+                or "Unpublishing failed. The local letter was preserved.",
+                error=True,
+            )
+            self._finish_publication_activity("unpublish")
+            self._show_unpublish_failure(unpublish_result)
+            return
+        self._pending_unpublish_context = None
+        self._pending_unpublish_retry_attempt = 0
+        self.published_url_changed.emit("")
+        self.refresh_project_state()
+        if play_dir is not None and Path(play_dir).is_dir():
+            try:
+                update_saved_publication_metadata(
+                    Path(play_dir),
+                    self.project_root,
+                )
+                self._refresh_catalog_entry(Path(play_dir))
+            except Exception:
+                _LOGGER.exception(
+                    "Cleared publication metadata could not be saved for %s",
+                    play_dir,
+                )
+                self._set_status(
+                    "The online copy was removed, but the saved letter's publication status could not be updated.",
+                    error=True,
+                )
+                self._finish_publication_activity("unpublish")
+                return
+        self._sync_publishing_controls()
+        self._set_status(
+            str(getattr(unpublish_result, "message", ""))
+            or "The online copy was removed. The local letter was preserved."
+        )
+        self._finish_publication_activity("unpublish")
+
+    def _show_unpublish_failure(self, unpublish_result: object) -> None:
+        details = str(
+            getattr(unpublish_result, "technical_details", "")
+        ).strip()
+        dialog = LetterSmithMessageDialog(
+            self,
+            title="Letter Was Not Unpublished",
+            message=(
+                str(getattr(unpublish_result, "message", "")).strip()
+                or "The online copy could not be removed."
+            ),
+            detail=(
+                "The local letter and its files were preserved. "
+                "You can retry unpublishing."
+            ),
+            technical_details=details,
+        )
+        dialog.exec()
 
     def _show_publish_failure(self, publish_result: object) -> None:
         message = (
@@ -2839,43 +4600,82 @@ class ForgeTab(QtWidgets.QWidget):
         )
         error_code = str(getattr(publish_result, "error_code", "")).strip()
         details = str(getattr(publish_result, "technical_details", "")).strip()
-        dialog = QtWidgets.QMessageBox(self)
-        dialog.setIcon(QtWidgets.QMessageBox.Warning)
-        dialog.setWindowTitle("Letter Was Not Published")
-        dialog.setText(message)
-        if error_code in {
-            "authentication",
-            "permission",
-        }:
-            dialog.setInformativeText(
+        if error_code == "authentication":
+            detail = (
                 "Sign in with GitHub to continue. The generated local letter was preserved."
             )
-            account_button = dialog.addButton(
-                "Sign in with GitHub",
-                QtWidgets.QMessageBox.ActionRole,
+            action_text = "Sign in with GitHub"
+        elif error_code == "permission":
+            detail = (
+                "Your GitHub sign-in is valid, but Letter Smith or its managed "
+                "publishing project does not have the required access."
             )
+            action_text = "Review GitHub Access"
         elif error_code == "app_not_configured":
-            dialog.setInformativeText(
+            detail = (
                 "GitHub publishing must be configured by the Letter Smith developer."
             )
-            account_button = dialog.addButton(
-                "Open GitHub Account",
-                QtWidgets.QMessageBox.ActionRole,
-            )
+            action_text = "Open GitHub Account"
         else:
-            account_button = None
-            dialog.setInformativeText(
+            action_text = ""
+            detail = (
                 "The generated local letter was preserved. You can retry publishing."
             )
-        dialog.addButton(QtWidgets.QMessageBox.Close)
-        if details:
-            dialog.setDetailedText(details)
+        dialog = LetterSmithMessageDialog(
+            self,
+            title="Letter Was Not Published",
+            message=message,
+            detail=detail,
+            technical_details=details,
+            action_text=action_text,
+        )
         dialog.exec()
-        if account_button is not None and dialog.clickedButton() is account_button:
-            if error_code in {"authentication", "permission"}:
+        if dialog.action_requested:
+            if error_code == "authentication":
                 self.sign_in_github()
+            elif error_code == "permission":
+                self._repair_github_publishing_access()
             else:
                 self.show_github_account()
+
+    def _repair_github_publishing_access(self) -> None:
+        if self._busy:
+            self._defer_until_idle(self._repair_github_publishing_access)
+            return
+        session = self._github_session
+        if not isinstance(session, GitHubSession):
+            self.sign_in_github()
+            return
+        self._start_operation(
+            "Checking GitHub publishing access…",
+            self._github_service.restore,
+            lambda snapshot: self._github_publishing_access_checked(snapshot),
+            "GitHub publishing access could not be checked.",
+        )
+
+    def _github_publishing_access_checked(
+        self,
+        snapshot: object,
+    ) -> None:
+        if not isinstance(snapshot, GitHubConnectionSnapshot):
+            raise TypeError("GitHub returned invalid connection state.")
+        session = snapshot.session
+        access = snapshot.access
+        if not isinstance(session, GitHubSession):
+            self.sign_in_github()
+            return
+        if not isinstance(access, GitHubPublishingAccess):
+            raise TypeError("GitHub returned invalid publishing access details.")
+        if access.ready:
+            self._set_status(
+                "GitHub access is active. Review the publishing project settings.",
+                error=True,
+                timeout_ms=0,
+            )
+            if access.setup_url:
+                QtGui.QDesktopServices.openUrl(QUrl(access.setup_url))
+            return
+        self._begin_github_access_setup(session, access)
 
     def _record_active_play_dir(self, play_dir: Path) -> None:
         candidate = Path(play_dir).resolve()
@@ -2949,9 +4749,19 @@ class ForgeTab(QtWidgets.QWidget):
     def _sync_published_url(self, snapshot: dict | None = None) -> None:
         if snapshot is None:
             snapshot = self.settings.snapshot()
-        unavailable = self._published_url_unavailable(snapshot)
-        available = bool(self.saved_page_url) and not unavailable
-        self.open_published_btn.setEnabled(available and not self._busy)
+        if self.is_protected_project(snapshot):
+            available = self._known_valid_publication(snapshot)
+            set_control_help(
+                self.open_published_btn,
+                (
+                    "Open this demonstration's local letter preview."
+                    if available
+                    else "Publish this demonstration to open its local preview."
+                ),
+            )
+            self._update_letter_action_button_states()
+            return
+        available = self._known_valid_publication(snapshot)
         if available:
             if snapshot is None:
                 snapshot = self.settings.snapshot()
@@ -2974,6 +4784,7 @@ class ForgeTab(QtWidgets.QWidget):
                 "the letter to create a link."
             )
             set_control_help(self.open_published_btn, disabled)
+        self._update_letter_action_button_states()
 
     def _published_url_unavailable(self, snapshot: dict | None = None) -> bool:
         if snapshot is None:
@@ -2982,6 +4793,28 @@ class ForgeTab(QtWidgets.QWidget):
         return is_publication_expired(expiry) or is_publication_expiration_malformed(expiry)
 
     def open_published_letter(self) -> None:
+        if self.is_protected_project():
+            index = self._current_play_index()
+            if (
+                not self._protected_published
+                or index is None
+                or not index.is_file()
+            ):
+                self._set_status(
+                    "Publish this demonstration before opening it.",
+                    error=True,
+                )
+                return
+            if not QtGui.QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(index.resolve()))
+            ):
+                self._set_status(
+                    "The demonstration preview could not be opened.",
+                    error=True,
+                )
+                return
+            self._set_status("Published demonstration opened.")
+            return
         url = self.refresh_saved_page_url()
         if not url:
             self._set_status("No valid published link is available.", error=True)
@@ -3003,9 +4836,10 @@ class ForgeTab(QtWidgets.QWidget):
         *,
         on_failure: Callable[[], None] | None = None,
     ) -> None:
-        if self._busy:
+        if self._shutdown or self._busy:
             return
         self._busy = True
+        self._busy_operation = activity
         self._set_busy(True)
         self._set_status(activity, timeout_ms=0)
 
@@ -3037,10 +4871,14 @@ class ForgeTab(QtWidgets.QWidget):
 
     @QtCore.Slot(object)
     def _operation_succeeded_on_ui(self, result: object) -> None:
+        if self._shutdown:
+            return
         callback = self._operation_success
         self._operation_success = None
         self._operation_failure = None
         if callback is None:
+            if self._publication_operation:
+                self._abort_publication_activity(self._publication_operation)
             return
         try:
             callback(result)
@@ -3051,6 +4889,8 @@ class ForgeTab(QtWidgets.QWidget):
                 or "The Forge operation could not be completed.",
                 error=True,
             )
+            if self._publication_operation:
+                self._abort_publication_activity(self._publication_operation)
 
     @QtCore.Slot(str, str, bool)
     def _operation_failed_on_ui(
@@ -3059,6 +4899,8 @@ class ForgeTab(QtWidgets.QWidget):
         technical: str,
         user_safe: bool,
     ) -> None:
+        if self._shutdown:
+            return
         sign_in_cancelled = (
             self._github_sign_in_cancelled
             and message == "GitHub sign-in was canceled."
@@ -3073,6 +4915,8 @@ class ForgeTab(QtWidgets.QWidget):
                 _LOGGER.exception(
                     "Forge failure-state recovery failed."
                 )
+        if self._publication_operation:
+            self._abort_publication_activity(self._publication_operation)
         if sign_in_cancelled:
             self._github_sign_in_cancelled = False
             _LOGGER.info("GitHub sign-in canceled by the user.")
@@ -3096,12 +4940,15 @@ class ForgeTab(QtWidgets.QWidget):
         self.request_preview()
 
     def _operation_finished(self) -> None:
+        if self._shutdown:
+            return
         thread = self._worker_thread
         self._worker = None
         self._worker_thread = None
         self._operation_error_message = ""
         self._operation_failure = None
         self._busy = False
+        self._busy_operation = ""
         self._set_busy(False)
         self._finish_restore_activity()
         if thread is not None:
@@ -3118,17 +4965,13 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_archive_list.setEnabled(not busy)
         self.saved_archive_delete.setEnabled(not busy)
         self.load_saved_btn.setEnabled(not busy)
+        self.load_stock_btn.setEnabled(not busy)
         self.saved_delete_toggle.setEnabled(not busy)
         self.preview_mode.setEnabled(not busy)
-        self.readiness_btn.setEnabled(not busy)
         self.github_account_btn.setEnabled(not busy)
-        if busy:
-            self.preview_btn.setEnabled(False)
-            self.publish_btn.setEnabled(False)
-            self.open_published_btn.setEnabled(False)
-        else:
-            self.refresh_readiness()
-            self._sync_published_url()
+        self.refresh_readiness()
+        self._sync_published_url()
+        self._sync_publishing_controls()
 
     def _set_status(
         self,
@@ -3147,7 +4990,7 @@ class ForgeTab(QtWidgets.QWidget):
             self._status_timer.start(timeout_ms)
 
     def activate_for_tab_change(self) -> None:
-        if self._tab_active:
+        if self._shutdown or self._tab_active:
             return
         self._tab_active = True
         self.refresh_project_state()
@@ -3161,9 +5004,12 @@ class ForgeTab(QtWidgets.QWidget):
             return
         self._tab_active = False
         self._preview_refresh_requested = False
+        self._refresh_timer.stop()
+        self._catalog_refresh_timer.stop()
+        self._card_layout_timer.stop()
+        self._scroll_restore_timer.stop()
         self.saved_panel.hide()
         self.preview_visibility_changed.emit(False)
-        self.preview_files_release_requested.emit()
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
@@ -3174,6 +5020,25 @@ class ForgeTab(QtWidgets.QWidget):
         super().hideEvent(event)
 
     def shutdown_operations(self, timeout_ms: int | None = None) -> bool:
+        deadline = (
+            None
+            if timeout_ms is None
+            else monotonic() + (max(0, int(timeout_ms)) / 1000.0)
+        )
+        cover_timeout_ms = (
+            None
+            if deadline is None
+            else max(0, int((deadline - monotonic()) * 1000))
+        )
+        if not self._stop_cover_decode_tasks(cover_timeout_ms):
+            return False
+        catalog_timeout_ms = (
+            None
+            if deadline is None
+            else max(0, int((deadline - monotonic()) * 1000))
+        )
+        if not self._stop_catalog_reconcile_tasks(catalog_timeout_ms):
+            return False
         threads = tuple(
             thread
             for thread in (
@@ -3187,10 +5052,15 @@ class ForgeTab(QtWidgets.QWidget):
             thread.quit()
         stopped = True
         for thread in threads:
+            remaining_ms = (
+                None
+                if deadline is None
+                else max(0, int((deadline - monotonic()) * 1000))
+            )
             thread_stopped = (
                 thread.wait()
-                if timeout_ms is None
-                else thread.wait(max(0, int(timeout_ms)))
+                if remaining_ms is None
+                else thread.wait(remaining_ms)
             )
             stopped = bool(thread_stopped) and stopped
         if stopped:
@@ -3202,11 +5072,117 @@ class ForgeTab(QtWidgets.QWidget):
             self._operation_failure = None
             self._operation_error_message = ""
             self._busy = False
+            self._busy_operation = ""
             self._finish_restore_activity()
+            finish_publication = getattr(
+                self,
+                "_finish_publication_activity",
+                None,
+            )
+            if callable(finish_publication):
+                finish_publication()
         return stopped
 
+    def shutdown(self, timeout_ms: int | None = 5000) -> bool:
+        """Stop Forge-owned work, callbacks, timers, watchers, and popups."""
+        if self._shutdown:
+            return True
+        if not self.shutdown_operations(timeout_ms=timeout_ms):
+            return False
+
+        self.deactivate_for_tab_change()
+        timers = (
+            self._card_layout_timer,
+            self._refresh_timer,
+            self._status_timer,
+            self._catalog_refresh_timer,
+            self._scroll_restore_timer,
+            self._metadata_timer,
+        )
+        for timer in (*timers, getattr(self, "_github_reconnect_timer", None)):
+            if timer is None:
+                continue
+            timer.stop()
+
+        if self._pending_metadata_update is not None:
+            try:
+                self._run_pending_metadata_update()
+            except Exception:
+                _LOGGER.exception("Pending Forge metadata could not be finalized.")
+
+        self._shutdown = True
+        github_service = getattr(self, "_github_service", None)
+        github_listener = getattr(self, "_github_state_listener", None)
+        if github_service is not None and github_listener is not None:
+            github_service.unsubscribe(github_listener)
+        self._preview_refresh_requested = False
+        self._pending_metadata_update = None
+        self._pending_publish_context = None
+        self._pending_unpublish_context = None
+        self._pending_publish_retry_attempt = 0
+        self._pending_unpublish_retry_attempt = 0
+        self._operation_success = None
+        self._operation_failure = None
+        self._operation_error_message = ""
+        self._finish_restore_activity()
+        finish_publication = getattr(
+            self,
+            "_finish_publication_activity",
+            None,
+        )
+        if callable(finish_publication):
+            finish_publication()
+
+        watched = (
+            self._catalog_watcher.directories()
+            + self._catalog_watcher.files()
+        )
+        if watched:
+            self._catalog_watcher.removePaths(watched)
+        self._catalog_watcher.blockSignals(True)
+        try:
+            self.settings.changed.disconnect(self._on_settings_changed)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            self._settings_refresh_requested.disconnect(self.schedule_refresh)
+        except (RuntimeError, TypeError):
+            pass
+        curtain_refresh = getattr(
+            self,
+            "_curtain_style_refresh_requested",
+            None,
+        )
+        curtain_styles = getattr(self, "curtain_styles", None)
+        if curtain_refresh is not None:
+            try:
+                curtain_refresh.disconnect(self._curtain_style_changed)
+            except (RuntimeError, TypeError):
+                pass
+        if curtain_styles is not None:
+            try:
+                curtain_styles.styleCommitted.disconnect(
+                    self._curtain_style_committed
+                )
+            except (RuntimeError, TypeError):
+                pass
+            if getattr(self, "_owns_curtain_styles", False):
+                curtain_styles.close()
+
+        self.saved_panel.close()
+        self.github_account_dialog.close()
+        github_auth_dialog = getattr(
+            self,
+            "github_auth_dialog",
+            getattr(self, "github_device_dialog", None),
+        )
+        if github_auth_dialog is not None:
+            github_auth_dialog.finish()
+        self.readiness_window.shutdown()
+        return True
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        if not self.shutdown_operations(timeout_ms=5000):
+        if not self.shutdown(timeout_ms=5000):
             event.ignore()
             self._set_status(
                 "Finish the current Forge operation before closing.",
@@ -3214,9 +5190,4 @@ class ForgeTab(QtWidgets.QWidget):
                 timeout_ms=0,
             )
             return
-        self.settings.changed.disconnect(self._on_settings_changed)
-        self.saved_panel.close()
-        self.github_account_dialog.close()
-        self.github_device_dialog.finish()
-        self.readiness_window.shutdown()
         super().closeEvent(event)

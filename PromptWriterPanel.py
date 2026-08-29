@@ -10,9 +10,11 @@ import json
 import logging
 import random
 import re
+import shutil
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import Callable, Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QEasingCurve, QUrl
@@ -20,15 +22,18 @@ from PySide6.QtGui import QDesktopServices, QColor
 from PySide6.QtWidgets import QGraphicsDropShadowEffect
 
 from app_icon import apply_qt_window_icon, configure_windows_app_identity
+from image_button import set_control_invisible
 from language_service import get_language_service
 from project_paths import application_paths
+from save_schema import PROMPT_WRITER_STATE_VERSION
 from settings_store import (
     DEFAULT_VISIONARY_URL,
     SettingsStore,
     VISIONARY_URL_KEY,
 )
-from window_chrome import StandardTitleBar
-from transactional_io import atomic_write_text, safe_write_json
+from window_chrome import MINIMIZE_SYMBOL, StandardTitleBar
+from transactional_io import atomic_write_text, safe_write_json, set_path_hidden
+from ui_dialogs import LetterSmithConfirmationDialog, show_lettersmith_message
 from ui_help import set_control_help
 
 
@@ -40,9 +45,39 @@ LOGGER = logging.getLogger(__name__)
 # ---------------------------
 
 _FILE_CACHE: Dict[str, Tuple[List[str], Optional[Path], Optional[Tuple[int, int]]]] = {}
-PROMPT_WRITER_STATE_VERSION = 6
 PROMPT_LANGUAGE_VERSION = 2
 STATE_PERSIST_DEBOUNCE_MS = 350
+MAX_INVALID_STATE_BACKUPS = 3
+
+
+def _backup_invalid_prompt_writer_state(path: Path) -> None:
+    if not path.is_file():
+        return
+    backup = path.with_name(
+        "prompt_writer_state.invalid."
+        f"{time.strftime('%Y%m%d-%H%M%S')}.{time.time_ns()}.json"
+    )
+    try:
+        shutil.copy2(path, backup)
+        set_path_hidden(backup)
+    except OSError:
+        LOGGER.exception("Invalid Prompt Writer state backup failed: %s", backup)
+        return
+    backups = sorted(
+        path.parent.glob("prompt_writer_state.invalid.*.json"),
+        key=lambda candidate: candidate.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for stale in backups[MAX_INVALID_STATE_BACKUPS:]:
+        try:
+            stale.unlink()
+        except OSError:
+            LOGGER.exception(
+                "Could not remove old Prompt Writer state backup: %s",
+                stale,
+            )
+
+
 MAX_STATE_TEXT_LENGTH = 24000
 MAX_GENERATED_PROMPT_LENGTH = 24000
 MAX_MANAGED_LIST_ENTRY_LENGTH = 300
@@ -68,8 +103,18 @@ PROMPT_COLORS: Dict[str, str] = {
 def prompt_color(semantic_key: str) -> str:
     return PROMPT_COLORS[semantic_key]
 
-COL_CHECK = "#005dff"
-COL_CHECK_MARK = "#ffd60a"
+
+def _service_app_font_family(service: object) -> str:
+    family = getattr(service, "app_font_family", "Segoe UI")
+    if callable(family):
+        family = family()
+    return str(family or "Segoe UI").strip() or "Segoe UI"
+
+
+def _qss_font_family(family: object) -> str:
+    return str(family or "Segoe UI").replace("\\", "\\\\").replace("'", "\\'")
+
+
 COL_HEADER_TEXT = "#72c8c8"
 UI_ACCENT = "#00b2b2"
 UI_ACCENT_SOFT = "#263535"
@@ -321,6 +366,15 @@ class ManagedListEntry:
 
 
 class HeaderAwareItemDelegate(QtWidgets.QStyledItemDelegate):
+    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
+        super().__init__(parent)
+        self._header_color = QColor(COL_HEADER_TEXT)
+
+    def apply_theme_tokens(self, tokens: object | None) -> None:
+        self._header_color = QColor(
+            str(getattr(tokens, "primary", COL_HEADER_TEXT))
+        )
+
     def paint(
         self,
         painter: QtGui.QPainter,
@@ -333,7 +387,7 @@ class HeaderAwareItemDelegate(QtWidgets.QStyledItemDelegate):
             font = QtGui.QFont(option.font)
             font.setBold(True)
             painter.setFont(font)
-            painter.setPen(QColor(COL_HEADER_TEXT))
+            painter.setPen(self._header_color)
             painter.drawText(rect, Qt.AlignVCenter | Qt.TextSingleLine, index.data(Qt.DisplayRole) or "")
             painter.restore()
             return
@@ -372,6 +426,15 @@ class ClickThroughNotice(QtWidgets.QLabel):
         app = QtWidgets.QApplication.instance()
         if app is not None:
             app.applicationStateChanged.connect(self._on_application_state_changed)
+
+    def apply_theme_tokens(self, tokens: object | None) -> None:
+        self.setStyleSheet(
+            "QLabel#clickThroughNotice{"
+            f"background:{getattr(tokens, 'panel_background', '#101820')};"
+            f"color:{getattr(tokens, 'text', '#dff7ff')};"
+            f"border:1px solid {getattr(tokens, 'accent', '#35c8e6')};"
+            "border-radius:8px;font-weight:700;}"
+        )
 
     def show_message(self, text: str, *, anchor: QtWidgets.QWidget) -> None:
         self.setText(text)
@@ -429,6 +492,7 @@ class ListManagerDialog(QtWidgets.QDialog):
         allow_headers: bool = False,
         auto_user_header: Optional[str] = None,
         user_owned_only: bool = False,
+        app_font_family: str = "Segoe UI",
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -439,6 +503,7 @@ class ListManagerDialog(QtWidgets.QDialog):
         self._allow_headers = bool(allow_headers)
         self._auto_user_header = _normalize_text(auto_user_header, strip=True, max_length=120)
         self._user_owned_only = bool(user_owned_only)
+        self._header_color = QColor(COL_HEADER_TEXT)
         self._duplicate_notice = ClickThroughNotice(self)
         self.setWindowTitle(f"Manage {title}")
         self.setModal(False)
@@ -524,8 +589,7 @@ class ListManagerDialog(QtWidgets.QDialog):
         self.btn_remove.clicked.connect(self._remove_entry)
         self.entry_edit.returnPressed.connect(self._submit_from_enter)
 
-        self.setStyleSheet(
-            """
+        self._base_stylesheet = """
             QDialog {
                 background: #1a1b1d;
                 border: 1px solid #343a3e;
@@ -533,15 +597,16 @@ class ListManagerDialog(QtWidgets.QDialog):
             }
             QLabel {
                 color: #edf7fb;
-                font-family: 'Segoe UI';
+                font-family: '__APP_FONT_FAMILY__';
             }
             QLabel#managerTitle {
                 color: #f2fbff;
-                font: 700 15px 'Segoe UI';
+                font-size: 15px;
+                font-weight: 700;
             }
             QLabel#managerHint {
                 color: #93a7b3;
-                font: 10px 'Segoe UI';
+                font-size: 10px;
             }
             QListWidget {
                 background: #151719;
@@ -582,10 +647,32 @@ class ListManagerDialog(QtWidgets.QDialog):
                 border-color: #293942;
             }
             """
-        )
+        self.apply_app_font_family(app_font_family)
 
         self._refresh_list()
         self._sync_button_state()
+
+    def apply_app_font_family(self, family: object) -> None:
+        family_name = str(family or "Segoe UI").strip() or "Segoe UI"
+        font = self.font()
+        font.setFamily(family_name)
+        self.setFont(font)
+        self.setStyleSheet(
+            self._base_stylesheet.replace(
+                "'__APP_FONT_FAMILY__'",
+                f"'{_qss_font_family(family_name)}'",
+            )
+        )
+
+    def apply_theme_tokens(self, tokens: object | None) -> None:
+        self._header_color = QColor(
+            str(getattr(tokens, "primary", COL_HEADER_TEXT))
+        )
+        self._duplicate_notice.apply_theme_tokens(tokens)
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            if bool(item.data(MANAGED_LIST_HEADER_ROLE)):
+                item.setForeground(self._header_color)
 
     def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
         if self.isVisible() and event.type() == QtCore.QEvent.MouseButtonPress:
@@ -732,7 +819,7 @@ class ListManagerDialog(QtWidgets.QDialog):
                 font = item.font()
                 font.setBold(True)
                 item.setFont(font)
-                item.setForeground(QColor(COL_HEADER_TEXT))
+                item.setForeground(self._header_color)
             self.list_widget.addItem(item)
         self.list_widget.blockSignals(False)
 
@@ -779,7 +866,7 @@ class ListManagerDialog(QtWidgets.QDialog):
     def _add_entry(self) -> None:
         entry = self._current_form_entry()
         if entry is None:
-            QtWidgets.QMessageBox.warning(self, "Invalid entry", "Enter a non-empty option.")
+            show_lettersmith_message(self, "Invalid entry", "Enter a non-empty option.")
             return
         conflict = self._duplicate_conflict(entry.text)
         if conflict is not None:
@@ -1080,17 +1167,21 @@ def _serialize_managed_list_entries(entries: List[ManagedListEntry], *, allow_he
     return ("\n".join(lines).rstrip() + "\n") if lines else ""
 
 
-def render_prompt_html(payload: PromptPayload) -> str:
+def render_prompt_html(
+    payload: PromptPayload,
+    *,
+    color_for: Callable[[str], str] = prompt_color,
+) -> str:
     """Render the preview with colored values (preview should match emitted text)."""
     page = _page_spec_for(payload.page_key)
-    col_img = page.preview_color if page is not None else prompt_color("back")
+    col_img = page.preview_color if page is not None else color_for("back")
     parts: list[str] = []
 
     first = _join_nonempty(payload.role_sentence, payload.order_fragment)
     if payload.subject_fragment.strip():
         first = (first + " " if first else "") + _span(
             payload.subject_fragment.strip(),
-            prompt_color("subject"),
+            color_for("subject"),
             bold=True,
         )
     if first:
@@ -1102,21 +1193,21 @@ def render_prompt_html(payload: PromptPayload) -> str:
     if payload.color_choice.strip():
         parts.append(
             "Use the "
-            + _span(payload.color_choice.strip(), prompt_color("scheme"), bold=True)
+            + _span(payload.color_choice.strip(), color_for("scheme"), bold=True)
             + " palette."
         )
 
     if payload.type_choice.strip():
         parts.append(
             "Use "
-            + _span(payload.type_choice.strip(), prompt_color("type"), bold=True)
+            + _span(payload.type_choice.strip(), color_for("type"), bold=True)
             + " as the visual style."
         )
 
     if payload.global_extra.strip():
         parts.append(
             "Shared visual direction: "
-            + _span(payload.global_extra.strip(), prompt_color("global"))
+            + _span(payload.global_extra.strip(), color_for("global"))
         )
 
     if payload.image_extra.strip():
@@ -1126,7 +1217,7 @@ def render_prompt_html(payload: PromptPayload) -> str:
         parts.append(_html_escape(_format_effort_line(payload.effort_line)))
 
     if payload.guidance_lines:
-        helpful_color = prompt_color("helpful")
+        helpful_color = color_for("helpful")
         g = "<br>".join(_span(f"- {line}", helpful_color) for line in payload.guidance_lines)
         parts.append(_span("Guidance:", helpful_color, bold=True) + "<br>" + g)
 
@@ -1140,14 +1231,26 @@ CHECKBOX_QSS = """
 QCheckBox {
     color: #d9e6ec;
     spacing: 8px;
-    font: 10px 'Segoe UI';
+    font-size: 10px;
 }
 QCheckBox:disabled { color: #667985; }
 """
 
 
 class GoldenCheckBox(QtWidgets.QCheckBox):
-    """Checkbox with a blue selected box and a golden painted check mark."""
+    """Checkbox painted from the active application's semantic theme."""
+
+    def __init__(
+        self,
+        text: str = "",
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
+        super().__init__(text, parent)
+        self._theme_tokens: object | None = None
+
+    def apply_theme_tokens(self, tokens: object | None) -> None:
+        self._theme_tokens = tokens
+        self.update()
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         del event
@@ -1172,15 +1275,46 @@ class GoldenCheckBox(QtWidgets.QCheckBox):
             contents = QtCore.QRect(size + 8, 0, max(0, self.width() - size - 8), self.height())
 
         hovered = bool(option.state & QtWidgets.QStyle.State_MouseOver)
-        border = QColor(UI_ACCENT if self.isChecked() else ("#48616f" if hovered else "#344956"))
-        fill = QColor("#123d49" if self.isChecked() else ("#17232c" if hovered else "#0c141a"))
+        tokens = self._theme_tokens
+        border = QColor(
+            str(
+                getattr(
+                    tokens,
+                    "accent"
+                    if self.isChecked()
+                    else "primary"
+                    if hovered
+                    else "control_border",
+                    UI_ACCENT if self.isChecked() else "#48616f" if hovered else "#344956",
+                )
+            )
+        )
+        fill = QColor(
+            str(
+                getattr(
+                    tokens,
+                    "selected_background"
+                    if self.isChecked()
+                    else "hover"
+                    if hovered
+                    else "control_background",
+                    "#123d49" if self.isChecked() else "#17232c" if hovered else "#0c141a",
+                )
+            )
+        )
 
         painter.setPen(QtGui.QPen(border, 1.35))
         painter.setBrush(fill)
         painter.drawRoundedRect(QtCore.QRectF(indicator), 3, 3)
 
         if self.isChecked():
-            pen = QtGui.QPen(QColor(UI_TEXT_PRIMARY), 2.35, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            pen = QtGui.QPen(
+                QColor(str(getattr(tokens, "selected_text", UI_TEXT_PRIMARY))),
+                2.35,
+                Qt.SolidLine,
+                Qt.RoundCap,
+                Qt.RoundJoin,
+            )
             painter.setPen(pen)
             path = QtGui.QPainterPath()
             path.moveTo(indicator.left() + 3.5, indicator.center().y() + 0.5)
@@ -1188,7 +1322,17 @@ class GoldenCheckBox(QtWidgets.QCheckBox):
             path.lineTo(indicator.right() - 3.0, indicator.top() + 4.0)
             painter.drawPath(path)
 
-        painter.setPen(QColor("#d9e6ec" if self.isEnabled() else "#667985"))
+        painter.setPen(
+            QColor(
+                str(
+                    getattr(
+                        tokens,
+                        "text" if self.isEnabled() else "muted_text",
+                        "#d9e6ec" if self.isEnabled() else "#667985",
+                    )
+                )
+            )
+        )
         painter.drawText(contents, Qt.AlignVCenter | Qt.AlignLeft, self.text())
         painter.end()
 
@@ -1401,6 +1545,7 @@ def reset_prompt_writer_state_file(project_root: str | Path) -> bool:
 
 class PromptWriterPanel(QtWidgets.QWidget):
     dismissed = QtCore.Signal()
+    project_changed = QtCore.Signal()
     prompts_generated = QtCore.Signal(dict, dict)  # prompts_map, debug_map
 
     def __init__(
@@ -1412,7 +1557,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
     ):
         super().__init__(parent)
         self.setObjectName("PromptWriterPanel")
-        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.FramelessWindowHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowCloseButtonHint
+        )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
         self.project_root = Path(project_root).resolve() if project_root else self._discover_project_root()
@@ -1423,16 +1573,15 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         # Prompt Writer persistence (separate file so other modules can\'t overwrite it)
         self._state_path = self.application_paths.workspace_root / "prompt_writer_state.json"
+        set_path_hidden(self._state_path)
         self._persist_timer = QtCore.QTimer(self)
         self._persist_timer.setSingleShot(True)
         self._persist_timer.timeout.connect(self._persist_state_now)
         self._state_persistence_suspended = False
+        self._state_write_blocked = False
         self._shutdown = False
 
-        self._drag_pos: Optional[QtCore.QPoint] = None
-        self._is_maximized: bool = False
         self._normal_geometry: Optional[QtCore.QRect] = None
-        self._header_draggable_height = 0
 
         self._geom_anim = QtCore.QPropertyAnimation(self, b"geometry", self)
         self._fade_anim = QtCore.QPropertyAnimation(self, b"windowOpacity", self)
@@ -1473,15 +1622,22 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._last_focused_widget: Optional[QtWidgets.QTextEdit] = None
         self._list_manager_dialogs: Dict[str, ListManagerDialog] = {}
         self._list_save_in_progress = False
+        self._app_font_family = "Segoe UI"
+        self._theme_tokens: object | None = None
+        self._ui_header_color = QColor(COL_HEADER_TEXT)
 
         self._build_ui()
         self._apply_styles()
+        theme_service = getattr(parent, "theme_service", None)
+        if theme_service is not None:
+            self.apply_theme_assets(theme_service)
         self.refresh_semantic_palette()
         self._connect_signals()
 
         self._load_colors_into_combo()
         self._start_visionary_pulse()
         self.reload_project_state()
+        self._sync_action_button_states()
 
     def _module_path(self, name: str) -> Path:
         return self._builtin_modules_dir() / name
@@ -1637,7 +1793,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         font = item.font()
         font.setBold(True)
         item.setFont(font)
-        item.setForeground(QColor(COL_HEADER_TEXT))
+        item.setForeground(self._ui_header_color)
 
     def _populate_managed_combo(
         self,
@@ -1775,7 +1931,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._schedule_persist_state(0)
         except (OSError, UnicodeError, ValueError, TypeError) as error:
             LOGGER.exception("Prompt Writer list save failed: %s (%s)", path, error)
-            QtWidgets.QMessageBox.warning(
+            show_lettersmith_message(
                 self,
                 "Save failed",
                 f"Could not save {config['title']} to:\n{path}\n\n{error}",
@@ -1797,11 +1953,13 @@ class PromptWriterPanel(QtWidgets.QWidget):
             allow_headers=bool(config["allow_headers"]),
             auto_user_header=config.get("auto_user_header"),
             user_owned_only=key == "color",
+            app_font_family=self._app_font_family,
             parent=self,
         )
         dialog.entries_changed.connect(lambda entries, list_key=key: self._apply_managed_list_changes(list_key, entries))
         dialog.finished.connect(lambda *_args, list_key=key: self._list_manager_dialogs.pop(list_key, None))
         self._list_manager_dialogs[key] = dialog
+        dialog.apply_theme_tokens(self._theme_tokens)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
@@ -1827,6 +1985,13 @@ class PromptWriterPanel(QtWidgets.QWidget):
         """
         try:
             self._persist_timer.stop()
+            if self._state_write_blocked:
+                LOGGER.error(
+                    "Prompt Writer state was written by a newer version and "
+                    "will not be overwritten: %s",
+                    self._state_path,
+                )
+                return False
             state = self._capture_state()
             safe_write_json(self._state_path, state)
             return True
@@ -2055,13 +2220,50 @@ class PromptWriterPanel(QtWidgets.QWidget):
         """
         try:
             state = None
+            self._state_write_blocked = False
 
             try:
                 if self._state_path.exists():
                     state = json.loads(self._state_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError) as error:
                 LOGGER.exception("Prompt Writer state could not be read: %s (%s)", self._state_path, error)
+                _backup_invalid_prompt_writer_state(self._state_path)
                 state = None
+
+            if state is not None and not isinstance(state, dict):
+                LOGGER.error(
+                    "Prompt Writer state root is invalid: %s",
+                    self._state_path,
+                )
+                _backup_invalid_prompt_writer_state(self._state_path)
+                state = None
+            if isinstance(state, dict):
+                raw_version = state.get("version", 0)
+                try:
+                    source_version = (
+                        -1
+                        if isinstance(raw_version, bool)
+                        else int(raw_version)
+                    )
+                except (TypeError, ValueError):
+                    source_version = -1
+                if source_version > PROMPT_WRITER_STATE_VERSION:
+                    self._state_write_blocked = True
+                    LOGGER.error(
+                        "Prompt Writer state schema %s is newer than supported "
+                        "schema %s: %s",
+                        source_version,
+                        PROMPT_WRITER_STATE_VERSION,
+                        self._state_path,
+                    )
+                    return False
+                if source_version < 0:
+                    LOGGER.error(
+                        "Prompt Writer state version is invalid: %s",
+                        self._state_path,
+                    )
+                    _backup_invalid_prompt_writer_state(self._state_path)
+                    state = None
 
             state = self._normalize_persisted_state(state)
             if not state:
@@ -2156,9 +2358,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "Prompt Writer",
             show_minimize=False,
             on_close=self._on_close,
-            on_minimize=self.showMinimized,
-            on_toggle_maximize=self._toggle_max_restore,
-            is_maximized=lambda: self._is_maximized,
+            close_icon_asset="titlebar/minimize.png",
+            close_fallback_symbol=MINIMIZE_SYMBOL,
+            close_danger=False,
         )
         cl.addWidget(self.title_bar)
 
@@ -2211,14 +2413,14 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.btn_visionary.setStyleSheet(
             "QPushButton#visionary_btn{"
             "background:#25282b;border:1px solid #00b2b2;border-radius:10px;padding:5px 12px;"
-            "font:700 10px 'Segoe UI';color:#dffbff;"
+            "font-weight:700;font-size:10px;color:#dffbff;"
             "}"
             "QPushButton#visionary_btn:hover{background:#293537;color:#ffffff;}"
         )
         self._visionary_effect = QGraphicsDropShadowEffect(self.btn_visionary)
         self._visionary_effect.setBlurRadius(32)
         self._visionary_effect.setOffset(0, 0)
-        self._visionary_effect.setColor(QColor("#2d6bff"))
+        self._visionary_effect.setColor(QColor(UI_ACCENT))
         self.btn_visionary.setGraphicsEffect(self._visionary_effect)
         self.btn_visionary.clicked.connect(self._open_visionary)
         _set_help(
@@ -2375,7 +2577,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             group.setStyleSheet(
                 f"QGroupBox#{object_name} {{"
                 f"color: {COL_HEADER_TEXT};"
-                "font: 700 10px 'Segoe UI';"
+                "font-weight:700;font-size:10px;"
                 "background: #1b1d20;"
                 "border: 1px solid #303438;"
                 "border-radius: 11px;"
@@ -2616,12 +2818,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
         right_v.addWidget(self._preview_scroll, 1)
 
     def _apply_styles(self):
-        self.setStyleSheet(
-            """
+        stylesheet = """
             QWidget#PromptWriterPanel {
                 background: rgba(0,0,0,0);
                 color: #d9e6ec;
-                font-family: 'Segoe UI';
+                font-family: '__APP_FONT_FAMILY__';
                 font-size: 11px;
             }
             QFrame#container {
@@ -2655,25 +2856,25 @@ class PromptWriterPanel(QtWidgets.QWidget):
             }
             QLabel#columnTitle {
                 color: #f2fbff;
-                font: 650 14px 'Segoe UI';
+                font: 650 14px '__APP_FONT_FAMILY__';
             }
             QLabel#columnHint,
             QLabel#sectionHint,
             QLabel#visionaryPrefix {
                 color: #93a7b3;
-                font: 10px 'Segoe UI';
+                font: 10px '__APP_FONT_FAMILY__';
             }
             QLabel#sectionTitle {
                 color: #eaf8fc;
-                font: 700 12px 'Segoe UI';
+                font: 700 12px '__APP_FONT_FAMILY__';
             }
             QLabel[inputLabel="true"] {
                 color: #b9ccd5;
-                font: 600 10px 'Segoe UI';
+                font: 600 10px '__APP_FONT_FAMILY__';
             }
             QLabel[pageDetailLabel="true"],
             QLabel[promptTitle="true"] {
-                font: 700 10px 'Segoe UI';
+                font: 700 10px '__APP_FONT_FAMILY__';
             }
             QPushButton {
                 padding: 6px 12px;
@@ -2681,7 +2882,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 border: 1px solid #3a4045;
                 color: #edf7fb;
                 border-radius: 10px;
-                font: 600 10px 'Segoe UI';
+                font: 600 10px '__APP_FONT_FAMILY__';
             }
             QPushButton:hover {
                 background: #293537;
@@ -2796,7 +2997,55 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 padding: 6px 8px;
             }
             """ + CHECKBOX_QSS
+        self.setStyleSheet(
+            stylesheet.replace(
+                "'__APP_FONT_FAMILY__'",
+                f"'{_qss_font_family(self._app_font_family)}'",
+            )
         )
+
+    def apply_theme_assets(self, service: object) -> None:
+        """Refresh Prompt Writer chrome, colors, and application typography."""
+        self._theme_tokens = getattr(service, "tokens", None)
+        self._ui_header_color = QColor(
+            str(getattr(self._theme_tokens, "primary", COL_HEADER_TEXT))
+        )
+        self._app_font_family = _service_app_font_family(service)
+        font = self.font()
+        font.setFamily(self._app_font_family)
+        self.setFont(font)
+        self._apply_styles()
+
+        title_bar = getattr(self, "title_bar", None)
+        if isinstance(title_bar, StandardTitleBar):
+            title_bar.apply_theme_assets(service)
+
+        for dialog in tuple(self._list_manager_dialogs.values()):
+            try:
+                dialog.apply_app_font_family(self._app_font_family)
+                dialog.apply_theme_tokens(self._theme_tokens)
+            except RuntimeError:
+                continue
+
+        for checkbox in self.findChildren(GoldenCheckBox):
+            checkbox.apply_theme_tokens(self._theme_tokens)
+        for combo in (self.cmb_type, self.cmb_subject, self.cmb_color):
+            delegate = combo.itemDelegate()
+            if isinstance(delegate, HeaderAwareItemDelegate):
+                delegate.apply_theme_tokens(self._theme_tokens)
+            model = combo.model()
+            for row in range(combo.count()):
+                item = model.item(row) if hasattr(model, "item") else None
+                if item is not None and bool(item.data(MANAGED_LIST_HEADER_ROLE)):
+                    item.setForeground(self._ui_header_color)
+            combo.view().viewport().update()
+
+        self._set_visionary_theme_colors()
+
+        apply_semantic_styles = getattr(service, "apply_semantic_styles", None)
+        if callable(apply_semantic_styles):
+            apply_semantic_styles(self)
+        self.refresh_semantic_palette()
 
     def _open_visionary(self) -> None:
         self._copy_all_prompts_text()
@@ -2885,12 +3134,51 @@ class PromptWriterPanel(QtWidgets.QWidget):
             for page in self._page_specs
         )
         self._generated_output_valid = bool(valid and signature_matches and all_pages_present)
-        self.btn_copy.setEnabled(self._generated_output_valid)
+        self._sync_action_button_states()
+
+    def _has_erasable_content(self) -> bool:
+        state = self._capture_state()
+        return any(
+            (
+                str(state.get("type", "")).strip(),
+                str(state.get("subject", "")).strip(),
+                str(state.get("color", "")).strip(),
+                str(state.get("global", "")).strip(),
+                any(
+                    str(state.get(page.key, "")).strip()
+                    for page in self._page_specs
+                ),
+                any(bool(value) for value in dict(state.get("checks", {})).values()),
+                bool(self._generated_prompts),
+            )
+        )
+
+    def _sync_action_button_states(self) -> None:
+        busy = self._generation_in_progress
+        set_control_invisible(
+            self.btn_generate,
+            busy,
+            available=bool(self.cmb_subject.currentText().strip()),
+        )
+        set_control_invisible(
+            self.btn_copy,
+            busy,
+            available=self._generated_output_valid,
+        )
+        set_control_invisible(
+            self.btn_erase,
+            busy,
+            available=self._has_erasable_content(),
+        )
         for page in self._page_specs:
             if page.copy_button is not None:
-                page.copy_button.setEnabled(
-                    self._generated_output_valid
-                    and bool(self._generated_prompts.get(page.key, "").strip())
+                set_control_invisible(
+                    page.copy_button,
+                    busy,
+                    available=(
+                        self._generated_output_valid
+                        and bool(self._generated_prompts.get(page.key, "").strip())
+                    ),
                 )
 
     def _invalidate_generated_output(self) -> None:
@@ -2905,6 +3193,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def _on_prompt_input_changed(self, *_args: object) -> None:
         self._invalidate_generated_output()
         self._schedule_persist_state()
+        self.project_changed.emit()
 
     def _build_copy_all_text(self) -> str:
         if not self._generated_output_valid:
@@ -2931,7 +3220,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             QtWidgets.QApplication.clipboard().setText(all_text)
         except (RuntimeError, OSError) as error:
             LOGGER.exception("Prompt Writer Copy All failed: %s", error)
-            QtWidgets.QMessageBox.warning(
+            show_lettersmith_message(
                 self,
                 "Copy failed",
                 "The generated prompts could not be copied to the clipboard.",
@@ -3030,7 +3319,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             document,
             subject_start,
             len(subject),
-            prompt_color("subject"),
+            self._display_prompt_color("subject"),
             bold=True,
         )
 
@@ -3051,21 +3340,21 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "Use ",
             type_choice,
             " as the visual style.",
-            prompt_color("type"),
+            self._display_prompt_color("type"),
             bold=True,
         )
         color_exact(
             "Use the ",
             color_choice,
             " palette.",
-            prompt_color("scheme"),
+            self._display_prompt_color("scheme"),
             bold=True,
         )
         color_exact(
             "Shared visual direction: ",
             global_extra,
             "",
-            prompt_color("global"),
+            self._display_prompt_color("global"),
         )
         color_exact("Page-specific direction: ", image_extra, "", page.preview_color)
 
@@ -3078,13 +3367,13 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 document,
                 guidance_start,
                 guidance_end - guidance_start,
-                prompt_color("helpful"),
+                self._display_prompt_color("helpful"),
             )
             self._color_preview_range(
                 document,
                 guidance_start,
                 len("Guidance:"),
-                prompt_color("helpful"),
+                self._display_prompt_color("helpful"),
                 bold=True,
             )
 
@@ -3098,6 +3387,30 @@ class PromptWriterPanel(QtWidgets.QWidget):
         PROMPT_COLORS[semantic_key] = parsed.name().upper()
         self.refresh_semantic_palette()
 
+    def _display_prompt_color(self, semantic_key: str) -> str:
+        configured = QColor(prompt_color(semantic_key))
+        theme_text = QColor(
+            str(getattr(self._theme_tokens, "text", configured.name()))
+        )
+        if not configured.isValid() or not theme_text.isValid():
+            return prompt_color(semantic_key)
+        configured_chroma = max(
+            configured.red(),
+            configured.green(),
+            configured.blue(),
+        ) - min(
+            configured.red(),
+            configured.green(),
+            configured.blue(),
+        )
+        opposite_polarity = (
+            configured.lightness() >= 160 > theme_text.lightness()
+            or configured.lightness() <= 95 < theme_text.lightness()
+        )
+        if configured_chroma < 32 and opposite_polarity:
+            return theme_text.name()
+        return configured.name()
+
     def refresh_semantic_palette(self) -> None:
         """Apply the centralized semantic palette to every live consumer."""
         labels = (
@@ -3109,7 +3422,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
         )
         for label, semantic_key in labels:
             if label is not None:
-                label.setStyleSheet(f"color:{prompt_color(semantic_key)};")
+                label.setStyleSheet(
+                    f"color:{self._display_prompt_color(semantic_key)};"
+                )
 
         for page in getattr(self, "_page_specs", ()):
             page_color = page.preview_color
@@ -3127,17 +3442,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def _set_generation_busy(self, busy: bool) -> None:
         self._generation_in_progress = bool(busy)
-        for name in ("btn_generate", "btn_erase"):
-            widget = getattr(self, name, None)
-            if widget is not None:
-                widget.setEnabled(not busy)
-        if busy:
-            self.btn_copy.setEnabled(False)
-            for page in self._page_specs:
-                if page.copy_button is not None:
-                    page.copy_button.setEnabled(False)
-        else:
-            self._set_generated_output_valid(self._generated_output_valid)
+        self._sync_action_button_states()
 
     def _validate_generated_prompt_set(self, prompts: Dict[str, str]) -> None:
         expected = {page.key for page in self._page_specs}
@@ -3250,7 +3555,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             return
         subject = self.cmb_subject.currentText().strip()
         if not subject:
-            QtWidgets.QMessageBox.warning(self, "Missing subject", "Please enter a Subject.")
+            show_lettersmith_message(self, "Missing subject", "Please enter a Subject.")
             return
 
         self._set_generation_busy(True)
@@ -3339,7 +3644,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 payload = per_data_map.get(page.key, {}).get("payload")
                 if not isinstance(payload, PromptPayload):
                     continue
-                page.preview_widget.setHtml(render_prompt_html(payload))
+                page.preview_widget.setHtml(
+                    render_prompt_html(
+                        payload,
+                        color_for=self._display_prompt_color,
+                    )
+                )
 
             self.prompts_generated.emit(
                 {
@@ -3353,15 +3663,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     if page.key in debug_map
                 },
             )
+            self.project_changed.emit()
             if not self._persist_state_now():
-                QtWidgets.QMessageBox.warning(
+                show_lettersmith_message(
                     self,
                     "Prompts generated",
                     "The prompts were generated, but the latest Prompt Writer state could not be saved.",
                 )
         except Exception:
             LOGGER.exception("Prompt Writer generation failed")
-            QtWidgets.QMessageBox.critical(
+            show_lettersmith_message(
                 self,
                 "Generation failed",
                 "The prompts could not be generated. Your previous generated prompts were kept.",
@@ -3409,7 +3720,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 QtWidgets.QApplication.clipboard().setText(text)
             except (RuntimeError, OSError) as error:
                 LOGGER.exception("Prompt Writer copy failed for %s: %s", panel_page.key, error)
-                QtWidgets.QMessageBox.warning(
+                show_lettersmith_message(
                     self,
                     "Copy failed",
                     "The prompt could not be copied to the clipboard.",
@@ -3462,7 +3773,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._geom_anim.stop()
             self._fade_anim.stop()
             self._generation_in_progress = False
-            return self._persist_state_now()
+            saved = self._persist_state_now()
+            if saved:
+                self.project_changed.emit()
+            return saved
         except (OSError, RuntimeError, ValueError, TypeError) as error:
             LOGGER.exception("Prompt Writer reset failed: %s", error)
             return False
@@ -3480,46 +3794,44 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 self._generated_prompts,
             )
         ):
-            answer = QtWidgets.QMessageBox.question(
+            confirmation = LetterSmithConfirmationDialog(
                 self,
-                "Erase all Prompt Writer content?",
-                "This clears the current Prompt Writer content but keeps built-in and user-created options.",
+                title="Erase Prompt Writer Content",
+                question=(
+                    "This clears the current Prompt Writer content but keeps "
+                    "built-in and user-created options."
+                ),
+                primary_text="Yes",
+                secondary_text="No",
+                destructive_primary=True,
+                click_outside_dismiss=False,
+                width=540,
             )
-            if answer != QtWidgets.QMessageBox.Yes:
+            if confirmation.exec() != QtWidgets.QDialog.Accepted:
                 return
         if not self.reset_prompt_writer_state():
-            QtWidgets.QMessageBox.critical(self, "Prompt Writer reset failed", "Prompt Writer could not be cleared or saved.")
-
-    def _toggle_max_restore(self) -> None:
-        screen_obj = self.screen() or QtGui.QGuiApplication.primaryScreen()
-        avail = screen_obj.availableGeometry() if screen_obj else QtGui.QGuiApplication.primaryScreen().availableGeometry()
-        if not self._is_maximized:
-            self._normal_geometry = self.geometry()
-            self.setGeometry(avail)
-            self._is_maximized = True
-        else:
-            if self._normal_geometry:
-                self.setGeometry(self._normal_geometry)
-            self._is_maximized = False
-        self.title_bar.sync_window_state()
+            show_lettersmith_message(
+                self,
+                "Prompt Writer reset failed",
+                "Prompt Writer could not be cleared or saved.",
+            )
 
     def _on_close(self):
         if self._shutdown:
             return
         self._proofread_visible_prompt_fields("close")
         if not self._persist_state_now():
-            QtWidgets.QMessageBox.warning(self, "Prompt Writer", "The current Prompt Writer state could not be saved.")
+            show_lettersmith_message(
+                self,
+                "Prompt Writer",
+                "The current Prompt Writer state could not be saved.",
+            )
         self.dismissed.emit()
         self.popdown()
 
     def _start_visionary_pulse(self):
         try:
-            self._visionary_colors = [
-                QColor("#008f8f"),
-                QColor("#00b2b2"),
-                QColor("#8ce3e3"),
-                QColor("#00b2b2"),
-            ]
+            self._set_visionary_theme_colors()
             self._visionary_index = 0
             self._visionary_timer = QtCore.QTimer(self)
             self._visionary_timer.setInterval(520)
@@ -3527,6 +3839,21 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._visionary_timer.start()
         except Exception:
             pass
+
+    def _set_visionary_theme_colors(self) -> None:
+        tokens = self._theme_tokens
+        primary = QColor(str(getattr(tokens, "primary", "#6d7b82")))
+        accent = QColor(str(getattr(tokens, "accent", "#aab4b9")))
+        secondary = QColor(str(getattr(tokens, "secondary_accent", "#7f9099")))
+        self._visionary_colors = [
+            primary.darker(115),
+            primary,
+            accent,
+            secondary,
+        ]
+        effect = getattr(self, "_visionary_effect", None)
+        if isinstance(effect, QGraphicsDropShadowEffect):
+            effect.setColor(primary)
 
     def _tick_visionary_pulse(self):
         try:
@@ -3542,7 +3869,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         style = (
             "QPushButton#visionary_btn{"
             "background:#25282b;border:1px solid %s;border-radius:10px;padding:5px 12px;"
-            "font:700 10px 'Segoe UI';color:#dffbff;"
+            "font-weight:700;font-size:10px;color:#dffbff;"
             "}"
             "QPushButton#visionary_btn:hover{background:#293537;color:#ffffff;}"
         ) % col.name()
@@ -3556,6 +3883,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._animation_generation += 1
         if self._shutdown:
             return
+        was_visible = self.isVisible()
         if self._proofread_visible_prompt_fields("open"):
             if not self._persist_state_now():
                 LOGGER.warning(
@@ -3567,9 +3895,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._geom_anim.stop()
         self._fade_anim.stop()
         self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        if self.isMinimized():
+            self.showNormal()
         self.show()
         self.raise_()
-        self.title_bar.sync_window_state()
 
         screen_obj = self.screen() or QtGui.QGuiApplication.primaryScreen()
         avail = screen_obj.availableGeometry() if screen_obj else QtGui.QGuiApplication.primaryScreen().availableGeometry()
@@ -3577,12 +3906,20 @@ class PromptWriterPanel(QtWidgets.QWidget):
         w = min(int(avail.width() * 0.816), 1104)
         h = min(int(avail.height() * 0.84), 860)
         target = QtCore.QRect(avail.x() + 24, avail.y() + 24, w, h)
+        if self._normal_geometry is not None and self._normal_geometry.isValid():
+            saved = self._normal_geometry
+            w = min(max(self.minimumWidth(), saved.width()), avail.width())
+            h = min(max(self.minimumHeight(), saved.height()), avail.height())
+            x = max(avail.left(), min(saved.x(), avail.right() - w + 1))
+            y = max(avail.top(), min(saved.y(), avail.bottom() - h + 1))
+            target = QtCore.QRect(x, y, w, h)
         off = QtCore.QRect(target.x() - w, target.y(), w, h)
 
         current = self.geometry()
-        if self.isVisible() and current.intersects(target):
+        if was_visible and not self.isMaximized():
+            target = current
             off = current
-        self.setWindowOpacity(0.0 if not self.isVisible() else min(1.0, self.windowOpacity()))
+        self.setWindowOpacity(0.0 if not was_visible else min(1.0, self.windowOpacity()))
         self.setGeometry(off)
         self._geom_anim.stop(); self._geom_anim.setDuration(260)
         self._geom_anim.setStartValue(off); self._geom_anim.setEndValue(target)
@@ -3599,6 +3936,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def popdown(self):
         if not self.isVisible():
             return
+        if self.isMaximized():
+            normal_geometry = self.normalGeometry()
+            if normal_geometry.isValid():
+                self._normal_geometry = QtCore.QRect(normal_geometry)
+            self.showNormal()
         visionary_timer = getattr(self, "_visionary_timer", None)
         if visionary_timer is not None:
             visionary_timer.stop()
@@ -3607,6 +3949,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._geom_anim.stop()
         self._fade_anim.stop()
         geom = self.geometry()
+        self._normal_geometry = QtCore.QRect(geom)
         off = QtCore.QRect(geom.x() - geom.width() - 20, geom.y(), geom.width(), geom.height())
         self._geom_anim.stop(); self._geom_anim.setDuration(200)
         self._geom_anim.setEasingCurve(QEasingCurve.InCubic)
@@ -3627,48 +3970,14 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.hide()
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
-    # Frameless move/max
-    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        try:
-            y = event.position().y() if hasattr(event, "position") else event.pos().y()
-            if event.button() == Qt.LeftButton and y <= self._header_draggable_height:
-                self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-                event.accept(); return
-        except Exception:
-            pass
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
-        try:
-            if self._drag_pos and not self._is_maximized:
-                new_top_left = event.globalPosition().toPoint() - self._drag_pos
-                screen_obj = self.screen() or QtGui.QGuiApplication.primaryScreen()
-                screen_geom = screen_obj.availableGeometry() if screen_obj else QtGui.QGuiApplication.primaryScreen().availableGeometry()
-                w, h = self.width(), self.height()
-                x = max(screen_geom.left(), min(new_top_left.x(), screen_geom.right() - w))
-                y = max(screen_geom.top(), min(new_top_left.y(), screen_geom.bottom() - h))
-                self.move(x, y)
-                event.accept(); return
-        except Exception:
-            pass
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
-        try:
-            self._drag_pos = None
-        except Exception:
-            pass
-        super().mouseReleaseEvent(event)
-
-    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
-        try:
-            y = event.position().y() if hasattr(event, "position") else event.pos().y()
-            if y <= self._header_draggable_height:
-                self._toggle_max_restore()
-                event.accept(); return
-        except Exception:
-            pass
-        super().mouseDoubleClickEvent(event)
+    def nativeEvent(self, event_type, message):
+        title_bar = getattr(self, "title_bar", None)
+        controller = getattr(title_bar, "window_controller", None)
+        if controller is not None:
+            handled, result = controller.native_event(event_type, message)
+            if handled:
+                return True, result
+        return super().nativeEvent(event_type, message)
 
     def shutdown(self) -> None:
         if self._shutdown:

@@ -11,6 +11,7 @@ import tempfile
 
 from audio_tools import AudioToolError, decode_mono_pcm16, toolchain_available
 from project_paths import application_paths
+from sound_model import analysis_cache_path
 
 import zlib
 from dataclasses import dataclass
@@ -398,12 +399,13 @@ class AudioAnalysisManager(QtCore.QObject):
     def is_busy(self) -> bool:
         return self._busy
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_ms: Optional[int] = None) -> bool:
         self._shutting_down = True
         self._queue.clear()
         self._pending.clear()
-        self._cleanup_thread(wait_ms=None)
+        stopped = self._cleanup_thread(wait_ms=timeout_ms)
         self._set_busy(False)
+        return stopped
 
     def enqueue_missing(self) -> None:
         if not self.processed_dir.exists():
@@ -468,7 +470,7 @@ class AudioAnalysisManager(QtCore.QObject):
     # ───────────────────── internals ─────────────────────
     def _analysis_file_for(self, path: Path) -> Path:
         # name-based, but also invalidated by mtime/size check in payload
-        return self.analysis_dir / (path.name + ".analysis.json")
+        return analysis_cache_path(self.project_root, path)
 
     def _needs_analysis(self, path: Path) -> bool:
         return self.load_cached(path) is None
@@ -528,6 +530,9 @@ class AudioAnalysisManager(QtCore.QObject):
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._thread.finished.connect(self._worker.deleteLater)
 
         self._thread.started.connect(self._worker.run)
 
@@ -555,8 +560,11 @@ class AudioAnalysisManager(QtCore.QObject):
             except Exception:
                 return False
 
+        thread = self._thread
         self._worker = None
         self._thread = None
+        if thread is not None:
+            thread.deleteLater()
         return True
 
     def _on_progress(self, path_str: str, pct: int) -> None:

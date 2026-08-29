@@ -21,7 +21,12 @@ from save_schema import (
     AUTOSAVE_DOCUMENT_TYPE,
     stamp_current_save_schema,
 )
-from transactional_io import atomic_write_json, safe_write_json
+from transactional_io import (
+    atomic_write_json,
+    enforce_internal_tree_visibility,
+    safe_write_json,
+    set_path_hidden,
+)
 
 
 PROJECT_METADATA_FILE = "lettersmith-metadata.json"
@@ -30,10 +35,19 @@ AUTOSAVE_RELATIVE_PATH = Path("output") / "projects"
 _LOGGER = logging.getLogger(__name__)
 
 STORAGE_LAYOUT_VERSION = 1
+_TRANSACTION_DIRECTORY_PATTERN = re.compile(
+    r"\.(?:snapshot|identity|build|new-project)-"
+    r"(?:staging\.[0-9a-f]{32}|backup)$",
+    flags=re.IGNORECASE,
+)
 
 
 def _resolved(path: str | Path) -> Path:
     return Path(path).expanduser().resolve()
+
+
+def _is_transaction_artifact_directory(path: Path) -> bool:
+    return bool(_TRANSACTION_DIRECTORY_PATTERN.search(path.name))
 
 
 @dataclass(frozen=True)
@@ -190,14 +204,28 @@ class ApplicationPaths:
         return (self.resource_root / value).resolve()
 
     def app_resource_path(self, relative: str | Path) -> Path:
-        """Resolve a 1.0 app resource with a source-tree compatibility read."""
+        """Resolve an app resource from its canonical source-tree owner."""
         value = Path(relative)
         if value.is_absolute() or ".." in value.parts:
             raise ValueError("Application resource paths must be relative.")
-        primary = (self.resource_root / "resources" / "app" / value).resolve()
+        resources_owned = bool(value.parts) and value.parts[0].casefold() in {
+            "fonts",
+            "themes",
+        }
+        primary_root = (
+            self.resource_root / "resources" / "app"
+            if resources_owned
+            else self.resource_root / "gallery" / "app"
+        )
+        compatibility_root = (
+            self.resource_root / "gallery" / "app"
+            if resources_owned
+            else self.resource_root / "resources" / "app"
+        )
+        primary = (primary_root / value).resolve()
         if primary.exists():
             return primary
-        return (self.resource_root / "gallery" / "app" / value).resolve()
+        return (compatibility_root / value).resolve()
 
     def tool_path(self, name: str) -> Path:
         filename = Path(name).name
@@ -234,9 +262,38 @@ class ApplicationPaths:
         for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)
 
+    def enforce_internal_visibility(self) -> tuple[Path, ...]:
+        """Hide implementation state while retaining user-authored assets."""
+        hidden: list[Path] = []
+        roots = {
+            self.workspace_root,
+            self.settings_root,
+            self.music_archive_root,
+            self.autosave_root,
+            self.saved_letters_root,
+            self.recovery_root,
+            self.export_root,
+            self.generated_root,
+            self.temporary_root,
+        }
+        for root in roots:
+            hidden.extend(enforce_internal_tree_visibility(root))
+        for path in (
+            self.settings_file,
+            self.workspace_root / "prompt_writer_state.json",
+            self.project_sound_state_file,
+            self.current_sound_manifest_file,
+            self.music_archive_root / "library.json",
+            self.workspace_root / "gallery/user/card/controls",
+        ):
+            if set_path_hidden(path):
+                hidden.append(path)
+        return tuple(dict.fromkeys(hidden))
+
     def initialize(self, legacy_root: str | Path | None = None) -> None:
         """Create writable roots and copy legacy data without overwriting it."""
         self.ensure_writable_roots()
+        self.enforce_internal_visibility()
         if legacy_root is None or self.workspace_root == self.resource_root:
             _LOGGER.debug("Writable application storage is ready: %s", self.app_data_root)
             return
@@ -316,6 +373,7 @@ class ApplicationPaths:
                 "legacy_root": str(legacy),
             },
         )
+        self.enforce_internal_visibility()
         _LOGGER.info(
             "Storage layout migration %s completed.",
             STORAGE_LAYOUT_VERSION,
@@ -463,6 +521,8 @@ class ProjectPathResolver:
             if not root.is_dir():
                 continue
             for child in root.iterdir():
+                if _is_transaction_artifact_directory(child):
+                    continue
                 if child.is_dir() and self._metadata_project_id(child) == stable_project_id:
                     matches.append(child.resolve())
         return tuple(dict.fromkeys(matches))
@@ -595,7 +655,10 @@ class ProjectPathResolver:
             if not recipient_directory.is_dir():
                 continue
             for directory in sorted(recipient_directory.iterdir()):
-                if not directory.is_dir():
+                if (
+                    not directory.is_dir()
+                    or _is_transaction_artifact_directory(directory)
+                ):
                     continue
                 candidate_title = self._directory_title(
                     directory
@@ -726,7 +789,12 @@ class ProjectPathResolver:
         for record in self.registry.list():
             root = self.resolve_autosave_recipient_directory(record.recipient_id)
             if root.is_dir():
-                paths.extend(child.resolve() for child in root.iterdir() if child.is_dir())
+                paths.extend(
+                    child.resolve()
+                    for child in root.iterdir()
+                    if child.is_dir()
+                    and not _is_transaction_artifact_directory(child)
+                )
         return tuple(paths)
 
     @staticmethod

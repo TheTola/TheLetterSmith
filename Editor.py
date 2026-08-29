@@ -1,7 +1,7 @@
 # File: Editor.py
 # -*- coding: utf-8 -*-
 """
-Letter Smith — Rich Text Editor (dark mode, professional polish)
+Letter Editor — Rich Text Editor
 
 Public contract (required by Message_tab.py)
 -------------------------------------------
@@ -79,7 +79,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QColorDialog,
     QPushButton,
-    QMessageBox,
     QDialogButtonBox,
     QLineEdit,
     QPlainTextEdit,
@@ -95,6 +94,11 @@ from config import (
     MESSAGE_HTML_FILE,
 )
 from language_service import get_language_service
+from letter_page import (
+    LETTER_PAGE_PRESETS,
+    MESSAGE_OVERLAY_PRESET_KEY,
+    normalize_letter_page_preset,
+)
 from message_format import normalize_ultralinks_in_document
 from project_save import ProjectNotReadyError, ProjectSaveService
 from project_state import ProjectStateController
@@ -106,6 +110,13 @@ from message_html import (
     mark_lettersmith_message_html,
     ultralink_message_from_href,
 )
+from ui_dialogs import (
+    LetterSmithConfirmationDialog,
+    LetterSmithDialog,
+    LetterSmithInputDialog,
+    show_lettersmith_message,
+)
+from window_chrome import StandardTitleBar
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants & Helpers
@@ -131,13 +142,6 @@ MIXED_TEXT_COLOR_INDICATOR = (
     QColor("#8f00ff"),
 )
 ASSET_SUBDIR = "message_assets"  # under gallery/
-MESSAGE_OVERLAY_PRESET_KEY = "message_overlay_preset"
-MESSAGE_OVERLAY_PRESETS = {
-    "black": ("#000000", "#ffffff"),
-    "white": ("#ffffff", "#221710"),
-    "paper": ("#f5ebd2", "#221710"),
-    "clear": ("transparent", "#eeeeee"),
-}
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -185,13 +189,17 @@ def _atomic_write(path: Path, data: str, *, encoding: str = "utf-8") -> None:
 # Find / Replace Dialog
 # ─────────────────────────────────────────────────────────────────────────────
 
-class FindReplaceDialog(QDialog):
+class FindReplaceDialog(LetterSmithDialog):
     """Persistent, formatting-safe find/replace tool."""
 
     def __init__(self, parent: "Editor") -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Find / Replace")
-        self.setModal(False)
+        super().__init__(
+            parent,
+            title="Find / Replace",
+            modal=False,
+            click_outside_dismiss=False,
+            width=560,
+        )
         self.setAttribute(Qt.WA_DeleteOnClose, False)
 
         self._editor: QTextEdit = parent.editor
@@ -230,22 +238,27 @@ class FindReplaceDialog(QDialog):
         buttons.addStretch(1)
         buttons.addWidget(self.close_button)
 
-        root = QVBoxLayout(self)
+        root = self.content_layout
         root.addLayout(row)
         root.addLayout(opts)
         root.addLayout(buttons)
 
         self.find_input.textChanged.connect(self._clear_status)
         self.match_case.toggled.connect(self._clear_status)
-        self.setMinimumWidth(560)
-
+        colors = self.colors
         self.setStyleSheet(
-            "QDialog{background:#141414;border:1px solid #00d0ff;border-radius:8px;}"
-            "QLineEdit{background:#1e1e1e;color:#eee;border:1px solid #2a2a2a;padding:6px;border-radius:4px;}"
-            "QLabel,QCheckBox{color:#ddd; padding-left:2px;}"
-            "QLabel#findStatus{color:#80eaff;}"
-            "QPushButton{background:#232323;color:#fff;border:1px solid #00d0ff;border-radius:4px;padding:6px 12px;}"
-            "QPushButton:hover{background:#00d0ff;color:#111}"
+            self.styleSheet()
+            + "QLineEdit{"
+            f"background:{colors['background']};color:{colors['text']};"
+            f"border:1px solid {colors['border']};padding:7px;border-radius:6px;}}"
+            "QLabel,QCheckBox{"
+            f"color:{colors['text']};padding-left:2px;}}"
+            f"QLabel#findStatus{{color:{colors['accent']};}}"
+            "QPushButton{"
+            f"background:{colors['control_background']};color:{colors['text']};"
+            f"border:1px solid {colors['accent']};border-radius:6px;"
+            "padding:7px 12px;}"
+            f"QPushButton:hover{{background:{colors['hover']};}}"
         )
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
@@ -906,13 +919,24 @@ class Editor(QDialog):
         self._language_check_timer.setInterval(550)
         self._language_check_timer.timeout.connect(self._refresh_language_issues)
 
-        self.setWindowTitle("Letter Smith — Editor")
+        self.setWindowTitle("Letter Editor")
+        self.setWindowFlags(
+            Qt.Dialog
+            | Qt.FramelessWindowHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowCloseButtonHint
+        )
         self.setModal(True)
         self.resize(1100, 720)
 
         self._apply_styles()
         self._restore_geometry()
         self._build_ui(preview_pixmap)
+        theme_service = getattr(parent, "theme_service", None)
+        if theme_service is None and isinstance(parent, QtWidgets.QWidget):
+            theme_service = getattr(parent.window(), "theme_service", None)
+        if theme_service is not None:
+            self.title_bar.apply_theme_assets(theme_service)
         self._settings_watcher = QtCore.QFileSystemWatcher(self)
         if self.settings_path.is_file():
             self._settings_watcher.addPath(str(self.settings_path))
@@ -943,6 +967,14 @@ class Editor(QDialog):
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(8)
 
+        self.title_bar = StandardTitleBar(
+            self,
+            "Letter Editor",
+            show_minimize=False,
+            on_close=self._request_close,
+        )
+        main_layout.addWidget(self.title_bar)
+
         self.toolbar = QToolBar()
         self.toolbar.setIconSize(TOOLBAR_ICON_SIZE)
         self.toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -953,6 +985,7 @@ class Editor(QDialog):
             language_service=self._language_service,
         )
         self.editor.setObjectName("EditorTextArea")
+        self.editor.setProperty("themeFontRole", "letterContent")
         self.editor.document().setDefaultFont(QFont("Papyrus", DEFAULT_FONT_SIZE))
         self.editor.setHtml(self.message_html)
         normalize_ultralinks_in_document(self.editor.document())
@@ -1010,24 +1043,36 @@ class Editor(QDialog):
         self._sync_current_format()
         self._schedule_language_check()
 
-    def _editor_background_setting(self) -> tuple[str, str]:
+    def _editor_background_setting(self) -> tuple[str, str, str]:
         data = _read_json(self.settings_path)
-        preset = str(data.get(MESSAGE_OVERLAY_PRESET_KEY, "paper")).strip().lower()
-        return MESSAGE_OVERLAY_PRESETS.get(preset, MESSAGE_OVERLAY_PRESETS["paper"])
+        preset = normalize_letter_page_preset(data.get(MESSAGE_OVERLAY_PRESET_KEY))
+        definition = LETTER_PAGE_PRESETS[preset]
+        if preset == "clear":
+            background = "transparent"
+        else:
+            center = ",".join(map(str, definition.center_rgb))
+            edge = ",".join(map(str, definition.edge_rgb))
+            background = (
+                f"qradialgradient(cx:.5,cy:.43,radius:.76,"
+                f"stop:0 rgb({center}),stop:1 rgb({edge}))"
+            )
+        return preset, background, definition.default_ink
 
     def _apply_editor_background(self) -> None:
-        background, foreground = self._editor_background_setting()
+        preset, background, foreground = self._editor_background_setting()
+        definition = LETTER_PAGE_PRESETS[preset]
+        border = "transparent" if preset == "clear" else definition.border
         self.editor.setStyleSheet(
             "QTextEdit#EditorTextArea{"
             f"background-color:{background};color:{foreground};"
-            "border:1px solid #70512c;border-radius:6px;padding:8px;"
+            f"border:1px solid {border};border-radius:6px;padding:8px;"
             "selection-background-color:#c9a86a;"
             f"selection-color:{foreground};}}"
         )
-        self.editor.setAttribute(Qt.WA_TranslucentBackground, background == "transparent")
+        self.editor.setAttribute(Qt.WA_TranslucentBackground, preset == "clear")
         self.editor.viewport().setAttribute(
             Qt.WA_TranslucentBackground,
-            background == "transparent",
+            preset == "clear",
         )
         self.editor.viewport().update()
 
@@ -1097,7 +1142,7 @@ class Editor(QDialog):
             callback()
         except Exception as error:
             self._record_failure(f"editor action: {label}", error)
-            QMessageBox.warning(
+            show_lettersmith_message(
                 self,
                 "Editor Action Failed",
                 f"{label} could not be completed. Your letter remains open. "
@@ -1671,7 +1716,7 @@ class Editor(QDialog):
                 if log_path is not None
                 else ""
             )
-            QMessageBox.critical(
+            show_lettersmith_message(
                 self,
                 "Save Error",
                 "Could not save the letter. The Editor remains open and your "
@@ -1705,7 +1750,7 @@ class Editor(QDialog):
             current = self._prepared_html()
         except Exception as error:
             self._record_failure("prepare letter before close", error)
-            QMessageBox.critical(
+            show_lettersmith_message(
                 self,
                 "Editor Error",
                 "The Editor could not verify the current letter, so it was kept "
@@ -1715,16 +1760,22 @@ class Editor(QDialog):
         if current == self._last_persisted_html:
             self._finish_close()
             return
-        choice = QMessageBox.question(
+        confirmation = LetterSmithConfirmationDialog(
             self,
-            "Unsaved Changes",
-            "Save changes before closing the Editor?",
-            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-            QMessageBox.Save,
+            title="Unsaved Changes",
+            question="Save changes before closing the Editor?",
+            primary_text="Save",
+            secondary_text="Discard",
+            secondary_accepts=True,
+            destructive_secondary=True,
+            cancel_text="Cancel",
+            click_outside_dismiss=False,
+            width=500,
         )
-        if choice == QMessageBox.Save:
+        confirmation.exec()
+        if confirmation.choice == "primary":
             self.save_and_close()
-        elif choice == QMessageBox.Discard:
+        elif confirmation.choice == "secondary":
             self._discard_changes = True
             self._finish_close()
 
@@ -1976,7 +2027,7 @@ class Editor(QDialog):
     def add_or_edit_link(self) -> None:
         cursor = self._link_target_cursor()
         if cursor is None:
-            QMessageBox.information(
+            show_lettersmith_message(
                 self,
                 "Link",
                 "Select text or place the cursor on a word first.",
@@ -1984,11 +2035,12 @@ class Editor(QDialog):
             return
 
         current_href = self._current_link_href() or "https://"
-        href, accepted = QtWidgets.QInputDialog.getText(
+        href, accepted = LetterSmithInputDialog.get_text(
             self,
             "Add or Edit Link",
-            "URL",
+            "URL:",
             text=current_href,
+            accept_text="Apply",
         )
         if not accepted:
             return
@@ -2196,7 +2248,7 @@ class Editor(QDialog):
             QtWidgets.QApplication.beep()
             return
         if self._selection_contains_standard_link(target):
-            QMessageBox.information(
+            show_lettersmith_message(
                 self,
                 "Ultra Link",
                 "Remove the existing web link before applying an Ultra Link.",

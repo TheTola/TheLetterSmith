@@ -13,9 +13,9 @@ from transactional_io import safe_write_json
 
 
 CURRENT_SAVE_SCHEMA_VERSION = "1.0"
+PROMPT_WRITER_STATE_VERSION = 6
 AUTOSAVE_DOCUMENT_TYPE = "project_autosave"
 SAVED_LETTER_DOCUMENT_TYPE = "saved_letter"
-LEGACY_COMPLETE_METADATA_VERSION = 4
 REQUIRED_PAGE_FILES = (
     "cover.png",
     "letter.png",
@@ -31,6 +31,36 @@ class SaveSchemaError(ValueError):
 
 class SaveSchemaMigrationError(SaveSchemaError):
     pass
+
+
+def validate_prompt_writer_state_payload(
+    payload: object,
+) -> dict[str, Any]:
+    """Validate the headless Prompt Writer state envelope."""
+    if not isinstance(payload, Mapping):
+        raise SaveSchemaError("Prompt Writer state must contain an object")
+
+    raw_version = payload.get("version", 0)
+    if isinstance(raw_version, bool):
+        raise SaveSchemaError("Prompt Writer state version is invalid")
+    if isinstance(raw_version, int):
+        version = raw_version
+    elif isinstance(raw_version, str) and re.fullmatch(
+        r"[0-9]+",
+        raw_version.strip(),
+    ):
+        version = int(raw_version.strip())
+    else:
+        raise SaveSchemaError("Prompt Writer state version is invalid")
+
+    if version < 0:
+        raise SaveSchemaError("Prompt Writer state version is invalid")
+    if version > PROMPT_WRITER_STATE_VERSION:
+        raise SaveSchemaError(
+            "unsupported Prompt Writer state version: "
+            f"{version}"
+        )
+    return dict(payload)
 
 
 @dataclass(frozen=True)
@@ -291,26 +321,6 @@ def is_current_save_schema(metadata: Mapping[str, Any]) -> bool:
     return stored_save_schema_version(metadata) == CURRENT_SAVE_SCHEMA_VERSION
 
 
-def legacy_metadata_version(metadata: Mapping[str, Any]) -> int:
-    raw = metadata.get(
-        "source_version",
-        metadata.get("schema_version", 0),
-    )
-    if isinstance(raw, bool):
-        return 0
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return 0
-
-
-def has_complete_saved_state(metadata: Mapping[str, Any]) -> bool:
-    return is_current_save_schema(metadata) or (
-        legacy_metadata_version(metadata)
-        >= LEGACY_COMPLETE_METADATA_VERSION
-    )
-
-
 def stamp_current_save_schema(
     metadata: Mapping[str, Any],
     *,
@@ -335,14 +345,6 @@ def migrate_saved_letter_metadata(
     repair_values: Mapping[str, Any] | None = None,
     registry: SaveSchemaMigrationRegistry | None = None,
 ) -> SaveSchemaMigrationReport:
-    version = stored_save_schema_version(metadata)
-    if not version or version.isdigit():
-        legacy = _copy_metadata(metadata)
-        return SaveSchemaMigrationReport(
-            metadata=legacy,
-            source_version=version,
-            target_version=version,
-        )
     return (registry or SAVE_SCHEMA_MIGRATIONS).migrate(
         metadata,
         repair_values=repair_values,
@@ -473,14 +475,12 @@ def _require_uuid(metadata: Mapping[str, Any], key: str) -> None:
 def validate_saved_letter_metadata(
     metadata: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Validate 1.0 metadata while allowing numeric pre-1.0 bundles."""
+    """Validate saved-letter metadata against the current schema."""
     migration = migrate_saved_letter_metadata(metadata)
     if migration.required_repairs:
         raise SaveSchemaRepairRequired(migration.required_repairs)
     validated = migration.metadata
     version = stored_save_schema_version(validated)
-    if not version or version.isdigit():
-        return validated
     if version != CURRENT_SAVE_SCHEMA_VERSION:
         raise SaveSchemaError(
             f"unsupported saved-letter schema version: {version}"
@@ -514,6 +514,23 @@ def validate_saved_letter_metadata(
             editable_assets.get(key),
             f"editable_assets.{key}",
         )
+    prompt_writer = validated.get("prompt_writer")
+    if prompt_writer is not None:
+        prompt_writer = _require_object(validated, "prompt_writer")
+        if prompt_writer.get("snapshot_schema_version") != 1:
+            raise SaveSchemaError(
+                "prompt_writer.snapshot_schema_version is unsupported"
+            )
+        state_file = _require_relative_file(
+            prompt_writer.get("state_file"),
+            "prompt_writer.state_file",
+        )
+        if state_file != editable_assets.get("prompt_writer_state"):
+            raise SaveSchemaError(
+                "prompt_writer.state_file must match "
+                "editable_assets.prompt_writer_state"
+            )
+        _require_object(prompt_writer, "state")
     _require_relative_file(
         validated.get("cover_thumbnail_path"),
         "cover_thumbnail_path",
@@ -524,7 +541,7 @@ def validate_saved_letter_metadata(
 __all__ = [
     "AUTOSAVE_DOCUMENT_TYPE",
     "CURRENT_SAVE_SCHEMA_VERSION",
-    "LEGACY_COMPLETE_METADATA_VERSION",
+    "PROMPT_WRITER_STATE_VERSION",
     "SAVED_LETTER_DOCUMENT_TYPE",
     "SAVE_SCHEMA_MIGRATIONS",
     "SaveSchemaError",
@@ -534,13 +551,12 @@ __all__ = [
     "SaveSchemaMigrationStepResult",
     "SaveSchemaRepair",
     "SaveSchemaRepairRequired",
-    "has_complete_saved_state",
     "is_current_save_schema",
-    "legacy_metadata_version",
     "migrate_saved_letter_metadata",
     "migrate_saved_letter_metadata_file",
     "persist_completed_save_schema_migration",
     "stamp_current_save_schema",
     "stored_save_schema_version",
+    "validate_prompt_writer_state_payload",
     "validate_saved_letter_metadata",
 ]

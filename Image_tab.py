@@ -18,9 +18,11 @@ without consuming the compact vertical space below the cards.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import MutableMapping, Optional
 
 from PIL import Image, ImageChops
 
@@ -28,16 +30,18 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QPoint, QSize, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon
 
-from image_button import ArtworkButton
+from image_button import ArtworkButton, set_control_invisible
 from image_animation import (
     FOREVER,
     IMAGE_MANIFEST_NAME,
     INDEX_TO_SLOT,
     MAX_PLAY_COUNT,
+    PreparedImageAssetImport,
     clear_slot_asset,
-    install_image_asset,
+    image_asset_revision,
     load_image_manifest,
     normalize_gif_settings,
+    prepare_image_asset_import,
     reconcile_external_image_assets,
     update_slot_gif_settings,
 )
@@ -45,7 +49,14 @@ from project_paths import ProjectPathResolver, application_paths
 from project_save import ProjectSaveService
 from project_state import ProjectStateController
 from project_sync import file_fingerprint, image_fingerprint
+from ui_dialogs import LetterSmithConfirmationDialog
 from ui_help import set_control_help
+from ui_theme import (
+    PRIMARY_PAGE_LAYOUT,
+    ButtonTier,
+    apply_button_tier,
+    apply_tab_heading_style,
+)
 
 
 STOCK_IMAGE_FILES = {
@@ -65,6 +76,107 @@ def _downloads_directory() -> str:
 
     downloads = Path.home() / "Downloads"
     return str(downloads if downloads.is_dir() else Path.home())
+
+
+@dataclass(frozen=True)
+class _PreparedImageImportResult:
+    generation: int
+    index: int
+    project_identity: tuple[str, str]
+    baseline_fingerprint: str
+    project_pages_directory: Path | None
+    prepared: PreparedImageAssetImport
+    preview_image: QtGui.QImage
+
+
+class _ImageImportWorker(QtCore.QObject):
+    prepared = Signal(object)
+    failed = Signal(int, int, str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        pages_directory: Path,
+        project_pages_directory: Path | None,
+        index: int,
+        slot: str,
+        source_path: Path,
+        project_identity: tuple[str, str],
+        baseline_fingerprint: str,
+        generation: int,
+        result_holder: MutableMapping[str, object],
+    ) -> None:
+        super().__init__()
+        self._pages_directory = pages_directory
+        self._project_pages_directory = project_pages_directory
+        self._index = index
+        self._slot = slot
+        self._source_path = source_path
+        self._project_identity = project_identity
+        self._baseline_fingerprint = baseline_fingerprint
+        self._generation = generation
+        self._result_holder = result_holder
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _is_cancelled(self) -> bool:
+        thread = QtCore.QThread.currentThread()
+        return self._cancelled or thread.isInterruptionRequested()
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        prepared: PreparedImageAssetImport | None = None
+        try:
+            if self._is_cancelled():
+                raise RuntimeError("Image import canceled.")
+            if (
+                image_asset_revision(self._pages_directory)
+                != self._baseline_fingerprint
+            ):
+                raise RuntimeError(
+                    "Images changed before the selection could be processed."
+                )
+
+            prepared = prepare_image_asset_import(
+                self._pages_directory,
+                self._slot,
+                self._source_path,
+                project_pages_directory=self._project_pages_directory,
+            )
+            if self._is_cancelled():
+                raise RuntimeError("Image import canceled.")
+            if (
+                image_asset_revision(self._pages_directory)
+                != self._baseline_fingerprint
+            ):
+                raise RuntimeError(
+                    "Images changed while the selection was being processed."
+                )
+
+            preview_image = QtGui.QImage(str(prepared.preview_path))
+            if preview_image.isNull():
+                raise ValueError("The selected image could not be decoded.")
+
+            result = _PreparedImageImportResult(
+                generation=self._generation,
+                index=self._index,
+                project_identity=self._project_identity,
+                baseline_fingerprint=self._baseline_fingerprint,
+                project_pages_directory=self._project_pages_directory,
+                prepared=prepared,
+                preview_image=preview_image,
+            )
+            self._result_holder["result"] = result
+            self.prepared.emit(result)
+            prepared = None
+        except Exception as error:
+            if prepared is not None:
+                prepared.abort()
+            self.failed.emit(self._generation, self._index, str(error))
+        finally:
+            self.finished.emit()
 
 
 class StockImageDialog(QtWidgets.QDialog):
@@ -418,19 +530,15 @@ class _ImageUtilityButton(ArtworkButton):
         project_root: str | Path,
         artwork_filename: str,
         *,
-        width: int,
-        height: int,
-        font_size: int,
         parent: QtWidgets.QWidget | None = None,
+        broken_artwork_filename: str | None = None,
     ) -> None:
-        self._utility_width = int(width)
-        self._utility_height = int(height)
-        self._utility_font_size = int(font_size)
         super().__init__(
             text,
             project_root,
             artwork_filename,
             parent,
+            broken_artwork_filename=broken_artwork_filename,
         )
 
     def apply_theme_assets(
@@ -443,26 +551,12 @@ class _ImageUtilityButton(ArtworkButton):
         _trim_artwork_canvas(self)
         self.set_artwork_stretch(False)
         self.set_text_word_wrap(True)
-        self.setFixedSize(
-            self._utility_width,
-            self._utility_height,
-        )
-        self.setSizePolicy(
-            QtWidgets.QSizePolicy.Fixed,
-            QtWidgets.QSizePolicy.Fixed,
-        )
-        self.setFont(
-            QtGui.QFont(
-                "Segoe UI Semibold",
-                self._utility_font_size,
-                QtGui.QFont.Weight.Bold,
-            )
-        )
+        apply_button_tier(self, ButtonTier.LARGE)
         _mask_button_to_artwork(self)
 
 
 class _ResetImagesConfirmationDialog(
-    QtWidgets.QDialog
+    LetterSmithConfirmationDialog
 ):
     def __init__(
         self,
@@ -470,8 +564,12 @@ class _ResetImagesConfirmationDialog(
     ) -> None:
         super().__init__(
             parent,
-            QtCore.Qt.Dialog
-            | QtCore.Qt.FramelessWindowHint,
+            question="Are you sure you want to reset?",
+            primary_text="Yes",
+            secondary_text="No",
+            destructive_primary=True,
+            click_outside_dismiss=False,
+            width=390,
         )
         self.setObjectName(
             "ResetImagesConfirmationDialog"
@@ -479,75 +577,14 @@ class _ResetImagesConfirmationDialog(
         self.setAccessibleName(
             "Confirm reset images"
         )
-        self.setModal(True)
-        self.setWindowModality(
-            QtCore.Qt.ApplicationModal
-        )
-        self.setFixedWidth(390)
-        self.setStyleSheet(
-            "QDialog#ResetImagesConfirmationDialog{"
-            "background:#101317;border:1px solid #43505d;"
-            "border-radius:10px;}"
-            "QLabel{color:#f2f5f7;font:600 13pt 'Segoe UI';}"
-            "QPushButton{background:#171c22;border:1px solid #465260;"
-            "border-radius:7px;padding:9px 26px;font:700 12pt 'Segoe UI';}"
-            "QPushButton#ResetImagesYes{color:#ff626c;border-color:#9b3740;}"
-            "QPushButton#ResetImagesYes:hover{background:#32191d;}"
-            "QPushButton#ResetImagesNo{color:#00d0ff;border-color:#287f92;}"
-            "QPushButton#ResetImagesNo:hover{background:#132a31;}"
-        )
-
-        layout = QtWidgets.QVBoxLayout(
-            self
-        )
-        layout.setContentsMargins(
-            28,
-            24,
-            28,
-            22,
-        )
-        layout.setSpacing(20)
-
-        question = QtWidgets.QLabel(
-            "Are you sure you want to reset?"
-        )
-        question.setAlignment(
-            QtCore.Qt.AlignCenter
-        )
-        question.setWordWrap(True)
-        layout.addWidget(question)
-
-        actions = QtWidgets.QHBoxLayout()
-        actions.setSpacing(12)
-        actions.addStretch(1)
-
-        yes_button = QtWidgets.QPushButton(
-            "Yes"
-        )
-        yes_button.setObjectName(
+        self.primary_button.setObjectName(
             "ResetImagesYes"
         )
-        yes_button.clicked.connect(
-            self.accept
-        )
-        actions.addWidget(yes_button)
-
-        no_button = QtWidgets.QPushButton(
-            "No"
-        )
-        no_button.setObjectName(
+        self.secondary_button.setObjectName(
             "ResetImagesNo"
         )
-        no_button.setDefault(True)
-        no_button.clicked.connect(
-            self.reject
-        )
-        actions.addWidget(no_button)
-        actions.addStretch(1)
-        layout.addLayout(actions)
-
-        self.yes_button = yes_button
-        self.no_button = no_button
+        self.yes_button = self.primary_button
+        self.no_button = self.secondary_button
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -577,6 +614,10 @@ class _ImageThumbnail(
         ] = None,
     ) -> None:
         super().__init__(parent)
+        self._theme_frame_source = QtGui.QPixmap()
+        self._theme_frame = QtGui.QPixmap()
+        self._theme_frame_path = Path()
+        self._theme_frame_color = QtGui.QColor("#7f9099")
 
         self.setAlignment(
             QtCore.Qt.AlignCenter
@@ -618,6 +659,67 @@ class _ImageThumbnail(
             "border: 1px solid #2d3540;"
             "border-radius: 6px;"
         )
+
+    def apply_theme_assets(
+        self,
+        theme_service: object | None,
+        project_root: str | Path | None = None,
+    ) -> None:
+        if project_root is None:
+            owner = self.parentWidget()
+            while owner is not None and not hasattr(owner, "project_root"):
+                owner = owner.parentWidget()
+            project_root = getattr(
+                owner,
+                "project_root",
+                application_paths().workspace_root,
+            )
+        baseline = application_paths(project_root).app_resource_path(
+            "themes/cyber_forge/image_frame.png"
+        )
+        frame_path = baseline
+        resolver = getattr(theme_service, "resolve_asset", None)
+        if callable(resolver):
+            try:
+                frame_path = Path(resolver("image_frame.png"))
+            except (OSError, RuntimeError, TypeError, ValueError):
+                frame_path = baseline
+        self._theme_frame_path = Path(frame_path).resolve()
+        self._theme_frame_source = QtGui.QPixmap(str(self._theme_frame_path))
+        tokens = getattr(theme_service, "tokens", None)
+        self._theme_frame_color = QtGui.QColor(
+            getattr(tokens, "secondary", "#7f9099")
+        )
+        self._theme_frame = QtGui.QPixmap(self._theme_frame_source.size())
+        self._theme_frame.fill(QtCore.Qt.transparent)
+        if not self._theme_frame_source.isNull():
+            painter = QtGui.QPainter(self._theme_frame)
+            painter.drawPixmap(0, 0, self._theme_frame_source)
+            painter.setCompositionMode(
+                QtGui.QPainter.CompositionMode_SourceIn
+            )
+            painter.fillRect(
+                self._theme_frame.rect(),
+                self._theme_frame_color,
+            )
+            painter.end()
+        self.update()
+
+    @property
+    def theme_frame_path(self) -> Path:
+        return self._theme_frame_path
+
+    @property
+    def theme_frame_color(self) -> QtGui.QColor:
+        return QtGui.QColor(self._theme_frame_color)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        super().paintEvent(event)
+        if self._theme_frame.isNull():
+            return
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+        painter.drawPixmap(self.rect(), self._theme_frame)
 
     def mousePressEvent(
         self,
@@ -727,6 +829,7 @@ class ImageAssetCard(
         self,
         index: int,
         title: str,
+        project_root: str | Path,
         parent: Optional[
             QtWidgets.QWidget
         ] = None,
@@ -741,6 +844,8 @@ class ImageAssetCard(
         self._movie: QtGui.QMovie | None = None
         self._playback_active = True
         self._resume_movie_on_activation = False
+        self._animation_enabled = True
+        self._speed_percent = 100
 
         self.setObjectName(
             "ImageAssetCard"
@@ -836,41 +941,32 @@ class ImageAssetCard(
         button_row.setSpacing(8)
 
         self.clear_btn = (
-            QtWidgets.QPushButton(
-                "♲  Clear"
+            ArtworkButton(
+                "Clear",
+                project_root,
+                "AButton.png",
+                self,
+                broken_artwork_filename="AButton.png",
+                tier=ButtonTier.SMALL,
             )
         )
 
         self.clear_btn.setMinimumHeight(
             34
         )
+        self.clear_btn.setFixedSize(
+            round(self.clear_btn.width() * 1.05),
+            round(self.clear_btn.height() * 1.05),
+        )
 
         self.clear_btn.setCursor(
             QtCore.Qt.PointingHandCursor
         )
-
+        self.clear_btn.setProperty("themeRole", "clearAction")
         set_control_help(
             self.clear_btn,
             "Remove this image from the letter and return this slot to its empty state.",
             accessible_name="Clear image",
-        )
-
-        self.clear_btn.setStyleSheet(
-            "QPushButton {"
-            "background: #151a20;"
-            "color: #d8e0ea;"
-            "border: 1px solid #35404d;"
-            "border-radius: 6px;"
-            "padding: 6px 14px;"
-            "}"
-            "QPushButton:hover {"
-            "background: #202832;"
-            "border-color: #00a9c7;"
-            "color: #ffffff;"
-            "}"
-            "QPushButton:pressed {"
-            "background: #11161c;"
-            "}"
         )
 
         self.clear_btn.clicked.connect(
@@ -888,6 +984,8 @@ class ImageAssetCard(
         self.settings_btn.setCursor(
             QtCore.Qt.PointingHandCursor
         )
+        apply_button_tier(self.settings_btn, ButtonTier.SMALL)
+        self.settings_btn.setProperty("themeRole", "button")
         set_control_help(
             self.settings_btn,
             "Adjust playback settings for this animated image.",
@@ -895,9 +993,6 @@ class ImageAssetCard(
         )
         self.settings_btn.setEnabled(False)
         self.settings_btn.setVisible(False)
-        self.settings_btn.setStyleSheet(
-            self.clear_btn.styleSheet()
-        )
         self.settings_btn.clicked.connect(
             lambda: self.settings_requested.emit(
                 self.index
@@ -934,6 +1029,23 @@ class ImageAssetCard(
             "border-color: #8c2f36;"
             "}"
         )
+
+    def apply_theme_assets(
+        self,
+        theme_service: object | None,
+        project_root: str | Path | None = None,
+    ) -> None:
+        if project_root is None:
+            owner = self.parentWidget()
+            while owner is not None and not hasattr(owner, "project_root"):
+                owner = owner.parentWidget()
+            project_root = getattr(
+                owner,
+                "project_root",
+                application_paths().workspace_root,
+            )
+        self.thumbnail.apply_theme_assets(theme_service, project_root)
+        self.clear_btn.apply_theme_assets(theme_service)
 
     def set_asset_state(
         self,
@@ -973,21 +1085,32 @@ class ImageAssetCard(
         path: str,
         *,
         animated_gif: bool,
+        settings: dict[str, object] | None = None,
         preview_path: str | None = None,
         animate_gif: bool = True,
+        preview_pixmap: QtGui.QPixmap | None = None,
     ) -> None:
         if not animated_gif:
             self.set_pixmap(
-                QtGui.QPixmap(path)
+                preview_pixmap
+                if preview_pixmap is not None
+                else QtGui.QPixmap(path)
             )
             self.settings_btn.setToolTip(
                 "Static image settings"
             )
             return
 
+        normalized = normalize_gif_settings(settings)
+        self._animation_enabled = bool(normalized["animation_enabled"])
+        self._speed_percent = int(normalized["speed_percent"])
         animation_path = preview_path or path
-        if not animate_gif:
-            preview = QtGui.QPixmap(animation_path)
+        if not self._animation_enabled:
+            preview = (
+                preview_pixmap
+                if preview_pixmap is not None
+                else QtGui.QPixmap(animation_path)
+            )
             self.set_pixmap(preview)
             if preview.isNull():
                 return
@@ -1005,6 +1128,7 @@ class ImageAssetCard(
         if not movie.isValid():
             self.set_pixmap(QtGui.QPixmap(animation_path))
             return
+        movie.setSpeed(self._speed_percent)
         self._movie = movie
         self.thumbnail.setText("")
         self.thumbnail.setStyleSheet(
@@ -1021,7 +1145,7 @@ class ImageAssetCard(
         )
         self.set_asset_state("ready")
         self._rescale()
-        if self._playback_active:
+        if self._playback_active and animate_gif:
             movie.start()
         else:
             self._resume_movie_on_activation = True
@@ -1239,6 +1363,27 @@ class ImageSettingsDialog(QtWidgets.QDialog):
         )
         form.addRow("Playback Mode", self.playback_mode)
 
+        self.animation_enabled = QtWidgets.QCheckBox("Play animation")
+        self.animation_enabled.setChecked(
+            bool(normalized["animation_enabled"])
+        )
+        set_control_help(
+            self.animation_enabled,
+            "Start or stop this image's animation. A stopped animation remains on its preview frame.",
+        )
+        form.addRow("Start / Stop", self.animation_enabled)
+
+        self.speed_percent = QtWidgets.QSpinBox()
+        self.speed_percent.setRange(25, 400)
+        self.speed_percent.setSingleStep(25)
+        self.speed_percent.setSuffix("%")
+        self.speed_percent.setValue(int(normalized["speed_percent"]))
+        set_control_help(
+            self.speed_percent,
+            "Set playback speed from 25% to 400% of the GIF's authored timing.",
+        )
+        form.addRow("Speed", self.speed_percent)
+
         count_row = QtWidgets.QWidget()
         count_layout = QtWidgets.QHBoxLayout(count_row)
         count_layout.setContentsMargins(0, 0, 0, 0)
@@ -1341,6 +1486,8 @@ class ImageSettingsDialog(QtWidgets.QDialog):
             play_count = self.custom_count.value()
         return normalize_gif_settings(
             {
+                "animation_enabled": self.animation_enabled.isChecked(),
+                "speed_percent": self.speed_percent.value(),
                 "playback_mode": self.playback_mode.currentData(),
                 "play_count": play_count,
                 "start_delay_ms": round(
@@ -1372,10 +1519,6 @@ class ImageTab(
 
     FAB_FIXED_X = 55
     FAB_CARD_GAP = 12
-
-    UTILITY_BUTTON_WIDTH = 210
-    UTILITY_BUTTON_HEIGHT = 120
-    UTILITY_BUTTON_FONT_SIZE = 12
 
     # Space between Reset Images and Gallery.
     UTILITY_BUTTON_GAP = 10
@@ -1434,33 +1577,25 @@ class ImageTab(
         self._cover_fingerprint = self._cover_file_fingerprint()
 
         self._tab_active = False
+        self._shutdown = False
+        self._image_import_generation = 0
+        self._image_import_thread: QtCore.QThread | None = None
+        self._image_import_worker: _ImageImportWorker | None = None
+        self._image_import_result_holder: dict[str, object] | None = None
+        self._image_import_index: int | None = None
 
         root = QtWidgets.QVBoxLayout(self)
 
-        root.setContentsMargins(0,0,0,0)
+        PRIMARY_PAGE_LAYOUT.apply(root)
 
-        root.setSpacing(8)
-
-        header = QtWidgets.QLabel(
+        self.heading = QtWidgets.QLabel(
             "Select images for your letter"
         )
-
-        header.setFont(
-            QtGui.QFont(
-                "Segoe UI Semibold",
-                13,
-            )
-        )
-
-        header.setStyleSheet(
-            "color: #00d0ff;"
-        )
-
-        header.setAlignment(
+        apply_tab_heading_style(self.heading)
+        self.heading.setAlignment(
             QtCore.Qt.AlignCenter
         )
-
-        root.addWidget(header)
+        root.addWidget(self.heading)
 
         self.cards: dict[
             int,
@@ -1478,7 +1613,7 @@ class ImageTab(
             0,
         )
 
-        cards_layout.setSpacing(6)
+        cards_layout.setSpacing(10)
 
         for index in (
             1,
@@ -1493,6 +1628,7 @@ class ImageTab(
             card = ImageAssetCard(
                 index,
                 title,
+                self.project_root,
                 self,
             )
             card.set_playback_active(
@@ -1557,28 +1693,24 @@ class ImageTab(
         self.reset_btn = _ImageUtilityButton(
             "Reset Images",
             self._project_dir(),
-            "BButton.png",
-            width=self.UTILITY_BUTTON_WIDTH,
-            height=self.UTILITY_BUTTON_HEIGHT,
-            font_size=self.UTILITY_BUTTON_FONT_SIZE,
+            "CButton.png",
             parent=self,
+            broken_artwork_filename="CButton.png",
         )
 
         self.open_btn = _ImageUtilityButton(
             "Gallery",
             self._project_dir(),
-            "PButton.png",
-            width=self.UTILITY_BUTTON_WIDTH,
-            height=self.UTILITY_BUTTON_HEIGHT,
-            font_size=self.UTILITY_BUTTON_FONT_SIZE,
+            "CButton.png",
             parent=self,
+            broken_artwork_filename="CButton.png",
         )
 
         for button in (
             self.reset_btn,
             self.open_btn,
         ):
-            if not button.has_artwork:
+            if button.uses_artwork_presentation and not button.has_artwork:
                 button.setStyleSheet(
                     "QPushButton {"
                     "background: #171a1f;"
@@ -1725,37 +1857,28 @@ class ImageTab(
         return str(self.project_root)
 
     def apply_theme_assets(self, theme_service: object | None = None) -> None:
-        """Refresh cloud buttons and Prompt Writer art for the active theme."""
+        """Refresh cloud buttons, image frames, and Prompt Writer artwork."""
         for button_name in ("reset_btn", "open_btn"):
             button = getattr(self, button_name, None)
             refresher = getattr(button, "apply_theme_assets", None)
             if callable(refresher):
                 refresher(theme_service)
 
+        for card in self.cards.values():
+            card.apply_theme_assets(theme_service, self.project_root)
+
         prompt_button = getattr(self, "pwrite_fab", None)
         if prompt_button is None:
             return
 
-        paths = application_paths(self._project_dir())
-        fallback_candidates = (
-            paths.app_resource_path("icons/Pwrite.png"),
-            paths.app_resource_path("icons/pwrite.png"),
-        )
-        fallback_path = next(
-            (path for path in fallback_candidates if path.is_file()),
-            fallback_candidates[0],
+        fallback_path = application_paths(self._project_dir()).app_resource_path(
+            "themes/cyber_forge/prompt_writer/Pwrite.png"
         )
         icon_path = fallback_path
         resolver = getattr(theme_service, "resolve_asset", None)
         if callable(resolver):
             try:
-                fallback = fallback_path.resolve().relative_to(
-                    paths.resource_root
-                ).as_posix()
-                icon_path = resolver(
-                    "prompt_writer/Pwrite.png",
-                    fallback=fallback,
-                )
+                icon_path = resolver("prompt_writer/Pwrite.png")
             except (TypeError, ValueError):
                 icon_path = fallback_path
 
@@ -1770,11 +1893,13 @@ class ImageTab(
         prompt_button.setText("PROMPT\nWRITER")
         if not bool(prompt_button.property("promptWriterTextFallback")):
             prompt_button.setProperty("promptWriterTextFallback", True)
+            tokens = getattr(theme_service, "tokens", None)
+            fallback_color = getattr(tokens, "accent_bright", "#00e5e5")
             prompt_button.setStyleSheet(
                 prompt_button.styleSheet()
                 + (
                     "#PWriteFab {"
-                    "color: #00e5e5;"
+                    f"color: {fallback_color};"
                     "font: 700 18px 'Segoe UI';"
                     "}"
                 )
@@ -1845,6 +1970,7 @@ class ImageTab(
                 self.cards[index].set_asset_path(
                     asset_path,
                     animated_gif=animated_gif,
+                    settings=record.get("settings"),
                     preview_path=thumbnail_path,
                     animate_gif=self._tab_active,
                 )
@@ -1858,7 +1984,42 @@ class ImageTab(
                 index
             ].clear_pixmap()
 
+        self._sync_image_action_state()
         return reconciled
+
+    def has_meaningful_images(self) -> bool:
+        """Return whether any user-selected image asset is currently present."""
+        return any(
+            bool(path) and Path(path).is_file()
+            for path in self.image_paths.values()
+        )
+
+    def _sync_image_action_state(self) -> None:
+        available = self.has_meaningful_images()
+        importing = self._image_import_thread is not None
+        for index, card in self.cards.items():
+            selected = bool(
+                self.image_paths[index]
+                and Path(str(self.image_paths[index])).is_file()
+            )
+            card.clear_btn.set_action_state(
+                broken=not selected,
+                invisible=importing,
+            )
+            set_control_invisible(
+                card.thumbnail,
+                importing,
+                available=True,
+            )
+
+        self.reset_btn.set_action_state(
+            broken=not available,
+            invisible=importing,
+        )
+        self.open_btn.set_action_state(
+            broken=not available,
+            invisible=importing,
+        )
 
     def sync_from_disk(
         self,
@@ -1939,8 +2100,6 @@ class ImageTab(
         if not self._tab_active:
             return
 
-        for card in self.cards.values():
-            card.release_asset_handle()
         self._tab_active = False
         for card in self.cards.values():
             card.set_playback_active(False)
@@ -2113,10 +2272,22 @@ class ImageTab(
         )
 
         if cards_top is not None:
+            protected_button = getattr(
+                window,
+                "protected_new_project_btn",
+                None,
+            )
+            protected_height = (
+                protected_button.height() + self.FAB_CARD_GAP
+                if protected_button is not None
+                and protected_button.isVisible()
+                else 0
+            )
             maximum_y = (
                 cards_top
                 - self.pwrite_fab.height()
                 - self.FAB_CARD_GAP
+                - protected_height
             )
 
             y_position = min(
@@ -2137,6 +2308,13 @@ class ImageTab(
         self.pwrite_fab.clamp_to_surface()
         self.pwrite_fab.show()
         self.pwrite_fab.raise_()
+        position_new_project = getattr(
+            window,
+            "_position_protected_new_project_button",
+            None,
+        )
+        if callable(position_new_project):
+            position_new_project()
 
     def _schedule_prompt_writer_position(
         self,
@@ -2278,6 +2456,7 @@ class ImageTab(
             )
         )
         self._emit_cover_change_if_needed()
+        self._sync_image_action_state()
 
         self.images_changed.emit(
             reason
@@ -2288,7 +2467,7 @@ class ImageTab(
         index: int,
         source_path: str,
     ) -> None:
-        if index not in self.labels:
+        if self._shutdown or index not in self.labels:
             return
         if not self.project_state.is_project_ready:
             self._show_temporary_status(
@@ -2296,132 +2475,262 @@ class ImageTab(
                 5000,
             )
             return
-
-        _label, filename = (
-            self.labels[index]
-        )
-        slot = INDEX_TO_SLOT[index]
-
-        pages_directory = (
-            self._user_pages_dir()
-        )
-
-        os.makedirs(
-            pages_directory,
-            exist_ok=True,
-        )
-
-        destination_path = (
-            os.path.join(
-                pages_directory,
-                filename,
+        if self._image_import_thread is not None:
+            self._show_temporary_status(
+                "Another image is already being processed.",
+                3000,
             )
-        )
+            return
 
+        source = Path(source_path).resolve()
+        if not source.is_file():
+            self._show_temporary_status(
+                f"Image file does not exist: {source.name}",
+                5000,
+            )
+            return
+
+        project_pages_directory: Path | None = None
         try:
-            self.cards[index].release_asset_handle()
-            record = install_image_asset(
-                pages_directory,
-                slot,
-                source_path,
-            )
-            self.project_save_service.copy_workspace_file(
-                destination_path,
-                Path("pages") / filename,
-            )
-            source_filename = str(
-                record["source_file"]
-            )
-            if record["asset_type"] == "animated_gif":
-                self.project_save_service.copy_workspace_file(
-                    Path(pages_directory) / source_filename,
-                    Path("pages") / source_filename,
-                )
-                thumbnail_filename = str(record["thumbnail_file"])
-                self.project_save_service.copy_workspace_file(
-                    Path(pages_directory) / thumbnail_filename,
-                    Path("pages") / thumbnail_filename,
-                )
-            else:
-                for obsolete_filename in (
-                    f"{slot}.gif",
-                    f"{slot}.thumbnail.gif",
-                ):
-                    self.project_save_service.delete_project_file(
-                        Path("pages") / obsolete_filename
-                    )
-            self.project_save_service.copy_workspace_file(
-                Path(pages_directory) / IMAGE_MANIFEST_NAME,
-                Path("pages") / IMAGE_MANIFEST_NAME,
-            )
-
+            eligibility = self.project_save_service.save_eligibility()
+            if eligibility.can_save:
+                context = self.project_save_service.current_context()
+                if context.autosave_directory.is_dir():
+                    project_pages_directory = (
+                        context.autosave_directory / "pages"
+                    ).resolve()
         except Exception as error:
             self._show_temporary_status(
-                (
-                    f"Failed to process "
-                    f"{filename}: {error}"
-                ),
+                f"The image project is not ready: {error}",
                 5000,
             )
-
-            self.cards[
-                index
-            ].set_asset_state(
-                "warning"
-            )
-
             return
 
-        pixmap = QtGui.QPixmap(
-            destination_path
+        baseline = image_asset_revision(self._user_pages_dir())
+        identity = self.project_state.identity
+        project_identity = (
+            identity.recipient_id,
+            identity.project_id,
         )
-
-        if pixmap.isNull():
-            self._show_temporary_status(
-                f"Invalid image: {filename}",
-                5000,
-            )
-
-            self.cards[
-                index
-            ].set_asset_state(
-                "warning"
-            )
-
-            return
-
-        self.image_paths[
-            index
-        ] = str(
-            Path(pages_directory)
-            / str(record["source_file"])
+        self._image_import_generation += 1
+        generation = self._image_import_generation
+        holder: dict[str, object] = {}
+        thread = QtCore.QThread(self)
+        worker = _ImageImportWorker(
+            Path(self._user_pages_dir()),
+            project_pages_directory,
+            index,
+            INDEX_TO_SLOT[index],
+            source,
+            project_identity,
+            baseline,
+            generation,
+            holder,
         )
-
-        self.cards[
-            index
-        ].set_asset_path(
-            self.image_paths[index] or destination_path,
-            animated_gif=(
-                record["asset_type"]
-                == "animated_gif"
-            ),
-            preview_path=str(
-                Path(pages_directory)
-                / str(record.get("thumbnail_file", filename))
-            ),
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.prepared.connect(
+            self._image_import_prepared,
+            QtCore.Qt.QueuedConnection,
         )
-
-        self.image_selected.emit(
-            pixmap
+        worker.failed.connect(
+            self._image_import_failed,
+            QtCore.Qt.QueuedConnection,
         )
-
-        self._commit_image_change(
-            "selected"
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(
+            thread.quit,
+            QtCore.Qt.DirectConnection,
         )
-
+        thread.finished.connect(
+            self._image_import_thread_finished,
+            QtCore.Qt.QueuedConnection,
+        )
+        thread.finished.connect(thread.deleteLater)
+        self._image_import_thread = thread
+        self._image_import_worker = worker
+        self._image_import_result_holder = holder
+        self._image_import_index = index
+        self._sync_image_action_state()
         self._show_temporary_status(
-            f"{record['source_file']} saved."
+            f"Processing {source.name}…",
+            0,
         )
+        thread.start()
+
+    @QtCore.Slot(object)
+    def _image_import_prepared(self, result: object) -> None:
+        if not isinstance(result, _PreparedImageImportResult):
+            return
+        holder = self._image_import_result_holder
+        if holder is None or holder.get("result") is not result:
+            return
+        holder.pop("result", None)
+
+        if self._shutdown or result.generation != self._image_import_generation:
+            result.prepared.abort()
+            return
+        if not self.project_state.is_project_ready:
+            result.prepared.abort()
+            self._show_temporary_status(
+                "The project changed before the image could be saved.",
+                5000,
+            )
+            return
+        current_identity = self.project_state.identity
+        if result.project_identity != (
+            current_identity.recipient_id,
+            current_identity.project_id,
+        ):
+            result.prepared.abort()
+            self._show_temporary_status(
+                "The active letter changed before the image could be saved.",
+                5000,
+            )
+            return
+
+        try:
+            if result.project_pages_directory is not None:
+                context = self.project_save_service.current_context()
+                current_project_pages = (
+                    context.autosave_directory / "pages"
+                ).resolve()
+                if current_project_pages != result.project_pages_directory:
+                    raise RuntimeError(
+                        "The active letter changed while the image was processing."
+                    )
+            if (
+                image_asset_revision(self._user_pages_dir())
+                != result.baseline_fingerprint
+            ):
+                raise RuntimeError(
+                    "Images changed while the selection was processing."
+                )
+
+            self.cards[result.index].release_asset_handle()
+            result.prepared.commit_workspace()
+            if self.project_save_service.can_save():
+                if result.project_pages_directory is not None:
+                    result.prepared.commit_project()
+                    self.project_save_service.copy_workspace_file(
+                        Path(self._user_pages_dir()) / IMAGE_MANIFEST_NAME,
+                        Path("pages") / IMAGE_MANIFEST_NAME,
+                    )
+                else:
+                    self._persist_image_record_to_project(
+                        result.index,
+                        result.prepared.record,
+                    )
+            else:
+                result.prepared.discard_project()
+
+            record = result.prepared.record
+            _label, filename = self.labels[result.index]
+            pages_directory = Path(self._user_pages_dir())
+            destination_path = pages_directory / filename
+            pixmap = QtGui.QPixmap.fromImage(result.preview_image)
+            if pixmap.isNull():
+                raise ValueError("The selected image preview is invalid.")
+
+            animated_gif = record["asset_type"] == "animated_gif"
+            self.image_paths[result.index] = str(
+                pages_directory / str(record["source_file"])
+            )
+            self.cards[result.index].set_asset_path(
+                self.image_paths[result.index] or str(destination_path),
+                animated_gif=animated_gif,
+                settings=record.get("settings"),
+                preview_path=str(
+                    pages_directory
+                    / str(record.get("thumbnail_file", filename))
+                ),
+                animate_gif=True,
+                preview_pixmap=pixmap,
+            )
+            self.image_selected.emit(pixmap)
+            self._commit_image_change("selected")
+            result.prepared.finalize()
+            self._show_temporary_status(
+                f"{record['source_file']} saved."
+            )
+        except Exception as error:
+            self.cards[result.index].release_asset_handle()
+            result.prepared.rollback()
+            self.cards[result.index].set_asset_state("warning")
+            self._show_temporary_status(
+                f"Failed to process {self.labels[result.index][1]}: {error}",
+                5000,
+            )
+
+    def _persist_image_record_to_project(
+        self,
+        index: int,
+        record: MutableMapping[str, object],
+    ) -> None:
+        _label, filename = self.labels[index]
+        slot = INDEX_TO_SLOT[index]
+        pages_directory = Path(self._user_pages_dir())
+        self.project_save_service.copy_workspace_file(
+            pages_directory / filename,
+            Path("pages") / filename,
+        )
+        source_filename = str(record["source_file"])
+        if record["asset_type"] == "animated_gif":
+            self.project_save_service.copy_workspace_file(
+                pages_directory / source_filename,
+                Path("pages") / source_filename,
+            )
+            thumbnail_filename = str(record["thumbnail_file"])
+            self.project_save_service.copy_workspace_file(
+                pages_directory / thumbnail_filename,
+                Path("pages") / thumbnail_filename,
+            )
+        else:
+            for obsolete_filename in (
+                f"{slot}.gif",
+                f"{slot}.thumbnail.gif",
+            ):
+                self.project_save_service.delete_project_file(
+                    Path("pages") / obsolete_filename
+                )
+        self.project_save_service.copy_workspace_file(
+            pages_directory / IMAGE_MANIFEST_NAME,
+            Path("pages") / IMAGE_MANIFEST_NAME,
+        )
+
+    @QtCore.Slot(int, int, str)
+    def _image_import_failed(
+        self,
+        generation: int,
+        index: int,
+        message: str,
+    ) -> None:
+        if self._shutdown or generation != self._image_import_generation:
+            return
+        if index in self.cards:
+            self.cards[index].set_asset_state("warning")
+        self._show_temporary_status(
+            f"Failed to process image: {message}",
+            5000,
+        )
+
+    @QtCore.Slot()
+    def _image_import_thread_finished(self) -> None:
+        thread = self._image_import_thread
+        if thread is None:
+            return
+        holder = self._image_import_result_holder
+        self._image_import_thread = None
+        self._image_import_worker = None
+        self._image_import_result_holder = None
+        if holder is not None:
+            result = holder.get("result")
+            if isinstance(result, _PreparedImageImportResult):
+                self._image_import_result_holder = holder
+                self._image_import_prepared(result)
+                self._image_import_result_holder = None
+        self._image_import_index = None
+        self._sync_image_action_state()
 
     def open_image_settings(
         self,
@@ -2462,6 +2771,7 @@ class ImageTab(
                 / IMAGE_MANIFEST_NAME,
                 Path("pages") / IMAGE_MANIFEST_NAME,
             )
+            self.refresh_cards()
         except Exception as error:
             self._show_temporary_status(
                 f"Could not save {slot} GIF settings: {error}",
@@ -2479,6 +2789,10 @@ class ImageTab(
         index: int,
     ) -> None:
         if index not in self.labels:
+            return
+        selected_path = self.image_paths.get(index)
+        if not selected_path or not Path(str(selected_path)).is_file():
+            self._sync_image_action_state()
             return
 
         _label, filename = (
@@ -2557,6 +2871,9 @@ class ImageTab(
             )
 
     def reset_images(self) -> None:
+        if not self.has_meaningful_images():
+            self._sync_image_action_state()
+            return
         confirmation = _ResetImagesConfirmationDialog(
             self
         )
@@ -2744,9 +3061,49 @@ class ImageTab(
             )
         )
 
-    def shutdown(self) -> None:
+    def _stop_image_import(self, timeout_ms: int | None = 5000) -> bool:
+        thread = self._image_import_thread
+        if thread is None:
+            return True
+
+        self._image_import_generation += 1
+        worker = self._image_import_worker
+        if worker is not None:
+            worker.cancel()
+        thread.requestInterruption()
+        if thread.isRunning():
+            stopped = (
+                thread.wait()
+                if timeout_ms is None
+                else thread.wait(max(0, int(timeout_ms)))
+            )
+            if not stopped:
+                thread.setParent(None)
+                self._image_import_thread = None
+                self._image_import_worker = None
+                self._image_import_result_holder = None
+                self._image_import_index = None
+                return False
+
+        holder = self._image_import_result_holder
+        if holder is not None:
+            result = holder.pop("result", None)
+            if isinstance(result, _PreparedImageImportResult):
+                result.prepared.abort()
+        self._image_import_thread = None
+        self._image_import_worker = None
+        self._image_import_result_holder = None
+        self._image_import_index = None
+        return True
+
+    def shutdown(self, timeout_ms: int | None = 5000) -> bool:
+        if self._shutdown:
+            return self._image_import_thread is None
+        self._shutdown = True
         self._status_clear_timer.stop()
         self.pwrite_fab.hide()
+
+        stopped = self._stop_image_import(timeout_ms)
 
         try:
             self.sync_to_disk()
@@ -2756,9 +3113,15 @@ class ImageTab(
                 exc_info=True,
             )
         finally:
-            self.prepare_for_project_restore()
+            for card in self.cards.values():
+                card.release_asset_handle()
+        return stopped
 
-    def prepare_for_project_restore(self) -> None:
+    def prepare_for_project_restore(self, timeout_ms: int = 5000) -> None:
+        if not self._stop_image_import(timeout_ms):
+            raise RuntimeError(
+                "Image processing did not stop before the project changed."
+            )
         for card in self.cards.values():
             card.release_asset_handle()
 

@@ -2,14 +2,34 @@ from __future__ import annotations
 
 import colorsys
 import math
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional
 
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
+from settings_store import (
+    CURTAIN_STYLE_COMPLEMENTARY,
+    CURTAIN_STYLE_COMPLEMENTARY_DARK,
+    CURTAIN_STYLE_COMPLEMENTARY_LIGHT,
+    CURTAIN_STYLE_NORMAL,
+    CURTAIN_STYLE_NORMAL_DARK,
+    CURTAIN_STYLE_NORMAL_LIGHT,
+    CURTAIN_STYLE_OPTIONS,
+    CURTAIN_STYLE_WHITE,
+    CURTAIN_TEXT_STYLE_PAIRS,
+    normalize_curtain_style,
+)
 
 RGB = tuple[int, int, int]
 Lab = tuple[float, float, float]
 WeightedLab = tuple[Lab, float]
+
+
+@dataclass(frozen=True, slots=True)
+class CurtainDisplayColors:
+    background: RGB
+    foreground: RGB
+
 
 FALLBACK_CURTAIN_RGB: RGB = (255, 255, 255)
 _MAX_SAMPLE_PIXELS = 30_000
@@ -34,6 +54,7 @@ _CURTAIN_MID_PERCENTILE = 0.50
 _CURTAIN_HIGH_PERCENTILE = 0.98
 _BANNER_TRANSPARENT_ALPHA = 3
 _BANNER_OPAQUE_ALPHA = 248
+_MIN_TEXT_CONTRAST = 4.5
 
 
 def extract_deep_dominant_color(image_path: Path, *, hue_shift: float = 0.0) -> RGB:
@@ -57,47 +78,12 @@ def curtain_rgb_for_style(image_paths: Iterable[Path], style: str) -> RGB:
     """Resolve a persisted curtain style into the tint used for both panels.
 
     Normal is derived from the dominant color's hue, lightness, and saturation
-    in the letter artwork. Light and Dark are relative variants of that Normal
-    color. Complementary rotates the source hue by 180 degrees before balancing.
+    in the letter artwork. Complementary rotates that hue by 180 degrees. Each
+    base color has its own relative Light and Dark variants.
     """
-    normalized = str(style or "pure_white").strip().lower().replace(" ", "_")
     cover_path = next((Path(path) for path in image_paths), None)
-
-    if normalized in {"pure_white", "white", "white_curtain"}:
-        return FALLBACK_CURTAIN_RGB
     variants = curtain_variant_rgbs(cover_path)
-    if normalized in {
-        "complementary",
-        "complementary_curtain",
-        "complementary_average_color",
-    }:
-        return variants["complementary_average_color"]
-    if normalized in {
-        "normal",
-        "normal_curtain",
-        "inverse_complementary_color",
-        "average_color",
-    }:
-        return variants["average_color"]
-    if normalized in {
-        "light",
-        "light_curtain",
-        "light_average_color",
-        "normal_light",
-    }:
-        return variants["normal_light"]
-    if normalized in {"complementary_light", "complementary_light_curtain"}:
-        return variants["complementary_light"]
-    if normalized in {
-        "dark",
-        "dark_curtain",
-        "dark_average_color",
-        "normal_dark",
-    }:
-        return variants["normal_dark"]
-    if normalized in {"complementary_dark", "complementary_dark_curtain"}:
-        return variants["complementary_dark"]
-    return FALLBACK_CURTAIN_RGB
+    return get_curtain_display_colors(style, variants).background
 
 
 def curtain_variant_rgbs(cover_path: Path | None) -> dict[str, RGB]:
@@ -110,29 +96,117 @@ def curtain_variant_rgbs(cover_path: Path | None) -> dict[str, RGB]:
     normal = _normal_rgb_from_source(source_color)
     complementary = _rotate_rgb_hue(normal, 0.5)
     return {
-        "pure_white": FALLBACK_CURTAIN_RGB,
-        "average_color": normal,
-        "complementary_average_color": complementary,
-        "normal_light": _relative_hls_variant(
+        CURTAIN_STYLE_WHITE: FALLBACK_CURTAIN_RGB,
+        CURTAIN_STYLE_NORMAL: normal,
+        CURTAIN_STYLE_COMPLEMENTARY: complementary,
+        CURTAIN_STYLE_NORMAL_LIGHT: _relative_hls_variant(
             normal,
             lightness_scale=0.72,
             saturation_scale=0.82,
         ),
-        "complementary_light": _relative_hls_variant(
+        CURTAIN_STYLE_COMPLEMENTARY_LIGHT: _relative_hls_variant(
             complementary,
             lightness_scale=0.72,
             saturation_scale=0.82,
         ),
-        "normal_dark": _relative_hls_variant(
+        CURTAIN_STYLE_NORMAL_DARK: _relative_hls_variant(
             normal,
             lightness_scale=-0.55,
             saturation_scale=1.42,
         ),
-        "complementary_dark": _relative_hls_variant(
+        CURTAIN_STYLE_COMPLEMENTARY_DARK: _relative_hls_variant(
             complementary,
             lightness_scale=-0.55,
             saturation_scale=1.42,
         ),
+    }
+
+
+def get_curtain_display_colors(
+    style: object,
+    variants: Mapping[str, RGB],
+) -> CurtainDisplayColors:
+    """Return the shared background and foreground for one curtain style."""
+    normal = _clamp_rgb(
+        variants.get(
+            CURTAIN_STYLE_NORMAL,
+            _normal_rgb_from_source(FALLBACK_CURTAIN_RGB),
+        )
+    )
+    complementary = _clamp_rgb(
+        variants.get(
+            CURTAIN_STYLE_COMPLEMENTARY,
+            _rotate_rgb_hue(normal, 0.5),
+        )
+    )
+    backgrounds = {
+        CURTAIN_STYLE_WHITE: FALLBACK_CURTAIN_RGB,
+        CURTAIN_STYLE_NORMAL: normal,
+        CURTAIN_STYLE_COMPLEMENTARY: complementary,
+        CURTAIN_STYLE_NORMAL_LIGHT: _clamp_rgb(
+            variants.get(
+                CURTAIN_STYLE_NORMAL_LIGHT,
+                _relative_hls_variant(
+                    normal,
+                    lightness_scale=0.72,
+                    saturation_scale=0.82,
+                ),
+            )
+        ),
+        CURTAIN_STYLE_COMPLEMENTARY_LIGHT: _clamp_rgb(
+            variants.get(
+                CURTAIN_STYLE_COMPLEMENTARY_LIGHT,
+                _relative_hls_variant(
+                    complementary,
+                    lightness_scale=0.72,
+                    saturation_scale=0.82,
+                ),
+            )
+        ),
+        CURTAIN_STYLE_NORMAL_DARK: _clamp_rgb(
+            variants.get(
+                CURTAIN_STYLE_NORMAL_DARK,
+                _relative_hls_variant(
+                    normal,
+                    lightness_scale=-0.55,
+                    saturation_scale=1.42,
+                ),
+            )
+        ),
+        CURTAIN_STYLE_COMPLEMENTARY_DARK: _clamp_rgb(
+            variants.get(
+                CURTAIN_STYLE_COMPLEMENTARY_DARK,
+                _relative_hls_variant(
+                    complementary,
+                    lightness_scale=-0.55,
+                    saturation_scale=1.42,
+                ),
+            )
+        ),
+    }
+    normalized = normalize_curtain_style(style)
+    background = backgrounds[normalized]
+    if normalized == CURTAIN_STYLE_WHITE:
+        foreground = (0, 0, 0)
+    elif normalized == CURTAIN_STYLE_NORMAL:
+        foreground = complementary
+    elif normalized == CURTAIN_STYLE_COMPLEMENTARY:
+        foreground = normal
+    else:
+        foreground = _readable_foreground_rgb(
+            background,
+            backgrounds[CURTAIN_TEXT_STYLE_PAIRS[normalized]],
+        )
+    return CurtainDisplayColors(background, foreground)
+
+
+def curtain_display_palette(
+    variants: Mapping[str, RGB],
+) -> dict[str, CurtainDisplayColors]:
+    """Return display colors for every visible curtain option."""
+    return {
+        style: get_curtain_display_colors(style, variants)
+        for style, _label in CURTAIN_STYLE_OPTIONS
     }
 
 
@@ -183,6 +257,58 @@ def _relative_hls_variant(
         max(0.0, min(1.0, saturation)),
     )
     return _clamp_rgb(tuple(round(channel * 255) for channel in converted))
+
+
+def _readable_foreground_rgb(background: RGB, preferred: RGB) -> RGB:
+    preferred = _clamp_rgb(preferred)
+    if _contrast_ratio(background, preferred) >= _MIN_TEXT_CONTRAST:
+        return preferred
+
+    red, green, blue = (channel / 255.0 for channel in preferred)
+    hue, lightness, saturation = colorsys.rgb_to_hls(red, green, blue)
+    background_luminance = _relative_luminance(background)
+    target_lightness = 0.0 if background_luminance >= 0.18 else 1.0
+    for step in range(1, 101):
+        fraction = step / 100.0
+        candidate_lightness = lightness + (
+            target_lightness - lightness
+        ) * fraction
+        candidate = _clamp_rgb(
+            tuple(
+                round(channel * 255)
+                for channel in colorsys.hls_to_rgb(
+                    hue,
+                    candidate_lightness,
+                    saturation,
+                )
+            )
+        )
+        if _contrast_ratio(background, candidate) >= _MIN_TEXT_CONTRAST:
+            return candidate
+
+    fallback_candidates = ((0, 0, 0), (255, 255, 255))
+    return max(
+        fallback_candidates,
+        key=lambda candidate: _contrast_ratio(background, candidate),
+    )
+
+
+def _contrast_ratio(first: RGB, second: RGB) -> float:
+    lighter = max(_relative_luminance(first), _relative_luminance(second))
+    darker = min(_relative_luminance(first), _relative_luminance(second))
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _relative_luminance(rgb: RGB) -> float:
+    channels = []
+    for channel in _clamp_rgb(rgb):
+        value = channel / 255.0
+        channels.append(
+            value / 12.92
+            if value <= 0.04045
+            else ((value + 0.055) / 1.055) ** 2.4
+        )
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
 
 
 def write_tinted_curtain_image(source_path: Path, target_path: Path, rgb: RGB) -> None:

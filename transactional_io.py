@@ -12,12 +12,68 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    class _WindowsFileBasicInfo(ctypes.Structure):
+        _fields_ = [
+            ("CreationTime", ctypes.c_longlong),
+            ("LastAccessTime", ctypes.c_longlong),
+            ("LastWriteTime", ctypes.c_longlong),
+            ("ChangeTime", ctypes.c_longlong),
+            ("FileAttributes", wintypes.DWORD),
+        ]
+
+    _WINDOWS_KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _WINDOWS_KERNEL32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    _WINDOWS_KERNEL32.CreateFileW.restype = wintypes.HANDLE
+    _WINDOWS_KERNEL32.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE,
+        wintypes.INT,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    _WINDOWS_KERNEL32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    _WINDOWS_KERNEL32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+    _WINDOWS_KERNEL32.GetFileAttributesW.restype = wintypes.DWORD
+    _WINDOWS_KERNEL32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+    _WINDOWS_KERNEL32.SetFileAttributesW.restype = wintypes.BOOL
+    _WINDOWS_KERNEL32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _WINDOWS_KERNEL32.CloseHandle.restype = wintypes.BOOL
+
 
 DirectoryValidator = Callable[[Path], bool | None]
 _LOGGER = logging.getLogger(__name__)
 _DIRECTORY_REPLACE_TIMEOUT_SECONDS = 2.0
 _PATH_REMOVE_TIMEOUT_SECONDS = 2.0
 _TRANSIENT_RETRY_DELAYS = (0.0, 0.05, 0.1, 0.2, 0.4, 0.8)
+_INTERNAL_METADATA_FILENAMES = frozenset(
+    {
+        ".lettersmith-snapshot-manifest.json",
+        "lettersmith-build.json",
+        "lettersmith-images.json",
+        "lettersmith-metadata.json",
+        "lettersmith-publication.json",
+        "lettersmith-sound.json",
+        "project_sound.json",
+        "prompt_writer_state.json",
+    }
+)
+_INTERNAL_INVALID_PREFIXES = (
+    "lettersmith-images.invalid.",
+    "project_sound.invalid.",
+    "prompt_writer_state.invalid.",
+    "settings.invalid.",
+)
 
 
 def _is_transient_windows_error(error: BaseException) -> bool:
@@ -47,6 +103,153 @@ def _temporary_path(target: Path) -> Path:
     )
 
 
+def file_change_token(
+    path: str | Path,
+    *,
+    stat_result: os.stat_result | None = None,
+) -> int:
+    """Return a metadata token that changes for in-place content edits."""
+    source = Path(path)
+    current = stat_result if stat_result is not None else source.stat()
+    if os.name != "nt":
+        return int(current.st_ctime_ns)
+
+    handle = _WINDOWS_KERNEL32.CreateFileW(
+        str(source),
+        0x0080,  # FILE_READ_ATTRIBUTES
+        0x0001 | 0x0002 | 0x0004,  # share read, write, and delete
+        None,
+        3,  # OPEN_EXISTING
+        0x0080,  # FILE_ATTRIBUTE_NORMAL
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        return int(current.st_ctime_ns)
+    try:
+        info = _WindowsFileBasicInfo()
+        if not _WINDOWS_KERNEL32.GetFileInformationByHandleEx(
+            handle,
+            0,  # FileBasicInfo
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            return int(current.st_ctime_ns)
+        return int(info.ChangeTime)
+    finally:
+        _WINDOWS_KERNEL32.CloseHandle(handle)
+
+
+def set_path_hidden(path: str | Path, hidden: bool = True) -> bool:
+    """Set or clear the Windows hidden attribute without changing other flags."""
+    target = Path(path)
+    if os.name != "nt" or not target.exists():
+        return False
+
+    attributes = int(_WINDOWS_KERNEL32.GetFileAttributesW(str(target)))
+    if attributes == 0xFFFFFFFF:
+        return False
+    hidden_flag = 0x00000002
+    updated = (
+        attributes | hidden_flag
+        if hidden
+        else attributes & ~hidden_flag
+    )
+    if updated == attributes:
+        return True
+    if updated == 0:
+        updated = 0x00000080  # FILE_ATTRIBUTE_NORMAL
+    if not _WINDOWS_KERNEL32.SetFileAttributesW(str(target), updated):
+        _LOGGER.warning(
+            "Could not update hidden attribute for %s (Windows error %s).",
+            target,
+            ctypes.get_last_error(),
+        )
+        return False
+    return True
+
+
+def is_internal_metadata_path(path: str | Path) -> bool:
+    candidate = Path(path)
+    name = candidate.name.casefold()
+    parent_name = candidate.parent.name.casefold()
+    if name in _INTERNAL_METADATA_FILENAMES:
+        return True
+    if name.startswith(_INTERNAL_INVALID_PREFIXES):
+        return True
+    if name.endswith(".analysis.json") and parent_name == "analysis":
+        return True
+    if name == "current.json" and parent_name == "appssong":
+        return True
+    if name == "library.json" and parent_name in {"appssong", "music archive"}:
+        return True
+    if name == "settings.json" and parent_name in {"active project", "settings"}:
+        return True
+    return name.startswith("storage-layout-") and parent_name == "migrations"
+
+
+def _is_viewer_controls_directory(path: Path) -> bool:
+    if path.name.casefold() != "controls":
+        return False
+    parts = tuple(part.casefold() for part in path.parts)
+    return (
+        len(parts) >= 4
+        and parts[-4:] == ("gallery", "user", "card", "controls")
+    ) or (
+        len(parts) >= 2
+        and parts[-2:] == ("gallery", "controls")
+    )
+
+
+def enforce_internal_tree_visibility(root: str | Path) -> tuple[Path, ...]:
+    """Hide Letter Smith implementation files without hiding user content."""
+    directory = Path(root)
+    if os.name != "nt" or not directory.is_dir():
+        return ()
+    hidden_paths: list[Path] = []
+    for candidate in directory.rglob("*"):
+        if candidate.is_symlink():
+            continue
+        should_hide = (
+            candidate.is_file() and is_internal_metadata_path(candidate)
+        ) or (
+            candidate.is_dir() and _is_viewer_controls_directory(candidate)
+        )
+        if should_hide and set_path_hidden(candidate):
+            hidden_paths.append(candidate)
+    return tuple(hidden_paths)
+
+
+def _path_is_hidden(path: Path) -> bool:
+    if os.name != "nt" or not path.exists():
+        return False
+    attributes = int(_WINDOWS_KERNEL32.GetFileAttributesW(str(path)))
+    return attributes != 0xFFFFFFFF and bool(attributes & 0x00000002)
+
+
+def _replace_file_path(
+    source: Path,
+    destination: Path,
+    *,
+    hidden: bool = False,
+) -> None:
+    destination_was_hidden = _path_is_hidden(destination)
+    should_hide = (
+        hidden
+        or destination_was_hidden
+        or is_internal_metadata_path(destination)
+    )
+    set_path_hidden(destination, False)
+    try:
+        _with_transient_retry(lambda: os.replace(source, destination))
+    except Exception:
+        if destination_was_hidden:
+            set_path_hidden(destination)
+        raise
+    if should_hide:
+        set_path_hidden(destination)
+
+
 def _replace_directory_path(source: Path, destination: Path) -> None:
     """Retry brief Windows sharing violations while viewers release files."""
     _with_transient_retry(lambda: os.replace(source, destination))
@@ -61,7 +264,34 @@ def atomic_write_bytes(path: str | Path, value: bytes) -> Path:
             stream.write(value)
             stream.flush()
             os.fsync(stream.fileno())
-        _with_transient_retry(lambda: os.replace(temporary, target))
+        _replace_file_path(temporary, target)
+    finally:
+        _remove_path(temporary)
+    return target
+
+
+def atomic_copy_file(source: str | Path, destination: str | Path) -> Path:
+    """Stream one file through a sibling temporary before replacement."""
+    source_path = Path(source).resolve()
+    target = Path(destination)
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Source file does not exist: {source_path}")
+    source_stat = source_path.stat()
+    source_hidden = _path_is_hidden(source_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _temporary_path(target)
+    try:
+        with source_path.open("rb") as read_stream, temporary.open("wb") as write_stream:
+            shutil.copyfileobj(read_stream, write_stream, length=1024 * 1024)
+            write_stream.flush()
+            os.fsync(write_stream.fileno())
+        # Preserve timestamps without carrying a packaged source's Windows
+        # read-only attribute onto a generated file that must be replaceable.
+        os.utime(
+            temporary,
+            ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+        )
+        _replace_file_path(temporary, target, hidden=source_hidden)
     finally:
         _remove_path(temporary)
     return target
@@ -108,7 +338,7 @@ def safe_write_json(
             raise ValueError("validated JSON must contain an object")
         if validator is not None:
             validator(parsed)
-        _with_transient_retry(lambda: os.replace(temporary, target))
+        _replace_file_path(temporary, target)
     finally:
         _remove_path(temporary)
     return target
@@ -418,6 +648,7 @@ def replace_directory(
 
 __all__ = [
     "PathTransaction",
+    "atomic_copy_file",
     "atomic_write_bytes",
     "atomic_write_json",
     "safe_write_json",
@@ -425,7 +656,11 @@ __all__ = [
     "cleanup_abandoned_staging",
     "cleanup_abandoned_temp_files",
     "create_staging_directory",
+    "enforce_internal_tree_visibility",
+    "file_change_token",
+    "is_internal_metadata_path",
     "recover_stale_transactions",
     "replace_directory",
+    "set_path_hidden",
     "validate_directory",
 ]

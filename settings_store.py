@@ -11,8 +11,18 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 
-from transactional_io import atomic_write_text
+from transactional_io import atomic_write_text, set_path_hidden
+from letter_page import (
+    DEFAULT_MESSAGE_OVERLAY_OPACITY,
+    DEFAULT_MESSAGE_OVERLAY_PRESET,
+    MESSAGE_OVERLAY_OPACITY_KEY,
+    MESSAGE_OVERLAY_PRESET_KEY,
+)
 from project_paths import application_paths
+from project_timestamps import (
+    PROJECT_CREATED_AT_KEY,
+    PROJECT_PUBLISHED_AT_KEY,
+)
 
 
 SETTINGS_FILENAME = "settings.json"
@@ -37,12 +47,52 @@ DEFAULT_VISIONARY_URL = (
 )
 
 
+CURTAIN_STYLE_WHITE = "pure_white"
+CURTAIN_STYLE_NORMAL = "average_color"
+CURTAIN_STYLE_COMPLEMENTARY = "complementary_average_color"
+CURTAIN_STYLE_NORMAL_LIGHT = "normal_light"
+CURTAIN_STYLE_COMPLEMENTARY_LIGHT = "complementary_light"
+CURTAIN_STYLE_NORMAL_DARK = "normal_dark"
+CURTAIN_STYLE_COMPLEMENTARY_DARK = "complementary_dark"
+
+# Compatibility names for callers that treated Light and Dark as single leaves.
+CURTAIN_STYLE_LIGHT = CURTAIN_STYLE_NORMAL_LIGHT
+CURTAIN_STYLE_DARK = CURTAIN_STYLE_NORMAL_DARK
+
+DEFAULT_CURTAIN_STYLE = CURTAIN_STYLE_NORMAL
+
+CURTAIN_STYLE_OPTIONS = (
+    (CURTAIN_STYLE_WHITE, "White Curtains"),
+    (CURTAIN_STYLE_NORMAL, "Normal Curtains"),
+    (CURTAIN_STYLE_COMPLEMENTARY, "Complementary Curtains"),
+    (CURTAIN_STYLE_NORMAL_LIGHT, "Normal Light Curtains"),
+    (CURTAIN_STYLE_COMPLEMENTARY_LIGHT, "Complementary Light Curtains"),
+    (CURTAIN_STYLE_NORMAL_DARK, "Normal Dark Curtains"),
+    (CURTAIN_STYLE_COMPLEMENTARY_DARK, "Complementary Dark Curtains"),
+)
+
+CURTAIN_STYLE_LABELS = dict(CURTAIN_STYLE_OPTIONS)
+VALID_CURTAIN_STYLES = frozenset(CURTAIN_STYLE_LABELS)
+CURTAIN_TEXT_STYLE_PAIRS = {
+    CURTAIN_STYLE_NORMAL: CURTAIN_STYLE_COMPLEMENTARY,
+    CURTAIN_STYLE_COMPLEMENTARY: CURTAIN_STYLE_NORMAL,
+    CURTAIN_STYLE_NORMAL_LIGHT: CURTAIN_STYLE_COMPLEMENTARY_LIGHT,
+    CURTAIN_STYLE_COMPLEMENTARY_LIGHT: CURTAIN_STYLE_NORMAL_LIGHT,
+    CURTAIN_STYLE_NORMAL_DARK: CURTAIN_STYLE_COMPLEMENTARY_DARK,
+    CURTAIN_STYLE_COMPLEMENTARY_DARK: CURTAIN_STYLE_NORMAL_DARK,
+}
+
+
 DEFAULT_SETTINGS = {
     SETTINGS_SCHEMA_KEY: SETTINGS_SCHEMA_VERSION,
     "starting_volume": 31,
     "last_audio": "music.mp3",
-    "curtain_style": "pure_white",
+    "curtain_style": DEFAULT_CURTAIN_STYLE,
+    MESSAGE_OVERLAY_PRESET_KEY: DEFAULT_MESSAGE_OVERLAY_PRESET,
+    MESSAGE_OVERLAY_OPACITY_KEY: DEFAULT_MESSAGE_OVERLAY_OPACITY,
     REQUIRED_FEATURES_KEY: [],
+    PROJECT_CREATED_AT_KEY: "",
+    PROJECT_PUBLISHED_AT_KEY: "",
     PUBLISHED_PAGE_URL_KEY: "",
     PUBLISHED_PUBLIC_PATH_KEY: "",
     PUBLISHED_AT_KEY: "",
@@ -80,77 +130,75 @@ def empty_publication_settings() -> dict[str, object]:
     }
 
 
-VALID_CURTAIN_STYLES = {
-    "pure_white",
-    "average_color",
-    "complementary_average_color",
-    "normal_light",
-    "complementary_light",
-    "normal_dark",
-    "complementary_dark",
-}
-
-
-CURTAIN_STYLE_LABELS = {
-    "pure_white": "White Curtain",
-    "average_color": "Normal Curtain",
-    "complementary_average_color": (
-        "Complementary Curtain"
-    ),
-    "normal_light": "Normal Light",
-    "complementary_light": "Complementary Light",
-    "normal_dark": "Normal Dark",
-    "complementary_dark": "Complementary Dark",
-}
-
-
-CURTAIN_TEXT_STYLE_PAIRS = {
-    "average_color": "complementary_average_color",
-    "complementary_average_color": "average_color",
-    "normal_light": "complementary_dark",
-    "complementary_light": "normal_dark",
-    "normal_dark": "complementary_light",
-    "complementary_dark": "normal_light",
-}
-
-
 CURTAIN_STYLE_ALIASES = {
-    "white": "pure_white",
-    "pure white": "pure_white",
-    "blank": "pure_white",
-    "original": "pure_white",
+    "white": CURTAIN_STYLE_WHITE,
+    "pure white": CURTAIN_STYLE_WHITE,
+    "white curtain": CURTAIN_STYLE_WHITE,
+    "white curtains": CURTAIN_STYLE_WHITE,
+    "blank": CURTAIN_STYLE_WHITE,
+    "original": CURTAIN_STYLE_WHITE,
 
-    "average": "average_color",
-    "average color": "average_color",
-    "common": "average_color",
-    "common color": "average_color",
+    "average": CURTAIN_STYLE_NORMAL,
+    "average color": CURTAIN_STYLE_NORMAL,
+    "common": CURTAIN_STYLE_NORMAL,
+    "common color": CURTAIN_STYLE_NORMAL,
+    "normal": CURTAIN_STYLE_NORMAL,
+    "normal curtain": CURTAIN_STYLE_NORMAL,
+    "normal curtains": CURTAIN_STYLE_NORMAL,
 
-    "complementary": "complementary_average_color",
-    "complementary average": (
-        "complementary_average_color"
-    ),
-    "complementary average color": (
-        "complementary_average_color"
-    ),
+    "complementary": CURTAIN_STYLE_COMPLEMENTARY,
+    "complementary average": CURTAIN_STYLE_COMPLEMENTARY,
+    "complementary average color": CURTAIN_STYLE_COMPLEMENTARY,
+    "complementary curtain": CURTAIN_STYLE_COMPLEMENTARY,
+    "complementary curtains": CURTAIN_STYLE_COMPLEMENTARY,
 
-    "light": "normal_light",
-    "light curtain": "normal_light",
-    "light_curtain": "normal_light",
-    "lighter": "normal_light",
-    "normal light": "normal_light",
-    "normal light curtain": "normal_light",
-    "complementary light": "complementary_light",
-    "complementary light curtain": "complementary_light",
+    "light": CURTAIN_STYLE_NORMAL_LIGHT,
+    "light curtain": CURTAIN_STYLE_NORMAL_LIGHT,
+    "light curtains": CURTAIN_STYLE_NORMAL_LIGHT,
+    "light_curtain": CURTAIN_STYLE_NORMAL_LIGHT,
+    "lighter": CURTAIN_STYLE_NORMAL_LIGHT,
+    "normal light": CURTAIN_STYLE_NORMAL_LIGHT,
+    "normal light curtain": CURTAIN_STYLE_NORMAL_LIGHT,
+    "normal light curtains": CURTAIN_STYLE_NORMAL_LIGHT,
+    "complementary light": CURTAIN_STYLE_COMPLEMENTARY_LIGHT,
+    "complementary light curtain": CURTAIN_STYLE_COMPLEMENTARY_LIGHT,
+    "complementary light curtains": CURTAIN_STYLE_COMPLEMENTARY_LIGHT,
+    "complementary_light": CURTAIN_STYLE_COMPLEMENTARY_LIGHT,
 
-    "dark": "normal_dark",
-    "dark curtain": "normal_dark",
-    "dark_curtain": "normal_dark",
-    "darker": "normal_dark",
-    "normal dark": "normal_dark",
-    "normal dark curtain": "normal_dark",
-    "complementary dark": "complementary_dark",
-    "complementary dark curtain": "complementary_dark",
+    "dark": CURTAIN_STYLE_NORMAL_DARK,
+    "dark curtain": CURTAIN_STYLE_NORMAL_DARK,
+    "dark curtains": CURTAIN_STYLE_NORMAL_DARK,
+    "dark_curtain": CURTAIN_STYLE_NORMAL_DARK,
+    "darker": CURTAIN_STYLE_NORMAL_DARK,
+    "normal dark": CURTAIN_STYLE_NORMAL_DARK,
+    "normal dark curtain": CURTAIN_STYLE_NORMAL_DARK,
+    "normal dark curtains": CURTAIN_STYLE_NORMAL_DARK,
+    "complementary dark": CURTAIN_STYLE_COMPLEMENTARY_DARK,
+    "complementary dark curtain": CURTAIN_STYLE_COMPLEMENTARY_DARK,
+    "complementary dark curtains": CURTAIN_STYLE_COMPLEMENTARY_DARK,
+    "complementary_dark": CURTAIN_STYLE_COMPLEMENTARY_DARK,
 }
+
+
+def normalize_curtain_style(value: object) -> str:
+    """Return one canonical persisted curtain style."""
+    key = " ".join(
+        str(value or "")
+        .strip()
+        .casefold()
+        .replace("_", " ")
+        .replace("-", " ")
+        .split()
+    )
+    style = CURTAIN_STYLE_ALIASES.get(
+        key,
+        key.replace(" ", "_"),
+    )
+    return (
+        style
+        if style in VALID_CURTAIN_STYLES
+        else DEFAULT_CURTAIN_STYLE
+    )
 
 
 def normalize_published_page_url(
@@ -302,6 +350,7 @@ class SettingsStore:
         self.path = application_paths(
             self.project_root
         ).settings_file
+        set_path_hidden(self.path)
 
         signal_key = str(self.path).casefold()
         with self._locks_guard:
@@ -603,6 +652,7 @@ class SettingsStore:
                 self.path,
                 backup,
             )
+            set_path_hidden(backup)
         except OSError:
             pass
 
@@ -626,6 +676,7 @@ class SettingsStore:
             self.path,
             payload,
         )
+        set_path_hidden(self.path)
         self._file_signature = self._stat_signature_unlocked()
 
     def _stat_signature_unlocked(
@@ -809,6 +860,8 @@ class SettingsStore:
             )
         )
         for key in (
+            PROJECT_CREATED_AT_KEY,
+            PROJECT_PUBLISHED_AT_KEY,
             PUBLISHED_PUBLIC_PATH_KEY,
             PUBLISHED_AT_KEY,
             PUBLISHED_EXPIRES_AT_KEY,
@@ -861,44 +914,33 @@ class SettingsStore:
         )
 
         # Curtain style
-        style = str(
-            normalized.get(
-                "curtain_style",
-                DEFAULT_SETTINGS[
-                    "curtain_style"
-                ],
-            )
-        ).strip().lower()
-
-        style = CURTAIN_STYLE_ALIASES.get(
-            style,
-            style.replace(
-                " ",
-                "_",
-            ),
-        )
-
-        if (
-            style
-            not in VALID_CURTAIN_STYLES
-        ):
-            style = str(
-                DEFAULT_SETTINGS[
-                    "curtain_style"
-                ]
-            )
-
         normalized[
             "curtain_style"
-        ] = style
+        ] = normalize_curtain_style(
+            normalized.get(
+                "curtain_style",
+                DEFAULT_CURTAIN_STYLE,
+            )
+        )
 
         return normalized
 
 
 __all__ = [
     "CURTAIN_STYLE_ALIASES",
+    "CURTAIN_STYLE_COMPLEMENTARY",
+    "CURTAIN_STYLE_COMPLEMENTARY_DARK",
+    "CURTAIN_STYLE_COMPLEMENTARY_LIGHT",
+    "CURTAIN_STYLE_DARK",
     "CURTAIN_STYLE_LABELS",
+    "CURTAIN_STYLE_LIGHT",
+    "CURTAIN_STYLE_NORMAL",
+    "CURTAIN_STYLE_NORMAL_DARK",
+    "CURTAIN_STYLE_NORMAL_LIGHT",
+    "CURTAIN_STYLE_OPTIONS",
+    "CURTAIN_STYLE_WHITE",
     "CURTAIN_TEXT_STYLE_PAIRS",
+    "DEFAULT_CURTAIN_STYLE",
     "DEFAULT_SETTINGS",
     "DEFAULT_VISIONARY_URL",
     "ACTIVE_PLAY_DIR_KEY",
@@ -912,6 +954,8 @@ __all__ = [
     "PUBLISHED_PUBLIC_PATH_KEY",
     "PUBLISHED_SOURCE_FINGERPRINT_KEY",
     "PUBLICATION_SETTING_KEYS",
+    "PROJECT_CREATED_AT_KEY",
+    "PROJECT_PUBLISHED_AT_KEY",
     "REQUIRED_FEATURES_KEY",
     "VISIONARY_URL_KEY",
     "SETTINGS_FILENAME",
@@ -922,5 +966,6 @@ __all__ = [
     "UnsupportedSettingsSchemaError",
     "empty_publication_settings",
     "VALID_CURTAIN_STYLES",
+    "normalize_curtain_style",
     "normalize_published_page_url",
 ]

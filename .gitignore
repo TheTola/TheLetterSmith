@@ -17,6 +17,7 @@ Thumbs.db
 output/
 dist/
 build/
+release/installer/
 .lettersmith-publishing/
 .lettersmith-publishing-workspaces/
 Quarantine/

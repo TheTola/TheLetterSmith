@@ -4,8 +4,11 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -21,8 +24,10 @@ import generate
 import image_animation
 from Image_tab import (
     ImageAssetCard,
+    ImageSettingsDialog,
     ImageTab,
     StockImageDialog,
+    _ImageThumbnail,
     _ResetImagesConfirmationDialog,
 )
 from image_animation import (
@@ -31,13 +36,18 @@ from image_animation import (
     inspect_gif,
     install_image_asset,
     load_image_manifest,
+    normalize_gif_settings,
+    prepare_image_asset_import,
     reconcile_external_image_assets,
     update_slot_gif_settings,
     validate_runtime_image_manifest,
+    write_image_manifest,
 )
 from portable_export import create_single_html
 from Message_tab import MessageTab
+from project_state import ProjectStateController
 from settings_store import SettingsStore
+from ui_theme import BUTTON_TIER_STYLES, THEMES, ButtonTier, ThemeService
 
 
 class _FakeMovie:
@@ -148,6 +158,8 @@ class ImageAnimationTests(unittest.TestCase):
                 pages,
                 "cover",
                 {
+                    "animation_enabled": False,
+                    "speed_percent": 175,
                     "playback_mode": "loop",
                     "play_count": 17,
                     "start_delay_ms": 1500,
@@ -160,7 +172,129 @@ class ImageAnimationTests(unittest.TestCase):
             self.assertEqual((pages / "cover.gif").read_bytes(), original)
             self.assertTrue((pages / "cover.png").is_file())
             self.assertEqual(manifest["slots"]["cover"]["settings"], settings)
-            self.assertNotIn("animation_speed", json.dumps(manifest))
+            self.assertFalse(settings["animation_enabled"])
+            self.assertEqual(settings["speed_percent"], 175)
+            if os.name == "nt":
+                self.assertTrue(
+                    (pages / IMAGE_MANIFEST_NAME).stat().st_file_attributes
+                    & stat.FILE_ATTRIBUTE_HIDDEN
+                )
+
+    def test_gif_settings_normalize_enablement_and_speed_bounds(self) -> None:
+        self.assertEqual(
+            normalize_gif_settings(None)["animation_enabled"],
+            True,
+        )
+        self.assertEqual(normalize_gif_settings(None)["speed_percent"], 100)
+        self.assertFalse(
+            normalize_gif_settings({"animation_enabled": "off"})[
+                "animation_enabled"
+            ]
+        )
+        self.assertEqual(
+            normalize_gif_settings({"speed_percent": 5})["speed_percent"],
+            25,
+        )
+        self.assertEqual(
+            normalize_gif_settings({"speed_percent": 900})["speed_percent"],
+            400,
+        )
+        self.assertEqual(
+            normalize_gif_settings({"speed_percent": "invalid"})[
+                "speed_percent"
+            ],
+            100,
+        )
+
+    def test_gif_settings_dialog_round_trips_start_stop_and_speed(self) -> None:
+        dialog = ImageSettingsDialog(
+            "Cover Page",
+            animated_gif=True,
+            settings={
+                "animation_enabled": False,
+                "speed_percent": 175,
+            },
+        )
+        self.addCleanup(dialog.deleteLater)
+
+        self.assertFalse(dialog.animation_enabled.isChecked())
+        self.assertEqual(dialog.speed_percent.value(), 175)
+        dialog.animation_enabled.setChecked(True)
+        dialog.speed_percent.setValue(225)
+
+        settings = dialog.gif_settings()
+        self.assertTrue(settings["animation_enabled"])
+        self.assertEqual(settings["speed_percent"], 225)
+
+    def test_prepared_import_changes_workspace_and_project_only_on_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pages = root / "gallery/user/pages"
+            project_pages = root / "saved/pages"
+            source = root / "replacement.png"
+            self._write_png(source, "green")
+            self._write_png(pages / "cover.png", "red")
+            project_pages.mkdir(parents=True)
+            shutil.copy2(pages / "cover.png", project_pages / "cover.png")
+
+            prepared = prepare_image_asset_import(
+                pages,
+                "cover",
+                source,
+                project_pages_directory=project_pages,
+            )
+            try:
+                with Image.open(pages / "cover.png") as workspace_image:
+                    self.assertEqual(workspace_image.getpixel((0, 0))[:3], (255, 0, 0))
+                with Image.open(project_pages / "cover.png") as project_image:
+                    self.assertEqual(project_image.getpixel((0, 0))[:3], (255, 0, 0))
+
+                prepared.commit()
+                if os.name == "nt":
+                    self.assertTrue(
+                        (pages / IMAGE_MANIFEST_NAME).stat().st_file_attributes
+                        & stat.FILE_ATTRIBUTE_HIDDEN
+                    )
+                    self.assertTrue(
+                        (project_pages / IMAGE_MANIFEST_NAME).stat().st_file_attributes
+                        & stat.FILE_ATTRIBUTE_HIDDEN
+                    )
+                with Image.open(pages / "cover.png") as workspace_image:
+                    self.assertEqual(workspace_image.getpixel((0, 0))[:3], (0, 128, 0))
+                with Image.open(project_pages / "cover.png") as project_image:
+                    self.assertEqual(project_image.getpixel((0, 0))[:3], (0, 128, 0))
+
+                prepared.rollback()
+                with Image.open(pages / "cover.png") as workspace_image:
+                    self.assertEqual(workspace_image.getpixel((0, 0))[:3], (255, 0, 0))
+                with Image.open(project_pages / "cover.png") as project_image:
+                    self.assertEqual(project_image.getpixel((0, 0))[:3], (255, 0, 0))
+            finally:
+                prepared.abort()
+
+    def test_prepared_import_rolls_back_an_interrupted_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pages = root / "pages"
+            source = root / "replacement.png"
+            self._write_png(source, "green")
+            self._write_png(pages / "cover.png", "red")
+            prepared = prepare_image_asset_import(pages, "cover", source)
+            failing_transaction = prepared._changes[1].transaction
+            try:
+                with (
+                    mock.patch.object(
+                        failing_transaction,
+                        "commit",
+                        side_effect=OSError("locked"),
+                    ),
+                    self.assertRaises(OSError),
+                ):
+                    prepared.commit()
+                with Image.open(pages / "cover.png") as restored:
+                    self.assertEqual(restored.getpixel((0, 0))[:3], (255, 0, 0))
+            finally:
+                prepared.abort()
 
     def test_original_loop_metadata_and_static_gif_detection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -226,24 +360,32 @@ class ImageAnimationTests(unittest.TestCase):
 
             expected_settings = {
                 "cover": {
+                    "animation_enabled": True,
+                    "speed_percent": 100,
                     "playback_mode": "loop",
                     "play_count": "forever",
                     "start_delay_ms": 0,
                     "loop_pause_ms": 2000,
                 },
                 "letter": {
+                    "animation_enabled": True,
+                    "speed_percent": 50,
                     "playback_mode": "loop",
                     "play_count": 3,
                     "start_delay_ms": 1500,
                     "loop_pause_ms": 4000,
                 },
                 "wall": {
+                    "animation_enabled": False,
+                    "speed_percent": 125,
                     "playback_mode": "ping_pong",
                     "play_count": "forever",
                     "start_delay_ms": 3000,
                     "loop_pause_ms": 1000,
                 },
                 "back": {
+                    "animation_enabled": True,
+                    "speed_percent": 200,
                     "playback_mode": "original",
                     "play_count": 1,
                     "start_delay_ms": 0,
@@ -311,10 +453,21 @@ class ImageAnimationTests(unittest.TestCase):
             self.assertIn("beginBtn.classList.add('is-dismissed')", script)
             self.assertIn("dismissTitleBanner();\n    flipTo(target);", script)
             self.assertIn("pointer-events:none", styles)
+            self.assertIn("--duration-overlay:180ms", styles)
+            self.assertIn("--duration-curtain:1500ms", styles)
+            self.assertIn(".text-wall.is-open{opacity:1", styles)
+            self.assertIn("#turnShadow{position:absolute", styles)
+            self.assertIn("#slideshow.page-turning .nav-button", styles)
+            self.assertIn("const goingNext = target > idx", script)
+            self.assertIn("const eased = motion.ease(raw)", script)
+            self.assertIn("if (!started || flipping", script)
             self.assertIn('"playback_mode": "ping_pong"', index)
+            self.assertIn('"animation_enabled": false', index)
+            self.assertIn('"speed_percent": 50', index)
             self.assertIn("playImageReverse", script)
+            self.assertIn("authoredDuration * 100 / speedPercent", script)
+            self.assertIn("config.animation_enabled === false", script)
             self.assertIn("completed animation stays on its last displayed frame", script)
-            self.assertNotIn("animation_speed", index + script)
 
             restored_pages = root / "restored-pages"
             shutil.copytree(play / "gallery/pages", restored_pages)
@@ -372,6 +525,121 @@ class ImageAnimationTests(unittest.TestCase):
             for record in manifest["slots"].values():
                 self.assertEqual(record["gif"]["render_mode"], "native_gif")
                 self.assertNotIn("frames", record["gif"])
+
+            update_slot_gif_settings(
+                source,
+                "cover",
+                {"speed_percent": 200},
+            )
+            scaled_destination = root / "scaled-destination"
+            scaled = build_runtime_image_assets(source, scaled_destination)
+            self.assertEqual(scaled.animations["0"]["render_mode"], "frames")
+            self.assertEqual(scaled.animations["0"]["speed_percent"], 200)
+
+    def test_runtime_validator_accepts_legacy_default_animation_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            gif = root / "source.gif"
+            self._write_gif(gif)
+            install_image_asset(source, "cover", gif)
+            for slot in ("letter", "wall", "back"):
+                self._write_png(source / f"{slot}.png")
+
+            build_runtime_image_assets(source, destination)
+            manifest_path = destination / IMAGE_MANIFEST_NAME
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            settings = manifest["slots"]["cover"]["settings"]
+            settings.pop("animation_enabled")
+            settings.pop("speed_percent")
+            write_image_manifest(destination, manifest)
+
+            validated = validate_runtime_image_manifest(destination)
+
+            self.assertTrue(
+                validated["slots"]["cover"]["settings"]["animation_enabled"]
+            )
+            self.assertEqual(
+                validated["slots"]["cover"]["settings"]["speed_percent"],
+                100,
+            )
+
+    def test_runtime_builder_reuses_unchanged_custom_gif_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            first = root / "first"
+            second = root / "second"
+            gif = root / "source.gif"
+            self._write_gif(gif)
+            install_image_asset(source, "cover", gif)
+            update_slot_gif_settings(
+                source,
+                "cover",
+                {"playback_mode": "ping_pong", "play_count": 2},
+            )
+            for slot in ("letter", "wall", "back"):
+                self._write_png(source / f"{slot}.png")
+
+            original = build_runtime_image_assets(source, first)
+            with mock.patch.object(
+                image_animation,
+                "_extract_gif_frames",
+                side_effect=AssertionError("unchanged frames were regenerated"),
+            ):
+                reused = build_runtime_image_assets(
+                    source,
+                    second,
+                    reuse_pages_directory=first,
+                )
+
+            self.assertEqual(
+                original.animations["0"]["frames"],
+                reused.animations["0"]["frames"],
+            )
+            validate_runtime_image_manifest(second)
+
+    def test_runtime_builder_regenerates_corrupt_cached_gif_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            first = root / "first"
+            second = root / "second"
+            gif = root / "source.gif"
+            self._write_gif(gif)
+            install_image_asset(source, "cover", gif)
+            update_slot_gif_settings(
+                source,
+                "cover",
+                {"playback_mode": "ping_pong", "play_count": 2},
+            )
+            for slot in ("letter", "wall", "back"):
+                self._write_png(source / f"{slot}.png")
+
+            original = build_runtime_image_assets(source, first)
+            cached_frame = first / original.manifest["slots"]["cover"]["gif"][
+                "frames"
+            ][0]
+            cached_frame.write_bytes(b"broken")
+            with mock.patch.object(
+                image_animation,
+                "_extract_gif_frames",
+                wraps=image_animation._extract_gif_frames,
+            ) as extract:
+                rebuilt = build_runtime_image_assets(
+                    source,
+                    second,
+                    reuse_pages_directory=first,
+                )
+
+            extract.assert_called_once()
+            validate_runtime_image_manifest(second)
+            regenerated = second / rebuilt.manifest["slots"]["cover"]["gif"][
+                "frames"
+            ][0]
+            with Image.open(regenerated) as frame:
+                frame.verify()
 
     def test_large_gif_is_normalized_for_viewer_and_thumbnail_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -475,7 +743,43 @@ class ImageAnimationTests(unittest.TestCase):
             MessageTab.select_file(message_tab)
 
         self.assertEqual(image_chooser.call_args.args[2], "C:/Users/Test/Downloads")
+        self.assertIn("*.gif", image_chooser.call_args.args[3])
         self.assertEqual(message_chooser.call_args.args[2], "C:/Users/Test/Downloads")
+
+    def test_saved_gif_settings_refresh_preview_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pages = Path(directory) / "pages"
+            source = Path(directory) / "source.gif"
+            self._write_gif(source)
+            install_image_asset(pages, "cover", source)
+            dialog = mock.Mock()
+            dialog.exec.return_value = QtWidgets.QDialog.Accepted
+            dialog.gif_settings.return_value = {
+                "animation_enabled": True,
+                "speed_percent": 225,
+            }
+            tab = SimpleNamespace(
+                labels={1: ("Cover Page", "cover.png")},
+                _user_pages_dir=mock.Mock(return_value=str(pages)),
+                project_save_service=SimpleNamespace(
+                    copy_workspace_file=mock.Mock()
+                ),
+                refresh_cards=mock.Mock(),
+                _commit_image_change=mock.Mock(),
+                animation_settings_changed=SimpleNamespace(emit=mock.Mock()),
+                _show_temporary_status=mock.Mock(),
+            )
+
+            with mock.patch(
+                "Image_tab.ImageSettingsDialog",
+                return_value=dialog,
+            ):
+                ImageTab.open_image_settings(tab, 1)
+
+            tab.refresh_cards.assert_called_once_with()
+            saved = load_image_manifest(pages)["slots"]["cover"]["settings"]
+            self.assertTrue(saved["animation_enabled"])
+            self.assertEqual(saved["speed_percent"], 225)
 
     def test_reset_confirmation_is_frameless_modal_and_color_coded(self) -> None:
         dialog = _ResetImagesConfirmationDialog()
@@ -491,10 +795,47 @@ class ImageAnimationTests(unittest.TestCase):
             )
             self.assertEqual(dialog.yes_button.text(), "Yes")
             self.assertEqual(dialog.no_button.text(), "No")
+            self.assertEqual(dialog.yes_button.size(), dialog.no_button.size())
+            self.assertEqual(dialog.yes_button.height(), 42)
             self.assertIn("#ff626c", dialog.styleSheet())
             self.assertIn("#00d0ff", dialog.styleSheet())
         finally:
             dialog.close()
+
+    def test_thumbnail_frame_uses_each_theme_secondary_color(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for theme_id in THEMES:
+                frame = (
+                    root
+                    / "resources"
+                    / "app"
+                    / "themes"
+                    / theme_id
+                    / "image_frame.png"
+                )
+                frame.parent.mkdir(parents=True, exist_ok=True)
+                image = QtGui.QImage(4, 4, QtGui.QImage.Format_ARGB32)
+                image.fill(QtCore.Qt.transparent)
+                image.setPixelColor(0, 0, QtGui.QColor("#00d0ff"))
+                self.assertTrue(image.save(str(frame)))
+
+            thumbnail = _ImageThumbnail()
+            self.addCleanup(thumbnail.deleteLater)
+            service = ThemeService(root, parent=thumbnail)
+            frame_colors = set()
+            for theme_id, definition in THEMES.items():
+                service.set_theme(theme_id, persist=False)
+                thumbnail.apply_theme_assets(service, root)
+                expected = QtGui.QColor(definition.tokens.secondary)
+                self.assertEqual(thumbnail.theme_frame_color, expected)
+                self.assertEqual(
+                    thumbnail._theme_frame.toImage().pixelColor(0, 0),
+                    expected,
+                )
+                frame_colors.add(expected.name())
+
+            self.assertEqual(len(frame_colors), len(THEMES))
 
     def test_reset_requires_yes_before_clearing_images(self) -> None:
         tab = mock.Mock()
@@ -514,8 +855,7 @@ class ImageAnimationTests(unittest.TestCase):
             tab._reset_images_confirmed.assert_called_once_with()
 
     def test_image_utility_buttons_preserve_artwork_and_do_not_overlap_cards(self) -> None:
-        self.assertEqual(ImageTab.UTILITY_BUTTON_WIDTH, 210)
-        self.assertEqual(ImageTab.UTILITY_BUTTON_HEIGHT, 120)
+        expected_size = BUTTON_TIER_STYLES[ButtonTier.LARGE].size
 
         with tempfile.TemporaryDirectory() as directory:
             image_tab = ImageTab(directory)
@@ -528,12 +868,14 @@ class ImageAnimationTests(unittest.TestCase):
             try:
                 self.assertEqual(
                     image_tab.reset_btn.size(),
-                    QtCore.QSize(210, 120),
+                    expected_size,
                 )
                 self.assertEqual(
                     image_tab.open_btn.size(),
-                    QtCore.QSize(210, 120),
+                    expected_size,
                 )
+                self.assertEqual(image_tab.reset_btn.property("buttonTier"), "large")
+                self.assertEqual(image_tab.open_btn.property("buttonTier"), "large")
                 self.assertFalse(image_tab.reset_btn._artwork_stretch)
                 self.assertFalse(image_tab.open_btn._artwork_stretch)
                 for button in (
@@ -550,6 +892,10 @@ class ImageAnimationTests(unittest.TestCase):
 
 
 class ImageTabPerformanceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+
     @staticmethod
     def _tab_stub(fingerprint: str = "same") -> SimpleNamespace:
         return SimpleNamespace(
@@ -604,6 +950,121 @@ class ImageTabPerformanceTests(unittest.TestCase):
         tab.refresh_cards.assert_not_called()
         tab.images_changed.emit.assert_not_called()
 
+    def test_image_preprocessing_runs_off_ui_thread_and_rejects_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = ProjectStateController(root)
+            state.initialize()
+            state.establish_project(
+                "Amanda Miller",
+                custom_capitalization=True,
+            )
+            SettingsStore(root).update_fields(
+                {"recipient_title": "Morning Joy"}
+            )
+            pages = root / "gallery/user/pages"
+            pages.mkdir(parents=True)
+            for name in ("letter.png", "wall.png", "back.png"):
+                Image.new("RGBA", (16, 16), "red").save(
+                    pages / name,
+                    format="PNG",
+                )
+            source = root / "replacement.png"
+            Image.new("RGBA", (512, 512), "green").save(source, format="PNG")
+            tab = ImageTab(root, project_state=state)
+            self.assertFalse(tab.project_save_service.can_save())
+            started = threading.Event()
+            release = threading.Event()
+            worker_threads: list[QtCore.QThread] = []
+
+            def delayed_prepare(*args, **kwargs):
+                worker_threads.append(QtCore.QThread.currentThread())
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError("Test image import did not resume.")
+                return prepare_image_asset_import(*args, **kwargs)
+
+            try:
+                with mock.patch(
+                    "Image_tab.prepare_image_asset_import",
+                    side_effect=delayed_prepare,
+                ):
+                    tab.set_image_path(1, str(source))
+                    self.assertTrue(started.wait(2))
+                    first_thread = tab._image_import_thread
+                    first_generation = tab._image_import_generation
+
+                    tab.set_image_path(1, str(source))
+
+                    self.assertIs(tab._image_import_thread, first_thread)
+                    self.assertEqual(tab._image_import_generation, first_generation)
+                    release.set()
+                    deadline = time.monotonic() + 5
+                    while tab._image_import_thread is not None:
+                        self.app.processEvents()
+                        if time.monotonic() >= deadline:
+                            self.fail("Image import thread did not finish.")
+                        time.sleep(0.01)
+
+                self.assertTrue(worker_threads)
+                self.assertIsNot(worker_threads[0], self.app.thread())
+                with Image.open(root / "gallery/user/pages/cover.png") as installed:
+                    self.assertEqual(installed.getpixel((0, 0))[:3], (0, 128, 0))
+                context = tab.project_save_service.current_context()
+                self.assertTrue(
+                    (context.autosave_directory / "pages/cover.png").is_file()
+                )
+            finally:
+                release.set()
+                tab.shutdown()
+                tab.close()
+                state.shutdown()
+
+    def test_project_restore_invalidates_late_image_import_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = ProjectStateController(root)
+            state.initialize()
+            state.establish_project(
+                "Amanda Miller",
+                custom_capitalization=True,
+            )
+            source = root / "replacement.png"
+            Image.new("RGBA", (128, 128), "green").save(source, format="PNG")
+            tab = ImageTab(root, project_state=state)
+            started = threading.Event()
+            release = threading.Event()
+
+            def delayed_prepare(*args, **kwargs):
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError("Test image import did not resume.")
+                return prepare_image_asset_import(*args, **kwargs)
+
+            try:
+                with mock.patch(
+                    "Image_tab.prepare_image_asset_import",
+                    side_effect=delayed_prepare,
+                ):
+                    tab.set_image_path(1, str(source))
+                    self.assertTrue(started.wait(2))
+                    worker_thread = tab._image_import_thread
+                    with self.assertRaises(RuntimeError):
+                        tab.prepare_for_project_restore(timeout_ms=10)
+                    release.set()
+                    self.assertIsNotNone(worker_thread)
+                    self.assertTrue(worker_thread.wait(5000))
+                    self.app.processEvents()
+
+                self.assertFalse(
+                    (root / "gallery/user/pages/cover.png").exists()
+                )
+            finally:
+                release.set()
+                tab.shutdown()
+                tab.close()
+                state.shutdown()
+
     def test_movie_pauses_and_resumes_without_reconstruction(self) -> None:
         movie = _FakeMovie(QtGui.QMovie.Running)
         card = SimpleNamespace(
@@ -622,6 +1083,56 @@ class ImageTabPerformanceTests(unittest.TestCase):
         self.assertEqual(movie.state(), QtGui.QMovie.Running)
         self.assertFalse(card._resume_movie_on_activation)
         self.assertEqual(movie.start_calls, 0)
+
+    def test_real_gif_card_applies_speed_and_survives_tab_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.gif"
+            ImageAnimationTests._write_gif(source)
+            card = ImageAssetCard(1, "Cover Page", root)
+            self.addCleanup(card.deleteLater)
+            card.set_playback_active(False)
+            card.set_asset_path(
+                str(source),
+                animated_gif=True,
+                settings={"animation_enabled": True, "speed_percent": 175},
+                animate_gif=False,
+            )
+
+            movie = card._movie
+            self.assertIsNotNone(movie)
+            self.assertEqual(movie.speed(), 175)
+            card.set_playback_active(True)
+            self.app.processEvents()
+            self.assertIs(card._movie, movie)
+            self.assertEqual(movie.state(), QtGui.QMovie.Running)
+
+            card.set_playback_active(False)
+            self.assertIs(card._movie, movie)
+            self.assertEqual(movie.state(), QtGui.QMovie.Paused)
+            card.set_playback_active(True)
+            self.assertIs(card._movie, movie)
+            self.assertEqual(movie.state(), QtGui.QMovie.Running)
+            card.release_asset_handle()
+            self.app.processEvents()
+
+    def test_stopped_gif_card_keeps_preview_frame_without_movie(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.gif"
+            ImageAnimationTests._write_gif(source)
+            card = ImageAssetCard(1, "Cover Page", root)
+            self.addCleanup(card.deleteLater)
+            card.set_asset_path(
+                str(source),
+                animated_gif=True,
+                settings={"animation_enabled": False, "speed_percent": 200},
+            )
+
+            self.assertIsNone(card._movie)
+            self.assertIsNotNone(card.thumbnail.pixmap())
+            self.assertFalse(card.thumbnail.pixmap().isNull())
+            self.assertTrue(card.settings_btn.isEnabled())
 
     def test_completed_movie_is_not_restarted_on_tab_activation(self) -> None:
         movie = _FakeMovie(QtGui.QMovie.NotRunning)
@@ -655,6 +1166,7 @@ class ImageTabPerformanceTests(unittest.TestCase):
         tab.sync_to_disk.assert_called_once_with()
         for card in cards.values():
             card.set_playback_active.assert_called_once_with(False)
+            card.release_asset_handle.assert_not_called()
 
         ImageTab.activate_for_tab_change(tab)
 
