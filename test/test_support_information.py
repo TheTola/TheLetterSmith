@@ -56,6 +56,22 @@ class SupportInformationLogicTests(unittest.TestCase):
         self.assertNotIn("SUPPORT EMAIL NOT CONFIGURED", about_source)
         self.assertFalse(application_identity.is_placeholder("support@example.com"))
 
+    def test_creator_is_public_without_allowing_private_home_paths(self) -> None:
+        from release import build_release
+
+        patterns = build_release._private_text_patterns(
+            include_secret_literals=False,
+        )
+        self.assertFalse(
+            any(
+                pattern.search(application_identity.CREATOR_NAME)
+                for pattern in patterns
+            )
+        )
+        self.assertTrue(
+            any(pattern.search(str(Path.home())) for pattern in patterns)
+        )
+
     def test_basic_report_omits_both_optional_sections(self) -> None:
         report = build_support_report(
             self.root,

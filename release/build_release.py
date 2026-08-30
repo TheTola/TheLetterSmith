@@ -641,6 +641,8 @@ def _private_text_patterns(
     *,
     include_secret_literals: bool,
 ) -> tuple[re.Pattern[str], ...]:
+    from application_identity import CREATOR_NAME
+
     patterns = list(PRIVATE_IDENTITY_PATTERNS)
     if include_secret_literals:
         patterns.extend(SECRET_TEXT_PATTERNS)
@@ -651,7 +653,7 @@ def _private_text_patterns(
     }
     for value in sorted(local_values):
         text = value.strip()
-        if len(text) >= 4:
+        if len(text) >= 4 and text.casefold() != CREATOR_NAME.casefold():
             patterns.append(re.compile(re.escape(text), re.IGNORECASE))
     return tuple(patterns)
 
@@ -684,6 +686,8 @@ def _validate_private_text(
 
 
 def _private_binary_markers() -> tuple[bytes, ...]:
+    from application_identity import CREATOR_NAME
+
     values = {
         str(PROJECT_ROOT),
         str(PROJECT_ROOT).replace("\\", "/"),
@@ -694,7 +698,7 @@ def _private_binary_markers() -> tuple[bytes, ...]:
     markers: set[bytes] = set()
     for value in values:
         text = value.strip()
-        if len(text) < 4:
+        if len(text) < 4 or text.casefold() == CREATOR_NAME.casefold():
             continue
         markers.add(text.encode("utf-8").lower())
         markers.add(text.encode("utf-16-le").lower())
