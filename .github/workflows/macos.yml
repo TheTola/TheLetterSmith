@@ -46,5 +46,9 @@ jobs:
         run: |
           python -c "from release.provision_ffmpeg import validate_provisioning_manifest; print(validate_provisioning_manifest())"
           python release/build_macos.py --configuration-only
+      - name: Validate native macOS release inputs
+        run: python release/build_macos.py --validate-only
       - name: Run complete test suite
         run: python -m unittest discover -s test -p 'test_*.py'
+      - name: Build and verify ad-hoc macOS package
+        run: python release/build_macos.py --build --confirm-package

@@ -458,6 +458,74 @@ TeamIdentifier=ABCDE12345
             )
             self.assertEqual(environment["LETTERSMITH_ENV_PROBE"], "preserved")
 
+    def test_public_release_pipeline_runs_every_windows_gate_in_order(self) -> None:
+        from release import run_release
+
+        events: list[str] = []
+        executable = Path("LetterSmith.exe")
+        installer = Path("LetterSmith-Setup.exe")
+        with (
+            mock.patch.object(
+                run_release,
+                "_preflight_release",
+                side_effect=lambda _platform: events.append("preflight"),
+            ),
+            mock.patch.object(
+                run_release,
+                "_run_test_suite",
+                side_effect=lambda: events.append("tests"),
+            ),
+            mock.patch.object(
+                run_release,
+                "_provision_release_tools",
+                side_effect=lambda _platform, _source: events.append("ffmpeg"),
+            ),
+            mock.patch.object(
+                run_release,
+                "_validate_release_sources",
+                side_effect=lambda _platform: events.append("sources"),
+            ),
+            mock.patch.object(
+                run_release,
+                "_build_windows_frozen",
+                side_effect=lambda _source: events.append("frozen") or executable,
+            ),
+            mock.patch.object(
+                run_release,
+                "_build_windows_installer",
+                side_effect=lambda: events.append("installer") or installer,
+            ),
+            mock.patch.object(
+                run_release,
+                "_verify_windows_package",
+                side_effect=lambda _path: events.append("verify"),
+            ),
+        ):
+            artifacts = run_release.run_release(platform_name="win32")
+
+        self.assertEqual(
+            events,
+            [
+                "preflight",
+                "tests",
+                "ffmpeg",
+                "sources",
+                "frozen",
+                "installer",
+                "verify",
+            ],
+        )
+        self.assertEqual(artifacts, (executable, installer))
+
+    def test_public_release_requires_explicit_confirmation(self) -> None:
+        from release import run_release
+
+        with mock.patch.object(run_release, "run_release") as pipeline:
+            result = run_release.main([])
+
+        self.assertEqual(result, 2)
+        pipeline.assert_not_called()
+
     def test_frozen_runtime_uses_bundle_only_for_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

@@ -87,7 +87,7 @@ def snapshot_current(
         return None
 
     try:
-        current = path.read_text(encoding="utf-8")
+        current = sanitize_message_html(path.read_text(encoding="utf-8"))
     except OSError:
         return None
 

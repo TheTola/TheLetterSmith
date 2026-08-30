@@ -623,6 +623,11 @@ def main() -> None:
     """
     Launch Letter Smith.
     """
+    if sys.argv[1:2] == ["--lettersmith-message-import-worker"]:
+        from message_import import run_worker
+
+        raise SystemExit(run_worker(sys.argv[2:]))
+
     resource_root = resolve_project_root()
     paths = configure_application_paths(
         ApplicationPaths.for_runtime(resource_root)

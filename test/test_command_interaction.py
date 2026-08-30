@@ -645,6 +645,7 @@ class CommandInteractionTests(unittest.TestCase):
         self.assertIn("App Theme", actions)
         self.assertIn("New Project", actions)
         self.assertIn("Delete Project", actions)
+        self.assertIn("About Letter Smith…", actions)
         self.assertIn("Exit", actions)
         project_actions = [
             action.text()
@@ -654,6 +655,10 @@ class CommandInteractionTests(unittest.TestCase):
         self.assertEqual(
             project_actions[project_actions.index("New Project") + 1],
             "Delete Project",
+        )
+        self.assertEqual(
+            project_actions[project_actions.index("Delete Project") + 1],
+            "About Letter Smith…",
         )
         theme_entries = [
             None if action.isSeparator() else action.text()

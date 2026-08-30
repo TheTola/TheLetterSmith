@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import stat
 import tempfile
 import unittest
@@ -13,7 +12,12 @@ from unittest import mock
 import saved_letters
 import sound_model
 
-from config import CONTROL_FILES, MESSAGE_ASSETS_DIR, REQUIRED_SLIDES
+from config import (
+    CONTROL_FILES,
+    MESSAGE_ASSETS_DIR,
+    REQUIRED_SLIDES,
+    USER_MESSAGE_DIR,
+)
 from recipient_registry import RecipientRegistry
 from publishing.expiration import publication_status
 from readiness import ReadinessResult
@@ -165,8 +169,8 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                     wraps=saved_letters.save_library,
                 ) as save_once,
                 mock.patch(
-                    "saved_letters.shutil.copytree",
-                    wraps=shutil.copytree,
+                    "saved_letters.copy_directory_tree_no_links",
+                    wraps=saved_letters.copy_directory_tree_no_links,
                 ) as copytree,
             ):
                 self._restore(root, bundle)
@@ -207,7 +211,8 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             bundle = self._bundle(root)
             message = bundle / "gallery" / "message" / "message.html"
             message.write_text(
-                '<p>Saved letter<img src="gallery/message_assets/saved.png"></p>',
+                '<p onclick="run()">Saved letter<img src="gallery/message_assets/saved.png">'
+                "<script>run()</script></p>",
                 encoding="utf-8",
             )
             saved_assets = bundle / MESSAGE_ASSETS_DIR
@@ -225,6 +230,38 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 b"saved asset",
             )
             self.assertFalse((active_assets / "old.png").exists())
+            restored_message = (root / USER_MESSAGE_DIR / "message.html").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("onclick", restored_message)
+            self.assertNotIn("<script", restored_message)
+
+    def test_restore_rejects_nested_directory_links_and_preserves_active_message(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            outside = root / "outside-content"
+            outside.mkdir()
+            (outside / "private.txt").write_text("private", encoding="utf-8")
+            linked = bundle / "gallery" / "message" / "linked"
+            try:
+                linked.symlink_to(outside, target_is_directory=True)
+            except (NotImplementedError, OSError):
+                self.skipTest("Directory links are unavailable on this host.")
+
+            active = root / USER_MESSAGE_DIR / "message.html"
+            active.parent.mkdir(parents=True)
+            active.write_text("<p>current project</p>", encoding="utf-8")
+            entry = SavedLetterCatalog(root).list_entries()[0]
+
+            with self.assertRaises(SavedLetterRestoreError):
+                SavedLetterRestorer(root).restore(entry)
+
+            self.assertEqual(
+                active.read_text(encoding="utf-8"),
+                "<p>current project</p>",
+            )
+            self.assertFalse((root / USER_MESSAGE_DIR / "linked").exists())
 
     def test_compatibility_copy_is_skipped_until_destination_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import struct
 import tempfile
 import time
 import unittest
@@ -41,6 +42,106 @@ class SmallImprovementSmokeTests(unittest.TestCase):
             encoding="utf-8",
         )
         return path.resolve()
+
+    @staticmethod
+    def _synthetic_name_table(family: str, subfamily: str) -> bytes:
+        full_name = family if subfamily == "Regular" else f"{family} {subfamily}"
+        names = (
+            (1, family),
+            (2, subfamily),
+            (4, full_name),
+            (16, family),
+            (17, subfamily),
+        )
+        string_data = bytearray()
+        records = bytearray()
+        string_offset = 6 + len(names) * 12
+        for name_id, value in names:
+            encoded = value.encode("utf-16-be")
+            records.extend(
+                struct.pack(
+                    ">HHHHHH",
+                    3,
+                    1,
+                    0x0409,
+                    name_id,
+                    len(encoded),
+                    len(string_data),
+                )
+            )
+            string_data.extend(encoded)
+        return (
+            struct.pack(">HHH", 0, len(names), string_offset)
+            + records
+            + string_data
+        )
+
+    @classmethod
+    def _write_synthetic_ttc(cls, path: Path, family: str) -> None:
+        faces: list[dict[bytes, bytes]] = []
+        for subfamily, weight, italic in (
+            ("Regular", 400, False),
+            ("Bold Italic", 700, True),
+        ):
+            head = bytearray(54)
+            struct.pack_into(">I", head, 0, 0x00010000)
+            struct.pack_into(">I", head, 12, 0x5F0F3CF5)
+            os2 = bytearray(64)
+            struct.pack_into(">H", os2, 0, 4)
+            struct.pack_into(">H", os2, 4, weight)
+            struct.pack_into(">H", os2, 62, 1 if italic else 0)
+            faces.append(
+                {
+                    b"OS/2": bytes(os2),
+                    b"head": bytes(head),
+                    b"name": cls._synthetic_name_table(family, subfamily),
+                }
+            )
+
+        header_size = 12 + len(faces) * 4
+        face_offsets: list[int] = []
+        directory_size = sum(12 + len(tables) * 16 for tables in faces)
+        directory_cursor = header_size
+        table_cursor = header_size + directory_size
+        directories: list[bytes] = []
+        table_data = bytearray()
+        for tables in faces:
+            face_offsets.append(directory_cursor)
+            table_count = len(tables)
+            entry_selector = table_count.bit_length() - 1
+            search_range = (1 << entry_selector) * 16
+            range_shift = table_count * 16 - search_range
+            directory = bytearray(
+                struct.pack(
+                    ">4sHHHH",
+                    b"\x00\x01\x00\x00",
+                    table_count,
+                    search_range,
+                    entry_selector,
+                    range_shift,
+                )
+            )
+            for tag, value in sorted(tables.items()):
+                directory.extend(
+                    struct.pack(
+                        ">4sIII",
+                        tag,
+                        0,
+                        table_cursor + len(table_data),
+                        len(value),
+                    )
+                )
+                table_data.extend(value)
+                table_data.extend(b"\0" * ((-len(value)) % 4))
+            directories.append(bytes(directory))
+            directory_cursor += len(directory)
+
+        path.write_bytes(
+            struct.pack(">4sII", b"ttcf", 0x00010000, len(faces))
+            + struct.pack(f">{len(face_offsets)}I", *face_offsets)
+            + b"".join(directories)
+            + table_data
+        )
 
     def test_settings_notifications_and_picker_folders_are_shared(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -752,6 +853,50 @@ class SmallImprovementSmokeTests(unittest.TestCase):
                 if family in italic_families:
                     self.assertIn("normal", {face.style for face in faces})
                     self.assertIn("italic", {face.style for face in faces})
+
+    def test_ttc_faces_resolve_and_export_as_standalone_fonts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fonts = root / "gallery" / "user" / "fonts"
+            fonts.mkdir(parents=True)
+            collection = fonts / "UnrelatedCollection.ttc"
+            self._write_synthetic_ttc(collection, "Arcane Collection")
+
+            faces = font_export.resolve_font_faces_for_family(
+                root,
+                "Arcane Collection",
+            )
+            self.assertEqual(
+                [(face.weight, face.style) for face in faces],
+                [(400, "normal"), (700, "italic")],
+            )
+            self.assertEqual(
+                [face.collection_index for face in faces],
+                [0, 1],
+            )
+
+            destination = root / "export" / "gallery" / "fonts"
+            result = font_export.build_embedded_font_payload(
+                root,
+                (
+                    '<span style="font-family:\'Arcane Collection\';">'
+                    "Letter</span>"
+                ),
+                destination,
+            )
+
+            self.assertIn("LetterSmithFont1", result.html)
+            self.assertIn("font-style:normal;font-weight:400", result.css)
+            self.assertIn("font-style:italic;font-weight:700", result.css)
+            self.assertEqual(len(result.report["files"]), 2)
+            for name in result.report["files"]:
+                self.assertTrue(name.endswith(".ttf"))
+                exported = (destination / name).read_bytes()
+                self.assertEqual(exported[:4], b"\x00\x01\x00\x00")
+                self.assertEqual(
+                    font_export._sfnt_checksum(exported),
+                    font_export.SFNT_CHECKSUM_MAGIC,
+                )
 
     def test_inconsistent_active_path_falls_back_and_repairs_hint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

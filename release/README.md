@@ -1,5 +1,24 @@
 # Letter Smith 1.0.0 Release Automation
 
+## Complete production release
+
+Run the complete signed release pipeline from the repository root:
+
+```powershell
+py -3.13 .\release\run_release.py --confirm-release
+```
+
+On macOS, use the same entrypoint with `python3`. The command validates the
+release environment, runs the complete test suite, provisions checksum-pinned
+FFmpeg tools, validates release inputs, builds and validates the frozen app,
+signs it, builds the installer or DMG, and verifies the final package. Windows
+requires Inno Setup, SignTool, and `LETTER_SMITH_WINDOWS_CODESIGN_SHA1`. macOS
+requires the architecture, Developer ID, and notary profile environment
+variables documented below. Any failed gate stops the release.
+
+The lower-level commands below remain available for validation and local
+package testing. They do not replace the complete production release command.
+
 Run the non-packaging release gates:
 
 ```powershell
@@ -45,8 +64,7 @@ thumbprint:
 
 ```powershell
 $env:LETTER_SMITH_WINDOWS_CODESIGN_SHA1 = "0123456789ABCDEF0123456789ABCDEF01234567"
-.\release\build_release.ps1 -Build -ConfirmPackage -Sign
-.\release\build_installer.ps1 -Build -ConfirmPackage -Sign
+py -3.13 .\release\run_release.py --confirm-release
 ```
 
 The signed build uses SHA-256 Authenticode and RFC 3161 timestamping, verifies
@@ -70,8 +88,8 @@ python3 release/build_macos.py --configuration-only
 On macOS, install Xcode command-line tools, Python 3.13, and
 `requirements.txt`. The shared provisioner stages the checksum-pinned FFmpeg
 inputs described in `tools/macos/README.md`; `--ffmpeg-source-dir PATH` selects
-reviewed local inputs instead. Select an architecture and run the strict native
-input gate:
+reviewed local inputs instead and requires the `ffmpeg-source.json` schema
+documented there. Select an architecture and run the strict native input gate:
 
 ```bash
 export LETTER_SMITH_MACOS_TARGET_ARCH="arm64"
@@ -91,7 +109,7 @@ an `xcrun notarytool` keychain profile, and run:
 export LETTER_SMITH_MACOS_CODESIGN_IDENTITY="Developer ID Application: ... (...)"
 export LETTER_SMITH_MACOS_NOTARY_PROFILE="lettersmith-notary"
 export LETTER_SMITH_MACOS_TARGET_ARCH="arm64"
-python3 release/build_macos.py --build --confirm-package --notarize
+python3 release/run_release.py --confirm-release
 ```
 
 Valid targets are `arm64`, `x86_64`, and `universal2`. Universal2 requires a

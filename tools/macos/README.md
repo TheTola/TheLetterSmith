@@ -17,9 +17,28 @@ ad-hoc signs the staged files before PyInstaller applies the final app signature
 The release validator also rejects non-system dynamic-library dependencies.
 
 Use `--ffmpeg-source-dir PATH` only with reviewed local inputs named `ffmpeg` and
-`ffprobe`; otherwise the pinned HTTPS artifacts are downloaded. Homebrew paths
-are never used at runtime. The staged tools, cache, and generated provenance are
-ignored by Git.
+`ffprobe`. The same directory must contain `ffmpeg-source.json` with exactly this
+schema (replace the angle-bracket values and hashes):
+
+```json
+{
+  "schema_version": 1,
+  "provider": "<binary provider or build owner>",
+  "version": "9.0.1",
+  "license": "<SPDX license identifier>",
+  "source_reference": "<reviewed build record or source URL>",
+  "tools": {
+    "ffmpeg": {"sha256": "<64 lowercase hexadecimal characters>"},
+    "ffprobe": {"sha256": "<64 lowercase hexadecimal characters>"}
+  }
+}
+```
+
+The version must match `release/ffmpeg_manifest.json`; generate hashes with
+`shasum -a 256 ffmpeg ffprobe`. The provisioner rejects missing or extra fields,
+unexpected tools, symlinks, and hash mismatches. Without this option, the pinned
+HTTPS artifacts are downloaded. Homebrew paths are never used at runtime. The
+staged tools, cache, and generated provenance are ignored by Git.
 
 Before public redistribution, retain the providers' signature/checksum evidence,
 the applicable license text, and matching Corresponding Source/build materials

@@ -170,6 +170,24 @@ _TAG_ATTRIBUTES = {
     "td": frozenset({"colspan", "height", "rowspan", "valign", "width"}),
     "th": frozenset({"colspan", "height", "rowspan", "scope", "valign", "width"}),
 }
+_ANCHOR_INLINE_TAGS = frozenset(
+    {
+        "b",
+        "code",
+        "del",
+        "em",
+        "i",
+        "ins",
+        "s",
+        "small",
+        "span",
+        "strike",
+        "strong",
+        "sub",
+        "sup",
+        "u",
+    }
+)
 _SAFE_STYLE_PROPERTIES = frozenset(
     {
         "-qt-block-indent",
@@ -223,6 +241,24 @@ _SAFE_STYLE_PROPERTIES = frozenset(
         "word-spacing",
     }
 )
+_ANCHOR_TEXT_STYLE_PROPERTIES = frozenset(
+    {
+        "color",
+        "direction",
+        "font-family",
+        "font-size",
+        "font-style",
+        "font-variant",
+        "font-weight",
+        "letter-spacing",
+        "line-height",
+        "text-decoration",
+        "text-transform",
+        "vertical-align",
+        "white-space",
+        "word-spacing",
+    }
+)
 _UNSAFE_STYLE_VALUE = re.compile(
     r"(?i)(?:url|expression|var|env|attr)\s*\(|@import|javascript:|vbscript:|"
     r"data:|file:|-moz-binding|\bbehavior\b"
@@ -234,7 +270,13 @@ _RASTER_DATA_URI = re.compile(
     re.IGNORECASE,
 )
 _RASTER_SUFFIXES = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"})
-_CONTROL_OR_SPACE = re.compile(r"[\x00-\x20\x7f]+")
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]+")
+MAX_MESSAGE_HTML_INPUT_CHARACTERS = 16 * 1024 * 1024
+MAX_MESSAGE_HTML_OUTPUT_CHARACTERS = 16 * 1024 * 1024
+MAX_MESSAGE_HTML_TAGS = 200_000
+MAX_MESSAGE_HTML_NESTING = 1_024
+_FALLBACK_INPUT_CHARACTERS = 1_000_000
+_SANITIZER_CHUNK_CHARACTERS = 64 * 1024
 _QT_DEFAULTS_STYLE = (
     '<style type="text/css">'
     ".lettersmith-defaults p,.lettersmith-defaults li{white-space:pre-wrap}"
@@ -431,6 +473,95 @@ def _normalize_style_value(prop: str, value: str) -> str:
     return compact
 
 
+def _anchor_text_style_is_safe(name: str, value: str) -> bool:
+    if name == "font-size":
+        if value.casefold() in {
+            "large",
+            "medium",
+            "small",
+            "x-large",
+            "x-small",
+            "xx-large",
+            "xx-small",
+            "xxx-large",
+        }:
+            return True
+        match = CSS_LENGTH_RE.fullmatch(value)
+        if not match:
+            return False
+        amount = float(match.group(1))
+        unit = match.group(2).casefold()
+        if unit == "pt":
+            amount *= 4.0 / 3.0
+        elif unit in {"em", "rem"}:
+            amount *= 16.0
+        elif unit == "%":
+            amount *= 0.16
+        return 8.0 <= amount <= 128.0
+    if name == "line-height":
+        match = CSS_LINE_HEIGHT_RE.fullmatch(value)
+        if value.casefold() == "normal":
+            return True
+        if not match:
+            return False
+        amount = float(match.group(1))
+        if value.endswith("%"):
+            amount /= 100.0
+        return 0.8 <= amount <= 3.0
+    if name in {"letter-spacing", "word-spacing"}:
+        if value.casefold() == "normal":
+            return True
+        match = CSS_LENGTH_RE.fullmatch(value)
+        if not match or match.group(2).casefold() == "%":
+            return False
+        amount = float(match.group(1))
+        unit = match.group(2).casefold()
+        if unit == "pt":
+            amount *= 4.0 / 3.0
+        elif unit in {"em", "rem"}:
+            amount *= 16.0
+        return abs(amount) <= 32.0
+    if name == "vertical-align":
+        return value.casefold() in {
+            "baseline",
+            "bottom",
+            "middle",
+            "sub",
+            "super",
+            "text-bottom",
+            "text-top",
+            "top",
+        }
+    if name == "white-space":
+        return value.casefold() == "normal"
+    if name == "color":
+        lowered = value.casefold().replace(" ", "")
+        if lowered in {
+            "currentcolor",
+            "inherit",
+            "initial",
+            "revert",
+            "revert-layer",
+            "transparent",
+            "unset",
+        }:
+            return False
+        if lowered.startswith("#"):
+            return bool(re.fullmatch(r"#[0-9a-f]{3}(?:[0-9a-f]{3})?", lowered))
+        if re.fullmatch(r"[a-z]{1,32}", lowered):
+            return True
+        if lowered.startswith(("rgb(", "hsl(")) and "/" not in lowered:
+            return bool(re.fullmatch(r"[a-z]+\([0-9.,%+-]+\)", lowered))
+        return False
+    return True
+
+
+def _style_value_is_safely_bounded(name: str, value: str) -> bool:
+    if name in {"font-size", "letter-spacing", "line-height", "word-spacing"}:
+        return _anchor_text_style_is_safe(name, value)
+    return True
+
+
 def _clean_style_attribute(style_value: str) -> str:
     cleaned_parts: list[str] = []
 
@@ -546,7 +677,7 @@ LETTERSMITH_MESSAGE_HINTS = (
 )
 
 
-def _sanitize_style_attribute(value: str) -> str:
+def _sanitize_style_attribute(value: str, *, text_only: bool = False) -> str:
     declarations: list[str] = []
     seen: set[str] = set()
     for raw_declaration in (value or "").split(";"):
@@ -557,6 +688,7 @@ def _sanitize_style_attribute(value: str) -> str:
         style_value = re.sub(r"\s+", " ", raw_value).strip()
         if (
             name not in _SAFE_STYLE_PROPERTIES
+            or (text_only and name not in _ANCHOR_TEXT_STYLE_PROPERTIES)
             or name in seen
             or not style_value
             or len(style_value) > 512
@@ -565,13 +697,19 @@ def _sanitize_style_attribute(value: str) -> str:
             or _UNSAFE_STYLE_VALUE.search(style_value)
         ):
             continue
+        if not _style_value_is_safely_bounded(name, style_value):
+            continue
+        if text_only and not _anchor_text_style_is_safe(name, style_value):
+            continue
+        if name == "font-family":
+            style_value = style_value.replace('"', "'")
         declarations.append(f"{name}:{style_value}")
         seen.add(name)
     return "; ".join(declarations)
 
 
 def _sanitize_href(value: str) -> str:
-    candidate = _CONTROL_OR_SPACE.sub("", value or "")
+    candidate = _CONTROL_CHARACTERS.sub("", (value or "").strip())
     if not candidate or len(candidate) > 16_384 or candidate.startswith("//"):
         return ""
     if candidate.startswith("#"):
@@ -583,7 +721,7 @@ def _sanitize_href(value: str) -> str:
 
 
 def _sanitize_image_source(value: str) -> str:
-    candidate = _CONTROL_OR_SPACE.sub("", value or "")
+    candidate = _CONTROL_CHARACTERS.sub("", (value or "").strip())
     if not candidate or candidate.startswith(("//", "/", "\\")):
         return ""
     if candidate.casefold().startswith("data:"):
@@ -595,6 +733,8 @@ def _sanitize_image_source(value: str) -> str:
     if parsed.scheme or parsed.netloc or "\\" in parsed.path:
         return ""
     decoded_path = unquote(parsed.path)
+    if "\\" in decoded_path or _CONTROL_CHARACTERS.search(decoded_path):
+        return ""
     parts = tuple(part for part in decoded_path.split("/") if part not in {"", "."})
     if not parts or any(part == ".." for part in parts):
         return ""
@@ -603,7 +743,13 @@ def _sanitize_image_source(value: str) -> str:
     return candidate
 
 
-def _sanitize_attribute(tag: str, name: str, value: str) -> str:
+def _sanitize_attribute(
+    tag: str,
+    name: str,
+    value: str,
+    *,
+    within_anchor: bool = False,
+) -> str:
     if name == "class":
         classes = [
             token
@@ -612,7 +758,7 @@ def _sanitize_attribute(tag: str, name: str, value: str) -> str:
         ]
         return " ".join(dict.fromkeys(classes))
     if name == "style":
-        return _sanitize_style_attribute(value)
+        return _sanitize_style_attribute(value, text_only=within_anchor)
     if name == "href":
         return _sanitize_href(value)
     if name == "src":
@@ -648,6 +794,10 @@ def _sanitize_attribute(tag: str, name: str, value: str) -> str:
     return ""
 
 
+class _SanitizationLimitError(ValueError):
+    pass
+
+
 class _PassiveMessageHTMLParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -655,15 +805,41 @@ class _PassiveMessageHTMLParser(HTMLParser):
         self.open_tags: list[str] = []
         self.blocked_tags: list[str] = []
         self.marker_emitted = False
+        self.output_characters = 0
+        self.tag_count = 0
+
+    def _append_output(self, value: str) -> None:
+        updated = self.output_characters + len(value)
+        if updated > MAX_MESSAGE_HTML_OUTPUT_CHARACTERS:
+            raise _SanitizationLimitError
+        self.output.append(value)
+        self.output_characters = updated
+
+    def _append_escaped_data(self, value: str) -> None:
+        for offset in range(0, len(value), _SANITIZER_CHUNK_CHARACTERS):
+            self._append_output(
+                _html.escape(
+                    value[offset : offset + _SANITIZER_CHUNK_CHARACTERS],
+                    quote=False,
+                )
+            )
+
+    def _record_tag(self) -> None:
+        self.tag_count += 1
+        if self.tag_count > MAX_MESSAGE_HTML_TAGS:
+            raise _SanitizationLimitError
 
     def _in_blocked_subtree(self) -> bool:
         return bool(self.blocked_tags)
 
     def _start_blocked(self, tag: str) -> None:
         if tag not in _VOID_TAGS:
+            if len(self.blocked_tags) >= MAX_MESSAGE_HTML_NESTING:
+                raise _SanitizationLimitError
             self.blocked_tags.append(tag)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._record_tag()
         tag = tag.casefold()
         if self._in_blocked_subtree():
             self._start_blocked(tag)
@@ -672,6 +848,12 @@ class _PassiveMessageHTMLParser(HTMLParser):
             self._start_blocked(tag)
             return
         if tag in _DOCUMENT_WRAPPERS or tag not in _PASSIVE_TAGS:
+            return
+        inside_anchor = "a" in self.open_tags
+        if inside_anchor and tag == "a":
+            self._start_blocked(tag)
+            return
+        if inside_anchor and tag not in _ANCHOR_INLINE_TAGS:
             return
 
         allowed = _GLOBAL_ATTRIBUTES | _TAG_ATTRIBUTES.get(tag, frozenset())
@@ -687,18 +869,40 @@ class _PassiveMessageHTMLParser(HTMLParser):
                 or ":" in name
             ):
                 continue
-            value = _sanitize_attribute(tag, name, str(raw_value or ""))
+            value = _sanitize_attribute(
+                tag,
+                name,
+                str(raw_value or ""),
+                within_anchor=inside_anchor or tag == "a",
+            )
             if not value:
                 continue
             cleaned.append((name, value))
             seen.add(name)
 
+        if tag == "a":
+            style_index = next(
+                (index for index, item in enumerate(cleaned) if item[0] == "style"),
+                None,
+            )
+            if style_index is None:
+                cleaned.append(("style", "white-space:normal"))
+            else:
+                style_value = cleaned[style_index][1]
+                if "white-space:" not in style_value.casefold():
+                    cleaned[style_index] = (
+                        "style",
+                        f"{style_value}; white-space:normal",
+                    )
+
         rendered_attributes = "".join(
-            f' {name}="{_html.escape(value, quote=True)}"'
+            f' {name}="{_html.escape(value, quote=False).replace(chr(34), "&quot;")}"'
             for name, value in cleaned
         )
-        self.output.append(f"<{tag}{rendered_attributes}>")
+        self._append_output(f"<{tag}{rendered_attributes}>")
         if tag not in _VOID_TAGS:
+            if len(self.open_tags) >= MAX_MESSAGE_HTML_NESTING:
+                raise _SanitizationLimitError
             self.open_tags.append(tag)
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -709,9 +913,10 @@ class _PassiveMessageHTMLParser(HTMLParser):
         self.handle_starttag(tag, attrs)
         if len(self.open_tags) > before and self.open_tags[-1] == tag:
             self.open_tags.pop()
-            self.output.append(f"</{tag}>")
+            self._append_output(f"</{tag}>")
 
     def handle_endtag(self, tag: str) -> None:
+        self._record_tag()
         tag = tag.casefold()
         if self._in_blocked_subtree():
             if tag in self.blocked_tags:
@@ -724,13 +929,13 @@ class _PassiveMessageHTMLParser(HTMLParser):
             return
         while self.open_tags:
             opened = self.open_tags.pop()
-            self.output.append(f"</{opened}>")
+            self._append_output(f"</{opened}>")
             if opened == tag:
                 break
 
     def handle_data(self, data: str) -> None:
         if not self._in_blocked_subtree() and data:
-            self.output.append(_html.escape(data, quote=False))
+            self._append_escaped_data(data)
 
     def handle_comment(self, data: str) -> None:
         if (
@@ -738,13 +943,37 @@ class _PassiveMessageHTMLParser(HTMLParser):
             and not self.marker_emitted
             and data.strip().casefold() == "lettersmith-message:v2"
         ):
-            self.output.append(LETTERSMITH_MESSAGE_MARKER)
+            self._append_output(LETTERSMITH_MESSAGE_MARKER)
             self.marker_emitted = True
 
     def finish(self) -> str:
         while self.open_tags:
-            self.output.append(f"</{self.open_tags.pop()}>")
+            self._append_output(f"</{self.open_tags.pop()}>")
         return "".join(self.output).strip()
+
+
+def _bounded_plain_text_fallback(source: str) -> str:
+    parts: list[str] = []
+    total = 0
+    truncated = len(source) > _FALLBACK_INPUT_CHARACTERS
+    value = source[:_FALLBACK_INPUT_CHARACTERS]
+    for offset in range(0, len(value), _SANITIZER_CHUNK_CHARACTERS):
+        escaped = _html.escape(
+            value[offset : offset + _SANITIZER_CHUNK_CHARACTERS],
+            quote=False,
+        )
+        remaining = MAX_MESSAGE_HTML_OUTPUT_CHARACTERS - total
+        if len(escaped) > remaining:
+            parts.append(escaped[:remaining])
+            total += remaining
+            truncated = True
+            break
+        parts.append(escaped)
+        total += len(escaped)
+    if truncated:
+        suffix = "\n[Message content exceeded safe formatting limits.]"
+        parts.append(suffix[: MAX_MESSAGE_HTML_OUTPUT_CHARACTERS - total])
+    return "".join(parts)
 
 
 def sanitize_message_html(raw: str) -> str:
@@ -752,14 +981,16 @@ def sanitize_message_html(raw: str) -> str:
     source = normalize_message_document_html(raw)
     if not source:
         return ""
+    if len(source) > MAX_MESSAGE_HTML_INPUT_CHARACTERS:
+        return _bounded_plain_text_fallback(source)
 
     parser = _PassiveMessageHTMLParser()
     try:
         parser.feed(source)
         parser.close()
+        sanitized = parser.finish()
     except (AssertionError, ValueError):
-        return _html.escape(source, quote=False)
-    sanitized = parser.finish()
+        return _bounded_plain_text_fallback(source)
 
     lowered = source.casefold()
     qt_document = (

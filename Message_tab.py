@@ -14,22 +14,6 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-# Optional converters (prefer mammoth for DOCX → HTML)
-try:
-    import mammoth  # type: ignore
-except Exception:
-    mammoth = None
-
-try:
-    from docx import Document  # type: ignore
-except Exception:
-    Document = None  # type: ignore
-
-try:
-    from PyPDF2 import PdfReader  # type: ignore
-except Exception:
-    PdfReader = None  # type: ignore
-
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QSizeF, Signal
 from PySide6.QtGui import (
@@ -52,6 +36,15 @@ from message_history import (
 )
 from message_format import normalize_ultralinks_in_document
 from message_html import is_lettersmith_message_html, sanitize_message_html
+from message_import import (
+    MESSAGE_IMPORT_TIMEOUT_MS,
+    MessageImportError,
+    create_result_path,
+    import_message_sync,
+    read_worker_result,
+    remove_result_path,
+    worker_command,
+)
 from letter_page import (
     DEFAULT_MESSAGE_OVERLAY_OPACITY,
     DEFAULT_MESSAGE_OVERLAY_PRESET,
@@ -853,6 +846,15 @@ class MessageTab(QtWidgets.QWidget):
         self._render_thread_pool.setMaxThreadCount(1)
         self._render_thread_pool.setExpiryTimeout(1000)
         self._render_shutdown = False
+        self._message_import_process: QtCore.QProcess | None = None
+        self._message_import_result_path: Path | None = None
+        self._message_import_source: Path | None = None
+        self._message_import_error = ""
+        self._message_import_timer = QtCore.QTimer(self)
+        self._message_import_timer.setSingleShot(True)
+        self._message_import_timer.timeout.connect(
+            self._on_message_import_timeout
+        )
         self._overlay_update_pending = False
         self._overlay_render_timer = QtCore.QTimer(self)
         self._overlay_render_timer.setSingleShot(True)
@@ -2054,83 +2056,158 @@ class MessageTab(QtWidgets.QWidget):
     # Extraction + processing
     # ──────────────────────────────────────────────────────────────────
     def extract_text(self, path: str) -> str:
-        low = path.lower()
         try:
-            if low.endswith((".html", ".htm")):
-                return Path(path).read_text(encoding="utf-8", errors="ignore")
-
-            if low.endswith(".txt"):
-                with open(path, "r", encoding="utf-8") as f:
-                    raw = f.read()
-                esc = (
-                    raw.replace("&", "&amp;")
-                       .replace("<", "&lt;")
-                       .replace(">", "&gt;")
-                )
-                return esc.replace("\n", "<br>")
-
-            if low.endswith(".docx"):
-                if mammoth is not None:
-                    try:
-                        with open(path, "rb") as docx_file:
-                            res = mammoth.convert_to_html(docx_file)
-                        return res.value
-                    except Exception:
-                        pass
-                if Document is not None:
-                    try:
-                        doc = Document(path)
-                        parts = []
-                        for p in doc.paragraphs:
-                            t = p.text.strip()
-                            if t:
-                                parts.append(_html.escape(t))
-                        return "<br>".join(parts)
-                    except Exception:
-                        pass
-                return ""
-
-            if low.endswith(".pdf"):
-                if PdfReader is not None:
-                    try:
-                        reader = PdfReader(path)
-                        pages = [(page.extract_text() or "").replace("\n", "<br>") for page in reader.pages]
-                        return "<br><br>".join(pages)
-                    except Exception:
-                        pass
-                try:
-                    import pdfplumber  # type: ignore
-                    txt_pages = []
-                    with pdfplumber.open(path) as pdf:
-                        for page in pdf.pages:
-                            txt = (page.extract_text() or "").strip()
-                            if txt:
-                                txt_pages.append(_html.escape(txt).replace("\n", "<br>"))
-                    return "<br><br>".join(txt_pages)
-                except Exception:
-                    return ""
-
-            if low.endswith(".odt"):
-                try:
-                    from odf.opendocument import load as _load  # type: ignore
-                    from odf.text import P as _P  # type: ignore
-                    doc = _load(path)
-                    paras = doc.getElementsByType(_P)
-                    chunks = []
-                    for p in paras:
-                        text = "".join(getattr(n, "data", "") for n in p.childNodes)
-                        text = _html.escape(text)
-                        if text.strip():
-                            chunks.append(text)
-                    return "<br>".join(chunks)
-                except Exception:
-                    return ""
-        except Exception as e:
-            self.status.setText(f"❌ Error reading file: {e}")
-        return ""
+            return import_message_sync(path)
+        except MessageImportError as error:
+            self.status.setText(str(error))
+            return ""
 
     def _process_file(self, path: str) -> None:
-        imported_html = self.extract_text(path)
+        process = self._message_import_process
+        if process is not None:
+            self.status.setText("A message is already being imported.")
+            return
+
+        result_path: Path | None = None
+        try:
+            source = Path(os.path.abspath(os.fspath(path)))
+            result_path = create_result_path()
+            program, arguments = worker_command(source, result_path)
+        except (OSError, TypeError, ValueError):
+            if result_path is not None:
+                remove_result_path(result_path, attempts=3)
+            self.status.setText("That file could not be imported.")
+            return
+        process = QtCore.QProcess(self)
+        process.setStandardOutputFile(QtCore.QProcess.nullDevice())
+        process.setStandardErrorFile(QtCore.QProcess.nullDevice())
+        process.finished.connect(self._on_message_import_finished)
+        process.errorOccurred.connect(self._on_message_import_error)
+        self._message_import_process = process
+        self._message_import_result_path = result_path
+        self._message_import_source = source
+        self._message_import_error = ""
+        self.btn.setEnabled(False)
+        self.status.setText(f"Importing {source.name}…")
+        self._message_import_timer.start(MESSAGE_IMPORT_TIMEOUT_MS)
+        process.start(program, arguments)
+
+    def _on_message_import_error(
+        self,
+        error: QtCore.QProcess.ProcessError,
+    ) -> None:
+        if error != QtCore.QProcess.ProcessError.FailedToStart:
+            return
+        self._message_import_error = "That file could not be imported."
+        self._finish_failed_message_import()
+
+    def _on_message_import_timeout(self) -> None:
+        process = self._message_import_process
+        if process is None:
+            return
+        self._message_import_error = "That file took too long to import."
+        process.kill()
+        QtCore.QTimer.singleShot(
+            500,
+            lambda candidate=process: self._finish_failed_message_import(
+                candidate
+            ),
+        )
+
+    def _on_message_import_finished(
+        self,
+        exit_code: int,
+        exit_status: QtCore.QProcess.ExitStatus,
+    ) -> None:
+        process = self._message_import_process
+        if process is None or self.sender() is not process:
+            return
+        source = self._message_import_source
+        result_path = self._message_import_result_path
+        error_message = self._message_import_error
+        imported_html = ""
+        if (
+            not error_message
+            and (
+                exit_code != 0
+                or exit_status != QtCore.QProcess.ExitStatus.NormalExit
+            )
+        ):
+            error_message = "That file could not be imported."
+        if not error_message and result_path is not None:
+            try:
+                imported_html = read_worker_result(result_path)
+            except MessageImportError as error:
+                error_message = str(error)
+        self._release_message_import()
+        if error_message:
+            self.status.setText(error_message)
+            return
+        if source is not None:
+            self._apply_imported_message(str(source), imported_html)
+
+    def _finish_failed_message_import(
+        self,
+        expected_process: QtCore.QProcess | None = None,
+    ) -> None:
+        if (
+            self._message_import_process is None
+            or (
+                expected_process is not None
+                and self._message_import_process is not expected_process
+            )
+        ):
+            return
+        error_message = (
+            self._message_import_error
+            or "That file could not be imported."
+        )
+        self._release_message_import()
+        self.status.setText(error_message)
+
+    def _release_message_import(self) -> None:
+        self._message_import_timer.stop()
+        process = self._message_import_process
+        result_path = self._message_import_result_path
+        self._message_import_process = None
+        self._message_import_result_path = None
+        self._message_import_source = None
+        self._message_import_error = ""
+        if hasattr(self, "btn"):
+            self.btn.setEnabled(True)
+        if process is not None:
+            if process.state() != QtCore.QProcess.ProcessState.NotRunning:
+                process.kill()
+                process.waitForFinished(100)
+            process.deleteLater()
+        if result_path is not None:
+            if not remove_result_path(result_path):
+                QtCore.QTimer.singleShot(
+                    250,
+                    lambda candidate=result_path: remove_result_path(
+                        candidate,
+                        attempts=3,
+                    ),
+                )
+
+    def _stop_message_import(self, timeout_ms: int) -> bool:
+        process = self._message_import_process
+        if process is None:
+            return True
+        try:
+            process.finished.disconnect(self._on_message_import_finished)
+            process.errorOccurred.disconnect(self._on_message_import_error)
+        except (RuntimeError, TypeError):
+            pass
+        if process.state() != QtCore.QProcess.ProcessState.NotRunning:
+            process.kill()
+            stopped = process.waitForFinished(max(0, int(timeout_ms)))
+        else:
+            stopped = True
+        self._release_message_import()
+        return stopped
+
+    def _apply_imported_message(self, path: str, imported_html: str) -> None:
         if not imported_html.strip():
             self.status.setText("That file had no extractable text.")
             return
@@ -2245,6 +2322,8 @@ class MessageTab(QtWidgets.QWidget):
         """Release render work before project directories are replaced."""
         self._overlay_render_timer.stop()
         self._flush_overlay_settings()
+        if not self._stop_message_import(timeout_ms):
+            raise RuntimeError("Message import did not stop before restore")
         if not self._cancel_pending_message_renders(
             timeout_ms=timeout_ms,
             resume=True,
@@ -2255,6 +2334,8 @@ class MessageTab(QtWidgets.QWidget):
         """Clear the live Message workspace after New Project commits."""
         self._overlay_render_timer.stop()
         self._overlay_update_pending = False
+        if not self._stop_message_import(5000):
+            raise RuntimeError("Message import did not stop during reset")
         if not self._cancel_pending_message_renders(
             timeout_ms=5000,
             resume=True,
@@ -2284,6 +2365,7 @@ class MessageTab(QtWidgets.QWidget):
     def shutdown(self, timeout_ms: int = 5000) -> bool:
         self._overlay_render_timer.stop()
         self._flush_overlay_settings()
+        import_stopped = self._stop_message_import(timeout_ms)
         try:
             if self._tab_active:
                 self.deactivate_for_tab_change()
@@ -2297,4 +2379,4 @@ class MessageTab(QtWidgets.QWidget):
         self._render_shutdown = True
         self._render_gate.invalidate(accepting=False)
         self._render_thread_pool.clear()
-        return stopped
+        return stopped and import_stopped

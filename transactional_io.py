@@ -298,7 +298,7 @@ def atomic_copy_file(source: str | Path, destination: str | Path) -> Path:
 
 
 def is_link_or_reparse_point(path: str | Path) -> bool:
-    """Return True for symbolic links, Windows junctions, and reparse points."""
+    """Return True for links and path-redirecting Windows reparse points."""
     candidate = Path(path)
     try:
         if candidate.is_symlink():
@@ -306,11 +306,20 @@ def is_link_or_reparse_point(path: str | Path) -> bool:
         is_junction = getattr(candidate, "is_junction", None)
         if callable(is_junction) and is_junction():
             return True
-        attributes = int(getattr(candidate.lstat(), "st_file_attributes", 0))
+        path_stat = candidate.lstat()
+        attributes = int(getattr(path_stat, "st_file_attributes", 0))
     except OSError:
         return False
     reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400))
-    return bool(attributes & reparse_flag)
+    if not attributes & reparse_flag:
+        return False
+    reparse_tag = int(getattr(path_stat, "st_reparse_tag", 0))
+    if not reparse_tag:
+        return True
+    # Name-surrogate tags redirect path resolution (for example symlinks and
+    # mount points). Data-only tags include OneDrive Files-On-Demand markers
+    # and remain subject to the resolved-containment checks during copying.
+    return bool(reparse_tag & 0x20000000)
 
 
 def copy_directory_tree_no_links(

@@ -22,6 +22,7 @@ from time import monotonic
 from typing import Optional
 
 from app_icon import apply_qt_window_icon, canonical_icon_paths
+from about_dialog import AboutLetterSmithDialog
 from settings_store import (
     DEFAULT_SETTINGS,
     DEFAULT_VISIONARY_URL,
@@ -908,6 +909,16 @@ class TitleBar(QtWidgets.QWidget):
         self.delete_project_action.triggered.connect(
             self.parent.delete_project
         )
+        self.settings_menu.addSeparator()
+        self.about_action = self.settings_menu.addAction(
+            "About Letter Smith…"
+        )
+        set_action_help(
+            self.about_action,
+            "View Letter Smith application information and prepare support details.",
+        )
+        self.about_action.triggered.connect(self._show_about)
+        self.settings_menu.addSeparator()
         self.exit_action = self.settings_menu.addAction("Exit")
         set_action_help(
             self.exit_action,
@@ -1373,6 +1384,12 @@ class TitleBar(QtWidgets.QWidget):
 
         settings.update_fields(**{VISIONARY_URL_KEY: visionary_url})
         self.parent.status("Visionary location updated.")
+
+    def _show_about(self) -> None:
+        AboutLetterSmithDialog(
+            self.parent,
+            application=self.parent,
+        ).exec()
 
     def _show_github_account(self) -> None:
         forge = getattr(self.parent, "forge_tab", None)

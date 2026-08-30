@@ -16,7 +16,7 @@ ID, and tester for each run. Do not record credentials or private user data.
 - Run the full test suite and focused release-input validation from source.
 - Publish the applicable FFmpeg license notices and exact Corresponding
   Source/build materials with access equivalent to the GPL binaries.
-- Build with `release/build_macos.py --build --confirm-package --notarize`.
+- Build with `python3 release/run_release.py --confirm-release`.
 - Confirm the release report, app, and architecture-qualified DMG paths.
 - Verify `codesign --verify --deep --strict --verbose=2` on the app.
 - Verify `spctl --assess --type execute --verbose=2` on the mounted app.

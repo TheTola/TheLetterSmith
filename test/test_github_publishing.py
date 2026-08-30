@@ -43,6 +43,7 @@ from publishing.github_pages import (
     GitHubPagesPublisher,
     _git_blob_sha,
     _publication_path,
+    _published_files,
 )
 from publishing.github_ui import (
     GitHubAccountDialog,
@@ -1004,6 +1005,8 @@ class GitHubPublishingTests(unittest.TestCase):
     def _build(root: Path) -> Path:
         build = root / "Play"
         (build / "gallery/message/revisions").mkdir(parents=True)
+        (build / "gallery/pages").mkdir(parents=True)
+        (build / "gallery/sounds").mkdir(parents=True)
         (build / "index.html").write_text("<html>letter</html>", encoding="utf-8")
         (build / "script.js").write_text("console.log('letter')", encoding="utf-8")
         (build / "lettersmith-build.json").write_text("{}", encoding="utf-8")
@@ -1013,7 +1016,33 @@ class GitHubPublishingTests(unittest.TestCase):
         (build / "gallery/message/revisions/private.html").write_text(
             "old draft", encoding="utf-8"
         )
+        (build / "gallery/pages/lettersmith-images.json").write_text(
+            '{"source_sha256":"private-image-hash"}',
+            encoding="utf-8",
+        )
+        (build / "gallery/sounds/lettersmith-sound.json").write_text(
+            '{"original_name":"private-song.mp3","content_hash":"private-sound-hash"}',
+            encoding="utf-8",
+        )
         return build
+
+    def test_public_file_inventory_excludes_private_runtime_manifests(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            build = self._build(Path(directory))
+
+            public_paths = {
+                relative
+                for _path, relative, _size in _published_files(build)
+            }
+
+            self.assertNotIn(
+                "gallery/pages/lettersmith-images.json",
+                public_paths,
+            )
+            self.assertNotIn(
+                "gallery/sounds/lettersmith-sound.json",
+                public_paths,
+            )
 
     def test_first_publish_uses_title_slug_and_filters_editable_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1051,6 +1080,14 @@ class GitHubPublishingTests(unittest.TestCase):
             self.assertNotIn(f"{prefix}prompt_writer_state.json", api.remote_files)
             self.assertNotIn(
                 f"{prefix}gallery/message/revisions/private.html", api.remote_files
+            )
+            self.assertNotIn(
+                f"{prefix}gallery/pages/lettersmith-images.json",
+                api.remote_files,
+            )
+            self.assertNotIn(
+                f"{prefix}gallery/sounds/lettersmith-sound.json",
+                api.remote_files,
             )
             self.assertIn(REPOSITORY_MARKER, api.remote_files)
             settings = SettingsStore(root).snapshot()
@@ -1094,6 +1131,16 @@ class GitHubPublishingTests(unittest.TestCase):
                     "type": "blob",
                     "sha": "marker",
                 },
+                {
+                    "path": f"{prefix}gallery/pages/lettersmith-images.json",
+                    "type": "blob",
+                    "sha": "old-images",
+                },
+                {
+                    "path": f"{prefix}gallery/sounds/lettersmith-sound.json",
+                    "type": "blob",
+                    "sha": "old-sounds",
+                },
             ]
             marker = json.dumps(
                 {
@@ -1112,6 +1159,8 @@ class GitHubPublishingTests(unittest.TestCase):
                     f"{prefix}index.html": b"old",
                     f"{prefix}stale.txt": b"stale",
                     f"{prefix}lettersmith-publication.json": marker,
+                    f"{prefix}gallery/pages/lettersmith-images.json": b"private images",
+                    f"{prefix}gallery/sounds/lettersmith-sound.json": b"private sounds",
                 },
             )
             publisher = GitHubPagesPublisher(
@@ -1143,6 +1192,19 @@ class GitHubPublishingTests(unittest.TestCase):
                 if item["path"] == f"{prefix}stale.txt"
             )
             self.assertIsNone(deletion["sha"])
+            deleted_paths = {
+                item["path"]
+                for item in api.last_tree_updates
+                if item.get("sha") is None
+            }
+            self.assertIn(
+                f"{prefix}gallery/pages/lettersmith-images.json",
+                deleted_paths,
+            )
+            self.assertIn(
+                f"{prefix}gallery/sounds/lettersmith-sound.json",
+                deleted_paths,
+            )
             self.assertEqual(
                 api.remote_files[f"{prefix}index.html"],
                 b"<html>letter</html>",
