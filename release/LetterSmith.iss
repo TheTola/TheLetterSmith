@@ -44,6 +44,11 @@ VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppName} Setup
 VersionInfoProductName={#MyAppName}
 VersionInfoTextVersion={#MyAppVersion}
+#ifdef LetterSmithSignedRelease
+SignTool=lettersmith
+SignedUninstaller=yes
+SignToolRetryCount=3
+#endif
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked

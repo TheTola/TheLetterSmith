@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from message_html import sanitize_message_html
 from transactional_io import atomic_write_text
 
 
@@ -108,6 +109,7 @@ def write_message_with_revision(
     reason: str = "autosave",
 ) -> bool:
     path = Path(message_path).resolve()
+    content = sanitize_message_html(content)
     previous = ""
     if path.is_file():
         try:
@@ -133,7 +135,7 @@ def restore_revision(message_path: str | Path, revision_path: str | Path) -> str
     if not revision.is_file() or revision.parent != folder:
         raise FileNotFoundError("The selected revision is not available.")
 
-    content = revision.read_text(encoding="utf-8")
+    content = sanitize_message_html(revision.read_text(encoding="utf-8"))
     snapshot_current(message, reason="before-restore", skip_if_content=content)
     _atomic_write(message, content)
     prune_revisions(message)

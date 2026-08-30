@@ -1,6 +1,7 @@
 param(
     [switch]$Build,
-    [switch]$ConfirmPackage
+    [switch]$ConfirmPackage,
+    [switch]$Sign
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,6 +14,9 @@ if ($Build) {
     if ($ConfirmPackage) {
         $arguments += "--confirm-package"
     }
+}
+if ($Sign) {
+    $arguments += "--sign"
 }
 
 Push-Location $projectRoot

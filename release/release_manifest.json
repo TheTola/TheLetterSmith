@@ -126,6 +126,10 @@
     {
       "source": "resources/stock/stock_manifest.json",
       "destination": "resources/stock"
+    },
+    {
+      "source": "tools/FFmpeg-PROVENANCE.txt",
+      "destination": "tools"
     }
   ],
   "binaries": [

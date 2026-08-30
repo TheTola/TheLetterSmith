@@ -101,9 +101,12 @@ def _font_match_key(value: str) -> str:
 
 
 def _font_file_match_keys(path: Path) -> set[str]:
-    parts = [part for part in re.split(r"[\s_\-.]+", path.stem) if part]
+    # Google Fonts variable files append axis tags such as ``[wght]`` or
+    # ``[opsz,wght]``. Those tags describe the face, not the family name.
+    normalized_stem = re.sub(r"\[[^\]]+\]", "", path.stem)
+    parts = [part for part in re.split(r"[\s_\-.]+", normalized_stem) if part]
     filtered = [part for part in parts if part.casefold() not in FONT_STYLE_TOKENS]
-    keys = {_font_match_key(path.stem)}
+    keys = {_font_match_key(normalized_stem)}
     if filtered:
         keys.add(_font_match_key(" ".join(filtered)))
     return {key for key in keys if key}
@@ -209,7 +212,10 @@ def _load_font_registry() -> tuple[tuple[str, Path], ...]:
 
 
 def _classify_font_face(display_name: str) -> tuple[int, str]:
-    tokens = set(part for part in re.split(r"[\s-]+", display_name.casefold()) if part)
+    normalized_name = re.sub(r"\[[^\]]+\]", "", display_name)
+    tokens = set(
+        part for part in re.split(r"[\s-]+", normalized_name.casefold()) if part
+    )
     if {"black", "heavy"} & tokens:
         weight = 900
     elif {"extrabold", "ultrabold"} & tokens:

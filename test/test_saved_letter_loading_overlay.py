@@ -94,10 +94,18 @@ class SavedLetterLoadingOverlayTests(unittest.TestCase):
         self.assertFalse(overlay.eventFilter(modal, modal_key))
         modal.hide()
 
+        dismissed = QtTest.QSignalSpy(overlay.dismissed)
         overlay.stop(animated=True)
         self.assertTrue(overlay.isVisible())
         self.assertTrue(overlay.spinner._timer.isActive())
-        QtTest.QTest.qWait(240)
+        self.assertEqual(
+            overlay._fade_animation.state(),
+            QtCore.QAbstractAnimation.Running,
+        )
+        overlay._fade_animation.setCurrentTime(
+            overlay._fade_animation.duration()
+        )
+        self.assertEqual(dismissed.count(), 1)
         self.assertFalse(overlay.isVisible())
         self.assertFalse(overlay.spinner._timer.isActive())
         self.assertFalse(overlay._filter_installed)

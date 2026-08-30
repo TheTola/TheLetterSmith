@@ -297,6 +297,67 @@ def atomic_copy_file(source: str | Path, destination: str | Path) -> Path:
     return target
 
 
+def is_link_or_reparse_point(path: str | Path) -> bool:
+    """Return True for symbolic links, Windows junctions, and reparse points."""
+    candidate = Path(path)
+    try:
+        if candidate.is_symlink():
+            return True
+        is_junction = getattr(candidate, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+        attributes = int(getattr(candidate.lstat(), "st_file_attributes", 0))
+    except OSError:
+        return False
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400))
+    return bool(attributes & reparse_flag)
+
+
+def copy_directory_tree_no_links(
+    source: str | Path,
+    destination: str | Path,
+) -> Path:
+    """Copy a regular directory tree while rejecting every linked entry."""
+    source_path = Path(source)
+    target_root = Path(destination)
+    if is_link_or_reparse_point(source_path):
+        raise ValueError(f"Linked directories are not supported: {source_path}")
+    try:
+        source_root = source_path.resolve(strict=True)
+    except OSError as error:
+        raise FileNotFoundError(f"Source directory does not exist: {source_path}") from error
+    if not source_root.is_dir():
+        raise NotADirectoryError(f"Source directory does not exist: {source_path}")
+    if target_root.exists() or target_root.is_symlink():
+        raise FileExistsError(f"Copy destination already exists: {target_root}")
+    target_root.mkdir(parents=True)
+
+    pending: list[tuple[Path, Path]] = [(source_root, target_root)]
+    while pending:
+        current_source, current_target = pending.pop()
+        for child in sorted(
+            current_source.iterdir(),
+            key=lambda item: item.name.casefold(),
+        ):
+            if is_link_or_reparse_point(child):
+                raise ValueError(f"Linked saved-letter content is not supported: {child}")
+            try:
+                child_stat = child.lstat()
+                resolved = child.resolve(strict=True)
+                resolved.relative_to(source_root)
+            except (OSError, ValueError) as error:
+                raise ValueError(f"Source path escaped its directory: {child}") from error
+            target = current_target / child.name
+            if stat.S_ISDIR(child_stat.st_mode):
+                target.mkdir()
+                pending.append((child, target))
+            elif stat.S_ISREG(child_stat.st_mode):
+                atomic_copy_file(child, target)
+            else:
+                raise ValueError(f"Special files are not supported: {child}")
+    return target_root
+
+
 def atomic_write_text(
     path: str | Path,
     value: str,
@@ -655,10 +716,12 @@ __all__ = [
     "atomic_write_text",
     "cleanup_abandoned_staging",
     "cleanup_abandoned_temp_files",
+    "copy_directory_tree_no_links",
     "create_staging_directory",
     "enforce_internal_tree_visibility",
     "file_change_token",
     "is_internal_metadata_path",
+    "is_link_or_reparse_point",
     "recover_stale_transactions",
     "replace_directory",
     "set_path_hidden",

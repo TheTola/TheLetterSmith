@@ -43,5 +43,9 @@ output/
 tools/_ffmpeg_download/
 tools/ffmpeg.exe
 tools/ffprobe.exe
+tools/macos/ffmpeg
+tools/macos/ffprobe
+tools/FFmpeg-PROVENANCE.txt
+release/macos/
 # Oversized generated conversion file
 converted64/convert64.py

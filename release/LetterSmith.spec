@@ -135,6 +135,7 @@ if IS_MACOS:
         bundle_identifier=MACOS["bundle_identifier"],
         version=MANIFEST["product"]["version"],
         info_plist={
+            "CFBundleVersion": MANIFEST["product"]["version"],
             "CFBundleDisplayName": MANIFEST["product"]["name"],
             "CFBundleName": MANIFEST["product"]["name"],
             "LSMinimumSystemVersion": MACOS["minimum_system_version"],

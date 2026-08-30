@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import tempfile
 import threading
 import webbrowser
@@ -61,6 +62,7 @@ from image_animation import (
 )
 from letter_page import letter_page_style_from_settings
 from message_format import message_plain_text
+from message_html import sanitize_message_html
 from performance_trace import performance_timed
 from readiness import evaluate_readiness
 from saved_letters import update_saved_metadata
@@ -491,6 +493,17 @@ def _message_overlay_style_from_settings(settings: dict) -> str:
     return letter_page_style_from_settings(settings)
 
 
+def _script_json(value: object) -> str:
+    return (
+        json.dumps(value, ensure_ascii=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
 def _require_file(path: Path, *, what: str, expected_rel_hint: Optional[str] = None) -> None:
     if path.is_file():
         return
@@ -504,6 +517,7 @@ def _validate_template_placeholders() -> None:
     """
     required = (
         "{{TITLE}}",
+        "{{CSP_NONCE}}",
         "{{TITLE_BANNER_TEXT_RGB}}",
         "{{MESSAGE_HTML}}",
         "{{HAS_MESSAGE_JSON}}",
@@ -1008,7 +1022,7 @@ def build_play_bundle_to(
     msg_html_src = pr / MESSAGE_HTML_FILE
     if message_html is None:
         message_html = _read_text_safe(msg_html_src)
-    message_html = message_html or ""
+    message_html = sanitize_message_html(message_html or "")
     has_message = bool(message_plain_text(message_html).strip())
     embedded_message_html = _prepare_embedded_message_html(
         message_html,
@@ -1168,21 +1182,22 @@ def build_play_bundle_to(
         if playlist_sources
         else ""
     )
+    csp_nonce = secrets.token_urlsafe(24)
     html = (
         TEMPLATE_HTML
+        .replace("{{CSP_NONCE}}", csp_nonce)
         .replace("{{TITLE}}", _html.escape(title, quote=True))
         .replace(
             "{{TITLE_BANNER_TEXT_RGB}}",
             _rgb_css_value(title_banner_text_rgb),
         )
-        .replace("{{MESSAGE_HTML}}", embedded_message_html)
-        .replace("{{HAS_MESSAGE_JSON}}", json.dumps(has_message))
+        .replace("{{HAS_MESSAGE_JSON}}", _script_json(has_message))
         .replace("{{INITIAL_VOLUME}}", str(starting_vol))
         .replace(
             "{{MESSAGE_OVERLAY_STYLE}}",
             _message_overlay_style_from_settings(settings),
         )
-        .replace("{{MUSIC_PLAYLIST_JSON}}", json.dumps(playlist_sources))
+        .replace("{{MUSIC_PLAYLIST_JSON}}", _script_json(playlist_sources))
         .replace(
             "{{MUSIC_CROSSFADE_MS}}",
             str(int(sound_manifest.get("crossfade_ms", 0))),
@@ -1190,9 +1205,12 @@ def build_play_bundle_to(
         .replace("{{MUSIC_PRELOAD_HTML}}", preload_html)
         .replace(
             "{{IMAGE_ANIMATIONS_JSON}}",
-            json.dumps(runtime_images.animations, ensure_ascii=False),
+            _script_json(runtime_images.animations),
         )
     )
+    # Message content is the only untrusted template value and must be inserted
+    # after every trusted placeholder, especially the CSP nonce.
+    html = html.replace("{{MESSAGE_HTML}}", embedded_message_html)
     for slot, source in runtime_images.page_sources.items():
         html = html.replace(
             f"gallery/pages/{slot}.png",

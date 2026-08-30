@@ -170,9 +170,16 @@ def validate_installer_configuration() -> dict[str, str]:
         "VersionInfoVersion": "1.0.0.0",
         "VersionInfoProductVersion": "1.0.0.0",
         "VersionInfoProductTextVersion": "{#MyAppVersion}",
+        "SignTool": "lettersmith",
+        "SignedUninstaller": "yes",
+        "SignToolRetryCount": "3",
     }
     for name, expected in required_directives.items():
         _require_directive(text, name, expected)
+    if "#ifdef LetterSmithSignedRelease" not in text:
+        raise InstallerValidationError(
+            "Windows signing directives must be limited to signed release builds."
+        )
 
     source_lines = re.findall(r"(?im)^Source:\s*.+$", text)
     expected_source = (
@@ -279,12 +286,25 @@ def _prepare_output_directory() -> None:
         shutil.rmtree(resolved)
 
 
-def build_installer() -> Path:
+def build_installer(*, sign: bool = False) -> Path:
     from application_identity import INSTALLER_NAME
 
     if sys.platform != "win32":
         raise InstallerValidationError("Letter Smith installers require Windows.")
-    _distribution_executable()
+    executable = _distribution_executable()
+    signing_configuration = None
+    if sign:
+        from release.windows_signing import (
+            WindowsSigningError,
+            load_signing_configuration,
+            sign_file,
+        )
+
+        try:
+            signing_configuration = load_signing_configuration()
+            sign_file(executable, signing_configuration)
+        except WindowsSigningError as error:
+            raise InstallerValidationError(str(error)) from error
     compiler = _find_iscc()
     if compiler is None:
         raise InstallerValidationError(
@@ -292,8 +312,17 @@ def build_installer() -> Path:
             "packaging is approved."
         )
     _prepare_output_directory()
+    command = [str(compiler), "/Qp"]
+    if signing_configuration is not None:
+        command.extend(
+            [
+                "/DLetterSmithSignedRelease",
+                "/Slettersmith=" + signing_configuration.inno_definition(),
+            ]
+        )
+    command.append(str(INSTALLER_SCRIPT))
     result = subprocess.run(
-        [str(compiler), "/Qp", str(INSTALLER_SCRIPT)],
+        command,
         cwd=RELEASE_ROOT,
         check=False,
     )
@@ -304,6 +333,13 @@ def build_installer() -> Path:
     output = OUTPUT_ROOT / INSTALLER_NAME
     if not output.is_file() or output.stat().st_size < 1_000_000:
         raise InstallerValidationError("The Windows installer was not produced correctly.")
+    if signing_configuration is not None:
+        from release.windows_signing import WindowsSigningError, verify_signature
+
+        try:
+            verify_signature(output, signing_configuration)
+        except WindowsSigningError as error:
+            raise InstallerValidationError(str(error)) from error
     return output
 
 
@@ -327,6 +363,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Required with --build to prevent an accidental package run.",
     )
+    parser.add_argument(
+        "--sign",
+        action="store_true",
+        help="Authenticode-sign the application, uninstaller, and installer.",
+    )
     return parser.parse_args()
 
 
@@ -334,6 +375,9 @@ def main() -> int:
     args = _parse_args()
     if args.build and not args.confirm_package:
         print("ERROR: --build requires --confirm-package.", file=sys.stderr)
+        return 2
+    if args.sign and not args.build:
+        print("ERROR: --sign requires --build.", file=sys.stderr)
         return 2
     try:
         summary = validate_installer_configuration()
@@ -345,7 +389,7 @@ def main() -> int:
             state = "available" if _find_iscc() is not None else "not installed"
             print(f"Inno Setup: {state}; packaging was not run.")
             return 0
-        output = build_installer()
+        output = build_installer(sign=args.sign)
         print(f"Built and verified: {output}")
         return 0
     except InstallerValidationError as error:

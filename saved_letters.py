@@ -39,6 +39,7 @@ from project_paths import (
     ProjectPathResolver,
     application_paths,
 )
+from message_html import sanitize_message_html
 from protected_projects import (
     EXAMPLE_PROJECT_KIND,
     PROTECTED_PROJECT_KIND_KEY,
@@ -111,8 +112,11 @@ from transactional_io import (
     PathTransaction,
     atomic_write_bytes,
     atomic_write_json,
+    atomic_write_text,
+    copy_directory_tree_no_links,
     enforce_internal_tree_visibility,
     file_change_token,
+    is_link_or_reparse_point,
     recover_stale_transactions,
 )
 
@@ -627,7 +631,7 @@ def _runtime_directory(
 ) -> Optional[Path]:
     play_root = play_dir.resolve()
     candidate = play_dir / relative_path
-    if not candidate.is_dir() or candidate.is_symlink():
+    if not candidate.is_dir() or is_link_or_reparse_point(candidate):
         return None
     try:
         resolved = candidate.resolve(strict=True)
@@ -637,7 +641,7 @@ def _runtime_directory(
     cursor = play_dir
     for part in Path(relative_path).parts:
         cursor = cursor / part
-        if cursor.is_symlink():
+        if is_link_or_reparse_point(cursor):
             return None
     return candidate
 
@@ -655,7 +659,7 @@ def _runtime_file(
         if relative.is_absolute() or ".." in relative.parts:
             continue
         candidate = play_dir / relative
-        if not candidate.is_file() or candidate.is_symlink():
+        if not candidate.is_file() or is_link_or_reparse_point(candidate):
             continue
         try:
             resolved = candidate.resolve(strict=True)
@@ -666,7 +670,7 @@ def _runtime_file(
         unsafe = False
         for part in relative.parts:
             cursor = cursor / part
-            if cursor.is_symlink():
+            if is_link_or_reparse_point(cursor):
                 unsafe = True
                 break
         if not unsafe:
@@ -705,6 +709,24 @@ def _readable_file(path: Path) -> bool:
         return True
     except OSError:
         return False
+
+
+def _sanitize_staged_message_tree(message_root: Path) -> None:
+    """Sanitize the editable message and revisions in private staging."""
+    candidates = [message_root / "message.html"]
+    revisions = message_root / "revisions"
+    if revisions.is_dir():
+        candidates.extend(
+            sorted(
+                revisions.glob("*.html"),
+                key=lambda path: path.name.casefold(),
+            )
+        )
+    for path in candidates:
+        if not path.is_file() or is_link_or_reparse_point(path):
+            continue
+        content = path.read_text(encoding="utf-8")
+        atomic_write_text(path, sanitize_message_html(content))
 
 
 class SavedLetterCatalog:
@@ -1435,13 +1457,18 @@ class SavedLetterRestorer:
         )
 
         try:
-            shutil.copytree(pages, pages_tx.prepare())
-            shutil.copytree(message, message_tx.prepare())
+            copy_directory_tree_no_links(pages, pages_tx.prepare())
+            message_staging = message_tx.prepare()
+            copy_directory_tree_no_links(message, message_staging)
+            _sanitize_staged_message_tree(message_staging)
             message_assets_staging = message_assets_tx.prepare()
             if message_assets is None:
                 message_assets_staging.mkdir(parents=True)
             else:
-                shutil.copytree(message_assets, message_assets_staging)
+                copy_directory_tree_no_links(
+                    message_assets,
+                    message_assets_staging,
+                )
 
             for transaction in transactions:
                 transaction.commit(keep_backup=True)
@@ -1714,7 +1741,10 @@ class SavedLetterRestorer:
         )
         staging = transaction.prepare()
         try:
-            shutil.copytree(source, staging)
+            copy_directory_tree_no_links(source, staging)
+            staged_message = staging / "gallery" / "message"
+            if staged_message.is_dir():
+                _sanitize_staged_message_tree(staged_message)
             atomic_write_json(
                 staging / PLAY_METADATA_FILE,
                 identity_metadata,
@@ -1744,7 +1774,7 @@ class SavedLetterRestorer:
             raise SavedLetterRestoreError(
                 "Saved-letter path traversal is not allowed."
             )
-        if original.is_symlink():
+        if is_link_or_reparse_point(original):
             raise SavedLetterRestoreError("Saved-letter links are not allowed.")
         try:
             resolved = original.resolve(strict=True)

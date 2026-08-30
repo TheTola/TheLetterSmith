@@ -9,6 +9,7 @@ TEMPLATE_HTML = r"""
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-{{CSP_NONCE}}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'; font-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; worker-src 'none'">
   <title>{{TITLE}}</title>
   <link rel="stylesheet" href="styles.css">
 
@@ -137,7 +138,7 @@ TEMPLATE_HTML = r"""
   <audio id="bg-music" preload="auto" playsinline></audio>
   <audio id="bg-music-standby" preload="auto" playsinline></audio>
 
-  <script>
+  <script nonce="{{CSP_NONCE}}">
     const INITIAL_VOLUME = {{INITIAL_VOLUME}};
     const MUSIC_PLAYLIST = {{MUSIC_PLAYLIST_JSON}};
     const MUSIC_CROSSFADE_MS = {{MUSIC_CROSSFADE_MS}};
@@ -145,7 +146,7 @@ TEMPLATE_HTML = r"""
     const HAS_MESSAGE = {{HAS_MESSAGE_JSON}};
   </script>
 
-  <script src="script.js"></script>
+  <script nonce="{{CSP_NONCE}}" src="script.js"></script>
 </body>
 </html>
 """

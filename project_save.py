@@ -15,6 +15,7 @@ from config import (
     USER_PAGES_DIR,
     resolve_play_bundle_directory,
 )
+from message_html import sanitize_message_html
 from message_history import write_message_with_revision
 from performance_trace import performance_timed
 from project_paths import (
@@ -120,6 +121,7 @@ class ProjectSaveService:
         workspace_path: str | Path,
         reason: str,
     ) -> Path:
+        content = sanitize_message_html(content)
         workspace = Path(workspace_path).resolve()
         write_message_with_revision(
             workspace,

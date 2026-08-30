@@ -108,6 +108,7 @@ from message_html import (
     is_ultralink_href,
     make_ultralink_href,
     mark_lettersmith_message_html,
+    sanitize_message_html,
     ultralink_message_from_href,
 )
 from ui_dialogs import (
@@ -1645,7 +1646,7 @@ class Editor(QDialog):
         normalize_ultralinks_in_document(self.editor.document())
         content = self.editor.toHtml()
         content = self._inject_export_line_spacing_wrapper(content)
-        return mark_lettersmith_message_html(content)
+        return sanitize_message_html(mark_lettersmith_message_html(content))
 
     def _sync_message_assets(self) -> None:
         self.project_save_service.copy_workspace_tree(

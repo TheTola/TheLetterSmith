@@ -147,14 +147,244 @@ class ApplicationPathsTests(unittest.TestCase):
             (repository / "release" / "dist" / "LetterSmith").resolve(),
         )
 
+    def test_ffmpeg_provisioning_manifest_is_checksum_pinned(self) -> None:
+        from release.provision_ffmpeg import validate_provisioning_manifest
+
+        self.assertEqual(
+            validate_provisioning_manifest(),
+            {"windows": "9.0.1", "macos": "9.0.1"},
+        )
+
+    def test_windows_signing_uses_sha256_rfc3161_timestamping(self) -> None:
+        from release import windows_signing
+
+        with tempfile.TemporaryDirectory() as directory:
+            signtool = Path(directory) / "signtool.exe"
+            signtool.write_bytes(b"test")
+            thumbprint = "A" * 40
+            with (
+                mock.patch.object(
+                    windows_signing,
+                    "find_signtool",
+                    return_value=signtool,
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {"LETTER_SMITH_WINDOWS_CODESIGN_SHA1": thumbprint},
+                ),
+            ):
+                configuration = windows_signing.load_signing_configuration()
+
+            arguments = configuration.sign_arguments("LetterSmith.exe")
+            self.assertEqual(arguments[arguments.index("/fd") + 1], "SHA256")
+            self.assertEqual(arguments[arguments.index("/td") + 1], "SHA256")
+            self.assertEqual(arguments[arguments.index("/sha1") + 1], thumbprint)
+            self.assertIn("/tr", arguments)
+            self.assertIn("$f", configuration.inno_definition())
+
     def test_macos_release_configuration_is_cross_platform_valid(self) -> None:
-        from release.build_macos import validate_macos_configuration
+        from release.build_macos import (
+            _dmg_name_for_architecture,
+            _normalized_target_architecture,
+            _parse_macos_minimum_versions,
+            _required_architectures,
+            _version_tuple,
+            validate_macos_configuration,
+        )
 
         summary = validate_macos_configuration(require_tools=False)
 
         self.assertEqual(summary["app"], "Letter Smith.app")
         self.assertEqual(summary["bundle_identifier"], "works.infini.lettersmith")
         self.assertEqual(summary["dmg"], "LetterSmith-1.0.0.dmg")
+        self.assertEqual(_required_architectures("arm64"), {"arm64"})
+        self.assertEqual(
+            _required_architectures("universal2"),
+            {"arm64", "x86_64"},
+        )
+        self.assertEqual(_normalized_target_architecture("aarch64"), "arm64")
+        self.assertEqual(
+            _dmg_name_for_architecture("LetterSmith-1.0.0.dmg", "arm64"),
+            "LetterSmith-1.0.0-arm64.dmg",
+        )
+        self.assertEqual(
+            _dmg_name_for_architecture("LetterSmith-1.0.0.dmg", "universal2"),
+            "LetterSmith-1.0.0.dmg",
+        )
+        self.assertEqual(_version_tuple("13.0"), (13, 0, 0))
+        self.assertEqual(
+            _parse_macos_minimum_versions(
+                """
+                cmd LC_BUILD_VERSION
+                minos 13.0
+                cmd LC_VERSION_MIN_MACOSX
+                version 12.3
+                """
+            ),
+            ("13.0", "12.3"),
+        )
+
+    def test_macos_frozen_payload_allows_rewritten_binary_bytes(self) -> None:
+        from release import build_release
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_binary = root / "source-ffmpeg"
+            source_resource = root / "source.json"
+            internal = root / "_internal"
+            frozen_binary = internal / "tools" / "ffmpeg"
+            frozen_resource = internal / "resources" / "source.json"
+            frozen_binary.parent.mkdir(parents=True)
+            frozen_resource.parent.mkdir(parents=True)
+            source_binary.write_bytes(b"unsigned-source")
+            frozen_binary.write_bytes(b"rewritten-and-signed")
+            source_resource.write_bytes(b"same-resource")
+            frozen_resource.write_bytes(b"same-resource")
+
+            with (
+                mock.patch.object(
+                    build_release,
+                    "_expected_payload_destinations",
+                    return_value={
+                        "tools/ffmpeg": source_binary,
+                        "resources/source.json": source_resource,
+                    },
+                ),
+                mock.patch.object(
+                    build_release,
+                    "_expected_binary_destinations",
+                    return_value={"tools/ffmpeg"},
+                ),
+            ):
+                build_release._validate_frozen_payload(
+                    internal,
+                    {},
+                    "darwin",
+                )
+
+    def test_macos_otool_parser_handles_universal_output(self) -> None:
+        from release.build_macos import (
+            _parse_otool_dependencies,
+            _unsafe_bundle_dependencies,
+        )
+
+        dependencies = _parse_otool_dependencies(
+            """
+/tmp/Letter Smith (architecture x86_64):
+    /usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)
+    @rpath/QtCore.framework/Versions/A/QtCore (compatibility version 6.0.0, current version 6.8.0)
+/tmp/Letter Smith (architecture arm64):
+    /System/Library/Frameworks/AppKit.framework/Versions/C/AppKit (compatibility version 45.0.0, current version 2575.0.0)
+    /opt/homebrew/lib/libforeign.dylib (compatibility version 1.0.0, current version 1.0.0)
+            """
+        )
+
+        self.assertEqual(
+            dependencies,
+            (
+                "/usr/lib/libSystem.B.dylib",
+                "@rpath/QtCore.framework/Versions/A/QtCore",
+                "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit",
+                "/opt/homebrew/lib/libforeign.dylib",
+            ),
+        )
+        self.assertEqual(
+            _unsafe_bundle_dependencies(dependencies),
+            ("/opt/homebrew/lib/libforeign.dylib",),
+        )
+
+    def test_macos_bundle_checks_every_macho_dependency_set(self) -> None:
+        from release import build_macos
+
+        with tempfile.TemporaryDirectory() as directory:
+            contents = Path(directory)
+            safe = contents / "safe"
+            unsafe = contents / "unsafe"
+            safe.write_bytes(b"\xcf\xfa\xed\xfe-safe")
+            unsafe.write_bytes(b"\xcf\xfa\xed\xfe-unsafe")
+
+            def dependencies(path: Path) -> tuple[str, ...]:
+                if path.name == "unsafe":
+                    return ("/opt/homebrew/lib/libforeign.dylib",)
+                return ("/usr/lib/libSystem.B.dylib",)
+
+            with (
+                mock.patch.object(build_macos, "_validate_binary_architectures"),
+                mock.patch.object(
+                    build_macos,
+                    "_validate_binary_minimum_system_version",
+                ),
+                mock.patch.object(
+                    build_macos,
+                    "_inspect_macho_dependencies",
+                    side_effect=dependencies,
+                ) as inspect,
+            ):
+                with self.assertRaisesRegex(
+                    build_macos.MacOSReleaseError,
+                    "non-portable dependency references",
+                ):
+                    build_macos._validate_bundle_macho_files(
+                        contents,
+                        required_architectures={"arm64"},
+                        minimum_system_version="13.0",
+                    )
+
+            self.assertEqual(inspect.call_count, 2)
+
+    def test_macos_dmg_stages_app_at_volume_root(self) -> None:
+        from release import build_macos
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app_path = root / "Letter Smith.app"
+            app_path.mkdir()
+            dmg_path = root / "LetterSmith.dmg"
+            commands: list[list[str]] = []
+
+            def record(command: list[str], *, label: str) -> None:
+                commands.append(command)
+
+            with (
+                mock.patch.object(build_macos, "_run_checked", side_effect=record),
+                mock.patch.object(Path, "symlink_to", autospec=True) as symlink,
+            ):
+                build_macos._create_dmg(app_path, dmg_path, identity="")
+
+        ditto = next(command for command in commands if command[0] == build_macos.DITTO_PATH)
+        create = next(
+            command
+            for command in commands
+            if command[:2] == [build_macos.HDIUTIL_PATH, "create"]
+        )
+        source_root = Path(create[create.index("-srcfolder") + 1])
+        self.assertNotEqual(source_root, app_path)
+        self.assertEqual(Path(ditto[-1]), source_root / app_path.name)
+        self.assertEqual(symlink.call_args.args[0].name, "Applications")
+        self.assertEqual(symlink.call_args.args[1], "/Applications")
+
+    def test_macos_codesign_parser_extracts_hardened_runtime_flags(self) -> None:
+        from release.build_macos import _parse_codesign_details
+
+        details = _parse_codesign_details(
+            """
+Executable=/Applications/Letter Smith.app/Contents/MacOS/Letter Smith
+CodeDirectory v=20500 size=880 flags=0x10000(runtime) hashes=18+7 location=embedded
+Signature size=9072
+Authority=Developer ID Application: Infini Works (ABCDE12345)
+Timestamp=Aug 30, 2026 at 12:00:00
+TeamIdentifier=ABCDE12345
+            """
+        )
+
+        self.assertEqual(details["flags"], "0x10000(runtime)")
+        self.assertEqual(details["signature"], "9072")
+        self.assertEqual(
+            details["authority"],
+            "Developer ID Application: Infini Works (ABCDE12345)",
+        )
+        self.assertEqual(details["team_identifier"], "ABCDE12345")
+        self.assertTrue(details["timestamp"])
 
     def test_release_rejects_foreign_icu_runtime_dlls(self) -> None:
         from release.build_release import (

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import html as _html
 import re
+from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 
 BODY_RE = re.compile(r"<body\b[^>]*>(.*?)</body>", re.IGNORECASE | re.DOTALL)
 DOC_GUID_RE = re.compile(
@@ -66,6 +68,181 @@ DROP_STYLE_PROPS = {
     "margin-right",
     "text-indent",
 }
+
+_PASSIVE_TAGS = frozenset(
+    {
+        "a",
+        "b",
+        "blockquote",
+        "br",
+        "code",
+        "del",
+        "div",
+        "em",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "hr",
+        "i",
+        "img",
+        "ins",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "s",
+        "small",
+        "span",
+        "strike",
+        "strong",
+        "sub",
+        "sup",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "u",
+        "ul",
+    }
+)
+_VOID_TAGS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
+_BLOCKED_SUBTREES = frozenset(
+    {
+        "audio",
+        "button",
+        "canvas",
+        "embed",
+        "form",
+        "head",
+        "iframe",
+        "math",
+        "noscript",
+        "object",
+        "option",
+        "script",
+        "select",
+        "style",
+        "svg",
+        "template",
+        "textarea",
+        "video",
+    }
+)
+_DOCUMENT_WRAPPERS = frozenset({"body", "html"})
+_SAFE_CLASSES = frozenset(
+    {
+        "checked",
+        "lettersmith-defaults",
+        "ls-linewrap",
+        "unchecked",
+    }
+)
+_GLOBAL_ATTRIBUTES = frozenset({"align", "class", "dir", "lang", "style", "title"})
+_TAG_ATTRIBUTES = {
+    "a": frozenset({"href"}),
+    "img": frozenset({"alt", "height", "src", "width"}),
+    "li": frozenset({"value"}),
+    "ol": frozenset({"start", "type"}),
+    "table": frozenset({"border", "cellpadding", "cellspacing", "width"}),
+    "td": frozenset({"colspan", "height", "rowspan", "valign", "width"}),
+    "th": frozenset({"colspan", "height", "rowspan", "scope", "valign", "width"}),
+}
+_SAFE_STYLE_PROPERTIES = frozenset(
+    {
+        "-qt-block-indent",
+        "background-color",
+        "border",
+        "border-bottom",
+        "border-collapse",
+        "border-color",
+        "border-left",
+        "border-right",
+        "border-spacing",
+        "border-style",
+        "border-top",
+        "border-width",
+        "color",
+        "direction",
+        "font-family",
+        "font-size",
+        "font-stretch",
+        "font-style",
+        "font-variant",
+        "font-weight",
+        "height",
+        "letter-spacing",
+        "line-height",
+        "list-style-position",
+        "list-style-type",
+        "margin",
+        "margin-bottom",
+        "margin-left",
+        "margin-right",
+        "margin-top",
+        "max-height",
+        "max-width",
+        "min-height",
+        "min-width",
+        "overflow-wrap",
+        "padding",
+        "padding-bottom",
+        "padding-left",
+        "padding-right",
+        "padding-top",
+        "text-align",
+        "text-decoration",
+        "text-indent",
+        "text-transform",
+        "vertical-align",
+        "white-space",
+        "width",
+        "word-break",
+        "word-spacing",
+    }
+)
+_UNSAFE_STYLE_VALUE = re.compile(
+    r"(?i)(?:url|expression|var|env|attr)\s*\(|@import|javascript:|vbscript:|"
+    r"data:|file:|-moz-binding|\bbehavior\b"
+)
+_LANGUAGE_VALUE = re.compile(r"[A-Za-z0-9-]{1,35}")
+_NUMBER_VALUE = re.compile(r"\d{1,5}(?:\.\d{1,3})?%?")
+_RASTER_DATA_URI = re.compile(
+    r"data:image/(?:png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=\r\n]+",
+    re.IGNORECASE,
+)
+_RASTER_SUFFIXES = frozenset({".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"})
+_CONTROL_OR_SPACE = re.compile(r"[\x00-\x20\x7f]+")
+_QT_DEFAULTS_STYLE = (
+    '<style type="text/css">'
+    ".lettersmith-defaults p,.lettersmith-defaults li{white-space:pre-wrap}"
+    ".lettersmith-defaults hr{height:1px;border-width:0}"
+    '.lettersmith-defaults li.unchecked::marker{content:"\\2610"}'
+    '.lettersmith-defaults li.checked::marker{content:"\\2612"}'
+    "</style>"
+)
 
 
 def _normalize_newlines(text: str) -> str:
@@ -367,6 +544,237 @@ LETTERSMITH_MESSAGE_HINTS = (
     'class="ls-linewrap"',
     "class='ls-linewrap'",
 )
+
+
+def _sanitize_style_attribute(value: str) -> str:
+    declarations: list[str] = []
+    seen: set[str] = set()
+    for raw_declaration in (value or "").split(";"):
+        if ":" not in raw_declaration:
+            continue
+        raw_name, raw_value = raw_declaration.split(":", 1)
+        name = raw_name.strip().casefold()
+        style_value = re.sub(r"\s+", " ", raw_value).strip()
+        if (
+            name not in _SAFE_STYLE_PROPERTIES
+            or name in seen
+            or not style_value
+            or len(style_value) > 512
+            or any(char in style_value for char in "<>[]{}\\@!")
+            or any(ord(char) < 32 and char not in "\t\r\n" for char in style_value)
+            or _UNSAFE_STYLE_VALUE.search(style_value)
+        ):
+            continue
+        declarations.append(f"{name}:{style_value}")
+        seen.add(name)
+    return "; ".join(declarations)
+
+
+def _sanitize_href(value: str) -> str:
+    candidate = _CONTROL_OR_SPACE.sub("", value or "")
+    if not candidate or len(candidate) > 16_384 or candidate.startswith("//"):
+        return ""
+    if candidate.startswith("#"):
+        return candidate
+    scheme = urlsplit(candidate).scheme.casefold()
+    if scheme not in {"http", "https", "mailto", "ultralink", "hypernote"}:
+        return ""
+    return candidate
+
+
+def _sanitize_image_source(value: str) -> str:
+    candidate = _CONTROL_OR_SPACE.sub("", value or "")
+    if not candidate or candidate.startswith(("//", "/", "\\")):
+        return ""
+    if candidate.casefold().startswith("data:"):
+        if len(candidate) > 8 * 1024 * 1024:
+            return ""
+        return candidate if _RASTER_DATA_URI.fullmatch(candidate) else ""
+
+    parsed = urlsplit(candidate)
+    if parsed.scheme or parsed.netloc or "\\" in parsed.path:
+        return ""
+    decoded_path = unquote(parsed.path)
+    parts = tuple(part for part in decoded_path.split("/") if part not in {"", "."})
+    if not parts or any(part == ".." for part in parts):
+        return ""
+    if Path(parts[-1]).suffix.casefold() not in _RASTER_SUFFIXES:
+        return ""
+    return candidate
+
+
+def _sanitize_attribute(tag: str, name: str, value: str) -> str:
+    if name == "class":
+        classes = [
+            token
+            for token in re.split(r"\s+", value.strip())
+            if token in _SAFE_CLASSES
+        ]
+        return " ".join(dict.fromkeys(classes))
+    if name == "style":
+        return _sanitize_style_attribute(value)
+    if name == "href":
+        return _sanitize_href(value)
+    if name == "src":
+        return _sanitize_image_source(value)
+    if name in {"width", "height", "border", "cellpadding", "cellspacing"}:
+        return value.strip() if _NUMBER_VALUE.fullmatch(value.strip()) else ""
+    if name in {"colspan", "rowspan", "start", "value"}:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return ""
+        return str(number) if -10_000 <= number <= 10_000 else ""
+    if name == "align":
+        candidate = value.strip().casefold()
+        return candidate if candidate in {"center", "justify", "left", "right"} else ""
+    if name == "valign":
+        candidate = value.strip().casefold()
+        return candidate if candidate in {"baseline", "bottom", "middle", "top"} else ""
+    if name == "dir":
+        candidate = value.strip().casefold()
+        return candidate if candidate in {"auto", "ltr", "rtl"} else ""
+    if name == "scope":
+        candidate = value.strip().casefold()
+        return candidate if candidate in {"col", "colgroup", "row", "rowgroup"} else ""
+    if name == "lang":
+        candidate = value.strip()
+        return candidate if _LANGUAGE_VALUE.fullmatch(candidate) else ""
+    if name == "type" and tag == "ol":
+        candidate = value.strip()
+        return candidate if candidate in {"1", "A", "a", "I", "i"} else ""
+    if name in {"alt", "title"}:
+        return value[:2048]
+    return ""
+
+
+class _PassiveMessageHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.output: list[str] = []
+        self.open_tags: list[str] = []
+        self.blocked_tags: list[str] = []
+        self.marker_emitted = False
+
+    def _in_blocked_subtree(self) -> bool:
+        return bool(self.blocked_tags)
+
+    def _start_blocked(self, tag: str) -> None:
+        if tag not in _VOID_TAGS:
+            self.blocked_tags.append(tag)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.casefold()
+        if self._in_blocked_subtree():
+            self._start_blocked(tag)
+            return
+        if tag in _BLOCKED_SUBTREES:
+            self._start_blocked(tag)
+            return
+        if tag in _DOCUMENT_WRAPPERS or tag not in _PASSIVE_TAGS:
+            return
+
+        allowed = _GLOBAL_ATTRIBUTES | _TAG_ATTRIBUTES.get(tag, frozenset())
+        cleaned: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for raw_name, raw_value in attrs:
+            name = str(raw_name or "").strip().casefold()
+            if (
+                not name
+                or name in seen
+                or name not in allowed
+                or name.startswith("on")
+                or ":" in name
+            ):
+                continue
+            value = _sanitize_attribute(tag, name, str(raw_value or ""))
+            if not value:
+                continue
+            cleaned.append((name, value))
+            seen.add(name)
+
+        rendered_attributes = "".join(
+            f' {name}="{_html.escape(value, quote=True)}"'
+            for name, value in cleaned
+        )
+        self.output.append(f"<{tag}{rendered_attributes}>")
+        if tag not in _VOID_TAGS:
+            self.open_tags.append(tag)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.casefold()
+        if self._in_blocked_subtree() or tag in _BLOCKED_SUBTREES:
+            return
+        before = len(self.open_tags)
+        self.handle_starttag(tag, attrs)
+        if len(self.open_tags) > before and self.open_tags[-1] == tag:
+            self.open_tags.pop()
+            self.output.append(f"</{tag}>")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.casefold()
+        if self._in_blocked_subtree():
+            if tag in self.blocked_tags:
+                while self.blocked_tags:
+                    blocked = self.blocked_tags.pop()
+                    if blocked == tag:
+                        break
+            return
+        if tag not in self.open_tags:
+            return
+        while self.open_tags:
+            opened = self.open_tags.pop()
+            self.output.append(f"</{opened}>")
+            if opened == tag:
+                break
+
+    def handle_data(self, data: str) -> None:
+        if not self._in_blocked_subtree() and data:
+            self.output.append(_html.escape(data, quote=False))
+
+    def handle_comment(self, data: str) -> None:
+        if (
+            not self._in_blocked_subtree()
+            and not self.marker_emitted
+            and data.strip().casefold() == "lettersmith-message:v2"
+        ):
+            self.output.append(LETTERSMITH_MESSAGE_MARKER)
+            self.marker_emitted = True
+
+    def finish(self) -> str:
+        while self.open_tags:
+            self.output.append(f"</{self.open_tags.pop()}>")
+        return "".join(self.output).strip()
+
+
+def sanitize_message_html(raw: str) -> str:
+    """Return balanced passive message markup safe for editor and viewer use."""
+    source = normalize_message_document_html(raw)
+    if not source:
+        return ""
+
+    parser = _PassiveMessageHTMLParser()
+    try:
+        parser.feed(source)
+        parser.close()
+    except (AssertionError, ValueError):
+        return _html.escape(source, quote=False)
+    sanitized = parser.finish()
+
+    lowered = source.casefold()
+    qt_document = (
+        LETTERSMITH_MESSAGE_MARKER.casefold() in lowered
+        or 'name="qrichtext"' in lowered
+        or "name='qrichtext'" in lowered
+        or "-qt-" in lowered
+        or "ls-linewrap" in lowered
+        or "lettersmith-defaults" in lowered
+    )
+    if not qt_document:
+        return sanitized
+    if "lettersmith-defaults" not in lowered:
+        sanitized = f'<div class="lettersmith-defaults">{sanitized}</div>'
+    return _QT_DEFAULTS_STYLE + sanitized
 
 
 def is_lettersmith_message_html(raw: str, *, filename: str = "") -> bool:

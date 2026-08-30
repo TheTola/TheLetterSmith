@@ -1,6 +1,8 @@
 param(
     [switch]$Build,
-    [switch]$ConfirmPackage
+    [switch]$ConfirmPackage,
+    [switch]$Sign,
+    [string]$FFmpegSourceDir
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,6 +15,12 @@ if ($Build) {
     if ($ConfirmPackage) {
         $arguments += "--confirm-package"
     }
+}
+if ($Sign) {
+    $arguments += "--sign"
+}
+if ($FFmpegSourceDir) {
+    $arguments += @("--ffmpeg-source-dir", $FFmpegSourceDir)
 }
 
 Push-Location $projectRoot

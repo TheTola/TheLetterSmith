@@ -36,9 +36,7 @@ from transactional_io import atomic_write_text, safe_write_json, set_path_hidden
 from ui_dialogs import LetterSmithConfirmationDialog, show_lettersmith_message
 from ui_help import set_control_help
 
-
 LOGGER = logging.getLogger(__name__)
-
 
 # ---------------------------
 # Robust file discovery & reading + cache
@@ -48,7 +46,6 @@ _FILE_CACHE: Dict[str, Tuple[List[str], Optional[Path], Optional[Tuple[int, int]
 PROMPT_LANGUAGE_VERSION = 2
 STATE_PERSIST_DEBOUNCE_MS = 350
 MAX_INVALID_STATE_BACKUPS = 3
-
 
 def _backup_invalid_prompt_writer_state(path: Path) -> None:
     if not path.is_file():

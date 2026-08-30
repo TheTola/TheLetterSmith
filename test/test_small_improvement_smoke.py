@@ -721,6 +721,38 @@ class SmallImprovementSmokeTests(unittest.TestCase):
                 first.chmod(stat.S_IREAD | stat.S_IWRITE)
                 second.chmod(stat.S_IREAD | stat.S_IWRITE)
 
+    def test_bundled_variable_fonts_resolve_by_family_name(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        italic_families = {
+            "Cormorant Garamond",
+            "Exo 2",
+            "IBM Plex Sans",
+            "Lora",
+            "Montserrat",
+            "Source Sans 3",
+            "Source Serif 4",
+        }
+        for family in (
+            "Cinzel",
+            "Cormorant Garamond",
+            "Exo 2",
+            "IBM Plex Sans",
+            "Lora",
+            "Manrope",
+            "Montserrat",
+            "Source Sans 3",
+            "Source Serif 4",
+        ):
+            with self.subTest(family=family):
+                faces = font_export.resolve_font_faces_for_family(
+                    project_root,
+                    family,
+                )
+                self.assertTrue(faces)
+                if family in italic_families:
+                    self.assertIn("normal", {face.style for face in faces})
+                    self.assertIn("italic", {face.style for face in faces})
+
     def test_inconsistent_active_path_falls_back_and_repairs_hint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

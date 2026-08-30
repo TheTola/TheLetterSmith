@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from PIL import Image
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 
@@ -27,6 +29,18 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
             QtWidgets.QApplication.instance()
             or QtWidgets.QApplication([])
         )
+
+    @classmethod
+    def _release_help_movies(cls, window: Nexus) -> None:
+        window.help_icon.clear()
+        for attribute in ("_help_movie_idle", "_help_movie_hover"):
+            movie = getattr(window, attribute)
+            if movie is not None:
+                movie.stop()
+                movie.setFileName("")
+                movie.deleteLater()
+                setattr(window, attribute, None)
+        cls.app.processEvents()
 
     def test_maximized_sound_preview_keeps_native_height_cap(self) -> None:
         preview_frame = QtWidgets.QWidget()
@@ -216,26 +230,28 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
 
     def test_help_hover_movie_is_created_only_when_first_used(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            window = Nexus(temp_dir)
+            root = Path(temp_dir)
+            idle_gif = root / "idle.gif"
+            hover_gif = root / "hover.gif"
+            for path, color in (
+                (idle_gif, "#4a90e2"),
+                (hover_gif, "#d85c6a"),
+            ):
+                frames = [
+                    Image.new("RGB", (4, 4), color),
+                    Image.new("RGB", (4, 4), "#ffffff"),
+                ]
+                frames[0].save(
+                    path,
+                    save_all=True,
+                    append_images=frames[1:],
+                    duration=100,
+                    loop=0,
+                )
+            window = Nexus(root)
             try:
-                window._help_movie_idle_path = str(
-                    PROJECT_ROOT
-                    / "resources"
-                    / "app"
-                    / "themes"
-                    / "cyber_forge"
-                    / "help"
-                    / "Help.gif"
-                )
-                window._help_movie_hover_path = str(
-                    PROJECT_ROOT
-                    / "resources"
-                    / "app"
-                    / "themes"
-                    / "cyber_forge"
-                    / "help"
-                    / "HHelp.gif"
-                )
+                window._help_movie_idle_path = str(idle_gif)
+                window._help_movie_hover_path = str(hover_gif)
 
                 self.assertTrue(window._show_help_movie("idle"))
                 self.assertIsNotNone(window._help_movie_idle)
@@ -256,22 +272,32 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 )
             finally:
                 window.shutdown()
+                self._release_help_movies(window)
                 window.close()
                 self.app.processEvents()
 
     def test_static_help_state_replaces_and_stops_an_active_gif(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            idle_gif = root / "Help.gif"
             hover_png = root / "HHelp.png"
+            frames = [
+                Image.new("RGB", (4, 4), "#4a90e2"),
+                Image.new("RGB", (4, 4), "#ffffff"),
+            ]
+            frames[0].save(
+                idle_gif,
+                save_all=True,
+                append_images=frames[1:],
+                duration=100,
+                loop=0,
+            )
             image = QtGui.QImage(24, 24, QtGui.QImage.Format_ARGB32)
             image.fill(QtGui.QColor("#4a90e2"))
             self.assertTrue(image.save(str(hover_png)))
             window = Nexus(root)
             try:
-                window._help_movie_idle_path = str(
-                    PROJECT_ROOT
-                    / "resources/app/themes/cyber_forge/help/Help.gif"
-                )
+                window._help_movie_idle_path = str(idle_gif)
                 window._help_movie_hover_path = ""
                 window._help_static_hover_path = str(hover_png)
 
@@ -286,6 +312,7 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 self.assertFalse(window.help_icon.pixmap().isNull())
             finally:
                 window.shutdown()
+                self._release_help_movies(window)
                 window.close()
                 self.app.processEvents()
 

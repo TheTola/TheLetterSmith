@@ -270,6 +270,25 @@ def _expected_payload_destinations(
     return expected
 
 
+def _expected_binary_destinations(
+    manifest: dict[str, Any],
+    platform_name: str | None = None,
+) -> set[str]:
+    expected: set[str] = set()
+    for source, destination_text in _binary_entries(manifest, platform_name):
+        destination = _safe_destination(destination_text)
+        if source.is_file():
+            source_files = ((source, Path(source.name)),)
+        else:
+            source_files = (
+                (candidate, candidate.relative_to(source))
+                for candidate in _files_under(source)
+            )
+        for _candidate, relative in source_files:
+            expected.add((destination / relative).as_posix())
+    return expected
+
+
 def _validate_identity(manifest: dict[str, Any]) -> None:
     from application_identity import (
         APPLICATION_NAME,
@@ -534,6 +553,20 @@ def _run_tool(path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
 
 def _validate_audio_tools(platform_name: str | None = None) -> None:
     platform = _release_platform(platform_name)
+    from release.provision_ffmpeg import (
+        FFmpegProvisionError,
+        validate_staged_tools,
+    )
+
+    target_architecture = (
+        os.environ.get("LETTER_SMITH_MACOS_TARGET_ARCH", "").strip()
+        if platform == "macos"
+        else None
+    )
+    try:
+        validate_staged_tools(platform, target_architecture)
+    except FFmpegProvisionError as error:
+        raise ReleaseValidationError(str(error)) from error
     suffix = ".exe" if platform == "windows" else ""
     tool_root = PROJECT_ROOT / "tools"
     if platform == "macos":
@@ -746,6 +779,11 @@ def _validate_frozen_payload(
     platform_name: str | None = None,
 ) -> None:
     expected = _expected_payload_destinations(manifest, platform_name)
+    rewritten_binary_paths = (
+        _expected_binary_destinations(manifest, platform_name)
+        if _release_platform(platform_name) == "macos"
+        else set()
+    )
     managed_roots = {"resources", "tools"}
     expected_paths = {
         relative
@@ -766,6 +804,12 @@ def _validate_frozen_payload(
             f"missing={missing}, unexpected={unexpected}"
         )
     for relative in sorted(expected_paths):
+        # PyInstaller rewrites Mach-O load commands and replaces signatures while
+        # collecting binaries. Their packaged bytes cannot equal the approved
+        # source bytes; the macOS release verifier checks architecture, minimum
+        # OS, dependency closure, and signatures after collection instead.
+        if relative in rewritten_binary_paths:
+            continue
         frozen = internal / Path(relative)
         source = expected[relative]
         try:
@@ -922,9 +966,19 @@ def _pyinstaller_environment() -> dict[str, str]:
     return environment
 
 
-def build_release() -> Path:
+def build_release(
+    *,
+    sign: bool = False,
+    ffmpeg_source_dir: str | Path | None = None,
+) -> Path:
     if sys.platform != "win32":
         raise ReleaseValidationError("Letter Smith release builds require Windows.")
+    from release.provision_ffmpeg import FFmpegProvisionError, provision_ffmpeg
+
+    try:
+        provision_ffmpeg("windows", source_dir=ffmpeg_source_dir)
+    except FFmpegProvisionError as error:
+        raise ReleaseValidationError(str(error)) from error
     if importlib.util.find_spec("PyInstaller") is None:
         raise ReleaseValidationError(
             "PyInstaller is not installed. Install requirements.txt only "
@@ -954,7 +1008,20 @@ def build_release() -> Path:
         raise ReleaseValidationError(
             f"PyInstaller failed with exit code {result.returncode}."
         )
-    return validate_distribution()
+    executable = validate_distribution()
+    if sign:
+        from release.windows_signing import (
+            WindowsSigningError,
+            load_signing_configuration,
+            sign_file,
+        )
+
+        try:
+            sign_file(executable, load_signing_configuration())
+        except WindowsSigningError as error:
+            raise ReleaseValidationError(str(error)) from error
+        validate_distribution()
+    return executable
 
 
 def _parse_args() -> argparse.Namespace:
@@ -977,6 +1044,15 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Required with --build to prevent an accidental package run.",
     )
+    parser.add_argument(
+        "--sign",
+        action="store_true",
+        help="Authenticode-sign and verify LetterSmith.exe for public distribution.",
+    )
+    parser.add_argument(
+        "--ffmpeg-source-dir",
+        help="Stage pinned FFmpeg/FFprobe from this directory instead of downloading.",
+    )
     return parser.parse_args()
 
 
@@ -985,7 +1061,13 @@ def main() -> int:
     if args.build and not args.confirm_package:
         print("ERROR: --build requires --confirm-package.", file=sys.stderr)
         return 2
+    if args.sign and not args.build:
+        print("ERROR: --sign requires --build.", file=sys.stderr)
+        return 2
     try:
+        from release.provision_ffmpeg import FFmpegProvisionError, provision_ffmpeg
+
+        provision_ffmpeg("windows", source_dir=args.ffmpeg_source_dir)
         summary = validate_release_inputs()
         print(
             "Release inputs validated: "
@@ -999,10 +1081,13 @@ def main() -> int:
             )
             print(f"PyInstaller: {state}; packaging was not run.")
             return 0
-        executable = build_release()
+        executable = build_release(
+            sign=args.sign,
+            ffmpeg_source_dir=args.ffmpeg_source_dir,
+        )
         print(f"Built and verified: {executable}")
         return 0
-    except ReleaseValidationError as error:
+    except (ReleaseValidationError, FFmpegProvisionError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 

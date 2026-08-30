@@ -1,0 +1,50 @@
+name: macOS source validation
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-tests:
+    name: ${{ matrix.target_architecture }} source tests
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            python_architecture: arm64
+            target_architecture: arm64
+          - runner: macos-15-intel
+            python_architecture: x64
+            target_architecture: x86_64
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      QT_QPA_PLATFORM: offscreen
+      QTWEBENGINE_DISABLE_SANDBOX: "1"
+      LETTER_SMITH_MACOS_TARGET_ARCH: ${{ matrix.target_architecture }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          architecture: ${{ matrix.python_architecture }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: python -m pip install --requirement requirements.txt
+      - name: Compile Python sources
+        run: python -m compileall -q -x '(^|/)(Quarantine|release/macos|\.git)(/|$)' .
+      - name: Validate macOS packaging configuration
+        run: |
+          python -c "from release.provision_ffmpeg import validate_provisioning_manifest; print(validate_provisioning_manifest())"
+          python release/build_macos.py --configuration-only
+      - name: Run complete test suite
+        run: python -m unittest discover -s test -p 'test_*.py'

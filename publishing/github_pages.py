@@ -68,6 +68,10 @@ _EXCLUDED_ROOT_FILES = {
     "lettersmith-metadata.json",
     "prompt_writer_state.json",
 }
+_EXCLUDED_PUBLIC_FILES = {
+    "gallery/pages/lettersmith-images.json",
+    "gallery/sounds/lettersmith-sound.json",
+}
 _ROOT_INDEX = b"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Letter Smith</title></head>
 <body><main><h1>Letter Smith</h1><p>Letters published with Letter Smith are available through their direct links.</p></main></body></html>
@@ -87,9 +91,13 @@ def _published_files(build: Path) -> tuple[tuple[Path, str, int], ...]:
                 "The generated letter contains an unsupported linked file.",
             )
         relative = path.relative_to(build).as_posix()
-        if relative in _EXCLUDED_ROOT_FILES:
+        relative_key = relative.casefold()
+        if (
+            relative_key in _EXCLUDED_ROOT_FILES
+            or relative_key in _EXCLUDED_PUBLIC_FILES
+        ):
             continue
-        if relative.startswith("gallery/message/revisions/"):
+        if relative_key.startswith("gallery/message/revisions/"):
             continue
         size = path.stat().st_size
         if size > MAX_BLOB_BYTES:

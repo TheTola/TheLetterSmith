@@ -51,7 +51,7 @@ from message_history import (
     restore_revision,
 )
 from message_format import normalize_ultralinks_in_document
-from message_html import is_lettersmith_message_html
+from message_html import is_lettersmith_message_html, sanitize_message_html
 from letter_page import (
     DEFAULT_MESSAGE_OVERLAY_OPACITY,
     DEFAULT_MESSAGE_OVERLAY_PRESET,
@@ -1429,7 +1429,9 @@ class MessageTab(QtWidgets.QWidget):
             self._content_has_intentional_formatting = False
             return
         try:
-            self.current_html = path.read_text(encoding="utf-8")
+            self.current_html = sanitize_message_html(
+                path.read_text(encoding="utf-8")
+            )
             self._content_has_intentional_formatting = True
         except Exception:
             pass
@@ -1449,6 +1451,7 @@ class MessageTab(QtWidgets.QWidget):
             )
             return False
 
+        restored = sanitize_message_html(restored)
         self.current_html = restored
         try:
             self.project_save_service.save_message(
@@ -1908,7 +1911,9 @@ class MessageTab(QtWidgets.QWidget):
         html_path = self._html_path()
         if html_path.is_file():
             try:
-                self.current_html = html_path.read_text(encoding="utf-8")
+                self.current_html = sanitize_message_html(
+                    html_path.read_text(encoding="utf-8")
+                )
                 # Canonical message.html is a saved Letter Smith message and must
                 # retain its intentional user formatting.
                 self._content_has_intentional_formatting = True
@@ -1981,7 +1986,9 @@ class MessageTab(QtWidgets.QWidget):
         html_path = self._html_path()
         if html_path.is_file():
             try:
-                html_for_editor = html_path.read_text(encoding="utf-8")
+                html_for_editor = sanitize_message_html(
+                    html_path.read_text(encoding="utf-8")
+                )
             except Exception:
                 html_for_editor = self.current_html or ""
         else:
@@ -2007,6 +2014,7 @@ class MessageTab(QtWidgets.QWidget):
     def _handle_editor_autosaved(self, html: str) -> None:
         if not html:
             return
+        html = sanitize_message_html(html)
         self.current_html = html
         self._content_has_intentional_formatting = True
         self._update_message_summary(html)
@@ -2023,6 +2031,7 @@ class MessageTab(QtWidgets.QWidget):
         if not new_html:
             return
 
+        new_html = sanitize_message_html(new_html)
         self.current_html = new_html
         self._content_has_intentional_formatting = True
         self._update_message_summary(new_html)
@@ -2127,7 +2136,11 @@ class MessageTab(QtWidgets.QWidget):
             return
 
         preserve_formatting = is_lettersmith_message_html(imported_html, filename=path)
-        html = imported_html if preserve_formatting else _normalize_imported_message_html(imported_html)
+        html = sanitize_message_html(
+            imported_html
+            if preserve_formatting
+            else _normalize_imported_message_html(imported_html)
+        )
 
         try:
             self.project_save_service.save_message(
@@ -2154,6 +2167,7 @@ class MessageTab(QtWidgets.QWidget):
     # ──────────────────────────────────────────────────────────────────
     def _generate_image(self, html: str) -> int | None:
         """Queue the latest full-resolution message.png render."""
+        html = sanitize_message_html(html)
         if self._render_shutdown:
             return None
         if not self._ensure_wall_exists():
