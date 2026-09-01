@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +30,7 @@ class ApplicationPathsTests(unittest.TestCase):
                 },
                 home=home,
                 temporary_base=temporary,
+                platform_name="win32",
             )
 
             self.assertEqual(paths.resource_root, resource_root.resolve())
@@ -300,8 +302,10 @@ class ApplicationPathsTests(unittest.TestCase):
             contents = Path(directory)
             safe = contents / "safe"
             unsafe = contents / "unsafe"
+            static_archive = contents / "plugin.a"
             safe.write_bytes(b"\xcf\xfa\xed\xfe-safe")
             unsafe.write_bytes(b"\xcf\xfa\xed\xfe-unsafe")
+            static_archive.write_bytes(b"\xcf\xfa\xed\xfe-static")
 
             def dependencies(path: Path) -> tuple[str, ...]:
                 if path.name == "unsafe":
@@ -331,6 +335,92 @@ class ApplicationPathsTests(unittest.TestCase):
                     )
 
             self.assertEqual(inspect.call_count, 2)
+
+    def test_macos_bundle_accepts_native_split_payload_layout(self) -> None:
+        from release import build_macos
+        from release import build_release
+
+        self.assertTrue(
+            build_macos._is_approved_resource_path(
+                Path("Resources/resources/stock/letters/lettersmith-build.json")
+            )
+        )
+        self.assertFalse(
+            build_macos._is_approved_resource_path(
+                Path("Resources/user-data/lettersmith-build.json")
+            )
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GITHUB_ACTIONS": "true",
+                "GITHUB_WORKSPACE": str(build_release.PROJECT_ROOT),
+            },
+        ):
+            self.assertEqual(build_release._private_binary_markers(), ())
+            build_release._validate_private_binary_markers(())
+
+        with tempfile.TemporaryDirectory() as directory:
+            contents = Path(directory) / "Letter Smith.app" / "Contents"
+            resources = contents / "Resources"
+            frameworks = contents / "Frameworks"
+            for relative in (
+                "resources/stock/stock_manifest.json",
+                "resources/examples/example_letter/lettersmith-metadata.json",
+                "gallery/app/icons/folder/lsmith.png",
+                "tools/FFmpeg-PROVENANCE.txt",
+            ):
+                path = resources / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"resource")
+            for name in ("ffmpeg", "ffprobe"):
+                path = frameworks / "tools" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"tool")
+
+            plist = {
+                "CFBundleIdentifier": "works.infini.lettersmith",
+                "CFBundleExecutable": "LetterSmith",
+                "CFBundleShortVersionString": "1.0.0",
+                "CFBundleVersion": "1.0.0",
+                "LSMinimumSystemVersion": "13.0",
+                "CFBundleIconFile": "lettersmith.icns",
+            }
+            (contents / "Info.plist").write_bytes(plistlib.dumps(plist))
+            executable = contents / "MacOS" / "LetterSmith"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"x" * 1_000_000)
+            executable.chmod(0o755)
+            (resources / "lettersmith.icns").write_bytes(b"icns" + b"x" * 100_000)
+
+            manifest = {
+                "product": {"version": "1.0.0"},
+                "macos": {
+                    "bundle_identifier": "works.infini.lettersmith",
+                    "executable": "LetterSmith",
+                    "minimum_system_version": "13.0",
+                },
+            }
+            with (
+                mock.patch.object(build_macos, "_validate_tool", return_value={}),
+                mock.patch.object(build_macos, "_validate_frozen_payload"),
+                mock.patch.object(build_macos, "_validate_bundle_sanitation", return_value=()),
+                mock.patch.object(build_macos, "_validate_bundle_macho_files", return_value=()),
+                mock.patch.object(build_macos, "_validate_private_text"),
+                mock.patch.object(build_macos, "_validate_private_binary_markers"),
+                mock.patch.object(build_macos, "_validate_bundle_signatures", return_value={}),
+                mock.patch.object(Path, "rglob", return_value=iter(())),
+            ):
+                with self.assertRaisesRegex(
+                    build_macos.MacOSReleaseError,
+                    "Qt WebEngine helper",
+                ):
+                    build_macos._validate_bundle(
+                        contents.parent,
+                        manifest,
+                        required_architectures={"arm64"},
+                        developer_identity="",
+                    )
 
     def test_macos_dmg_stages_app_at_volume_root(self) -> None:
         from release import build_macos
@@ -544,6 +634,7 @@ TeamIdentifier=ABCDE12345
                         "USERPROFILE": str(home),
                     },
                     home=home,
+                    platform_name="win32",
                 )
 
             self.assertEqual(paths.resource_root, bundle)

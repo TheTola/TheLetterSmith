@@ -21,6 +21,7 @@ _SOUND_DIRECTORY = Path("sounds") / "App sounds"
 class UiSound(str, Enum):
     ADDED = "added"
     BROKEN = "broken"
+    OPENED = "opened"
     REMOVED = "removed"
     SAVED = "saved"
     GITHUB_CONNECTED = "github_connected"
@@ -32,6 +33,7 @@ class UiSound(str, Enum):
 SOUND_FILES = {
     UiSound.ADDED: "Chime.mp3",
     UiSound.BROKEN: "Ching.mp3",
+    UiSound.OPENED: "Open.mp3",
     UiSound.REMOVED: "Bounc.mp3",
     UiSound.SAVED: "Save.mp3",
     UiSound.GITHUB_CONNECTED: "connect.mp3",
@@ -226,6 +228,10 @@ class UiSoundPlayer(QtCore.QObject):
         watched: QtCore.QObject,
         event: QtCore.QEvent,
     ) -> bool:
+        if event.type() == QtCore.QEvent.Type.Show:
+            if self._is_open_sound_window(watched):
+                self.play(UiSound.OPENED)
+            return False
         if event.type() != QtCore.QEvent.Type.MouseButtonPress:
             return False
         if not isinstance(event, QtGui.QMouseEvent):
@@ -237,6 +243,22 @@ class UiSoundPlayer(QtCore.QObject):
         if button is not None and self._is_broken(button):
             self.play(UiSound.BROKEN)
         return False
+
+    @staticmethod
+    def _is_open_sound_window(watched: QtCore.QObject) -> bool:
+        if not isinstance(watched, QtWidgets.QWidget) or not watched.isWindow():
+            return False
+        if watched.objectName() == "NexusWindow":
+            return False
+        if isinstance(
+            watched,
+            (
+                QtWidgets.QMenu,
+                QtWidgets.QSplashScreen,
+            ),
+        ):
+            return False
+        return watched.windowType() != QtCore.Qt.WindowType.ToolTip
 
     @staticmethod
     def _button_at_event(

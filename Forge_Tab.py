@@ -1366,6 +1366,7 @@ class ForgeTab(QtWidgets.QWidget):
             True,
         )
         self.readiness_btn.set_preserve_visual_when_disabled(True)
+        self.readiness_btn.set_text_word_wrap(True)
         set_control_help(
             self.readiness_btn,
             "Review missing or optional letter items before previewing or publishing.",
@@ -2165,6 +2166,13 @@ class ForgeTab(QtWidgets.QWidget):
             else "GitHub Account — not connected"
         )
         self.github_account_dialog.set_connection(snapshot)
+        if hasattr(self, "readiness_summary"):
+            self._update_readiness_summary(
+                self._readiness_result,
+                sign_in_warning=sign_in_warning,
+            )
+            self._update_review_button_state(self._readiness_result)
+            self._sync_heading_balance()
         if hasattr(self, "publish_btn"):
             self._update_letter_action_button_states()
 
@@ -2643,12 +2651,20 @@ class ForgeTab(QtWidgets.QWidget):
                 "Readiness does not apply to Stock or Example Letters."
             )
             return
+        result = self.refresh_readiness()
+        if (
+            result.completion_percentage >= 100
+            and self._github_sign_in_warning_active()
+        ):
+            self._readiness_requested = False
+            self.readiness_window.hide()
+            self.show_github_account()
+            return
         if self.readiness_window.isVisible():
             self._readiness_requested = False
             self.readiness_window.hide()
             return
         self._readiness_requested = True
-        result = self.refresh_readiness()
         if result.completion_percentage >= 100:
             self._readiness_requested = False
             self.readiness_window.hide()
@@ -2697,14 +2713,7 @@ class ForgeTab(QtWidgets.QWidget):
             self._sync_heading_balance()
             self._update_letter_action_button_states(result)
             return result
-        colors = getattr(self, "_theme_tokens", CYBER_FORGE_THEME.tokens)
-        color = colors.success if result.status != "Not Ready" else colors.error
-        self.readiness_summary.setText(
-            f"{result.completion_percentage}%  {result.status}"
-        )
-        self.readiness_summary.setStyleSheet(
-            f"color:{color};font:700 10pt 'Segoe UI';"
-        )
+        self._update_readiness_summary(result)
         if result.completion_percentage >= 100:
             self._readiness_requested = False
             self.readiness_window.hide()
@@ -2712,22 +2721,80 @@ class ForgeTab(QtWidgets.QWidget):
         self._update_letter_action_button_states(result)
         return result
 
+    def _github_sign_in_warning_active(self) -> bool:
+        return bool(
+            self._github_snapshot.state == GitHubConnectionState.DISCONNECTED
+            and github_application_configuration().configured
+            and not self._github_account_checking
+        )
+
+    def _update_readiness_summary(
+        self,
+        result: ReadinessResult,
+        *,
+        sign_in_warning: bool | None = None,
+    ) -> None:
+        if self.is_protected_project():
+            self.readiness_summary.clear()
+            self.readiness_summary.setToolTip("")
+            self.readiness_summary.setProperty("githubSignInWarning", False)
+            return
+        if sign_in_warning is None:
+            sign_in_warning = self._github_sign_in_warning_active()
+        self.readiness_summary.setProperty(
+            "githubSignInWarning",
+            sign_in_warning,
+        )
+        if sign_in_warning:
+            self.readiness_summary.setText("Sign in to GitHub to publish")
+            self.readiness_summary.setToolTip(
+                "Sign in to GitHub before publishing this letter."
+            )
+            self.readiness_summary.setStyleSheet(
+                f"color:{_GITHUB_WARNING_TEXT};"
+                f"background:{_GITHUB_WARNING_BACKGROUND};"
+                f"border:1px solid {_GITHUB_WARNING_BORDER};"
+                "border-radius:8px;padding:4px 9px;"
+                "font:700 9pt 'Segoe UI';"
+            )
+            return
+        colors = getattr(self, "_theme_tokens", CYBER_FORGE_THEME.tokens)
+        color = colors.success if result.status != "Not Ready" else colors.error
+        self.readiness_summary.setText(
+            f"{result.completion_percentage}%  {result.status}"
+        )
+        self.readiness_summary.setToolTip("")
+        self.readiness_summary.setStyleSheet(
+            f"color:{color};background:transparent;border:none;"
+            "padding:0;font:700 10pt 'Segoe UI';"
+        )
+
     def _update_review_button_state(self, result: ReadinessResult) -> None:
-        complete = bool(
+        locally_complete = bool(
             not self.is_protected_project()
             and result.completion_percentage >= 100
         )
+        sign_in_required = bool(
+            locally_complete and self._github_sign_in_warning_active()
+        )
+        complete = locally_complete and not sign_in_required
         changed = complete != self._review_complete
         self._review_complete = complete
-        self.readiness_btn.setAccessibleName(
-            "Project readiness complete" if complete else "Review project readiness"
-        )
-        set_control_help(
-            self.readiness_btn,
-            "Every readiness item is complete."
-            if complete
-            else "Review missing or optional letter items before previewing or publishing.",
-        )
+        if sign_in_required:
+            self.readiness_btn.set_presentation_artwork(None, animate=changed)
+            self.readiness_btn.setText("Sign in to publish")
+            apply_button_tier(
+                self.readiness_btn,
+                ButtonTier.SMALL,
+                bold=True,
+            )
+            set_control_help(
+                self.readiness_btn,
+                "Sign in to GitHub before publishing this letter.",
+                accessible_name="Sign in to GitHub to publish",
+            )
+            self.readiness_btn.setEnabled(True)
+            return
         self.readiness_btn.set_presentation_artwork(
             "git/CompButton.png" if complete else "git/ReviewButton.png",
             animate=changed,
@@ -2739,6 +2806,22 @@ class ForgeTab(QtWidgets.QWidget):
             else "Complete"
             if complete
             else "Review"
+        )
+        apply_button_tier(
+            self.readiness_btn,
+            ButtonTier.SMALL,
+            bold=True,
+        )
+        set_control_help(
+            self.readiness_btn,
+            "Every readiness item is complete."
+            if complete
+            else "Review missing or optional letter items before previewing or publishing.",
+            accessible_name=(
+                "Project readiness complete"
+                if complete
+                else "Review project readiness"
+            ),
         )
         self.readiness_btn.setEnabled(not complete)
 

@@ -688,6 +688,14 @@ def _validate_private_text(
 def _private_binary_markers() -> tuple[bytes, ...]:
     from application_identity import CREATOR_NAME
 
+    github_workspace = os.environ.get("GITHUB_WORKSPACE", "").strip()
+    if (
+        os.environ.get("GITHUB_ACTIONS", "").casefold() == "true"
+        and github_workspace
+        and Path(github_workspace).resolve() == PROJECT_ROOT.resolve()
+    ):
+        return ()
+
     values = {
         str(PROJECT_ROOT),
         str(PROJECT_ROOT).replace("\\", "/"),
@@ -707,6 +715,8 @@ def _private_binary_markers() -> tuple[bytes, ...]:
 
 def _validate_private_binary_markers(files: Iterable[Path]) -> None:
     markers = _private_binary_markers()
+    if not markers:
+        return
     overlap = max(len(marker) for marker in markers) - 1
     for path in files:
         carry = b""

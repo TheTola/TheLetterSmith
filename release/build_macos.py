@@ -370,7 +370,10 @@ def _validate_bundle_macho_files(
     binaries = tuple(
         path
         for path in contents.rglob("*")
-        if path.is_file() and not path.is_symlink() and _is_macho_binary(path)
+        if path.is_file()
+        and not path.is_symlink()
+        and path.suffix.casefold() != ".a"
+        and _is_macho_binary(path)
     )
     if not binaries:
         raise MacOSReleaseError("The macOS app contains no Mach-O binaries.")
@@ -419,7 +422,7 @@ def validate_macos_configuration(
         "executable": MACOS_EXECUTABLE_NAME,
         "bundle_identifier": MACOS_BUNDLE_IDENTIFIER,
         "dmg_name": MACOS_DISK_IMAGE_NAME,
-        "minimum_system_version": "13.0",
+        "minimum_system_version": "15.0",
     }
     for key, value in expected.items():
         if macos.get(key) != value:
@@ -555,7 +558,7 @@ def _validate_developer_id_identity(identity: str) -> None:
 
 def _is_approved_resource_path(relative: Path) -> bool:
     parts = tuple(part.casefold() for part in relative.parts)
-    return any(
+    return parts[:2] == ("resources", "resources") or any(
         parts[index : index + 2] == ("_internal", "resources")
         for index in range(max(0, len(parts) - 1))
     )
@@ -743,13 +746,36 @@ def _validate_bundle(
     executable = contents / "MacOS" / macos["executable"]
     frameworks = contents / "Frameworks"
     resources = contents / "Resources"
-    framework_internal = frameworks / "_internal"
-    resource_internal = resources / "_internal"
     if not executable.is_file() or executable.stat().st_size < 1_000_000:
         raise MacOSReleaseError("The macOS application executable is incomplete.")
     if not os.access(executable, os.X_OK):
         raise MacOSReleaseError("The macOS application executable is not executable.")
-    if not framework_internal.is_dir() or not resource_internal.is_dir():
+
+    resource_markers = (
+        "resources/stock/stock_manifest.json",
+        "resources/examples/example_letter/lettersmith-metadata.json",
+        "gallery/app/icons/folder/lsmith.png",
+        "tools/FFmpeg-PROVENANCE.txt",
+    )
+    resource_internal = next(
+        (
+            root
+            for root in (resources / "_internal", resources)
+            if root.is_dir()
+            and all((root / relative).is_file() for relative in resource_markers)
+        ),
+        None,
+    )
+    framework_internal = next(
+        (
+            root
+            for root in (frameworks / "_internal", frameworks)
+            if root.is_dir()
+            and all((root / "tools" / name).is_file() for name in ("ffmpeg", "ffprobe"))
+        ),
+        None,
+    )
+    if resource_internal is None or framework_internal is None:
         raise MacOSReleaseError(
             "The macOS Frameworks/Resources payload layout is incomplete."
         )
@@ -772,14 +798,6 @@ def _validate_bundle(
         except (OSError, ValueError) as error:
             raise MacOSReleaseError(f"Unsafe macOS bundle link: {path}") from error
 
-    for relative in (
-        "resources/stock/stock_manifest.json",
-        "resources/examples/example_letter/lettersmith-metadata.json",
-        "gallery/app/icons/folder/lsmith.png",
-        "tools/FFmpeg-PROVENANCE.txt",
-    ):
-        if not (resource_internal / relative).is_file():
-            raise MacOSReleaseError(f"The macOS app is missing {relative}.")
     packaged_tools: list[dict[str, str]] = []
     for name in ("ffmpeg", "ffprobe"):
         path = framework_internal / "tools" / name

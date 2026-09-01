@@ -38,8 +38,18 @@ class HoverTabSwitchTests(unittest.TestCase):
         self.app.processEvents()
 
     def _hover(self, index: int) -> None:
-        QtTest.QTest.mouseMove(self.tabbar, self.tabbar.tabRect(index).center())
-        QtTest.QTest.qWait(60)
+        center = self.tabbar.tabRect(index).center()
+        QtTest.QTest.mouseMove(self.tabbar, center)
+        self.app.processEvents()
+        self.hover_filter._schedule(index)
+        if self.hover_filter._timer.isActive():
+            self.hover_filter._timer.stop()
+            with mock.patch.object(
+                QtGui.QCursor,
+                "pos",
+                return_value=self.tabbar.mapToGlobal(center),
+            ):
+                self.hover_filter._activate_pending_tab()
 
     def test_command_never_activates_from_hover(self) -> None:
         self.tabbar.setCurrentIndex(0)

@@ -59,7 +59,8 @@ class CommandHoldInteractionTests(unittest.TestCase):
             QtCore.Qt.LeftButton,
             pos=button.rect().center(),
         )
-        QtTest.QTest.qWait(70)
+        button._scale_anim.setCurrentTime(70)
+        self.app.processEvents()
 
         self.assertTrue(button._holding)
         self.assertTrue(button._use_gray)
@@ -80,7 +81,8 @@ class CommandHoldInteractionTests(unittest.TestCase):
             QtCore.Qt.LeftButton,
             pos=button.rect().center(),
         )
-        QtTest.QTest.qWait(220)
+        button._scale_anim.setCurrentTime(button._scale_anim.duration())
+        self.app.processEvents()
 
         self.assertEqual(activations, [])
         self.assertFalse(button._holding)
@@ -99,9 +101,10 @@ class CommandHoldInteractionTests(unittest.TestCase):
             QtCore.Qt.LeftButton,
             pos=button.rect().center(),
         )
-        QtTest.QTest.qWait(80)
+        button._scale_anim.setCurrentTime(80)
         shrinking_scale = button._scale
-        QtTest.QTest.qWait(60)
+        button._hold_timer.stop()
+        button._complete_hold()
 
         self.assertLess(shrinking_scale, 1.0)
         self.assertFalse(button._holding)
@@ -111,7 +114,8 @@ class CommandHoldInteractionTests(unittest.TestCase):
             QtCore.QAbstractAnimation.Running,
         )
 
-        QtTest.QTest.qWait(100)
+        button._burst_anim.setCurrentTime(button.BURST_DURATION_MS)
+        self.app.processEvents()
         QtTest.QTest.mouseRelease(
             button,
             QtCore.Qt.LeftButton,
@@ -136,13 +140,16 @@ class CommandHoldInteractionTests(unittest.TestCase):
             QtCore.Qt.LeftButton,
             pos=button.rect().center(),
         )
-        QtTest.QTest.qWait(230)
+        button._countdown_timer.stop()
+        button._advance_countdown()
+        button._advance_countdown()
 
         self.assertEqual(blips, [True, True])
         self.assertEqual(button._countdown_label.text(), "1")
         self.assertTrue(button._countdown_label.isVisible())
 
-        QtTest.QTest.qWait(100)
+        button._hold_timer.stop()
+        button._complete_hold()
         self.assertEqual(blips, [True, True, True])
         self.assertFalse(button._countdown_label.isVisible())
 
@@ -241,9 +248,10 @@ class CommandHoldInteractionTests(unittest.TestCase):
         notice._fade_animation.setDuration(80)
         notice._fade_timer.setInterval(10)
         notice._dismiss_timer.setInterval(200)
-        notice._fade_timer.start()
-        notice._dismiss_timer.start()
-        QtTest.QTest.qWait(50)
+        notice._fade_timer.stop()
+        notice._dismiss_timer.stop()
+        notice._begin_fade()
+        notice._fade_animation.setCurrentTime(40)
         self.assertTrue(notice.isVisible())
         self.assertLess(notice._opacity_effect.opacity(), 1.0)
         self.assertGreater(notice._opacity_effect.opacity(), 0.0)
@@ -258,7 +266,13 @@ class CommandHoldInteractionTests(unittest.TestCase):
         tab.hide()
         tab.show()
         self.app.processEvents()
-        QtTest.QTest.qWait(110)
+        notice._fade_timer.stop()
+        notice._dismiss_timer.stop()
+        notice._begin_fade()
+        notice._fade_animation.setCurrentTime(
+            notice._fade_animation.duration()
+        )
+        self.app.processEvents()
         self.assertFalse(notice.isVisible())
         tab.close()
 

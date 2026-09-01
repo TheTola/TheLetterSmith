@@ -27,6 +27,11 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
+if sys.argv[1:2] == ["--lettersmith-message-import-worker"]:
+    from message_import import run_worker as _run_message_import_worker
+
+    raise SystemExit(_run_message_import_worker(sys.argv[2:]))
+
 from PySide6 import QtCore, QtGui, QtWidgets
 from application_identity import (
     APPLICATION_NAME,
@@ -641,11 +646,6 @@ def main() -> None:
     """
     Launch Letter Smith.
     """
-    if sys.argv[1:2] == ["--lettersmith-message-import-worker"]:
-        from message_import import run_worker
-
-        raise SystemExit(run_worker(sys.argv[2:]))
-
     resource_root = resolve_project_root()
     paths = configure_application_paths(
         ApplicationPaths.for_runtime(resource_root)
@@ -700,6 +700,10 @@ def main() -> None:
     application = bootstrap_qt(
         icon
     )
+
+    from ui_sounds import install_ui_sounds
+
+    install_ui_sounds(root)
 
     from beta_diagnostics import install_beta_diagnostics
 

@@ -24,6 +24,9 @@ Quarantine/
 *.bak_*
 editor_error.log
 editor_error.previous.log
+# Temporary audio-remux outputs
+*.lettersmith-xing.tmp.mp3
+/.tmp-switch-xing.mp3
 # Optional
 hide/
 # Generated user content

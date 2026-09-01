@@ -2942,6 +2942,7 @@ class ImageTab(
         self._show_temporary_status(
             "All images cleared."
         )
+        play_ui_sound(UiSound.REMOVED)
 
     def reset_project_images(self) -> None:
         """Refresh the empty image workspace after New Project commits."""

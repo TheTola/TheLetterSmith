@@ -17,7 +17,7 @@
     "executable": "LetterSmith",
     "bundle_identifier": "works.infini.lettersmith",
     "dmg_name": "LetterSmith-Beta-1.0.0.dmg",
-    "minimum_system_version": "13.0",
+    "minimum_system_version": "15.0",
     "icon": "gallery/app/icons/folder/lsmith.icns",
     "supported_architectures": [
       "arm64",
@@ -97,6 +97,7 @@
       "connect.mp3",
       "deconn.mp3",
       "error.mp3",
+      "Open.mp3",
       "Save.mp3",
       "Success.mp3",
       "Switch.mp3"

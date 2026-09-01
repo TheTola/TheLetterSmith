@@ -424,6 +424,30 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
             window.close()
 
     def test_forge_preview_is_unloaded_before_directory_replacement(self) -> None:
+        class PreviewView(QtWidgets.QWidget):
+            loadFinished = QtCore.Signal(bool)
+
+            def __init__(self) -> None:
+                super().__init__()
+                self._url = QtCore.QUrl()
+                self._page = mock.Mock()
+
+            def page(self):
+                return self._page
+
+            def setUrl(self, url: QtCore.QUrl) -> None:
+                self._url = QtCore.QUrl(url)
+                QtCore.QTimer.singleShot(
+                    0,
+                    lambda: self.loadFinished.emit(True),
+                )
+
+            def stop(self) -> None:
+                pass
+
+            def url(self) -> QtCore.QUrl:
+                return QtCore.QUrl(self._url)
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             preview = root / "preview"
@@ -435,6 +459,9 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
             )
             window = Nexus(root)
             window._initialize_project_tabs()
+            preview_view = PreviewView()
+            window.preview_stack.addWidget(preview_view)
+            window.html_preview = preview_view
             try:
                 preview_view = window._ensure_forge_preview()
                 loaded = False
@@ -514,7 +541,9 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                     "_anima_hover_tab_switch",
                 )
                 hover_switch._cancel()
-                QtTest.QTest.qWait(1050)
+                window._image_tab_readiness_hide_timer.stop()
+                window._hide_readiness_after_image_tab_hover()
+                self.app.processEvents()
 
                 self.assertEqual(window.tabbar.currentIndex(), 3)
                 self.assertFalse(window.forge_tab.readiness_window.isVisible())
@@ -536,8 +565,10 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             window = Nexus(temp_dir)
             window._initialize_project_tabs()
+            preview_view = QtWidgets.QWidget()
+            window.preview_stack.addWidget(preview_view)
+            window.html_preview = preview_view
             try:
-                preview_view = window._ensure_forge_preview()
                 window.resize(1200, 820)
                 window.application_stack.setCurrentWidget(window.body)
                 window.preview_stack.setCurrentWidget(preview_view)
@@ -560,6 +591,11 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 self.assertIs(preview_view.parentWidget(), window.preview_stack)
                 self.assertTrue(preview_view.isVisible())
             finally:
+                window._restore_forge_preview_from_fullscreen()
+                window.preview_stack.removeWidget(preview_view)
+                preview_view.setParent(None)
+                preview_view.deleteLater()
+                window.html_preview = None
                 window.shutdown()
                 window.close()
                 self.app.processEvents()

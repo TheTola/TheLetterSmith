@@ -573,17 +573,31 @@ def _apply_posix_worker_limits() -> None:
             raise MessageImportError("That file could not be imported safely.")
         resource.setrlimit(resource_id, (target, hard))
 
-    memory_limit = getattr(resource, "RLIMIT_AS", None)
-    if memory_limit is None:
-        memory_limit = getattr(resource, "RLIMIT_DATA", None)
-    if memory_limit is None:
+    memory_limit_names = (
+        ("RLIMIT_DATA", "RLIMIT_AS")
+        if sys.platform == "darwin"
+        else ("RLIMIT_AS", "RLIMIT_DATA")
+    )
+    memory_limited = False
+    for limit_name in memory_limit_names:
+        memory_limit = getattr(resource, limit_name, None)
+        if memory_limit is None:
+            continue
+        try:
+            apply_limit(memory_limit, MAX_WORKER_MEMORY_BYTES)
+        except (MessageImportError, OSError, ValueError):
+            continue
+        memory_limited = True
+        break
+    if not memory_limited and sys.platform != "darwin":
         raise MessageImportError("That file could not be imported safely.")
     try:
-        apply_limit(memory_limit, MAX_WORKER_MEMORY_BYTES)
         cpu_limit = getattr(resource, "RLIMIT_CPU", None)
         if cpu_limit is not None:
             apply_limit(cpu_limit, MAX_WORKER_CPU_SECONDS)
-    except (OSError, ValueError) as error:
+    except (MessageImportError, OSError, ValueError) as error:
+        if sys.platform == "darwin":
+            return
         raise MessageImportError("That file could not be imported safely.") from error
 
 

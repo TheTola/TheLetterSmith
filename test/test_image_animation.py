@@ -27,6 +27,7 @@ from Image_tab import (
     ImageSettingsDialog,
     ImageTab,
     StockImageDialog,
+    _PreparedImageImportResult,
     _ImageThumbnail,
     _ResetImagesConfirmationDialog,
 )
@@ -47,6 +48,7 @@ from portable_export import create_single_html
 from Message_tab import MessageTab
 from project_state import ProjectStateController
 from settings_store import SettingsStore
+from ui_sounds import UiSound
 from ui_theme import BUTTON_TIER_STYLES, THEMES, ButtonTier, ThemeService
 
 
@@ -854,6 +856,30 @@ class ImageAnimationTests(unittest.TestCase):
             ImageTab.reset_images(tab)
             tab._reset_images_confirmed.assert_called_once_with()
 
+    def test_confirmed_reset_uses_the_clear_image_sound_once(self) -> None:
+        card = SimpleNamespace(
+            release_asset_handle=mock.Mock(),
+            clear_pixmap=mock.Mock(),
+        )
+        tab = SimpleNamespace(
+            labels={1: ("Cover Page", "cover.png")},
+            cards={1: card},
+            image_paths={1: "cover.png"},
+            project_state=SimpleNamespace(is_project_ready=False),
+            _user_pages_dir=mock.Mock(return_value="pages"),
+            clear_preview=SimpleNamespace(emit=mock.Mock()),
+            _commit_image_change=mock.Mock(),
+            _show_temporary_status=mock.Mock(),
+        )
+
+        with (
+            mock.patch("Image_tab.clear_slot_asset"),
+            mock.patch("Image_tab.play_ui_sound") as play_sound,
+        ):
+            ImageTab._reset_images_confirmed(tab)
+
+        play_sound.assert_called_once_with(UiSound.REMOVED)
+
     def test_image_utility_buttons_preserve_artwork_and_do_not_overlap_cards(self) -> None:
         expected_size = BUTTON_TIER_STYLES[ButtonTier.LARGE].size
 
@@ -1029,38 +1055,47 @@ class ImageTabPerformanceTests(unittest.TestCase):
                 "Amanda Miller",
                 custom_capitalization=True,
             )
-            source = root / "replacement.png"
-            Image.new("RGBA", (128, 128), "green").save(source, format="PNG")
             tab = ImageTab(root, project_state=state)
-            started = threading.Event()
-            release = threading.Event()
-
-            def delayed_prepare(*args, **kwargs):
-                started.set()
-                if not release.wait(5):
-                    raise RuntimeError("Test image import did not resume.")
-                return prepare_image_asset_import(*args, **kwargs)
+            generation = tab._image_import_generation
+            worker = mock.Mock()
+            worker_thread = mock.Mock()
+            worker_thread.isRunning.return_value = True
+            worker_thread.wait.return_value = False
+            tab._image_import_thread = worker_thread
+            tab._image_import_worker = worker
+            tab._image_import_result_holder = {}
+            tab._image_import_index = 1
 
             try:
-                with mock.patch(
-                    "Image_tab.prepare_image_asset_import",
-                    side_effect=delayed_prepare,
-                ):
-                    tab.set_image_path(1, str(source))
-                    self.assertTrue(started.wait(2))
-                    worker_thread = tab._image_import_thread
-                    with self.assertRaises(RuntimeError):
-                        tab.prepare_for_project_restore(timeout_ms=10)
-                    release.set()
-                    self.assertIsNotNone(worker_thread)
-                    self.assertTrue(worker_thread.wait(5000))
-                    self.app.processEvents()
+                with self.assertRaises(RuntimeError):
+                    tab.prepare_for_project_restore(timeout_ms=10)
+                worker.cancel.assert_called_once_with()
+                worker_thread.requestInterruption.assert_called_once_with()
+                worker_thread.wait.assert_called_once_with(10)
+                worker_thread.setParent.assert_called_once_with(None)
+                self.assertEqual(tab._image_import_generation, generation + 1)
+                self.assertIsNone(tab._image_import_thread)
+
+                prepared = mock.Mock()
+                result = _PreparedImageImportResult(
+                    generation=generation,
+                    index=1,
+                    project_identity=("recipient", "project"),
+                    baseline_fingerprint="baseline",
+                    project_pages_directory=None,
+                    prepared=prepared,
+                    preview_image=QtGui.QImage(),
+                )
+                holder = {"result": result}
+                tab._image_import_result_holder = holder
+                tab._image_import_prepared(result)
+                prepared.abort.assert_called_once_with()
+                self.assertNotIn("result", holder)
 
                 self.assertFalse(
                     (root / "gallery/user/pages/cover.png").exists()
                 )
             finally:
-                release.set()
                 tab.shutdown()
                 tab.close()
                 state.shutdown()

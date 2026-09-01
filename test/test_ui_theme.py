@@ -1447,7 +1447,10 @@ class ThemeServiceTests(unittest.TestCase):
             QtCore.Qt.LeftButton,
             pos=selector.male_button.rect().center(),
         )
-        QtTest.QTest.qWait(120)
+        selector.male_button._press_animation.setCurrentTime(
+            selector.male_button._press_animation.duration()
+        )
+        self.app.processEvents()
         self.assertEqual(selector.selected_family, "")
         self.assertEqual(selector.male_button.iconSize(), QtCore.QSize(450, 450))
         QtTest.QTest.mouseRelease(
@@ -1455,7 +1458,10 @@ class ThemeServiceTests(unittest.TestCase):
             QtCore.Qt.LeftButton,
             pos=QtCore.QPoint(-10, -10),
         )
-        QtTest.QTest.qWait(160)
+        selector.male_button._restore_animation.setCurrentTime(
+            selector.male_button._restore_animation.duration()
+        )
+        self.app.processEvents()
         self.assertEqual(selector.selected_family, "")
         self.assertEqual(selector.male_button.iconSize(), QtCore.QSize(500, 500))
 

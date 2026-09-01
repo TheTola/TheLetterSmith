@@ -7,7 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
@@ -227,7 +227,8 @@ def validate_installer_configuration() -> dict[str, str]:
                 f"Installer actions must not target writable user data: {value}"
             )
 
-    icon_path = (RELEASE_ROOT / _directive(text, "SetupIconFile")).resolve()
+    icon_directive = PureWindowsPath(_directive(text, "SetupIconFile"))
+    icon_path = RELEASE_ROOT.joinpath(*icon_directive.parts).resolve()
     expected_icon = (
         PROJECT_ROOT / "gallery" / "app" / "icons" / "folder" / "lsmith.ico"
     ).resolve()

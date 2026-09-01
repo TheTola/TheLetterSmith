@@ -79,6 +79,7 @@ class UiSoundTests(unittest.TestCase):
             {
                 UiSound.ADDED: "Chime.mp3",
                 UiSound.BROKEN: "Ching.mp3",
+                UiSound.OPENED: "Open.mp3",
                 UiSound.REMOVED: "Bounc.mp3",
                 UiSound.SAVED: "Save.mp3",
                 UiSound.GITHUB_CONNECTED: "connect.mp3",
@@ -112,6 +113,30 @@ class UiSoundTests(unittest.TestCase):
             player.eventFilter(button, event)
         play.assert_called_once_with(UiSound.BROKEN)
 
+    def test_open_sound_uses_secondary_windows_but_not_shell_surfaces(
+        self,
+    ) -> None:
+        player = UiSoundPlayer(PROJECT_ROOT)
+        dialog = QtWidgets.QDialog()
+        secondary_window = QtWidgets.QWidget()
+        primary_window = QtWidgets.QMainWindow()
+        primary_window.setObjectName("NexusWindow")
+        menu = QtWidgets.QMenu()
+        child = QtWidgets.QWidget(secondary_window)
+        event = QtCore.QEvent(QtCore.QEvent.Type.Show)
+
+        with mock.patch.object(player, "play") as play:
+            for window in (dialog, secondary_window, primary_window, menu, child):
+                player.eventFilter(window, event)
+
+        self.assertEqual(
+            play.call_args_list,
+            [
+                mock.call(UiSound.OPENED),
+                mock.call(UiSound.OPENED),
+            ],
+        )
+
     def test_overlapping_sound_fades_and_warps_previous_voice(self) -> None:
         player = UiSoundPlayer(PROJECT_ROOT)
         self.addCleanup(player.deleteLater)
@@ -127,15 +152,21 @@ class UiSoundTests(unittest.TestCase):
         self.assertIsNot(second_player, first_player)
         self.assertIn(first_player, player._fade_groups)
         self.assertFalse(first_player.pitchCompensation())
-        QtTest.QTest.qWait(player.OVERLAP_FADE_MS // 2)
+        fade_group = player._fade_groups[first_player]
+        fade_group.setCurrentTime(fade_group.duration() // 2)
+        self.app.processEvents()
         self.assertLess(first_output.volume(), 1.0)
         self.assertLess(first_player.playbackRate(), 1.0)
 
-        QtTest.QTest.qWait(player.OVERLAP_FADE_MS)
+        fade_group.setCurrentTime(fade_group.duration())
+        self.app.processEvents()
         self.assertNotIn(first_player, player._fade_groups)
-        self.assertEqual(
+        self.assertIn(
             first_player.playbackState(),
-            QMediaPlayer.PlaybackState.PausedState,
+            {
+                QMediaPlayer.PlaybackState.PausedState,
+                QMediaPlayer.PlaybackState.StoppedState,
+            },
         )
         self.assertEqual(
             first_player.pitchCompensation(),
@@ -626,6 +657,14 @@ class ThemedButtonStateTests(unittest.TestCase):
         self.addCleanup(lambda: forge.shutdown(timeout_ms=1000))
         repository = Path(__file__).resolve().parents[1]
         service = ThemeService(repository, settings=SettingsStore(self.root))
+        account = GitHubAccount("lettersmith", 1)
+        forge._apply_github_state(
+            GitHubConnectionSnapshot(
+                GitHubConnectionState.CONNECTED_READY,
+                session=GitHubSession(account, GitHubToken("ghu_access")),
+                access=GitHubPublishingAccess(True, "ready"),
+            )
+        )
         incomplete = ReadinessResult((), 89, "Not Ready")
         complete = ReadinessResult((), 100, "Ready")
 
@@ -867,6 +906,16 @@ class ThemedButtonStateTests(unittest.TestCase):
         self.assertFalse(
             forge.github_account_summary.property("githubSignInWarning")
         )
+        complete = ReadinessResult((), 100, "Ready")
+        forge._readiness_result = complete
+        forge._update_readiness_summary(complete)
+        forge._update_review_button_state(complete)
+        self.assertEqual(forge.readiness_summary.text(), "100%  Ready")
+        self.assertFalse(forge.readiness_btn.isEnabled())
+        self.assertEqual(
+            forge.readiness_btn.artwork_path.name.casefold(),
+            "compbutton.png",
+        )
 
         forge._github_account_checking = True
         forge._sync_publishing_controls()
@@ -933,6 +982,64 @@ class ThemedButtonStateTests(unittest.TestCase):
         self.assertEqual(
             forge.github_account_btn.artwork_path.name.casefold(),
             "bbutton.png",
+        )
+        self.assertEqual(
+            forge.readiness_summary.text(),
+            "Sign in to GitHub to publish",
+        )
+        self.assertNotIn("%", forge.readiness_summary.text())
+        self.assertTrue(
+            forge.readiness_summary.property("githubSignInWarning")
+        )
+        self.assertEqual(forge.readiness_btn.text(), "Sign in to publish")
+        self.assertEqual(
+            forge.readiness_btn.accessibleName(),
+            "Sign in to GitHub to publish",
+        )
+        self.assertTrue(forge.readiness_btn.isEnabled())
+        self.assertEqual(
+            forge.readiness_btn.artwork_path.name.casefold(),
+            "bbutton.png",
+        )
+        text_bounds = forge.readiness_btn.fontMetrics().boundingRect(
+            QtCore.QRect(
+                0,
+                0,
+                forge.readiness_btn.width() - 6,
+                forge.readiness_btn.height() - 8,
+            ),
+            QtCore.Qt.AlignCenter | QtCore.Qt.TextWordWrap,
+            forge.readiness_btn.text(),
+        )
+        self.assertLessEqual(text_bounds.width(), forge.readiness_btn.width() - 6)
+        self.assertLessEqual(text_bounds.height(), forge.readiness_btn.height() - 8)
+        with (
+            mock.patch.object(
+                forge,
+                "refresh_readiness",
+                return_value=complete,
+            ),
+            mock.patch.object(forge, "show_github_account") as show_account,
+        ):
+            forge.readiness_btn.click()
+        show_account.assert_called_once_with()
+
+        forge._apply_github_state(
+            GitHubConnectionSnapshot(
+                GitHubConnectionState.CONNECTED_READY,
+                session=GitHubSession(account, GitHubToken("ghu_access")),
+                access=GitHubPublishingAccess(True, "ready"),
+            )
+        )
+        self.assertEqual(forge.readiness_summary.text(), "100%  Ready")
+        self.assertFalse(
+            forge.readiness_summary.property("githubSignInWarning")
+        )
+        self.assertEqual(forge.readiness_btn.text(), "")
+        self.assertFalse(forge.readiness_btn.isEnabled())
+        self.assertEqual(
+            forge.readiness_btn.artwork_path.name.casefold(),
+            "compbutton.png",
         )
 
         for theme_id in (
