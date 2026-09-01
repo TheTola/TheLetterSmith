@@ -1455,6 +1455,15 @@ class SavedLetterRestorer:
         sound_archive_snapshot = _SoundArchiveSnapshot.capture(
             self.project_root
         )
+        message_assets_source = (
+            message_assets
+            if message_assets is not None
+            and any(
+                is_link_or_reparse_point(path) or not path.is_dir()
+                for path in message_assets.rglob("*")
+            )
+            else None
+        )
 
         try:
             copy_directory_tree_no_links(pages, pages_tx.prepare())
@@ -1462,16 +1471,20 @@ class SavedLetterRestorer:
             copy_directory_tree_no_links(message, message_staging)
             _sanitize_staged_message_tree(message_staging)
             message_assets_staging = message_assets_tx.prepare()
-            if message_assets is None:
-                message_assets_staging.mkdir(parents=True)
-            else:
+            if message_assets_source is not None:
                 copy_directory_tree_no_links(
-                    message_assets,
+                    message_assets_source,
                     message_assets_staging,
                 )
 
             for transaction in transactions:
-                transaction.commit(keep_backup=True)
+                transaction.commit(
+                    replace=(
+                        transaction is not message_assets_tx
+                        or message_assets_source is not None
+                    ),
+                    keep_backup=True,
+                )
                 committed.append(transaction)
 
             imported_ids: list[str] = []

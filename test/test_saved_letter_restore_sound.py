@@ -236,6 +236,37 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             self.assertNotIn("onclick", restored_message)
             self.assertNotIn("<script", restored_message)
 
+    def test_restore_without_message_assets_removes_the_active_asset_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            (bundle / MESSAGE_ASSETS_DIR).mkdir(parents=True)
+            active_assets = root / MESSAGE_ASSETS_DIR
+            active_assets.mkdir(parents=True)
+            (active_assets / "old.png").write_bytes(b"old asset")
+
+            self._restore(root, bundle)
+
+            self.assertFalse(active_assets.exists())
+
+    def test_failed_restore_without_message_assets_restores_active_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            active_asset = root / MESSAGE_ASSETS_DIR / "current.png"
+            active_asset.parent.mkdir(parents=True)
+            active_asset.write_bytes(b"current asset")
+            restorer = SavedLetterRestorer(root)
+            restorer._verify_committed_state = lambda: (_ for _ in ()).throw(
+                RuntimeError("injected")
+            )
+            entry = SavedLetterCatalog(root).list_entries()[0]
+
+            with self.assertRaises(SavedLetterRestoreError):
+                restorer.restore(entry)
+
+            self.assertEqual(active_asset.read_bytes(), b"current asset")
+
     def test_restore_rejects_nested_directory_links_and_preserves_active_message(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

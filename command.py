@@ -370,7 +370,6 @@ def _reset_active_paths(
     directory_targets = [
         (root / USER_PAGES_DIR).resolve(),
         (root / USER_MESSAGE_DIR).resolve(),
-        (root / MESSAGE_ASSETS_DIR).resolve(),
     ]
     saved_catalog: object | None = None
     saved_project_paths: tuple[Path, ...] = ()
@@ -381,6 +380,7 @@ def _reset_active_paths(
         )
 
     deletion_targets = [
+        (root / MESSAGE_ASSETS_DIR).resolve(),
         current_music_path(root).resolve(),
         (root / "gallery" / "sounds" / MUSIC_FILE).resolve(),
         current_manifest_path(root).resolve(),

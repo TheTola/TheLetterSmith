@@ -277,10 +277,13 @@ class CommandInteractionTests(unittest.TestCase):
         root = Path(self.temp_dir.name) / "new-project"
         active_page = root / "gallery" / "user" / "pages" / "cover.png"
         active_message = root / "gallery" / "user" / "message" / "message.html"
+        active_message_asset = root / "gallery" / "message_assets" / "old.png"
         active_page.parent.mkdir(parents=True)
         active_message.parent.mkdir(parents=True)
+        active_message_asset.parent.mkdir(parents=True)
         active_page.write_bytes(b"active page")
         active_message.write_text("<p>active message</p>", encoding="utf-8")
+        active_message_asset.write_bytes(b"old asset")
         prompt_state = root / "prompt_writer_state.json"
         prompt_state.write_text(
             json.dumps(
@@ -363,6 +366,7 @@ class CommandInteractionTests(unittest.TestCase):
 
         self.assertFalse(active_page.exists())
         self.assertFalse(active_message.exists())
+        self.assertFalse(active_message_asset.parent.exists())
         self.assertEqual(list(active_page.parent.iterdir()), [])
         self.assertEqual(list(active_message.parent.iterdir()), [])
         self.assertFalse(autosave.exists())
@@ -540,10 +544,13 @@ class CommandInteractionTests(unittest.TestCase):
         root = Path(self.temp_dir.name) / "new-project-rollback"
         page = root / "gallery" / "user" / "pages" / "cover.png"
         message = root / "gallery" / "user" / "message" / "message.html"
+        message_asset = root / "gallery" / "message_assets" / "current.png"
         page.parent.mkdir(parents=True)
         message.parent.mkdir(parents=True)
+        message_asset.parent.mkdir(parents=True)
         page.write_bytes(b"cover before failure")
         message.write_text("<p>message before failure</p>", encoding="utf-8")
+        message_asset.write_bytes(b"asset before failure")
         prompt = root / "prompt_writer_state.json"
         prompt.write_text(
             json.dumps({"subject": "preserve me"}),
@@ -565,17 +572,17 @@ class CommandInteractionTests(unittest.TestCase):
         original_commit = command.PathTransaction.commit
         commits = 0
 
-        def fail_second_commit(transaction, *args, **kwargs):
+        def fail_after_message_assets_commit(transaction, *args, **kwargs):
             nonlocal commits
             commits += 1
-            if commits == 2:
+            if commits == 6:
                 raise OSError("simulated locked project path")
             return original_commit(transaction, *args, **kwargs)
 
         with mock.patch.object(
             command.PathTransaction,
             "commit",
-            new=fail_second_commit,
+            new=fail_after_message_assets_commit,
         ):
             with self.assertRaisesRegex(OSError, "locked project path"):
                 command.start_new_project(
@@ -588,6 +595,7 @@ class CommandInteractionTests(unittest.TestCase):
             message.read_text(encoding="utf-8"),
             "<p>message before failure</p>",
         )
+        self.assertEqual(message_asset.read_bytes(), b"asset before failure")
         self.assertEqual(
             json.loads(prompt.read_text(encoding="utf-8"))["subject"],
             "preserve me",

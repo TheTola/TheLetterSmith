@@ -1330,6 +1330,7 @@ class ThemeService(QtCore.QObject):
             bool,
         ] = WeakKeyDictionary()
         self._reported_missing_assets: set[tuple[str, str]] = set()
+        self._reported_asset_fallbacks: set[tuple[str, str, str]] = set()
 
         application = QtWidgets.QApplication.instance()
         if application is not None:
@@ -2227,7 +2228,28 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
         themes_root = paths.app_resource_path("themes").resolve()
         theme_root = (themes_root / self._theme_id).resolve()
         self._require_within(theme_root, themes_root, label="Theme root")
-        for logical in logicals:
+        missing_key = (self._theme_id, " | ".join(logicals))
+
+        def report_fallback(
+            path: Path,
+            missing_logicals: tuple[str, ...] = logicals,
+        ) -> None:
+            missing_description = " | ".join(missing_logicals)
+            fallback_key = (self._theme_id, missing_description, str(path))
+            if (
+                self.current.uses_image_buttons
+                and fallback_key not in self._reported_asset_fallbacks
+            ):
+                self._reported_asset_fallbacks.add(fallback_key)
+                _LOGGER.info(
+                    "Theme image is missing, but a fallback was found: "
+                    "theme=%s asset=%s fallback=%s",
+                    self._theme_id,
+                    missing_description,
+                    path.relative_to(resource_root).as_posix(),
+                )
+
+        for index, logical in enumerate(logicals):
             relative_override = self.current.asset_overrides.get(logical, logical)
             relative_override = _safe_relative_path(
                 relative_override,
@@ -2236,21 +2258,21 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
             themed_path = (theme_root / relative_override).resolve()
             self._require_within(themed_path, theme_root, label="Themed asset")
             if themed_path.is_file():
+                if index:
+                    report_fallback(themed_path, logicals[:index])
                 return themed_path
 
-        missing_key = (self._theme_id, " | ".join(logicals))
-        if (
-            self.current.uses_image_buttons
-            and missing_key not in self._reported_missing_assets
-        ):
-            self._reported_missing_assets.add(missing_key)
-            _LOGGER.warning(
-                "Theme asset is missing%s: "
-                "theme=%s asset=%s",
-                "; using the Cyber Forge baseline" if allow_baseline else "",
-                self._theme_id,
-                missing_key[1],
-            )
+        def report_missing() -> None:
+            if (
+                self.current.uses_image_buttons
+                and missing_key not in self._reported_missing_assets
+            ):
+                self._reported_missing_assets.add(missing_key)
+                _LOGGER.warning(
+                    "Theme asset and fallback are missing: theme=%s asset=%s",
+                    self._theme_id,
+                    missing_key[1],
+                )
 
         if not allow_baseline:
             if fallback_relative is not None:
@@ -2260,6 +2282,10 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
                     resource_root,
                     label="Fallback asset",
                 )
+                if not fallback_path.is_file():
+                    report_missing()
+                else:
+                    report_fallback(fallback_path)
                 return fallback_path
             first_override = self.current.asset_overrides.get(logicals[0], logicals[0])
             missing_path = (theme_root / first_override).resolve()
@@ -2268,6 +2294,7 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
                 theme_root,
                 label="Themed asset",
             )
+            report_missing()
             return missing_path
 
         baseline = self._themes[DEFAULT_THEME_ID]
@@ -2292,6 +2319,7 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
             )
             baseline_candidates.append(baseline_path)
             if baseline_path.is_file():
+                report_fallback(baseline_path)
                 return baseline_path
 
         if fallback is not None:
@@ -2302,7 +2330,12 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
                 resource_root,
                 label="Fallback asset",
             )
+            if not fallback_path.is_file():
+                report_missing()
+            else:
+                report_fallback(fallback_path)
             return fallback_path
+        report_missing()
         return baseline_candidates[0]
 
     @staticmethod

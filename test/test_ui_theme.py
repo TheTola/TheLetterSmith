@@ -669,10 +669,28 @@ class ThemeServiceTests(unittest.TestCase):
         self.assertEqual(resolved, themed.resolve())
 
         themed.unlink()
-        self.assertEqual(
-            service.resolve_asset("prompt_writer/Pwrite.png"),
-            baseline.resolve(),
-        )
+        with self.assertLogs("ui_theme", level="INFO") as logged:
+            self.assertEqual(
+                service.resolve_asset("prompt_writer/Pwrite.png"),
+                baseline.resolve(),
+            )
+        self.assertEqual(len(logged.output), 1)
+        self.assertIn("fallback was found", logged.output[0])
+        self.assertIn("Pwrite.png", logged.output[0])
+
+    def test_missing_theme_asset_warns_only_when_all_fallbacks_are_missing(self) -> None:
+        service = ThemeService(self.root)
+        service.set_theme("velvet_rose", persist=False)
+
+        with self.assertLogs("ui_theme", level="WARNING") as logged:
+            missing = service.resolve_first_asset(
+                ("help/hover.png",),
+                fallback="icons/Help.png",
+            )
+
+        self.assertFalse(missing.is_file())
+        self.assertEqual(len(logged.output), 1)
+        self.assertIn("Theme asset and fallback are missing", logged.output[0])
 
     def test_help_assets_prefer_idle_gif_and_hover_png(self) -> None:
         themed_help = self.root / "resources/app/themes/velvet_rose/help"
@@ -703,10 +721,14 @@ class ThemeServiceTests(unittest.TestCase):
         )
         themed_hover_png.unlink()
         themed_hover_gif.unlink()
-        self.assertEqual(
-            service.resolve_first_asset(HELP_THEME_ASSET_CANDIDATES["hover"]),
-            themed_png.resolve(),
-        )
+        with self.assertLogs("ui_theme", level="INFO") as logged:
+            self.assertEqual(
+                service.resolve_first_asset(HELP_THEME_ASSET_CANDIDATES["hover"]),
+                themed_png.resolve(),
+            )
+        self.assertEqual(len(logged.output), 1)
+        self.assertIn("fallback was found", logged.output[0])
+        self.assertIn("Help.png", logged.output[0])
         themed_gif.write_bytes(b"gif")
         self.assertEqual(
             service.resolve_first_asset(candidates),
