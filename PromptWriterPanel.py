@@ -36,6 +36,7 @@ from window_chrome import MINIMIZE_SYMBOL, StandardTitleBar
 from transactional_io import atomic_write_text, safe_write_json, set_path_hidden
 from ui_dialogs import LetterSmithConfirmationDialog, show_lettersmith_message
 from ui_help import set_control_help
+from ui_sounds import UiSound, play_ui_sound
 
 LOGGER = logging.getLogger(__name__)
 
@@ -878,6 +879,7 @@ class ListManagerDialog(QtWidgets.QDialog):
             self._entries.insert(insert_at, ManagedListEntry(entry.text, False, True))
         self._refresh_list(insert_at)
         self._emit_entries_changed()
+        play_ui_sound(UiSound.ADDED)
 
     def _update_entry(self) -> None:
         row = self._selected_row()
@@ -901,6 +903,7 @@ class ListManagerDialog(QtWidgets.QDialog):
         next_row = min(row, len(self._entries) - 1)
         self._refresh_list(next_row)
         self._emit_entries_changed()
+        play_ui_sound(UiSound.REMOVED)
 
 
 def _html_escape(s: str) -> str:

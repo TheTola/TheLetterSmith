@@ -141,7 +141,7 @@ class ApplicationPathsTests(unittest.TestCase):
         summary = validate_installer_configuration()
         repository = Path(__file__).resolve().parents[1]
 
-        self.assertEqual(summary["name"], "LetterSmith-Setup-1.0.0.exe")
+        self.assertEqual(summary["name"], "LetterSmith-Beta-Setup-1.0.0.exe")
         self.assertEqual(
             Path(summary["payload"]),
             (repository / "release" / "dist" / "LetterSmith").resolve(),
@@ -196,7 +196,7 @@ class ApplicationPathsTests(unittest.TestCase):
 
         self.assertEqual(summary["app"], "Letter Smith.app")
         self.assertEqual(summary["bundle_identifier"], "works.infini.lettersmith")
-        self.assertEqual(summary["dmg"], "LetterSmith-1.0.0.dmg")
+        self.assertEqual(summary["dmg"], "LetterSmith-Beta-1.0.0.dmg")
         self.assertEqual(_required_architectures("arm64"), {"arm64"})
         self.assertEqual(
             _required_architectures("universal2"),
@@ -204,12 +204,12 @@ class ApplicationPathsTests(unittest.TestCase):
         )
         self.assertEqual(_normalized_target_architecture("aarch64"), "arm64")
         self.assertEqual(
-            _dmg_name_for_architecture("LetterSmith-1.0.0.dmg", "arm64"),
-            "LetterSmith-1.0.0-arm64.dmg",
+            _dmg_name_for_architecture("LetterSmith-Beta-1.0.0.dmg", "arm64"),
+            "LetterSmith-Beta-1.0.0-arm64.dmg",
         )
         self.assertEqual(
-            _dmg_name_for_architecture("LetterSmith-1.0.0.dmg", "universal2"),
-            "LetterSmith-1.0.0.dmg",
+            _dmg_name_for_architecture("LetterSmith-Beta-1.0.0.dmg", "universal2"),
+            "LetterSmith-Beta-1.0.0.dmg",
         )
         self.assertEqual(_version_tuple("13.0"), (13, 0, 0))
         self.assertEqual(

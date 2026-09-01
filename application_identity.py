@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 APPLICATION_NAME = "Letter Smith"
-APPLICATION_VERSION = "1.0.0"
+APPLICATION_VERSION = "1.0.0-beta.1"
 PUBLISHER_NAME = "Infini Works"
 CREATOR_NAME = "Oluwatola Ayedun"
 APPLICATION_DESCRIPTION = (
@@ -13,12 +13,12 @@ APPLICATION_DESCRIPTION = (
 ORGANIZATION_DOMAIN = "infini.works"
 APP_USER_MODEL_ID = "InfiniWorks.LetterSmith"
 EXECUTABLE_NAME = "LetterSmith.exe"
-INSTALLER_NAME = "LetterSmith-Setup-1.0.0.exe"
+INSTALLER_NAME = "LetterSmith-Beta-Setup-1.0.0.exe"
 INSTALLER_APP_ID = "{44498786-B309-5F44-9BDB-E2B7250E6304}"
 MACOS_BUNDLE_IDENTIFIER = "works.infini.lettersmith"
 MACOS_APP_NAME = "Letter Smith.app"
 MACOS_EXECUTABLE_NAME = "LetterSmith"
-MACOS_DISK_IMAGE_NAME = "LetterSmith-1.0.0.dmg"
+MACOS_DISK_IMAGE_NAME = "LetterSmith-Beta-1.0.0.dmg"
 
 # Public-release metadata is deliberately conspicuous until the creator
 # replaces each value here. PLACEHOLDER_COLOR is not theme-derived.

@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -11,6 +12,7 @@ from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
 from anima import TabSwitcher, install_hover_tab_switch
 from ui_help import set_action_help, set_control_help, set_tab_help
+from ui_sounds import UiSound
 
 
 class HoverTabSwitchTests(unittest.TestCase):
@@ -191,6 +193,11 @@ class NexusHoverIntegrationTests(unittest.TestCase):
                     window.tabbar.tabRect(4).center(),
                 )
                 self.assertEqual(window.tabbar.currentIndex(), 4)
+
+                with mock.patch("Nexus.play_ui_sound") as play_sound:
+                    window.tabbar.setCurrentIndex(1)
+                    self.app.processEvents()
+                play_sound.assert_called_once_with(UiSound.TAB_SWITCHED)
 
                 window._tabswitch.go_to(0)
                 self.assertIsNotNone(window._tabswitch._active)

@@ -28,7 +28,7 @@ from support_information import (
     recent_diagnostic_excerpt,
     sanitize_support_text,
 )
-from ui_theme import BASIC_DARK_THEME, THEMES
+from ui_theme import BASIC_DARK_THEME, THEMES, minimum_button_text_size
 
 
 class SupportInformationLogicTests(unittest.TestCase):
@@ -264,6 +264,12 @@ class SupportInformationUiTests(unittest.TestCase):
         self.assertTrue(dialog.copy_button.isDefault())
         self.assertTrue(dialog.computer_checkbox.toolTip())
         self.assertTrue(dialog.diagnostic_checkbox.toolTip())
+        dialog.show()
+        QtWidgets.QApplication.processEvents()
+        for button in (dialog.cancel_button, dialog.copy_button):
+            required = minimum_button_text_size(button)
+            self.assertGreaterEqual(button.width(), required.width())
+            self.assertGreaterEqual(button.height(), required.height())
         dialog.cancel_button.click()
 
         self.assertEqual(dialog.result(), QtWidgets.QDialog.Rejected)

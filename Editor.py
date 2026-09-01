@@ -103,6 +103,7 @@ from message_format import normalize_ultralinks_in_document
 from project_save import ProjectNotReadyError, ProjectSaveService
 from project_state import ProjectStateController
 from project_paths import application_paths
+from ui_sounds import UiSound, play_ui_sound
 from editor_diagnostics import record_editor_failure
 from message_html import (
     is_ultralink_href,
@@ -400,7 +401,8 @@ class UltralinkDialog(QDialog):
 
     def _save(self) -> None:
         if not self.message_text():
-            QtWidgets.QApplication.beep()
+            if not play_ui_sound(UiSound.BROKEN):
+                QtWidgets.QApplication.beep()
             self.message_edit.setFocus(Qt.OtherFocusReason)
             return
         self.accept()
@@ -1681,6 +1683,7 @@ class Editor(QDialog):
             self._sync_message_assets()
             self._last_persisted_html = content
             self.autosaved.emit(content)
+            play_ui_sound(UiSound.SAVED)
         except ProjectNotReadyError:
             return
         except Exception as error:
@@ -1709,6 +1712,7 @@ class Editor(QDialog):
             self._sync_message_assets()
             self._last_persisted_html = content
             self.autosaved.emit(content)
+            play_ui_sound(UiSound.SAVED)
             return True
         except Exception as error:
             log_path = self._record_failure("save letter", error)

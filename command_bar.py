@@ -9,6 +9,7 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
 
+from app_icon import apply_qt_window_icon
 from config import canonical_play_root, canonical_stock_letters_root
 from project_paths import application_paths
 from publishing.expiration import publication_status
@@ -27,6 +28,7 @@ from ui_fonts import (
 
 _LOGGER = logging.getLogger(__name__)
 _COMMAND_BAR_INSTANCE: Optional["CommandBarWindow"] = None
+COMMAND_COMPACT_POSITION_SETTINGS_KEY = "ui_command_compact_position"
 
 
 def _command_font_family() -> str:
@@ -405,6 +407,8 @@ class _CompactRestoreLabel(QtWidgets.QLabel):
         self._drag_offset = None
         self._dragging = False
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+        if was_dragging:
+            self._owner._persist_compact_position()
         if (
             event.button() == Qt.MouseButton.LeftButton
             and not was_dragging
@@ -414,6 +418,10 @@ class _CompactRestoreLabel(QtWidgets.QLabel):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
+        self._owner._show_compact_context_menu(event.globalPos())
+        event.accept()
 
 
 class CommandBarWindow(QtWidgets.QWidget):
@@ -431,7 +439,12 @@ class CommandBarWindow(QtWidgets.QWidget):
         *,
         screen: QtGui.QScreen | None = None,
     ) -> None:
-        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        super().__init__(
+            None,
+            Qt.WindowType.Window
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint,
+        )
         recipient_name = str(data.recipient_name or "").strip()
         recipient_title = str(data.recipient_title or "").strip()
         self.data = CommandBarData(
@@ -441,6 +454,7 @@ class CommandBarWindow(QtWidgets.QWidget):
             published_url=normalize_published_page_url(data.published_url),
         )
         self.project_root = Path(project_root).resolve()
+        self.settings = SettingsStore(self.project_root)
         load_application_fonts(self.project_root)
         _apply_command_font(self)
         self._screen_hint = screen
@@ -478,6 +492,7 @@ class CommandBarWindow(QtWidgets.QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setObjectName("CommandBarWindow")
         self.setWindowTitle("Letter Smith Command Bar")
+        apply_qt_window_icon(self, self.project_root)
 
         self._surface = _DragRegion(self, self)
         self._surface.setObjectName("CommandBarSurface")
@@ -510,10 +525,10 @@ class CommandBarWindow(QtWidgets.QWidget):
         )
         self._compact_label.setCursor(Qt.CursorShape.OpenHandCursor)
         self._compact_label.setToolTip(
-            "Drag to move; click to restore the Command Bar."
+            "Drag to move; click to reopen Letter Smith. Right-click for options."
         )
-        self._compact_label.setAccessibleName("Movable Command Bar icon")
-        self._compact_label.clicked.connect(self._restore_expanded_mode)
+        self._compact_label.setAccessibleName("Movable Letter Smith envelope")
+        self._compact_label.clicked.connect(self._reopen_letter_smith)
         self.compact_maximize_button = QtWidgets.QToolButton(
             self._compact_label
         )
@@ -522,18 +537,9 @@ class CommandBarWindow(QtWidgets.QWidget):
         )
         self.compact_maximize_button.setFixedSize(56, 38)
         self.compact_maximize_button.setAutoRaise(True)
-        self.compact_maximize_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.compact_maximize_button.setToolTip("Reopen Letter Smith")
-        self.compact_maximize_button.setAccessibleName("Reopen Letter Smith")
-        self.compact_maximize_button.setStyleSheet(
-            "QToolButton{background:transparent;border:none;padding:0;}"
-            "QToolButton:hover{background:rgba(255,45,45,0.18);"
-            "border-radius:8px;}"
-            "QToolButton:pressed{background:rgba(90,0,0,0.42);"
-            "border-radius:8px;}"
-        )
-        self.compact_maximize_button.clicked.connect(
-            self._reopen_letter_smith
+        self.compact_maximize_button.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+            True,
         )
         self._compact_label.hide()
 
@@ -541,6 +547,8 @@ class CommandBarWindow(QtWidgets.QWidget):
         self._build_scan_overlay()
         self._build_compact_icon()
         self._build_compact_maximize_button()
+        self.compact_maximize_button.hide()
+        self._build_compact_menu()
         self._build_controls()
         self._set_size_from_background()
         self._position_on_screen()
@@ -651,10 +659,6 @@ class CommandBarWindow(QtWidgets.QWidget):
             fallback_font.setPointSize(18)
             fallback_font.setWeight(QtGui.QFont.Weight.Bold)
             self.compact_maximize_button.setFont(fallback_font)
-            self.compact_maximize_button.setStyleSheet(
-                self.compact_maximize_button.styleSheet()
-                + "QToolButton{color:#ff5a5f;}"
-            )
         else:
             self.compact_maximize_button.setIcon(QtGui.QIcon(pixmap))
             self.compact_maximize_button.setIconSize(QtCore.QSize(52, 35))
@@ -666,6 +670,38 @@ class CommandBarWindow(QtWidgets.QWidget):
         y = max(0, self._compact_size.height() - button.height() - 4)
         button.move(x, y)
         button.raise_()
+
+    def _build_compact_menu(self) -> None:
+        menu = QtWidgets.QMenu(self)
+        menu.setObjectName("CommandCompactMenu")
+        _apply_command_font(menu)
+        menu.setStyleSheet(
+            "QMenu#CommandCompactMenu{background:#090d12;color:#f0fbff;"
+            "border:1px solid #58738b;padding:5px;}"
+            "QMenu#CommandCompactMenu::item{padding:8px 24px 8px 12px;}"
+            "QMenu#CommandCompactMenu::item:selected{"
+            "background:#17364a;color:#ffffff;}"
+            "QMenu#CommandCompactMenu::item:disabled{color:#58738b;}"
+        )
+        self.compact_close_action = menu.addAction("Close")
+        self.compact_maximize_action = menu.addAction("Maximize")
+        self.compact_copy_url_action = menu.addAction("Copy Letter URL")
+        self.compact_close_action.triggered.connect(self.close)
+        self.compact_maximize_action.triggered.connect(
+            self._reopen_letter_smith
+        )
+        self.compact_copy_url_action.triggered.connect(self._copy_published)
+        self.compact_copy_url_action.setEnabled(bool(self.data.published_url))
+        self._compact_menu = menu
+
+    def _show_compact_context_menu(
+        self,
+        global_position: QtCore.QPoint,
+    ) -> None:
+        if not self._compact_mode:
+            return
+        self.compact_copy_url_action.setEnabled(bool(self.data.published_url))
+        self._compact_menu.popup(global_position)
 
     def _build_controls(self) -> None:
         layout = QtWidgets.QHBoxLayout(self._surface)
@@ -814,6 +850,8 @@ class CommandBarWindow(QtWidgets.QWidget):
         self.move_within_screen(QtCore.QPoint(x, y), screen=screen)
 
     def _position_compact_icon(self, screen: QtGui.QScreen | None = None) -> None:
+        if self._restore_compact_position(screen=screen):
+            return
         target_screen = screen or self.screen() or self._screen_hint
         target_screen = target_screen or QtGui.QGuiApplication.primaryScreen()
         if target_screen is None:
@@ -822,6 +860,57 @@ class CommandBarWindow(QtWidgets.QWidget):
         x = geometry.right() - self._compact_size.width() + 1 - self.COMPACT_MARGIN
         y = geometry.bottom() - self._compact_size.height() + 1 - self.COMPACT_MARGIN
         self.move_within_screen(QtCore.QPoint(x, y), screen=target_screen)
+        self._persist_compact_position()
+
+    def _persist_compact_position(self) -> None:
+        if not self._compact_mode:
+            return
+        position = {"x": self.x(), "y": self.y()}
+        try:
+            if (
+                self.settings.get(
+                    COMMAND_COMPACT_POSITION_SETTINGS_KEY,
+                    {},
+                )
+                == position
+            ):
+                return
+            self.settings.update_fields(
+                {COMMAND_COMPACT_POSITION_SETTINGS_KEY: position}
+            )
+        except Exception:
+            _LOGGER.exception("Command envelope position could not be saved.")
+
+    def _restore_compact_position(
+        self,
+        *,
+        screen: QtGui.QScreen | None = None,
+    ) -> bool:
+        try:
+            stored = self.settings.get(
+                COMMAND_COMPACT_POSITION_SETTINGS_KEY,
+                {},
+            )
+        except Exception:
+            _LOGGER.exception("Command envelope position could not be read.")
+            return False
+        if not isinstance(stored, dict):
+            return False
+        x = stored.get("x")
+        y = stored.get("y")
+        if (
+            not isinstance(x, int)
+            or isinstance(x, bool)
+            or not isinstance(y, int)
+            or isinstance(y, bool)
+        ):
+            return False
+        requested = QtCore.QPoint(x, y)
+        target_screen = QtGui.QGuiApplication.screenAt(requested)
+        target_screen = target_screen or screen or self.screen() or self._screen_hint
+        target_screen = target_screen or QtGui.QGuiApplication.primaryScreen()
+        self.move_within_screen(requested, screen=target_screen)
+        return True
 
     def move_within_screen(
         self,
@@ -883,6 +972,7 @@ class CommandBarWindow(QtWidgets.QWidget):
         self.setFixedSize(self._compact_size)
         self._compact_label.setGeometry(self.rect())
         self._compact_label.show()
+        self.compact_maximize_button.hide()
         self._compact_movie.start()
         self._update_compact_frame()
         self._position_compact_icon(current_screen)
@@ -932,7 +1022,7 @@ class CommandBarWindow(QtWidgets.QWidget):
                 QtWidgets.QToolTip.showText(
                     QtGui.QCursor.pos(),
                     "Letter Smith could not be reopened.",
-                    self.compact_maximize_button,
+                    self._compact_label,
                 )
                 return
             program = sys.executable
@@ -948,10 +1038,12 @@ class CommandBarWindow(QtWidgets.QWidget):
             QtWidgets.QToolTip.showText(
                 QtGui.QCursor.pos(),
                 "Letter Smith could not be reopened.",
-                self.compact_maximize_button,
+                self._compact_label,
             )
             return
         self._reopen_started = True
+        self._compact_label.setEnabled(False)
+        self.compact_maximize_action.setEnabled(False)
         self.compact_maximize_button.setEnabled(False)
         self.close()
 
@@ -1118,6 +1210,7 @@ class CommandBarWindow(QtWidgets.QWidget):
         if self._closing:
             event.accept()
             return
+        self._persist_compact_position()
         self._closing = True
         self._copy_timer.stop()
         self._scan_initial_timer.stop()
@@ -1184,6 +1277,7 @@ def _clear_command_bar_instance(window: CommandBarWindow) -> None:
 
 
 __all__ = [
+    "COMMAND_COMPACT_POSITION_SETTINGS_KEY",
     "CommandBarData",
     "CommandBarWindow",
     "build_command_bar_data",

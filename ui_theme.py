@@ -30,6 +30,8 @@ RESTORE_THEME_ASSET_CANDIDATES = (
     "titlebar/restore.png",
     MAXIMIZE_THEME_ASSET,
 )
+SHARED_SETTINGS_IDLE_ASSET = "settings/settings.png"
+SHARED_SETTINGS_HOVER_ASSET = "settings/Settings.gif"
 
 THEME_FAMILIES: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {
@@ -51,8 +53,6 @@ REQUIRED_THEME_ASSETS = (
     "buttons/ROButton.png",
     "image_frame.png",
     "prompt_writer/Pwrite.png",
-    "settings/Settings.gif",
-    "settings/settingz.gif",
     "titlebar/Exi.png",
     "titlebar/maxi.png",
     "titlebar/mini.png",
@@ -62,10 +62,15 @@ REQUIRED_CONTENT_THEME_ASSETS = (
     "image_frame.png",
     "prompt_writer/Pwrite.png",
 )
-HELP_THEME_ASSET_CANDIDATES: Mapping[str, tuple[str, str]] = MappingProxyType(
+HELP_THEME_ASSET_CANDIDATES: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {
         "idle": ("help/idle.gif", "help/idle.png"),
-        "hover": ("help/hover.png", "help/hover.gif"),
+        "hover": (
+            "help/hover.png",
+            "help/hover.gif",
+            "help/idle.png",
+            "help/idle.gif",
+        ),
     }
 )
 _LEGACY_THEME_ALIASES = {
@@ -81,8 +86,6 @@ _STANDARD_ASSET_OVERRIDES = MappingProxyType(
         MAXIMIZE_THEME_ASSET: "titlebar/maxi.png",
         "titlebar/restore.png": "titlebar/rest.png",
         "titlebar/close.png": "titlebar/Exi.png",
-        "settings/idle.png": "settings/settings.png",
-        "settings/hover.gif": "settings/Settings.gif",
         "help/idle.gif": "help/Help.gif",
         "help/idle.png": "help/Help.png",
         "help/hover.gif": "help/HHelp.gif",
@@ -445,6 +448,175 @@ def apply_tab_heading_style(label: QtWidgets.QLabel) -> QtWidgets.QLabel:
     return label
 
 
+_BUTTON_TEXT_HORIZONTAL_SAFETY = 24
+_BUTTON_TEXT_VERTICAL_SAFETY = 8
+
+
+def minimum_button_text_size(button: QtWidgets.QAbstractButton) -> QtCore.QSize:
+    """Return the smallest size that can display the button's full label."""
+    if not isinstance(button, QtWidgets.QAbstractButton):
+        raise TypeError("Button text can only be measured on button widgets.")
+    text = button.text()
+    if not text:
+        return QtCore.QSize()
+
+    metrics = button.fontMetrics()
+    lines = text.splitlines() or [text]
+    text_width = max(metrics.horizontalAdvance(line) for line in lines)
+    text_height = metrics.height() * max(1, len(lines))
+    icon_size = button.iconSize() if not button.icon().isNull() else QtCore.QSize()
+    icon_spacing = 4 if icon_size.width() else 0
+    content_size = QtCore.QSize(
+        text_width + icon_size.width() + icon_spacing,
+        max(text_height, icon_size.height()),
+    )
+
+    option = QtWidgets.QStyleOptionButton()
+    option.initFrom(button)
+    option.text = text
+    option.icon = button.icon()
+    option.iconSize = icon_size
+    if isinstance(button, QtWidgets.QCheckBox):
+        content_type = QtWidgets.QStyle.ContentsType.CT_CheckBox
+    elif isinstance(button, QtWidgets.QRadioButton):
+        content_type = QtWidgets.QStyle.ContentsType.CT_RadioButton
+    elif isinstance(button, QtWidgets.QToolButton):
+        content_type = QtWidgets.QStyle.ContentsType.CT_ToolButton
+    else:
+        content_type = QtWidgets.QStyle.ContentsType.CT_PushButton
+    style = button.style()
+    styled_size = (
+        style.sizeFromContents(content_type, option, content_size, button)
+        if style is not None
+        else QtCore.QSize()
+    )
+    hint = button.sizeHint()
+    return QtCore.QSize(
+        max(
+            content_size.width() + _BUTTON_TEXT_HORIZONTAL_SAFETY,
+            styled_size.width(),
+            hint.width(),
+        ),
+        max(
+            content_size.height() + _BUTTON_TEXT_VERTICAL_SAFETY,
+            styled_size.height(),
+            hint.height(),
+        ),
+    )
+
+
+def ensure_button_text_fits(button: QtWidgets.QAbstractButton) -> QtCore.QSize:
+    """Grow a text button when its current constraints would clip its label."""
+    required = minimum_button_text_size(button)
+    if required.isEmpty():
+        return required
+
+    fixed_width = button.minimumWidth() == button.maximumWidth()
+    fixed_height = button.minimumHeight() == button.maximumHeight()
+    if required.width() > button.minimumWidth():
+        if fixed_width:
+            button.setFixedWidth(max(button.width(), required.width()))
+        else:
+            button.setMinimumWidth(required.width())
+    if required.height() > button.minimumHeight():
+        if fixed_height:
+            button.setFixedHeight(max(button.height(), required.height()))
+        else:
+            button.setMinimumHeight(required.height())
+    if button.width() < required.width() or button.height() < required.height():
+        button.resize(
+            max(button.width(), required.width()),
+            max(button.height(), required.height()),
+        )
+    button.updateGeometry()
+    return required
+
+
+class _ButtonTextFitGuard(QtCore.QObject):
+    """Keep labels fitted after runtime text, font, style, or size changes."""
+
+    _EVENT_TYPES = {
+        QtCore.QEvent.Type.Polish,
+        QtCore.QEvent.Type.Show,
+        QtCore.QEvent.Type.FontChange,
+        QtCore.QEvent.Type.StyleChange,
+        QtCore.QEvent.Type.DynamicPropertyChange,
+        QtCore.QEvent.Type.LayoutRequest,
+        QtCore.QEvent.Type.Resize,
+        QtCore.QEvent.Type.Paint,
+    }
+
+    def __init__(self, parent: QtCore.QObject) -> None:
+        super().__init__(parent)
+        self._signatures: WeakKeyDictionary[
+            QtWidgets.QAbstractButton,
+            tuple[object, ...],
+        ] = WeakKeyDictionary()
+        self._fitting: set[QtWidgets.QAbstractButton] = set()
+
+    @staticmethod
+    def _signature(button: QtWidgets.QAbstractButton) -> tuple[object, ...]:
+        font = button.font()
+        return (
+            button.text(),
+            button.iconSize().width(),
+            button.iconSize().height(),
+            font.family(),
+            font.pointSizeF(),
+            font.pixelSize(),
+            font.weight(),
+            button.width(),
+            button.height(),
+            button.minimumWidth(),
+            button.minimumHeight(),
+            button.maximumWidth(),
+            button.maximumHeight(),
+            button.styleSheet(),
+        )
+
+    def eventFilter(
+        self,
+        watched: QtCore.QObject,
+        event: QtCore.QEvent,
+    ) -> bool:
+        if (
+            isinstance(watched, QtWidgets.QAbstractButton)
+            and watched.text()
+            and event.type() in self._EVENT_TYPES
+            and watched not in self._fitting
+        ):
+            signature = self._signature(watched)
+            force_refit = event.type() not in {
+                QtCore.QEvent.Type.Resize,
+                QtCore.QEvent.Type.Paint,
+            }
+            if force_refit or self._signatures.get(watched) != signature:
+                self._fitting.add(watched)
+                try:
+                    ensure_button_text_fits(watched)
+                    self._signatures[watched] = self._signature(watched)
+                finally:
+                    self._fitting.discard(watched)
+        return super().eventFilter(watched, event)
+
+
+def install_button_text_guard(
+    application: QtWidgets.QApplication | None = None,
+) -> _ButtonTextFitGuard | None:
+    """Install the application-wide button text fitting guard once."""
+    app = application or QtWidgets.QApplication.instance()
+    if app is None:
+        return None
+    attribute = "_lettersmith_button_text_fit_guard"
+    guard = getattr(app, attribute, None)
+    if isinstance(guard, _ButtonTextFitGuard):
+        return guard
+    guard = _ButtonTextFitGuard(app)
+    app.installEventFilter(guard)
+    setattr(app, attribute, guard)
+    return guard
+
+
 def apply_button_tier(
     button: QtWidgets.QAbstractButton,
     tier: ButtonTier | str,
@@ -476,6 +648,7 @@ def apply_button_tier(
     if widget_style is not None:
         widget_style.unpolish(button)
         widget_style.polish(button)
+    ensure_button_text_fits(button)
     button.updateGeometry()
     button.update()
     return button
@@ -496,8 +669,7 @@ def _button_tier_stylesheet(
             f'{scope}QToolButton[{BUTTON_TIER_PROPERTY}="{tier.value}"]'
         )
         geometry = (
-            f"min-width:{style.width}px;max-width:{style.width}px;"
-            f"min-height:{style.height}px;max-height:{style.height}px;"
+            f"min-width:{style.width}px;min-height:{style.height}px;"
             if include_geometry_constraints
             else ""
         )
@@ -1648,6 +1820,8 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
                 style.polish(widget)
             if not self.current.uses_image_buttons:
                 self._apply_button_geometry(widget)
+            if isinstance(widget, QtWidgets.QAbstractButton):
+                ensure_button_text_fits(widget)
             widget.update()
 
     def _apply_button_geometry(self, widget: QtWidgets.QWidget) -> None:
@@ -2164,6 +2338,8 @@ __all__ = [
     "REQUIRED_CONTENT_THEME_ASSETS",
     "REQUIRED_THEME_ASSETS",
     "RESTORE_THEME_ASSET_CANDIDATES",
+    "SHARED_SETTINGS_HOVER_ASSET",
+    "SHARED_SETTINGS_IDLE_ASSET",
     "ROW_LAYOUT_SPACING",
     "PRIMARY_PAGE_LAYOUT",
     "SECTION_LAYOUT_SPACING",
@@ -2182,6 +2358,9 @@ __all__ = [
     "ThemeTokens",
     "apply_button_tier",
     "apply_tab_heading_style",
+    "ensure_button_text_fits",
+    "install_button_text_guard",
+    "minimum_button_text_size",
     "normalize_theme_id",
     "theme_family_for_id",
 ]

@@ -69,6 +69,7 @@ from ui_dialogs import (
     show_lettersmith_message,
 )
 from ui_help import set_control_help
+from ui_sounds import UiSound, play_ui_sound
 from ui_theme import (
     PRIMARY_PAGE_LAYOUT,
     ButtonTier,
@@ -793,6 +794,7 @@ class RevisionHistoryDialog(LetterSmithDialog):
             )
             return
         self.refresh()
+        play_ui_sound(UiSound.REMOVED)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -168,6 +168,7 @@ class CommandHoldInteractionTests(unittest.TestCase):
                 / "gallery"
                 / "app"
                 / "sounds"
+                / "App sounds"
                 / "Blip.mp3"
             ).resolve(),
         )

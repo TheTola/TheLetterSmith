@@ -62,9 +62,12 @@ from ui_theme import (
     HELP_THEME_ASSET_CANDIDATES,
     MAXIMIZE_THEME_ASSET,
     RESTORE_THEME_ASSET_CANDIDATES,
+    SHARED_SETTINGS_HOVER_ASSET,
+    SHARED_SETTINGS_IDLE_ASSET,
     ThemeService,
 )
 from ui_fonts import COMMAND_FONT_FAMILY
+from ui_sounds import UiSound, install_ui_sounds, play_ui_sound
 from window_chrome import FramelessWindowController
 
 # ===================================================================================================================================================================================
@@ -713,7 +716,7 @@ class TitleBar(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.parent = parent
+        self._nexus = parent
         self.setObjectName("NexusTitleBar")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setAttribute(Qt.WA_Hover, True)
@@ -727,14 +730,14 @@ class TitleBar(QtWidgets.QWidget):
         self._owns_theme_service = self.theme_service is None
         if self.theme_service is None:
             self.theme_service = ThemeService(
-                self.parent.project_root,
+                self._nexus.project_root,
                 parent=self,
             )
         self.curtain_styles = getattr(parent, "curtain_styles", None)
         self._owns_curtain_styles = self.curtain_styles is None
         if self.curtain_styles is None:
             self.curtain_styles = CurtainStyleController(
-                SettingsStore(self.parent.project_root),
+                SettingsStore(self._nexus.project_root),
                 self,
             )
             self.destroyed.connect(self.curtain_styles.close)
@@ -753,7 +756,7 @@ class TitleBar(QtWidgets.QWidget):
         self.app_icon.setObjectName("AppIcon")
         self.app_icon.setFixedSize(TITLE_BAR_CONTROL_PX, TITLE_BAR_CONTROL_PX)
         self.app_icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        png_path, _ = canonical_icon_paths(self.parent.project_root)
+        png_path, _ = canonical_icon_paths(self._nexus.project_root)
         pixmap = QPixmap(str(png_path))
         self._app_icon_available = not pixmap.isNull()
         if not pixmap.isNull():
@@ -897,7 +900,7 @@ class TitleBar(QtWidgets.QWidget):
             "Clear the active workspace and begin a letter for another recipient.",
         )
         self.new_project_action.triggered.connect(
-            self.parent.start_new_project
+            self._nexus.start_new_project
         )
         self.delete_project_action = self.settings_menu.addAction(
             "Delete Project"
@@ -907,7 +910,7 @@ class TitleBar(QtWidgets.QWidget):
             "Permanently remove the active draft, saved letter, and recovery copies.",
         )
         self.delete_project_action.triggered.connect(
-            self.parent.delete_project
+            self._nexus.delete_project
         )
         self.settings_menu.addSeparator()
         self.about_action = self.settings_menu.addAction(
@@ -924,7 +927,7 @@ class TitleBar(QtWidgets.QWidget):
             self.exit_action,
             "Close Letter Smith safely.",
         )
-        self.exit_action.triggered.connect(self.parent.close)
+        self.exit_action.triggered.connect(self._nexus.close)
         self.settings_menu.aboutToShow.connect(
             self._sync_curtain_menu
         )
@@ -983,7 +986,7 @@ class TitleBar(QtWidgets.QWidget):
         )
 
         self.btn_minimize.clicked.connect(
-            self.parent.showMinimized
+            self._nexus.showMinimized
         )
 
         layout.addWidget(self.btn_minimize)
@@ -1022,14 +1025,14 @@ class TitleBar(QtWidgets.QWidget):
         )
 
         self.btn_close.clicked.connect(
-            self.parent.close
+            self._nexus.close
         )
 
         layout.addWidget(self.btn_close)
 
         # Keep the maximize/restore symbol synchronized when Windows changes
         # the window state outside this button.
-        self.parent.installEventFilter(self)
+        self._nexus.installEventFilter(self)
         self._sync_max_restore_button()
         self.apply_theme(self.theme_service)
 
@@ -1061,7 +1064,7 @@ class TitleBar(QtWidgets.QWidget):
             action.setChecked(theme_id == current)
 
     def _sync_project_actions(self) -> None:
-        settings = SettingsStore(self.parent.project_root).snapshot()
+        settings = SettingsStore(self._nexus.project_root).snapshot()
         self.delete_project_action.setEnabled(
             bool(str(settings.get("project_id", "")).strip())
             and not is_protected_project(settings)
@@ -1075,35 +1078,35 @@ class TitleBar(QtWidgets.QWidget):
                 definition.theme_id == previous_theme_id
                 or self._owns_theme_service
             ):
-                apply_current = getattr(self.parent, "_apply_current_theme", None)
+                apply_current = getattr(self._nexus, "_apply_current_theme", None)
                 if callable(apply_current):
                     apply_current()
                 else:
                     self.apply_theme(self.theme_service)
         except (OSError, RuntimeError, ValueError) as error:
             _LOGGER.exception("Theme selection failed.")
-            self.parent.status(f"Theme could not be applied: {error}")
+            self._nexus.status(f"Theme could not be applied: {error}")
             return
         self._sync_theme_menu()
-        self.parent.status(f"{definition.display_name} theme applied.")
-        toast = getattr(self.parent, "toast", None)
+        self._nexus.status(f"{definition.display_name} theme applied.")
+        toast = getattr(self._nexus, "toast", None)
         if callable(toast):
             toast(f"{definition.display_name} theme applied")
 
     def _save_settings(self) -> None:
         try:
             self.theme_service.save()
-            apply_current = getattr(self.parent, "_apply_current_theme", None)
+            apply_current = getattr(self._nexus, "_apply_current_theme", None)
             if callable(apply_current):
                 apply_current()
             else:
                 self.apply_theme(self.theme_service)
         except (OSError, RuntimeError, ValueError) as error:
             _LOGGER.exception("Settings could not be saved.")
-            self.parent.status(f"Settings could not be saved: {error}")
+            self._nexus.status(f"Settings could not be saved: {error}")
             return
-        self.parent.status("Settings saved and applied.")
-        toast = getattr(self.parent, "toast", None)
+        self._nexus.status("Settings saved and applied.")
+        toast = getattr(self._nexus, "toast", None)
         if callable(toast):
             toast("Settings saved")
 
@@ -1203,7 +1206,7 @@ class TitleBar(QtWidgets.QWidget):
         self,
         logical_name: str,
     ) -> Path:
-        resolver = getattr(self.parent, "resolve_theme_asset", None)
+        resolver = getattr(self._nexus, "resolve_theme_asset", None)
         if callable(resolver):
             return resolver(logical_name)
         return self.theme_service.resolve_asset(logical_name)
@@ -1214,24 +1217,13 @@ class TitleBar(QtWidgets.QWidget):
         previous_movie.stop()
         previous_movie.setFileName("")
 
-        if not self.theme_service.current.uses_image_buttons:
-            self._settings_static_icon = QIcon()
-            self._settings_movie_path = ""
-            self._settings_movie = QMovie(parent=self)
-            self._settings_icon_animated = False
-            self.settings_button.setIcon(QIcon())
-            self.settings_button.setText("\u2699")
-            gear_font = QFont("Segoe UI Symbol", 17)
-            gear_font.setBold(False)
-            self.settings_button.setFont(gear_font)
-            previous_movie.deleteLater()
-            return
-
-        static_path = self._resolve_theme_asset(
-            "settings/idle.png",
+        static_path = _app_asset(
+            self._nexus.project_root,
+            SHARED_SETTINGS_IDLE_ASSET,
         )
-        movie_path = self._resolve_theme_asset(
-            "settings/hover.gif",
+        movie_path = _app_asset(
+            self._nexus.project_root,
+            SHARED_SETTINGS_HOVER_ASSET,
         )
         self._settings_static_icon = QIcon(str(static_path))
         self._settings_movie_path = str(movie_path)
@@ -1264,8 +1256,6 @@ class TitleBar(QtWidgets.QWidget):
             self.settings_button.setIcon(QIcon(pixmap))
 
     def _show_animated_settings_icon(self) -> None:
-        if not self.theme_service.current.uses_image_buttons:
-            return
         if not self._settings_movie.fileName():
             self._settings_movie.setFileName(self._settings_movie_path)
         if not self._settings_movie.isValid():
@@ -1355,7 +1345,7 @@ class TitleBar(QtWidgets.QWidget):
         self.curtain_styles.set_style(style)
 
     def _edit_visionary_location(self) -> None:
-        settings = SettingsStore(self.parent.project_root)
+        settings = SettingsStore(self._nexus.project_root)
         current = str(
             settings.get(
                 VISIONARY_URL_KEY,
@@ -1383,25 +1373,25 @@ class TitleBar(QtWidgets.QWidget):
             return
 
         settings.update_fields(**{VISIONARY_URL_KEY: visionary_url})
-        self.parent.status("Visionary location updated.")
+        self._nexus.status("Visionary location updated.")
 
     def _show_about(self) -> None:
         AboutLetterSmithDialog(
-            self.parent,
-            application=self.parent,
+            self._nexus,
+            application=self._nexus,
         ).exec()
 
     def _show_github_account(self) -> None:
-        forge = getattr(self.parent, "forge_tab", None)
+        forge = getattr(self._nexus, "forge_tab", None)
         if forge is None:
-            self.parent.status("GitHub account settings are not available yet.")
+            self._nexus.status("GitHub account settings are not available yet.")
             return
         forge.show_github_account()
 
     def _repair_music_archive(self) -> None:
-        sound_tab = getattr(self.parent, "sound_tab", None)
+        sound_tab = getattr(self._nexus, "sound_tab", None)
         if sound_tab is None:
-            self.parent.status("Music Archive is not ready.")
+            self._nexus.status("Music Archive is not ready.")
             return
         sound_tab.repair_music_archive()
 
@@ -1498,7 +1488,7 @@ class TitleBar(QtWidgets.QWidget):
         )
 
     def _sync_max_restore_button(self) -> None:
-        maximized = self.parent.isMaximized()
+        maximized = self._nexus.isMaximized()
         if self.theme_service.current.uses_image_buttons:
             candidates = (
                 RESTORE_THEME_ASSET_CANDIDATES
@@ -1533,15 +1523,15 @@ class TitleBar(QtWidgets.QWidget):
     def _toggle_max_restore(self) -> None:
         self._window_state_generation += 1
         generation = self._window_state_generation
-        if self.parent.isMaximized():
+        if self._nexus.isMaximized():
             target = self._normal_window_geometry
             if target is None or not target.isValid():
-                normal = self.parent.normalGeometry()
+                normal = self._nexus.normalGeometry()
                 target = QtCore.QRect(normal) if normal.isValid() else None
-            self.parent.setWindowState(
-                self.parent.windowState() & ~Qt.WindowMaximized
+            self._nexus.setWindowState(
+                self._nexus.windowState() & ~Qt.WindowMaximized
             )
-            self.parent.showNormal()
+            self._nexus.showNormal()
             if target is not None:
                 QtCore.QTimer.singleShot(
                     0,
@@ -1551,10 +1541,10 @@ class TitleBar(QtWidgets.QWidget):
                     ),
                 )
         else:
-            current = self.parent.geometry()
-            if current.isValid() and not self.parent.isFullScreen():
+            current = self._nexus.geometry()
+            if current.isValid() and not self._nexus.isFullScreen():
                 self._normal_window_geometry = QtCore.QRect(current)
-            self.parent.showMaximized()
+            self._nexus.showMaximized()
 
         QtCore.QTimer.singleShot(
             0,
@@ -1568,11 +1558,11 @@ class TitleBar(QtWidgets.QWidget):
     ) -> None:
         if generation != self._window_state_generation or not target.isValid():
             return
-        self.parent.setWindowState(
-            self.parent.windowState() & ~Qt.WindowMaximized
+        self._nexus.setWindowState(
+            self._nexus.windowState() & ~Qt.WindowMaximized
         )
-        self.parent.showNormal()
-        self.parent.setGeometry(target)
+        self._nexus.showNormal()
+        self._nexus.setGeometry(target)
         self._normal_window_geometry = QtCore.QRect(target)
         self._sync_max_restore_button()
 
@@ -1584,7 +1574,7 @@ class TitleBar(QtWidgets.QWidget):
                 if not self._settings_menu_open:
                     self._show_static_settings_icon()
         if (
-            watched is self.parent
+            watched is self._nexus
             and event.type() == QEvent.WindowStateChange
         ):
             QtCore.QTimer.singleShot(
@@ -1607,7 +1597,7 @@ class TitleBar(QtWidgets.QWidget):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
-            controller = getattr(self.parent, "_window_controller", None)
+            controller = getattr(self._nexus, "_window_controller", None)
             if controller is not None and controller.start_system_move():
                 event.accept()
                 return
@@ -1882,6 +1872,7 @@ class Nexus(QtWidgets.QMainWindow):
     def __init__(self, project_root: str | Path):
         super().__init__()
         self.project_root = str(project_root)
+        self.ui_sounds = install_ui_sounds(self.project_root)
         self.theme_service = ThemeService(self.project_root, parent=self)
         self.theme_service.theme_changed.connect(self._on_theme_changed)
         self.setWindowTitle("Letter Smith")
@@ -3150,6 +3141,8 @@ class Nexus(QtWidgets.QMainWindow):
     def _apply_tab_state(self, idx: int, *, animate_page: bool) -> None:
         """Apply the complete settled UI state for one tab."""
         old_idx = self.page_stack.currentIndex()
+        if old_idx != idx:
+            play_ui_sound(UiSound.TAB_SWITCHED)
         autosave_note = ""
         if old_idx != idx:
             if old_idx == 0:
@@ -3290,6 +3283,7 @@ class Nexus(QtWidgets.QMainWindow):
             return f"Project autosave failed: {error}"
         if dirty is not None:
             dirty.mark_saved()
+        play_ui_sound(UiSound.SAVED)
         return "Project autosaved."
 
     def _start_project_autosave(self, revision: int) -> None:
@@ -3338,6 +3332,7 @@ class Nexus(QtWidgets.QMainWindow):
             and not self._shutdown_in_progress
             and not self._shutdown_complete
         ):
+            play_ui_sound(UiSound.SAVED)
             self.status("Project autosaved.")
 
     @QtCore.Slot(int, str)
@@ -4884,13 +4879,18 @@ class Nexus(QtWidgets.QMainWindow):
             selected = resolver(candidates, fallback=REL_HELP_PNG)
             selected_path = str(selected) if selected.is_file() else ""
             movie_path = selected_path if selected.suffix.casefold() == ".gif" else ""
-            static_candidate = next(
-                candidate for candidate in candidates if candidate.endswith(".png")
-            )
-            static_path = self.resolve_theme_asset(
-                static_candidate,
-                REL_HELP_PNG,
-            )
+            if selected.suffix.casefold() == ".png":
+                static_path = selected
+            else:
+                static_candidates = tuple(
+                    candidate
+                    for candidate in candidates
+                    if candidate.endswith(".png")
+                )
+                static_path = resolver(
+                    static_candidates,
+                    fallback=REL_HELP_PNG,
+                )
             setattr(self, f"_help_movie_{kind}_path", movie_path)
             setattr(
                 self,

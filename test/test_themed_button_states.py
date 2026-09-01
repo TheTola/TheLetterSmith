@@ -9,6 +9,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6 import QtCore, QtGui, QtTest, QtWidgets
+from PySide6.QtMultimedia import QMediaPlayer
 
 from Forge_Tab import FORGE_ACTION_FONT_POINT_SIZE, ForgeTab
 from Image_tab import ImageTab
@@ -61,6 +62,85 @@ from ui_theme import (
     THEME_FONT_ROLE_PROPERTY,
     ThemeService,
 )
+from ui_sounds import SOUND_FILES, UiSound, UiSoundPlayer
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+class UiSoundTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_interface_sound_roles_use_the_requested_files(self) -> None:
+        self.assertEqual(
+            SOUND_FILES,
+            {
+                UiSound.ADDED: "Chime.mp3",
+                UiSound.BROKEN: "Ching.mp3",
+                UiSound.REMOVED: "Bounc.mp3",
+                UiSound.SAVED: "Save.mp3",
+                UiSound.GITHUB_CONNECTED: "connect.mp3",
+                UiSound.GITHUB_DISCONNECTED: "deconn.mp3",
+                UiSound.PUBLISH_COMPLETE: "Success.mp3",
+                UiSound.TAB_SWITCHED: "Switch.mp3",
+            },
+        )
+        player = UiSoundPlayer(PROJECT_ROOT)
+        for sound in UiSound:
+            self.assertTrue(player.sound_path(sound).is_file())
+
+    def test_broken_artwork_button_attempt_plays_broken_sound(self) -> None:
+        player = UiSoundPlayer(PROJECT_ROOT)
+        button = ArtworkButton(
+            "Unavailable",
+            PROJECT_ROOT,
+            "AButton.png",
+            broken_artwork_filename="AButton.png",
+        )
+        button.set_unavailable(True)
+        event = QtGui.QMouseEvent(
+            QtCore.QEvent.Type.MouseButtonPress,
+            QtCore.QPointF(1, 1),
+            QtCore.QPointF(1, 1),
+            QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.KeyboardModifier.NoModifier,
+        )
+        with mock.patch.object(player, "play") as play:
+            player.eventFilter(button, event)
+        play.assert_called_once_with(UiSound.BROKEN)
+
+    def test_overlapping_sound_fades_and_warps_previous_voice(self) -> None:
+        player = UiSoundPlayer(PROJECT_ROOT)
+        self.addCleanup(player.deleteLater)
+        self.addCleanup(player.stop_all)
+        self.assertTrue(player.play(UiSound.TAB_SWITCHED))
+        first_player = player._players[UiSound.TAB_SWITCHED]
+        first_output = player._outputs[UiSound.TAB_SWITCHED]
+        original_pitch_compensation = first_player.pitchCompensation()
+
+        self.assertTrue(player.play(UiSound.TAB_SWITCHED))
+        second_player = player._players[UiSound.TAB_SWITCHED]
+
+        self.assertIsNot(second_player, first_player)
+        self.assertIn(first_player, player._fade_groups)
+        self.assertFalse(first_player.pitchCompensation())
+        QtTest.QTest.qWait(player.OVERLAP_FADE_MS // 2)
+        self.assertLess(first_output.volume(), 1.0)
+        self.assertLess(first_player.playbackRate(), 1.0)
+
+        QtTest.QTest.qWait(player.OVERLAP_FADE_MS)
+        self.assertNotIn(first_player, player._fade_groups)
+        self.assertEqual(
+            first_player.playbackState(),
+            QMediaPlayer.PlaybackState.PausedState,
+        )
+        self.assertEqual(
+            first_player.pitchCompensation(),
+            original_pitch_compensation,
+        )
 
 
 class ThemedButtonStateTests(unittest.TestCase):
@@ -761,7 +841,8 @@ class ThemedButtonStateTests(unittest.TestCase):
                     )
 
     def test_github_ready_state_uses_connected_artwork_and_is_reversible(self) -> None:
-        forge = ForgeTab(self.root)
+        with mock.patch.object(ForgeTab, "_validate_github_account_async"):
+            forge = ForgeTab(self.root)
         self.addCleanup(forge.deleteLater)
         self.addCleanup(lambda: forge.shutdown(timeout_ms=1000))
         repository = Path(__file__).resolve().parents[1]
@@ -783,6 +864,9 @@ class ThemedButtonStateTests(unittest.TestCase):
             "connectbutton.png",
         )
         self.assertEqual(forge.github_account_summary.text(), "Connected as lettersmith")
+        self.assertFalse(
+            forge.github_account_summary.property("githubSignInWarning")
+        )
 
         forge._github_account_checking = True
         forge._sync_publishing_controls()
@@ -831,17 +915,57 @@ class ThemedButtonStateTests(unittest.TestCase):
             GitHubConnectionSnapshot(GitHubConnectionState.DISCONNECTED)
         )
         self.assertTrue(forge.github_account_btn.isEnabled())
+        self.assertEqual(forge.github_account_btn.text(), "Sign in")
+        self.assertEqual(
+            forge.github_account_btn.accessibleName(),
+            "Sign in to GitHub",
+        )
+        self.assertEqual(
+            forge.github_account_summary.text(),
+            "Not signed in to GitHub",
+        )
+        self.assertNotIn("%", forge.github_account_summary.text())
+        self.assertTrue(
+            forge.github_account_summary.property("githubSignInWarning")
+        )
+        self.assertIn("#0d1117", forge.github_account_summary.styleSheet())
+        self.assertIn("#58a6ff", forge.github_account_summary.styleSheet())
         self.assertEqual(
             forge.github_account_btn.artwork_path.name.casefold(),
             "bbutton.png",
         )
+
+        for theme_id in (
+            "cyber_forge",
+            "obsidian_forge",
+            "velvet_rose",
+            "celestial_rose",
+            "dark",
+            "light",
+        ):
+            service.set_theme(theme_id, persist=False)
+            forge.apply_theme_assets(service)
+            forge._apply_github_state(
+                GitHubConnectionSnapshot(GitHubConnectionState.DISCONNECTED)
+            )
+            with self.subTest(theme_id=theme_id):
+                self.assertEqual(forge.github_account_btn.text(), "Sign in")
+                self.assertEqual(
+                    forge.github_account_summary.text(),
+                    "Not signed in to GitHub",
+                )
+                self.assertTrue(
+                    forge.github_account_summary.property(
+                        "githubSignInWarning"
+                    )
+                )
 
         for theme_id in ("dark", "light"):
             service.set_theme(theme_id, persist=False)
             forge.apply_theme_assets(service)
             service.apply_semantic_styles(forge)
             self.app.processEvents()
-            self.assertEqual(forge.github_account_btn.text(), "Connect GitHub")
+            self.assertEqual(forge.github_account_btn.text(), "Sign in")
             self.assertFalse(forge.github_account_btn.has_artwork)
             self.assertEqual(
                 forge.github_account_btn.size(),
@@ -859,7 +983,8 @@ class ThemedButtonStateTests(unittest.TestCase):
     def test_basic_themes_use_their_connected_github_artwork_without_text(
         self,
     ) -> None:
-        forge = ForgeTab(self.root)
+        with mock.patch.object(ForgeTab, "_validate_github_account_async"):
+            forge = ForgeTab(self.root)
         self.addCleanup(forge.deleteLater)
         self.addCleanup(lambda: forge.shutdown(timeout_ms=1000))
         repository = Path(__file__).resolve().parents[1]

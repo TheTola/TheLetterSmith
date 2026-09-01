@@ -51,6 +51,7 @@ from project_state import ProjectStateController
 from project_sync import file_fingerprint, image_fingerprint
 from ui_dialogs import LetterSmithConfirmationDialog
 from ui_help import set_control_help
+from ui_sounds import UiSound, play_ui_sound
 from ui_theme import (
     PRIMARY_PAGE_LAYOUT,
     ButtonTier,
@@ -2653,6 +2654,7 @@ class ImageTab(
             self._show_temporary_status(
                 f"{record['source_file']} saved."
             )
+            play_ui_sound(UiSound.ADDED)
         except Exception as error:
             self.cards[result.index].release_asset_handle()
             result.prepared.rollback()
@@ -2848,6 +2850,7 @@ class ImageTab(
         self._show_temporary_status(
             f"{filename} cleared."
         )
+        play_ui_sound(UiSound.REMOVED)
 
     def preview_from_gallery(
         self,

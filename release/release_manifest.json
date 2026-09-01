@@ -2,12 +2,12 @@
   "schema_version": "1.0",
   "product": {
     "name": "Letter Smith",
-    "version": "1.0.0",
+    "version": "1.0.0-beta.1",
     "publisher": "Infini Works",
     "executable": "LetterSmith.exe"
   },
   "installer": {
-    "name": "LetterSmith-Setup-1.0.0.exe",
+    "name": "LetterSmith-Beta-Setup-1.0.0.exe",
     "app_id": "{44498786-B309-5F44-9BDB-E2B7250E6304}",
     "start_menu_name": "Letter Smith",
     "desktop_shortcut_default": false
@@ -16,7 +16,7 @@
     "app_name": "Letter Smith.app",
     "executable": "LetterSmith",
     "bundle_identifier": "works.infini.lettersmith",
-    "dmg_name": "LetterSmith-1.0.0.dmg",
+    "dmg_name": "LetterSmith-Beta-1.0.0.dmg",
     "minimum_system_version": "13.0",
     "icon": "gallery/app/icons/folder/lsmith.icns",
     "supported_architectures": [
@@ -72,8 +72,11 @@
     "pages": [
       "Dmessage.png"
     ],
+    "settings": [
+      "settings.png",
+      "Settings.gif"
+    ],
     "sounds": [
-      "Blip.mp3",
       "flip1.mp3",
       "flip2.mp3",
       "flip3.mp3",
@@ -85,6 +88,18 @@
       "flip9.mp3",
       "flip10.mp3",
       "glissando.mp3"
+    ],
+    "sounds/App sounds": [
+      "Blip.mp3",
+      "Bounc.mp3",
+      "Chime.mp3",
+      "Ching.mp3",
+      "connect.mp3",
+      "deconn.mp3",
+      "error.mp3",
+      "Save.mp3",
+      "Success.mp3",
+      "Switch.mp3"
     ]
   },
   "prompt_writer_files": [

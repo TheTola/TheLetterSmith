@@ -1,4 +1,4 @@
-# Letter Smith 1.0.0 Release Automation
+# Letter Smith 1.0.0 Beta 1 Release Automation
 
 ## Complete production release
 
@@ -53,7 +53,8 @@ explicitly approved, install Inno Setup 6.3 or newer and run:
 .\release\build_installer.ps1 -Build -ConfirmPackage
 ```
 
-The installer output is `release\installer\LetterSmith-Setup-1.0.0.exe`. Its
+The installer output is
+`release\installer\LetterSmith-Beta-Setup-1.0.0.exe`. Its
 stable AppId supports upgrades. Installation and uninstall do not remove the
 Letter Smith data under Local AppData or Documents. Installer creation re-runs
 the frozen-distribution sanitation gate before invoking Inno Setup.
@@ -117,10 +118,10 @@ universal2 Python and every native dependency to contain both slices. If that
 gate cannot pass, build and test the two thin targets separately. Thin outputs
 are architecture-qualified:
 
-- `release/macos/LetterSmith-1.0.0-arm64.dmg`
-- `release/macos/LetterSmith-1.0.0-x86_64.dmg`
+- `release/macos/LetterSmith-Beta-1.0.0-arm64.dmg`
+- `release/macos/LetterSmith-Beta-1.0.0-x86_64.dmg`
 
-Universal2 keeps `release/macos/LetterSmith-1.0.0.dmg`. Each successful build
+Universal2 keeps `release/macos/LetterSmith-Beta-1.0.0.dmg`. Each successful build
 also writes `release/macos/release-report-<architecture>.json` with artifact
 sizes, checksums, tool provenance, signing summary, architecture sweep, and
 notarization result. Generated artifacts and local third-party tools are ignored

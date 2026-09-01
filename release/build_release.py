@@ -582,7 +582,7 @@ def _validate_audio_tools(platform_name: str | None = None) -> None:
     stock_manifest = _load_json(
         PROJECT_ROOT / "resources" / "stock" / "stock_manifest.json"
     )
-    audio_files = list((PROJECT_ROOT / "gallery/app/sounds").glob("*.mp3"))
+    audio_files = list((PROJECT_ROOT / "gallery/app/sounds").rglob("*.mp3"))
     audio_files.extend(
         PROJECT_ROOT / "resources" / "stock" / item["filename"]
         for item in stock_manifest["music"]
@@ -1030,7 +1030,7 @@ def build_release(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate or build the Letter Smith 1.0.0 Windows release."
+        description="Validate or build the Letter Smith 1.0.0 Beta 1 Windows release."
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(

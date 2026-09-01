@@ -1,8 +1,8 @@
 #define MyAppName "Letter Smith"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.0-beta.1"
 #define MyAppPublisher "Infini Works"
 #define MyAppExeName "LetterSmith.exe"
-#define MyInstallerBaseName "LetterSmith-Setup-1.0.0"
+#define MyInstallerBaseName "LetterSmith-Beta-Setup-1.0.0"
 
 [Setup]
 AppId={{44498786-B309-5F44-9BDB-E2B7250E6304}

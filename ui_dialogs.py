@@ -6,6 +6,8 @@ from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from ui_theme import ensure_button_text_fits
+
 
 _FALLBACK_COLORS = {
     "background": "#0b0f15",
@@ -131,17 +133,15 @@ class LetterSmithDialog(QtWidgets.QDialog):
             return
         width = max(
             118,
-            max(
-                button.fontMetrics().horizontalAdvance(button.text()) + 34
-                for button in buttons
-            ),
+            *(ensure_button_text_fits(button).width() for button in buttons),
         )
-        width = min(width, 220)
         for button in buttons:
             button.setFixedWidth(width)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
+        for button in self.findChildren(QtWidgets.QAbstractButton):
+            ensure_button_text_fits(button)
         application = QtWidgets.QApplication.instance()
         if (
             self._click_outside_dismiss

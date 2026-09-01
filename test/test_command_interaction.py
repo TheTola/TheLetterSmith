@@ -639,6 +639,12 @@ class CommandInteractionTests(unittest.TestCase):
             / "resources/app/themes/cyber_forge"
         )
         shutil.copytree(source_theme, target_theme)
+        source_settings = (
+            Path(__file__).resolve().parents[1]
+            / "gallery/app/settings"
+        )
+        target_settings = Path(host.project_root) / "gallery/app/settings"
+        shutil.copytree(source_settings, target_settings)
         title_bar = TitleBar(host)
         actions = {action.text(): action for action in title_bar.settings_menu.actions()}
 
@@ -690,7 +696,15 @@ class CommandInteractionTests(unittest.TestCase):
         )
         self.assertEqual(title_bar.settings_button.text(), "")
         self.assertFalse(title_bar.settings_button.icon().isNull())
-        self.assertTrue(Path(title_bar._settings_movie_path).is_file())
+        shared_movie_path = (target_settings / "Settings.gif").resolve()
+        shared_icon = QtGui.QIcon(str(target_settings / "settings.png"))
+        shared_icon_image = shared_icon.pixmap(
+            title_bar.settings_button.iconSize()
+        ).toImage()
+        self.assertEqual(
+            Path(title_bar._settings_movie_path).resolve(),
+            shared_movie_path,
+        )
         self.assertFalse(title_bar._settings_icon_animated)
         for button in (
             title_bar.settings_button,
@@ -714,10 +728,29 @@ class CommandInteractionTests(unittest.TestCase):
             self.assertEqual(button.text(), "")
             self.assertFalse(button.icon().isNull())
 
-        title_bar.theme_service.set_theme("dark", persist=False)
-        title_bar.apply_theme(title_bar.theme_service)
-        self.assertEqual(title_bar.settings_button.text(), "\u2699")
-        self.assertTrue(title_bar.settings_button.icon().isNull())
+        for theme_id in (
+            "cyber_forge",
+            "obsidian_forge",
+            "velvet_rose",
+            "celestial_rose",
+            "dark",
+            "light",
+        ):
+            title_bar.theme_service.set_theme(theme_id, persist=False)
+            title_bar.apply_theme(title_bar.theme_service)
+            with self.subTest(theme_id=theme_id):
+                self.assertEqual(title_bar.settings_button.text(), "")
+                self.assertFalse(title_bar.settings_button.icon().isNull())
+                self.assertEqual(
+                    Path(title_bar._settings_movie_path).resolve(),
+                    shared_movie_path,
+                )
+                self.assertEqual(
+                    title_bar._settings_static_icon.pixmap(
+                        title_bar.settings_button.iconSize()
+                    ).toImage(),
+                    shared_icon_image,
+                )
         for button in (
             title_bar.btn_minimize,
             title_bar.btn_max,

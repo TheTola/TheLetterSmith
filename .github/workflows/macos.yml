@@ -29,9 +29,12 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "13.0"
       QT_QPA_PLATFORM: offscreen
       QTWEBENGINE_DISABLE_SANDBOX: "1"
+      PYTHONFAULTHANDLER: "1"
       LETTER_SMITH_MACOS_TARGET_ARCH: ${{ matrix.target_architecture }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          lfs: true
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
@@ -49,6 +52,15 @@ jobs:
       - name: Validate native macOS release inputs
         run: python release/build_macos.py --validate-only
       - name: Run complete test suite
-        run: python -m unittest discover -s test -p 'test_*.py'
+        run: python -m unittest discover -s test -p 'test_*.py' -v
       - name: Build and verify ad-hoc macOS package
         run: python release/build_macos.py --build --confirm-package
+      - name: Upload macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: LetterSmith-macOS-${{ matrix.target_architecture }}
+          path: |
+            release/macos/*.dmg
+            release/macos/release-report-${{ matrix.target_architecture }}.json
+          if-no-files-found: error
+          compression-level: 0

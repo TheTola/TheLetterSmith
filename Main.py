@@ -403,6 +403,9 @@ def bootstrap_qt(
             )
         )
 
+    from ui_theme import install_button_text_guard
+
+    install_button_text_guard(application)
     return application
 
 
@@ -431,6 +434,7 @@ def _show_critical(
 def install_exception_hook(
     app_name: str,
     log_path: Path | None = None,
+    diagnostics: object | None = None,
 ) -> None:
     """
     Record uncaught main-thread, background-thread, and unraisable failures.
@@ -442,6 +446,20 @@ def install_exception_hook(
         exception,
         traceback_object,
     ) -> None:
+        recorder = getattr(
+            diagnostics,
+            "record_unhandled_exception",
+            None,
+        )
+        if callable(recorder):
+            try:
+                recorder(
+                    context,
+                    exception_type,
+                    traceback_object,
+                )
+            except Exception:
+                pass
         trace = "".join(
             traceback.format_exception(
                 exception_type,
@@ -683,6 +701,13 @@ def main() -> None:
         icon
     )
 
+    from beta_diagnostics import install_beta_diagnostics
+
+    beta_diagnostics = install_beta_diagnostics(
+        application,
+        paths,
+    )
+
     from ui_fonts import load_application_fonts
 
     load_application_fonts(root)
@@ -690,6 +715,7 @@ def main() -> None:
     install_exception_hook(
         APP_NAME,
         paths.logs_root / LOG_FILE_NAME,
+        beta_diagnostics,
     )
 
     _upgrade_saved_letters_at_startup(root)

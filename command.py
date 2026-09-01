@@ -2105,7 +2105,7 @@ class CommandTab(
             "icons"
         )
         countdown_sound_path = app_paths.app_resource_path(
-            "sounds/Blip.mp3"
+            "sounds/App sounds/Blip.mp3"
         )
 
         self._bg_path = (

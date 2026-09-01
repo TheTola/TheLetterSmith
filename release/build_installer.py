@@ -345,7 +345,7 @@ def build_installer(*, sign: bool = False) -> Path:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate or build the Letter Smith 1.0.0 Windows installer."
+        description="Validate or build the Letter Smith 1.0.0 Beta 1 Windows installer."
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(

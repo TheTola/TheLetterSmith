@@ -63,6 +63,8 @@ from ui_theme import (
     ThemeService,
     apply_button_tier,
     apply_tab_heading_style,
+    install_button_text_guard,
+    minimum_button_text_size,
     normalize_theme_id,
 )
 
@@ -357,11 +359,13 @@ class ThemeServiceTests(unittest.TestCase):
         self.assertEqual(sound_button.styleSheet(), "")
         self.assertEqual(button.property("buttonTier"), "standard")
         self.assertEqual(sound_button.property("buttonTier"), "standard")
-        self.assertEqual(
-            button.size(),
-            BUTTON_TIER_STYLES[ButtonTier.STANDARD].size,
-        )
-        self.assertEqual(button.size(), sound_button.size())
+        tier_size = BUTTON_TIER_STYLES[ButtonTier.STANDARD].size
+        for themed_button in (button, sound_button):
+            required = minimum_button_text_size(themed_button)
+            self.assertGreaterEqual(themed_button.width(), tier_size.width())
+            self.assertGreaterEqual(themed_button.height(), tier_size.height())
+            self.assertGreaterEqual(themed_button.width(), required.width())
+            self.assertGreaterEqual(themed_button.height(), required.height())
         self.assertAlmostEqual(button.font().pointSizeF(), 14.3)
         self.assertAlmostEqual(sound_button.font().pointSizeF(), 14.3)
         self.assertTrue(button.font().bold())
@@ -401,7 +405,7 @@ class ThemeServiceTests(unittest.TestCase):
                     ),
                     expected_tiers[tier],
                 )
-                button = QtWidgets.QPushButton("Role-assigned")
+                button = QtWidgets.QPushButton("Role")
                 self.addCleanup(button.deleteLater)
 
                 apply_button_tier(button, tier)
@@ -524,6 +528,55 @@ class ThemeServiceTests(unittest.TestCase):
                             available_width,
                         )
 
+    def test_long_tier_label_expands_across_every_theme(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        service = ThemeService(repository, settings=SettingsStore(self.root))
+        button = QtWidgets.QPushButton("Copy Support Information")
+        self.addCleanup(button.deleteLater)
+        apply_button_tier(button, ButtonTier.SMALL)
+
+        for theme_id in THEMES:
+            service.set_theme(theme_id, persist=False)
+            service.apply_semantic_styles(button)
+            QtWidgets.QApplication.processEvents()
+            required = minimum_button_text_size(button)
+            with self.subTest(theme_id=theme_id):
+                self.assertGreaterEqual(button.width(), required.width())
+                self.assertGreaterEqual(button.height(), required.height())
+
+    def test_runtime_guard_refits_a_dynamic_fixed_width_label(self) -> None:
+        existing_guard = getattr(
+            self.app,
+            "_lettersmith_button_text_fit_guard",
+            None,
+        )
+        guard = install_button_text_guard(self.app)
+        if existing_guard is None and guard is not None:
+            def remove_guard() -> None:
+                self.app.removeEventFilter(guard)
+                delattr(self.app, "_lettersmith_button_text_fit_guard")
+
+            self.addCleanup(remove_guard)
+
+        for button_type in (
+            QtWidgets.QPushButton,
+            QtWidgets.QToolButton,
+            QtWidgets.QCheckBox,
+            QtWidgets.QRadioButton,
+        ):
+            with self.subTest(button_type=button_type.__name__):
+                button = button_type()
+                button.setText("Ready")
+                button.setFixedSize(80, 34)
+                self.addCleanup(button.deleteLater)
+                button.show()
+                button.setText("Preparing Support Information...")
+                QtWidgets.QApplication.processEvents()
+
+                required = minimum_button_text_size(button)
+                self.assertGreaterEqual(button.width(), required.width())
+                self.assertGreaterEqual(button.height(), required.height())
+
     def test_basic_themes_use_compact_button_geometry(self) -> None:
         expected_basic_sizes = {
             ButtonTier.LARGE: QtCore.QSize(277, 82),
@@ -542,7 +595,8 @@ class ThemeServiceTests(unittest.TestCase):
         button = QtWidgets.QPushButton("Revisions")
         self.addCleanup(button.deleteLater)
         apply_button_tier(button, ButtonTier.STANDARD)
-        service = ThemeService(self.root)
+        repository = Path(__file__).resolve().parents[1]
+        service = ThemeService(repository, settings=SettingsStore(self.root))
 
         for theme_id in ("dark", "light"):
             service.set_theme(theme_id, persist=False)
@@ -646,6 +700,12 @@ class ThemeServiceTests(unittest.TestCase):
         self.assertEqual(
             service.resolve_first_asset(HELP_THEME_ASSET_CANDIDATES["hover"]),
             themed_hover_png.resolve(),
+        )
+        themed_hover_png.unlink()
+        themed_hover_gif.unlink()
+        self.assertEqual(
+            service.resolve_first_asset(HELP_THEME_ASSET_CANDIDATES["hover"]),
+            themed_png.resolve(),
         )
         themed_gif.write_bytes(b"gif")
         self.assertEqual(

@@ -161,6 +161,8 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
             try:
                 window.show()
                 self.app.processEvents()
+                self.assertTrue(callable(window.title_bar.parent))
+                self.assertIs(window.title_bar.parent(), window.main_widget)
                 self.assertIsNone(window._window_controller._maximize_button)
                 self.assertFalse(window.isMaximized())
                 original_geometry = QtCore.QRect(window.geometry())

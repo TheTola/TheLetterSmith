@@ -75,6 +75,7 @@ from settings_store import (
 )
 from ui_dialogs import LetterSmithConfirmationDialog, LetterSmithMessageDialog
 from ui_help import set_control_help
+from ui_sounds import UiSound, play_ui_sound
 from ui_theme import (
     CYBER_FORGE_THEME,
     BUTTON_FULL_TIER_GEOMETRY_PROPERTY,
@@ -99,6 +100,9 @@ PREVIEW_MODE_DESCRIPTIONS = {
     "landscape": " ",
     "window": "",
 }
+_GITHUB_WARNING_BACKGROUND = "#0d1117"
+_GITHUB_WARNING_BORDER = "#58a6ff"
+_GITHUB_WARNING_TEXT = "#f0f6fc"
 RECENT_SAVED_LETTER_LIMIT = 15
 _CATALOG_INTERNAL_CHANGE_GRACE_SECONDS = 1.0
 _FORGE_RELEVANT_SETTING_KEYS = frozenset(
@@ -1690,6 +1694,9 @@ class ForgeTab(QtWidgets.QWidget):
         )
         publishing_row.addWidget(self.publishing_provider_label)
         self.github_account_summary = QtWidgets.QLabel()
+        self.github_account_summary.setObjectName(
+            "ForgeGitHubAccountSummary"
+        )
         self.github_account_summary.setStyleSheet(
             "color:#9fcbd5;font:600 9pt 'Segoe UI';"
         )
@@ -2088,8 +2095,16 @@ class ForgeTab(QtWidgets.QWidget):
         elif not configuration.configured:
             summary = "Developer setup required"
         else:
-            summary = "Not connected"
-        self.github_account_summary.setText(summary)
+            summary = "Not signed in to GitHub"
+        sign_in_warning = bool(
+            state == GitHubConnectionState.DISCONNECTED
+            and configuration.configured
+            and not self._github_account_checking
+        )
+        self._set_github_account_summary(
+            summary,
+            sign_in_warning=sign_in_warning,
+        )
         connected = bool(
             account is not None
             and state in {
@@ -2118,15 +2133,23 @@ class ForgeTab(QtWidgets.QWidget):
                 broken=connected and image_theme,
             )
         uses_artwork = self.github_account_btn.uses_artwork_presentation
-        self.github_account_btn.setText(
-            ""
-            if connected or uses_artwork
-            else "GitHub Connected"
-            if state == GitHubConnectionState.CONNECTED
-            else "GitHub Reconnecting"
-            if state == GitHubConnectionState.RECONNECTING and account is not None
-            else "Connect GitHub"
-        )
+        if connected:
+            button_text = ""
+        elif state == GitHubConnectionState.DISCONNECTED:
+            button_text = "Sign in"
+        elif uses_artwork:
+            button_text = ""
+        elif state == GitHubConnectionState.CONNECTED:
+            button_text = "GitHub Connected"
+        elif (
+            state == GitHubConnectionState.RECONNECTING
+            and account is not None
+        ):
+            button_text = "GitHub Reconnecting"
+        else:
+            button_text = "Connect GitHub"
+        self.github_account_btn.setText(button_text)
+        apply_button_tier(self.github_account_btn, ButtonTier.SMALL)
         self.github_account_btn.setEnabled(
             not self._busy
             and state not in {
@@ -2137,16 +2160,52 @@ class ForgeTab(QtWidgets.QWidget):
         self.github_account_btn.setAccessibleName(
             "GitHub Account — connected"
             if connected
+            else "Sign in to GitHub"
+            if state == GitHubConnectionState.DISCONNECTED
             else "GitHub Account — not connected"
         )
         self.github_account_dialog.set_connection(snapshot)
         if hasattr(self, "publish_btn"):
             self._update_letter_action_button_states()
 
+    def _set_github_account_summary(
+        self,
+        summary: str,
+        *,
+        sign_in_warning: bool,
+    ) -> None:
+        self.github_account_summary.setText(summary)
+        self.github_account_summary.setAccessibleName(summary)
+        self.github_account_summary.setProperty(
+            "githubSignInWarning",
+            sign_in_warning,
+        )
+        if sign_in_warning:
+            self.github_account_summary.setToolTip(
+                "Sign in to GitHub before publishing this letter."
+            )
+            self.github_account_summary.setStyleSheet(
+                "QLabel#ForgeGitHubAccountSummary{"
+                f"color:{_GITHUB_WARNING_TEXT};"
+                f"background:{_GITHUB_WARNING_BACKGROUND};"
+                f"border:1px solid {_GITHUB_WARNING_BORDER};"
+                "border-radius:8px;padding:4px 9px;"
+                "font:700 9pt 'Segoe UI';}"
+            )
+            return
+        colors = getattr(self, "_theme_tokens", CYBER_FORGE_THEME.tokens)
+        self.github_account_summary.setToolTip("")
+        self.github_account_summary.setStyleSheet(
+            "QLabel#ForgeGitHubAccountSummary{"
+            f"color:{colors.muted_text};background:transparent;"
+            "border:none;padding:0;font:600 9pt 'Segoe UI';}"
+        )
+
     @QtCore.Slot(object)
     def _apply_github_state(self, result: object) -> None:
         if self._shutdown or not isinstance(result, GitHubConnectionSnapshot):
             return
+        previous_state = self._github_snapshot.state
         self._github_snapshot = result
         self._github_session = result.session
         self._github_account = (
@@ -2206,6 +2265,20 @@ class ForgeTab(QtWidgets.QWidget):
                 0,
                 lambda: self._defer_until_idle(self.sign_in_github),
             )
+        if (
+            result.state == GitHubConnectionState.CONNECTED
+            and previous_state != GitHubConnectionState.CONNECTED
+        ):
+            play_ui_sound(UiSound.GITHUB_CONNECTED)
+        elif (
+            result.state == GitHubConnectionState.DISCONNECTED
+            and previous_state
+            in {
+                GitHubConnectionState.CONNECTED,
+                GitHubConnectionState.RECONNECTING,
+            }
+        ):
+            play_ui_sound(UiSound.GITHUB_DISCONNECTED)
         self._sync_publishing_controls()
 
     def _schedule_github_reconnect(
@@ -3478,6 +3551,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._set_saved_delete_mode(False)
         self._refresh_catalog_entry(deleted)
         self._set_status("Saved letter deleted.")
+        play_ui_sound(UiSound.REMOVED)
 
     def _layout_saved_cards(self) -> None:
         if not hasattr(self, "saved_cards_layout"):
@@ -4038,6 +4112,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._protected_published = index.is_file()
         self._sync_published_url()
         if self._protected_published:
+            play_ui_sound(UiSound.PUBLISH_COMPLETE)
             self._set_status(
                 "Published for this demonstration. Open Letter is ready."
             )
@@ -4398,6 +4473,7 @@ class ForgeTab(QtWidgets.QWidget):
             if source_changed
             else "The letter is published."
         )
+        play_ui_sound(UiSound.PUBLISH_COMPLETE)
         self._finish_publication_activity("publish")
 
     def unpublish_letter(self) -> None:
@@ -4572,6 +4648,7 @@ class ForgeTab(QtWidgets.QWidget):
             str(getattr(unpublish_result, "message", ""))
             or "The online copy was removed. The local letter was preserved."
         )
+        play_ui_sound(UiSound.REMOVED)
         self._finish_publication_activity("unpublish")
 
     def _show_unpublish_failure(self, unpublish_result: object) -> None:

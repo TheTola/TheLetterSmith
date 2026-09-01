@@ -14,6 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
 from command_bar import (
+    COMMAND_COMPACT_POSITION_SETTINGS_KEY,
     CommandBarData,
     CommandBarWindow,
     build_command_bar_data,
@@ -177,6 +178,8 @@ class CommandBarTests(unittest.TestCase):
         try:
             window.show()
             self.app.processEvents()
+            self.assertEqual(window.windowType(), QtCore.Qt.WindowType.Window)
+            self.assertFalse(window.windowIcon().isNull())
             self.assertEqual(window.font().family(), COMMAND_FONT_FAMILY)
             self.assertEqual(
                 window.recipient_label.font().family(),
@@ -524,13 +527,6 @@ class CommandBarTests(unittest.TestCase):
             )
             for name in ("bloodsnow.gif", "scanned.gif", "com.gif"):
                 icons.joinpath(name).write_bytes(animated_gif)
-            maximize = QtGui.QImage(
-                12,
-                8,
-                QtGui.QImage.Format.Format_ARGB32,
-            )
-            maximize.fill(QtGui.QColor("#ff0000"))
-            self.assertTrue(maximize.save(str(icons / "maximize.png")))
             window = CommandBarWindow(
                 CommandBarData("Recipient", "Title", None, ""),
                 root,
@@ -554,8 +550,9 @@ class CommandBarTests(unittest.TestCase):
                 self.assertFalse(window.isMinimized())
                 self.assertFalse(window._surface.isVisible())
                 self.assertTrue(window._compact_label.isVisible())
-                self.assertTrue(window.compact_maximize_button.isVisible())
-                self.assertFalse(window.compact_maximize_button.icon().isNull())
+                self.assertFalse(
+                    window.compact_maximize_button.isVisible()
+                )
                 self.assertEqual(
                     window.grab().toImage().pixelColor(0, 0).alpha(),
                     0,
@@ -592,11 +589,15 @@ class CommandBarTests(unittest.TestCase):
                     window.frameGeometry().topLeft(),
                     compact_position,
                 )
-
-                QtTest.QTest.mouseClick(
-                    window._compact_label,
-                    QtCore.Qt.MouseButton.LeftButton,
+                saved_position = SettingsStore(root).get(
+                    COMMAND_COMPACT_POSITION_SETTINGS_KEY,
                 )
+                self.assertEqual(
+                    saved_position,
+                    {"x": window.x(), "y": window.y()},
+                )
+
+                window._restore_expanded_mode()
                 self.app.processEvents()
 
                 self.assertFalse(window.is_compact)
@@ -617,7 +618,22 @@ class CommandBarTests(unittest.TestCase):
                 window.abort_launch()
             self.assertEqual(compact_movie.fileName(), "")
 
-    def test_compact_maximize_button_reopens_letter_smith(self) -> None:
+            restored = CommandBarWindow(
+                CommandBarData("Recipient", "Title", None, ""),
+                root,
+            )
+            try:
+                restored.show()
+                restored._enter_compact_mode()
+                self.app.processEvents()
+                self.assertEqual(
+                    {"x": restored.x(), "y": restored.y()},
+                    saved_position,
+                )
+            finally:
+                restored.abort_launch()
+
+    def test_compact_envelope_click_reopens_letter_smith(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             icons = root / "gallery" / "app" / "icons"
@@ -629,13 +645,6 @@ class CommandBarTests(unittest.TestCase):
                     "21f904000a0000002c00000000010001000002024401003b"
                 )
             )
-            maximize = QtGui.QImage(
-                12,
-                8,
-                QtGui.QImage.Format.Format_ARGB32,
-            )
-            maximize.fill(QtGui.QColor("#ff0000"))
-            self.assertTrue(maximize.save(str(icons / "maximize.png")))
             entrypoint = root / "Main.py"
             entrypoint.write_text("", encoding="utf-8")
             window = CommandBarWindow(
@@ -646,6 +655,9 @@ class CommandBarTests(unittest.TestCase):
                 window.show()
                 window._enter_compact_mode()
                 self.app.processEvents()
+                self.assertFalse(
+                    window.compact_maximize_button.isVisible()
+                )
                 with (
                     mock.patch.object(
                         QtCore.QProcess,
@@ -654,7 +666,10 @@ class CommandBarTests(unittest.TestCase):
                     ) as start_detached,
                     mock.patch.object(window, "close") as close_window,
                 ):
-                    window.compact_maximize_button.click()
+                    QtTest.QTest.mouseClick(
+                        window._compact_label,
+                        QtCore.Qt.MouseButton.LeftButton,
+                    )
 
                 start_detached.assert_called_once_with(
                     sys.executable,
@@ -663,7 +678,78 @@ class CommandBarTests(unittest.TestCase):
                 )
                 close_window.assert_called_once_with()
                 self.assertTrue(window._reopen_started)
+                self.assertFalse(window._compact_label.isEnabled())
+                self.assertFalse(window.compact_maximize_action.isEnabled())
                 self.assertFalse(window.compact_maximize_button.isEnabled())
+            finally:
+                window.abort_launch()
+
+    def test_compact_envelope_right_click_menu_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            icons = root / "gallery" / "app" / "icons"
+            icons.mkdir(parents=True)
+            icons.joinpath("com.gif").write_bytes(
+                bytes.fromhex(
+                    "47494638396101000100800000000000ffffff"
+                    "21ff0b4e45545343415045322e300301000000"
+                    "21f904000a0000002c00000000010001000002024401003b"
+                )
+            )
+            entrypoint = root / "Main.py"
+            entrypoint.write_text("", encoding="utf-8")
+            url = "https://example.com/letter"
+            window = CommandBarWindow(
+                CommandBarData("Recipient", "Title", None, url),
+                root,
+            )
+            try:
+                window.show()
+                window._enter_compact_mode()
+                self.app.processEvents()
+
+                self.assertEqual(
+                    [action.text() for action in window._compact_menu.actions()],
+                    ["Close", "Maximize", "Copy Letter URL"],
+                )
+                self.assertTrue(window.compact_copy_url_action.isEnabled())
+                window.compact_copy_url_action.trigger()
+                self.assertEqual(QtWidgets.QApplication.clipboard().text(), url)
+
+                local_position = QtCore.QPoint(8, 8)
+                global_position = window._compact_label.mapToGlobal(
+                    local_position
+                )
+                event = QtGui.QContextMenuEvent(
+                    QtGui.QContextMenuEvent.Reason.Mouse,
+                    local_position,
+                    global_position,
+                )
+                with mock.patch.object(
+                    window,
+                    "_show_compact_context_menu",
+                ) as show_menu:
+                    QtWidgets.QApplication.sendEvent(
+                        window._compact_label,
+                        event,
+                    )
+                show_menu.assert_called_once_with(global_position)
+
+                with (
+                    mock.patch.object(
+                        QtCore.QProcess,
+                        "startDetached",
+                        return_value=(True, 42),
+                    ) as start_detached,
+                    mock.patch.object(window, "close") as close_window,
+                ):
+                    window.compact_maximize_action.trigger()
+                start_detached.assert_called_once_with(
+                    sys.executable,
+                    [str(entrypoint.resolve())],
+                    str(root.resolve()),
+                )
+                close_window.assert_called_once_with()
             finally:
                 window.abort_launch()
 
@@ -744,6 +830,7 @@ class CommandBarTests(unittest.TestCase):
             self.assertEqual(window.data.published_url, "")
             self.assertFalse(window.open_button.isEnabled())
             self.assertFalse(window.copy_button.isEnabled())
+            self.assertFalse(window.compact_copy_url_action.isEnabled())
             window.abort_launch()
 
     def test_openable_target_requires_a_real_action(self) -> None:

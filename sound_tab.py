@@ -72,6 +72,7 @@ from ui_dialogs import (
     LetterSmithInputDialog,
     show_lettersmith_message,
 )
+from ui_sounds import UiSound, play_ui_sound
 from ui_theme import (
     ROW_LAYOUT_SPACING,
     SECTION_LAYOUT_SPACING,
@@ -1636,6 +1637,7 @@ class ProjectSound(
         self,
         track_id: str,
     ) -> None:
+        was_present = track_id in self.state.playlist
         self.state.playlist = [
             item
             for item
@@ -1655,7 +1657,9 @@ class ProjectSound(
             else:
                 self.state.selected_track_id = ""
 
-        self.save()
+        changed = self.save()
+        if was_present and changed:
+            play_ui_sound(UiSound.REMOVED)
 
     def select_track(
         self,
@@ -3693,15 +3697,16 @@ class ArchiveDialog(
 
         self._stop_preview()
 
+        removed = False
         for track_id in track_ids:
             record = self.library.get(track_id)
             if record is None or record.source_kind == "stock":
                 continue
-            self.delete_callback(
-                track_id
-            )
+            removed = self.delete_callback(track_id) or removed
 
         self.refresh()
+        if removed:
+            play_ui_sound(UiSound.REMOVED)
 
     def closeEvent(
         self,
@@ -5790,6 +5795,8 @@ class SoundTab(QtWidgets.QWidget):
         self._show_status(
             f"Added {len(track_ids)} track{suffix}."
         )
+        if track_ids:
+            play_ui_sound(UiSound.ADDED)
 
     def _import_failed(
         self,
@@ -5906,6 +5913,7 @@ class SoundTab(QtWidgets.QWidget):
         self,
         track_ids: list[str],
     ) -> None:
+        previous_ids = tuple(self.project_sound.ordered_ids())
         if (
             self.project_sound
             .state
@@ -5920,6 +5928,9 @@ class SoundTab(QtWidgets.QWidget):
             self.project_sound.set_single(
                 track_ids[0]
             )
+
+        if tuple(self.project_sound.ordered_ids()) != previous_ids:
+            play_ui_sound(UiSound.ADDED)
 
     def _delete_archive_track(
         self,
@@ -5971,6 +5982,8 @@ class SoundTab(QtWidgets.QWidget):
                 self.project_sound.remove_usage(
                     track_id
                 )
+
+                play_ui_sound(UiSound.REMOVED)
 
                 return False
 
@@ -6231,6 +6244,7 @@ class SoundTab(QtWidgets.QWidget):
             )
 
             self.project_sound.clear()
+            play_ui_sound(UiSound.REMOVED)
 
     def _toggle_play(
         self,

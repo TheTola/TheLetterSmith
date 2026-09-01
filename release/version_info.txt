@@ -17,12 +17,12 @@ VSVersionInfo(
           [
             StringStruct("CompanyName", "Infini Works"),
             StringStruct("FileDescription", "Letter Smith"),
-            StringStruct("FileVersion", "1.0.0"),
+            StringStruct("FileVersion", "1.0.0-beta.1"),
             StringStruct("InternalName", "LetterSmith"),
             StringStruct("LegalCopyright", "Copyright Infini Works"),
             StringStruct("OriginalFilename", "LetterSmith.exe"),
             StringStruct("ProductName", "Letter Smith"),
-            StringStruct("ProductVersion", "1.0.0")
+            StringStruct("ProductVersion", "1.0.0-beta.1")
           ]
         )
       ]

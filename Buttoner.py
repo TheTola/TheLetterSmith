@@ -426,52 +426,6 @@ def _process_help_assets(
         result.missing_after.append("Help: HHelp.png or HHelp.gif")
 
 
-def _process_settings_assets(
-    directory: Path | None,
-    result: SpecialAssetResult,
-    project_root: Path,
-) -> None:
-    if directory is None or not directory.is_dir():
-        result.missing_after.extend(("Settings: settings.png", "Settings: Settings.gif"))
-        result.errors.append("Settings directory is missing.")
-        return
-    files = _direct_theme_images(directory)
-    protected = [path for path in files if path.name.casefold() == "settingz.gif"]
-    result.protected.extend(path.name for path in protected)
-
-    for extension, canonical_name in ((".png", "settings.png"), (".gif", "Settings.gif")):
-        recognized = [
-            path
-            for path in files
-            if path.name.casefold() == canonical_name.casefold()
-            and path.suffix.casefold() == extension
-        ]
-        candidate_pool = [
-            path
-            for path in files
-            if path.suffix.casefold() == extension
-            and path not in recognized
-            and path not in protected
-        ]
-        candidates = _valid_special_candidates(
-            candidate_pool,
-            frozenset({extension}),
-            result,
-        )
-        target = directory / canonical_name
-        if len(candidates) == 1:
-            _replace_special_asset(candidates[0], recognized, target, result, project_root)
-        elif len(candidates) > 1:
-            result.unused_candidates.extend(path.name for path in candidates)
-            result.warnings.append(
-                f"Settings: multiple {extension.upper()} candidates found; no file was renamed."
-            )
-        elif recognized:
-            _normalize_special_asset(recognized[0], target, result)
-        if not target.is_file():
-            result.missing_after.append(f"Settings: {canonical_name}")
-
-
 def process_special_theme_images(
     theme_id: str,
     theme_directory: Path,
@@ -489,7 +443,6 @@ def process_special_theme_images(
     new_directory = _find_child_directory(theme_directory, "New")
     prompt_directory = _find_child_directory(theme_directory, "prompt_writer")
     help_directory = _find_child_directory(theme_directory, "help")
-    settings_directory = _find_child_directory(theme_directory, "settings")
     titlebar_directory = _find_child_directory(theme_directory, "titlebar")
 
     _process_single_png_asset(
@@ -507,7 +460,6 @@ def process_special_theme_images(
         project_root,
     )
     _process_help_assets(help_directory, result, project_root)
-    _process_settings_assets(settings_directory, result, project_root)
     result.titlebar_images = [
         path.name for path in _direct_theme_images(titlebar_directory)
     ]
@@ -1157,7 +1109,6 @@ class ThemePanel(QtWidgets.QFrame):
             "help": "Help",
             "new": "New Project",
             "prompt_writer": "Prompt Writer",
-            "settings": "Settings",
             "titlebar": "Title Bar",
         }
         grouped: dict[str, list[Path]] = {}
@@ -1170,7 +1121,7 @@ class ThemePanel(QtWidgets.QFrame):
             )
             grouped.setdefault(category_key, []).append(path)
 
-        category_order = ("new", "help", "prompt_writer", "settings", "titlebar", "other")
+        category_order = ("new", "help", "prompt_writer", "titlebar", "other")
         ordered_keys = [key for key in category_order if key in grouped]
         ordered_keys.extend(sorted(key for key in grouped if key not in category_order))
         for category_key in ordered_keys:
