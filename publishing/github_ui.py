@@ -6,6 +6,7 @@ import threading
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
 
+from external_urls import open_external_url
 from project_paths import application_paths
 from publishing.github_auth import (
     GitHubAccount,
@@ -385,6 +386,13 @@ class GitHubAuthenticationDialog(QtWidgets.QDialog):
                 signals.connected.emit(snapshot.session)
         except GitHubOperationError as error:
             if not cancelled.is_set():
+                _LOGGER.warning(
+                    "GitHub authentication transport failed: code=%s "
+                    "status=%s details=%s",
+                    error.code,
+                    error.status,
+                    error.technical_details or "unavailable",
+                )
                 signals.failed.emit(error.user_message)
         except Exception:
             if not cancelled.is_set():
@@ -486,10 +494,17 @@ class GitHubAuthenticationDialog(QtWidgets.QDialog):
         self.authorization_code.hide()
         self.connection_status.setText(message)
         self._restart_access_on_open = bool(self._browser_url)
-        self.open_button.setText(
-            "Open GitHub / Retry" if self._restart_access_on_open else "Open GitHub"
+        self._start_auth_on_open = bool(
+            not self._browser_url and self._connection_service is not None
         )
-        self.open_button.setEnabled(bool(self._browser_url))
+        self.open_button.setText(
+            "Open GitHub / Retry"
+            if self._restart_access_on_open
+            else "Retry GitHub Sign-In"
+        )
+        self.open_button.setEnabled(
+            bool(self._browser_url) or self._start_auth_on_open
+        )
         self.authentication_failed.emit(message)
         _LOGGER.warning("GitHub authentication failed: %s", message)
 
@@ -508,7 +523,7 @@ class GitHubAuthenticationDialog(QtWidgets.QDialog):
             return
         if self._authorization_code:
             self._copy_authorization_code()
-        opened = QtGui.QDesktopServices.openUrl(QUrl(self._browser_url))
+        opened = open_external_url(QUrl(self._browser_url))
         _LOGGER.info("GitHub authorization browser launch: opened=%s", opened)
         if not opened:
             self.connection_status.setText(

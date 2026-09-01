@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -72,6 +74,30 @@ class GitHubFailureKind(str, Enum):
 def _safe_details(value: object) -> str:
     text = _TOKEN_PATTERN.sub("[REDACTED]", str(value))
     return _BEARER_PATTERN.sub("Bearer [REDACTED]", text)[:1200]
+
+
+def _network_failure_message(error: BaseException) -> str:
+    reason = getattr(error, "reason", error)
+    detail = f"{type(reason).__name__}: {reason}".casefold()
+    if isinstance(reason, ssl.SSLCertVerificationError) or (
+        "certificate_verify_failed" in detail
+    ):
+        return (
+            "GitHub's security certificate could not be verified. Update the "
+            "system or Python certificate store, then retry. Your letter is "
+            "still saved locally."
+        )
+    if isinstance(reason, socket.gaierror):
+        return (
+            "GitHub's address could not be resolved. Check DNS, VPN, proxy, "
+            "or network settings, then retry. Your letter is still saved locally."
+        )
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return (
+            "GitHub did not respond in time. Check the network connection and "
+            "retry. Your letter is still saved locally."
+        )
+    return "GitHub could not be reached. Your letter is still saved locally."
 
 
 class GitHubOperationError(RuntimeError):
@@ -309,7 +335,7 @@ class GitHubAPI:
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise GitHubOperationError(
                 "network",
-                "GitHub could not be reached. Your letter is still saved locally.",
+                _network_failure_message(error),
                 technical_details=f"{type(error).__name__}: {error}",
             ) from error
         if status not in expected:

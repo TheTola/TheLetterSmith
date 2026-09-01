@@ -896,6 +896,19 @@ class TabSwitcher(QtCore.QObject):
                 pass
         return max(1, int(round(FX.TAB_MS * multiplier)))
 
+    @staticmethod
+    def _has_graphics_effect(widget: QtWidgets.QWidget) -> bool:
+        """Return whether a page or one of its children owns an effect."""
+        candidates = (widget, *widget.findChildren(QtWidgets.QWidget))
+        for candidate in candidates:
+            try:
+                effect = candidate.graphicsEffect()
+                if effect is not None:
+                    return True
+            except RuntimeError:
+                continue
+        return False
+
     def _stop_active(self) -> None:
         grp = self._active
         cleanup = self._active_cleanup
@@ -1142,7 +1155,13 @@ class TabSwitcher(QtCore.QObject):
         new_w.setVisible(True)
         new_w.raise_()
 
-        can_fade = (old_w.graphicsEffect() is None) and (new_w.graphicsEffect() is None)
+        # A page-level opacity effect cannot safely contain installed child effects.
+        # Qt otherwise nests effect source-pixmap renders, which can invalidate
+        # the painter on Cocoa. Preserve the slide without adding parent effects.
+        can_fade = not (
+            self._has_graphics_effect(old_w)
+            or self._has_graphics_effect(new_w)
+        )
 
         start_pos = QtCore.QPoint(new_geo.x() + FX.TAB_OFFSET_PX, new_geo.y())
         end_pos = new_geo.topLeft()

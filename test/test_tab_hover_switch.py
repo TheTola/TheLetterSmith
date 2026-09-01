@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
-from anima import install_hover_tab_switch
+from anima import TabSwitcher, install_hover_tab_switch
 from ui_help import set_action_help, set_control_help, set_tab_help
 
 
@@ -58,6 +58,35 @@ class HoverTabSwitchTests(unittest.TestCase):
         self.tabbar.setCurrentIndex(0)
         self._hover(2)
         self.assertEqual(self.tabbar.currentIndex(), 2)
+
+
+class TabSwitcherGraphicsEffectTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_child_effect_prevents_nested_page_opacity_effects(self) -> None:
+        stack = QtWidgets.QStackedWidget()
+        old_page = QtWidgets.QWidget()
+        new_page = QtWidgets.QWidget()
+        button = QtWidgets.QPushButton("Glow", old_page)
+        child_effect = QtWidgets.QGraphicsDropShadowEffect(button)
+        button.setGraphicsEffect(child_effect)
+        stack.addWidget(old_page)
+        stack.addWidget(new_page)
+        stack.resize(500, 320)
+        stack.show()
+        self.app.processEvents()
+
+        switcher = TabSwitcher(stack)
+        switcher.go_to(1)
+
+        self.assertIs(button.graphicsEffect(), child_effect)
+        self.assertIsNone(old_page.graphicsEffect())
+        self.assertIsNone(new_page.graphicsEffect())
+        QtTest.QTest.qWait(400)
+        self.assertEqual(stack.currentIndex(), 1)
+        stack.close()
 
 
 class UiHelpTests(unittest.TestCase):
@@ -162,6 +191,11 @@ class NexusHoverIntegrationTests(unittest.TestCase):
                     window.tabbar.tabRect(4).center(),
                 )
                 self.assertEqual(window.tabbar.currentIndex(), 4)
+
+                window._tabswitch.go_to(0)
+                self.assertIsNotNone(window._tabswitch._active)
+                window.shutdown()
+                self.assertIsNone(window._tabswitch._active)
             finally:
                 window.shutdown()
                 window.close()

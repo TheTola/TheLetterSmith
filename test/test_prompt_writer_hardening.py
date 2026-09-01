@@ -658,12 +658,32 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
 
         with mock.patch(
-            "PromptWriterPanel.QDesktopServices.openUrl",
+            "PromptWriterPanel.open_external_url",
             return_value=True,
         ) as open_url:
             self.panel.btn_visionary.click()
 
         self.assertEqual(open_url.call_args.args[0].toString(), url)
+
+    def test_visionary_uses_macos_launchservices_fallback(self):
+        url = "https://example.com/custom-visionary"
+        SettingsStore(self.project_root).update_fields(**{VISIONARY_URL_KEY: url})
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+
+        with (
+            mock.patch("external_urls.sys.platform", "darwin"),
+            mock.patch(
+                "external_urls.QtGui.QDesktopServices.openUrl",
+                return_value=False,
+            ),
+            mock.patch(
+                "external_urls.QtCore.QProcess.startDetached",
+                return_value=(True, 123),
+            ) as start_detached,
+        ):
+            self.panel.btn_visionary.click()
+
+        start_detached.assert_called_once_with("/usr/bin/open", [url])
 
     def test_invalid_user_color_storage_does_not_fallback_to_legacy_file(self):
         modules = self.project_root / "Prompter" / "modules"

@@ -4327,6 +4327,16 @@ class Nexus(QtWidgets.QMainWindow):
         _LOGGER.info("Application resource shutdown started.")
         try:
             try:
+                stop_tab_animation = getattr(
+                    self,
+                    "_stop_shared_tab_animation",
+                    None,
+                )
+                if callable(stop_tab_animation):
+                    stop_tab_animation()
+            except Exception:
+                _LOGGER.exception("Tab transition shutdown failed.")
+            try:
                 if not self._stop_curtain_preparation(timeout_ms=5000):
                     _LOGGER.warning(
                         "Curtain preparation did not stop before shutdown."

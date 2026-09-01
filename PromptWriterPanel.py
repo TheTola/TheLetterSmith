@@ -18,10 +18,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QEasingCurve, QUrl
-from PySide6.QtGui import QDesktopServices, QColor
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QGraphicsDropShadowEffect
 
 from app_icon import apply_qt_window_icon, configure_windows_app_identity
+from external_urls import open_external_url
 from image_button import set_control_invisible
 from language_service import get_language_service
 from project_paths import application_paths
@@ -3052,8 +3053,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 DEFAULT_VISIONARY_URL,
             )
         ).strip() or DEFAULT_VISIONARY_URL
-        if not QDesktopServices.openUrl(QUrl(url)):
-            LOGGER.warning("Could not open The Visionary at %s", url)
+        if not open_external_url(QUrl(url)):
+            QtWidgets.QApplication.clipboard().setText(url)
+            LOGGER.warning(
+                "Could not open The Visionary at %s; the address was copied.",
+                url,
+            )
 
 
     def _exclusive_checkbox_groups(

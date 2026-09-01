@@ -1623,6 +1623,8 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
                 not letter_content
                 and themed.strip()
                 and _QSS_INTERFACE_FONT_PATTERN.search(source)
+                and "{" in source
+                and "}" in source
             ):
                 themed = f"{themed.strip()}\n{self._font_role_stylesheet()}"
             if widget is root:

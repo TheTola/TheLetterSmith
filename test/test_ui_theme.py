@@ -877,6 +877,8 @@ class ThemeServiceTests(unittest.TestCase):
         content = QtWidgets.QLabel("Content", root)
         content.setProperty(THEME_FONT_ROLE_PROPERTY, LETTER_CONTENT_FONT_ROLE)
         content.setStyleSheet("QLabel { font-family: 'Segoe UI'; }")
+        inline = QtWidgets.QLabel("Inline", root)
+        inline.setStyleSheet("font:700 12pt 'Segoe UI';")
         self.addCleanup(root.deleteLater)
 
         service.apply_semantic_styles(root)
@@ -889,6 +891,8 @@ class ThemeServiceTests(unittest.TestCase):
         self.assertIn("Segoe UI Emoji", special.styleSheet())
         self.assertIn("Consolas", special.styleSheet())
         self.assertIn("'Segoe UI'", content.styleSheet())
+        self.assertIn("'IBM Plex Sans'", inline.styleSheet())
+        self.assertNotIn("*[themeFontRole", inline.styleSheet())
 
     def test_semantic_style_translation_recolors_legacy_blue_for_every_theme(self) -> None:
         service = ThemeService(self.root)

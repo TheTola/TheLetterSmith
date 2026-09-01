@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import os
+import ssl
 import tempfile
 import threading
 import unittest
@@ -490,6 +491,25 @@ class GitHubAuthenticationTests(unittest.TestCase):
             classify_github_error(raised.exception),
             GitHubFailureKind.TEMPORARY,
         )
+
+    def test_tls_failure_has_actionable_certificate_message(self) -> None:
+        def unavailable(_request, **_kwargs):
+            raise urllib.error.URLError(
+                ssl.SSLCertVerificationError("CERTIFICATE_VERIFY_FAILED")
+            )
+
+        with self.assertRaises(GitHubOperationError) as raised:
+            GitHubAPI(opener=unavailable).request(
+                "POST",
+                "https://github.com/login/device/code",
+                {"client_id": "client"},
+                authenticate=False,
+                form=True,
+            )
+
+        self.assertEqual(raised.exception.code, "network")
+        self.assertIn("certificate", raised.exception.user_message.casefold())
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", raised.exception.technical_details)
 
     def test_secondary_rate_limit_without_headers_waits_one_minute(self) -> None:
         def limited(request, **_kwargs):
@@ -1695,6 +1715,21 @@ class GitHubAccountUITests(unittest.TestCase):
                 dialog.open_button.click()
                 begin.assert_called_once_with(service)
                 open_url.assert_not_called()
+        finally:
+            dialog.close()
+
+    def test_initial_network_failure_allows_device_flow_retry(self) -> None:
+        dialog = GitHubAuthenticationDialog()
+        service = mock.Mock()
+        try:
+            dialog._connection_service = service
+            dialog._browser_url = ""
+            with mock.patch.object(dialog, "begin_authentication") as begin:
+                dialog._authentication_failed("GitHub could not be reached.")
+                self.assertTrue(dialog.open_button.isEnabled())
+                self.assertEqual(dialog.open_button.text(), "Retry GitHub Sign-In")
+                dialog.open_button.click()
+                begin.assert_called_once_with(service)
         finally:
             dialog.close()
 

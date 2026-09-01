@@ -40,8 +40,14 @@ ID, and tester for each run. Do not record credentials or private user data.
   FFmpeg conversion, and FFprobe inspection.
 - WebEngine previews, local media, publication rendering, fullscreen, links,
   and clean shutdown.
+- Cycle Images, Sound, Message, Forge, and Command at least 100 times, including
+  while WebEngine and sound visualization are active; quit during a transition.
+  Require no `QPainter`, `QWidgetEffectSourcePrivate`, stylesheet-parser, or
+  crash messages.
 - GitHub App/device authentication, Keychain allow/deny/locked behavior,
   credential persistence/refresh/sign-out, repository access, publish, and retry.
+- GitHub authorization and The Visionary open in the default browser; test the
+  retry and copied-address behavior after an intentionally failed launch.
 - Finder folder/file opening and native file dialogs.
 - Frameless-window drag/resize/minimize/maximize/full screen, title bars, popups,
   multiple monitors, focus, shortcuts, accessibility names, and VoiceOver.
