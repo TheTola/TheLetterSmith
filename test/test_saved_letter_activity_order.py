@@ -245,7 +245,9 @@ class SavedLetterActivityOrderTests(unittest.TestCase):
 
             tab._last_play_dir = bundle
             tab.saved_page_url = "https://example.com/old"
-            with mock.patch.object(tab, "_update_metadata_silently") as update:
+            with mock.patch.object(
+                forge_module.generate, "play_bundle_directory", return_value=bundle
+            ), mock.patch.object(tab, "_update_metadata_silently") as update:
                 tab.set_saved_page_url("https://example.com/new")
                 self.assertTrue(update.call_args.kwargs["record_activity"])
                 update.reset_mock()

@@ -14,6 +14,9 @@ from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
+
+VISUALIZER_BACKGROUND = "#0F1116"
+
 # Try to import QMediaPlayer constants for robust state comparisons.
 try:
     from PySide6.QtMultimedia import (  # type: ignore
@@ -50,7 +53,7 @@ class _BlankStage(QtWidgets.QWidget):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self._bg_color = QtGui.QColor("#0f1116")
+        self._bg_color = QtGui.QColor(VISUALIZER_BACKGROUND)
         self._grid_color = QtGui.QColor(255, 255, 255, 12)
 
     def paintEvent(self, _ev: QtGui.QPaintEvent) -> None:
@@ -97,7 +100,7 @@ class _LiveBarVisualizer(QtWidgets.QWidget):
         self._player = None
         self._buffer_output = None
 
-        self._bg_color = QtGui.QColor("#0f1116")
+        self._bg_color = QtGui.QColor(VISUALIZER_BACKGROUND)
         self._bar_color = QtGui.QColor(0, 210, 255, 180)
         self._grid_color = QtGui.QColor(255, 255, 255, 12)
 
@@ -263,19 +266,21 @@ class _LiveBarVisualizer(QtWidgets.QWidget):
             return
 
         n = len(self._bars)
-        gap = max(4, int(r.width() * 0.006))
-        total_gap = gap * (n + 1)
-        bar_w = max(6, (r.width() - total_gap) // n)
+        margin = min(10.0, r.width() * 0.04)
+        plot_width = max(1.0, r.width() - margin * 2)
+        gap = min(4.0, plot_width / (n * 4))
+        bar_w = (plot_width - gap * (n - 1)) / n
 
         base_y = int(r.bottom() - max(8, r.height() * 0.10))
         max_h = int(r.height() * 0.64)
-        x = r.left() + gap
+        x = r.left() + margin
 
         p.setPen(Qt.NoPen)
         p.setBrush(self._bar_color)
         for h_ratio in self._bars:
             h = int(max(3, max_h * float(h_ratio)))
-            p.drawRoundedRect(QtCore.QRectF(x, base_y - h, bar_w, h), 3, 3)
+            radius = min(3.0, bar_w / 2)
+            p.drawRoundedRect(QtCore.QRectF(x, base_y - h, bar_w, h), radius, radius)
             x += bar_w + gap
 
         p.end()
@@ -693,12 +698,9 @@ class SoundPreviewWidget(QtWidgets.QFrame):
         self._audio_path = ""
         self._renderer_mode = "inactive"
         self.setObjectName("sound_preview_frame")
+        self.setFrameStyle(QtWidgets.QFrame.NoFrame)
         self.setStyleSheet(
-            "#sound_preview_frame {"
-            "  background: #101014;"
-            "  border: 1px solid #2b2b31;"
-            "  border-radius: 12px;"
-            "}"
+            f"#sound_preview_frame {{ background: {VISUALIZER_BACKGROUND}; border: 0; }}"
         )
         self.setAccessibleName("Sound Preview Frame")
         self.setToolTip("Music visualizer")
@@ -726,7 +728,7 @@ class SoundPreviewWidget(QtWidgets.QFrame):
 
         # Stacked layout to keep size stable while "vanishing"
         stack = QtWidgets.QStackedLayout()
-        stack.setContentsMargins(8, 8, 8, 8)
+        stack.setContentsMargins(0, 0, 0, 0)
         stack.addWidget(self._blank)             # index 0: inactive
         stack.addWidget(self._live_visualizer)   # index 1: live PCM
         if self._analyzed_visualizer is not None:

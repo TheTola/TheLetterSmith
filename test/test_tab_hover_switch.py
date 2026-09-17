@@ -207,6 +207,8 @@ class NexusHoverIntegrationTests(unittest.TestCase):
                 with mock.patch("Nexus.play_ui_sound") as play_sound:
                     window.tabbar.setCurrentIndex(1)
                     self.app.processEvents()
+                    window.tabbar.setCurrentIndex(1)
+                    self.app.processEvents()
                 play_sound.assert_called_once_with(UiSound.TAB_SWITCHED)
 
                 window._tabswitch.go_to(0)

@@ -405,13 +405,18 @@ class CurtainStyleComboBox(QtWidgets.QToolButton):
         self.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self._model: CurtainStyleModel | None = None
         self._current_style = DEFAULT_CURTAIN_STYLE
+        self._choices_available = True
         self._theme_tokens = CYBER_FORGE_THEME.tokens
+        self._popup_anchors: list[QtWidgets.QWidget] = []
         self._choice_menu = _CurtainChoiceMenu(
             "",
             self,
             object_name=f"{object_name}Popup",
         )
         self.setMenu(self._choice_menu)
+        self._choice_menu.installEventFilter(self)
+        self._choice_menu.aboutToShow.connect(self._track_popup_anchor)
+        self._choice_menu.aboutToHide.connect(self._release_popup_anchor)
         self._choice_menu.styleActivated.connect(self._activate_style)
         self._choice_menu.previewColorsRequested.connect(
             self.previewColorsRequested
@@ -439,10 +444,29 @@ class CurtainStyleComboBox(QtWidgets.QToolButton):
         return self._model
 
     def count(self) -> int:
-        return 0 if self._model is None else self._model.rowCount()
+        if self._model is None or not self._choices_available:
+            return 0
+        return self._model.rowCount()
+
+    def set_choices_available(self, available: bool) -> None:
+        available = bool(available)
+        if self._choices_available == available:
+            return
+        self._choices_available = available
+        if available:
+            self.set_current_style(self._current_style)
+        else:
+            self.hidePopup()
+            self.setText("")
+        self._arrow.setVisible(available)
+        self._refresh_selected_visual()
 
     def itemData(self, index: int, role: int = CURTAIN_STYLE_ROLE) -> object:
-        if self._model is None or not 0 <= index < self._model.rowCount():
+        if (
+            not self._choices_available
+            or self._model is None
+            or not 0 <= index < self._model.rowCount()
+        ):
             return None
         return self._model.index(index, 0).data(role)
 
@@ -483,7 +507,7 @@ class CurtainStyleComboBox(QtWidgets.QToolButton):
                 label = str(
                     self._model.index(row, 0).data(Qt.DisplayRole) or label
                 )
-        self.setText(label)
+        self.setText(label if self._choices_available else "")
         self._refresh_selected_visual()
 
     def current_style(self) -> str:
@@ -499,6 +523,7 @@ class CurtainStyleComboBox(QtWidgets.QToolButton):
 
     def apply_theme_tokens(self, colors: ThemeTokens) -> None:
         self._theme_tokens = colors
+        self.hidePopup()
         self._choice_menu.apply_theme_tokens(colors)
         self._arrow.setStyleSheet(
             f"color:{colors.accent};background:transparent;"
@@ -507,9 +532,13 @@ class CurtainStyleComboBox(QtWidgets.QToolButton):
         self._refresh_selected_visual()
 
     def showPopup(self) -> None:
-        self.showMenu()
+        if self._choices_available and self.isEnabled():
+            self.showMenu()
 
     def hidePopup(self) -> None:
+        for menu in (self._choice_menu.light_menu, self._choice_menu.dark_menu):
+            if menu is not None:
+                menu.close()
         self._choice_menu.close()
 
     def popup_menu(self) -> QtWidgets.QMenu:
@@ -538,7 +567,7 @@ class CurtainStyleComboBox(QtWidgets.QToolButton):
         colors = self._theme_tokens
         background = _qcolor(colors.control_background, "#202830")
         foreground = _qcolor(colors.text, "#ffffff")
-        if self._model is not None:
+        if self._choices_available and self._model is not None:
             row = self._model.row_for_style(self._current_style)
             if row >= 0:
                 index = self._model.index(row, 0)
@@ -564,14 +593,64 @@ class CurtainStyleComboBox(QtWidgets.QToolButton):
             f"background:{background.name()};color:{foreground.name()};"
             f"border:2px solid {colors.accent};"
             "padding:3px 37px 3px 9px;}"
+            f"QToolButton#{self.objectName()}:disabled{{"
+            f"background:{colors.control_background};color:{colors.muted_text};"
+            f"border:1px solid {colors.border};}}"
             f"QToolButton#{self.objectName()}::menu-indicator{{image:none;}}"
         )
         self.update()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        self._sync_popup_width()
         self._arrow.setGeometry(self.width() - 33, 1, 31, self.height() - 2)
         self._arrow.raise_()
         super().resizeEvent(event)
+
+    def _sync_popup_width(self) -> None:
+        width = self.width()
+        self._choice_menu.setFixedWidth(width)
+        for style in _DIRECT_STYLES:
+            row = self._choice_menu.leaf_widget(style)
+            if row is not None:
+                row.setFixedWidth(width - 12)
+
+    def _track_popup_anchor(self) -> None:
+        self._sync_popup_width()
+        self._release_popup_anchor()
+        anchor: QtWidgets.QWidget | None = self
+        while anchor is not None:
+            anchor.installEventFilter(self)
+            self._popup_anchors.append(anchor)
+            anchor = anchor.parentWidget()
+
+    def _release_popup_anchor(self) -> None:
+        for anchor in self._popup_anchors:
+            try:
+                anchor.removeEventFilter(self)
+            except RuntimeError:
+                pass
+        self._popup_anchors.clear()
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if not hasattr(self, "_choice_menu"):
+            return super().eventFilter(watched, event)
+        if watched is self._choice_menu and event.type() == QtCore.QEvent.Show:
+            # QMenu leaves a one-pixel screen-edge inset on Windows. When the
+            # field fits, keep its border alignment while retaining Qt's y placement.
+            field = QtCore.QRect(self.mapToGlobal(QtCore.QPoint()), self.size())
+            available = self.screen().availableGeometry()
+            if available.left() <= field.left() and field.right() <= available.right():
+                self._choice_menu.move(field.left(), self._choice_menu.y())
+        if watched in self._popup_anchors and event.type() in (
+            QtCore.QEvent.Move,
+            QtCore.QEvent.Resize,
+            QtCore.QEvent.Hide,
+            QtCore.QEvent.ParentChange,
+            QtCore.QEvent.WindowStateChange,
+            QtCore.QEvent.DevicePixelRatioChange,
+        ):
+            self.hidePopup()
+        return super().eventFilter(watched, event)
 
 
 class CurtainStyleMenuSelector(QtCore.QObject):

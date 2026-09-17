@@ -68,7 +68,7 @@ from ui_theme import (
 )
 from ui_fonts import COMMAND_FONT_FAMILY
 from ui_sounds import UiSound, install_ui_sounds, play_ui_sound
-from window_chrome import FramelessWindowController
+from window_chrome import FramelessWindowController, fit_window_to_screen
 
 # ===================================================================================================================================================================================
 # Overlay integration
@@ -159,10 +159,31 @@ def _color_rgba(color: QColor | str, alpha: int) -> str:
     )
 
 WIN_W, WIN_H = 1400, 900
+MIN_WINDOW_SIZE = QSize(960, 600)
 _PREVIEW_AR = 169 / 253  # preview frame aspect (matches your 169├ù253 scaling)
 SHELL_FONT_PX = 13
 SOUND_PREVIEW_MIN_HEIGHT = 220
 SOUND_PREVIEW_MAX_HEIGHT = 253
+PREVIEW_BORDER_PX = 2
+PREVIEW_FRAME_EXTRA = PREVIEW_BORDER_PX * 2
+PREVIEW_CONTENT_BACKGROUND = "#0F1116"
+FORGE_PREVIEW_BACKGROUND = "#0b0c12"
+FORGE_WINDOW_VIEWPORT = QSize(1600, 760)
+
+
+def _fit_preview_content_size(source: QSize, width: int, height: int) -> QSize:
+    """Fit a complete source into a logical-pixel content rectangle."""
+    return source.scaled(
+        QSize(max(1, int(width)), max(1, int(height))),
+        Qt.KeepAspectRatio,
+    )
+
+
+def _activate_preview_frame_layout(frame: QtWidgets.QWidget) -> None:
+    layout = frame.layout()
+    if layout is not None:
+        layout.invalidate()
+        layout.activate()
 
 # Help icon display size
 HELP_ICON_PX = 125
@@ -1562,8 +1583,9 @@ class TitleBar(QtWidgets.QWidget):
             self._nexus.windowState() & ~Qt.WindowMaximized
         )
         self._nexus.showNormal()
-        self._nexus.setGeometry(target)
-        self._normal_window_geometry = QtCore.QRect(target)
+        self._normal_window_geometry = fit_window_to_screen(
+            self._nexus, MIN_WINDOW_SIZE, target
+        )
         self._sync_max_restore_button()
 
     def eventFilter(self, watched, event):
@@ -1957,7 +1979,8 @@ class Nexus(QtWidgets.QMainWindow):
         # Keep maximize/restore on the ordinary Qt click path. Advertising the
         # custom button as HTMAXBUTTON makes Windows consume the click for its
         # Snap Layout flyout before QPushButton can toggle the window state.
-        self._window_controller = FramelessWindowController(self)
+        self._window_controller = FramelessWindowController(self, title_bar=self.title_bar)
+        self._window_controller.system_interaction_finished.connect(self._window_interaction_finished)
         self.title_bar.set_project_title(
             str(self.settings_store.get("recipient_title", ""))
         )
@@ -1997,17 +2020,31 @@ class Nexus(QtWidgets.QMainWindow):
         # Body
         self.body = QtWidgets.QWidget()
         self.body.setObjectName("NexusBody")
+        self.body.installEventFilter(self)
         self.body.setAttribute(Qt.WA_StyledBackground, True)
         body_layout = QtWidgets.QVBoxLayout(self.body)
         body_layout.setContentsMargins(12, 12, 12, 12)
         body_layout.setSpacing(10)
         self.body_layout = body_layout
+        self._forge_compact_layout = False
 
-        # Preview frame (centered)
+        # Keep the allotted preview area stable while each source determines
+        # the proportions of its border inside that area.
+        self.preview_region = QtWidgets.QWidget(self.body)
+        self.preview_region.setObjectName("PreviewRegion")
+        region_layout = QVBoxLayout(self.preview_region)
+        region_layout.setContentsMargins(0, 0, 0, 0)
+        region_layout.setSpacing(0)
+
+        # Shared border; the only inset is the border's own thickness.
         self.preview_frame = QtWidgets.QWidget()
         self.preview_frame.setObjectName("PreviewFrame")
         pf_layout = QVBoxLayout(self.preview_frame)
-        pf_layout.setContentsMargins(6, 6, 6, 6)
+        pf_layout.setContentsMargins(
+            PREVIEW_BORDER_PX, PREVIEW_BORDER_PX,
+            PREVIEW_BORDER_PX, PREVIEW_BORDER_PX,
+        )
+        pf_layout.setSpacing(0)
 
         self.preview_stack = QtWidgets.QStackedWidget(self.preview_frame)
         self.preview_stack.setObjectName("PreviewStack")
@@ -2015,19 +2052,23 @@ class Nexus(QtWidgets.QMainWindow):
         self.preview_blank = QtWidgets.QWidget()
         self.preview_blank.setObjectName("PreviewBlank")
         self.preview_blank.setAttribute(Qt.WA_StyledBackground, True)
+        self.preview_blank.setStyleSheet(
+            f"QWidget#PreviewBlank {{ background:{PREVIEW_CONTENT_BACKGROUND}; }}"
+        )
         self.preview_stack.addWidget(self.preview_blank)
 
         self.image_preview = QtWidgets.QLabel(alignment=Qt.AlignCenter)
         self.image_preview.setStyleSheet("background:transparent;")
         self.preview_stack.addWidget(self.image_preview)
 
-        # Chromium is only needed after Forge has a playable viewer. Keeping
-        # the view absent until then avoids starting WebEngine for Image,
-        # Sound, Message, and recipient-selection sessions.
+        # The browser is initialized before the top-level window is shown.
+        # Its first navigation can recreate the native Windows window, which
+        # would otherwise look like a restart on the first Forge visit.
         self.html_preview: Optional[QtWidgets.QWidget] = None
 
         pf_layout.addWidget(self.preview_stack)
-        body_layout.addWidget(self.preview_frame, alignment=Qt.AlignHCenter)
+        region_layout.addWidget(self.preview_frame, alignment=Qt.AlignCenter)
+        body_layout.addWidget(self.preview_region)
 
         # Caption under preview (Forge tab: project title)
         self.preview_caption = QLabel("", alignment=Qt.AlignCenter)
@@ -2058,7 +2099,11 @@ class Nexus(QtWidgets.QMainWindow):
         help_row.addStretch(1)
         self.preview_tools_layout = help_row
 
-        self.help_icon = QLabel()
+        self.help_anchor = QtWidgets.QWidget(self.body)
+        self.help_anchor.setFixedSize(HELP_ICON_PX, HELP_ICON_PX)
+        self.help_anchor.installEventFilter(self)
+        self.preview_frame.installEventFilter(self)
+        self.help_icon = QLabel(self.body)
         self.help_icon.setObjectName("HelpIcon")
         self.help_icon.setAutoFillBackground(False)
         self.help_icon.setAttribute(Qt.WA_NoSystemBackground, True)
@@ -2073,9 +2118,6 @@ class Nexus(QtWidgets.QMainWindow):
         """)
         self.help_icon.setCursor(Qt.WhatsThisCursor)
         self.help_icon.setAccessibleName("Help ΓÇö instructions for this tab")
-        self.help_icon.setToolTip(
-            "Show instructions for the current Letter Smith workspace."
-        )
         self.help_icon.setFixedSize(HELP_ICON_PX, HELP_ICON_PX)
         self.help_icon.setMouseTracking(True)
         self.help_icon.setAttribute(Qt.WA_Hover, True)
@@ -2087,7 +2129,7 @@ class Nexus(QtWidgets.QMainWindow):
         self._help_movie_hover_path = ""
         self._help_static_idle_path = ""
         self._help_static_hover_path = ""
-        help_row.addWidget(self.help_icon, 0, Qt.AlignRight)
+        help_row.addWidget(self.help_anchor, 0, Qt.AlignRight)
         body_layout.addLayout(help_row)
 
         # Help popover (top-level tooltip window)
@@ -2111,6 +2153,7 @@ class Nexus(QtWidgets.QMainWindow):
         # Feature tabs
         self.page_stack = QtWidgets.QStackedWidget()
         self.page_stack.setObjectName("FeatureStack")
+        self._page_stack_vertical_policy = self.page_stack.sizePolicy().verticalPolicy()
         body_layout.addWidget(self.page_stack)
 
         self.recipient_page = RecipientPage(self.main_widget)
@@ -2153,6 +2196,11 @@ class Nexus(QtWidgets.QMainWindow):
         # Preview fade state
         self._fade_timer: Optional[QtCore.QTimer] = None
         self._fade_anim: Optional[QtCore.QPropertyAnimation] = None
+        self._preview_geometry_timer = QtCore.QTimer(self)
+        self._preview_geometry_timer.setSingleShot(True)
+        self._preview_geometry_timer.timeout.connect(
+            self._refresh_preview_after_layout
+        )
 
         # Message-tab detail visibility is owned by Over_Nexus.
         self._over = install_over_nexus(self)
@@ -2178,8 +2226,12 @@ class Nexus(QtWidgets.QMainWindow):
         # === Mounted Sound visualizer state ===
         self._sound_preview_widget: Optional[QtWidgets.QWidget] = None
         self._sound_preview_index: Optional[int] = None
-        self._forge_preview_mode = "portrait"
+        self._forge_preview_mode = "landscape"
         self._forge_preview_generation = 0
+        self._forge_viewport_measurement: dict[str, object] | None = None
+        self._forge_viewport_timer = QtCore.QTimer(self)
+        self._forge_viewport_timer.setSingleShot(True)
+        self._forge_viewport_timer.timeout.connect(self._measure_forge_viewport)
 
         # Remember last image pixmap for proper re-scaling on resize
         self._last_pixmap: Optional[QPixmap] = None
@@ -2188,7 +2240,7 @@ class Nexus(QtWidgets.QMainWindow):
         self._prompt_writer_win: Optional[QtWidgets.QWidget] = None
 
         # Initial sizing & tab
-        self.setMinimumSize(1180, 820)
+        self.setMinimumSize(MIN_WINDOW_SIZE)
         self.resize(WIN_W, WIN_H)
         self._restore_window_preferences()
 
@@ -2205,6 +2257,7 @@ class Nexus(QtWidgets.QMainWindow):
         self._apply_current_theme()
         self.project_state.add_listener(self._on_project_state_transition)
         self._apply_application_state(initial_project_state)
+        self._ensure_forge_preview().setUrl(QUrl("about:blank"))
         self.project_dirty.mark_saved()
 
         # Diagnostics after event loop starts
@@ -2301,7 +2354,7 @@ class Nexus(QtWidgets.QMainWindow):
             }}
 
             QWidget#PreviewFrame {{
-                background:{colors.card_background};
+                background:transparent;
                 border:2px solid {colors.preview_frame_border};
                 border-radius:6px;
             }}
@@ -2341,11 +2394,6 @@ class Nexus(QtWidgets.QMainWindow):
         help_pop = getattr(self, "help_pop", None)
         if help_pop is not None:
             help_pop.apply_theme(self.theme_service)
-        html_preview = getattr(self, "html_preview", None)
-        if html_preview is not None:
-            background = self.theme_service.tokens.background
-            html_preview.setStyleSheet(f"background-color:{background};")
-            html_preview.page().setBackgroundColor(QColor(background))
         preview_caption = getattr(self, "preview_caption", None)
         if preview_caption is not None:
             preview_caption.setStyleSheet(
@@ -2365,6 +2413,9 @@ class Nexus(QtWidgets.QMainWindow):
             )
         self._apply_theme_assets_to_descendants()
         self._apply_theme_styles_to_ordinary_ui()
+        timer = getattr(self, "_preview_geometry_timer", None)
+        if isinstance(timer, QtCore.QTimer):
+            timer.start(0)
 
     def _apply_theme_assets_to_descendants(self) -> None:
         for widget in self.findChildren(QtWidgets.QWidget):
@@ -2433,6 +2484,7 @@ class Nexus(QtWidgets.QMainWindow):
             project_paths=self.project_paths,
             curtain_styles=self.curtain_styles,
         )
+        self.forge_tab.installEventFilter(self)
         self.command_tab = CommandTab(
             self.project_root,
             project_state=self.project_state,
@@ -2450,19 +2502,31 @@ class Nexus(QtWidgets.QMainWindow):
         self.image_page = self._make_page_surface(
             "ImagePageSurface",
             self.image_tab,
+            scroll_name="ImageControlsScroll",
         )
         self.sound_page = self._make_page_surface(
             "SoundPageSurface",
             self.sound_tab,
+            scroll_name="SoundControlsScroll",
         )
         self.message_page = self._make_page_surface(
             "MessagePageSurface",
             self.message_tab,
+            scroll_name="MessageControlsScroll",
         )
         self.forge_page = self._make_page_surface(
             "ForgePageSurface",
             self.forge_tab,
+            scroll_name="ForgeControlsScroll",
         )
+        self.image_controls_scroll = self.image_page.controls_scroll
+        self.sound_controls_scroll = self.sound_page.controls_scroll
+        self.message_controls_scroll = self.message_page.controls_scroll
+        self.forge_controls_scroll = self.forge_page.controls_scroll
+        # Forge fits its controls to the viewport. Keep its width stable while
+        # wrapped labels reflow instead of feeding scrollbar width back into sizing.
+        self.forge_controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.forge_controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.command_page = self._make_page_surface(
             "CommandPageSurface",
             self.command_tab,
@@ -2483,6 +2547,7 @@ class Nexus(QtWidgets.QMainWindow):
             self._route_forge_correction
         )
         self.forge_tab.preview_requested.connect(self._load_forge_preview)
+        self.forge_tab.preview_failed.connect(self._forge_preview_failed)
         self.forge_tab.preview_visibility_changed.connect(
             self._set_forge_preview_visible
         )
@@ -2786,6 +2851,8 @@ class Nexus(QtWidgets.QMainWindow):
         self,
         object_name: str,
         content: QtWidgets.QWidget,
+        *,
+        scroll_name: str | None = None,
     ) -> QtWidgets.QWidget:
         """Wrap a feature tab in a page-owned background surface."""
         surface = QtWidgets.QWidget(self.page_stack)
@@ -2795,7 +2862,22 @@ class Nexus(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(surface)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addWidget(content)
+        if scroll_name is None:
+            layout.addWidget(content)
+        else:
+            scroll = QtWidgets.QScrollArea(surface)
+            scroll.setObjectName(scroll_name)
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+            scroll.setStyleSheet(
+                f"QScrollArea#{scroll_name}{{background:transparent;border:none;}}"
+                f"QScrollArea#{scroll_name}>QWidget>QWidget"
+                "{background:transparent;}"
+            )
+            scroll.setWidget(content)
+            scroll.viewport().setAutoFillBackground(False)
+            layout.addWidget(scroll)
+            surface.controls_scroll = scroll
 
         # The feature widget itself remains transparent unless it deliberately
         # paints one of its own panels. Its unused regions therefore reveal the
@@ -3087,6 +3169,12 @@ class Nexus(QtWidgets.QMainWindow):
         """Let Command cover all app content while retaining hover navigation."""
         active = bool(active)
         self.title_bar.set_command_mode(active)
+        self.preview_region.setVisible(
+            not active and not self.preview_frame.isHidden()
+        )
+        self.help_anchor.setVisible(
+            not active and self.tabbar.currentIndex() not in {1, 4}
+        )
         if self._command_immersive == active:
             self._sync_protected_project_ui()
             if active:
@@ -3173,14 +3261,50 @@ class Nexus(QtWidgets.QMainWindow):
 
         self._last_pixmap = None
         self._clear_preview()
-        self.preview_stack.setCurrentIndex(0)
+        forge_view = self.html_preview if idx == 3 else None
+        forge_index = (
+            self.forge_tab.current_play_index()
+            if forge_view is not None
+            else None
+        )
+        reuse_forge_view = False
+        if forge_view is not None and forge_index is not None:
+            current_url = forge_view.url()
+            if current_url.isLocalFile():
+                try:
+                    reuse_forge_view = (
+                        Path(current_url.toLocalFile()).resolve()
+                        == forge_index.resolve()
+                    )
+                except OSError:
+                    pass
+        if reuse_forge_view:
+            self.preview_stack.setCurrentWidget(forge_view)
+        else:
+            self.preview_stack.setCurrentIndex(0)
         self.preview_caption.setVisible(False)
         self.preview_frame.setVisible(idx != 4)
+        if idx != 3:
+            self._set_forge_compact_layout(False)
+        self.preview_region.setVisible(idx != 4)
         self.forge_tab.preview_format_panel.setVisible(idx == 3)
+        stack_policy = self.page_stack.sizePolicy()
+        stack_policy.setVerticalPolicy(
+            QtWidgets.QSizePolicy.Ignored if idx == 3
+            else self._page_stack_vertical_policy
+        )
+        self.page_stack.setSizePolicy(stack_policy)
         self._set_command_immersive(idx == 4)
+        if idx != 4:
+            self.body_layout.setSpacing(8 if idx == 3 else 10)
         self._update_preview_tools_geometry()
 
-        if animate_page and self._tabswitch is not None:
+        if idx == 3 and old_idx not in {3, 4}:
+            # Switch directly to Forge so its first paint is never obscured by
+            # a full-workspace transition snapshot.
+            self._stop_shared_tab_animation()
+            self.page_stack.setCurrentIndex(idx)
+        elif animate_page and self._tabswitch is not None:
             self._tabswitch.go_to(idx)
         else:
             self._stop_shared_tab_animation()
@@ -3232,6 +3356,7 @@ class Nexus(QtWidgets.QMainWindow):
             self.preview_stack.setCurrentIndex(0)
 
         self.help_icon.setVisible(idx != 4)
+        self.help_anchor.setVisible(idx not in {1, 3, 4})
         if idx == 4:
             self._stop_help_movies()
         else:
@@ -3244,6 +3369,7 @@ class Nexus(QtWidgets.QMainWindow):
                 self._reposition_help_popover()
 
         QtCore.QTimer.singleShot(0, self._update_preview_geometry)
+        QtCore.QTimer.singleShot(0, self._position_help_icon)
 
     def _autosave_project_on_tab_switch(self) -> str:
         dirty = getattr(self, "project_dirty", None)
@@ -3280,6 +3406,7 @@ class Nexus(QtWidgets.QMainWindow):
             return f"Project not saved: {error}"
         except Exception as error:
             _LOGGER.exception("Project tab-switch autosave failed: %s", error)
+            play_ui_sound(UiSound.ERROR)
             return f"Project autosave failed: {error}"
         if dirty is not None:
             dirty.mark_saved()
@@ -3351,6 +3478,7 @@ class Nexus(QtWidgets.QMainWindow):
             return
         _LOGGER.error("Project tab-switch autosave failed: %s", message)
         if not self._shutdown_in_progress and not self._shutdown_complete:
+            play_ui_sound(UiSound.ERROR)
             self.status(f"Project autosave failed: {message}")
 
     def _finish_project_autosave_for_shutdown(
@@ -3428,11 +3556,78 @@ class Nexus(QtWidgets.QMainWindow):
     def _update_preview_tools_geometry(self) -> None:
         forge_visible = self.tabbar.currentIndex() == 3
         left_margin = (
-            max(0, int(self.width() * 0.085))
-            if forge_visible
+            max(0, int(self.width() * 0.0765))
+            if forge_visible and not self._forge_compact_layout
             else 0
         )
         self.preview_tools_layout.setContentsMargins(left_margin, 0, 0, 0)
+        if forge_visible:
+            self.help_anchor.setVisible(self._forge_compact_layout)
+        icon_size = round(HELP_ICON_PX * 0.9) if forge_visible else HELP_ICON_PX
+        if self.help_icon.width() != icon_size:
+            self.help_anchor.setFixedSize(icon_size, icon_size)
+            self.help_icon.setFixedSize(icon_size, icon_size)
+            for movie in (self._help_movie_idle, self._help_movie_hover):
+                if movie is not None:
+                    movie.setScaledSize(self.help_icon.size())
+            self._show_help_asset("hover" if self.help_icon.underMouse() else "idle")
+
+    def _set_forge_compact_layout(self, compact: bool) -> None:
+        if self._forge_compact_layout == compact:
+            return
+        self._forge_compact_layout = compact
+        region_layout = self.preview_region.layout()
+        source = self.body_layout if compact else region_layout
+        source.removeWidget(self.preview_caption)
+        source.removeItem(self.preview_tools_layout)
+        self.preview_tools_layout.setParent(None)
+        parent = self.preview_region if compact else self.body
+        for widget in (self.preview_caption, self.forge_tab.preview_format_panel, self.help_anchor):
+            visible = not widget.isHidden()
+            widget.setParent(parent)
+            widget.setVisible(visible)
+        if compact:
+            region_layout.addWidget(self.preview_caption, alignment=Qt.AlignHCenter)
+            region_layout.addLayout(self.preview_tools_layout)
+        else:
+            self.body_layout.insertWidget(1, self.preview_caption, alignment=Qt.AlignHCenter)
+            self.body_layout.insertLayout(2, self.preview_tools_layout)
+        self.body_layout.setDirection(
+            QtWidgets.QBoxLayout.LeftToRight if compact else QtWidgets.QBoxLayout.TopToBottom
+        )
+        self.preview_tools_layout.setSpacing(7 if compact else 0)
+        self.forge_tab.preview_format_panel.layout().setDirection(
+            QtWidgets.QBoxLayout.TopToBottom if compact else QtWidgets.QBoxLayout.LeftToRight
+        )
+        region_layout.setSpacing(7 if compact else 0)
+        self.preview_region.setMinimumSize(0, 0)
+        self.preview_region.setMaximumSize(16_777_215, 16_777_215)
+        self.forge_tab.set_compact_layout(compact)
+        self._update_preview_tools_geometry()
+
+    def _position_help_icon(self) -> None:
+        current_tab = self.tabbar.currentIndex()
+        if current_tab in {1, 3} and not self._forge_compact_layout:
+            reference = (
+                self.forge_tab.preview_format_panel
+                if current_tab == 3 and self._project_tabs_initialized
+                else self.preview_frame
+            )
+            preview_top = reference.mapTo(self.body, QPoint(0, 0)).y()
+            x = (
+                self.body.width()
+                - self.body_layout.contentsMargins().right()
+                - self.help_icon.width()
+            )
+            y = preview_top + max(
+                0, (reference.height() - self.help_icon.height()) // 2
+            )
+            self.help_icon.move(x, y)
+        else:
+            self.help_icon.move(self.help_anchor.mapTo(self.body, QPoint(0, 0)))
+        self.help_icon.raise_()
+        if self.help_pop.isVisible():
+            self._reposition_help_popover()
 
     def _stop_shared_tab_animation(self) -> None:
         """Stop and clean the ordinary TabSwitcher without starting another."""
@@ -3605,17 +3800,80 @@ class Nexus(QtWidgets.QMainWindow):
     # =============================================================================================
     # Preview rendering (image/html) + fade behavior
     # =============================================================================================
+    def _forge_preview_loaded(self, _ok: bool) -> None:
+        self._update_forge_preview_zoom()
+
+    def _update_forge_preview_zoom(self) -> None:
+        """Keep the embedded browser's CSS viewport at the target size."""
+        view = getattr(self, "html_preview", None)
+        setter = getattr(view, "setZoomFactor", None)
+        if not callable(setter):
+            return
+        if self._forge_fullscreen_active or self._forge_preview_mode != "window":
+            zoom = 1.0
+        else:
+            width = max(1, view.width())
+            zoom = max(0.25, min(5.0, width / FORGE_WINDOW_VIEWPORT.width()))
+        current = getattr(view, "zoomFactor", lambda: 1.0)()
+        if abs(current - zoom) > 0.0001:
+            setter(zoom)
+        timer = getattr(self, "_forge_viewport_timer", None)
+        if isinstance(timer, QtCore.QTimer):
+            timer.start(120)
+
+    def _measure_forge_viewport(self) -> None:
+        if self._shutdown_in_progress or self._shutdown_complete:
+            return
+        view = self.html_preview
+        if (
+            view is None or self._forge_fullscreen_active
+            or self._forge_preview_mode != "window"
+            or not view.url().isLocalFile()
+        ):
+            return
+
+        def record(value: object) -> None:
+            try:
+                measurement = json.loads(str(value))
+                if not isinstance(measurement, dict):
+                    return
+                self._forge_viewport_measurement = measurement
+                width = int(measurement["width"])
+                height = int(measurement["height"])
+                if (
+                    abs(width - FORGE_WINDOW_VIEWPORT.width()) > 2
+                    or abs(height - FORGE_WINDOW_VIEWPORT.height()) > 2
+                ):
+                    _LOGGER.warning(
+                        "Forge CSS viewport %sx%s differs from target %sx%s",
+                        width, height,
+                        FORGE_WINDOW_VIEWPORT.width(),
+                        FORGE_WINDOW_VIEWPORT.height(),
+                    )
+            except (TypeError, ValueError, KeyError, RuntimeError):
+                return
+
+        view.page().runJavaScript(
+            "JSON.stringify({width:innerWidth,height:innerHeight,"
+            "dpr:devicePixelRatio})",
+            record,
+        )
+
+    def _forge_preview_failed(self) -> None:
+        if self.tabbar.currentIndex() == 3:
+            self.preview_caption.setText("Forge preview could not be updated.")
+            self.preview_caption.setVisible(True)
+
     def _ensure_forge_preview(self) -> QtWidgets.QWidget:
-        """Construct the shared WebEngine view on first actual viewer use."""
+        """Construct the shared WebEngine view once for the preview stack."""
         view = self.html_preview
         if view is not None:
             return view
 
         web_view_type, settings_type = _webengine_components()
         view = web_view_type()
-        preview_background = self.theme_service.tokens.background
-        view.setStyleSheet(f"background-color:{preview_background};")
-        view.page().setBackgroundColor(QColor(preview_background))
+        view.setStyleSheet(f"background-color:{FORGE_PREVIEW_BACKGROUND};")
+        view.page().setBackgroundColor(QColor(FORGE_PREVIEW_BACKGROUND))
         view.settings().setAttribute(
             settings_type.FullScreenSupportEnabled,
             True,
@@ -3627,6 +3885,7 @@ class Nexus(QtWidgets.QMainWindow):
         view.page().fullScreenRequested.connect(
             self._on_web_fullscreen_requested
         )
+        view.loadFinished.connect(self._forge_preview_loaded)
         view.installEventFilter(self)
         view.installEventFilter(self._dbl_filter)
         self.preview_stack.addWidget(view)
@@ -3637,6 +3896,7 @@ class Nexus(QtWidgets.QMainWindow):
         """Ignore delayed preview work after its source tab has been left."""
         if self.tabbar.currentIndex() != tab_index:
             return
+        self._last_pixmap_tab = tab_index
         self._show_image(pixmap)
 
     def _show_image(self, pixmap: QPixmap):
@@ -3644,18 +3904,40 @@ class Nexus(QtWidgets.QMainWindow):
             return
         self._last_pixmap = pixmap
         self._clear_preview()
-        scaled = pixmap.scaled(
-            max(1, self.preview_frame.width() - 12),
-            max(1, self.preview_frame.height() - 12),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-        self.image_preview.setPixmap(scaled)
+        self._update_preview_geometry()
+        self._update_displayed_preview_image()
         self.preview_stack.setCurrentWidget(self.image_preview)
         # gentle fade after 30s idle
         self._fade_timer = QtCore.QTimer(self)
         self._fade_timer.setSingleShot(True)
         self._fade_timer.timeout.connect(self._fade_preview)
         self._fade_timer.start(30000)
+
+    def _update_displayed_preview_image(self) -> None:
+        """Scale once from the full source for the current size and pixel density."""
+        source = getattr(self, "_last_pixmap", None)
+        if not isinstance(source, QPixmap) or source.isNull():
+            return
+        content = QSize(
+            max(1, self.preview_frame.width() - PREVIEW_FRAME_EXTRA),
+            max(1, self.preview_frame.height() - PREVIEW_FRAME_EXTRA),
+        )
+        density = max(1.0, self.preview_frame.devicePixelRatioF())
+        cache_key = (
+            source.cacheKey(), content.width(), content.height(), density,
+        )
+        if getattr(self, "_preview_display_key", None) != cache_key:
+            physical = QSize(
+                max(1, round(content.width() * density)),
+                max(1, round(content.height() * density)),
+            )
+            display = source.scaled(
+                physical, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            )
+            display.setDevicePixelRatio(density)
+            self._preview_display_pixmap = display
+            self._preview_display_key = cache_key
+        self.image_preview.setPixmap(self._preview_display_pixmap)
 
     def _show_html(self, html: str):
         view = self._ensure_forge_preview()
@@ -3677,6 +3959,7 @@ class Nexus(QtWidgets.QMainWindow):
     def _on_image_tab_clear_preview(self) -> None:
         # Hard-clear: also drop last pixmap so resize can't resurrect it
         self._last_pixmap = None
+        self._last_pixmap_tab = None
         self._clear_preview()
 
     def _clear_preview(self):
@@ -3811,7 +4094,7 @@ class Nexus(QtWidgets.QMainWindow):
             return
         view = self._ensure_forge_preview()
         self._forge_preview_mode = (
-            mode if mode in {"portrait", "landscape", "window"} else "portrait"
+            mode if mode in {"portrait", "landscape", "window"} else "landscape"
         )
         self._update_preview_geometry()
         self._last_pixmap = None
@@ -3835,6 +4118,7 @@ class Nexus(QtWidgets.QMainWindow):
 
         self._clear_preview()
         self.preview_caption.setVisible(False)
+        self._update_preview_geometry()
         self.preview_stack.setCurrentWidget(view)
         if same_build:
             self.status(
@@ -4089,6 +4373,7 @@ class Nexus(QtWidgets.QMainWindow):
         window.showFullScreen()
         view.show()
         window.layout().activate()
+        self._update_forge_preview_zoom()
         window.raise_()
         window.activateWindow()
         view.setFocus()
@@ -4131,6 +4416,8 @@ class Nexus(QtWidgets.QMainWindow):
             self.preview_stack.addWidget(view)
         self.preview_stack.setCurrentWidget(view)
         QtCore.QTimer.singleShot(0, self._update_preview_geometry)
+        QtCore.QTimer.singleShot(0, self._update_forge_preview_zoom)
+        QtCore.QTimer.singleShot(0, self._position_help_icon)
         view.setFocus()
 
     def _read_project_title(self) -> str:
@@ -4154,14 +4441,81 @@ class Nexus(QtWidgets.QMainWindow):
                 self.restoreGeometry(geometry)
             except Exception:
                 _LOGGER.exception("Window geometry could not be restored.")
-        if bool(self.settings_store.get("ui_window_maximized", False)):
+        # Qt's restoreGeometry cannot fit a minimum larger than the current
+        # display. Recover only window state; never discard project settings.
+        maximized = self.isMaximized() or (
+            self.settings_store.get("ui_window_maximized", False) is True
+        )
+        self.setWindowState(self.windowState() & ~(Qt.WindowMinimized | Qt.WindowMaximized))
+        normal = self.settings_store.get("ui_window_normal_geometry")
+        target = None
+        if (
+            isinstance(normal, (list, tuple)) and len(normal) == 4
+            and all(type(value) is int and -(2**30) < value < 2**30 for value in normal)
+            and normal[2] > 0 and normal[3] > 0
+        ):
+            target = QtCore.QRect(*normal)
+        fit_window_to_screen(self, MIN_WINDOW_SIZE, target)
+        if maximized:
             self.setWindowState(self.windowState() | Qt.WindowMaximized)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        handle = self.windowHandle()
+        if handle is not None and handle is not getattr(self, "_geometry_handle", None):
+            self._geometry_handle = handle
+            handle.screenChanged.connect(self._window_screen_changed)
+            self._window_screen_changed(handle.screen())
+
+    def _window_screen_changed(self, screen: QtGui.QScreen | None) -> None:
+        previous = getattr(self, "_geometry_screen", None)
+        if previous is not screen:
+            if previous is not None:
+                try:
+                    previous.availableGeometryChanged.disconnect(self._queue_window_geometry_recovery)
+                except (RuntimeError, TypeError):
+                    pass
+            self._geometry_screen = screen
+            if screen is not None:
+                screen.availableGeometryChanged.connect(self._queue_window_geometry_recovery)
+        self._queue_window_geometry_recovery()
+
+    def _queue_window_geometry_recovery(self, *_args) -> None:
+        # screenChanged precedes Qt's position/DPI update on Windows. Recover
+        # once the native event completes, using the actual destination screen.
+        self._geometry_recovery_pending = True
+        timer = getattr(self, "_geometry_recovery_timer", None)
+        if timer is None:
+            timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._recover_window_geometry)
+            self._geometry_recovery_timer = timer
+        timer.start(0)
+
+    def _window_interaction_finished(self) -> None:
+        if getattr(self, "_geometry_recovery_pending", False):
+            self._queue_window_geometry_recovery()
+
+    def _recover_window_geometry(self, *_args) -> None:
+        controller = getattr(self, "_window_controller", None)
+        if controller is not None and controller.system_interaction_active:
+            return
+        self._geometry_recovery_pending = False
+        handle = self.windowHandle()
+        geometry = handle.geometry() if handle is not None else self.geometry()
+        fit_window_to_screen(self, MIN_WINDOW_SIZE, geometry, screen=self.screen())
 
     def _save_window_preferences(self) -> None:
         geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
+        normal = self.normalGeometry()
+        if not normal.isValid():
+            normal = self.geometry()
         self.settings_store.update_fields(
             {
                 "ui_window_geometry": geometry,
+                # Qt restoreGeometry reserves a native title bar even for this
+                # frameless shell, shrinking windows near the work-area edges.
+                "ui_window_normal_geometry": list(normal.getRect()),
                 "ui_window_maximized": self.isMaximized(),
             }
         )
@@ -4170,7 +4524,7 @@ class Nexus(QtWidgets.QMainWindow):
     # Resize/Move: keep preview aspect; keep popover aligned
     # =============================================================================================
     def _update_preview_geometry(self) -> None:
-        """Keep Sound controls usable across window states without shrinking other tabs."""
+        """Fit each preview's content, then put the shared border around it."""
         if self._forge_fullscreen_active:
             return
         window_height = max(1, self.height())
@@ -4181,81 +4535,132 @@ class Nexus(QtWidgets.QMainWindow):
             current_tab = self.tabbar.currentIndex()
         except Exception:
             current_tab = -1
-
-        if current_tab == 2:
-            message_tab = getattr(self, "message_tab", None)
-            message_height = 340
-            if message_tab is not None:
-                message_height = max(
-                    message_height,
-                    message_tab.minimumSizeHint().height(),
-                )
-            help_height = self.help_icon.height() if self.help_icon.isVisible() else 0
-            layout_gaps = max(0, self.body_layout.spacing()) * 2
-            available_frame_height = max(
-                120,
-                body_height - message_height - help_height - layout_gaps,
-            )
-            h = max(
-                108,
-                min(
-                    int(window_height * 0.35),
-                    available_frame_height - 12,
-                ),
-            )
-            w = int(h * _PREVIEW_AR)
-            self.preview_frame.setFixedSize(
-                max(160, w + 12),
-                max(120, h + 12),
-            )
-            return
+        max_width = max(1, body_width - PREVIEW_FRAME_EXTRA)
+        region = getattr(self, "preview_region", None)
+        if hasattr(self, "forge_tab"):
+            # Reserve a usable browser viewport as well as wrapped control text.
+            # Keep the breakpoint stable across preview modes and layout hints.
+            self._set_forge_compact_layout(current_tab == 3 and body_height < 760)
 
         if current_tab == 3:
-            mode = getattr(self, "_forge_preview_mode", "portrait")
-            max_h = max(
-                1,
-                min(
-                    int(window_height * 0.34),
-                    int(body_height * 0.45),
-                ),
-            )
-            max_w = max(
-                1,
-                min(
-                    int(window_width * 0.74),
-                    body_width,
-                ),
-            )
-            if mode == "portrait":
-                h = max_h
-                w = int(h * 0.8)
-                if w > max_w:
-                    w = max_w
-                    h = int(w / 0.8)
-            elif mode == "landscape":
-                w = min(max_w, int(max_h * (16 / 9)))
-                h = int(w * (9 / 16))
+            self.help_anchor.setVisible(self._forge_compact_layout)
+            forge_tab = getattr(self, "forge_tab", None)
+            format_panel = getattr(forge_tab, "preview_format_panel", None)
+            compact = self._forge_compact_layout
+            if compact:
+                minimum_preview_width = round(FORGE_WINDOW_VIEWPORT.width() * 0.25) + PREVIEW_FRAME_EXTRA
+                preview_width = max(minimum_preview_width, min(540, int(body_width * 0.42)))
+                region.setFixedWidth(preview_width)
+                format_panel.setFixedWidth(preview_width - self.help_anchor.width() - 7)
             else:
-                w = max_w
-                h = max_h
-            self.preview_frame.setFixedSize(
-                min(body_width, max(1, w + 12)),
-                min(body_height, max(1, h + 12)),
+                format_panel.setFixedWidth(468)
+            panel_height = self.preview_tools_layout.minimumSize().height()
+            controls_height = max(
+                forge_tab.minimumSizeHint().height(),
+                forge_tab.heightForWidth(body_width),
+            ) + 2 * self.forge_controls_scroll.frameWidth()
+            caption = getattr(self, "preview_caption", None)
+            caption_height = (
+                caption.sizeHint().height()
+                if isinstance(caption, QtWidgets.QWidget) and caption.isVisible()
+                else 0
             )
+            gaps = max(0, self.body_layout.spacing()) * (3 if caption_height else 2)
+            mode = getattr(self, "_forge_preview_mode", "landscape")
+            height_budget = max(
+                PREVIEW_FRAME_EXTRA + 1,
+                body_height - panel_height - (0 if compact else controls_height) - caption_height - gaps,
+            )
+            source = (
+                FORGE_WINDOW_VIEWPORT if mode == "window"
+                else QSize(16, 9) if mode == "landscape"
+                else QSize(4, 5)
+            )
+            max_height = min(
+                height_budget - PREVIEW_FRAME_EXTRA,
+                int(window_height * (0.495 if mode == "window" else 0.306)),
+                int(body_height * (1.0 if mode == "window" else 0.405)),
+            )
+            content = _fit_preview_content_size(
+                source,
+                (preview_width - PREVIEW_FRAME_EXTRA) if compact
+                else min(max_width, int(window_width * 0.666)),
+                max_height,
+            )
+            self.preview_frame.setFixedSize(
+                content.width() + PREVIEW_FRAME_EXTRA,
+                content.height() + PREVIEW_FRAME_EXTRA,
+            )
+            _activate_preview_frame_layout(self.preview_frame)
+            if isinstance(region, QtWidgets.QWidget) and not compact:
+                region.setFixedHeight(self.preview_frame.height())
+            self._update_forge_preview_zoom()
             return
+
+        preview_budget = body_height
+        if isinstance(getattr(self, "page_stack", None), QtWidgets.QWidget):
+            tools_height = self.preview_tools_layout.minimumSize().height()
+            caption_height = self.preview_caption.sizeHint().height() if self.preview_caption.isVisible() else 0
+            gaps = max(0, self.body_layout.spacing()) * (3 if caption_height else 2)
+            preview_budget = max(
+                1, body_height - tools_height - caption_height - gaps
+                - min(180, max(68, int(body_height * 0.4))) - PREVIEW_FRAME_EXTRA,
+            )
+
         if current_tab == 1:
-            # The visualizer is naturally 169 x 253. Enlarging it in maximized
-            # windows steals the height needed by the Sound controls below.
-            h = max(
+            content_height = max(
                 SOUND_PREVIEW_MIN_HEIGHT,
                 min(SOUND_PREVIEW_MAX_HEIGHT, int(window_height * 0.30)),
             )
+            content = _fit_preview_content_size(
+                QSize(169, 253), max_width, min(content_height, preview_budget),
+            )
+            region_height = content.height() + PREVIEW_FRAME_EXTRA
         else:
-            # Preserve the existing appearance on every other tab.
-            h = int(window_height * 0.35)
+            content_height = min(max(1, int(window_height * 0.35)), preview_budget)
+            if current_tab == 2:
+                message_tab = getattr(self, "message_tab", None)
+                message_height = max(
+                    340,
+                    message_tab.minimumSizeHint().height()
+                    if message_tab is not None else 340,
+                )
+                message_height = min(message_height, max(180, int(body_height * 0.5)))
+                help_height = (
+                    self.help_icon.height() if self.help_icon.isVisible() else 0
+                )
+                gaps = max(0, self.body_layout.spacing()) * 2
+                content_height = min(
+                    content_height,
+                    max(1, body_height - message_height - help_height
+                        - gaps - PREVIEW_FRAME_EXTRA),
+                )
+            source_pixmap = getattr(self, "_last_pixmap", None)
+            source = (
+                source_pixmap.size()
+                if isinstance(source_pixmap, QPixmap)
+                and not source_pixmap.isNull()
+                and getattr(self, "_last_pixmap_tab", None) == current_tab
+                else QSize(169, 253)
+            )
+            content = _fit_preview_content_size(
+                source, max_width, content_height,
+            )
+            region_height = content_height + PREVIEW_FRAME_EXTRA
 
-        w = int(h * _PREVIEW_AR)
-        self.preview_frame.setFixedSize(max(160, w + 12), max(120, h + 12))
+        self.preview_frame.setFixedSize(
+            content.width() + PREVIEW_FRAME_EXTRA,
+            content.height() + PREVIEW_FRAME_EXTRA,
+        )
+        _activate_preview_frame_layout(self.preview_frame)
+        if isinstance(region, QtWidgets.QWidget):
+            region.setFixedHeight(region_height)
+
+    def _refresh_preview_after_layout(self) -> None:
+        self._update_preview_geometry()
+        if self.preview_stack.currentWidget() is self.image_preview:
+            self._update_displayed_preview_image()
+        self._position_help_icon()
 
     def nativeEvent(self, event_type, message):
         controller = getattr(self, "_window_controller", None)
@@ -4266,7 +4671,6 @@ class Nexus(QtWidgets.QMainWindow):
         return super().nativeEvent(event_type, message)
 
     def resizeEvent(self, event):
-        self._update_preview_geometry()
         self._update_preview_tools_geometry()
         self._position_protected_new_project_button()
         self._position_command_tabbar()
@@ -4285,28 +4689,23 @@ class Nexus(QtWidgets.QMainWindow):
         if self._spark:
             self._spark.setGeometry(self.body.rect())
 
-        # Rescale current image preview cleanly
-        try:
-            if self.preview_stack.currentWidget() is self.image_preview and self._last_pixmap and not self._last_pixmap.isNull():
-                scaled = self._last_pixmap.scaled(
-                    max(1, self.preview_frame.width() - 12),
-                    max(1, self.preview_frame.height() - 12),
-                    Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
-                self.image_preview.setPixmap(scaled)
-        except Exception:
-            pass
-
-        # Keep help popover adjacent to the icon if visible
-        if self.help_pop.isVisible():
-            self._reposition_help_popover()
-
         super().resizeEvent(event)
+        timer = getattr(self, "_preview_geometry_timer", None)
+        if isinstance(timer, QtCore.QTimer):
+            timer.start(0)
+        if hasattr(self, "help_pop"):
+            self._position_help_icon()
 
     def moveEvent(self, event):
         # Keep help popover glued to the Help icon while the window moves
         if self.help_pop.isVisible():
             self._reposition_help_popover()
+        self._update_forge_preview_zoom()
+        if (
+            hasattr(self, "preview_stack")
+            and self.preview_stack.currentWidget() is self.image_preview
+        ):
+            self._update_displayed_preview_image()
         if (
             getattr(self, "_project_tabs_initialized", False)
             and self.forge_tab.readiness_window.isVisible()
@@ -4319,6 +4718,8 @@ class Nexus(QtWidgets.QMainWindow):
         if self._shutdown_complete or self._shutdown_in_progress:
             return
         self._shutdown_in_progress = True
+        self._forge_viewport_timer.stop()
+        self._preview_geometry_timer.stop()
         _LOGGER.info("Application resource shutdown started.")
         try:
             try:
@@ -4932,7 +5333,7 @@ class Nexus(QtWidgets.QMainWindow):
             return None
         movie.setCacheMode(QMovie.CacheAll)
         movie.setSpeed(100)
-        movie.setScaledSize(QSize(HELP_ICON_PX, HELP_ICON_PX))
+        movie.setScaledSize(self.help_icon.size())
         setattr(self, attribute, movie)
         return movie
 
@@ -4975,7 +5376,7 @@ class Nexus(QtWidgets.QMainWindow):
         if os.path.exists(png_path):
             pm = QPixmap(png_path)
             if not pm.isNull():
-                pm = pm.scaled(HELP_ICON_PX, HELP_ICON_PX, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                pm = pm.scaled(self.help_icon.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.help_icon.setPixmap(pm)
                 return True
         # Final fallback: small text
@@ -5037,7 +5438,7 @@ class Nexus(QtWidgets.QMainWindow):
         # Place adjacent to the help icon; flip to left if near right edge
         global_center = self.help_icon.mapToGlobal(self.help_icon.rect().center())
         prefer_left = True  # prefer left so it doesnΓÇÖt collide with right edge
-        self.help_pop.popup_at(global_center, prefer_left, self.body, icon_px=HELP_ICON_PX)
+        self.help_pop.popup_at(global_center, prefer_left, self.body, icon_px=self.help_icon.width())
 
     def _show_help_from_icon(self):
         idx = self.tabbar.currentIndex()
@@ -5072,6 +5473,25 @@ class Nexus(QtWidgets.QMainWindow):
         icon = getattr(self, "help_icon", None)
         pop  = getattr(self, "help_pop", None)
         web_view = getattr(self, "html_preview", None)
+        if (
+            watched is getattr(self, "body", None) and event.type() == QEvent.Resize
+            or (event.type() == QEvent.LayoutRequest
+                and getattr(self, "_project_tabs_initialized", False)
+                and self.tabbar.currentIndex() == 3
+                and watched in (self.body, self.forge_tab))
+        ):
+            timer = getattr(self, "_preview_geometry_timer", None)
+            if isinstance(timer, QtCore.QTimer):
+                timer.start(0)
+        if watched is web_view and event.type() == QEvent.Resize:
+            self._update_forge_preview_zoom()
+
+        if watched in (
+            getattr(self, "help_anchor", None),
+            getattr(self, "preview_frame", None),
+        ) and event.type() in (QEvent.Move, QEvent.Resize, QEvent.Show):
+            if pop is not None:
+                QtCore.QTimer.singleShot(0, self._position_help_icon)
 
         if watched is getattr(self, "tabbar", None):
             event_type = event.type()

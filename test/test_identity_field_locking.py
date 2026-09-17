@@ -690,6 +690,8 @@ class IdentityFieldLockingTests(unittest.TestCase):
         harness = types.SimpleNamespace(
             _shutdown_complete=False,
             _shutdown_in_progress=False,
+            _forge_viewport_timer=types.SimpleNamespace(stop=lambda: events.append("viewport-timer")),
+            _preview_geometry_timer=types.SimpleNamespace(stop=lambda: events.append("geometry-timer")),
             _project_tabs_initialized=True,
             _stop_curtain_preparation=lambda timeout_ms=None: (
                 events.append("curtain") or True
@@ -718,6 +720,8 @@ class IdentityFieldLockingTests(unittest.TestCase):
 
         Nexus.shutdown(harness)
 
+        self.assertLess(events.index("viewport-timer"), events.index("project"))
+        self.assertLess(events.index("geometry-timer"), events.index("project"))
         self.assertLess(events.index("curtain"), events.index("project"))
         self.assertLess(events.index("prompt"), events.index("autosave"))
         self.assertLess(events.index("forge-operation"), events.index("project"))

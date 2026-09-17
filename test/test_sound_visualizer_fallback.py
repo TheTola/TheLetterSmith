@@ -12,7 +12,7 @@ from typing import Callable
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtMultimedia import QAudioBuffer, QAudioFormat, QMediaPlayer
 
 from sound_preview import SoundPreviewWidget, _LiveBarVisualizer
@@ -276,6 +276,47 @@ class AnalyzedVisualizerContractTests(unittest.TestCase):
         finally:
             visualizer.shutdown()
             visualizer.close()
+            self.app.processEvents()
+
+    def test_compact_preview_has_no_inset_and_retains_last_analyzed_bar(self) -> None:
+        preview = SoundPreviewWidget(None)
+        try:
+            preview.resize(180, 230)
+            preview.show()
+            self.app.processEvents()
+
+            self.assertEqual(preview._blank.geometry(), preview.rect())
+            self.assertEqual(preview._blank._bg_color.name(), "#0f1116")
+            self.assertEqual(preview._live_visualizer._bg_color.name(), "#0f1116")
+            visualizer = preview.visualizer()
+            self.assertEqual(visualizer._bg.name(), "#0f1116")
+
+            blank = QtGui.QImage(180, 230, QtGui.QImage.Format_ARGB32)
+            preview._blank.render(blank)
+            self.assertEqual(blank.pixelColor(0, 0).name(), "#0f1116")
+
+            visualizer.set_analysis_payload(_analysis_payload(Path("C:/music/song.mp3")))
+            visualizer.resize(180, 230)
+            visualizer._bars = [0.0] * visualizer.BARS
+            visualizer._peaks = [0.0] * visualizer.BARS
+            before = QtGui.QImage(180, 230, QtGui.QImage.Format_ARGB32)
+            visualizer.render(before)
+            visualizer._bars[-1] = 0.8
+            after = QtGui.QImage(180, 230, QtGui.QImage.Format_ARGB32)
+            visualizer.render(after)
+
+            changed_columns = [
+                x for x in range(180)
+                if any(before.pixel(x, y) != after.pixel(x, y) for y in range(70, 190))
+            ]
+            self.assertEqual(len(visualizer._bars), 48)
+            self.assertTrue(changed_columns)
+            self.assertGreaterEqual(min(changed_columns), 160)
+            self.assertGreaterEqual(max(changed_columns), 160)
+            self.assertLess(max(changed_columns), 180)
+        finally:
+            preview.shutdown()
+            preview.close()
             self.app.processEvents()
 
 

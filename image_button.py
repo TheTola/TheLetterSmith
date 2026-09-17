@@ -9,13 +9,18 @@ from typing import Any, Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 from project_paths import application_paths
 from ui_theme import (
+    BUTTON_GEOMETRY_SCALE_PROPERTY,
     BUTTON_TIER_PROPERTY,
+    BUTTON_TIER_STYLES,
     ButtonTier,
     apply_button_tier,
+    button_geometry_size,
 )
 
 
 _ARTWORK_STYLESHEET = "QPushButton{background:transparent;border:none;padding:0;}"
+_SCALED_ARTWORK_STYLESHEET = "QPushButton{background:transparent;border:none;padding:0;min-width:0;min-height:0;}"
+_SCALED_BUTTON_STYLESHEET = "QPushButton{min-width:0;min-height:0;}"
 BUTTON_STATE_STABILIZATION_MS = 1500
 BUTTON_STATE_FADE_MS = 400
 INVISIBLE_BUTTON_OPACITY = 0.52
@@ -204,7 +209,9 @@ class ArtworkButton(QtWidgets.QPushButton):
             self._artwork_path = fallback_path.resolve()
             self._artwork = QtGui.QPixmap()
             self.setAttribute(QtCore.Qt.WA_Hover, False)
-            if self.styleSheet() == _ARTWORK_STYLESHEET:
+            if self.property(BUTTON_GEOMETRY_SCALE_PROPERTY) and self.property(BUTTON_TIER_PROPERTY):
+                self.setStyleSheet(_SCALED_BUTTON_STYLESHEET)
+            elif self.styleSheet() in {_ARTWORK_STYLESHEET, _SCALED_ARTWORK_STYLESHEET}:
                 self.setStyleSheet("")
             self.setAccessibleName(self.text())
             self.updateGeometry()
@@ -221,7 +228,11 @@ class ArtworkButton(QtWidgets.QPushButton):
 
         if self.has_artwork:
             self.setAttribute(QtCore.Qt.WA_Hover, True)
-            self.setStyleSheet(_ARTWORK_STYLESHEET)
+            self.setStyleSheet(
+                _SCALED_ARTWORK_STYLESHEET
+                if self.property(BUTTON_GEOMETRY_SCALE_PROPERTY) and self.property(BUTTON_TIER_PROPERTY)
+                else _ARTWORK_STYLESHEET
+            )
             if not self.property(BUTTON_TIER_PROPERTY):
                 self.setMinimumSize(118, 46)
                 self.setSizePolicy(
@@ -231,7 +242,9 @@ class ArtworkButton(QtWidgets.QPushButton):
             self.setAccessibleName(self.text())
         else:
             self.setAttribute(QtCore.Qt.WA_Hover, False)
-            if self.styleSheet() == _ARTWORK_STYLESHEET:
+            if self.property(BUTTON_GEOMETRY_SCALE_PROPERTY) and self.property(BUTTON_TIER_PROPERTY):
+                self.setStyleSheet(_SCALED_BUTTON_STYLESHEET)
+            elif self.styleSheet() in {_ARTWORK_STYLESHEET, _SCALED_ARTWORK_STYLESHEET}:
                 self.setStyleSheet("")
             self.setAccessibleName(self.text())
         self.updateGeometry()
@@ -561,6 +574,7 @@ class ArtworkButton(QtWidgets.QPushButton):
     def _animate_visual_opacity(self) -> None:
         target = self._target_visual_opacity()
         if abs(self._visual_opacity - target) < 0.001:
+            self._opacity_transition.stop()
             self._visual_opacity = target
             self.update()
             return
@@ -671,9 +685,18 @@ class ArtworkButton(QtWidgets.QPushButton):
     def sizeHint(self) -> QtCore.QSize:  # type: ignore[override]
         if not self.has_artwork:
             return super().sizeHint()
+        if self.property(BUTTON_GEOMETRY_SCALE_PROPERTY):
+            tier = self.property(BUTTON_TIER_PROPERTY)
+            if tier:
+                return button_geometry_size(self, BUTTON_TIER_STYLES[ButtonTier(tier)].size)
         width = max(118, min(190, self._artwork.width()))
         height = max(46, min(72, self._artwork.height()))
-        return QtCore.QSize(width, height)
+        if self.property(BUTTON_GEOMETRY_SCALE_PROPERTY):
+            # Responsive long controls own their artwork aspect ratio. Only
+            # the label, not the source bitmap height, sets their minimum.
+            return QtCore.QSize(button_geometry_size(self, QtCore.QSize(width, 1)).width(),
+                                super().sizeHint().height())
+        return button_geometry_size(self, QtCore.QSize(width, height))
 
     def enterEvent(self, event: QtCore.QEvent) -> None:  # type: ignore[override]
         self._hovered = True

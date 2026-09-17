@@ -11,6 +11,18 @@ MESSAGE_OVERLAY_OPACITY_KEY = "message_overlay_opacity"
 DEFAULT_MESSAGE_OVERLAY_PRESET = "paper"
 DEFAULT_MESSAGE_OVERLAY_OPACITY = 68
 
+# Shared message-render geometry.  The editor and the committed message.png
+# renderer both use these values so the editing surface keeps the same usable
+# text frame as the final raster output.
+MESSAGE_RENDER_WIDTH = 2048
+MESSAGE_RENDER_HEIGHT = 3072
+MESSAGE_RENDER_MARGIN_LR = 100
+MESSAGE_RENDER_MARGIN_TOP = 100
+MESSAGE_RENDER_MARGIN_BOTTOM = 100
+MESSAGE_RENDER_FONT_FAMILY = "Papyrus"
+MESSAGE_RENDER_FONT_SIZE = 16
+MESSAGE_RENDER_LINE_HEIGHT = 2.0
+
 
 @dataclass(frozen=True)
 class LetterPagePreset:

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
-from typing import MutableMapping, Optional
+from typing import Callable, MutableMapping, Optional
 
 from PIL import Image, ImageChops
 
@@ -39,6 +39,7 @@ from image_animation import (
     PreparedImageAssetImport,
     clear_slot_asset,
     image_asset_revision,
+    inspect_gif,
     load_image_manifest,
     normalize_gif_settings,
     prepare_image_asset_import,
@@ -49,7 +50,8 @@ from project_paths import ProjectPathResolver, application_paths
 from project_save import ProjectSaveService
 from project_state import ProjectStateController
 from project_sync import file_fingerprint, image_fingerprint
-from ui_dialogs import LetterSmithConfirmationDialog
+from recent_media import recent_media, remember_image_copy
+from ui_dialogs import LetterSmithConfirmationDialog, LetterSmithDialog
 from ui_help import set_control_help
 from ui_sounds import UiSound, play_ui_sound
 from ui_theme import (
@@ -88,6 +90,7 @@ class _PreparedImageImportResult:
     project_pages_directory: Path | None
     prepared: PreparedImageAssetImport
     preview_image: QtGui.QImage
+    source_path: Path | None = None
 
 
 class _ImageImportWorker(QtCore.QObject):
@@ -168,6 +171,7 @@ class _ImageImportWorker(QtCore.QObject):
                 project_pages_directory=self._project_pages_directory,
                 prepared=prepared,
                 preview_image=preview_image,
+                source_path=self._source_path,
             )
             self._result_holder["result"] = result
             self.prepared.emit(result)
@@ -186,43 +190,79 @@ class StockImageDialog(QtWidgets.QDialog):
         title: str,
         image_paths: tuple[Path, ...],
         parent: QtWidgets.QWidget | None = None,
+        *,
+        recent_paths: tuple[Path, ...] = (),
+        recent_labels: tuple[str, ...] = (),
+        allow_browse: bool = False,
     ) -> None:
         super().__init__(
             parent,
             QtCore.Qt.Popup | QtCore.Qt.FramelessWindowHint,
         )
         self.setObjectName("StockImageTray")
-        self.setAccessibleName(f"Stock Images - {title}")
-        self.setFixedSize(420, 146)
+        self.setAccessibleName(
+            f"{'Recently Used' if recent_paths else 'Stock Images'} - {title}"
+        )
+        self.setFixedSize(420, 205 if allow_browse else 146)
         self._selected_path: Path | None = None
+        self.browse_requested = False
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        self._images = QtWidgets.QListWidget()
-        self._images.setViewMode(QtWidgets.QListView.IconMode)
-        self._images.setIconSize(QtCore.QSize(112, 112))
-        self._images.setGridSize(QtCore.QSize(130, 126))
-        self._images.setSpacing(3)
-        self._images.setMovement(QtWidgets.QListView.Static)
-        self._images.setResizeMode(QtWidgets.QListView.Adjust)
-        self._images.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self._images.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        for path in image_paths:
-            item = QtWidgets.QListWidgetItem(QIcon(str(path)), "")
-            item.setData(QtCore.Qt.UserRole, str(path))
-            item.setToolTip(path.stem)
-            self._images.addItem(item)
-        self._images.itemClicked.connect(self._accept_item)
-        layout.addWidget(self._images)
+        self._images: QtWidgets.QListWidget | None = None
+        self._recent_images: QtWidgets.QListWidget | None = None
+        if recent_paths:
+            if allow_browse:
+                layout.addWidget(QtWidgets.QLabel("Recently Used"))
+            self._recent_images = self._make_image_list(
+                recent_paths, recent_labels
+            )
+            layout.addWidget(self._recent_images)
+        else:
+            if allow_browse:
+                layout.addWidget(QtWidgets.QLabel("Stock Images"))
+            self._images = self._make_image_list(image_paths)
+            layout.addWidget(self._images)
+        if allow_browse:
+            browse = QtWidgets.QPushButton("Choose Image…")
+            browse.clicked.connect(self._browse)
+            layout.addWidget(browse)
         self.setStyleSheet(
             "QDialog#StockImageTray{background:#101317;border:1px solid #394654;"
             "border-radius:8px;}"
+            "QLabel{color:#e8edf5;font-weight:600;}"
             "QListWidget{background:transparent;border:none;outline:none;}"
             "QListWidget::item{border:1px solid #2d3540;border-radius:6px;}"
             "QListWidget::item:hover,QListWidget::item:selected{"
             "border:2px solid #00d0ff;background:#19232d;}"
         )
+
+    def _make_image_list(
+        self,
+        paths: tuple[Path, ...],
+        labels: tuple[str, ...] = (),
+    ) -> QtWidgets.QListWidget:
+        images = QtWidgets.QListWidget()
+        images.setViewMode(QtWidgets.QListView.IconMode)
+        images.setIconSize(QtCore.QSize(112, 112))
+        images.setGridSize(QtCore.QSize(130, 126))
+        images.setSpacing(3)
+        images.setMovement(QtWidgets.QListView.Static)
+        images.setResizeMode(QtWidgets.QListView.Adjust)
+        images.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        images.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        for index, path in enumerate(paths):
+            item = QtWidgets.QListWidgetItem(QIcon(str(path)), "")
+            item.setData(QtCore.Qt.UserRole, str(path))
+            item.setToolTip(labels[index] if index < len(labels) else path.stem)
+            images.addItem(item)
+        images.itemClicked.connect(self._accept_item)
+        return images
+
+    def _browse(self) -> None:
+        self.browse_requested = True
+        self.accept()
 
     def selected_path(self) -> Path | None:
         return self._selected_path
@@ -556,6 +596,71 @@ class _ImageUtilityButton(ArtworkButton):
         _mask_button_to_artwork(self)
 
 
+class _ImageSettingsButton(ArtworkButton):
+    """Square GIF control; use setbutton.png when the active theme supplies it."""
+
+    def __init__(self, project_root: str | Path, parent: QtWidgets.QWidget) -> None:
+        super().__init__("⚙", project_root, "setbutton.png", parent, tier=None)
+        self.setFixedSize(44, 44)
+        font = QtGui.QFont("Segoe UI Symbol")
+        font.setPointSize(18)
+        self.setFont(font)
+        self.setAccessibleName("Settings")
+
+    def sizeHint(self) -> QtCore.QSize:  # type: ignore[override]
+        # The shared text-fit guard must not size this control from its pixmap.
+        return QtCore.QSize(44, 44)
+
+    def apply_theme_assets(self, theme_service: object | None = None) -> None:
+        service = theme_service if theme_service is not None else self._theme_service
+        theme_id = getattr(service, "theme_id", "cyber_forge")
+        dedicated = application_paths(self._project_root).app_resource_path(
+            Path("themes") / theme_id / "buttons" / "setbutton.png"
+        )
+        self._artwork_filename = "setbutton.png" if dedicated.is_file() else "AButton.png"
+        super().apply_theme_assets(theme_service)
+        # ArtworkButton raises its minimum size when artwork is available.
+        self.setFixedSize(44, 44)
+        self.setAccessibleName("Settings")
+
+    def _resolved_artwork(self, state):
+        path, artwork, broken = super()._resolved_artwork(state)
+        if self._artwork_filename != "AButton.png" or artwork.isNull():
+            return path, artwork, broken
+
+        # Reuse the themed frame's end caps and a centered panel at native
+        # proportions, instead of squeezing its wide canvas into a square.
+        source_width, source_height = artwork.width(), artwork.height()
+        canvas_size = 176
+        cap_source = min(round(source_height * 0.38), source_width // 3)
+        cap_target = round(cap_source * canvas_size / source_height)
+        center_target = canvas_size - 2 * cap_target
+        center_source = round(center_target * source_height / canvas_size)
+        square = QtGui.QPixmap(canvas_size, canvas_size)
+        square.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(square)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(
+            QtCore.QRect(0, 0, cap_target, canvas_size),
+            artwork,
+            QtCore.QRect(0, 0, cap_source, source_height),
+        )
+        painter.drawPixmap(
+            QtCore.QRect(cap_target, 0, center_target, canvas_size),
+            artwork,
+            QtCore.QRect(
+                (source_width - center_source) // 2, 0, center_source, source_height
+            ),
+        )
+        painter.drawPixmap(
+            QtCore.QRect(canvas_size - cap_target, 0, cap_target, canvas_size),
+            artwork,
+            QtCore.QRect(source_width - cap_source, 0, cap_source, source_height),
+        )
+        painter.end()
+        return path, square, broken
+
+
 class _ResetImagesConfirmationDialog(
     LetterSmithConfirmationDialog
 ):
@@ -624,15 +729,7 @@ class _ImageThumbnail(
             QtCore.Qt.AlignCenter
         )
 
-        self.setMinimumSize(
-            150,
-            165,
-        )
-
-        self.setMaximumSize(
-            170,
-            185,
-        )
+        self.setFixedSize(150, 165)
 
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Preferred,
@@ -843,10 +940,20 @@ class ImageAssetCard(
             QtGui.QPixmap()
         )
         self._movie: QtGui.QMovie | None = None
+        self._movie_source_size = QtCore.QSize()
         self._playback_active = True
         self._resume_movie_on_activation = False
         self._animation_enabled = True
         self._speed_percent = 100
+        self._gif_settings = normalize_gif_settings(None)
+        self._managed_preview = False
+        self._preview_running = False
+        self._preview_phase = ""
+        self._completed_cycles = 0
+        self._target_cycles: int | str = FOREVER
+        self._preview_timer = QtCore.QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._advance_preview_cycle)
 
         self.setObjectName(
             "ImageAssetCard"
@@ -857,9 +964,8 @@ class ImageAssetCard(
             "missing",
         )
 
-        self.setFixedWidth(190)
-        self.setMinimumHeight(255)
-        self.setMaximumHeight(280)
+        self.setFixedWidth(300)
+        self.setMinimumHeight(270)
 
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Fixed,
@@ -933,6 +1039,7 @@ class ImageAssetCard(
         root_layout.addWidget(
             self.thumbnail,
             1,
+            QtCore.Qt.AlignCenter,
         )
 
         button_row = (
@@ -948,16 +1055,8 @@ class ImageAssetCard(
                 "AButton.png",
                 self,
                 broken_artwork_filename="AButton.png",
-                tier=ButtonTier.SMALL,
+                tier=ButtonTier.MEDIUM,
             )
-        )
-
-        self.clear_btn.setMinimumHeight(
-            34
-        )
-        self.clear_btn.setFixedSize(
-            round(self.clear_btn.width() * 1.05),
-            round(self.clear_btn.height() * 1.05),
         )
 
         self.clear_btn.setCursor(
@@ -978,19 +1077,15 @@ class ImageAssetCard(
             )
         )
 
-        self.settings_btn = QtWidgets.QPushButton(
-            "Settings"
-        )
-        self.settings_btn.setMinimumHeight(34)
+        self.settings_btn = _ImageSettingsButton(project_root, self)
         self.settings_btn.setCursor(
             QtCore.Qt.PointingHandCursor
         )
-        apply_button_tier(self.settings_btn, ButtonTier.SMALL)
         self.settings_btn.setProperty("themeRole", "button")
         set_control_help(
             self.settings_btn,
-            "Adjust playback settings for this animated image.",
-            accessible_name="Image animation settings",
+            "Settings — adjust playback for this animated image.",
+            accessible_name="Settings",
         )
         self.settings_btn.setEnabled(False)
         self.settings_btn.setVisible(False)
@@ -1000,12 +1095,14 @@ class ImageAssetCard(
             )
         )
 
-        button_row.addWidget(
-            self.settings_btn
-        )
+        button_row.addStretch(1)
         button_row.addWidget(
             self.clear_btn
         )
+        button_row.addWidget(
+            self.settings_btn
+        )
+        button_row.addStretch(1)
 
         root_layout.addLayout(
             button_row
@@ -1047,6 +1144,7 @@ class ImageAssetCard(
             )
         self.thumbnail.apply_theme_assets(theme_service, project_root)
         self.clear_btn.apply_theme_assets(theme_service)
+        self.settings_btn.apply_theme_assets(theme_service)
 
     def set_asset_state(
         self,
@@ -1090,6 +1188,7 @@ class ImageAssetCard(
         preview_path: str | None = None,
         animate_gif: bool = True,
         preview_pixmap: QtGui.QPixmap | None = None,
+        embedded_play_count: int | str | None = None,
     ) -> None:
         if not animated_gif:
             self.set_pixmap(
@@ -1098,13 +1197,40 @@ class ImageAssetCard(
                 else QtGui.QPixmap(path)
             )
             self.settings_btn.setToolTip(
-                "Static image settings"
+                "Settings — static image"
             )
             return
 
         normalized = normalize_gif_settings(settings)
+        self._gif_settings = normalized
         self._animation_enabled = bool(normalized["animation_enabled"])
         self._speed_percent = int(normalized["speed_percent"])
+        self._managed_preview = (
+            normalized["playback_mode"] != "original"
+            or normalized["play_count"] != FOREVER
+            or normalized["start_delay_ms"] > 0
+            or normalized["loop_pause_ms"] > 0
+        )
+        if self._managed_preview:
+            if embedded_play_count is None:
+                try:
+                    embedded_play_count = inspect_gif(path).embedded_play_count
+                except (OSError, ValueError):
+                    embedded_play_count = FOREVER
+            if embedded_play_count != FOREVER:
+                try:
+                    embedded_play_count = max(1, int(embedded_play_count))
+                except (TypeError, ValueError):
+                    embedded_play_count = FOREVER
+            configured = normalized["play_count"]
+            if normalized["playback_mode"] == "original":
+                self._target_cycles = (
+                    embedded_play_count if configured == FOREVER
+                    else configured if embedded_play_count == FOREVER
+                    else min(int(configured), int(embedded_play_count))
+                )
+            else:
+                self._target_cycles = configured
         animation_path = preview_path or path
         if not self._animation_enabled:
             preview = (
@@ -1118,7 +1244,7 @@ class ImageAssetCard(
             self.settings_btn.setVisible(True)
             self.settings_btn.setEnabled(True)
             self.settings_btn.setToolTip(
-                "Animation settings for this GIF"
+                "Settings — animation for this GIF"
             )
             return
 
@@ -1131,6 +1257,8 @@ class ImageAssetCard(
             return
         movie.setSpeed(self._speed_percent)
         self._movie = movie
+        if self._managed_preview:
+            movie.frameChanged.connect(self._preview_frame_changed)
         self.thumbnail.setText("")
         self.thumbnail.setStyleSheet(
             "background: #101317;"
@@ -1139,15 +1267,19 @@ class ImageAssetCard(
         )
         self.thumbnail.setMovie(movie)
         movie.jumpToFrame(0)
+        self._movie_source_size = movie.currentPixmap().size()
         self.settings_btn.setVisible(True)
         self.settings_btn.setEnabled(True)
         self.settings_btn.setToolTip(
-            "Animation settings for this GIF"
+            "Settings — animation for this GIF"
         )
         self.set_asset_state("ready")
         self._rescale()
         if self._playback_active and animate_gif:
-            movie.start()
+            if self._managed_preview:
+                self._restart_managed_preview()
+            else:
+                movie.start()
         else:
             self._resume_movie_on_activation = True
 
@@ -1158,6 +1290,7 @@ class ImageAssetCard(
         )
 
         self.thumbnail.clear()
+        self.thumbnail.setFixedSize(150, 165)
 
         self.thumbnail.setText(
             "Click to select image"
@@ -1176,30 +1309,20 @@ class ImageAssetCard(
         self.settings_btn.setEnabled(False)
         self.settings_btn.setVisible(False)
         self.settings_btn.setToolTip(
-            "Select an image before opening settings"
+            "Settings — select an image before opening"
         )
 
     def _rescale(self) -> None:
+        maximum_content = QtCore.QSize(168, 155)
         if self._movie is not None:
-            target_size = (
-                self.thumbnail.size()
-                - QtCore.QSize(8, 8)
-            )
-            if (
-                target_size.width() > 0
-                and target_size.height() > 0
-            ):
-                current = self._movie.currentPixmap()
-                source_size = current.size()
-                if source_size.isEmpty():
-                    source_size = self._movie.currentImage().size()
-                if not source_size.isEmpty():
-                    self._movie.setScaledSize(
-                        source_size.scaled(
-                            target_size,
-                            QtCore.Qt.KeepAspectRatio,
-                        )
-                    )
+            if not self._movie_source_size.isEmpty():
+                content_size = self._movie_source_size.scaled(
+                    maximum_content, QtCore.Qt.KeepAspectRatio,
+                )
+                self.thumbnail.setFixedSize(
+                    content_size + QtCore.QSize(2, 2)
+                )
+                self._movie.setScaledSize(content_size)
             return
 
         if self._source_pixmap.isNull():
@@ -1214,26 +1337,15 @@ class ImageAssetCard(
             "border-radius: 6px;"
         )
 
-        target_size = (
-            self.thumbnail.size()
-            - QtCore.QSize(
-                8,
-                8,
-            )
-        )
-
-        if (
-            target_size.width() <= 0
-            or target_size.height() <= 0
-        ):
-            return
-
         scaled_pixmap = (
             self._source_pixmap.scaled(
-                target_size,
+                maximum_content,
                 QtCore.Qt.KeepAspectRatio,
                 QtCore.Qt.SmoothTransformation,
             )
+        )
+        self.thumbnail.setFixedSize(
+            scaled_pixmap.size() + QtCore.QSize(2, 2)
         )
 
         self.thumbnail.setPixmap(
@@ -1250,6 +1362,17 @@ class ImageAssetCard(
 
         self._playback_active = active
         if self._movie is None:
+            return
+
+        if getattr(self, "_managed_preview", False):
+            if active:
+                if self._preview_phase != "end":
+                    self._restart_managed_preview()
+            else:
+                self._preview_running = False
+                self._preview_timer.stop()
+                if self._movie.state() == QtGui.QMovie.Running:
+                    self._movie.setPaused(True)
             return
 
         if not active:
@@ -1279,7 +1402,11 @@ class ImageAssetCard(
         self._resume_movie_on_activation = False
 
     def _stop_movie(self) -> None:
+        self._preview_timer.stop()
+        self._preview_running = False
+        self._preview_phase = ""
         self._resume_movie_on_activation = False
+        self._movie_source_size = QtCore.QSize()
         if self._movie is None:
             return
         self._movie.stop()
@@ -1287,6 +1414,61 @@ class ImageAssetCard(
         self._movie.setFileName("")
         self._movie.deleteLater()
         self._movie = None
+
+    def _restart_managed_preview(self) -> None:
+        movie = self._movie
+        if movie is None:
+            return
+        self._preview_timer.stop()
+        self._preview_running = False
+        movie.stop()
+        movie.jumpToFrame(0)
+        self._completed_cycles = 0
+        self._preview_phase = "start"
+        delay = int(self._gif_settings["start_delay_ms"])
+        if delay:
+            self._preview_timer.start(delay)
+        else:
+            self._advance_preview_cycle()
+
+    def _preview_frame_changed(self, frame: int) -> None:
+        movie = self._movie
+        if (
+            not self._preview_running or movie is None
+            or frame != movie.frameCount() - 1
+        ):
+            return
+        remaining = max(1, movie.nextFrameDelay())
+        self._preview_running = False
+        movie.setPaused(True)
+        self._preview_phase = "frame"
+        self._preview_timer.start(remaining)
+
+    def _advance_preview_cycle(self) -> None:
+        movie = self._movie
+        if movie is None or not self._playback_active:
+            return
+        if self._preview_phase == "frame":
+            self._completed_cycles += 1
+            movie.stop()
+            movie.jumpToFrame(max(0, movie.frameCount() - 1))
+            if (
+                self._target_cycles != FOREVER
+                and self._completed_cycles >= self._target_cycles
+            ):
+                # Published playback also retains the final displayed frame.
+                self._preview_phase = "end"
+                return
+            self._preview_phase = "pause"
+            pause = int(self._gif_settings["loop_pause_ms"])
+            if pause:
+                self._preview_timer.start(pause)
+                return
+        self._preview_phase = "playing"
+        self._preview_running = True
+        movie.start()
+        if movie.currentFrameNumber() != 0:
+            movie.jumpToFrame(0)
 
     def release_asset_handle(self) -> None:
         self._stop_movie()
@@ -1304,201 +1486,251 @@ class ImageAssetCard(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class ImageSettingsDialog(QtWidgets.QDialog):
+class ImageSettingsDialog(LetterSmithDialog):
     def __init__(
         self,
         title: str,
         *,
         animated_gif: bool,
         settings: dict[str, object] | None = None,
+        embedded_play_count: int | str = FOREVER,
+        preview_callback: Callable[[dict[str, object]], None] | None = None,
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(f"{title} Settings")
-        self.setModal(True)
-        self.setMinimumWidth(410)
-
-        root = QtWidgets.QVBoxLayout(self)
-        heading = QtWidgets.QLabel(
-            "Animated GIF" if animated_gif else "Static image"
-        )
-        heading.setStyleSheet(
-            "color:#00d0ff;font:700 14px 'Segoe UI';"
-        )
-        root.addWidget(heading)
-
         if not animated_gif:
-            message = QtWidgets.QLabel(
-                "This image has no animation settings."
-            )
-            message.setWordWrap(True)
-            root.addWidget(message)
-            buttons = QtWidgets.QDialogButtonBox(
-                QtWidgets.QDialogButtonBox.Close
-            )
-            buttons.rejected.connect(self.reject)
-            root.addWidget(buttons)
-            return
+            raise ValueError("GIF controls are only available for animated GIFs")
+        heading = {
+            "Cover Page Image": "COVER CONTROLS",
+            "Main Letter Image": "LETTER CONTROLS",
+            "Letter Background Image": "CLARIFIER CONTROLS",
+            "Final Backdrop Image": "BACKDROP CONTROLS",
+        }.get(title, f"{title.upper()} CONTROLS")
+        super().__init__(
+            parent, title=heading, click_outside_dismiss=True, width=400,
+        )
+        self._saved_settings = normalize_gif_settings(settings)
+        self._preview_callback = preview_callback
+        self._embedded_play_count = embedded_play_count
+        self._committed = False
+        self._preserve_timing_precision = True
+        self.setObjectName("GifControlsPopup")
 
-        normalized = normalize_gif_settings(settings)
-        form = QtWidgets.QFormLayout()
-        form.setFieldGrowthPolicy(
-            QtWidgets.QFormLayout.AllNonFixedFieldsGrow
+        controls_style = (
+            "QComboBox,QSpinBox,QDoubleSpinBox{"
+            f"background:{self.colors['control_background']};"
+            f"color:{self.colors['text']};"
+            f"border:1px solid {self.colors['border']};"
+            "border-radius:6px;padding:6px 9px;"
+            "min-height:24px;}"
+            "QComboBox:hover,QSpinBox:hover,QDoubleSpinBox:hover{"
+            f"border-color:{self.colors['accent']};}}"
+            f"QLabel{{color:{self.colors['text']};background:transparent;border:none;}}"
+            "QPushButton[dialogRole='primary']{"
+            f"background:{self.colors['accent']};color:{self.colors['background']};"
+            f"border-color:{self.colors['accent']};}}"
         )
+        self.panel.setStyleSheet(controls_style)
 
-        self.playback_mode = QtWidgets.QComboBox()
-        self.playback_mode.addItem("Original", "original")
-        self.playback_mode.addItem("Loop", "loop")
-        self.playback_mode.addItem("Ping-Pong", "ping_pong")
-        self.playback_mode.setCurrentIndex(
-            max(
-                0,
-                self.playback_mode.findData(
-                    normalized["playback_mode"]
-                ),
-            )
-        )
-        set_control_help(
-            self.playback_mode,
-            "Choose whether this animated image plays normally, loops, or reverses between cycles.",
-        )
-        form.addRow("Playback Mode", self.playback_mode)
-
-        self.animation_enabled = QtWidgets.QCheckBox("Play animation")
-        self.animation_enabled.setChecked(
-            bool(normalized["animation_enabled"])
-        )
-        set_control_help(
-            self.animation_enabled,
-            "Start or stop this image's animation. A stopped animation remains on its preview frame.",
-        )
-        form.addRow("Start / Stop", self.animation_enabled)
-
-        self.speed_percent = QtWidgets.QSpinBox()
-        self.speed_percent.setRange(25, 400)
-        self.speed_percent.setSingleStep(25)
-        self.speed_percent.setSuffix("%")
-        self.speed_percent.setValue(int(normalized["speed_percent"]))
-        set_control_help(
-            self.speed_percent,
-            "Set playback speed from 25% to 400% of the GIF's authored timing.",
-        )
-        form.addRow("Speed", self.speed_percent)
-
-        count_row = QtWidgets.QWidget()
-        count_layout = QtWidgets.QHBoxLayout(count_row)
-        count_layout.setContentsMargins(0, 0, 0, 0)
-        count_layout.setSpacing(8)
-        self.play_count = QtWidgets.QComboBox()
-        self.play_count.addItem("Once", 1)
-        self.play_count.addItem("2 times", 2)
-        self.play_count.addItem("3 times", 3)
-        self.play_count.addItem("Custom number", "custom")
-        self.play_count.addItem("Forever", FOREVER)
-        self.custom_count = QtWidgets.QSpinBox()
+        self._section("Playback")
+        playback = QtWidgets.QFormLayout()
+        playback.setSpacing(10)
+        playback.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        self.speed = QtWidgets.QComboBox(self.panel)
+        self.speed.setAccessibleName("Speed")
+        for label, value in (
+            ("Original", 100), ("50%", 50), ("75%", 75),
+            ("125%", 125), ("150%", 150), ("Custom…", "custom"),
+        ):
+            self.speed.addItem(label, value)
+        self.custom_speed = QtWidgets.QSpinBox(self.panel)
+        self.custom_speed.setRange(25, 400)
+        self.custom_speed.setSuffix("%")
+        self.custom_speed.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.custom_speed.setAccessibleName("Custom speed")
+        speed_row = self._selection_row(self.speed, self.custom_speed)
+        playback.addRow("Speed", speed_row)
+        self.play_count = QtWidgets.QComboBox(self.panel)
+        self.play_count.setAccessibleName("Play Count")
+        for label, value in (
+            ("Original", "original"), ("Forever", FOREVER),
+            ("1", 1), ("2", 2), ("3", 3), ("5", 5),
+            ("Custom…", "custom"),
+        ):
+            self.play_count.addItem(label, value)
+        self.custom_count = QtWidgets.QSpinBox(self.panel)
         self.custom_count.setRange(1, MAX_PLAY_COUNT)
-        self.custom_count.setValue(4)
-        set_control_help(
-            self.play_count,
-            "Choose how many times the animation plays before stopping.",
-        )
-        set_control_help(
-            self.custom_count,
-            "Set the exact number of animation cycles when Custom number is selected.",
-        )
-        stored_count = normalized["play_count"]
-        if stored_count in (1, 2, 3, FOREVER):
-            count_index = self.play_count.findData(stored_count)
-        else:
-            count_index = self.play_count.findData("custom")
-            self.custom_count.setValue(int(stored_count))
-        self.play_count.setCurrentIndex(max(0, count_index))
-        count_layout.addWidget(self.play_count, 1)
-        count_layout.addWidget(self.custom_count)
-        form.addRow("Play Count", count_row)
+        self.custom_count.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.custom_count.setAccessibleName("Custom play count")
+        count_row = self._selection_row(self.play_count, self.custom_count)
+        playback.addRow("Play Count", count_row)
+        self.content_layout.addLayout(playback)
 
+        self._section("Timing")
+        timing = QtWidgets.QFormLayout()
+        timing.setSpacing(10)
+        timing.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
         self.start_delay = self._seconds_control(
-            int(normalized["start_delay_ms"])
+            int(self._saved_settings["start_delay_ms"])
         )
-        form.addRow("Start Delay", self.start_delay)
+        self.start_delay.setAccessibleName("Start Delay")
+        timing.addRow("Start Delay", self.start_delay)
         self.loop_pause = self._seconds_control(
-            int(normalized["loop_pause_ms"])
+            int(self._saved_settings["loop_pause_ms"])
         )
-        form.addRow("Loop Pause / End Hold", self.loop_pause)
-        root.addLayout(form)
+        self.timing_label = QtWidgets.QLabel(self.panel)
+        self.loop_pause.setAccessibleName("Loop Pause")
+        timing.addRow(self.timing_label, self.loop_pause)
+        self.content_layout.addLayout(timing)
 
-        self.mode_help = QtWidgets.QLabel()
-        self.mode_help.setWordWrap(True)
-        self.mode_help.setStyleSheet("color:#aebbc8;")
-        root.addWidget(self.mode_help)
-        self.playback_mode.currentIndexChanged.connect(
-            self._update_mode_help
-        )
-        self.play_count.currentIndexChanged.connect(
-            self._sync_custom_count
-        )
-        self._sync_custom_count()
-        self._update_mode_help()
+        actions = QtWidgets.QHBoxLayout()
+        actions.addStretch()
+        self.reset_button = self._action_button("Reset", "secondary")
+        self.save_button = self._action_button("Save", "primary")
+        self.reset_button.setAutoDefault(False)
+        self.save_button.setAutoDefault(False)
+        actions.addWidget(self.reset_button)
+        actions.addWidget(self.save_button)
+        self.content_layout.addLayout(actions)
+        self.reset_button.clicked.connect(self.reset_defaults)
+        self.save_button.clicked.connect(self.accept)
 
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Save
-            | QtWidgets.QDialogButtonBox.Cancel
+        stored_speed = int(self._saved_settings["speed_percent"])
+        speed_index = self.speed.findData(stored_speed)
+        if speed_index < 0:
+            speed_index = self.speed.findData("custom")
+        self.speed.setCurrentIndex(speed_index)
+        self.custom_speed.setValue(stored_speed)
+        stored_count = self._saved_settings["play_count"]
+        mode = self._saved_settings["playback_mode"]
+        selected_count = (
+            "original" if mode == "original" and stored_count == FOREVER
+            else stored_count
         )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        count_index = self.play_count.findData(selected_count)
+        if count_index < 0:
+            count_index = self.play_count.findData("custom")
+        self.play_count.setCurrentIndex(count_index)
+        self.custom_count.setValue(
+            int(stored_count) if stored_count != FOREVER else 4
+        )
+        self._sync_controls()
+        self.speed.currentIndexChanged.connect(self._changed)
+        self.play_count.currentIndexChanged.connect(self._changed)
+        self.custom_speed.valueChanged.connect(self._changed)
+        self.custom_count.valueChanged.connect(self._changed)
+        self.start_delay.valueChanged.connect(self._changed)
+        self.loop_pause.valueChanged.connect(self._changed)
+
+    def _section(self, title: str) -> None:
+        label = QtWidgets.QLabel(title, self.panel)
+        label.setStyleSheet(
+            f"color:{self.colors['accent']};font:600 10pt 'Segoe UI';"
+        )
+        self.content_layout.addWidget(label)
+
+    @staticmethod
+    def _selection_row(
+        selector: QtWidgets.QComboBox, custom: QtWidgets.QSpinBox,
+    ) -> QtWidgets.QWidget:
+        row = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(selector, 1)
+        layout.addWidget(custom)
+        return row
 
     @staticmethod
     def _seconds_control(milliseconds: int) -> QtWidgets.QDoubleSpinBox:
         control = QtWidgets.QDoubleSpinBox()
         control.setRange(0.0, 86_400.0)
-        control.setDecimals(3)
+        control.setDecimals(2)
         control.setSingleStep(0.25)
-        control.setSuffix(" seconds")
+        control.setSuffix(" s")
+        control.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
         control.setValue(milliseconds / 1000.0)
         return control
 
-    def _sync_custom_count(self) -> None:
+    def _sync_controls(self) -> None:
+        self.custom_speed.setVisible(self.speed.currentData() == "custom")
         self.custom_count.setVisible(
             self.play_count.currentData() == "custom"
         )
-
-    def _update_mode_help(self) -> None:
-        descriptions = {
-            "original": (
-                "Uses the GIF's embedded loop behavior. Forever leaves that "
-                "behavior authoritative; a finite Play Count caps it."
-            ),
-            "loop": (
-                "Plays forward from beginning to end for the selected count."
-            ),
-            "ping_pong": (
-                "Plays forward, then displays the frames in reverse before "
-                "the next forward play."
-            ),
-        }
-        self.mode_help.setText(
-            descriptions[str(self.playback_mode.currentData())]
+        selected = self.play_count.currentData()
+        looping = selected == FOREVER or (
+            selected == "original" and self._embedded_play_count == FOREVER
         )
+        label = "Loop Pause" if looping else "End Hold"
+        self.timing_label.setText(label)
+        self.loop_pause.setAccessibleName(label)
+
+    def _changed(self, *_args: object) -> None:
+        self._sync_controls()
+        if self._preview_callback is not None:
+            self._preview_callback(self.gif_settings())
+
+    def reset_defaults(self) -> None:
+        self._preserve_timing_precision = False
+        for control, value in (
+            (self.speed, "Original"), (self.play_count, "Original"),
+        ):
+            with QtCore.QSignalBlocker(control):
+                control.setCurrentText(value)
+        for control in (self.start_delay, self.loop_pause):
+            with QtCore.QSignalBlocker(control):
+                control.setValue(0)
+        self._changed()
+
+    def reject(self) -> None:
+        if self._preview_callback is not None:
+            self._preview_callback(self._saved_settings.copy())
+        super().reject()
+
+    def accept(self) -> None:
+        self._committed = True
+        super().accept()
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        if not self._committed and self._preview_callback is not None:
+            self._preview_callback(self._saved_settings.copy())
+        super().hideEvent(event)
 
     def gif_settings(self) -> dict[str, object]:
-        play_count = self.play_count.currentData()
-        if play_count == "custom":
-            play_count = self.custom_count.value()
+        selected_count = self.play_count.currentData()
+        play_count = (
+            self.custom_count.value() if selected_count == "custom"
+            else FOREVER if selected_count == "original" else selected_count
+        )
+        speed = self.speed.currentData()
         return normalize_gif_settings(
             {
-                "animation_enabled": self.animation_enabled.isChecked(),
-                "speed_percent": self.speed_percent.value(),
-                "playback_mode": self.playback_mode.currentData(),
-                "play_count": play_count,
-                "start_delay_ms": round(
-                    self.start_delay.value() * 1000
+                "animation_enabled": True,
+                "speed_percent": (
+                    self.custom_speed.value() if speed == "custom" else speed
                 ),
-                "loop_pause_ms": round(
-                    self.loop_pause.value() * 1000
+                "playback_mode": (
+                    "loop" if selected_count == FOREVER else "original"
+                ),
+                "play_count": play_count,
+                "start_delay_ms": self._timing_milliseconds(
+                    self.start_delay, "start_delay_ms"
+                ),
+                "loop_pause_ms": self._timing_milliseconds(
+                    self.loop_pause, "loop_pause_ms"
                 ),
             }
         )
+
+    def _timing_milliseconds(
+        self, control: QtWidgets.QDoubleSpinBox, key: str,
+    ) -> int:
+        original = int(self._saved_settings[key])
+        if (
+            self._preserve_timing_precision
+            and control.value() == round(original / 1000, 2)
+        ):
+            return original
+        return round(control.value() * 1000)
 
 
 class ImageTab(
@@ -1603,9 +1835,7 @@ class ImageTab(
             ImageAssetCard,
         ] = {}
 
-        cards_layout = (
-            QtWidgets.QHBoxLayout()
-        )
+        cards_layout = QtWidgets.QGridLayout()
 
         cards_layout.setContentsMargins(
             0,
@@ -1615,6 +1845,8 @@ class ImageTab(
         )
 
         cards_layout.setSpacing(10)
+        self._cards_layout = cards_layout
+        self._cards_columns = 2
 
         for index in (
             1,
@@ -1660,7 +1892,8 @@ class ImageTab(
 
             cards_layout.addWidget(
                 card,
-                0,
+                (index - 1) // 2,
+                (index - 1) % 2,
                 QtCore.Qt.AlignTop,
             )
 
@@ -1788,6 +2021,17 @@ class ImageTab(
             1,
             utility_position_column,
         )
+        self._minimum_cards_width = (
+            root.contentsMargins().left()
+            + root.contentsMargins().right()
+            + max(self.reset_btn.width(), self.open_btn.width())
+            + centered_cards.spacing()
+            + self.cards[1].width()
+        )
+        self.setMinimumWidth(self._minimum_cards_width)
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
 
         self.status = QtWidgets.QLabel()
 
@@ -1974,6 +2218,11 @@ class ImageTab(
                     settings=record.get("settings"),
                     preview_path=thumbnail_path,
                     animate_gif=self._tab_active,
+                    embedded_play_count=(
+                        record.get("gif", {}).get("embedded_play_count")
+                        if animated_gif and isinstance(record.get("gif"), dict)
+                        else None
+                    ),
                 )
                 continue
 
@@ -2348,11 +2597,52 @@ class ImageTab(
 
         super().hideEvent(event)
 
+    def _columns_for_width(self, width: int) -> int:
+        step = self.cards[1].width() + self._cards_layout.horizontalSpacing()
+        return min(len(self.cards), max(1, 1 + (width - self._minimum_cards_width) // step))
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        hint = super().minimumSizeHint()
+        if hasattr(self, "_minimum_cards_width"):
+            # A previous four-column grid must not prevent the viewport shrinking.
+            hint.setWidth(self._minimum_cards_width)
+        return hint
+
+    def heightForWidth(self, width: int) -> int:
+        if not hasattr(self, "_minimum_cards_width"):
+            return super().heightForWidth(width)
+        columns = self._columns_for_width(width)
+        rows = (len(self.cards) + columns - 1) // columns
+        previous_rows = (len(self.cards) + self._cards_columns - 1) // self._cards_columns
+        card_height = max(
+            max(card.minimumHeight(), card.minimumSizeHint().height())
+            for card in self.cards.values()
+        )
+        return super().minimumSizeHint().height() + (rows - previous_rows) * (
+            card_height + self._cards_layout.verticalSpacing()
+        )
+
     def resizeEvent(
             self,
             event: QtGui.QResizeEvent,
     ) -> None:
         super().resizeEvent(event)
+
+        if hasattr(self, "_minimum_cards_width"):
+            columns = self._columns_for_width(self.width())
+            if columns != self._cards_columns:
+                self._cards_columns = columns
+                for card in self.cards.values():
+                    self._cards_layout.removeWidget(card)
+                for index, card in self.cards.items():
+                    self._cards_layout.addWidget(
+                        card,
+                        (index - 1) // columns,
+                        (index - 1) % columns,
+                        QtCore.Qt.AlignTop,
+                    )
+                self._cards_layout.invalidate()
+                self.updateGeometry()
 
         if not self.isVisible():
             return
@@ -2418,8 +2708,16 @@ class ImageTab(
     def open_stock_gallery(self, index: int) -> None:
         if index not in self.labels:
             return
-        image_paths = self._stock_image_paths(index)
-        if len(image_paths) != 3:
+        recent_entries = tuple(
+            (path, label) for value, label in recent_media(
+                self.project_root,
+                self.project_state.identity.project_id,
+                f"image:{INDEX_TO_SLOT[index]}",
+            )
+            if (path := Path(value)).is_file()
+        )
+        image_paths = () if recent_entries else self._stock_image_paths(index)
+        if not recent_entries and len(image_paths) != 3:
             self._show_temporary_status(
                 f"Stock images are unavailable for {self.labels[index][0]}.",
                 5000,
@@ -2429,8 +2727,14 @@ class ImageTab(
             self.labels[index][0],
             image_paths,
             self,
+            recent_paths=tuple(path for path, _label in recent_entries),
+            recent_labels=tuple(label for _path, label in recent_entries),
+            allow_browse=True,
         )
         if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        if dialog.browse_requested:
+            self._browse_image_file(index)
             return
         selected_path = dialog.selected_path()
         if selected_path is not None:
@@ -2663,6 +2967,20 @@ class ImageTab(
                 f"Failed to process {self.labels[result.index][1]}: {error}",
                 5000,
             )
+        else:
+            if result.source_path is not None:
+                try:
+                    remember_image_copy(
+                        self.project_root,
+                        result.project_identity[1],
+                        INDEX_TO_SLOT[result.index],
+                        pages_directory / str(record["source_file"]),
+                        result.source_path.name,
+                    )
+                except (OSError, ValueError):
+                    logging.getLogger(__name__).exception(
+                        "Could not save recent image history."
+                    )
 
     def _persist_image_record_to_project(
         self,
@@ -2751,15 +3069,39 @@ class ImageTab(
             record.get("asset_type")
             == "animated_gif"
         )
+        if not animated_gif:
+            return
+        gif_record = record.get("gif")
+        embedded_count = (
+            gif_record.get("embedded_play_count", FOREVER)
+            if isinstance(gif_record, dict) else FOREVER
+        )
+
+        def preview_settings(values: dict[str, object]) -> None:
+            card = getattr(self, "cards", {}).get(index)
+            if card is None:
+                return
+            asset_path = os.path.join(self._user_pages_dir(), f"{slot}.gif")
+            preview_path = os.path.join(
+                self._user_pages_dir(),
+                str(record.get("thumbnail_file", f"{slot}.gif")),
+            )
+            card.set_asset_path(
+                asset_path,
+                animated_gif=True,
+                settings=values,
+                preview_path=preview_path,
+                embedded_play_count=embedded_count,
+            )
+
         dialog = ImageSettingsDialog(
             self.labels[index][0],
-            animated_gif=animated_gif,
+            animated_gif=True,
             settings=record.get("settings"),
+            embedded_play_count=embedded_count,
+            preview_callback=preview_settings,
             parent=self,
         )
-        if not animated_gif:
-            dialog.exec()
-            return
         if dialog.exec() != QtWidgets.QDialog.Accepted:
             return
         try:
@@ -2775,6 +3117,7 @@ class ImageTab(
             )
             self.refresh_cards()
         except Exception as error:
+            preview_settings(normalize_gif_settings(record.get("settings")))
             self._show_temporary_status(
                 f"Could not save {slot} GIF settings: {error}",
                 5000,

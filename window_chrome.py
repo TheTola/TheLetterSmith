@@ -16,7 +16,56 @@ TITLE_BAR_CONTROL_PX = 40
 TITLE_BAR_ICON_PX = 36
 FRAME_RESIZE_MARGIN_PX = 8
 
+
+def bounded_window_geometry(
+    geometry: QtCore.QRect,
+    available: QtCore.QRect,
+    minimum: QtCore.QSize = QtCore.QSize(1, 1),
+) -> QtCore.QRect:
+    """Fit logical window coordinates inside one screen, including negative origins."""
+    width = min(available.width(), max(minimum.width(), geometry.width(), 1))
+    height = min(available.height(), max(minimum.height(), geometry.height(), 1))
+    return QtCore.QRect(
+        min(max(geometry.x(), available.left()), available.right() - width + 1),
+        min(max(geometry.y(), available.top()), available.bottom() - height + 1),
+        width,
+        height,
+    )
+
+
+def fit_window_to_screen(
+    window: QtWidgets.QWidget,
+    minimum: QtCore.QSize,
+    geometry: QtCore.QRect | None = None,
+    *,
+    screen: QtGui.QScreen | None = None,
+) -> QtCore.QRect:
+    """Recover a frameless window without taking ownership of ordinary resizing."""
+    target = QtCore.QRect(geometry if geometry is not None else window.geometry())
+    screens = QtGui.QGuiApplication.screens()
+    if not screens:
+        return target
+
+    def screen_rank(screen: QtGui.QScreen) -> tuple[int, int]:
+        bounds = screen.availableGeometry()
+        overlap = bounds.intersected(target)
+        center = target.center()
+        dx = max(bounds.left() - center.x(), 0, center.x() - bounds.right())
+        dy = max(bounds.top() - center.y(), 0, center.y() - bounds.bottom())
+        return overlap.width() * overlap.height(), -(dx * dx + dy * dy)
+
+    available = (screen or max(screens, key=screen_rank)).availableGeometry()
+    window.setMinimumSize(minimum.boundedTo(available.size()))
+    fitted = bounded_window_geometry(target, available, window.minimumSize())
+    if not window.isMaximized() and not window.isFullScreen():
+        if fitted != window.geometry():
+            window.setGeometry(fitted)
+    return fitted
+
 _WM_NCHITTEST = 0x0084
+_WM_ENTERSIZEMOVE = 0x0231
+_WM_EXITSIZEMOVE = 0x0232
+_HTCAPTION = 2
 _HTMAXBUTTON = 9
 _HTLEFT = 10
 _HTRIGHT = 11
@@ -87,16 +136,21 @@ def native_resize_hit_test(edges: Qt.Edge) -> int:
 class FramelessWindowController(QtCore.QObject):
     """Give a custom-framed QWidget native move, resize, and Snap behavior."""
 
+    system_interaction_finished = QtCore.Signal()
+
     def __init__(
         self,
         window: QtWidgets.QWidget,
         maximize_button: Optional[QtWidgets.QWidget] = None,
         *,
         resize_margin: int = FRAME_RESIZE_MARGIN_PX,
+        title_bar: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(window)
         self._window = window
         self._maximize_button = maximize_button
+        self._title_bar = title_bar
+        self._system_interaction_active = False
         self._resize_margin = max(1, int(resize_margin))
         self._cursor_target: Optional[QtWidgets.QWidget] = None
         self._cursor_was_explicit = False
@@ -111,6 +165,49 @@ class FramelessWindowController(QtCore.QObject):
         widget.setMouseTracking(True)
         for child in widget.findChildren(QtWidgets.QWidget):
             child.setMouseTracking(True)
+
+    def _enable_native_resize_style(self) -> None:
+        if (
+            sys.platform != "win32"
+            or QtGui.QGuiApplication.platformName() != "windows"
+            or not self._window.windowFlags() & Qt.FramelessWindowHint
+            or self._window.windowHandle() is None
+        ):
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        user32.GetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.GetWindowLongW.restype = wintypes.LONG
+        user32.SetWindowLongW.argtypes = (wintypes.HWND, ctypes.c_int, wintypes.LONG)
+        user32.SetWindowLongW.restype = wintypes.LONG
+        user32.SetWindowPos.argtypes = (
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        )
+        hwnd = int(self._window.winId())
+        style = user32.GetWindowLongW(hwnd, -16)  # GWL_STYLE
+        if not style & 0x00040000:  # WS_THICKFRAME
+            # Qt removes this flag for frameless windows. Native resize hits
+            # require it; Qt still removes the visible frame in WM_NCCALCSIZE.
+            user32.SetWindowLongW(hwnd, -16, style | 0x00040000)
+            # Refresh non-client metrics without moving, resizing or activating.
+            user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0037)
+
+    def _is_caption_point(self, point: QtCore.QPoint) -> bool:
+        title = self._title_bar
+        if title is None or not title.isVisible():
+            return False
+        local = title.mapFrom(self._window, point)
+        if not title.rect().contains(local):
+            return False
+        child = title.childAt(local)
+        return child is None or isinstance(child, QtWidgets.QLabel)
+
+    @property
+    def system_interaction_active(self) -> bool:
+        return self._system_interaction_active
 
     def start_system_move(self) -> bool:
         handle = self._window.windowHandle()
@@ -157,6 +254,10 @@ class FramelessWindowController(QtCore.QObject):
         )
 
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if watched is self._window and event.type() in (
+            QtCore.QEvent.Show, QtCore.QEvent.WinIdChange,
+        ):
+            self._enable_native_resize_style()
         if isinstance(watched, QtWidgets.QWidget):
             if event.type() == QtCore.QEvent.ChildAdded:
                 child = event.child()
@@ -201,9 +302,19 @@ class FramelessWindowController(QtCore.QObject):
             from ctypes import wintypes
 
             native_message = wintypes.MSG.from_address(int(message))
-            if int(native_message.message) != _WM_NCHITTEST:
+            message_id = int(native_message.message)
+            if message_id not in (_WM_NCHITTEST, _WM_ENTERSIZEMOVE, _WM_EXITSIZEMOVE):
                 return False, 0
             if int(native_message.hWnd or 0) != int(self._window.winId()):
+                return False, 0
+            if message_id == _WM_ENTERSIZEMOVE:
+                self._system_interaction_active = True
+                return False, 0
+            if message_id == _WM_EXITSIZEMOVE:
+                self._system_interaction_active = False
+                self.system_interaction_finished.emit()
+                return False, 0
+            if message_id != _WM_NCHITTEST:
                 return False, 0
 
             packed_position = int(native_message.lParam)
@@ -232,6 +343,9 @@ class FramelessWindowController(QtCore.QObject):
                 )
                 if resize_hit:
                     return True, resize_hit
+
+            if self._is_caption_point(local_point):
+                return True, _HTCAPTION
 
             button = self._maximize_button
             if button is not None and button.isVisible() and button.isEnabled():

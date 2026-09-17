@@ -28,7 +28,7 @@ What this editor does
 - Font family + size with live sync.
 - Color picker (persists last color).
 - Word/char counter.
-- Live preview painted over wall.png (letter background) or provided pixmap.
+- Unified editing surface painted over the selected wall image.
 - Paste/drag-drop images into:
     <project_root>/gallery/message_assets/
 
@@ -55,6 +55,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QSize, QSettings, QMimeData
 from PySide6.QtGui import (
     QFont,
+    QFontInfo,
+    QRawFont,
     QColor,
     QAction,
     QActionGroup,
@@ -79,13 +81,13 @@ from PySide6.QtWidgets import (
     QLabel,
     QColorDialog,
     QPushButton,
-    QDialogButtonBox,
     QLineEdit,
     QPlainTextEdit,
     QToolButton,
     QMenu,
-    QSplitter,
+    QFrame,
     QCheckBox,
+    QWidgetAction,
 )
 
 from config import (
@@ -95,39 +97,86 @@ from config import (
 )
 from language_service import get_language_service
 from letter_page import (
+    MESSAGE_RENDER_FONT_FAMILY,
+    MESSAGE_RENDER_FONT_SIZE,
+    MESSAGE_RENDER_HEIGHT,
+    MESSAGE_RENDER_LINE_HEIGHT,
+    MESSAGE_RENDER_MARGIN_BOTTOM,
+    MESSAGE_RENDER_MARGIN_LR,
+    MESSAGE_RENDER_MARGIN_TOP,
+    MESSAGE_RENDER_WIDTH,
     LETTER_PAGE_PRESETS,
-    MESSAGE_OVERLAY_PRESET_KEY,
+    composite_rgb,
+    contrast_ratio,
+    effective_letter_page_opacity,
     normalize_letter_page_preset,
+    normalized_letter_page_settings,
 )
 from message_format import normalize_ultralinks_in_document
 from project_save import ProjectNotReadyError, ProjectSaveService
 from project_state import ProjectStateController
 from project_paths import application_paths
-from ui_sounds import UiSound, play_ui_sound
+from ui_sounds import EDITOR_WINDOW_OBJECT_NAME, UiSound, play_ui_sound
 from editor_diagnostics import record_editor_failure
 from message_html import (
+    embed_lettersmith_style_state,
+    extract_lettersmith_style_state,
+    has_unsupported_lettersmith_style_state,
     is_ultralink_href,
     make_ultralink_href,
     mark_lettersmith_message_html,
     sanitize_message_html,
     ultralink_message_from_href,
 )
+from named_text_styles import (
+    InvalidStyleSetError,
+    SavedStyleSetStore,
+    STYLE_KEYS,
+    STYLE_LABELS,
+    StyleSetOverwriteRequired,
+    default_style_set,
+)
+from named_text_style_document import NamedTextStyleDocument
+from named_text_style_preview import (
+    add_style_preview_submenu,
+    preview_font,
+    preview_font_stylesheet,
+    set_action_style_preview,
+    set_slot_style_preview,
+)
+from settings_store import SettingsStore
 from ui_dialogs import (
     LetterSmithConfirmationDialog,
     LetterSmithDialog,
     LetterSmithInputDialog,
     show_lettersmith_message,
 )
-from window_chrome import StandardTitleBar
+from window_chrome import StandardTitleBar, fit_window_to_screen
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants & Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 TOOLBAR_ICON_SIZE = QSize(16, 16)
-DEFAULT_FONT_SIZE = 16
+DEFAULT_FONT_SIZE = MESSAGE_RENDER_FONT_SIZE
 FONT_SIZE_MIN, FONT_SIZE_MAX = 1, 100
 FONT_SIZE_STEP = 1
+
+
+def _toolbar_symbol_font(base: QFont, symbol: str) -> QFont:
+    """Use an installed symbol font when the toolbar font lacks a glyph."""
+    for family in ("Segoe UI Symbol", "Apple Symbols", "Noto Sans Symbols 2", "DejaVu Sans"):
+        font = QFont(base)
+        font.setFamily(family)
+        if not QFontInfo(font).exactMatch():
+            continue
+        raw_font = QRawFont.fromFont(font)
+        if raw_font.isValid() and all(raw_font.supportsCharacter(ord(char)) for char in symbol):
+            font.setPointSizeF(max(14.0, font.pointSizeF()))
+            return font
+    font = QFont(base)
+    font.setPointSizeF(max(14.0, font.pointSizeF()))
+    return font
 
 SETTINGS_ORG = "LetterSmith"
 SETTINGS_APP = "Editor"
@@ -315,7 +364,7 @@ class FindReplaceDialog(LetterSmithDialog):
             found = doc.find(term, boundary, flags)
 
         if found.isNull():
-            QtWidgets.QApplication.beep()
+            play_ui_sound(UiSound.ERROR)
             self.status_label.setText("No matches found.")
             return False
 
@@ -401,8 +450,7 @@ class UltralinkDialog(QDialog):
 
     def _save(self) -> None:
         if not self.message_text():
-            if not play_ui_sound(UiSound.BROKEN):
-                QtWidgets.QApplication.beep()
+            play_ui_sound(UiSound.ERROR)
             self.message_edit.setFocus(Qt.OtherFocusReason)
             return
         self.accept()
@@ -669,15 +717,6 @@ class RichTextEdit(QTextEdit):
         menu.exec(event.globalPos())
         menu.deleteLater()
 
-    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        super().paintEvent(event)
-        painter = QtGui.QPainter(self.viewport())
-        painter.setPen(QColor(112, 81, 44, 10))
-        for y in range(18, self.viewport().height(), 29):
-            for x in range(17 + (y % 23), self.viewport().width(), 23):
-                painter.drawPoint(x, y)
-        painter.end()
-
     def viewportEvent(self, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.ToolTip:
             href = self.anchorAt(event.pos())
@@ -747,6 +786,12 @@ class RichTextEdit(QTextEdit):
         else:
             super().dropEvent(event)
 
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        controller = getattr(self, "named_style_controller", None)
+        if controller is not None and controller.handle_key_press(event):
+            return
+        super().keyPressEvent(event)
+
     def insertFromMimeData(self, source: QMimeData) -> None:
         if source.hasImage():
             img = source.imageData()
@@ -769,12 +814,14 @@ class RichTextEdit(QTextEdit):
                         self.insert_image_html(rel, 320)
                         return
 
-        super().insertFromMimeData(source)
+        controller = getattr(self, "named_style_controller", None)
+        context = controller.before_paste(source) if controller is not None else None
+        try:
+            super().insertFromMimeData(source)
+        finally:
+            if controller is not None:
+                controller.after_paste(context)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Preview Widget
-# ─────────────────────────────────────────────────────────────────────────────
 
 class FontSizeSpinBox(QSpinBox):
     """Exact point-size input that ignores incidental page scrolling."""
@@ -786,47 +833,139 @@ class FontSizeSpinBox(QSpinBox):
         super().wheelEvent(event)
 
 
-class PreviewWidget(QtWidgets.QWidget):
+class EditorSurface(QFrame):
+    """The single editing surface shared with the committed message renderer."""
+
     def __init__(
         self,
-        background_path: Optional[Path],
         editor: QTextEdit,
-        preview_pixmap: Optional[QPixmap] = None,
-        parent=None
+        wall_pixmap: Optional[QPixmap] = None,
+        parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self._bg_path = Path(background_path) if background_path else None
-        self._bg_pm: Optional[QPixmap] = preview_pixmap if (preview_pixmap and not preview_pixmap.isNull()) else None
+        self.setObjectName("LetterEditorSurface")
+        self.setFrameStyle(QFrame.NoFrame)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
         self._editor = editor
-        self.setMinimumWidth(320)
+        self._wall_pixmap = (
+            wall_pixmap
+            if wall_pixmap is not None and not wall_pixmap.isNull()
+            else None
+        )
+        self._preset = "paper"
+        self._opacity = 68
+        self._layout = QVBoxLayout(self)
+        self._layout.setSpacing(0)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.addWidget(editor)
 
-    def paintEvent(self, _event) -> None:
+        editor.setFrameStyle(QFrame.NoFrame)
+        editor.setAttribute(Qt.WA_TranslucentBackground, True)
+        editor.viewport().setAttribute(Qt.WA_TranslucentBackground, True)
+        editor.viewport().setAutoFillBackground(False)
+
+    @property
+    def wall_pixmap(self) -> Optional[QPixmap]:
+        return self._wall_pixmap
+
+    def set_wall_pixmap(self, pixmap: Optional[QPixmap]) -> None:
+        self._wall_pixmap = (
+            pixmap if pixmap is not None and not pixmap.isNull() else None
+        )
+        self.update()
+
+    def set_surface_settings(self, preset: str, opacity: int) -> None:
+        self._preset = normalize_letter_page_preset(preset)
+        self._opacity = max(
+            0,
+            min(100, int(effective_letter_page_opacity(self._preset, opacity))),
+        )
+        self.update()
+
+    def _scaled_background(self) -> Optional[QPixmap]:
+        pixmap = self._wall_pixmap
+        if pixmap is None or pixmap.isNull() or self.size().isEmpty():
+            return None
+        return pixmap.scaled(
+            self.size(),
+            Qt.KeepAspectRatioByExpanding,
+            Qt.SmoothTransformation,
+        )
+
+    def _overlay_color(self, x_fraction: float, y_fraction: float) -> tuple[int, int, int]:
+        definition = LETTER_PAGE_PRESETS[self._preset]
+        x = max(0.0, min(1.0, float(x_fraction)))
+        y = max(0.0, min(1.0, float(y_fraction)))
+        distance = min(1.0, ((x - 0.5) ** 2 + (y - 0.43) ** 2) ** 0.5 / 0.76)
+        return tuple(
+            round(center + ((edge - center) * distance))
+            for center, edge in zip(definition.center_rgb, definition.edge_rgb)
+        )
+
+    def readability_backgrounds(self) -> tuple[tuple[int, int, int], ...]:
+        """Return representative composited backgrounds for live contrast checks."""
+        definition = LETTER_PAGE_PRESETS[self._preset]
+        samples = ((0.50, 0.43), (0.20, 0.25), (0.80, 0.75))
+        image = self._wall_pixmap.toImage() if self._wall_pixmap is not None else None
+        if image is not None and not image.isNull():
+            image = image.convertToFormat(QImage.Format_RGB32)
+
+        backgrounds: list[tuple[int, int, int]] = []
+        alpha = self._opacity / 100.0
+        for x_fraction, y_fraction in samples:
+            if image is None or image.isNull():
+                wall_rgb = definition.base_rgb
+            else:
+                x = max(0, min(image.width() - 1, round((image.width() - 1) * x_fraction)))
+                y = max(0, min(image.height() - 1, round((image.height() - 1) * y_fraction)))
+                color = image.pixelColor(x, y)
+                wall_rgb = (color.red(), color.green(), color.blue())
+            backgrounds.append(
+                composite_rgb(wall_rgb, self._overlay_color(x_fraction, y_fraction), alpha)
+            )
+        return tuple(backgrounds)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        width_scale = self.width() / float(MESSAGE_RENDER_WIDTH or 1)
+        height_scale = self.height() / float(MESSAGE_RENDER_HEIGHT or 1)
+        self._layout.setContentsMargins(
+            max(12, round(MESSAGE_RENDER_MARGIN_LR * width_scale)),
+            max(12, round(MESSAGE_RENDER_MARGIN_TOP * height_scale)),
+            max(12, round(MESSAGE_RENDER_MARGIN_LR * width_scale)),
+            max(12, round(MESSAGE_RENDER_MARGIN_BOTTOM * height_scale)),
+        )
+        super().resizeEvent(event)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
-        w, h = self.width(), self.height()
-
-        pm = self._bg_pm
-        if pm is None and self._bg_path and self._bg_path.exists():
-            pm = QPixmap(str(self._bg_path))
-
-        if pm and not pm.isNull():
-            bg = pm.scaled(w, h, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-            painter.drawPixmap(0, 0, bg)
+        background = self._scaled_background()
+        if background is None:
+            painter.fillRect(self.rect(), QtGui.QColor(14, 14, 18))
         else:
-            painter.fillRect(self.rect(), Qt.black)
+            source = QtCore.QRect(
+                max(0, (background.width() - self.width()) // 2),
+                max(0, (background.height() - self.height()) // 2),
+                min(self.width(), background.width()),
+                min(self.height(), background.height()),
+            )
+            painter.drawPixmap(self.rect(), background, source)
 
-        doc = QtGui.QTextDocument()
-        doc.setHtml(self._editor.toHtml())
-        normalize_ultralinks_in_document(doc)
-
-        margin = 16
-        doc.setTextWidth(max(1, w - margin * 2))
-
-        painter.save()
-        painter.translate(margin, margin)
-        doc.drawContents(painter, QtCore.QRectF(0, 0, w - margin * 2, h - margin * 2))
-        painter.restore()
+        if self._opacity > 0:
+            definition = LETTER_PAGE_PRESETS[self._preset]
+            alpha = round(255 * (self._opacity / 100.0))
+            gradient = QtGui.QRadialGradient(
+                QtCore.QPointF(self.width() * 0.5, self.height() * 0.43),
+                max(1.0, (self.width() ** 2 * 0.25 + self.height() ** 2 * 0.325) ** 0.5),
+            )
+            gradient.setColorAt(0.0, QtGui.QColor(*definition.center_rgb, alpha))
+            gradient.setColorAt(1.0, QtGui.QColor(*definition.edge_rgb, alpha))
+            painter.fillRect(self.rect(), gradient)
+        painter.end()
+        super().paintEvent(event)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -863,6 +1002,7 @@ class Editor(QDialog):
         self.settings_path = application_paths(
             self.project_root
         ).settings_file.resolve()
+        self._style_slots = SavedStyleSetStore(SettingsStore(self.project_root))
         self.project_state = getattr(parent, "project_state", None)
         if self.project_state is None:
             self.project_state = ProjectStateController(self.project_root)
@@ -902,6 +1042,10 @@ class Editor(QDialog):
         )
 
         self.message_html = message_html or ""
+        self._unsupported_style_state = has_unsupported_lettersmith_style_state(
+            self.message_html
+        )
+        self._restored_style_state = extract_lettersmith_style_state(self.message_html)
         self._apply_message_defaults = bool(apply_defaults)
         self._initializing = True
         self._last_persisted_html = ""
@@ -911,7 +1055,10 @@ class Editor(QDialog):
         self._discard_changes = False
 
         # Tracks the most recent spacing selection (used to force identical browser output).
-        self._export_line_spacing: Optional[float] = 2.0 if self._apply_message_defaults else None
+        self._export_line_spacing: Optional[float] = (
+            2.0 if self._apply_message_defaults and self._restored_style_state is None
+            else None
+        )
 
         self._autosave_timer = QtCore.QTimer(self)
         self._autosave_timer.setSingleShot(True)
@@ -923,6 +1070,7 @@ class Editor(QDialog):
         self._language_check_timer.timeout.connect(self._refresh_language_issues)
 
         self.setWindowTitle("Letter Editor")
+        self.setObjectName(EDITOR_WINDOW_OBJECT_NAME)
         self.setWindowFlags(
             Qt.Dialog
             | Qt.FramelessWindowHint
@@ -931,10 +1079,15 @@ class Editor(QDialog):
         )
         self.setModal(True)
         self.resize(1100, 720)
+        self._wall_pixmap = (
+            preview_pixmap
+            if preview_pixmap is not None and not preview_pixmap.isNull()
+            else None
+        )
 
         self._apply_styles()
         self._restore_geometry()
-        self._build_ui(preview_pixmap)
+        self._build_ui(self._wall_pixmap)
         theme_service = getattr(parent, "theme_service", None)
         if theme_service is None and isinstance(parent, QtWidgets.QWidget):
             theme_service = getattr(parent.window(), "theme_service", None)
@@ -955,6 +1108,11 @@ class Editor(QDialog):
             self._last_persisted_html = ""
         self._initializing = False
 
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self._update_font_controls_height()
+        fit_window_to_screen(self, QSize(640, 420))
+
     def _settings_file_changed(self, path: str) -> None:
         if self._closing:
             return
@@ -965,7 +1123,7 @@ class Editor(QDialog):
         if Path(path).is_file() and path not in self._settings_watcher.files():
             self._settings_watcher.addPath(path)
 
-    def _build_ui(self, preview_pixmap: Optional[QPixmap]) -> None:
+    def _build_ui(self, wall_pixmap: Optional[QPixmap]) -> None:
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(8)
@@ -989,27 +1147,54 @@ class Editor(QDialog):
         )
         self.editor.setObjectName("EditorTextArea")
         self.editor.setProperty("themeFontRole", "letterContent")
-        self.editor.document().setDefaultFont(QFont("Papyrus", DEFAULT_FONT_SIZE))
+        self.editor.document().setDefaultFont(
+            QFont(MESSAGE_RENDER_FONT_FAMILY, DEFAULT_FONT_SIZE)
+        )
         self.editor.setHtml(self.message_html)
         normalize_ultralinks_in_document(self.editor.document())
-        self.preview = self.editor
-        main_layout.addWidget(self.editor, 1)
+        self.named_styles = NamedTextStyleDocument(
+            self.editor,
+            default_style_set(
+                color=QColor(self._editor_background_setting()[2]).name()
+            ),
+        )
+        if self._restored_style_state is not None:
+            try:
+                self.named_styles.restore(self._restored_style_state)
+            except (InvalidStyleSetError, ValueError) as error:
+                _LOGGER.warning("Ignoring invalid letter style state: %s", error)
+        self.editor_surface = EditorSurface(
+            self.editor,
+            wall_pixmap=wall_pixmap,
+            parent=self,
+        )
+        main_layout.addWidget(self.editor_surface, 1)
 
         self._build_toolbar_actions()
-        if self._apply_message_defaults:
+        if self._apply_message_defaults and self._restored_style_state is None:
             self._apply_initial_message_defaults()
+            if not self.editor.toPlainText().strip():
+                self.named_styles.apply_style("normal_text")
 
-        self.editor.textChanged.connect(self.preview.update)
         self.editor.textChanged.connect(self.update_word_count)
         self.editor.textChanged.connect(self._schedule_autosave)
         self.editor.textChanged.connect(self._schedule_language_check)
+        self.editor.textChanged.connect(self._update_readability_indicator)
+        self.editor.textChanged.connect(self._sync_named_style_selector)
         self.editor.language_refresh_requested.connect(self._schedule_language_check)
-        self.editor.currentCharFormatChanged.connect(self.preview.update)
         self.editor.currentCharFormatChanged.connect(self._sync_format)
+        self.editor.currentCharFormatChanged.connect(self._update_readability_indicator)
 
         hb = QHBoxLayout()
         self.word_label = QLabel()
         hb.addWidget(self.word_label)
+        self.readability_indicator = QLabel()
+        self.readability_indicator.setObjectName("readabilityIndicator")
+        self.readability_indicator.setAccessibleName("Text readability status")
+        self.readability_indicator.setToolTip(
+            "Live contrast check for the current text color against the letter artwork."
+        )
+        hb.addWidget(self.readability_indicator)
         hb.addStretch()
 
         btn_save = QPushButton("Save")
@@ -1042,47 +1227,98 @@ class Editor(QDialog):
                 control.lineEdit().installEventFilter(self)
         self.editor.cursorPositionChanged.connect(self._sync_current_format)
         self.editor.selectionChanged.connect(self._sync_current_format)
+        self.editor.cursorPositionChanged.connect(self._update_readability_indicator)
+        self.editor.selectionChanged.connect(self._update_readability_indicator)
         self._apply_editor_background()
         self._sync_current_format()
+        self._update_readability_indicator()
         self._schedule_language_check()
 
-    def _editor_background_setting(self) -> tuple[str, str, str]:
+    def _editor_background_setting(self) -> tuple[str, int, str]:
         data = _read_json(self.settings_path)
-        preset = normalize_letter_page_preset(data.get(MESSAGE_OVERLAY_PRESET_KEY))
-        definition = LETTER_PAGE_PRESETS[preset]
-        if preset == "clear":
-            background = "transparent"
-        else:
-            center = ",".join(map(str, definition.center_rgb))
-            edge = ",".join(map(str, definition.edge_rgb))
-            background = (
-                f"qradialgradient(cx:.5,cy:.43,radius:.76,"
-                f"stop:0 rgb({center}),stop:1 rgb({edge}))"
-            )
-        return preset, background, definition.default_ink
+        preset, opacity, _rgb, ink = normalized_letter_page_settings(data)
+        return preset, opacity, ink
 
     def _apply_editor_background(self) -> None:
-        preset, background, foreground = self._editor_background_setting()
-        definition = LETTER_PAGE_PRESETS[preset]
-        border = "transparent" if preset == "clear" else definition.border
+        preset, opacity, foreground = self._editor_background_setting()
+        self.editor_surface.set_surface_settings(preset, opacity)
+        self.editor.document().setDefaultStyleSheet(
+            f"body {{ color: {foreground}; background: transparent; "
+            f"font-family: '{MESSAGE_RENDER_FONT_FAMILY}'; "
+            f"text-align: center; line-height: {MESSAGE_RENDER_LINE_HEIGHT:g}; }}"
+            "p { margin: 0 0 12px 0; }"
+            f"br {{ line-height: {MESSAGE_RENDER_LINE_HEIGHT:g}; }}"
+        )
         self.editor.setStyleSheet(
             "QTextEdit#EditorTextArea{"
-            f"background-color:{background};color:{foreground};"
-            f"border:1px solid {border};border-radius:6px;padding:8px;"
+            f"background:transparent;color:{foreground};"
+            "border:none;border-radius:0;padding:0;"
             "selection-background-color:#c9a86a;"
             f"selection-color:{foreground};}}"
         )
-        self.editor.setAttribute(Qt.WA_TranslucentBackground, preset == "clear")
+        self.editor.setAttribute(Qt.WA_TranslucentBackground, True)
         self.editor.viewport().setAttribute(
             Qt.WA_TranslucentBackground,
-            preset == "clear",
+            True,
         )
+        self.editor.viewport().setAutoFillBackground(False)
         self.editor.viewport().update()
+        self.editor_surface.update()
 
     def refresh_background_from_settings(self) -> None:
         self._apply_editor_background()
+        self._update_readability_indicator()
+
+    def _update_readability_indicator(self, *_args: object) -> None:
+        if not hasattr(self, "readability_indicator") or self._closing:
+            return
+        try:
+            _preset, _opacity, fallback = self._editor_background_setting()
+            cursor = self.editor.textCursor()
+            if cursor.hasSelection():
+                colors = self._selected_text_colors(cursor)
+            else:
+                brush = self.editor.currentCharFormat().foreground()
+                color = (
+                    brush.color()
+                    if brush.style() != Qt.BrushStyle.NoBrush
+                    else QColor(fallback)
+                )
+                colors = (color if color.isValid() else QColor(fallback),)
+            backgrounds = self.editor_surface.readability_backgrounds()
+            ratios = tuple(
+                contrast_ratio(
+                    (color.red(), color.green(), color.blue()),
+                    background,
+                )
+                for color in colors
+                for background in backgrounds
+            )
+            minimum = min(ratios) if ratios else 0.0
+            if minimum >= 4.5:
+                state, text = "good", "Contrast good"
+            elif minimum >= 3.0:
+                state, text = "reduced", "Contrast reduced"
+            else:
+                state, text = "low", "Low contrast"
+            self.readability_indicator.setText(text)
+            self.readability_indicator.setProperty("readabilityState", state)
+            self.readability_indicator.setToolTip(
+                f"Lowest sampled contrast: {minimum:.1f}:1."
+            )
+            style = self.readability_indicator.style()
+            style.unpolish(self.readability_indicator)
+            style.polish(self.readability_indicator)
+            self.readability_indicator.update()
+        except Exception as error:
+            self._record_failure("update readability indicator", error)
 
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if watched is getattr(self, "font_controls", None) and event.type() in (
+            QtCore.QEvent.LayoutRequest, QtCore.QEvent.FontChange,
+            QtCore.QEvent.StyleChange,
+        ):
+            self._update_font_controls_height()
         format_inputs = (
             self.font_combo,
             self.font_size_spin,
@@ -1107,8 +1343,10 @@ class Editor(QDialog):
         return super().eventFilter(watched, event)
 
     def _sync_current_format(self) -> None:
+        self.named_styles.sync_empty_insertion_format()
         self._sync_format(self.editor.currentCharFormat())
         self._sync_block_actions()
+        self._sync_named_style_selector()
         self.update_word_count()
 
     def _sync_block_actions(self) -> None:
@@ -1202,6 +1440,11 @@ class Editor(QDialog):
             self._guarded_action("Insert salutation", self.insert_salutation)
         )
         self.toolbar.addAction(self.act_salutation)
+        salutation_font = QFont(self.toolbar.font())
+        salutation_font.setBold(True)
+        salutation_font.setItalic(True)
+        self.act_salutation.setFont(salutation_font)
+        self.toolbar.widgetForAction(self.act_salutation).setFont(salutation_font)
 
         self.toolbar.addSeparator()
 
@@ -1213,6 +1456,9 @@ class Editor(QDialog):
 
         fmt_menu = QMenu(self)
         self.act_bold = fmt_menu.addAction("Bold")
+        bold_label_font = QFont(fmt_menu.font())
+        bold_label_font.setBold(True)
+        self.act_bold.setFont(bold_label_font)
         self.act_bold.setCheckable(True)
         self.act_bold.setShortcut(QKeySequence.Bold)
         self.act_bold.triggered.connect(
@@ -1220,6 +1466,9 @@ class Editor(QDialog):
         )
 
         self.act_italic = fmt_menu.addAction("Italic")
+        italic_label_font = QFont(fmt_menu.font())
+        italic_label_font.setItalic(True)
+        self.act_italic.setFont(italic_label_font)
         self.act_italic.setCheckable(True)
         self.act_italic.setShortcut(QKeySequence.Italic)
         self.act_italic.triggered.connect(
@@ -1227,6 +1476,9 @@ class Editor(QDialog):
         )
 
         self.act_underline = fmt_menu.addAction("Underline")
+        underline_label_font = QFont(fmt_menu.font())
+        underline_label_font.setUnderline(True)
+        self.act_underline.setFont(underline_label_font)
         self.act_underline.setCheckable(True)
         self.act_underline.setShortcut(QKeySequence.Underline)
         self.act_underline.triggered.connect(
@@ -1234,6 +1486,9 @@ class Editor(QDialog):
         )
 
         self.act_strike = fmt_menu.addAction("Strike")
+        strike_label_font = QFont(fmt_menu.font())
+        strike_label_font.setStrikeOut(True)
+        self.act_strike.setFont(strike_label_font)
         self.act_strike.setCheckable(True)
         self.act_strike.triggered.connect(
             self._guarded_action("Strikethrough", self.toggle_strikethrough)
@@ -1356,7 +1611,10 @@ class Editor(QDialog):
         self._update_text_color_indicator(self._active_text_color)
 
         self.btn_links = QToolButton(self)
-        self.btn_links.setText("Links")
+        self.btn_links.setText("🔗")
+        self.btn_links.setFont(_toolbar_symbol_font(self.btn_links.font(), "🔗"))
+        self.btn_links.setAccessibleName("Add/edit link")
+        self.btn_links.setMinimumSize(44, 36)
         self.btn_links.setPopupMode(QToolButton.InstantPopup)
         self.btn_links.setAutoRaise(True)
 
@@ -1371,6 +1629,27 @@ class Editor(QDialog):
         self.act_remove_link.triggered.connect(
             self._guarded_action("Remove link", self.remove_link)
         )
+        self.btn_links.setToolTip(
+            f"Add/edit link ({self.act_add_edit_link.shortcut().toString(QKeySequence.NativeText)})"
+        )
+        link_metrics = link_menu.fontMetrics()
+        menu_style = link_menu.style()
+        menu_chrome = (
+            2 * menu_style.pixelMetric(QtWidgets.QStyle.PM_MenuHMargin, None, link_menu)
+            + 2 * menu_style.pixelMetric(QtWidgets.QStyle.PM_MenuPanelWidth, None, link_menu)
+            + menu_style.pixelMetric(QtWidgets.QStyle.PM_SmallIconSize, None, link_menu)
+        )
+        shortcut_gap = link_metrics.horizontalAdvance("    ")
+        link_menu.setMinimumWidth(max(
+            link_menu.sizeHint().width() + shortcut_gap,
+            *(
+                link_metrics.horizontalAdvance(action.text())
+                + link_metrics.horizontalAdvance(
+                    action.shortcut().toString(QKeySequence.NativeText)
+                ) + shortcut_gap + menu_chrome
+                for action in (self.act_add_edit_link, self.act_remove_link)
+            ),
+        ))
         self.btn_links.setMenu(link_menu)
         self.toolbar.addWidget(self.btn_links)
         self.addAction(self.act_add_edit_link)
@@ -1418,7 +1697,7 @@ class Editor(QDialog):
         self.toolbar.addSeparator()
 
         # Undo / Redo / Find
-        self.act_undo = QAction("Undo", self)
+        self.act_undo = QAction("↶", self)
         self.act_undo.setShortcut(QKeySequence.Undo)
         self.act_undo.triggered.connect(
             self._guarded_action("Undo", self.editor.undo)
@@ -1427,7 +1706,7 @@ class Editor(QDialog):
         self.editor.document().undoAvailable.connect(self.act_undo.setEnabled)
         self.toolbar.addAction(self.act_undo)
 
-        self.act_redo = QAction("Redo", self)
+        self.act_redo = QAction("↷", self)
         self.act_redo.setShortcut(QKeySequence.Redo)
         self.act_redo.triggered.connect(
             self._guarded_action("Redo", self.editor.redo)
@@ -1438,12 +1717,26 @@ class Editor(QDialog):
 
         self.toolbar.addSeparator()
 
-        self.act_find = QAction("Find", self)
+        self.act_find = QAction("🔍", self)
         self.act_find.setShortcut(QKeySequence.Find)
         self.act_find.triggered.connect(
             self._guarded_action("Find", self.open_find_replace)
         )
         self.toolbar.addAction(self.act_find)
+        for action, label in (
+            (self.act_undo, "Undo"),
+            (self.act_redo, "Redo"),
+            (self.act_find, "Find and replace"),
+        ):
+            shortcut = action.shortcut().toString(QKeySequence.NativeText)
+            tooltip = f"{label} ({shortcut})"
+            action.setToolTip(tooltip)
+            action.setStatusTip(tooltip)
+            widget = self.toolbar.widgetForAction(action)
+            widget.setAccessibleName(label)
+            widget.setToolTip(tooltip)
+            widget.setFont(_toolbar_symbol_font(widget.font(), action.text()))
+            widget.setMinimumWidth(38)
 
         # Font family + size
         self.font_combo = QFontComboBox()
@@ -1496,6 +1789,9 @@ class Editor(QDialog):
         font_layout = QHBoxLayout(self.font_controls)
         font_layout.setContentsMargins(8, 4, 8, 4)
         font_layout.setSpacing(6)
+        self._build_named_style_menu()
+        font_layout.addWidget(self.btn_named_style)
+        font_layout.addSpacing(8)
         font_label = QLabel("Font", self.font_controls)
         font_label.setObjectName("fontControlsLabel")
         size_label = QLabel("Size", self.font_controls)
@@ -1525,8 +1821,195 @@ class Editor(QDialog):
         font_layout.addStretch(1)
         root_layout = self.layout()
         if isinstance(root_layout, QVBoxLayout):
-            root_layout.insertWidget(1, self.font_controls)
+            self.font_controls_scroll = QtWidgets.QScrollArea(self)
+            self.font_controls_scroll.setObjectName("FontControlsScroll")
+            self.font_controls_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+            self.font_controls_scroll.setWidgetResizable(True)
+            self.font_controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self.font_controls_scroll.setWidget(self.font_controls)
+            root_layout.insertWidget(1, self.font_controls_scroll)
+            self.font_controls.installEventFilter(self)
+            self._update_font_controls_height()
         self._sync_font_size_actions()
+
+    def _update_font_controls_height(self) -> None:
+        scroll = getattr(self, "font_controls_scroll", None)
+        if scroll is not None:
+            scroll.setFixedHeight(
+                self.font_controls.sizeHint().height()
+                + scroll.horizontalScrollBar().sizeHint().height()
+            )
+
+    def _build_named_style_menu(self) -> None:
+        self.btn_named_style = QToolButton(self.font_controls)
+        self.btn_named_style.setObjectName("namedTextStyleButton")
+        self.btn_named_style.setAccessibleName("Named text style")
+        self.btn_named_style.setText("Normal text")
+        self._named_style_selector_base_font = QFont(self.btn_named_style.font())
+        self.btn_named_style.setPopupMode(QToolButton.InstantPopup)
+        self.btn_named_style.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.btn_named_style.setMinimumWidth(145)
+        self.btn_named_style.setAutoRaise(True)
+        self.named_style_menu = QMenu(self.btn_named_style)
+        self.named_style_menu.setToolTipsVisible(True)
+        self._style_update_actions: dict[str, QAction] = {}
+        for key in STYLE_KEYS:
+            label = STYLE_LABELS[key]
+            submenu = add_style_preview_submenu(self.named_style_menu, label)
+            submenu.setToolTipsVisible(True)
+            apply_action = submenu.addAction(f"Apply {label}")
+            apply_action.triggered.connect(
+                self._guarded_action(
+                    f"Apply {label}",
+                    lambda key=key: self._apply_named_style(key),
+                )
+            )
+            update_action = submenu.addAction(f"Update {label} to match")
+            update_action.triggered.connect(
+                self._guarded_action(
+                    f"Update {label}",
+                    lambda key=key: self._update_named_style(key),
+                )
+            )
+            self._style_update_actions[key] = update_action
+
+        row_action = QWidgetAction(self.named_style_menu)
+        row = QtWidgets.QWidget(self.named_style_menu)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(5, 5, 5, 5)
+        row_layout.setSpacing(5)
+        self._style_slot_buttons: dict[int, QPushButton] = {}
+        for slot in (1, 2, 3):
+            button = QPushButton(f"Style {slot}", row)
+            button.setAutoDefault(False)
+            button.setMinimumWidth(79)
+            button.setAccessibleName(f"Load Style {slot}")
+            button.clicked.connect(
+                self._guarded_action(
+                    f"Load Style {slot}",
+                    lambda slot=slot: self._load_style_slot(slot),
+                )
+            )
+            row_layout.addWidget(button)
+            self._style_slot_buttons[slot] = button
+        row_action.setDefaultWidget(row)
+        self.named_style_menu.addAction(row_action)
+        self.named_style_menu.addSeparator()
+        options = self.named_style_menu.addMenu("Options")
+        for slot in (1, 2, 3):
+            action = options.addAction(f"Save current style set to Style {slot}")
+            action.triggered.connect(
+                self._guarded_action(
+                    f"Save Style {slot}",
+                    lambda slot=slot: self._save_style_slot(slot),
+                )
+            )
+        self.named_style_menu.aboutToShow.connect(self._refresh_named_style_menu)
+        self.btn_named_style.setMenu(self.named_style_menu)
+        self._sync_named_style_selector()
+
+    def _sync_named_style_selector(self) -> None:
+        if not hasattr(self, "btn_named_style"):
+            return
+        selected = self.named_styles.selected_style()
+        self.btn_named_style.setText(
+            STYLE_LABELS[selected]
+            if selected in STYLE_LABELS
+            else "Mixed styles" if selected == "mixed" else "Custom"
+        )
+        definition = (
+            self.named_styles.active_set.get(selected)
+            if selected in STYLE_LABELS else None
+        )
+        if definition != getattr(self, "_named_style_selector_preview", None):
+            self._named_style_selector_preview = definition
+            if definition is None:
+                self.btn_named_style.setFont(self._named_style_selector_base_font)
+                self.btn_named_style.setStyleSheet("")
+            else:
+                font = preview_font(
+                    definition, self._named_style_selector_base_font
+                )
+                self.btn_named_style.setFont(font)
+                self.btn_named_style.setStyleSheet(
+                    "QToolButton#namedTextStyleButton, "
+                    "QToolButton#namedTextStyleButton:hover "
+                    f"{{ color: {definition.font_color}; {preview_font_stylesheet(font)} }}"
+                )
+
+    def _refresh_named_style_menu(self) -> None:
+        for key, action in zip(STYLE_KEYS, self.named_style_menu.actions()[:6]):
+            set_action_style_preview(
+                action, self.named_styles.active_set.get(key)
+            )
+        can_update = self.named_styles.can_sample()
+        for action in self._style_update_actions.values():
+            action.setEnabled(can_update)
+            action.setToolTip(
+                "" if can_update else
+                "Select uniformly formatted text or place the cursor in representative text."
+            )
+        for slot, button in self._style_slot_buttons.items():
+            try:
+                saved_set = self._style_slots.load(slot)
+                occupied = saved_set is not None
+            except InvalidStyleSetError:
+                saved_set = None
+                occupied = False
+                button.setToolTip("Saved style set is invalid or unsupported.")
+            else:
+                button.setToolTip(
+                    "Load this saved style set" if occupied
+                    else "Empty — save the current style set through Options."
+                )
+            set_slot_style_preview(button, saved_set)
+            button.setEnabled(occupied)
+
+    def _apply_named_style(self, key: str) -> None:
+        self.named_styles.apply_style(key)
+        self._sync_current_format()
+        self._schedule_autosave()
+        self.editor.setFocus(Qt.OtherFocusReason)
+
+    def _update_named_style(self, key: str) -> None:
+        self.named_styles.update_style(key)
+        self._sync_current_format()
+        self._refresh_named_style_menu()
+        self._schedule_autosave()
+        self.editor.setFocus(Qt.OtherFocusReason)
+
+    def _load_style_slot(self, slot: int) -> None:
+        style_set = self._style_slots.load(slot)
+        if style_set is None:
+            return
+        self.named_styles.load_set(style_set)
+        self.named_style_menu.hide()
+        self._sync_current_format()
+        self._refresh_named_style_menu()
+        self._schedule_autosave()
+        self.editor.setFocus(Qt.OtherFocusReason)
+
+    def _save_style_slot(self, slot: int) -> None:
+        active = self.named_styles.active_set
+        try:
+            self._style_slots.save(slot, active)
+        except StyleSetOverwriteRequired:
+            confirmation = LetterSmithConfirmationDialog(
+                self,
+                title=f"Replace Style {slot}?",
+                question=f"Replace the saved Style {slot} set with the current styles?",
+                primary_text="Replace",
+                secondary_text="Keep Saved Set",
+                secondary_accepts=True,
+                cancel_text="Cancel",
+                click_outside_dismiss=False,
+                width=500,
+            )
+            confirmation.exec()
+            if confirmation.choice != "primary":
+                return
+            self._style_slots.save(slot, active, overwrite=True)
+        self._refresh_named_style_menu()
 
 
     def _apply_styles(self) -> None:
@@ -1534,9 +2017,13 @@ class Editor(QDialog):
             "QDialog{background:#121212;}"
             "QToolBar{background:#161616;border:1px solid #242424;border-radius:6px;margin:2px;padding:2px;}"
             "QToolBar::separator{background:#454545;width:1px;margin:7px 6px;}"
-            "QTextEdit#EditorTextArea{border:1px solid #70512c;border-radius:6px;padding:8px;selection-background-color:#c9a86a;}"
+            "QFrame#LetterEditorSurface{border:1px solid rgba(255,255,255,.16);border-radius:10px;}"
+            "QTextEdit#EditorTextArea{background:transparent;border:none;padding:0;selection-background-color:#c9a86a;}"
             "QLabel{color:#bbb;}"
-            "QSplitter::handle{background:#1e1e1e;}"
+            "QLabel#readabilityIndicator{padding:2px 7px;border:1px solid rgba(255,255,255,.18);border-radius:8px;color:#b9c7d4;background:rgba(15,24,32,.72);font-size:9pt;}"
+            "QLabel#readabilityIndicator[readabilityState='good']{color:#9ff0bd;border-color:rgba(91,214,139,.55);background:rgba(18,62,39,.72);}"
+            "QLabel#readabilityIndicator[readabilityState='reduced']{color:#f4d98a;border-color:rgba(227,185,78,.55);background:rgba(69,53,17,.72);}"
+            "QLabel#readabilityIndicator[readabilityState='low']{color:#ffabb5;border-color:rgba(237,89,109,.65);background:rgba(75,24,33,.78);}"
             "QPushButton{background:#1d1d1d;color:#fff;border:1px solid #00d0ff;border-radius:6px;padding:6px 12px;}"
             "QPushButton:hover{background:#00d0ff;color:#111;}"
             "QSpinBox{background:#181818;color:#eee;border:1px solid #333;border-radius:4px;padding:2px;}"
@@ -1645,9 +2132,15 @@ class Editor(QDialog):
         return self._prepared_html()
 
     def _prepared_html(self) -> str:
+        if self._unsupported_style_state:
+            raise ValueError(
+                "This letter has style data from a newer LetterSmith version. "
+                "Update LetterSmith before saving it."
+            )
         normalize_ultralinks_in_document(self.editor.document())
-        content = self.editor.toHtml()
+        content = self.named_styles.export_html()
         content = self._inject_export_line_spacing_wrapper(content)
+        content = embed_lettersmith_style_state(content, self.named_styles.serialize())
         return sanitize_message_html(mark_lettersmith_message_html(content))
 
     def _sync_message_assets(self) -> None:
@@ -1660,6 +2153,7 @@ class Editor(QDialog):
         if (
             self._initializing
             or self._save_in_progress
+            or self._unsupported_style_state
             or not self.project_state.is_project_ready
         ):
             return
@@ -1683,7 +2177,6 @@ class Editor(QDialog):
             self._sync_message_assets()
             self._last_persisted_html = content
             self.autosaved.emit(content)
-            play_ui_sound(UiSound.SAVED)
         except ProjectNotReadyError:
             return
         except Exception as error:
@@ -1693,6 +2186,14 @@ class Editor(QDialog):
 
     def _save_document(self) -> bool:
         if self._save_in_progress:
+            return False
+        if self._unsupported_style_state:
+            show_lettersmith_message(
+                self,
+                "Newer Letter Style Data",
+                "Update LetterSmith before saving this letter. Its newer style "
+                "data has been preserved.",
+            )
             return False
         self._autosave_timer.stop()
         self._save_in_progress = True
@@ -1716,6 +2217,7 @@ class Editor(QDialog):
             return True
         except Exception as error:
             log_path = self._record_failure("save letter", error)
+            play_ui_sound(UiSound.ERROR)
             detail = (
                 f"\n\nDetails were recorded in:\n{log_path}"
                 if log_path is not None
@@ -1750,6 +2252,26 @@ class Editor(QDialog):
 
     def _request_close(self) -> None:
         if self._closing:
+            return
+        if self._unsupported_style_state:
+            confirmation = LetterSmithConfirmationDialog(
+                self,
+                title="Newer Letter Style Data",
+                question=(
+                    "This letter uses style data from a newer LetterSmith version "
+                    "and cannot be saved here. Close without saving changes?"
+                ),
+                primary_text="Discard and Close",
+                secondary_text="Keep Editing",
+                secondary_accepts=True,
+                cancel_text="Cancel",
+                click_outside_dismiss=False,
+                width=520,
+            )
+            confirmation.exec()
+            if confirmation.choice == "primary":
+                self._discard_changes = True
+                self._finish_close()
             return
         try:
             current = self._prepared_html()
@@ -1857,7 +2379,7 @@ class Editor(QDialog):
 
     def _apply_initial_message_defaults(self) -> None:
         """Apply editable defaults without locking later user formatting."""
-        font = QFont("Papyrus", DEFAULT_FONT_SIZE)
+        font = QFont(MESSAGE_RENDER_FONT_FAMILY, DEFAULT_FONT_SIZE)
         self.editor.document().setDefaultFont(font)
         self.editor.setCurrentFont(font)
         self.editor.setFontPointSize(float(DEFAULT_FONT_SIZE))
@@ -1867,7 +2389,7 @@ class Editor(QDialog):
         try:
             cursor.select(QTextCursor.Document)
             char_format = QTextCharFormat()
-            char_format.setFontFamily("Papyrus")
+            char_format.setFontFamily(MESSAGE_RENDER_FONT_FAMILY)
             char_format.setFontPointSize(float(DEFAULT_FONT_SIZE))
             cursor.mergeCharFormat(char_format)
 
@@ -1889,7 +2411,7 @@ class Editor(QDialog):
         end_block_format.setLineHeight(200.0, QTextBlockFormat.ProportionalHeight.value)
         end_cursor.setBlockFormat(end_block_format)
         end_char_format = end_cursor.charFormat()
-        end_char_format.setFontFamily("Papyrus")
+        end_char_format.setFontFamily(MESSAGE_RENDER_FONT_FAMILY)
         end_char_format.setFontPointSize(float(DEFAULT_FONT_SIZE))
         end_cursor.setCharFormat(end_char_format)
         self.editor.setTextCursor(end_cursor)
@@ -1908,24 +2430,10 @@ class Editor(QDialog):
 
     def insert_salutation(self) -> None:
         active_cursor = self.editor.textCursor()
-        active_char_format = QTextCharFormat(self.editor.currentCharFormat())
         active_block_format = QTextBlockFormat(active_cursor.blockFormat())
-
-        cursor = self.editor.textCursor()
-        cursor.movePosition(QTextCursor.Start)
-
-        fmt = QTextCharFormat()
-        fmt.setFontFamilies(["Papyrus"])
-        fmt.setFontPointSize(50.0)
-
-        cursor.beginEditBlock()
-        try:
-            cursor.insertText(f"Dear {self.recipient_name},", fmt)
-            cursor.insertBlock(active_block_format, active_char_format)
-        finally:
-            cursor.endEditBlock()
-        self.editor.setTextCursor(cursor)
-        self.editor.setCurrentCharFormat(active_char_format)
+        self.named_styles.insert_salutation(
+            f"Dear {self.recipient_name},", active_block_format
+        )
 
     def open_find_replace(self) -> None:
         if self._find_dialog is None:
@@ -2250,9 +2758,10 @@ class Editor(QDialog):
             editor_cursor if editor_cursor.hasSelection() else None
         )
         if target is None:
-            QtWidgets.QApplication.beep()
+            play_ui_sound(UiSound.ERROR)
             return
         if self._selection_contains_standard_link(target):
+            play_ui_sound(UiSound.ERROR)
             show_lettersmith_message(
                 self,
                 "Ultra Link",
@@ -2486,17 +2995,7 @@ class Editor(QDialog):
     # ──────────────────────────────────────────────────────────────────────
 
     def _apply_char_format(self, fmt: QTextCharFormat) -> None:
-        cursor = QTextCursor(self.editor.textCursor())
-        if not cursor.hasSelection():
-            self.editor.mergeCurrentCharFormat(fmt)
-            return
-
-        cursor.beginEditBlock()
-        try:
-            cursor.mergeCharFormat(fmt)
-        finally:
-            cursor.endEditBlock()
-        self.editor.setTextCursor(cursor)
+        self.named_styles.apply_direct_format(fmt)
 
     def _toggle_weight(self, wt: int) -> None:
         current = self.editor.currentCharFormat()
@@ -2564,17 +3063,7 @@ class Editor(QDialog):
         self._apply_char_format(fmt)
 
     def clear_formatting(self) -> None:
-        cursor = QTextCursor(self.editor.textCursor())
-        if not cursor.hasSelection():
-            self.editor.setCurrentCharFormat(QTextCharFormat())
-            return
-
-        cursor.beginEditBlock()
-        try:
-            cursor.setCharFormat(QTextCharFormat())
-        finally:
-            cursor.endEditBlock()
-        self.editor.setTextCursor(cursor)
+        self.named_styles.clear_direct_format()
 
     def choose_color(self) -> None:
         initial_color = getattr(self, "_active_text_color", self.last_color)

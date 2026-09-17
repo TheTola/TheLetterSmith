@@ -39,6 +39,7 @@ from image_button import (
 from project_paths import ProjectPathResolver, application_paths
 from project_save import ProjectSaveService
 from project_state import ProjectStateController
+from recent_media import recent_media, remember_media
 
 from sound_model import (
     ProjectSoundState,
@@ -80,6 +81,7 @@ from ui_theme import (
     ButtonTier,
     apply_button_tier,
     apply_tab_heading_style,
+    ensure_button_text_fits,
 )
 
 
@@ -3011,6 +3013,7 @@ QListWidget {{
 QTableWidget {{
     alternate-background-color: {control};
     gridline-color: {border};
+    outline: none;
 }}
 QHeaderView::section {{
     background: {control};
@@ -3737,27 +3740,35 @@ class StockMusicDialog(
         *,
         multi_select: bool,
         parent: Optional[QtWidgets.QWidget] = None,
+        recent_track_ids: tuple[str, ...] = (),
+        allow_browse: bool = False,
     ) -> None:
         super().__init__(
             parent
         )
         self.library = library
         self.setWindowTitle(
-            "Stock Music"
+            "Select Music" if allow_browse else "Stock Music"
         )
         self.setAccessibleName(
-            "Stock Music"
+            "Select Music" if allow_browse else "Stock Music"
         )
+        self._recent_track_ids = tuple(
+            track_id for track_id in dict.fromkeys(recent_track_ids)
+            if library.get(track_id) is not None
+            and library.path_for(track_id) is not None
+        ) if allow_browse else ()
         self.setFixedSize(
             430,
-            300,
+            340 if self._recent_track_ids else 180 if allow_browse else 300,
         )
+        self.browse_requested = False
 
         root = QtWidgets.QVBoxLayout(
             self
         )
         self.heading = QtWidgets.QLabel(
-            "Stock Music"
+            "Select Music" if allow_browse else "Stock Music"
         )
         self.heading.setObjectName(
             "MusicPopupHeading"
@@ -3765,32 +3776,47 @@ class StockMusicDialog(
         root.addWidget(
             self.heading
         )
+        if allow_browse:
+            browse_btn = QtWidgets.QPushButton("Choose Music…")
+            browse_btn.clicked.connect(self._browse)
+            root.addWidget(browse_btn)
 
-        self.track_list = QtWidgets.QListWidget()
-        self.track_list.setObjectName(
-            "StockMusicList"
-        )
-        self.track_list.setSelectionMode(
-            QtWidgets.QAbstractItemView.ExtendedSelection
-            if multi_select
-            else QtWidgets.QAbstractItemView.SingleSelection
-        )
-        self.track_list.setEditTriggers(
-            QtWidgets.QAbstractItemView.NoEditTriggers
-        )
-        self.track_list.setToolTip(
-            "Select a bundled song to preview it."
-        )
-        self.track_list.itemSelectionChanged.connect(
-            self._selection_changed
-        )
-        self.track_list.itemDoubleClicked.connect(
-            lambda _item: self._choose()
-        )
-        root.addWidget(
-            self.track_list,
-            1,
-        )
+        self.track_list: QtWidgets.QListWidget | None = None
+        if not allow_browse:
+            self.track_list = QtWidgets.QListWidget()
+            self.track_list.setObjectName("StockMusicList")
+            self.track_list.setSelectionMode(
+                QtWidgets.QAbstractItemView.ExtendedSelection
+                if multi_select
+                else QtWidgets.QAbstractItemView.SingleSelection
+            )
+            self.track_list.setEditTriggers(
+                QtWidgets.QAbstractItemView.NoEditTriggers
+            )
+            self.track_list.setToolTip(
+                "Select a bundled song to preview it."
+            )
+            self.track_list.itemSelectionChanged.connect(self._selection_changed)
+            self.track_list.itemDoubleClicked.connect(
+                lambda _item: self._choose()
+            )
+            root.addWidget(self.track_list, 1)
+        self.recent_list: QtWidgets.QListWidget | None = None
+        if self._recent_track_ids:
+            root.addWidget(QtWidgets.QLabel("Recently Used"))
+            self.recent_list = QtWidgets.QListWidget()
+            self.recent_list.setSelectionMode(
+                QtWidgets.QAbstractItemView.ExtendedSelection
+                if multi_select
+                else QtWidgets.QAbstractItemView.SingleSelection
+            )
+            self.recent_list.itemSelectionChanged.connect(
+                self._recent_selection_changed
+            )
+            self.recent_list.itemDoubleClicked.connect(
+                lambda _item: self._choose()
+            )
+            root.addWidget(self.recent_list, 1)
 
         choose_text = (
             "Add Selected"
@@ -3801,9 +3827,9 @@ class StockMusicDialog(
             choose_text
         )
         self.choose_btn.setToolTip(
-            "Add the selected stock music to this letter."
+            "Add the selected music to this letter."
             if multi_select
-            else "Use the selected stock song for this letter."
+            else "Use the selected song for this letter."
         )
         self.choose_btn.clicked.connect(
             self._choose
@@ -3816,7 +3842,6 @@ class StockMusicDialog(
             0,
             Qt.AlignRight,
         )
-
         self.preview_output = QAudioOutput(
             self
         )
@@ -3847,33 +3872,41 @@ class StockMusicDialog(
         selected = set(
             self.selected_ids()
         )
-        records = [
-            record
-            for record in self.library.all_records("name")
-            if record.source_kind == "stock"
-        ]
-        self.track_list.clear()
-        for record in records:
-            item = QtWidgets.QListWidgetItem(
-                record.display_title
-            )
-            item.setData(
-                Qt.UserRole,
-                record.track_id,
-            )
-            item.setToolTip(
-                f"Preview {record.display_title}."
-            )
-            self.track_list.addItem(
-                item
-            )
-            if record.track_id in selected:
-                item.setSelected(
-                    True
-                )
+        if self.track_list is not None:
+            records = [
+                record
+                for record in self.library.all_records("name")
+                if record.source_kind == "stock"
+            ]
+            self.track_list.clear()
+            for record in records:
+                item = QtWidgets.QListWidgetItem(record.display_title)
+                item.setData(Qt.UserRole, record.track_id)
+                item.setToolTip(f"Preview {record.display_title}.")
+                self.track_list.addItem(item)
+                if record.track_id in selected:
+                    item.setSelected(True)
+        if self.recent_list is not None:
+            self.recent_list.clear()
+            for track_id in self._recent_track_ids:
+                record = self.library.get(track_id)
+                if record is None or self.library.path_for(track_id) is None:
+                    continue
+                item = QtWidgets.QListWidgetItem(record.display_title)
+                item.setData(Qt.UserRole, track_id)
+                self.recent_list.addItem(item)
+                if track_id in selected:
+                    item.setSelected(True)
         self._selection_changed()
 
     def selected_ids(self) -> list[str]:
+        if self.recent_list is not None and self.recent_list.selectedItems():
+            return [
+                str(item.data(Qt.UserRole))
+                for item in self.recent_list.selectedItems()
+            ]
+        if self.track_list is None:
+            return []
         return [
             str(item.data(Qt.UserRole) or "")
             for item in self.track_list.selectedItems()
@@ -3889,6 +3922,16 @@ class StockMusicDialog(
         )
         if has_selection:
             self._preview()
+        else:
+            self._stop_preview()
+
+    def _recent_selection_changed(self) -> None:
+        self._selection_changed()
+
+    def _browse(self) -> None:
+        self._stop_preview()
+        self.browse_requested = True
+        self.accept()
 
     def _choose(self) -> None:
         track_ids = self.selected_ids()
@@ -3993,27 +4036,24 @@ class PlaylistItemWidget(
         )
 
         row.setContentsMargins(
-            12,
             8,
-            10,
-            8,
+            5,
+            6,
+            5,
         )
-
-        row.setSpacing(
-            ROW_LAYOUT_SPACING
-        )
+        row.setSpacing(5)
 
         drag = QtWidgets.QLabel(
             "≡"
         )
+        drag.setFixedWidth(12)
 
-        title = QtWidgets.QLabel(
-            record.display_title
-        )
-
-        title.setToolTip(
-            record.original_name
-        )
+        self._title_text = record.display_title
+        title = QtWidgets.QLabel(self._title_text)
+        self._title_label = title
+        title.setToolTip(record.display_title)
+        title.setAccessibleName(record.display_title)
+        title.setMinimumWidth(0)
 
         duration = QtWidgets.QLabel(
             _format_duration(
@@ -4022,6 +4062,7 @@ class PlaylistItemWidget(
         )
 
         remove = QtWidgets.QToolButton()
+        remove.setObjectName("playlistRemove")
 
         remove.setText(
             "×"
@@ -4032,8 +4073,8 @@ class PlaylistItemWidget(
         )
 
         remove.setFixedSize(
-            30,
-            30,
+            24,
+            24,
         )
 
         remove.clicked.connect(
@@ -4059,6 +4100,9 @@ class PlaylistItemWidget(
         row.addWidget(
             remove
         )
+        self.setFixedSize(274, 44)
+        row.activate()
+        self._elide_title()
 
         self._active: bool | None = None
         self._theme_tokens: object | None = None
@@ -4074,6 +4118,14 @@ class PlaylistItemWidget(
     def apply_theme_assets(self, service: object | None = None) -> None:
         self._theme_tokens = getattr(service, "tokens", None)
         self._apply_theme_style()
+        self._elide_title()
+
+    def _elide_title(self) -> None:
+        self._title_label.setText(
+            self._title_label.fontMetrics().elidedText(
+                self._title_text, Qt.ElideRight, self._title_label.width()
+            )
+        )
 
     def _apply_theme_style(self) -> None:
         tokens = self._theme_tokens
@@ -4121,20 +4173,28 @@ class PlaylistItemWidget(
                 color: {text};
             }}
 
-            QToolButton {{
+            QToolButton#playlistRemove {{
                 color: {muted};
+                background: transparent;
                 border: none;
-                font-size: 18px;
+                border-radius: 4px;
+                padding: 0;
+                min-width: 0;
+                min-height: 0;
+                font-size: 16px;
             }}
 
-            QToolButton:hover {{
+            QToolButton#playlistRemove:hover {{
                 color: {error};
+                background: {border};
             }}
             """
         )
 
 class SoundTab(QtWidgets.QWidget):
     preview_widget = QtCore.Signal(QtWidgets.QWidget)
+    _import_result_ready = QtCore.Signal(int, object)
+    _import_error_ready = QtCore.Signal(int, str)
 
     # Nexus/Forge synchronization signals.
     volume_changed = QtCore.Signal(int)
@@ -4205,6 +4265,12 @@ class SoundTab(QtWidgets.QWidget):
         self._analysis_disabled = False
         self._shutdown = False
         self._background_generation = 0
+        self._import_result_ready.connect(
+            self._accept_import_finished, QtCore.Qt.QueuedConnection,
+        )
+        self._import_error_ready.connect(
+            self._accept_import_failed, QtCore.Qt.QueuedConnection,
+        )
 
         self._preview = SoundPreviewWidget(
             self.player.player,
@@ -4359,13 +4425,13 @@ class SoundTab(QtWidgets.QWidget):
         header.setSpacing(SECTION_LAYOUT_SPACING)
 
         self.stock_btn = ThemedArtworkButton(
-            "Stock",
+            "Stock Music",
             self.project_root,
             "AButton.png",
         )
 
         self.stock_btn.setToolTip(
-            "Choose a bundled song for this letter."
+            "Choose a bundled stock song for this letter."
         )
 
         self.stock_btn.setAccessibleName(
@@ -4423,6 +4489,7 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         self.mode_stack = QtWidgets.QStackedWidget()
+        self.mode_stack.setMinimumHeight(230)
 
         self.single_panel = (
             self._build_single_panel()
@@ -4784,9 +4851,10 @@ class SoundTab(QtWidgets.QWidget):
             "BButton.png",
         )
         self.single_action_btn.setToolTip(
-            "Import a song and assign it to this letter."
+            "Choose music from your computer or recently used songs."
         )
         apply_button_tier(self.single_action_btn, ButtonTier.MEDIUM)
+        ensure_button_text_fits(self.single_action_btn)
 
         self.create_playlist_btn = ThemedArtworkButton(
             "Create Playlist",
@@ -4797,6 +4865,7 @@ class SoundTab(QtWidgets.QWidget):
             "Keep this song and add more tracks as a playlist."
         )
         apply_button_tier(self.create_playlist_btn, ButtonTier.MEDIUM)
+        ensure_button_text_fits(self.create_playlist_btn)
 
         self.create_playlist_btn.hide()
 
@@ -4871,18 +4940,11 @@ class SoundTab(QtWidgets.QWidget):
             "Playlist"
         )
 
-        self.expand_btn = QtWidgets.QPushButton(
-            "Collapse"
-        )
-        self.expand_btn.setToolTip(
-            "Show or hide the songs in this playlist."
-        )
-
         self.add_track_btn = QtWidgets.QPushButton(
             "Add Track"
         )
         self.add_track_btn.setToolTip(
-            "Import another song into this playlist."
+            "Choose music from your computer or recently used songs."
         )
 
         self.convert_single_btn = QtWidgets.QPushButton(
@@ -4893,7 +4955,6 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         for button in (
-            self.expand_btn,
             self.add_track_btn,
             self.convert_single_btn,
         ):
@@ -4904,10 +4965,6 @@ class SoundTab(QtWidgets.QWidget):
         summary.addWidget(
             self.playlist_summary,
             1,
-        )
-
-        summary.addWidget(
-            self.expand_btn
         )
 
         summary.addWidget(
@@ -4923,8 +4980,20 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         self.playlist_list = QtWidgets.QListWidget()
+        self.playlist_list.setObjectName("playlistList")
         self.playlist_list.setToolTip(
             "Select a song, double-click to play, or drag to reorder."
+        )
+        self.playlist_list.setFlow(QtWidgets.QListView.LeftToRight)
+        self.playlist_list.setWrapping(True)
+        self.playlist_list.setResizeMode(QtWidgets.QListView.Adjust)
+        self.playlist_list.setGridSize(QtCore.QSize(282, 52))
+        self.playlist_list.setMinimumHeight(110)
+        self.playlist_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.playlist_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.playlist_list.setStyleSheet(
+            "QListWidget#playlistList::item{padding:0;border:none;"
+            "background:transparent;}"
         )
 
         self.playlist_list.setDragDropMode(
@@ -4966,7 +5035,7 @@ class SoundTab(QtWidgets.QWidget):
         self,
     ) -> None:
         self.single_action_btn.clicked.connect(
-            self._choose_new_files
+            self._open_user_music_for_current_mode
         )
 
         self.create_playlist_btn.clicked.connect(
@@ -4974,7 +5043,7 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         self.add_track_btn.clicked.connect(
-            self._choose_new_files
+            self._open_user_music_for_current_mode
         )
 
         self.archive_btn.clicked.connect(
@@ -4983,10 +5052,6 @@ class SoundTab(QtWidgets.QWidget):
 
         self.stock_btn.clicked.connect(
             self._open_stock_for_current_mode
-        )
-
-        self.expand_btn.clicked.connect(
-            self._toggle_playlist_expanded
         )
 
         self.convert_single_btn.clicked.connect(
@@ -5328,6 +5393,8 @@ class SoundTab(QtWidgets.QWidget):
                     "Replace Music"
                 )
 
+            ensure_button_text_fits(self.single_action_btn)
+
         self._sync_transport_enabled()
 
         if refresh_track:
@@ -5412,7 +5479,7 @@ class SoundTab(QtWidgets.QWidget):
                 widget.removeRequested.connect(
                     self.project_sound.remove_from_playlist
                 )
-                item.setSizeHint(widget.sizeHint())
+                item.setSizeHint(QtCore.QSize(274, 44))
                 self.playlist_list.addItem(item)
                 self.playlist_list.setItemWidget(item, widget)
 
@@ -5432,26 +5499,6 @@ class SoundTab(QtWidgets.QWidget):
             f"Playlist • {count} track{suffix} • "
             f"{_format_duration(total_duration)}"
         )
-
-        expanded = (
-            self.project_sound
-            .state
-            .playlist_expanded
-        )
-
-        self.playlist_list.setVisible(
-            expanded
-        )
-
-        if expanded:
-            self.expand_btn.setText(
-                "Collapse"
-            )
-
-        else:
-            self.expand_btn.setText(
-                "Expand"
-            )
 
     def _playlist_item_selected(
         self,
@@ -5699,12 +5746,12 @@ class SoundTab(QtWidgets.QWidget):
         generation = self._background_generation
         worker.finished.connect(
             lambda payload, value=generation:
-                self._accept_import_finished(value, payload)
+                self._import_result_ready.emit(value, payload)
         )
 
         worker.failed.connect(
             lambda message, value=generation:
-                self._accept_import_failed(value, message)
+                self._import_error_ready.emit(value, message)
         )
 
         worker.finished.connect(
@@ -5749,6 +5796,7 @@ class SoundTab(QtWidgets.QWidget):
 
         thread.start()
 
+    @QtCore.Slot(int, object)
     def _accept_import_finished(
         self,
         generation: int,
@@ -5757,6 +5805,7 @@ class SoundTab(QtWidgets.QWidget):
         if generation == self._background_generation and not self._shutdown:
             self._import_finished(payloads)
 
+    @QtCore.Slot(int, str)
     def _accept_import_failed(self, generation: int, message: str) -> None:
         if generation == self._background_generation and not self._shutdown:
             self._import_failed(message)
@@ -5783,6 +5832,8 @@ class SoundTab(QtWidgets.QWidget):
             self.project_sound.set_single(
                 track_ids[0]
             )
+
+        self._remember_tracks(track_ids)
 
         if len(
             track_ids
@@ -5813,6 +5864,7 @@ class SoundTab(QtWidgets.QWidget):
                 persistent=True,
             )
 
+            play_ui_sound(UiSound.ERROR)
             show_lettersmith_message(self, "Audio Import Error", message)
 
     def _clear_import_handles(
@@ -5888,6 +5940,12 @@ class SoundTab(QtWidgets.QWidget):
     def _open_stock_for_current_mode(
         self,
     ) -> None:
+        self._open_music_selector(user_music=False)
+
+    def _open_user_music_for_current_mode(self) -> None:
+        self._open_music_selector(user_music=True)
+
+    def _open_music_selector(self, *, user_music: bool) -> None:
         dialog = StockMusicDialog(
             self.library,
             multi_select=(
@@ -5897,6 +5955,15 @@ class SoundTab(QtWidgets.QWidget):
                 == "playlist"
             ),
             parent=self,
+            recent_track_ids=tuple(
+                track_id for track_id, _label in recent_media(
+                    self.project_root,
+                    self.project_state.identity.project_id,
+                    "music",
+                )
+                if self.library.path_for(track_id) is not None
+            ) if user_music else (),
+            allow_browse=user_music,
         )
 
         dialog.tracksChosen.connect(
@@ -5908,6 +5975,27 @@ class SoundTab(QtWidgets.QWidget):
         finally:
             dialog._stop_preview()
             dialog.deleteLater()
+
+        if dialog.browse_requested:
+            self._choose_new_files()
+
+    def _remember_tracks(self, track_ids: list[str]) -> None:
+        if not self.project_state.is_project_ready:
+            return
+        for track_id in track_ids:
+            record = self.library.get(track_id)
+            if record is None or self.library.path_for(track_id) is None:
+                continue
+            try:
+                remember_media(
+                    self.project_root,
+                    self.project_state.identity.project_id,
+                    "music",
+                    track_id,
+                    record.display_title,
+                )
+            except OSError:
+                _LOGGER.exception("Could not save recent music history.")
 
     def _archive_tracks_chosen(
         self,
@@ -5928,6 +6016,8 @@ class SoundTab(QtWidgets.QWidget):
             self.project_sound.set_single(
                 track_ids[0]
             )
+
+        self._remember_tracks(track_ids)
 
         if tuple(self.project_sound.ordered_ids()) != previous_ids:
             play_ui_sound(UiSound.ADDED)
@@ -6162,6 +6252,7 @@ class SoundTab(QtWidgets.QWidget):
             f"Archive repair failed: {message}",
             persistent=True,
         )
+        play_ui_sound(UiSound.ERROR)
 
     def _clear_repair_handles(
         self,
@@ -6177,7 +6268,10 @@ class SoundTab(QtWidgets.QWidget):
     def _create_playlist(
         self,
     ) -> None:
+        previous_mode = self.project_sound.state.mode
         self.project_sound.create_playlist()
+        if self.project_sound.state.mode != previous_mode:
+            play_ui_sound(UiSound.BLIP)
 
         if not self.project_sound.state.playlist:
             self._choose_new_files()
@@ -6205,22 +6299,12 @@ class SoundTab(QtWidgets.QWidget):
                 or selected
             )
 
+        previous_mode = self.project_sound.state.mode
         self.project_sound.convert_to_single(
             selected
         )
-
-    def _toggle_playlist_expanded(
-        self,
-    ) -> None:
-        self.project_sound.state.playlist_expanded = (
-            not self.project_sound
-            .state
-            .playlist_expanded
-        )
-
-        self._persist_project_sound_state()
-
-        self._refresh_playlist()
+        if self.project_sound.state.mode != previous_mode:
+            play_ui_sound(UiSound.BLIP)
 
     def _clear_project_sound(
         self,

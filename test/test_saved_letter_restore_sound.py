@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import saved_letters
+import generate
 import sound_model
 
 from config import (
@@ -30,6 +31,7 @@ from saved_letters import (
     SavedLetterCatalog,
     SavedLetterRestoreError,
     SavedLetterRestorer,
+    save_published_snapshot,
     update_saved_metadata,
 )
 from settings_store import ACTIVE_PLAY_DIR_KEY, SettingsStore
@@ -416,9 +418,15 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundle = self._bundle(root)
+            SettingsStore(root).update_fields({"forge_preview_mode": "window"})
+            metadata_path = bundle / "lettersmith-metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["settings"]["forge_preview_mode"] = "portrait"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
             restored = self._restore(root, bundle)
 
+            self.assertEqual(SettingsStore(root).get("forge_preview_mode"), "window")
             self.assertEqual(restored.play_dir, bundle.resolve())
             self.assertEqual(
                 SettingsStore(root).get(ACTIVE_PLAY_DIR_KEY),
@@ -484,6 +492,104 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 restored.as_payload()["published_github_repository"],
                 "LetterSmith-Published",
             )
+
+    def test_published_snapshot_survives_working_edits_and_restores_owned_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            publication = {
+                "published_page_url": "https://ada.github.io/letter/",
+                "published_public_path": "letter",
+                "published_at": "2026-09-16T12:00:00+00:00",
+                "published_expires_at": "",
+                "publication_provider": "github_pages",
+                "publication_verified": True,
+                "published_source_fingerprint": "version-one",
+                "published_github_owner": "ada",
+                "published_github_repository": "letter",
+            }
+            metadata_path = bundle / "lettersmith-metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata.update(publication)
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            (bundle / generate.BUILD_STATE_FILE).write_text(
+                json.dumps({"source_fingerprint": "version-one"}),
+                encoding="utf-8",
+            )
+            snapshot = save_published_snapshot(bundle, root, publication)
+            self.assertEqual(
+                (snapshot / "gallery/pages/cover.png").read_bytes(),
+                b"cover.png",
+            )
+
+            (bundle / "gallery/pages/cover.png").write_bytes(b"version two")
+            (bundle / generate.BUILD_STATE_FILE).write_text(
+                json.dumps({"source_fingerprint": "version-two"}),
+                encoding="utf-8",
+            )
+            entries = SavedLetterCatalog(root).list_entries()
+            self.assertIn(bundle.resolve(), [item.path for item in entries])
+            self.assertTrue(next(item for item in entries if item.path == snapshot).published)
+            self.assertFalse(
+                next(item for item in entries if item.path == bundle.resolve()).published
+            )
+            working = root / "gallery/user/pages"
+            working.mkdir(parents=True)
+            (working / "cover.png").write_bytes(b"version two")
+            (working / "cover.png").unlink()
+
+            entry = next(item for item in entries if item.path == snapshot)
+            frozen_metadata = (snapshot / "lettersmith-metadata.json").read_bytes()
+            SavedLetterRestorer(root).restore(entry)
+            self.assertEqual((working / "cover.png").read_bytes(), b"cover.png")
+            self.assertEqual(
+                (snapshot / "gallery/pages/cover.png").read_bytes(),
+                b"cover.png",
+            )
+            self.assertEqual(
+                (snapshot / "lettersmith-metadata.json").read_bytes(),
+                frozen_metadata,
+            )
+            self.assertEqual(
+                SettingsStore(root).get("published_source_fingerprint"),
+                "version-one",
+            )
+            self.assertEqual(SettingsStore(root).get(ACTIVE_PLAY_DIR_KEY), "")
+
+    def test_existing_published_play_is_preserved_before_working_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            (bundle / generate.BUILD_STATE_FILE).write_text(
+                json.dumps({"source_fingerprint": "published-version"}),
+                encoding="utf-8",
+            )
+            SettingsStore(root).update_fields(
+                {
+                    "published_page_url": "https://ada.github.io/letter/",
+                    "published_public_path": "letter",
+                    "published_at": "2026-09-16T12:00:00+00:00",
+                    "published_expires_at": "",
+                    "publication_provider": "github_pages",
+                    "publication_verified": True,
+                    "published_source_fingerprint": "published-version",
+                    "published_github_owner": "ada",
+                    "published_github_repository": "letter",
+                }
+            )
+            generate._preserve_published_play_bundle(root, bundle)
+            snapshots = tuple((root / "output/Recovery/Published").iterdir())
+            self.assertEqual(len(snapshots), 1)
+            snapshot_cover = snapshots[0] / "gallery/pages/cover.png"
+            self.assertEqual(snapshot_cover.read_bytes(), b"cover.png")
+
+            (bundle / "gallery/pages/cover.png").write_bytes(b"working version")
+            (bundle / generate.BUILD_STATE_FILE).write_text(
+                json.dumps({"source_fingerprint": "working-version"}),
+                encoding="utf-8",
+            )
+            generate._preserve_published_play_bundle(root, bundle)
+            self.assertEqual(snapshot_cover.read_bytes(), b"cover.png")
 
     def test_local_letter_restore_clears_another_letters_publication_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

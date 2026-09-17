@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import sys
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
@@ -22,7 +23,9 @@ from sound_model import (
     save_library,
     save_project_state,
 )
-from sound_tab import ArchiveDialog, SoundTab, StockMusicDialog
+from sound_tab import ArchiveDialog, PlaylistItemWidget, SoundTab, StockMusicDialog
+from recent_media import recent_media
+from ui_sounds import UiSound
 
 
 class _Library(QtCore.QObject):
@@ -89,6 +92,124 @@ class SoundArchivePreviewTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 
+    def test_music_mode_changes_use_blip_only_when_mode_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tab = SoundTab(Path(directory))
+            try:
+                with (
+                    mock.patch.object(tab, "_choose_new_files"),
+                    mock.patch("sound_tab.play_ui_sound") as play,
+                ):
+                    tab._create_playlist()
+                    tab._create_playlist()
+                    tab._convert_to_single()
+                self.assertEqual(
+                    play.call_args_list,
+                    [mock.call(UiSound.BLIP), mock.call(UiSound.BLIP)],
+                )
+            finally:
+                tab.close()
+
+    def test_failed_import_uses_error_but_cancellation_stays_quiet(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tab = SoundTab(Path(directory))
+            try:
+                with (
+                    mock.patch("sound_tab.show_lettersmith_message"),
+                    mock.patch("sound_tab.play_ui_sound") as play,
+                ):
+                    tab._import_failed("Invalid audio file")
+                    tab._import_failed("Import canceled")
+                play.assert_called_once_with(UiSound.ERROR)
+            finally:
+                tab.close()
+
+    def test_playlist_remove_is_compact_and_tracks_stay_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tab = SoundTab(Path(directory))
+            try:
+                tab.resize(960, 720)
+                tab.project_sound.state.mode = "playlist"
+                tab.project_sound.state.playlist_expanded = False
+                tab.show()
+                tab.mode_stack.setCurrentWidget(tab.playlist_panel)
+                tab._refresh_playlist()
+                self.app.processEvents()
+                self.assertFalse(hasattr(tab, "expand_btn"))
+                self.assertTrue(tab.playlist_list.isVisible())
+
+                row = PlaylistItemWidget(_Library().record, False, tab)
+                row.show()
+                self.app.processEvents()
+                remove = row.findChild(QtWidgets.QToolButton, "playlistRemove")
+                self.assertEqual(remove.size(), QtCore.QSize(24, 24))
+                self.assertLessEqual(remove.geometry().bottom(), row.height())
+                self.assertGreater(remove.geometry().x(), row.width() - 40)
+                title = row._title_label
+                self.assertLessEqual(
+                    title.fontMetrics().horizontalAdvance(title.text()),
+                    title.width(),
+                )
+                removed: list[str] = []
+                row.removeRequested.connect(removed.append)
+                remove.click()
+                self.assertEqual(removed, ["track-1"])
+                row.close()
+            finally:
+                tab.close()
+
+    def test_playlist_tracks_wrap_before_vertical_scrolling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tab = SoundTab(Path(directory))
+            try:
+                tab.resize(960, 720)
+                tab.mode_stack.setCurrentWidget(tab.playlist_panel)
+                tab.playlist_list.setVisible(True)
+                tab.show()
+                for index in range(30):
+                    item = QtWidgets.QListWidgetItem(str(index))
+                    item.setSizeHint(QtCore.QSize(274, 44))
+                    tab.playlist_list.addItem(item)
+                self.app.processEvents()
+
+                view = tab.playlist_list
+                rects = [view.visualItemRect(view.item(index)) for index in range(10)]
+                self.assertTrue(
+                    any(rect.y() == rects[0].y() and rect.x() > rects[0].x()
+                        for rect in rects[1:])
+                )
+                self.assertTrue(any(rect.y() > rects[0].y() for rect in rects[1:]))
+                self.assertGreaterEqual(view.viewport().height(), 2 * view.gridSize().height())
+                self.assertGreater(view.verticalScrollBar().maximum(), 0)
+                self.assertEqual(view.horizontalScrollBarPolicy(), QtCore.Qt.ScrollBarAlwaysOff)
+            finally:
+                tab.close()
+
+    def test_sound_buttons_open_separate_user_and_stock_selectors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tab = SoundTab(Path(directory))
+            try:
+                tab.resize(960, 720)
+                tab.show()
+                self.app.processEvents()
+                with mock.patch.object(tab, "_open_music_selector") as selector:
+                    tab.single_action_btn.click()
+                    tab.project_sound.state.mode = "playlist"
+                    tab._refresh_ui()
+                    tab.add_track_btn.click()
+                    tab.stock_btn.click()
+                self.assertEqual(tab.stock_btn.text(), "Stock Music")
+                self.assertEqual(
+                    selector.call_args_list,
+                    [
+                        mock.call(user_music=True),
+                        mock.call(user_music=True),
+                        mock.call(user_music=False),
+                    ],
+                )
+            finally:
+                tab.close()
+
     def test_archive_preview_loops_until_explicitly_stopped(self) -> None:
         dialog = ArchiveDialog(
             _Library(),
@@ -125,6 +246,56 @@ class SoundArchivePreviewTests(unittest.TestCase):
             dialog.close()
             self.app.processEvents()
 
+    def test_add_track_shows_only_choose_music_and_recent_songs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            library = _MixedLibrary()
+            library.path_for = mock.Mock(return_value=Path(temp_dir) / "song.mp3")
+            tab = mock.Mock()
+            tab.project_root = Path(temp_dir)
+            tab.project_state.is_project_ready = True
+            tab.project_state.identity.project_id = "project-a"
+            tab.library = library
+            SoundTab._remember_tracks(tab, ["track-1"])
+            self.assertEqual(
+                recent_media(tab.project_root, "project-a", "music")[0][0],
+                "track-1",
+            )
+
+            dialog = StockMusicDialog(
+                library,
+                multi_select=False,
+                recent_track_ids=("track-1",),
+                allow_browse=True,
+            )
+            try:
+                self.assertIsNone(dialog.track_list)
+                self.assertEqual(dialog.recent_list.count(), 1)
+                self.assertEqual(dialog.layout().itemAt(1).widget().text(), "Choose Music…")
+                self.assertFalse(any(
+                    button.text() == "Stock Music"
+                    for button in dialog.findChildren(QtWidgets.QPushButton)
+                ))
+                with mock.patch.object(dialog, "_preview"):
+                    dialog.recent_list.setCurrentRow(0)
+                self.assertEqual(dialog.selected_ids(), ["track-1"])
+                dialog._browse()
+                self.assertTrue(dialog.browse_requested)
+            finally:
+                dialog.close()
+                self.app.processEvents()
+
+    def test_add_track_without_history_only_shows_choose_music(self) -> None:
+        dialog = StockMusicDialog(
+            _StockLibrary(), multi_select=False, allow_browse=True
+        )
+        try:
+            self.assertIsNone(dialog.recent_list)
+            self.assertIsNone(dialog.track_list)
+            self.assertEqual(dialog.layout().itemAt(1).widget().text(), "Choose Music…")
+        finally:
+            dialog.close()
+            self.app.processEvents()
+
     def test_stock_dialog_filters_out_user_music(self) -> None:
         dialog = StockMusicDialog(
             _MixedLibrary(),
@@ -134,6 +305,11 @@ class SoundArchivePreviewTests(unittest.TestCase):
             self.assertEqual(dialog.windowTitle(), "Stock Music")
             self.assertEqual(dialog.track_list.count(), 1)
             self.assertEqual(dialog.track_list.item(0).text(), "Stock Song")
+            self.assertIsNone(dialog.recent_list)
+            self.assertFalse(any(
+                button.text() == "Choose Music…"
+                for button in dialog.findChildren(QtWidgets.QPushButton)
+            ))
         finally:
             dialog.close()
             self.app.processEvents()

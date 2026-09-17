@@ -11,6 +11,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+import uuid
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -32,6 +33,7 @@ from Image_tab import (
     _ResetImagesConfirmationDialog,
 )
 from image_animation import (
+    FOREVER,
     IMAGE_MANIFEST_NAME,
     build_runtime_image_assets,
     inspect_gif,
@@ -47,6 +49,7 @@ from image_animation import (
 from portable_export import create_single_html
 from Message_tab import MessageTab
 from project_state import ProjectStateController
+from recent_media import _history_path, recent_media, remember_image_copy, remember_media
 from settings_store import SettingsStore
 from ui_sounds import UiSound
 from ui_theme import BUTTON_TIER_STYLES, THEMES, ButtonTier, ThemeService
@@ -208,25 +211,107 @@ class ImageAnimationTests(unittest.TestCase):
             100,
         )
 
-    def test_gif_settings_dialog_round_trips_start_stop_and_speed(self) -> None:
+    def test_gif_controls_popup_is_frameless_and_slot_specific(self) -> None:
+        for title, heading in (
+            ("Cover Page Image", "COVER CONTROLS"),
+            ("Main Letter Image", "LETTER CONTROLS"),
+            ("Letter Background Image", "CLARIFIER CONTROLS"),
+            ("Final Backdrop Image", "BACKDROP CONTROLS"),
+        ):
+            dialog = ImageSettingsDialog(title, animated_gif=True)
+            try:
+                self.assertTrue(dialog.windowFlags() & QtCore.Qt.FramelessWindowHint)
+                self.assertEqual(dialog.heading.text(), heading)
+                self.assertEqual(dialog.speed.currentText(), "Original")
+                self.assertEqual(dialog.play_count.currentText(), "Original")
+                self.assertEqual(dialog.start_delay.value(), 0)
+                self.assertEqual(dialog.loop_pause.value(), 0)
+                self.assertEqual(dialog.timing_label.text(), "Loop Pause")
+                labels = [label.text() for label in dialog.findChildren(QtWidgets.QLabel)]
+                self.assertNotIn("Animated GIF", labels)
+                self.assertNotIn("Playback Mode", labels)
+                self.assertNotIn("Start / Stop", labels)
+                self.assertNotIn("Play Animation", labels)
+                buttons = [button.text() for button in dialog.findChildren(QtWidgets.QPushButton)]
+                self.assertEqual(buttons, ["Reset", "Save"])
+            finally:
+                dialog.close()
+
+    def test_gif_controls_preview_reset_save_and_discard(self) -> None:
+        previews = []
         dialog = ImageSettingsDialog(
-            "Cover Page",
-            animated_gif=True,
-            settings={
-                "animation_enabled": False,
-                "speed_percent": 175,
-            },
+            "Cover Page Image", animated_gif=True,
+            settings={"speed_percent": 175, "playback_mode": "loop", "play_count": 3},
+            preview_callback=previews.append,
         )
         self.addCleanup(dialog.deleteLater)
+        self.assertEqual(dialog.timing_label.text(), "End Hold")
+        dialog.speed.setCurrentText("50%")
+        self.assertEqual(previews[-1]["speed_percent"], 50)
+        dialog.reset_defaults()
+        self.assertEqual(dialog.speed.currentText(), "Original")
+        self.assertEqual(dialog.play_count.currentText(), "Original")
+        self.assertEqual(previews[-1]["speed_percent"], 100)
+        self.assertEqual(dialog._saved_settings["speed_percent"], 175)
+        dialog.reject()
+        self.assertEqual(previews[-1]["speed_percent"], 175)
 
-        self.assertFalse(dialog.animation_enabled.isChecked())
-        self.assertEqual(dialog.speed_percent.value(), 175)
-        dialog.animation_enabled.setChecked(True)
-        dialog.speed_percent.setValue(225)
+        saved = ImageSettingsDialog(
+            "Cover Page Image", animated_gif=True,
+            preview_callback=previews.append,
+        )
+        self.addCleanup(saved.deleteLater)
+        saved.play_count.setCurrentText("Forever")
+        self.assertEqual(saved.gif_settings()["playback_mode"], "loop")
+        saved.accept()
+        self.assertEqual(saved.result(), QtWidgets.QDialog.Accepted)
+        self.assertEqual(previews[-1]["playback_mode"], "loop")
 
-        settings = dialog.gif_settings()
-        self.assertTrue(settings["animation_enabled"])
-        self.assertEqual(settings["speed_percent"], 225)
+    def test_gif_controls_preserve_saved_millisecond_precision(self) -> None:
+        dialog = ImageSettingsDialog(
+            "Cover Page Image", animated_gif=True,
+            settings={"start_delay_ms": 1234, "loop_pause_ms": 2345},
+            embedded_play_count=1,
+        )
+        self.addCleanup(dialog.deleteLater)
+        self.assertEqual(dialog.timing_label.text(), "End Hold")
+        self.assertEqual(dialog.start_delay.text(), "1.23 s")
+        self.assertEqual(dialog.gif_settings()["start_delay_ms"], 1234)
+        self.assertEqual(dialog.gif_settings()["loop_pause_ms"], 2345)
+        dialog.reset_defaults()
+        self.assertEqual(dialog.gif_settings()["start_delay_ms"], 0)
+        self.assertEqual(dialog.gif_settings()["loop_pause_ms"], 0)
+
+    def test_gif_controls_outside_click_and_escape_discard(self) -> None:
+        previews = []
+        for outside in (True, False):
+            dialog = ImageSettingsDialog(
+                "Cover Page Image", animated_gif=True,
+                settings={"speed_percent": 150}, preview_callback=previews.append,
+            )
+            self.addCleanup(dialog.deleteLater)
+            dialog.show()
+            self.app.processEvents()
+            dialog.speed.setCurrentText("50%")
+            if outside:
+                other = QtWidgets.QWidget()
+                event = QtGui.QMouseEvent(
+                    QtCore.QEvent.MouseButtonPress,
+                    QtCore.QPointF(0, 0), QtCore.QPointF(-100, -100),
+                    QtCore.Qt.LeftButton, QtCore.Qt.LeftButton,
+                    QtCore.Qt.NoModifier,
+                )
+                dialog.eventFilter(other, event)
+                other.deleteLater()
+            else:
+                QtWidgets.QApplication.sendEvent(
+                    dialog, QtGui.QKeyEvent(
+                        QtCore.QEvent.KeyPress, QtCore.Qt.Key_Escape,
+                        QtCore.Qt.NoModifier,
+                    ),
+                )
+            self.assertEqual(dialog.result(), QtWidgets.QDialog.Rejected)
+            self.assertEqual(previews[-1]["speed_percent"], 150)
 
     def test_prepared_import_changes_workspace_and_project_only_on_commit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -690,6 +775,8 @@ class ImageAnimationTests(unittest.TestCase):
             self.assertTrue(dialog.windowFlags() & QtCore.Qt.FramelessWindowHint)
             self.assertEqual(dialog.size(), QtCore.QSize(420, 146))
             self.assertIsNone(dialog.findChild(QtWidgets.QDialogButtonBox))
+            self.assertIsNone(dialog._recent_images)
+            self.assertEqual(dialog._images.count(), 3)
 
             item = dialog._images.item(1)
             dialog._images.itemClicked.emit(item)
@@ -698,6 +785,125 @@ class ImageAnimationTests(unittest.TestCase):
             self.assertEqual(dialog.selected_path(), paths[1])
         finally:
             dialog.close()
+
+        browse_dialog = StockImageDialog("Cover Page", paths, allow_browse=True)
+        try:
+            self.assertEqual(browse_dialog._images.count(), 3)
+            self.assertIsNone(browse_dialog._recent_images)
+            self.assertEqual(
+                browse_dialog.findChildren(QtWidgets.QLabel)[0].text(),
+                "Stock Images",
+            )
+        finally:
+            browse_dialog.close()
+
+    def test_recent_images_are_limited_to_each_project_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = tuple(root / f"image-{index}.png" for index in range(4))
+            for path in paths:
+                Image.new("RGB", (8, 8), "red").save(path)
+                remember_media(root, "project-a", "image:cover", str(path), path.name)
+            remember_media(root, "project-a", "image:letter", str(paths[0]), paths[0].name)
+            remember_media(root, "project-b", "image:cover", str(paths[0]), paths[0].name)
+
+            self.assertEqual(
+                [value for value, _label in recent_media(root, "project-a", "image:cover")],
+                [str(path) for path in (paths[3], paths[2], paths[1])],
+            )
+            self.assertEqual(len(recent_media(root, "project-a", "image:letter")), 1)
+            self.assertEqual(len(recent_media(root, "project-b", "image:cover")), 1)
+
+            dialog = StockImageDialog(
+                "Cover Page", paths[:3], recent_paths=paths[1:], allow_browse=True
+            )
+            try:
+                self.assertEqual(dialog.size(), QtCore.QSize(420, 205))
+                self.assertIsNone(dialog._images)
+                self.assertEqual(dialog._recent_images.count(), 3)
+                self.assertEqual(
+                    dialog.findChildren(QtWidgets.QLabel)[0].text(),
+                    "Recently Used",
+                )
+                dialog._recent_images.itemClicked.emit(dialog._recent_images.item(0))
+                self.assertEqual(dialog.selected_path(), paths[1])
+            finally:
+                dialog.close()
+
+    def test_recent_media_is_unique_and_scoped_for_images_music_and_sounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for slot in ("image:cover", "music", "sound:opening"):
+                for value in ("A", "B", "C", "A", "A", "D"):
+                    remember_media(root, "project-a", slot, value, value)
+                self.assertEqual(
+                    [value for value, _label in recent_media(root, "project-a", slot)],
+                    ["D", "A", "C"],
+                )
+            self.assertEqual(recent_media(root, "project-a", "image:letter"), ())
+            self.assertEqual(recent_media(root, "project-a", "sound:closing"), ())
+            self.assertEqual(recent_media(root, "project-b", "music"), ())
+
+            history_path = _history_path(root)
+            payload = json.loads(history_path.read_text(encoding="utf-8"))
+            payload["project-a"]["music"] = [
+                {"value": value, "label": value}
+                for value in ("A", "B", "A", "C")
+            ]
+            history_path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(
+                [value for value, _label in recent_media(root, "project-a", "music")],
+                ["A", "B", "C"],
+            )
+            remember_media(root, "project-a", "music", "B", "B")
+            self.assertEqual(
+                [value for value, _label in recent_media(root, "project-a", "music")],
+                ["B", "A", "C"],
+            )
+
+    def test_recent_images_open_without_stock_images(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            recent_path = Path(directory) / "recent.png"
+            Image.new("RGB", (8, 8), "red").save(recent_path)
+            tab = mock.Mock()
+            tab.labels = {1: ("Cover Page Image", "cover.png")}
+            tab.project_root = Path(directory)
+            tab.project_state.identity.project_id = "project-a"
+            with (
+                mock.patch(
+                    "Image_tab.recent_media",
+                    return_value=((str(recent_path), recent_path.name),),
+                ),
+                mock.patch("Image_tab.StockImageDialog") as dialog_type,
+            ):
+                dialog_type.return_value.exec.return_value = (
+                    QtWidgets.QDialog.Rejected
+                )
+                ImageTab.open_stock_gallery(tab, 1)
+
+            tab._stock_image_paths.assert_not_called()
+            tab._show_temporary_status.assert_not_called()
+            self.assertEqual(dialog_type.call_args.args[1], ())
+            self.assertEqual(
+                dialog_type.call_args.kwargs["recent_paths"], (recent_path,)
+            )
+
+    def test_recent_image_uses_owned_copy_after_source_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project_id = str(uuid.uuid4())
+            source = root / "gallery/user/pages/cover.png"
+            source.parent.mkdir(parents=True)
+            Image.new("RGB", (8, 8), "red").save(source)
+
+            remember_image_copy(root, project_id, "cover", source, "dragon.jpg")
+            source.unlink()
+
+            recent = recent_media(root, project_id, "image:cover")
+            self.assertEqual(len(recent), 1)
+            self.assertEqual(recent[0][1], "dragon.jpg")
+            self.assertTrue(Path(recent[0][0]).is_file())
+            self.assertEqual(recent_media(root, project_id, "image:letter"), ())
 
     def test_empty_image_uses_stock_tray_and_filled_image_browses(self) -> None:
         tab = mock.Mock()
@@ -782,6 +988,12 @@ class ImageAnimationTests(unittest.TestCase):
             saved = load_image_manifest(pages)["slots"]["cover"]["settings"]
             self.assertTrue(saved["animation_enabled"])
             self.assertEqual(saved["speed_percent"], 225)
+            reopened = ImageSettingsDialog(
+                "Cover Page Image", animated_gif=True, settings=saved,
+            )
+            self.addCleanup(reopened.deleteLater)
+            self.assertEqual(reopened.speed.currentText(), "Custom…")
+            self.assertEqual(reopened.custom_speed.value(), 225)
 
     def test_reset_confirmation_is_frameless_modal_and_color_coded(self) -> None:
         dialog = _ResetImagesConfirmationDialog()
@@ -838,6 +1050,64 @@ class ImageAnimationTests(unittest.TestCase):
                 frame_colors.add(expected.name())
 
             self.assertEqual(len(frame_colors), len(THEMES))
+
+    def test_populated_thumbnail_frame_follows_image_in_every_theme(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        card = ImageAssetCard(1, "Cover Page", root)
+        self.addCleanup(card.deleteLater)
+        service = ThemeService(root, parent=card)
+        card.show()
+        self.app.processEvents()
+
+        for theme_id in THEMES:
+            service.set_theme(theme_id, persist=False)
+            card.apply_theme_assets(service, root)
+            for width, height in ((600, 900), (900, 600), (700, 700)):
+                source = QtGui.QPixmap(width, height)
+                source.fill(QtGui.QColor("red"))
+                card.set_pixmap(source)
+                self.app.processEvents()
+                displayed = card.thumbnail.pixmap()
+                with self.subTest(theme=theme_id, size=(width, height)):
+                    self.assertEqual(
+                        card.thumbnail.size(),
+                        displayed.size() + QtCore.QSize(2, 2),
+                    )
+                    self.assertLessEqual(card.thumbnail.width(), 170)
+                    self.assertLessEqual(card.thumbnail.height(), 157)
+                    self.assertGreaterEqual(
+                        card.clear_btn.y()
+                        - card.thumbnail.y()
+                        - card.thumbnail.height(),
+                        12,
+                    )
+
+        card.clear_pixmap()
+        self.assertEqual(card.thumbnail.size(), QtCore.QSize(150, 165))
+
+    def test_animated_gif_thumbnail_frame_follows_movie(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "portrait.gif"
+            self._write_gif(source, size=(12, 24))
+            card = ImageAssetCard(1, "Cover Page", directory)
+            self.addCleanup(card.deleteLater)
+            card.show()
+            try:
+                card.set_asset_path(str(source), animated_gif=True)
+                self.app.processEvents()
+                self.assertIsNotNone(card._movie)
+                self.assertEqual(
+                    card.thumbnail.size(),
+                    card._movie.scaledSize() + QtCore.QSize(2, 2),
+                )
+                self.assertGreaterEqual(
+                    card.clear_btn.y()
+                    - card.thumbnail.y()
+                    - card.thumbnail.height(),
+                    12,
+                )
+            finally:
+                card.release_asset_handle()
 
     def test_reset_requires_yes_before_clearing_images(self) -> None:
         tab = mock.Mock()
@@ -913,6 +1183,27 @@ class ImageAnimationTests(unittest.TestCase):
                             image_tab.cards[1].geometry()
                         )
                     )
+            finally:
+                image_tab.close()
+
+    def test_image_cards_wrap_when_window_narrows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image_tab = ImageTab(directory)
+            try:
+                image_tab.resize(1920, 820)
+                image_tab.show()
+                self.app.processEvents()
+                self.assertEqual(image_tab._cards_columns, 4)
+
+                image_tab.resize(1180, 820)
+                self.app.processEvents()
+                self.assertEqual(image_tab.width(), 1180)
+                self.assertEqual(image_tab._cards_columns, 2)
+                self.assertGreater(
+                    image_tab.cards[3].y(), image_tab.cards[1].y()
+                )
+                for card in image_tab.cards.values():
+                    self.assertLessEqual(card.geometry().right(), image_tab.width())
             finally:
                 image_tab.close()
 
@@ -1151,6 +1442,35 @@ class ImageTabPerformanceTests(unittest.TestCase):
             card.release_asset_handle()
             self.app.processEvents()
 
+    def test_card_previews_delay_speed_finite_count_and_loop_pause(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.gif"
+            ImageAnimationTests._write_gif(source, durations=(30, 30, 30))
+            card = ImageAssetCard(1, "Cover Page", directory)
+            self.addCleanup(card.deleteLater)
+            card.set_asset_path(
+                str(source), animated_gif=True,
+                settings={
+                    "speed_percent": 50,
+                    "play_count": 2,
+                    "start_delay_ms": 100,
+                    "loop_pause_ms": 100,
+                },
+                embedded_play_count=FOREVER,
+            )
+            self.assertEqual(card._movie.speed(), 50)
+            self.assertEqual(card._target_cycles, 2)
+            self.assertEqual(card._preview_phase, "start")
+            self.assertTrue(card._preview_timer.isActive())
+            deadline = time.monotonic() + 2
+            while card._preview_phase != "end" and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+            self.assertEqual(card._completed_cycles, 2)
+            self.assertEqual(card._preview_phase, "end")
+            self.assertEqual(card._movie.currentFrameNumber(), 2)
+            card.release_asset_handle()
+
     def test_stopped_gif_card_keeps_preview_frame_without_movie(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1168,6 +1488,62 @@ class ImageTabPerformanceTests(unittest.TestCase):
             self.assertIsNotNone(card.thumbnail.pixmap())
             self.assertFalse(card.thumbnail.pixmap().isNull())
             self.assertTrue(card.settings_btn.isEnabled())
+
+    def test_static_image_card_has_no_gif_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.png"
+            ImageAnimationTests._write_png(source)
+            card = ImageAssetCard(1, "Cover Page", directory)
+            self.addCleanup(card.deleteLater)
+            card.set_asset_path(str(source), animated_gif=False)
+            self.assertFalse(card.settings_btn.isVisible())
+            self.assertFalse(card.settings_btn.isEnabled())
+
+    def test_image_card_keeps_clear_and_gif_settings_inside_frame(self) -> None:
+        card = ImageAssetCard(1, "Cover Page", Path(__file__).resolve().parents[1])
+        self.addCleanup(card.deleteLater)
+        card.show()
+        self.app.processEvents()
+        self.assertEqual(card.settings_btn.text(), "⚙")
+        self.assertEqual(card.settings_btn.size(), QtCore.QSize(44, 44))
+        self.assertEqual(card.clear_btn.size(), QtCore.QSize(155, 51))
+        self.assertLess(card.settings_btn.width(), card.clear_btn.width())
+        self.assertEqual(card.settings_btn.accessibleName(), "Settings")
+        self.assertIn("Settings", card.settings_btn.toolTip())
+        dedicated = (
+            Path(__file__).resolve().parents[1]
+            / "resources/app/themes/cyber_forge/buttons/setbutton.png"
+        )
+        expected_artwork = "setbutton.png" if dedicated.is_file() else "AButton.png"
+        self.assertEqual(card.settings_btn.artwork_path.name, expected_artwork)
+        self.assertTrue(card.settings_btn.has_artwork)
+        if not dedicated.is_file():
+            self.assertEqual(card.settings_btn._artwork.width(), card.settings_btn._artwork.height())
+
+        clear_requests = []
+        settings_requests = []
+        card.clear_requested.connect(clear_requests.append)
+        card.settings_requested.connect(settings_requests.append)
+        card.clear_btn.click()
+        card.settings_btn.setEnabled(True)
+        card.settings_btn.click()
+        self.assertEqual(clear_requests, [1])
+        self.assertEqual(settings_requests, [1])
+
+        for settings_visible in (False, True):
+            card.settings_btn.setVisible(settings_visible)
+            self.app.processEvents()
+            buttons = (card.clear_btn, card.settings_btn) if settings_visible else (card.clear_btn,)
+            for button in buttons:
+                position = button.mapTo(card, QtCore.QPoint(0, 0))
+                self.assertGreaterEqual(position.x(), 10)
+                self.assertLessEqual(position.x() + button.width(), card.width() - 10)
+                self.assertGreaterEqual(position.y(), 2)
+                self.assertLessEqual(position.y() + button.height() + 2, card.height())
+            if settings_visible:
+                clear_right = card.clear_btn.mapTo(card, QtCore.QPoint(0, 0)).x() + card.clear_btn.width()
+                settings_left = card.settings_btn.mapTo(card, QtCore.QPoint(0, 0)).x()
+                self.assertGreaterEqual(settings_left - clear_right, 8)
 
     def test_completed_movie_is_not_restarted_on_tab_activation(self) -> None:
         movie = _FakeMovie(QtGui.QMovie.NotRunning)

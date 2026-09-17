@@ -50,6 +50,14 @@ from letter_page import (
     DEFAULT_MESSAGE_OVERLAY_PRESET,
     LETTER_PAGE_PRESET_LABELS,
     LETTER_PAGE_PRESETS,
+    MESSAGE_RENDER_FONT_FAMILY,
+    MESSAGE_RENDER_FONT_SIZE,
+    MESSAGE_RENDER_HEIGHT,
+    MESSAGE_RENDER_LINE_HEIGHT,
+    MESSAGE_RENDER_MARGIN_BOTTOM,
+    MESSAGE_RENDER_MARGIN_LR,
+    MESSAGE_RENDER_MARGIN_TOP,
+    MESSAGE_RENDER_WIDTH,
     MESSAGE_OVERLAY_OPACITY_KEY,
     MESSAGE_OVERLAY_PRESET_KEY,
     adaptive_text_rgb,
@@ -386,11 +394,11 @@ def _render_message_png(
     overlay_opacity: int,
 ) -> bool:
     """Render one full-resolution Message image outside the GUI thread."""
-    full_width, full_height = 2048, 3072
-    margin_lr = 100
-    margin_top = 100
-    margin_bottom = 100
-    text_width = full_width - 2 * margin_lr
+    full_width, full_height = MESSAGE_RENDER_WIDTH, MESSAGE_RENDER_HEIGHT
+    margin_lr = MESSAGE_RENDER_MARGIN_LR
+    margin_top = MESSAGE_RENDER_MARGIN_TOP
+    margin_bottom = MESSAGE_RENDER_MARGIN_BOTTOM
+    text_width = full_width - (2 * margin_lr)
     text_height = full_height - margin_top - margin_bottom
 
     canvas = QImage(full_width, full_height, QImage.Format_ARGB32)
@@ -429,12 +437,15 @@ def _render_message_png(
     painter.end()
 
     document = QTextDocument()
-    document.setDefaultFont(QFont("Papyrus", 12))
+    document.setDefaultFont(
+        QFont(MESSAGE_RENDER_FONT_FAMILY, MESSAGE_RENDER_FONT_SIZE)
+    )
     document.setDefaultStyleSheet(
-        f"body {{ color: {ink_color}; background: transparent; font-family: 'Papyrus'; "
-        "text-align: center; line-height: 2; }}"
+        f"body {{ color: {ink_color}; background: transparent; "
+        f"font-family: '{MESSAGE_RENDER_FONT_FAMILY}'; "
+        f"text-align: center; line-height: {MESSAGE_RENDER_LINE_HEIGHT:g}; }}"
         "p { margin: 0 0 12px 0; }"
-        "br { line-height: 2; }"
+        f"br {{ line-height: {MESSAGE_RENDER_LINE_HEIGHT:g}; }}"
     )
     document.setHtml(html)
     normalize_ultralinks_in_document(document)
@@ -1945,8 +1956,7 @@ class MessageTab(QtWidgets.QWidget):
         if png_path.is_file():
             full_pix = QPixmap(str(png_path))
             if not full_pix.isNull():
-                thumb = full_pix.scaled(169, 253, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.preview_image.emit(thumb)
+                self.preview_image.emit(full_pix)
                 self.status.setText("🖼️ Showing message.png")
                 return
 
@@ -1954,8 +1964,7 @@ class MessageTab(QtWidgets.QWidget):
         if wall_path.is_file():
             full_pix = QPixmap(str(wall_path))
             if not full_pix.isNull():
-                thumb = full_pix.scaled(169, 253, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.preview_image.emit(thumb)
+                self.preview_image.emit(full_pix)
                 self.status.setText("🧱 Showing wall.png")
                 return
 
@@ -1998,16 +2007,16 @@ class MessageTab(QtWidgets.QWidget):
         else:
             html_for_editor = self.current_html or ""
 
-        full_pix: Optional[QPixmap] = None
-        png_path = self._png_path()
-        if png_path.is_file():
-            candidate = QPixmap(str(png_path))
+        wall_pix: Optional[QPixmap] = None
+        wall_path = self._render_wall_path()
+        if wall_path.is_file():
+            candidate = QPixmap(str(wall_path))
             if not candidate.isNull():
-                full_pix = candidate
+                wall_pix = candidate
 
         dlg = Editor(
             html_for_editor,
-            full_pix,
+            wall_pix,
             parent=self,
             apply_defaults=not self._content_has_intentional_formatting,
         )

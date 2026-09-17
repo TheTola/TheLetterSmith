@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from pathlib import Path
+from time import monotonic
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QUrl
@@ -16,6 +17,8 @@ from project_paths import application_paths
 _LOGGER = logging.getLogger(__name__)
 _APP_PLAYER_ATTRIBUTE = "_lettersmith_ui_sound_player"
 _SOUND_DIRECTORY = Path("sounds") / "App sounds"
+UI_SOUND_VOLUME = 0.08
+EDITOR_WINDOW_OBJECT_NAME = "LetterEditor"
 
 
 class UiSound(str, Enum):
@@ -28,6 +31,8 @@ class UiSound(str, Enum):
     GITHUB_DISCONNECTED = "github_disconnected"
     PUBLISH_COMPLETE = "publish_complete"
     TAB_SWITCHED = "tab_switched"
+    BLIP = "blip"
+    ERROR = "error"
 
 
 SOUND_FILES = {
@@ -40,6 +45,22 @@ SOUND_FILES = {
     UiSound.GITHUB_DISCONNECTED: "deconn.mp3",
     UiSound.PUBLISH_COMPLETE: "Success.mp3",
     UiSound.TAB_SWITCHED: "Switch.mp3",
+    UiSound.BLIP: "Blip.mp3",
+    UiSound.ERROR: "error.mp3",
+}
+
+UI_SOUND_VOLUMES = {
+    UiSound.BLIP: 0.035,
+    UiSound.TAB_SWITCHED: UI_SOUND_VOLUME * 0.8,
+    UiSound.OPENED: 0.072,
+    UiSound.ADDED: 0.09,
+    UiSound.REMOVED: 0.09,
+    UiSound.SAVED: 0.10,
+    UiSound.BROKEN: 0.10,
+    UiSound.ERROR: 0.10,
+    UiSound.GITHUB_CONNECTED: 0.11,
+    UiSound.GITHUB_DISCONNECTED: 0.11,
+    UiSound.PUBLISH_COMPLETE: 0.12,
 }
 
 
@@ -47,7 +68,7 @@ class UiSoundPlayer(QtCore.QObject):
     """Own reusable Qt multimedia players for short interface sounds."""
 
     OVERLAP_FADE_MS = 240
-    OVERLAP_WARP_RATE = 0.92
+    TAB_SWITCH_MIN_INTERVAL_S = 0.08
 
     def __init__(
         self,
@@ -69,8 +90,12 @@ class UiSoundPlayer(QtCore.QObject):
             QMediaPlayer,
             QtCore.QParallelAnimationGroup,
         ] = {}
-        self._fade_pitch_compensation: dict[QMediaPlayer, bool] = {}
         self._missing_files: set[Path] = set()
+        self._last_tab_switch_at = float("-inf")
+
+    @staticmethod
+    def _volume_for(role: UiSound) -> float:
+        return UI_SOUND_VOLUMES[role]
 
     def sound_path(self, sound: UiSound | str) -> Path:
         role = UiSound(sound)
@@ -84,6 +109,12 @@ class UiSoundPlayer(QtCore.QObject):
                 self._missing_files.add(path)
                 _LOGGER.warning("Interface sound is missing: %s", path)
             return False
+
+        if role == UiSound.TAB_SWITCHED:
+            now = monotonic()
+            if now - self._last_tab_switch_at < self.TAB_SWITCH_MIN_INTERVAL_S:
+                return False
+            self._last_tab_switch_at = now
 
         self._fade_active_players()
         player = self._players.get(role)
@@ -102,8 +133,7 @@ class UiSoundPlayer(QtCore.QObject):
             self._outputs[role] = self._player_outputs[player]
         output = self._player_outputs[player]
 
-        output.setVolume(1.0)
-        player.setPlaybackRate(1.0)
+        output.setVolume(self._volume_for(role))
         player.setPosition(0)
         self._active_players.add(player)
         player.play()
@@ -111,7 +141,7 @@ class UiSoundPlayer(QtCore.QObject):
 
     def _create_player(self, role: UiSound, path: Path) -> QMediaPlayer:
         output = QAudioOutput(self)
-        output.setVolume(1.0)
+        output.setVolume(self._volume_for(role))
         player = QMediaPlayer(self)
         player.setAudioOutput(output)
         player.setSource(QUrl.fromLocalFile(str(path)))
@@ -158,18 +188,6 @@ class UiSoundPlayer(QtCore.QObject):
         volume_fade.setEndValue(0.0)
         volume_fade.setEasingCurve(QtCore.QEasingCurve.Type.OutCubic)
 
-        warp = QtCore.QPropertyAnimation(player, b"playbackRate", group)
-        warp.setDuration(self.OVERLAP_FADE_MS)
-        warp.setStartValue(player.playbackRate())
-        warp.setEndValue(self.OVERLAP_WARP_RATE)
-        warp.setEasingCurve(QtCore.QEasingCurve.Type.InOutSine)
-
-        if hasattr(player, "pitchCompensation"):
-            pitch_compensation = bool(player.pitchCompensation())
-            self._fade_pitch_compensation[player] = pitch_compensation
-            if pitch_compensation:
-                player.setPitchCompensation(False)
-
         self._fade_groups[player] = group
         group.finished.connect(
             lambda active_player=player, active_group=group: self._finish_fade(
@@ -190,12 +208,8 @@ class UiSoundPlayer(QtCore.QObject):
         self._active_players.discard(player)
         output = self._player_outputs.get(player)
         player.pause()
-        player.setPlaybackRate(1.0)
         if output is not None:
-            output.setVolume(1.0)
-        pitch_compensation = self._fade_pitch_compensation.pop(player, None)
-        if pitch_compensation is not None:
-            player.setPitchCompensation(pitch_compensation)
+            output.setVolume(self._volume_for(self._player_roles[player]))
 
         role = self._player_roles.get(player)
         if role is not None and self._players.get(role) is not player:
@@ -213,14 +227,7 @@ class UiSoundPlayer(QtCore.QObject):
 
         for player, output in self._player_outputs.items():
             player.pause()
-            player.setPlaybackRate(1.0)
-            output.setVolume(1.0)
-            pitch_compensation = self._fade_pitch_compensation.pop(
-                player,
-                None,
-            )
-            if pitch_compensation is not None:
-                player.setPitchCompensation(pitch_compensation)
+            output.setVolume(self._volume_for(self._player_roles[player]))
         self._active_players.clear()
 
     def eventFilter(
@@ -248,17 +255,7 @@ class UiSoundPlayer(QtCore.QObject):
     def _is_open_sound_window(watched: QtCore.QObject) -> bool:
         if not isinstance(watched, QtWidgets.QWidget) or not watched.isWindow():
             return False
-        if watched.objectName() == "NexusWindow":
-            return False
-        if isinstance(
-            watched,
-            (
-                QtWidgets.QMenu,
-                QtWidgets.QSplashScreen,
-            ),
-        ):
-            return False
-        return watched.windowType() != QtCore.Qt.WindowType.ToolTip
+        return watched.objectName() == EDITOR_WINDOW_OBJECT_NAME
 
     @staticmethod
     def _button_at_event(
@@ -323,7 +320,10 @@ def play_ui_sound(sound: UiSound | str) -> bool:
 
 
 __all__ = [
+    "EDITOR_WINDOW_OBJECT_NAME",
     "SOUND_FILES",
+    "UI_SOUND_VOLUME",
+    "UI_SOUND_VOLUMES",
     "UiSound",
     "UiSoundPlayer",
     "install_ui_sounds",

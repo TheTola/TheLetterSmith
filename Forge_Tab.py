@@ -56,6 +56,7 @@ from saved_letters import (
     SavedLetterDeleteError,
     SavedLetterRestorer,
     record_saved_letter_activity,
+    save_published_snapshot,
     update_saved_metadata,
     update_saved_publication_metadata,
 )
@@ -79,21 +80,24 @@ from ui_sounds import UiSound, play_ui_sound
 from ui_theme import (
     CYBER_FORGE_THEME,
     BUTTON_FULL_TIER_GEOMETRY_PROPERTY,
+    BUTTON_GEOMETRY_SCALE_PROPERTY,
     ButtonTier,
     ThemeService,
     ThemeTokens,
     apply_button_tier,
     apply_tab_heading_style,
+    minimum_button_text_size,
 )
 from transactional_io import file_change_token
 
 
 PREVIEW_MODE_KEY = "forge_preview_mode"
 FORGE_ACTION_FONT_POINT_SIZE = 13.0
+FORGE_GEOMETRY_SCALE = 0.9
 PREVIEW_MODES = (
     ("Portrait", "portrait"),
     ("Landscape", "landscape"),
-    ("Window / Browser", "window"),
+    ("Browser", "window"),
 )
 PREVIEW_MODE_DESCRIPTIONS = {
     "portrait": " ",
@@ -367,6 +371,40 @@ def _forge_source_fingerprint(project_root: Path) -> str:
         return ""
 
 
+def _publication_fields_from_result(publish_result: PublishResult) -> dict:
+    publication = {
+        PUBLISHED_PAGE_URL_KEY: normalize_published_page_url(
+            getattr(publish_result, "url", "")
+        ),
+        PUBLISHED_PUBLIC_PATH_KEY: str(
+            getattr(publish_result, "public_path", "")
+        ).strip(),
+        PUBLISHED_AT_KEY: str(
+            getattr(publish_result, "published_at", "")
+        ).strip(),
+        PUBLISHED_EXPIRES_AT_KEY: str(
+            getattr(publish_result, "expires_at", "")
+        ).strip(),
+        PUBLICATION_PROVIDER_KEY: str(
+            getattr(publish_result, "provider", "")
+        ).strip(),
+        PUBLICATION_VERIFIED_KEY: (
+            getattr(publish_result, "verified", False) is True
+        ),
+        PUBLISHED_SOURCE_FINGERPRINT_KEY: str(
+            getattr(publish_result, "source_fingerprint", "")
+        ).strip(),
+        PUBLISHED_GITHUB_OWNER_KEY: str(
+            getattr(publish_result, "owner", "")
+        ).strip(),
+        PUBLISHED_GITHUB_REPOSITORY_KEY: str(
+            getattr(publish_result, "repository", "")
+        ).strip(),
+    }
+    publication[PROJECT_PUBLISHED_AT_KEY] = publication[PUBLISHED_AT_KEY]
+    return publication
+
+
 class _ForgeOperationError(RuntimeError):
     """An operation failure whose message is safe to show in Forge."""
 
@@ -415,7 +453,7 @@ class _PreviewModeDelegate(QtWidgets.QStyledItemDelegate):
         index: QtCore.QModelIndex,
     ) -> QtCore.QSize:
         del option, index
-        return QtCore.QSize(280, 52)
+        return QtCore.QSize(150, 52)
 
     def paint(
         self,
@@ -470,14 +508,15 @@ class _PreviewModeCombo(QtWidgets.QComboBox):
         super().__init__(parent)
         self.setObjectName("PreviewFormatSelector")
         self.setCursor(Qt.PointingHandCursor)
-        self.setMinimumSize(178, 38)
+        self.setFixedWidth(144)
+        self.setMinimumHeight(34)
         self.setMaxVisibleItems(len(PREVIEW_MODES))
         view = QtWidgets.QListView(self)
         view.setObjectName("PreviewFormatMenu")
         view.setMouseTracking(True)
         view.setSpacing(2)
         view.setUniformItemSizes(True)
-        view.setMinimumWidth(290)
+        view.setMinimumWidth(144)
         self.setView(view)
         self.setItemDelegate(_PreviewModeDelegate(self))
         self._arrow = QtWidgets.QLabel("⌄", self)
@@ -497,12 +536,15 @@ class _PreviewModeCombo(QtWidgets.QComboBox):
             "background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
             f"stop:0 {background_top},stop:1 {background_bottom});"
             f"color:{colors.text};border:1px solid {colors.accent};border-radius:8px;"
-            "padding:7px 38px 7px 12px;font:600 10pt 'Segoe UI';}"
+            "padding:6px 34px 6px 11px;font:600 10pt 'Segoe UI';}"
             "QComboBox#PreviewFormatSelector:hover{"
             f"background:{colors.hover};border-color:{colors.highlight};}}"
             "QComboBox#PreviewFormatSelector:focus{"
-            f"border:2px solid {colors.accent};padding:6px 37px 6px 11px;}}"
-            "QComboBox#PreviewFormatSelector::drop-down{width:34px;border:none;"
+            f"border:2px solid {colors.accent};padding:5px 33px 5px 10px;}}"
+            "QComboBox#PreviewFormatSelector:disabled{"
+            f"background:{colors.control_background};color:{colors.muted_text};"
+            f"border:1px solid {colors.border};}}"
+            "QComboBox#PreviewFormatSelector::drop-down{width:31px;border:none;"
             f"border-left:1px solid {_rgba(colors.border, 170)};}}"
             "QComboBox#PreviewFormatSelector::down-arrow{image:none;width:0;height:0;}"
             "QListView#PreviewFormatMenu{"
@@ -519,12 +561,12 @@ class _PreviewModeCombo(QtWidgets.QComboBox):
         self.update()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
-        self._arrow.setGeometry(self.width() - 33, 1, 31, self.height() - 2)
+        self._arrow.setGeometry(self.width() - 30, 1, 28, self.height() - 2)
         self._arrow.raise_()
         super().resizeEvent(event)
 
     def showPopup(self) -> None:
-        self.view().setMinimumWidth(max(290, self.width()))
+        self.view().setMinimumWidth(self.width())
         super().showPopup()
 
 
@@ -1104,6 +1146,7 @@ class ForgeTab(QtWidgets.QWidget):
     project_restored = QtCore.Signal(dict)
     letter_loaded = QtCore.Signal(dict)
     preview_requested = QtCore.Signal(str, str)
+    preview_failed = QtCore.Signal()
     preview_files_release_requested = QtCore.Signal()
     project_files_release_requested = QtCore.Signal()
     restore_activity_changed = QtCore.Signal(bool, str)
@@ -1315,12 +1358,12 @@ class ForgeTab(QtWidgets.QWidget):
 
     def _saved_preview_mode(self, snapshot: dict | None = None) -> str:
         if snapshot is None:
-            value = self.settings.get(PREVIEW_MODE_KEY, "portrait")
+            value = self.settings.get(PREVIEW_MODE_KEY, "landscape")
         else:
-            value = snapshot.get(PREVIEW_MODE_KEY, "portrait")
+            value = snapshot.get(PREVIEW_MODE_KEY, "landscape")
         value = str(value).strip()
         valid = {mode for _label, mode in PREVIEW_MODES}
-        return value if value in valid else "portrait"
+        return value if value in valid else "landscape"
 
     def _init_ui(self) -> None:
         self.setObjectName("ForgeWorkflow")
@@ -1333,27 +1376,38 @@ class ForgeTab(QtWidgets.QWidget):
         )
 
         self._main_layout = QtWidgets.QVBoxLayout(self)
-        self._main_layout.setContentsMargins(72, 22, 72, 18)
-        self._main_layout.setSpacing(12)
+        self._compact_layout = False
+        self._main_layout.setContentsMargins(65, 20, 65, 11)
+        self._main_layout.setSpacing(11)
+        self._action_geometry_timer = QtCore.QTimer(self)
+        self._action_geometry_timer.setSingleShot(True)
+        self._action_geometry_timer.timeout.connect(self._sync_long_action_button_aspect_ratios)
 
         heading_row = QtWidgets.QHBoxLayout()
-        heading_row.setContentsMargins(0, 0, 0, 6)
-        heading_row.setSpacing(10)
+        self._heading_row = heading_row
+        heading_row.setContentsMargins(0, 0, 0, 5)
+        heading_row.setSpacing(9)
         self._heading_balance = QtWidgets.QWidget()
-        heading_row.addWidget(self._heading_balance)
-        heading_row.addStretch(1)
+        self._heading_balance.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Preferred,
+        )
+        heading_row.addWidget(self._heading_balance, 1)
+        heading_row.addStretch(0)
         self.heading_title = QtWidgets.QLabel("Review and forge your letter")
         apply_tab_heading_style(self.heading_title)
         self.heading_title.setAlignment(Qt.AlignCenter)
-        heading_row.addWidget(self.heading_title)
-        heading_row.addStretch(1)
+        self.heading_title.setWordWrap(True)
+        heading_row.addWidget(self.heading_title, 4)
+        heading_row.addStretch(0)
 
         self._readiness_controls = QtWidgets.QWidget()
         readiness_row = QtWidgets.QHBoxLayout(self._readiness_controls)
         readiness_row.setContentsMargins(0, 0, 0, 0)
-        readiness_row.setSpacing(10)
+        readiness_row.setSpacing(9)
         self.readiness_summary = QtWidgets.QLabel()
         self.readiness_summary.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.readiness_summary.setWordWrap(True)
         readiness_row.addWidget(self.readiness_summary)
         self.readiness_btn = self._tier_button(
             "Review",
@@ -1425,6 +1479,7 @@ class ForgeTab(QtWidgets.QWidget):
             alignment=Qt.AlignCenter,
         )
         saved_holder = QtWidgets.QHBoxLayout()
+        saved_holder.setSpacing(5)
         saved_holder.setContentsMargins(0, 0, 0, 0)
         saved_holder.addWidget(self._unpublish_balance)
         saved_holder.addStretch(1)
@@ -1599,14 +1654,14 @@ class ForgeTab(QtWidgets.QWidget):
 
         self.identity_panel = QtWidgets.QFrame()
         self.identity_panel.setObjectName("ForgeIdentity")
-        self.identity_panel.setMaximumWidth(1510)
+        self.identity_panel.setMaximumWidth(1359)
         self.identity_panel.setStyleSheet(
             "QFrame#ForgeIdentity{background:#111921;"
             "border:1px solid #253d49;border-radius:7px;}"
         )
         identity_row = QtWidgets.QHBoxLayout(self.identity_panel)
-        identity_row.setContentsMargins(10, 7, 10, 7)
-        identity_row.setSpacing(10)
+        identity_row.setContentsMargins(9, 6, 9, 6)
+        identity_row.setSpacing(9)
         identity_row.addWidget(self._muted_label("Title"))
         self.identity_title = QtWidgets.QLabel()
         self.identity_title.setStyleSheet("color:#f2fbff;font:600 10pt 'Segoe UI';")
@@ -1616,8 +1671,13 @@ class ForgeTab(QtWidgets.QWidget):
         self.identity_recipient.setStyleSheet(
             "color:#f2fbff;font:600 10pt 'Segoe UI';"
         )
+        for label in (self.identity_title, self.identity_recipient):
+            label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+            label.setWordWrap(True)
+            label.setMaximumHeight(46)
         identity_row.addWidget(self.identity_recipient, 1)
         identity_holder = QtWidgets.QHBoxLayout()
+        self._identity_holder = identity_holder
         identity_holder.setContentsMargins(0, 0, 0, 0)
         identity_holder.addStretch(1)
         identity_holder.addWidget(self.identity_panel, 1)
@@ -1626,14 +1686,14 @@ class ForgeTab(QtWidgets.QWidget):
 
         self.preview_format_panel = QtWidgets.QFrame(self)
         self.preview_format_panel.setObjectName("ForgePreviewFormat")
-        self.preview_format_panel.setFixedWidth(680)
+        self.preview_format_panel.setFixedWidth(468)
         self.preview_format_panel.setStyleSheet(
             "QFrame#ForgePreviewFormat{background:rgba(13,31,40,.86);"
             "border:1px solid #315c69;border-radius:10px;}"
         )
         format_row = QtWidgets.QHBoxLayout(self.preview_format_panel)
-        format_row.setContentsMargins(12, 7, 10, 7)
-        format_row.setSpacing(12)
+        format_row.setContentsMargins(11, 6, 9, 6)
+        format_row.setSpacing(11)
         preview_format_controls = QtWidgets.QVBoxLayout()
         preview_format_controls.setContentsMargins(0, 0, 0, 0)
         preview_format_controls.setSpacing(4)
@@ -1647,20 +1707,12 @@ class ForgeTab(QtWidgets.QWidget):
             self.preview_mode,
             "Choose the screen shape used when previewing the finished letter.",
         )
-        for label, mode in PREVIEW_MODES:
-            self.preview_mode.addItem(label, mode)
-            self.preview_mode.setItemData(
-                self.preview_mode.count() - 1,
-                PREVIEW_MODE_DESCRIPTIONS[mode],
-                Qt.UserRole + 1,
-            )
-        current = self.preview_mode.findData(self._preview_mode)
-        self.preview_mode.setCurrentIndex(max(0, current))
+        self.preview_mode.setEnabled(False)
         self.preview_mode.currentIndexChanged.connect(
             self._preview_mode_changed
         )
         preview_format_controls.addWidget(self.preview_mode)
-        format_row.addLayout(preview_format_controls, 1)
+        format_row.addLayout(preview_format_controls)
 
         curtain_controls = QtWidgets.QVBoxLayout()
         curtain_controls.setContentsMargins(0, 0, 0, 0)
@@ -1674,6 +1726,7 @@ class ForgeTab(QtWidgets.QWidget):
             self,
             object_name="ForgeCurtainStyleSelector",
         )
+        self.curtain_style_selector.setMinimumSize(225, 34)
         set_control_help(
             self.curtain_style_selector,
             "Choose white, normal, complementary, or normal/complementary "
@@ -1681,13 +1734,15 @@ class ForgeTab(QtWidgets.QWidget):
             accessible_name="Choose Curtains",
         )
         self.curtain_styles.bind(self.curtain_style_selector)
+        self.curtain_style_selector.set_choices_available(False)
+        self.curtain_style_selector.setEnabled(False)
         curtain_controls.addWidget(self.curtain_style_selector)
         format_row.addLayout(curtain_controls, 1)
         self._sync_curtain_style()
 
         publishing_row = QtWidgets.QHBoxLayout()
         publishing_row.setContentsMargins(0, 0, 0, 0)
-        publishing_row.setSpacing(9)
+        publishing_row.setSpacing(8)
         publishing_row.addWidget(self._muted_label("Online hosting"))
         self.publishing_provider_label = QtWidgets.QLabel("GitHub Pages")
         self.publishing_provider_label.setStyleSheet(
@@ -1701,8 +1756,13 @@ class ForgeTab(QtWidgets.QWidget):
         self.github_account_summary.setStyleSheet(
             "color:#9fcbd5;font:600 9pt 'Segoe UI';"
         )
-        publishing_row.addWidget(self.github_account_summary)
-        publishing_row.addStretch(1)
+        self.github_account_summary.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred,
+        )
+        self.github_account_summary.setWordWrap(True)
+        self.github_account_summary.setMaximumHeight(46)
+        publishing_row.addWidget(self.github_account_summary, 1)
+        publishing_row.addStretch(0)
         self.github_account_btn = self._tier_button(
             "GitHub Account",
             ButtonTier.SMALL,
@@ -1722,7 +1782,8 @@ class ForgeTab(QtWidgets.QWidget):
         self._main_layout.addLayout(publishing_row)
 
         actions = QtWidgets.QHBoxLayout()
-        actions.setSpacing(10)
+        self._actions_layout = actions
+        actions.setSpacing(9)
         self.preview_btn = self._action_button(
             "Preview Letter", "ForgePreviewAction", "ALbutton.png"
         )
@@ -1769,13 +1830,14 @@ class ForgeTab(QtWidgets.QWidget):
         }
         for button, _filename in self._long_action_artwork:
             button.set_artwork_stretch(True)
+            button.installEventFilter(self)
         self._long_action_row = QtWidgets.QHBoxLayout()
         self._long_action_row.setContentsMargins(0, 0, 0, 0)
         self._long_action_row.setSpacing(0)
-        # Keep the centered action group 10% narrower than its previous share.
-        self._long_action_row.addStretch(209)
-        self._long_action_row.addLayout(actions, 832)
-        self._long_action_row.addStretch(209)
+        # Reduce the existing centered group's geometry by 10%, keeping its fonts.
+        self._long_action_row.addStretch(2506)
+        self._long_action_row.addLayout(actions, 7488)
+        self._long_action_row.addStretch(2506)
         self._main_layout.addLayout(self._long_action_row)
         self._sync_publishing_controls()
 
@@ -1794,29 +1856,55 @@ class ForgeTab(QtWidgets.QWidget):
 
     def _sync_heading_balance(self) -> None:
         self.unpublish_btn.setAccessibleName("Unpublish Letter")
-        self._heading_balance.setFixedWidth(
+        self._heading_balance.setMaximumWidth(
             self._readiness_controls.sizeHint().width()
         )
-        unpublish_width = self.unpublish_btn.sizeHint().width()
+        self.heading_title.setMaximumWidth(
+            self.heading_title.fontMetrics().horizontalAdvance(
+                self.heading_title.text()
+            ) + 4
+        )
+        unpublish_width = self.unpublish_btn.width()
         self._unpublish_balance.setFixedWidth(unpublish_width)
         self._unpublish_controls.setFixedWidth(unpublish_width)
 
-    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
-        for button, _filename in getattr(self, "_long_action_artwork", ()):
-            button.setMinimumWidth(0)
-            button.setMaximumWidth(16_777_215)
-        side_margin = min(104, max(24, int(self.width() * 0.055)))
+    def set_compact_layout(self, compact: bool) -> None:
+        """Reflow beside the preview when the window cannot fit both vertically."""
+        if self._compact_layout == compact:
+            return
+        self._compact_layout = compact
+        self._heading_balance.setVisible(not compact)
+        self._unpublish_balance.setVisible(not compact)
+        self._identity_holder.setStretch(0, 0 if compact else 1)
+        self._identity_holder.setStretch(2, 0 if compact else 1)
+        self._heading_row.setContentsMargins(0, 0, 0, 0 if compact else 5)
+        self._main_layout.setSpacing(3 if compact else 11)
+        self.identity_panel.layout().setContentsMargins(9, 4 if compact else 6, 9, 4 if compact else 6)
+        self._actions_layout.setSpacing(2 if compact else 9)
+        self._update_layout_margins()
+        self._action_geometry_timer.start(0)
+
+    def _update_layout_margins(self) -> None:
+        side_margin = 2 if self._compact_layout else min(94, max(22, round(self.width() * 0.0495)))
         self._main_layout.setContentsMargins(
-            side_margin,
-            22,
-            side_margin,
-            18,
+            side_margin, 0 if self._compact_layout else 20,
+            side_margin, 0 if self._compact_layout else 11,
         )
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        self._update_layout_margins()
         self._layout_saved_cards()
         self._card_layout_timer.start(0)
         self._sync_heading_balance()
         super().resizeEvent(event)
-        QtCore.QTimer.singleShot(0, self._sync_long_action_button_aspect_ratios)
+        self._action_geometry_timer.start(0)
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if (event.type() == QtCore.QEvent.Resize
+                and watched in self._long_action_aspect_ratios
+                and event.size().width() != event.oldSize().width()):
+            self._action_geometry_timer.start(0)
+        return super().eventFilter(watched, event)
 
     @staticmethod
     def _muted_label(text: str) -> QtWidgets.QLabel:
@@ -1840,6 +1928,7 @@ class ForgeTab(QtWidgets.QWidget):
         )
         button.setCursor(Qt.PointingHandCursor)
         button.setProperty("themeRole", "button")
+        button.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, FORGE_GEOMETRY_SCALE)
         apply_button_tier(button, tier, bold=bold)
         return button
 
@@ -1858,7 +1947,8 @@ class ForgeTab(QtWidgets.QWidget):
             tier=None,
         )
         button.setObjectName(object_name)
-        button.setMinimumHeight(70)
+        button.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, FORGE_GEOMETRY_SCALE)
+        button.setMinimumHeight(63)
         button.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Fixed,
@@ -1882,31 +1972,11 @@ class ForgeTab(QtWidgets.QWidget):
         )
         if not buttons:
             return
-        scales = self._long_action_width_scales
-        primary_buttons = tuple(
-            button
-            for button in buttons
-            if scales.get(button, 1.0) == 1.0
-        )
-        if primary_buttons:
-            base_width = min(button.width() for button in primary_buttons)
-        else:
-            base_width = min(
-                button.width() / max(0.01, scales.get(button, 1.0))
-                for button in buttons
-            )
-        if base_width > 0:
-            for button in buttons:
-                button.setFixedWidth(
-                    round(base_width * scales.get(button, 1.0))
-                )
         for button in buttons:
             ratio = self._long_action_aspect_ratios.get(button, 0.0)
-            if ratio <= 0:
-                button.setFixedHeight(70)
-                continue
             content_width = max(1, button.width() - 4)
-            button.setFixedHeight(round(content_width / ratio) + 4)
+            height = round(content_width / ratio) + 4 if ratio > 0 else 63
+            button.setFixedHeight(max(height, minimum_button_text_size(button).height()))
 
     def apply_theme_assets(self, service: ThemeService) -> None:
         self._apply_forge_theme(
@@ -1938,7 +2008,7 @@ class ForgeTab(QtWidgets.QWidget):
         for button, _filename in self._long_action_artwork:
             self._long_action_aspect_ratios[button] = ratio
         QtCore.QTimer.singleShot(0, self._sync_heading_balance)
-        QtCore.QTimer.singleShot(0, self._sync_long_action_button_aspect_ratios)
+        self._action_geometry_timer.start(0)
 
     def _apply_forge_theme(
         self,
@@ -2021,7 +2091,7 @@ class ForgeTab(QtWidgets.QWidget):
                 f"QPushButton#{name}{{background:{background};color:{foreground};"
                 f"border:1px solid {border};border-radius:9px;"
                 f"font:700 {FORGE_ACTION_FONT_POINT_SIZE:g}pt '{app_font_family}';"
-                "padding:10px 18px;}"
+                "padding:9px 16px;}"
                 f"QPushButton#{name}:hover{{background:{hover};"
                 f"border-color:{colors.highlight};}}"
                 f"QPushButton#{name}:pressed{{background:{pressed};}}"
@@ -2200,13 +2270,19 @@ class ForgeTab(QtWidgets.QWidget):
                 "border-radius:8px;padding:4px 9px;"
                 "font:700 9pt 'Segoe UI';}"
             )
+            self.github_account_summary.setMaximumWidth(
+                self.github_account_summary.fontMetrics().horizontalAdvance(summary) + 20
+            )
             return
         colors = getattr(self, "_theme_tokens", CYBER_FORGE_THEME.tokens)
-        self.github_account_summary.setToolTip("")
+        self.github_account_summary.setToolTip(summary)
         self.github_account_summary.setStyleSheet(
             "QLabel#ForgeGitHubAccountSummary{"
             f"color:{colors.muted_text};background:transparent;"
             "border:none;padding:0;font:600 9pt 'Segoe UI';}"
+        )
+        self.github_account_summary.setMaximumWidth(
+            self.github_account_summary.fontMetrics().horizontalAdvance(summary)
         )
 
     @QtCore.Slot(object)
@@ -2621,12 +2697,6 @@ class ForgeTab(QtWidgets.QWidget):
         preview_mode = self._saved_preview_mode(snapshot)
         preview_mode_changed = preview_mode != self._preview_mode
         self._preview_mode = preview_mode
-        if self.preview_mode.currentData() != preview_mode:
-            blocker = QtCore.QSignalBlocker(self.preview_mode)
-            self.preview_mode.setCurrentIndex(
-                max(0, self.preview_mode.findData(preview_mode))
-            )
-            del blocker
         title = str(snapshot.get("recipient_title", "")).strip()
         recipient = str(snapshot.get("recipient_name", "")).strip()
         self.identity_title.setText(title or "Untitled")
@@ -2703,6 +2773,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._readiness_result = evaluate_readiness(self.project_root)
         self.readiness_window.refresh(self._readiness_result)
         result = self._readiness_result
+        self._sync_preview_option_controls(result)
         protected = self.is_protected_project()
         self._readiness_controls.setVisible(not protected)
         self._update_review_button_state(result)
@@ -2720,6 +2791,27 @@ class ForgeTab(QtWidgets.QWidget):
         self._sync_heading_balance()
         self._update_letter_action_button_states(result)
         return result
+
+    def _sync_preview_option_controls(self, readiness: ReadinessResult) -> None:
+        available = readiness.can_preview
+        with QtCore.QSignalBlocker(self.preview_mode):
+            if available:
+                if self.preview_mode.count() == 0:
+                    for label, mode in PREVIEW_MODES:
+                        self.preview_mode.addItem(label, mode)
+                        self.preview_mode.setItemData(
+                            self.preview_mode.count() - 1,
+                            PREVIEW_MODE_DESCRIPTIONS[mode],
+                            Qt.UserRole + 1,
+                        )
+                current = self.preview_mode.findData(self._preview_mode)
+                self.preview_mode.setCurrentIndex(current)
+            else:
+                self.preview_mode.clear()
+        self.preview_mode.setEnabled(available and not self._busy)
+        self.preview_mode._arrow.setVisible(available)
+        self.curtain_style_selector.set_choices_available(available)
+        self.curtain_style_selector.setEnabled(available and not self._busy)
 
     def _github_sign_in_warning_active(self) -> bool:
         return bool(
@@ -2846,6 +2938,7 @@ class ForgeTab(QtWidgets.QWidget):
                 or published_fingerprint != current_fingerprint
             )
         )
+        publication_locked = published and not publication_changed
         self.publish_btn.setText(
             "Update Published Letter"
             if publication_changed
@@ -2867,8 +2960,12 @@ class ForgeTab(QtWidgets.QWidget):
             invisible=self._busy,
         )
         self.publish_btn.set_action_state(
-            broken=not protected and not readiness.can_publish,
-            invisible=self._busy,
+            broken=(
+                not protected
+                and not readiness.can_publish
+                and not publication_locked
+            ),
+            invisible=self._busy or publication_locked,
         )
         self.open_published_btn.set_action_state(
             broken=not publication_valid,
@@ -2903,7 +3000,7 @@ class ForgeTab(QtWidgets.QWidget):
             invisible=self._busy,
         )
         if primary_visibility_changed:
-            QtCore.QTimer.singleShot(0, self._sync_long_action_button_aspect_ratios)
+            self._action_geometry_timer.start(0)
 
     def _known_valid_publication(self, snapshot: dict | None = None) -> bool:
         state = self.settings.snapshot() if snapshot is None else snapshot
@@ -3924,12 +4021,9 @@ class ForgeTab(QtWidgets.QWidget):
                 error=True,
             )
             return
+        self._last_play_dir = None
         if self.is_protected_project():
-            self._last_play_dir = None
             self._protected_published = False
-        else:
-            self._last_play_dir = Path(restored.play_dir).resolve()
-            self._record_active_play_dir(self._last_play_dir)
         self.project_state.transition(
             ApplicationState.PROJECT_READY,
             identity=restored.identity,
@@ -3937,8 +4031,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._pending_recipient_entry = None
         self.refresh_project_state()
         self._preview_refresh_pending = True
-        if self._last_play_dir is not None:
-            self._refresh_catalog_entry(self._last_play_dir)
+        self._refresh_catalog_entry(Path(restored.play_dir).resolve())
         payload = restored.as_payload()
         self.project_restored.emit(payload)
         self.letter_loaded.emit(payload)
@@ -3966,16 +4059,14 @@ class ForgeTab(QtWidgets.QWidget):
             )
 
     def _preview_mode_changed(self) -> None:
-        mode = str(self.preview_mode.currentData() or "portrait")
+        if not self._readiness_result.can_preview:
+            return
+        mode = str(self.preview_mode.currentData() or "landscape")
         self._preview_mode = mode
         self.settings.update_fields({PREVIEW_MODE_KEY: mode})
         self.request_preview()
 
     def _current_play_index(self) -> Optional[Path]:
-        if self._last_play_dir is not None:
-            index = self._last_play_dir / "index.html"
-            if index.is_file():
-                return index
         try:
             index = generate.play_bundle_directory(self.project_root) / "index.html"
         except Exception:
@@ -3985,7 +4076,7 @@ class ForgeTab(QtWidgets.QWidget):
 
     def current_play_index(self) -> Optional[Path]:
         """Return the current playable viewer entry point, when available."""
-        if self._preview_refresh_pending:
+        if self._preview_refresh_pending or not self._readiness_result.can_preview:
             return None
         return self._current_play_index()
 
@@ -4047,6 +4138,10 @@ class ForgeTab(QtWidgets.QWidget):
 
     def ensure_preview_current(self) -> None:
         """Build or refresh the embedded preview before it is displayed."""
+        self._refresh_source_fingerprint()
+        if not self.refresh_readiness().can_preview:
+            self._preview_refresh_pending = True
+            return
         if self._busy:
             self._preview_refresh_pending = True
             self._preview_refresh_requested = True
@@ -4067,10 +4162,11 @@ class ForgeTab(QtWidgets.QWidget):
     ) -> None:
         if self._busy:
             return
+        if not self._flush_prompt_writer_state():
+            return
+        self._refresh_source_fingerprint()
         readiness = self._required_gate(for_publish=protected_publish)
         if readiness is None:
-            return
-        if not self._flush_prompt_writer_state():
             return
         ensure_output_dirs(self.project_root)
         message_path = self.project_root / MESSAGE_HTML_FILE
@@ -4127,6 +4223,7 @@ class ForgeTab(QtWidgets.QWidget):
                 )
             ),
             "Preview could not be updated. The previous preview was preserved.",
+            on_failure=self.preview_failed.emit,
         )
 
     def _finish_preview(
@@ -4425,6 +4522,22 @@ class ForgeTab(QtWidgets.QWidget):
                 ),
             )
             publish_result = publisher.publish(Path(play_dir), dict(metadata))
+            snapshot_path = None
+            snapshot_failed = False
+            if getattr(publish_result, "success", False):
+                publication = _publication_fields_from_result(publish_result)
+                if publication_status(publication) == "published":
+                    try:
+                        snapshot_path = save_published_snapshot(
+                            play_dir,
+                            self.project_root,
+                            publication,
+                        )
+                    except Exception:
+                        _LOGGER.exception(
+                            "The published recovery copy could not be saved."
+                        )
+                        snapshot_failed = True
             return (
                 Path(play_dir),
                 readiness,
@@ -4433,6 +4546,8 @@ class ForgeTab(QtWidgets.QWidget):
                 int(source_revision),
                 str(requested_fingerprint),
                 _forge_source_fingerprint(self.project_root),
+                snapshot_path,
+                snapshot_failed,
             )
 
         self._update_publication_activity(
@@ -4449,6 +4564,8 @@ class ForgeTab(QtWidgets.QWidget):
     def _publish_completed(self, result: object) -> None:
         values = tuple(result)
         play_dir, readiness, metadata, publish_result = values[:4]
+        snapshot_path = Path(values[7]) if len(values) >= 9 and values[7] else None
+        snapshot_failed = bool(values[8]) if len(values) >= 9 else False
         source_changed = False
         if len(values) >= 7:
             source_revision = int(values[4])
@@ -4467,6 +4584,8 @@ class ForgeTab(QtWidgets.QWidget):
         else:
             self.request_preview()
         self._refresh_catalog_entry(Path(play_dir))
+        if snapshot_path is not None:
+            self._refresh_catalog_entry(snapshot_path)
         if not getattr(publish_result, "success", False):
             if (
                 not source_changed
@@ -4491,37 +4610,8 @@ class ForgeTab(QtWidgets.QWidget):
             return
         self._pending_publish_context = None
         self._pending_publish_retry_attempt = 0
-        url = normalize_published_page_url(
-            getattr(publish_result, "url", "")
-        )
-        publication = {
-            PUBLISHED_PAGE_URL_KEY: url,
-            PUBLISHED_PUBLIC_PATH_KEY: str(
-                getattr(publish_result, "public_path", "")
-            ).strip(),
-            PUBLISHED_AT_KEY: str(
-                getattr(publish_result, "published_at", "")
-            ).strip(),
-            PUBLISHED_EXPIRES_AT_KEY: str(
-                getattr(publish_result, "expires_at", "")
-            ).strip(),
-            PUBLICATION_PROVIDER_KEY: str(
-                getattr(publish_result, "provider", "")
-            ).strip(),
-            PUBLICATION_VERIFIED_KEY: (
-                getattr(publish_result, "verified", False) is True
-            ),
-            PUBLISHED_SOURCE_FINGERPRINT_KEY: str(
-                getattr(publish_result, "source_fingerprint", "")
-            ).strip(),
-            PUBLISHED_GITHUB_OWNER_KEY: str(
-                getattr(publish_result, "owner", "")
-            ).strip(),
-            PUBLISHED_GITHUB_REPOSITORY_KEY: str(
-                getattr(publish_result, "repository", "")
-            ).strip(),
-        }
-        publication[PROJECT_PUBLISHED_AT_KEY] = publication[PUBLISHED_AT_KEY]
+        publication = _publication_fields_from_result(publish_result)
+        url = publication[PUBLISHED_PAGE_URL_KEY]
         if publication_status(publication) != "published":
             _LOGGER.error("Publisher returned incomplete verification metadata.")
             self._set_status(
@@ -4552,9 +4642,12 @@ class ForgeTab(QtWidgets.QWidget):
         self._refresh_catalog_entry(Path(play_dir))
         self._sync_publishing_controls()
         self._set_status(
-            "Published. Publish again to include newer project changes."
+            "The letter is online, but its local recovery copy could not be saved."
+            if snapshot_failed
+            else "Published. Publish again to include newer project changes."
             if source_changed
-            else "The letter is published."
+            else "The letter is published.",
+            error=snapshot_failed,
         )
         play_ui_sound(UiSound.PUBLISH_COMPLETE)
         self._finish_publication_activity("publish")
@@ -4735,6 +4828,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._finish_publication_activity("unpublish")
 
     def _show_unpublish_failure(self, unpublish_result: object) -> None:
+        play_ui_sound(UiSound.ERROR)
         details = str(
             getattr(unpublish_result, "technical_details", "")
         ).strip()
@@ -4754,6 +4848,7 @@ class ForgeTab(QtWidgets.QWidget):
         dialog.exec()
 
     def _show_publish_failure(self, publish_result: object) -> None:
+        play_ui_sound(UiSound.ERROR)
         message = (
             str(getattr(publish_result, "message", "")).strip()
             or "Publishing failed. The local letter was preserved."
@@ -5083,6 +5178,7 @@ class ForgeTab(QtWidgets.QWidget):
             self._set_status("GitHub sign-in canceled.")
             self.request_preview()
             return
+        play_ui_sound(UiSound.ERROR)
         _LOGGER.error("Forge operation failed: %s\n%s", message, technical)
         error_message = self._operation_error_message
         safe_message = (
@@ -5127,7 +5223,6 @@ class ForgeTab(QtWidgets.QWidget):
         self.load_saved_btn.setEnabled(not busy)
         self.load_stock_btn.setEnabled(not busy)
         self.saved_delete_toggle.setEnabled(not busy)
-        self.preview_mode.setEnabled(not busy)
         self.github_account_btn.setEnabled(not busy)
         self.refresh_readiness()
         self._sync_published_url()

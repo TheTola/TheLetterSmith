@@ -65,7 +65,8 @@ from message_format import message_plain_text
 from message_html import sanitize_message_html
 from performance_trace import performance_timed
 from readiness import evaluate_readiness
-from saved_letters import update_saved_metadata
+from saved_letters import save_published_snapshot, update_saved_metadata
+from publishing.expiration import publication_status
 from sound_model import (
     BUILD_SOUND_MANIFEST_NAME,
     build_sound_manifest,
@@ -78,6 +79,7 @@ from protected_projects import demo_preview_directory, is_protected_project
 from settings_store import (
     ACTIVE_PLAY_DIR_KEY,
     DEFAULT_SETTINGS,
+    PUBLISHED_SOURCE_FINGERPRINT_KEY,
     SettingsStore,
     normalize_curtain_style,
 )
@@ -1267,6 +1269,27 @@ def _verify_committed_play_bundle(
     return root
 
 
+def _preserve_published_play_bundle(project_root: Path, play_dir: Path) -> None:
+    settings = SettingsStore(project_root).snapshot()
+    published_fingerprint = str(
+        settings.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")
+    ).strip()
+    if (
+        not published_fingerprint
+        or publication_status(settings) != "published"
+        or not play_dir.is_dir()
+    ):
+        return
+    try:
+        previous_build = json.loads(
+            (play_dir / BUILD_STATE_FILE).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return
+    if previous_build.get("source_fingerprint") == published_fingerprint:
+        save_published_snapshot(play_dir, project_root, settings)
+
+
 @performance_timed("forge.generate_play_bundle")
 def generate_play_bundle(
     project_root: str,
@@ -1280,6 +1303,7 @@ def generate_play_bundle(
     pr = Path(project_root).resolve()
     ensure_output_dirs(pr)
     final_play_dir = play_bundle_directory(pr)
+    _preserve_published_play_bundle(pr, final_play_dir)
     staging_prefix = final_play_dir.name + ".build-staging."
     cleanup_abandoned_staging(
         final_play_dir.parent,

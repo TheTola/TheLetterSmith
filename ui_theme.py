@@ -359,6 +359,7 @@ LETTER_CONTENT_FONT_ROLE = "letterContent"
 BUTTON_TIER_PROPERTY = "buttonTier"
 BUTTON_WEIGHT_PROPERTY = "buttonWeight"
 BUTTON_FULL_TIER_GEOMETRY_PROPERTY = "fullTierGeometry"
+BUTTON_GEOMETRY_SCALE_PROPERTY = "buttonGeometryScale"
 _VELVET_FONT_ADJUSTED_PROPERTY = "_velvetRoseFontAdjusted"
 TAB_HEADING_FONT_POINT_SIZE = 18.0
 
@@ -617,6 +618,15 @@ def install_button_text_guard(
     return guard
 
 
+def button_geometry_size(
+    button: QtWidgets.QAbstractButton, size: QtCore.QSize,
+) -> QtCore.QSize:
+    """Scale control geometry independently of its theme's typography."""
+    scale = float(button.property(BUTTON_GEOMETRY_SCALE_PROPERTY) or 1.0)
+    return QtCore.QSize(max(1, round(size.width() * scale)),
+                        max(1, round(size.height() * scale)))
+
+
 def apply_button_tier(
     button: QtWidgets.QAbstractButton,
     tier: ButtonTier | str,
@@ -631,7 +641,7 @@ def apply_button_tier(
     use_bold = style.bold if bold is None else bool(bold)
     button.setProperty(BUTTON_TIER_PROPERTY, resolved.value)
     button.setProperty(BUTTON_WEIGHT_PROPERTY, "bold" if use_bold else "regular")
-    button.setFixedSize(style.size)
+    button.setFixedSize(button_geometry_size(button, style.size))
     button.setSizePolicy(
         QtWidgets.QSizePolicy.Fixed,
         QtWidgets.QSizePolicy.Fixed,
@@ -1819,7 +1829,7 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
             if style is not None:
                 style.unpolish(widget)
                 style.polish(widget)
-            if not self.current.uses_image_buttons:
+            if not self.current.uses_image_buttons or widget.property(BUTTON_GEOMETRY_SCALE_PROPERTY):
                 self._apply_button_geometry(widget)
             if isinstance(widget, QtWidgets.QAbstractButton):
                 ensure_button_text_fits(widget)
@@ -1843,7 +1853,7 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
             if self.current.uses_image_buttons or use_full_tier_geometry
             else BASIC_BUTTON_TIER_STYLES
         )
-        widget.setFixedSize(styles[tier].size)
+        widget.setFixedSize(button_geometry_size(widget, styles[tier].size))
         widget.setSizePolicy(
             QtWidgets.QSizePolicy.Fixed,
             QtWidgets.QSizePolicy.Fixed,
@@ -2352,6 +2362,7 @@ __all__ = [
     "BASIC_DARK_THEME",
     "BASIC_LIGHT_THEME",
     "BUTTON_FULL_TIER_GEOMETRY_PROPERTY",
+    "BUTTON_GEOMETRY_SCALE_PROPERTY",
     "BUTTON_TIER_PROPERTY",
     "BUTTON_TIER_STYLES",
     "BUTTON_WEIGHT_PROPERTY",
@@ -2390,6 +2401,7 @@ __all__ = [
     "ThemeService",
     "ThemeTokens",
     "apply_button_tier",
+    "button_geometry_size",
     "apply_tab_heading_style",
     "ensure_button_text_fits",
     "install_button_text_guard",

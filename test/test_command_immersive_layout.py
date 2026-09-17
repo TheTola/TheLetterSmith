@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from dataclasses import replace
 from unittest import mock
 
 from PIL import Image
@@ -14,8 +16,14 @@ os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
 from command import CommandTab
-from Nexus import Nexus, SHELL_FONT_PX, SOUND_PREVIEW_MAX_HEIGHT
+from Nexus import (
+    FORGE_WINDOW_VIEWPORT, Nexus,
+    PREVIEW_BORDER_PX, PREVIEW_FRAME_EXTRA,
+    SHELL_FONT_PX, SOUND_PREVIEW_MAX_HEIGHT,
+)
 from project_state import ProjectStateController
+import project_paths
+from project_paths import ApplicationPaths, configure_application_paths
 from settings_store import SettingsStore
 
 
@@ -23,6 +31,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CommandImmersiveLayoutTests(unittest.TestCase):
+    def _use_project_resources(self, root: str | Path) -> None:
+        # Use the same bundled fonts/artwork as the real launcher, with isolated data.
+        previous = project_paths._APPLICATION_PATHS
+        configure_application_paths(replace(
+            ApplicationPaths.for_project(root), resource_root=PROJECT_ROOT,
+        ))
+        self.addCleanup(configure_application_paths, previous)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = (
@@ -58,10 +74,111 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
 
         self.assertEqual(
             preview_frame.height(),
-            SOUND_PREVIEW_MAX_HEIGHT + 12,
+            SOUND_PREVIEW_MAX_HEIGHT + PREVIEW_FRAME_EXTRA,
         )
         preview_frame.deleteLater()
         body.deleteLater()
+
+    def test_image_preview_border_follows_the_complete_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = ProjectStateController(temp_dir)
+            state.initialize()
+            state.establish_project("Preview Geometry", custom_capitalization=True)
+            window = Nexus(temp_dir)
+            try:
+                window.resize(1400, 900)
+                window.application_stack.setCurrentWidget(window.body)
+                window.show()
+                self.app.processEvents()
+                region_heights = set()
+                for width, height in ((600, 900), (900, 600), (700, 700)):
+                    source = QtGui.QPixmap(width, height)
+                    source.fill(QtGui.QColor("red"))
+                    window._show_image_for_tab(0, source)
+                    self.app.processEvents()
+                    frame = window.preview_frame
+                    content = window.preview_stack.geometry()
+                    region_heights.add(window.preview_region.height())
+                    self.assertEqual((content.x(), content.y()), (2, 2))
+                    self.assertEqual(content.width(), frame.width() - PREVIEW_FRAME_EXTRA)
+                    self.assertEqual(content.height(), frame.height() - PREVIEW_FRAME_EXTRA)
+                    self.assertAlmostEqual(
+                        content.width() / content.height(), width / height,
+                        delta=0.01,
+                    )
+                    displayed = window.image_preview.pixmap()
+                    ratio = displayed.devicePixelRatio()
+                    self.assertLessEqual(
+                        abs(displayed.width() / ratio - content.width()), 1,
+                    )
+                    self.assertLessEqual(
+                        abs(displayed.height() / ratio - content.height()), 1,
+                    )
+                    grabbed = frame.grab()
+                    grab_ratio = grabbed.devicePixelRatio()
+                    middle = grabbed.toImage().pixelColor(
+                        round((PREVIEW_BORDER_PX + 5) * grab_ratio),
+                        round(frame.height() * grab_ratio / 2),
+                    )
+                    self.assertEqual(middle.name(), "#ff0000")
+                self.assertEqual(len(region_heights), 1)
+            finally:
+                window.shutdown()
+                window.close()
+                self.app.processEvents()
+                state.shutdown()
+
+    def test_sound_card_keeps_buttons_visible_and_help_near_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = ProjectStateController(temp_dir)
+            state.initialize()
+            state.establish_project(
+                "Amanda Miller", custom_capitalization=True
+            )
+            window = Nexus(temp_dir)
+            try:
+                window.application_stack.setCurrentWidget(window.body)
+                window.show()
+                for width, height in ((1400, 900), (1180, 820)):
+                    window.resize(width, height)
+                    self.app.processEvents()
+                    window.tabbar.setCurrentIndex(1)
+                    QtTest.QTest.qWait(350)
+                    self.app.processEvents()
+
+                    card = window.sound_tab.single_panel
+                    button = window.sound_tab.single_action_btn
+                    self.assertGreaterEqual(card.height(), 230)
+                    self.assertLessEqual(
+                        button.y() + button.height(), card.height()
+                    )
+                    self.assertFalse(window.help_anchor.isVisible())
+                    self.assertLessEqual(
+                        abs(
+                            window.help_icon.geometry().center().y()
+                            - (
+                                window.preview_frame.mapTo(
+                                    window.body, QtCore.QPoint(0, 0)
+                                ).y()
+                                + window.preview_frame.height() // 2
+                            )
+                        ),
+                        1,
+                    )
+
+                    window.tabbar.setCurrentIndex(0)
+                    QtTest.QTest.qWait(350)
+                    self.app.processEvents()
+                    self.assertEqual(
+                        window.help_icon.pos(),
+                        window.help_anchor.mapTo(
+                            window.body, QtCore.QPoint(0, 0)
+                        ),
+                    )
+            finally:
+                window.shutdown()
+                window.close()
+                self.app.processEvents()
 
     def test_command_and_go_share_exact_display_canvas(self) -> None:
         tab = CommandTab(PROJECT_ROOT)
@@ -130,16 +247,43 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
             SettingsStore(temp_dir).update_fields({"ui_last_tab": "Forge"})
             window = Nexus(temp_dir)
             try:
-                self.assertIsNone(window.html_preview)
+                self.assertIsNotNone(window.html_preview)
+                self.assertEqual(
+                    window.html_preview.url().toString(), "about:blank"
+                )
                 window._initialize_project_tabs()
                 self.assertEqual(window.tabbar.currentIndex(), 0)
                 self.assertEqual(window.tabbar.tabText(0), "Images")
                 self.assertEqual(window.page_stack.currentIndex(), 0)
-                self.assertIsNone(window.html_preview)
+                self.assertIsNot(
+                    window.preview_stack.currentWidget(), window.html_preview
+                )
             finally:
                 window.shutdown()
                 window.close()
                 self.app.processEvents()
+
+    def test_images_preview_is_visible_on_first_project_ready_show(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = ProjectStateController(temp_dir)
+            state.initialize()
+            state.establish_project("Startup Preview", custom_capitalization=True)
+            window = Nexus(temp_dir)
+            try:
+                self.assertEqual(window.tabbar.currentIndex(), 0)
+                self.assertFalse(window.preview_region.isHidden())
+                window.resize(1400, 900)
+                window.show()
+                self.app.processEvents()
+                self.assertIs(window.application_stack.currentWidget(), window.body)
+                self.assertTrue(window.preview_region.isVisible())
+                self.assertTrue(window.preview_frame.isVisible())
+                self.assertGreater(window.preview_region.height(), 0)
+            finally:
+                window.shutdown()
+                window.close()
+                self.app.processEvents()
+                state.shutdown()
 
     def test_main_tab_labels_are_bold_in_every_theme(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -252,6 +396,7 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 )
             window = Nexus(root)
             try:
+                self.assertEqual(window.help_icon.toolTip(), "")
                 window._help_movie_idle_path = str(idle_gif)
                 window._help_movie_hover_path = str(hover_gif)
 
@@ -596,6 +741,298 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 preview_view.setParent(None)
                 preview_view.deleteLater()
                 window.html_preview = None
+                window.shutdown()
+                window.close()
+                self.app.processEvents()
+
+    def test_forge_window_preview_keeps_design_viewport_on_resize(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            index = root / "preview.html"
+            index.write_text(
+                '<!doctype html><html><head><meta name="viewport" '
+                'content="width=device-width, initial-scale=1"></head>'
+                '<body><button onclick="window.previewClicks='
+                '(window.previewClicks||0)+1">Preview control</button></body></html>',
+                encoding="utf-8",
+            )
+            state = ProjectStateController(root)
+            state.initialize()
+            state.establish_project("Forge Viewport", custom_capitalization=True)
+            self._use_project_resources(root)
+            window = Nexus(root)
+            try:
+                window.resize(1400, 900)
+                window.application_stack.setCurrentWidget(window.body)
+                window._initialize_project_tabs()
+                window.show()
+                with QtCore.QSignalBlocker(window.tabbar):
+                    window.tabbar.setCurrentIndex(3)
+                window.page_stack.setCurrentIndex(3)
+                window.preview_frame.show()
+                window.preview_region.show()
+                window.forge_tab.preview_format_panel.show()
+                window.help_anchor.hide()
+                window.preview_caption.hide()
+                window._forge_preview_mode = "window"
+                view = window._ensure_forge_preview()
+                window.preview_stack.setCurrentWidget(view)
+                window._update_preview_geometry()
+                self.app.processEvents()
+
+                loads = []
+                load_loop = QtCore.QEventLoop()
+                view.loadFinished.connect(
+                    lambda ok: (loads.append(ok), load_loop.quit())
+                )
+                view.setUrl(QtCore.QUrl.fromLocalFile(str(index)))
+                QtCore.QTimer.singleShot(3000, load_loop.quit)
+                load_loop.exec()
+                self.assertEqual(loads, [True])
+                revision = window.project_dirty.revision
+
+                def browser_viewport() -> dict[str, int]:
+                    result = []
+                    loop = QtCore.QEventLoop()
+                    view.page().runJavaScript(
+                        "JSON.stringify({width:innerWidth,height:innerHeight})",
+                        lambda value: (result.append(value), loop.quit()),
+                    )
+                    QtCore.QTimer.singleShot(3000, loop.quit)
+                    loop.exec()
+                    self.assertTrue(result)
+                    return json.loads(str(result[0]))
+
+                window.setMinimumHeight(516)
+                for size in ((1400, 900), (1180, 820), (960, 516), (960, 780), (960, 840), (1920, 600), (1400, 900)):
+                    window.resize(*size)
+                    QtTest.QTest.qWait(250)
+                    self.app.processEvents()
+                    content = window.preview_stack.size()
+                    self.assertEqual(
+                        window.preview_stack.pos(),
+                        QtCore.QPoint(PREVIEW_BORDER_PX, PREVIEW_BORDER_PX),
+                    )
+                    self.assertEqual(content, view.size())
+                    self.assertEqual(
+                        content.width(),
+                        window.preview_frame.width() - PREVIEW_FRAME_EXTRA,
+                    )
+                    self.assertEqual(
+                        content.height(),
+                        window.preview_frame.height() - PREVIEW_FRAME_EXTRA,
+                    )
+                    self.assertAlmostEqual(
+                        content.width() / content.height(),
+                        FORGE_WINDOW_VIEWPORT.width()
+                        / FORGE_WINDOW_VIEWPORT.height(),
+                        delta=0.02,
+                    )
+                    measured = browser_viewport()
+                    self.assertLessEqual(
+                        abs(measured["width"] - FORGE_WINDOW_VIEWPORT.width()), 2,
+                        f"{size=} {content=} {view.size()=} "
+                        f"{view.zoomFactor()=} {view.isVisible()=} {measured=} "
+                        f"mode={window._forge_preview_mode} "
+                        f"current_view={window.html_preview is view} "
+                        f"timer={window._preview_geometry_timer.isActive()}",
+                    )
+                    self.assertLessEqual(
+                        abs(measured["height"] - FORGE_WINDOW_VIEWPORT.height()), 2
+                    )
+                    self.assertEqual(len(loads), 1)
+                    self.assertEqual(window.project_dirty.revision, revision)
+                    self.assertTrue(window.forge_controls_scroll.isVisible())
+                    self.assertLessEqual(
+                        window.forge_tab.width(),
+                        window.forge_controls_scroll.viewport().width(),
+                        f"Forge controls exceed their viewport at {size}",
+                    )
+                    frame_bottom = window.preview_frame.mapTo(
+                        window.body,
+                        QtCore.QPoint(0, window.preview_frame.height()),
+                    ).y()
+                    panel_top = window.forge_tab.preview_format_panel.mapTo(
+                        window.body, QtCore.QPoint(0, 0),
+                    ).y()
+                    self.assertGreaterEqual(panel_top, frame_bottom)
+
+                self.assertEqual(
+                    window.forge_controls_scroll.verticalScrollBar().maximum(), 0,
+                )
+                click_position = QtCore.QPoint(10, 8)
+                click_target = view.childAt(click_position)
+                self.assertIsNotNone(click_target)
+                QtTest.QTest.mouseClick(
+                    click_target, QtCore.Qt.LeftButton,
+                    pos=click_target.mapFrom(view, click_position),
+                )
+                QtTest.QTest.qWait(100)
+                clicks = []
+                click_loop = QtCore.QEventLoop()
+                view.page().runJavaScript(
+                    "window.previewClicks||0",
+                    lambda value: (clicks.append(value), click_loop.quit()),
+                )
+                QtCore.QTimer.singleShot(3000, click_loop.quit)
+                click_loop.exec()
+                self.assertEqual(clicks, [1])
+
+                window._enter_forge_fullscreen()
+                self.app.processEvents()
+                self.assertEqual(view.zoomFactor(), 1.0)
+                window._restore_forge_preview_from_fullscreen()
+                QtTest.QTest.qWait(250)
+                self.app.processEvents()
+                measured = browser_viewport()
+                self.assertLessEqual(
+                    abs(measured["width"] - FORGE_WINDOW_VIEWPORT.width()), 2
+                )
+                self.assertLessEqual(
+                    abs(measured["height"] - FORGE_WINDOW_VIEWPORT.height()), 2
+                )
+                self.assertEqual(len(loads), 1)
+                self.assertEqual(window.project_dirty.revision, revision)
+            finally:
+                window.shutdown()
+                window.close()
+                self.app.processEvents()
+                state.shutdown()
+
+    def test_forge_tab_switch_keeps_controls_below_preview_and_accessible(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = ProjectStateController(temp_dir)
+            state.initialize()
+            state.establish_project("Forge layout", custom_capitalization=True)
+            self._use_project_resources(temp_dir)
+            window = Nexus(temp_dir)
+            try:
+                window.resize(1920, 1032)
+                window.application_stack.setCurrentWidget(window.body)
+                window._initialize_project_tabs()
+                window.show()
+                self.app.processEvents()
+                window.tabbar.setCurrentIndex(3)
+                window._forge_preview_mode = "window"
+                QtTest.QTest.qWait(250)
+                window.setMinimumHeight(516)
+                for size in ((1920, 1032), (1400, 900), (1180, 820), (960, 516), (1920, 600), (1400, 900)):
+                    window.resize(*size)
+                    window._update_preview_geometry()
+                    QtTest.QTest.qWait(100)
+                    self.app.processEvents()
+                    frame_bottom = window.preview_frame.mapTo(
+                        window.body,
+                        QtCore.QPoint(0, window.preview_frame.height()),
+                    ).y()
+                    panel_top = window.forge_tab.preview_format_panel.mapTo(
+                        window.body, QtCore.QPoint(0, 0),
+                    ).y()
+                    self.assertGreaterEqual(panel_top, frame_bottom)
+                    scroll = window.forge_controls_scroll
+                    self.assertEqual(window.size(), QtCore.QSize(*size))
+                    self.assertGreaterEqual(
+                        window.forge_tab.height(),
+                        window.forge_tab.minimumSizeHint().height(),
+                    )
+                    self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
+                    self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
+                    self.assertGreater(scroll.viewport().height(), 100)
+                self.assertEqual(
+                    window.page_stack.sizePolicy().verticalPolicy(),
+                    QtWidgets.QSizePolicy.Ignored,
+                )
+                window.tabbar.setCurrentIndex(0)
+                self.assertEqual(
+                    window.page_stack.sizePolicy().verticalPolicy(),
+                    window._page_stack_vertical_policy,
+                )
+            finally:
+                window.shutdown()
+                window.close()
+                self.app.processEvents()
+                state.shutdown()
+
+    def test_returning_to_forge_keeps_the_loaded_preview_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            index = Path(temp_dir) / "index.html"
+            index.write_text("<html></html>", encoding="utf-8")
+            preview_stack = QtWidgets.QStackedWidget()
+            preview_stack.addWidget(QtWidgets.QWidget())
+            view = QtWidgets.QWidget()
+            view.url = lambda: QtCore.QUrl.fromLocalFile(str(index))
+            preview_stack.addWidget(view)
+
+            window = mock.Mock()
+            window.page_stack.currentIndex.return_value = 0
+            window._tabswitch = None
+            window._autosave_project_on_tab_switch.return_value = ""
+            window.tabbar.tabText.return_value = "Forge"
+            window.help_pop.isVisible.return_value = False
+            window.html_preview = view
+            window.preview_stack = preview_stack
+            window.forge_tab.current_play_index.return_value = index
+
+            with mock.patch("Nexus.QtCore.QTimer.singleShot"):
+                Nexus._apply_tab_state(window, 3, animate_page=False)
+
+            self.assertIs(preview_stack.currentWidget(), view)
+            window.forge_tab.activate_for_tab_change.assert_called_once_with()
+
+            window.forge_tab.current_play_index.return_value = None
+            with mock.patch("Nexus.QtCore.QTimer.singleShot"):
+                Nexus._apply_tab_state(window, 3, animate_page=False)
+            self.assertIs(preview_stack.currentWidget(), preview_stack.widget(0))
+
+    def test_first_forge_switch_shows_new_page_without_window_blink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = ProjectStateController(temp_dir)
+            state.initialize()
+            state.establish_project("Incomplete Forge", custom_capitalization=True)
+            window = Nexus(temp_dir)
+            try:
+                window.application_stack.setCurrentWidget(window.body)
+                window.show()
+                self.app.processEvents()
+
+                marker = QtWidgets.QLabel(window.image_page)
+                marker.setStyleSheet("background:#ff00ff;")
+                marker.setGeometry(16, 16, 48, 48)
+                marker.show()
+                marker.raise_()
+                self.app.processEvents()
+                point = marker.mapTo(window.body, QtCore.QPoint(24, 24))
+                old_color = window.body.grab().toImage().pixelColor(point)
+                self.assertEqual(old_color, QtGui.QColor("#ff00ff"))
+
+                class WindowEvents(QtCore.QObject):
+                    def __init__(self) -> None:
+                        super().__init__()
+                        self.types: list[QtCore.QEvent.Type] = []
+
+                    def eventFilter(self, _watched, event) -> bool:
+                        if event.type() in {
+                            QtCore.QEvent.Hide,
+                            QtCore.QEvent.Show,
+                            QtCore.QEvent.WinIdChange,
+                            QtCore.QEvent.WindowStateChange,
+                        }:
+                            self.types.append(event.type())
+                        return False
+
+                events = WindowEvents()
+                window.installEventFilter(events)
+                window.tabbar.setCurrentIndex(3)
+                self.app.processEvents()
+                self.assertTrue(window.isVisible())
+                self.assertEqual(window.page_stack.currentIndex(), 3)
+                self.assertIsNone(window._tabswitch._active)
+                self.assertEqual(events.types, [])
+                self.assertNotEqual(
+                    window.body.grab().toImage().pixelColor(point),
+                    old_color,
+                )
+            finally:
                 window.shutdown()
                 window.close()
                 self.app.processEvents()

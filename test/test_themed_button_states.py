@@ -62,7 +62,13 @@ from ui_theme import (
     THEME_FONT_ROLE_PROPERTY,
     ThemeService,
 )
-from ui_sounds import SOUND_FILES, UiSound, UiSoundPlayer
+from ui_sounds import (
+    SOUND_FILES,
+    UI_SOUND_VOLUME,
+    UI_SOUND_VOLUMES,
+    UiSound,
+    UiSoundPlayer,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -86,6 +92,8 @@ class UiSoundTests(unittest.TestCase):
                 UiSound.GITHUB_DISCONNECTED: "deconn.mp3",
                 UiSound.PUBLISH_COMPLETE: "Success.mp3",
                 UiSound.TAB_SWITCHED: "Switch.mp3",
+                UiSound.BLIP: "Blip.mp3",
+                UiSound.ERROR: "error.mp3",
             },
         )
         player = UiSoundPlayer(PROJECT_ROOT)
@@ -112,11 +120,16 @@ class UiSoundTests(unittest.TestCase):
         with mock.patch.object(player, "play") as play:
             player.eventFilter(button, event)
         play.assert_called_once_with(UiSound.BROKEN)
+        with mock.patch.object(player, "play") as play:
+            player.eventFilter(QtWidgets.QPushButton("Ordinary"), event)
+        play.assert_not_called()
 
-    def test_open_sound_uses_secondary_windows_but_not_shell_surfaces(
+    def test_open_sound_is_limited_to_the_editor_window(
         self,
     ) -> None:
         player = UiSoundPlayer(PROJECT_ROOT)
+        editor = QtWidgets.QDialog()
+        editor.setObjectName("LetterEditor")
         dialog = QtWidgets.QDialog()
         secondary_window = QtWidgets.QWidget()
         primary_window = QtWidgets.QMainWindow()
@@ -126,37 +139,94 @@ class UiSoundTests(unittest.TestCase):
         event = QtCore.QEvent(QtCore.QEvent.Type.Show)
 
         with mock.patch.object(player, "play") as play:
-            for window in (dialog, secondary_window, primary_window, menu, child):
+            for window in (
+                editor,
+                dialog,
+                secondary_window,
+                primary_window,
+                menu,
+                child,
+            ):
                 player.eventFilter(window, event)
 
         self.assertEqual(
             play.call_args_list,
-            [
-                mock.call(UiSound.OPENED),
-                mock.call(UiSound.OPENED),
-            ],
+            [mock.call(UiSound.OPENED)],
         )
 
-    def test_overlapping_sound_fades_and_warps_previous_voice(self) -> None:
+    def test_interface_sounds_use_semantic_volume_levels(self) -> None:
         player = UiSoundPlayer(PROJECT_ROOT)
         self.addCleanup(player.deleteLater)
         self.addCleanup(player.stop_all)
+        self.assertLessEqual(UI_SOUND_VOLUME, 0.1)
+        self.assertEqual(set(UI_SOUND_VOLUMES), set(UiSound))
+        self.assertAlmostEqual(
+            UI_SOUND_VOLUMES[UiSound.TAB_SWITCHED],
+            UI_SOUND_VOLUME * 0.8,
+        )
+        self.assertEqual(UI_SOUND_VOLUMES[UiSound.ADDED], 0.09)
+        self.assertLess(
+            UI_SOUND_VOLUMES[UiSound.BLIP],
+            UI_SOUND_VOLUMES[UiSound.TAB_SWITCHED],
+        )
+        self.assertGreater(
+            UI_SOUND_VOLUMES[UiSound.PUBLISH_COMPLETE],
+            max(
+                volume for role, volume in UI_SOUND_VOLUMES.items()
+                if role != UiSound.PUBLISH_COMPLETE
+            ),
+        )
         self.assertTrue(player.play(UiSound.TAB_SWITCHED))
-        first_player = player._players[UiSound.TAB_SWITCHED]
-        first_output = player._outputs[UiSound.TAB_SWITCHED]
-        original_pitch_compensation = first_player.pitchCompensation()
+        self.assertAlmostEqual(
+            player._outputs[UiSound.TAB_SWITCHED].volume(),
+            UI_SOUND_VOLUME * 0.8,
+            places=3,
+        )
+        self.assertTrue(player.play(UiSound.ERROR))
+        self.assertAlmostEqual(
+            player._outputs[UiSound.ERROR].volume(),
+            UI_SOUND_VOLUMES[UiSound.ERROR],
+            places=3,
+        )
+        self.assertTrue(player.play(UiSound.BLIP))
+        self.assertAlmostEqual(
+            player._outputs[UiSound.BLIP].volume(),
+            UI_SOUND_VOLUMES[UiSound.BLIP],
+            places=3,
+        )
 
-        self.assertTrue(player.play(UiSound.TAB_SWITCHED))
+    def test_rapid_tab_switches_do_not_stack_sounds(self) -> None:
+        player = UiSoundPlayer(PROJECT_ROOT)
+        self.addCleanup(player.deleteLater)
+        self.addCleanup(player.stop_all)
+        with mock.patch("ui_sounds.monotonic", side_effect=(100, 100.03, 100.09)):
+            self.assertTrue(player.play(UiSound.TAB_SWITCHED))
+            first_player = player._players[UiSound.TAB_SWITCHED]
+            self.assertFalse(player.play(UiSound.TAB_SWITCHED))
+            self.assertIs(player._players[UiSound.TAB_SWITCHED], first_player)
+            self.assertTrue(player.play(UiSound.TAB_SWITCHED))
+            self.assertIsNot(player._players[UiSound.TAB_SWITCHED], first_player)
+
+    def test_overlapping_sound_fades_without_changing_playback_rate(self) -> None:
+        player = UiSoundPlayer(PROJECT_ROOT)
+        self.addCleanup(player.deleteLater)
+        self.addCleanup(player.stop_all)
+        with mock.patch("ui_sounds.monotonic", side_effect=(100, 100.1)):
+            self.assertTrue(player.play(UiSound.TAB_SWITCHED))
+            first_player = player._players[UiSound.TAB_SWITCHED]
+            first_output = player._outputs[UiSound.TAB_SWITCHED]
+            starting_volume = first_output.volume()
+
+            self.assertTrue(player.play(UiSound.TAB_SWITCHED))
         second_player = player._players[UiSound.TAB_SWITCHED]
 
         self.assertIsNot(second_player, first_player)
         self.assertIn(first_player, player._fade_groups)
-        self.assertFalse(first_player.pitchCompensation())
         fade_group = player._fade_groups[first_player]
         fade_group.setCurrentTime(fade_group.duration() // 2)
         self.app.processEvents()
-        self.assertLess(first_output.volume(), 1.0)
-        self.assertLess(first_player.playbackRate(), 1.0)
+        self.assertLess(first_output.volume(), starting_volume)
+        self.assertEqual(first_player.playbackRate(), 1.0)
 
         fade_group.setCurrentTime(fade_group.duration())
         self.app.processEvents()
@@ -168,10 +238,10 @@ class UiSoundTests(unittest.TestCase):
                 QMediaPlayer.PlaybackState.StoppedState,
             },
         )
-        self.assertEqual(
-            first_player.pitchCompensation(),
-            original_pitch_compensation,
-        )
+        self.assertAlmostEqual(first_output.volume(), starting_volume)
+        with mock.patch("ui_sounds.monotonic", return_value=100.2):
+            self.assertTrue(player.play(UiSound.TAB_SWITCHED))
+        self.assertIs(player._players[UiSound.TAB_SWITCHED], first_player)
 
 
 class ThemedButtonStateTests(unittest.TestCase):
@@ -325,6 +395,29 @@ class ThemedButtonStateTests(unittest.TestCase):
             QtCore.QAbstractAnimation.State.Stopped,
         )
 
+    def test_reenabled_artwork_button_cancels_pending_invisible_fade(self) -> None:
+        button = ArtworkButton("Settings", self.root, "AButton.png")
+        self.addCleanup(button.deleteLater)
+        button.show()
+        self.app.processEvents()
+
+        button.setEnabled(False)
+        self.assertTrue(button.is_invisible)
+        self.assertEqual(
+            button._opacity_transition.state(),
+            QtCore.QAbstractAnimation.State.Running,
+        )
+        button.setEnabled(True)
+        self.assertFalse(button.is_invisible)
+
+        QtTest.QTest.qWait(BUTTON_STATE_FADE_MS + 100)
+        self.assertTrue(button.isEnabled())
+        self.assertAlmostEqual(button._visual_opacity, 0.94)
+        self.assertEqual(
+            button._opacity_transition.state(),
+            QtCore.QAbstractAnimation.State.Stopped,
+        )
+
     def test_fixed_control_mappings_and_empty_states(self) -> None:
         image = ImageTab(self.root)
         sound = SoundTab(self.root)
@@ -430,7 +523,7 @@ class ThemedButtonStateTests(unittest.TestCase):
         self.assertEqual(forge.open_published_btn._artwork_filename, "CLbutton.png")
         self.assertEqual(
             tuple(forge._long_action_row.stretch(index) for index in range(3)),
-            (209, 832, 209),
+            (2506, 7488, 2506),
         )
         self.assertEqual(forge._long_action_width_scales[forge.preview_btn], 1.0)
         self.assertEqual(forge._long_action_width_scales[forge.publish_btn], 1.0)
@@ -439,7 +532,7 @@ class ThemedButtonStateTests(unittest.TestCase):
             forge._long_action_width_scales[forge.open_published_btn],
             0.9,
         )
-        self.assertEqual(forge.preview_btn.minimumHeight(), 70)
+        self.assertEqual(forge.preview_btn.minimumHeight(), 63)
         self.assertIn("font:700 13pt", forge.preview_btn.styleSheet())
         self.assertEqual(
             forge.preview_btn.visual_semantic_state,
@@ -686,7 +779,7 @@ class ThemedButtonStateTests(unittest.TestCase):
                 self.assertTrue(forge.readiness_btn.has_artwork)
                 self.assertEqual(
                     forge.readiness_btn.size(),
-                    BUTTON_TIER_STYLES[ButtonTier.SMALL].size,
+                    QtCore.QSize(118, 40),
                 )
                 self.assertEqual(
                     forge.readiness_btn.artwork_path,
@@ -800,6 +893,9 @@ class ThemedButtonStateTests(unittest.TestCase):
     def test_image_utility_buttons_use_full_custom_and_compact_basic_sizes(self) -> None:
         image = ImageTab(self.root)
         self.addCleanup(image.deleteLater)
+        image.show()
+        settings_button = image.cards[1].settings_btn
+        settings_button.setVisible(True)
         repository = Path(__file__).resolve().parents[1]
         service = ThemeService(
             repository,
@@ -814,7 +910,10 @@ class ThemedButtonStateTests(unittest.TestCase):
         ):
             service.set_theme(theme_id, persist=False)
             image.apply_theme_assets(service)
+            service.apply_semantic_styles(image)
+            self.app.processEvents()
             with self.subTest(theme_id=theme_id):
+                self.assertEqual(settings_button.size(), QtCore.QSize(44, 44))
                 self.assertEqual(
                     image.reset_btn.size(),
                     BUTTON_TIER_STYLES[ButtonTier.LARGE].size,
@@ -829,7 +928,9 @@ class ThemedButtonStateTests(unittest.TestCase):
             service.set_theme(theme_id, persist=False)
             image.apply_theme_assets(service)
             service.apply_semantic_styles(image)
+            self.app.processEvents()
             with self.subTest(theme_id=theme_id):
+                self.assertEqual(settings_button.size(), QtCore.QSize(44, 44))
                 self.assertEqual(
                     image.reset_btn.size(),
                     BASIC_BUTTON_TIER_STYLES[ButtonTier.LARGE].size,
@@ -1076,16 +1177,16 @@ class ThemedButtonStateTests(unittest.TestCase):
             self.assertFalse(forge.github_account_btn.has_artwork)
             self.assertEqual(
                 forge.github_account_btn.size(),
-                BUTTON_TIER_STYLES[ButtonTier.SMALL].size,
+                QtCore.QSize(118, 40),
             )
             self.assertEqual(
                 forge.unpublish_btn.size(),
-                BUTTON_TIER_STYLES[ButtonTier.SMALL].size,
+                QtCore.QSize(118, 40),
             )
 
-            self.assertEqual(forge.preview_btn.minimumHeight(), 70)
-            self.assertEqual(forge.publish_btn.minimumHeight(), 70)
-            self.assertEqual(forge.open_published_btn.minimumHeight(), 70)
+            self.assertEqual(forge.preview_btn.minimumHeight(), 63)
+            self.assertEqual(forge.publish_btn.minimumHeight(), 63)
+            self.assertEqual(forge.open_published_btn.minimumHeight(), 63)
 
     def test_basic_themes_use_their_connected_github_artwork_without_text(
         self,
@@ -1112,11 +1213,11 @@ class ThemedButtonStateTests(unittest.TestCase):
                 self.assertTrue(forge.github_account_btn.has_artwork)
                 self.assertEqual(
                     forge.github_account_btn.size(),
-                    BUTTON_TIER_STYLES[ButtonTier.SMALL].size,
+                    QtCore.QSize(118, 40),
                 )
                 self.assertEqual(
                     forge.unpublish_btn.size(),
-                    BUTTON_TIER_STYLES[ButtonTier.SMALL].size,
+                    QtCore.QSize(118, 40),
                 )
                 self.assertEqual(
                     forge.github_account_btn.artwork_path,
@@ -1180,13 +1281,13 @@ class ThemedButtonStateTests(unittest.TestCase):
             expected_width = round(
                 base_width * forge._long_action_width_scales[button]
             )
-            self.assertEqual(button.width(), expected_width)
+            self.assertAlmostEqual(button.width(), expected_width, delta=1)
             self.assertEqual(
                 button.height(),
-                round((expected_width - 4) / 3) + 4,
+                round((button.width() - 4) / 3) + 4,
             )
             self.assertTrue(button._artwork_stretch)
-        self.assertEqual(forge.preview_btn.width(), forge.publish_btn.width())
+        self.assertAlmostEqual(forge.preview_btn.width(), forge.publish_btn.width(), delta=1)
         self.assertEqual(forge.preview_btn.height(), forge.publish_btn.height())
         self.assertLess(
             forge.open_published_btn.width(),
@@ -1304,7 +1405,9 @@ class ThemedButtonStateTests(unittest.TestCase):
         (self.root / USER_PAGES_DIR / "cover.png").unlink()
         forge._update_letter_action_button_states(evaluate_readiness(self.root))
         self.assertEqual(forge.preview_btn.semantic_state, ButtonSemanticState.BROKEN)
-        self.assertEqual(forge.publish_btn.semantic_state, ButtonSemanticState.BROKEN)
+        self.assertEqual(forge.publish_btn.semantic_state, ButtonSemanticState.NORMAL)
+        self.assertTrue(forge.publish_btn.is_invisible)
+        self.assertFalse(forge.publish_btn.isEnabled())
         self.assertEqual(
             forge.open_published_btn.semantic_state,
             ButtonSemanticState.NORMAL,
@@ -1447,7 +1550,8 @@ class ThemedButtonStateTests(unittest.TestCase):
         forge._update_letter_action_button_states(ready)
 
         self.assertEqual(forge.publish_btn.text(), "Published")
-        self.assertTrue(forge.publish_btn.isEnabled())
+        self.assertTrue(forge.publish_btn.is_invisible)
+        self.assertFalse(forge.publish_btn.isEnabled())
         self.assertFalse(forge.unpublish_btn.isHidden())
         self.assertTrue(forge.unpublish_btn.isEnabled())
         self.assertEqual(forge.unpublish_btn.text(), "")
@@ -1499,6 +1603,7 @@ class ThemedButtonStateTests(unittest.TestCase):
 
         self.assertEqual(forge.publish_btn.text(), "Update Published Letter")
         self.assertTrue(forge.publish_btn.isEnabled())
+        self.assertFalse(forge.publish_btn.is_invisible)
 
     def test_missing_wall_keeps_images_incomplete(self) -> None:
         built_in = self.root / "gallery/app/pages/Dmessage.png"

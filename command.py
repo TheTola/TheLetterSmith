@@ -96,7 +96,6 @@ PROJECT_RESET_SETTINGS = {
     "curtain_style": DEFAULT_CURTAIN_STYLE,
     "message_overlay_preset": "paper",
     "message_overlay_opacity": 68,
-    "forge_preview_mode": "portrait",
     "required_features": [],
     "music_required": False,
     "music_muted": False,

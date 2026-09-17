@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import re
 import stat
@@ -26,6 +27,63 @@ from settings_store import SettingsStore
 
 
 class MessageHTMLSecurityTests(unittest.TestCase):
+    def test_style_state_comment_survives_sanitization_and_revisions(self) -> None:
+        state = {
+            "schema_version": 1,
+            "definitions": {"normal_text": {"font_family": "Arial"}},
+            "blocks": [{"style": "normal_text", "overrides": []}],
+        }
+        html = message_html.embed_lettersmith_style_state(
+            "<!-- lettersmith-message:v2 --><p>Hello</p>", state
+        )
+        sanitized = sanitize_message_html(html)
+        self.assertEqual(message_html.extract_lettersmith_style_state(sanitized), state)
+        self.assertEqual(sanitize_message_html(sanitized), sanitized)
+        self.assertEqual(sanitized.count("lettersmith-style-state:v1:"), 1)
+        self.assertEqual(
+            message_html.embed_lettersmith_style_state(sanitized, state).count(
+                "lettersmith-style-state:v1:"
+            ),
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "message.html"
+            write_message_with_revision(path, sanitized, reason="first")
+            write_message_with_revision(path, "<p>Second</p>", reason="second")
+            revision = next(iter(revision_directory(path).glob("*.html")))
+            restored = restore_revision(path, revision)
+            self.assertEqual(message_html.extract_lettersmith_style_state(restored), state)
+
+    def test_style_state_comment_rejects_invalid_and_duplicate_payloads(self) -> None:
+        state = {"schema_version": 1, "definitions": {}, "blocks": []}
+        valid = message_html.embed_lettersmith_style_state("<p>Hello</p>", state)
+        duplicated = valid + valid
+        sanitized = sanitize_message_html(duplicated)
+        self.assertEqual(sanitized.count("lettersmith-style-state:v1:"), 1)
+        self.assertEqual(message_html.extract_lettersmith_style_state(sanitized), state)
+        malformed = (
+            "<!-- lettersmith-style-state:v1:invalid! -->"
+            "<!-- lettersmith-style-state:v2:e30= -->"
+            "<script><!-- lettersmith-style-state:v1:e30= --></script>"
+            "<p>Hello</p>"
+        )
+        self.assertIsNone(message_html.extract_lettersmith_style_state(malformed))
+        self.assertNotIn("lettersmith-style-state", sanitize_message_html(malformed))
+        with self.assertRaises(ValueError):
+            message_html.embed_lettersmith_style_state("<p>Hello</p>", {"schema_version": 2})
+
+    def test_future_style_state_is_preserved_but_not_loaded(self) -> None:
+        encoded = base64.b64encode(
+            b'{"schema_version":2,"future_field":"keep"}'
+        ).decode("ascii")
+        raw = f"<!-- lettersmith-style-state:v2:{encoded} --><p>Hello</p>"
+        safe = sanitize_message_html(raw)
+        self.assertIn(f"lettersmith-style-state:v2:{encoded}", safe)
+        self.assertEqual(sanitize_message_html(safe), safe)
+        self.assertTrue(message_html.has_unsupported_lettersmith_style_state(safe))
+        self.assertIsNone(message_html.extract_lettersmith_style_state(safe))
+
     def test_sanitizer_preserves_passive_formatting_and_drops_active_content(self) -> None:
         raw = """
 <!doctype html><html><!-- lettersmith-message:v2 --><head>

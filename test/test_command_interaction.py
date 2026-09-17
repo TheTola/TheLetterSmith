@@ -393,7 +393,7 @@ class CommandInteractionTests(unittest.TestCase):
         )
         self.assertEqual(current["message_overlay_preset"], "paper")
         self.assertEqual(current["message_overlay_opacity"], 68)
-        self.assertEqual(current["forge_preview_mode"], "portrait")
+        self.assertEqual(current["forge_preview_mode"], "window")
         self.assertEqual(current["required_features"], [])
         self.assertEqual(current["published_page_url"], "")
         self.assertEqual(current["published_at"], "")
@@ -805,14 +805,19 @@ class CommandInteractionTests(unittest.TestCase):
             CurtainStyleMenuSelector,
         )
         from Forge_Tab import ForgeTab
+        from readiness import ReadinessResult
         from settings_store import CURTAIN_STYLE_OPTIONS
 
         curtain_styles = title_bar.curtain_styles
         curtain_styles.set_style("average_color")
-        forge = ForgeTab(
-            host.project_root,
-            curtain_styles=curtain_styles,
-        )
+        with mock.patch(
+            "Forge_Tab.evaluate_readiness",
+            return_value=ReadinessResult((), 100, "Ready"),
+        ):
+            forge = ForgeTab(
+                host.project_root,
+                curtain_styles=curtain_styles,
+            )
         settings_selector = title_bar.curtain_style_selector
         forge_selector = forge.curtain_style_selector
         self.assertEqual(forge.preview_format_label.text(), "Preview Format")

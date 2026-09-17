@@ -133,7 +133,6 @@ RESTORABLE_SETTING_KEYS = (
     "message_overlay_preset",
     "message_overlay_opacity",
     "required_features",
-    "forge_preview_mode",
 )
 PUBLICATION_METADATA_KEYS = (
     PROJECT_PUBLISHED_AT_KEY,
@@ -700,6 +699,24 @@ def _required_feature_enabled(
         for value in raw_features
         if str(value).strip()
     }
+
+
+def _bundle_matches_publication(path: Path, metadata: dict[str, Any]) -> bool:
+    published_fingerprint = str(
+        metadata.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")
+    ).strip()
+    if not published_fingerprint:
+        return True
+    try:
+        build = json.loads(
+            (path / "lettersmith-build.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return True
+    if not isinstance(build, dict):
+        return True
+    source_fingerprint = str(build.get("source_fingerprint", "")).strip()
+    return not source_fingerprint or source_fingerprint == published_fingerprint
 
 
 def _readable_file(path: Path) -> bool:
@@ -1317,6 +1334,7 @@ class SavedLetterCatalog:
             ).strip(),
             publication_verified=(
                 metadata.get(PUBLICATION_VERIFIED_KEY) is True
+                and _bundle_matches_publication(path, metadata)
             ),
             published_source_fingerprint=str(
                 metadata.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")
@@ -1550,7 +1568,9 @@ class SavedLetterRestorer:
             self.settings.replace_snapshot(restored_settings)
             settings_committed = True
             self._verify_committed_state()
-            if needs_created_timestamp and not (entry.example or entry.stock):
+            if needs_created_timestamp and not (
+                entry.example or entry.stock or entry.recovery
+            ):
                 persisted_metadata = _read_metadata(play_dir, strict=True)
                 persisted_metadata[PROJECT_CREATED_AT_KEY] = created_timestamp
                 atomic_write_json(
@@ -1730,6 +1750,13 @@ class SavedLetterRestorer:
                 "recipient_title": title,
             }
         )
+        if entry.recovery:
+            return replace(
+                entry,
+                recipient=record.display_name,
+                recipient_id=record.recipient_id,
+                project_id=project_id,
+            )
         prompt_writer_state = _saved_prompt_writer_state(source, metadata)
         identity_metadata = dict(metadata)
         identity_metadata.update(
@@ -2153,7 +2180,7 @@ class SavedLetterRestorer:
         )
         recipient_id = (
             entry.recipient_id
-            if protected_entry
+            if protected_entry or entry.recovery
             else (
                 _valid_uuid(metadata.get("recipient_id"))
                 or entry.recipient_id
@@ -2178,7 +2205,11 @@ class SavedLetterRestorer:
         else:
             restored[PROTECTED_PROJECT_KIND_KEY] = ""
             restored[PROTECTED_PROJECT_MASTER_PATH_KEY] = ""
-            restored[ACTIVE_PLAY_DIR_KEY] = str(play_dir.resolve())
+            restored[ACTIVE_PLAY_DIR_KEY] = (
+                str(play_dir.resolve())
+                if play_dir.is_relative_to(canonical_play_root(self.project_root))
+                else ""
+            )
         restored[PROJECT_SCHEMA_KEY] = PROJECT_METADATA_SCHEMA_VERSION
         return restored
 
@@ -2368,6 +2399,50 @@ def update_saved_publication_metadata(
     return metadata
 
 
+def save_published_snapshot(
+    play_dir: str | Path,
+    project_root: str | Path,
+    publication: dict[str, Any],
+) -> Path:
+    """Keep the verified publication restorable as the working Play bundle changes."""
+    root = Path(project_root).resolve()
+    source = Path(play_dir).resolve(strict=True)
+    if not source.is_relative_to(canonical_play_root(root)):
+        raise ValueError("The published source must be a Play bundle.")
+    if get_publication_status(publication) != "published":
+        raise ValueError("The publication is not verified.")
+    metadata = _read_metadata(source, strict=True)
+    project_id = _valid_uuid(metadata.get("project_id"))
+    if not project_id:
+        raise ValueError("The published letter has no valid project identity.")
+
+    destination = canonical_recovery_root(root) / "Published" / project_id
+    transaction = PathTransaction(
+        destination,
+        staging_suffix=".publish-staging",
+        backup_suffix=".publish-backup",
+        unique_staging=True,
+    )
+    committed = False
+    try:
+        staging = transaction.prepare()
+        copy_directory_tree_no_links(source, staging)
+        metadata.update(_publication_metadata(publication))
+        atomic_write_json(staging / PLAY_METADATA_FILE, metadata)
+        SavedLetterRestorer(root)._validated_saved_letter_content(staging)
+        transaction.commit(keep_backup=True)
+        committed = True
+    except Exception:
+        transaction.abort()
+        raise
+    if committed:
+        try:
+            transaction.finalize()
+        except OSError:
+            _LOGGER.exception("Published snapshot backup cleanup failed: %s", destination)
+    return destination
+
+
 def record_saved_letter_activity(
     play_dir: str | Path,
     *,
@@ -2417,6 +2492,7 @@ __all__ = [
     "SavedLetterCatalog",
     "SavedLetterDeleteError",
     "SavedLetterRestoreError",
+    "save_published_snapshot",
     "record_saved_letter_activity",
     "SavedLetterRestorer",
     "update_saved_metadata",

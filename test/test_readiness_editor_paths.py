@@ -15,7 +15,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
 import generate
-from Editor import Editor, UltralinkDialog
+import Editor as editor_module
+from Editor import Editor, FindReplaceDialog, UltralinkDialog
 from message_html import ultralink_message_from_href
 from Forge_Tab import ForgeTab, ReadinessWindow
 from config import (
@@ -45,6 +46,7 @@ from sound_model import (
 )
 from sound_tab import ArchiveDialog
 from ui_theme import THEMES, ThemeService
+from ui_sounds import UiSound
 
 
 class FakeLanguageService:
@@ -96,6 +98,21 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_failed_find_uses_letter_smith_cue_and_keeps_visual_status(self) -> None:
+        host = QtWidgets.QWidget()
+        host.editor = QtWidgets.QTextEdit(host)
+        host.editor.setPlainText("hello world")
+        dialog = FindReplaceDialog(host)
+        try:
+            dialog.find_input.setText("missing")
+            with mock.patch.object(editor_module, "play_ui_sound") as play:
+                self.assertFalse(dialog.find_next())
+            play.assert_called_once_with(UiSound.ERROR)
+            self.assertEqual(dialog.status_label.text(), "No matches found.")
+        finally:
+            dialog.close()
+            host.close()
 
     def test_readiness_panel_is_frameless_tool_closed_only_by_toggle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -175,6 +192,8 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             _busy=False,
             _preview_refresh_pending=True,
             _preview_refresh_requested=False,
+            _refresh_source_fingerprint=mock.Mock(),
+            refresh_readiness=mock.Mock(return_value=SimpleNamespace(can_preview=True)),
             _current_play_index=mock.Mock(return_value=None),
             _prepare_preview=mock.Mock(),
             request_preview=mock.Mock(),
@@ -189,6 +208,8 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             _busy=False,
             _preview_refresh_pending=False,
             _preview_refresh_requested=False,
+            _refresh_source_fingerprint=mock.Mock(),
+            refresh_readiness=mock.Mock(return_value=SimpleNamespace(can_preview=True)),
             _current_play_index=mock.Mock(return_value=Path("index.html")),
             _prepare_preview=mock.Mock(),
             request_preview=mock.Mock(),
@@ -198,6 +219,35 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
 
         current.request_preview.assert_called_once_with()
         current._prepare_preview.assert_not_called()
+
+        incomplete = SimpleNamespace(
+            _busy=False,
+            _preview_refresh_pending=False,
+            _refresh_source_fingerprint=mock.Mock(),
+            refresh_readiness=mock.Mock(return_value=SimpleNamespace(can_preview=False)),
+            _prepare_preview=mock.Mock(),
+            request_preview=mock.Mock(),
+        )
+        ForgeTab.ensure_preview_current(incomplete)
+        self.assertTrue(incomplete._preview_refresh_pending)
+        incomplete._prepare_preview.assert_not_called()
+        incomplete.request_preview.assert_not_called()
+
+    def test_forge_preview_index_uses_working_bundle_after_saved_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            working = root / "output/Play/letter"
+            recovery = root / "output/Recovery/letter"
+            working.mkdir(parents=True)
+            recovery.mkdir(parents=True)
+            (working / "index.html").write_text("working", encoding="utf-8")
+            (recovery / "index.html").write_text("published", encoding="utf-8")
+            forge = SimpleNamespace(project_root=root, _last_play_dir=recovery)
+            with mock.patch.object(generate, "play_bundle_directory", return_value=working):
+                self.assertEqual(
+                    ForgeTab._current_play_index(forge),
+                    working / "index.html",
+                )
 
     def test_forge_does_not_retry_a_preview_after_leaving_the_tab(self) -> None:
         forge = SimpleNamespace(
@@ -641,6 +691,62 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 protected_publish=True,
             )
             tab.close()
+
+    def test_preview_options_follow_preview_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tab = ForgeTab(Path(directory))
+            try:
+                self.assertEqual(tab.preview_mode_value, "landscape")
+                blocked = tab._readiness_result
+                self.assertFalse(blocked.can_preview)
+                self.assertEqual(tab.preview_mode.count(), 0)
+                self.assertEqual(tab.preview_mode.currentIndex(), -1)
+                self.assertFalse(tab.preview_mode.isEnabled())
+                self.assertEqual(tab.curtain_style_selector.count(), 0)
+                self.assertEqual(tab.curtain_style_selector.currentText(), "")
+                self.assertFalse(tab.curtain_style_selector.isEnabled())
+
+                ready = ReadinessResult((), 100, "Ready")
+                with mock.patch("Forge_Tab.evaluate_readiness", return_value=ready):
+                    tab.refresh_readiness()
+                self.assertTrue(tab.preview_mode.isEnabled())
+                self.assertEqual(tab.preview_mode.count(), 3)
+                self.assertEqual(tab.preview_mode.currentData(), "landscape")
+                self.assertEqual(
+                    [tab.preview_mode.itemText(index) for index in range(3)],
+                    ["Portrait", "Landscape", "Browser"],
+                )
+                self.assertTrue(tab.curtain_style_selector.isEnabled())
+                self.assertEqual(tab.curtain_style_selector.count(), 7)
+
+                with mock.patch.object(tab, "request_preview") as request_preview:
+                    tab.preview_mode.setCurrentIndex(tab.preview_mode.findData("window"))
+                request_preview.assert_called_once_with()
+                self.assertEqual(SettingsStore(directory).get("forge_preview_mode"), "window")
+                tab.curtain_style_selector.set_current_style("normal_dark")
+                with mock.patch("Forge_Tab.evaluate_readiness", return_value=blocked):
+                    tab.refresh_readiness()
+                self.assertEqual(tab.preview_mode.count(), 0)
+                self.assertEqual(tab.preview_mode.currentText(), "")
+                self.assertFalse(tab.preview_mode.isEnabled())
+                self.assertEqual(tab.curtain_style_selector.count(), 0)
+                self.assertEqual(tab.curtain_style_selector.currentText(), "")
+                self.assertFalse(tab.curtain_style_selector.isEnabled())
+                with mock.patch("Forge_Tab.evaluate_readiness", return_value=ready):
+                    tab.refresh_readiness()
+                self.assertEqual(tab.preview_mode.currentData(), "window")
+            finally:
+                tab.shutdown()
+                tab.close()
+
+            with mock.patch("Forge_Tab.evaluate_readiness", return_value=ready):
+                reopened = ForgeTab(Path(directory))
+            try:
+                self.assertEqual(reopened.preview_mode_value, "window")
+                self.assertEqual(reopened.preview_mode.currentText(), "Browser")
+            finally:
+                reopened.shutdown()
+                reopened.close()
 
     def test_forge_actions_and_preview_format_follow_each_theme(self) -> None:
         def contrast_ratio(foreground: str, background: str) -> float:
@@ -1147,9 +1253,11 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.assertFalse(hasattr(editor, "font_size_down"))
             self.assertFalse(hasattr(editor, "font_size_up"))
             self.assertIn(
-                "stop:1 rgb(15,15,15)",
+                "background:transparent",
                 editor.editor.styleSheet(),
             )
+            self.assertEqual(editor.editor_surface._preset, "black")
+            self.assertEqual(editor.readability_indicator.objectName(), "readabilityIndicator")
             self.assertIn("color:#f1eee8", editor.editor.styleSheet())
             editor.editor.selectAll()
             editor.set_font_size(24)
@@ -1183,10 +1291,46 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 editor._save_only()
             self.assertFalse(editor._closing)
             self.assertEqual(save.call_count, 1)
-            self.assertIn("background-color:transparent", editor.editor.styleSheet())
+            self.assertIn("background:transparent", editor.editor.styleSheet())
+            self.assertEqual(editor.editor_surface._opacity, 0)
         finally:
             editor.deleteLater()
             editor._host_for_test.deleteLater()
+            self.app.processEvents()
+            holder.cleanup()
+
+    def test_editor_surface_uses_wall_art_and_reports_low_contrast(self) -> None:
+        holder = tempfile.TemporaryDirectory()
+        root = Path(holder.name)
+        (root / "settings.json").write_text(
+            json.dumps({"message_overlay_preset": "clear"}),
+            encoding="utf-8",
+        )
+        host = QtWidgets.QWidget()
+        host.project_root = root
+        wall = QtGui.QPixmap(64, 64)
+        wall.fill(QtGui.QColor("white"))
+        editor = Editor("<p>Letter</p>", wall, parent=host)
+        try:
+            editor.show()
+            self.app.processEvents()
+            self.assertIsNotNone(editor.editor_surface.wall_pixmap)
+            self.assertFalse(hasattr(editor_module, "PreviewWidget"))
+
+            cursor = editor.editor.textCursor()
+            cursor.select(QtGui.QTextCursor.Document)
+            format_ = QtGui.QTextCharFormat()
+            format_.setForeground(QtGui.QColor("white"))
+            cursor.mergeCharFormat(format_)
+            editor.editor.setTextCursor(cursor)
+            editor._update_readability_indicator()
+            self.assertEqual(
+                editor.readability_indicator.property("readabilityState"),
+                "low",
+            )
+        finally:
+            editor.deleteLater()
+            host.deleteLater()
             self.app.processEvents()
             holder.cleanup()
 
@@ -1640,7 +1784,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.app.processEvents()
             holder.cleanup()
 
-    def test_salutation_restores_active_character_and_paragraph_format(self) -> None:
+    def test_salutation_uses_title_then_normal_text(self) -> None:
         editor, holder = self._make_editor("paper")
         try:
             editor.recipient_name = "Amani Hill"
@@ -1674,8 +1818,11 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             salutation.setPosition(0)
             salutation.setPosition(len("Dear Amani Hill,"), QtGui.QTextCursor.KeepAnchor)
             salutation_format = salutation.charFormat()
-            self.assertEqual(salutation_format.fontFamilies()[0], "Papyrus")
-            self.assertEqual(round(salutation_format.fontPointSize()), 50)
+            title = editor.named_styles.active_set.get("title")
+            normal = editor.named_styles.active_set.get("normal_text")
+            self.assertEqual(salutation_format.fontFamilies()[0], title.font_family)
+            self.assertEqual(round(salutation_format.fontPointSize()), title.font_size)
+            self.assertEqual(editor.named_styles.selected_style(), "normal_text")
 
             restored_cursor = editor.editor.textCursor()
             self.assertEqual(restored_cursor.positionInBlock(), 0)
@@ -1687,13 +1834,13 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.assertEqual(restored_cursor.blockFormat().leftMargin(), 13.0)
 
             restored_format = editor.editor.currentCharFormat()
-            self.assertEqual(restored_format.fontFamilies()[0], "Onyx")
-            self.assertEqual(round(restored_format.fontPointSize()), 16)
-            self.assertEqual(restored_format.fontWeight(), QtGui.QFont.Bold)
-            self.assertTrue(restored_format.fontItalic())
-            self.assertTrue(restored_format.fontUnderline())
-            self.assertTrue(restored_format.fontStrikeOut())
-            self.assertEqual(restored_format.foreground().color().name(), "#123456")
+            self.assertEqual(restored_format.fontFamilies()[0], normal.font_family)
+            self.assertEqual(round(restored_format.fontPointSize()), normal.font_size)
+            self.assertEqual(restored_format.fontWeight(), normal.font_weight)
+            self.assertEqual(restored_format.fontItalic(), normal.italic)
+            self.assertEqual(restored_format.fontUnderline(), normal.underline)
+            self.assertEqual(restored_format.fontStrikeOut(), normal.strikethrough)
+            self.assertEqual(restored_format.foreground().color().name(), normal.font_color)
 
             restored_cursor.insertText("X")
             typed = QtGui.QTextCursor(editor.editor.document())
@@ -1701,9 +1848,9 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             typed.movePosition(QtGui.QTextCursor.NextCharacter, QtGui.QTextCursor.KeepAnchor)
             typed_format = typed.charFormat()
             self.assertEqual(typed.selectedText(), "X")
-            self.assertEqual(typed_format.fontFamilies()[0], "Onyx")
-            self.assertEqual(round(typed_format.fontPointSize()), 16)
-            self.assertEqual(typed_format.foreground().color().name(), "#123456")
+            self.assertEqual(typed_format.fontFamilies()[0], normal.font_family)
+            self.assertEqual(round(typed_format.fontPointSize()), normal.font_size)
+            self.assertEqual(typed_format.foreground().color().name(), normal.font_color)
         finally:
             editor._closing = True
             editor.close()
@@ -1758,6 +1905,48 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.assertTrue(editor.act_undo.isEnabled())
             editor.act_undo.trigger()
             self.assertTrue(editor.act_redo.isEnabled())
+        finally:
+            editor._closing = True
+            editor.close()
+            editor.deleteLater()
+            editor._host_for_test.deleteLater()
+            self.app.processEvents()
+            holder.cleanup()
+
+    def test_editor_format_and_shortcut_labels_show_their_effects(self) -> None:
+        editor, holder = self._make_editor("paper")
+        try:
+            self.assertTrue(editor.act_bold.font().bold())
+            self.assertTrue(editor.act_italic.font().italic())
+            self.assertTrue(editor.act_underline.font().underline())
+            self.assertTrue(editor.act_strike.font().strikeOut())
+            salutation_button = editor.toolbar.widgetForAction(editor.act_salutation)
+            self.assertTrue(salutation_button.font().bold())
+            self.assertTrue(salutation_button.font().italic())
+
+            for action, symbol, label in (
+                (editor.act_undo, "↶", "Undo"),
+                (editor.act_redo, "↷", "Redo"),
+                (editor.act_find, "🔍", "Find and replace"),
+            ):
+                self.assertEqual(action.text(), symbol)
+                self.assertFalse(action.shortcut().isEmpty())
+                button = editor.toolbar.widgetForAction(action)
+                self.assertEqual(button.accessibleName(), label)
+                self.assertIn(action.shortcut().toString(), button.toolTip())
+
+            self.assertEqual(editor.btn_links.text(), "🔗")
+            self.assertEqual(editor.btn_links.accessibleName(), "Add/edit link")
+            self.assertEqual(editor.btn_links.menu().actions()[0], editor.act_add_edit_link)
+            self.assertEqual(editor.act_add_edit_link.text(), "Add / Edit Link")
+            self.assertEqual(editor.act_add_edit_link.shortcut().toString(), "Ctrl+K")
+            self.assertIn("Ctrl+K", editor.btn_links.toolTip())
+            self.assertGreater(
+                editor.btn_links.menu().minimumWidth(),
+                editor.btn_links.menu().fontMetrics().horizontalAdvance(
+                    editor.act_add_edit_link.text()
+                ),
+            )
         finally:
             editor._closing = True
             editor.close()

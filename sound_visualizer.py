@@ -155,7 +155,7 @@ class AudioVisualizerUltra(QtWidgets.QWidget):
         self._timer.setInterval(16)  # ~60 fps
         self._timer.timeout.connect(self._tick)
 
-        self._bg = QtGui.QColor("#0b0d12")
+        self._bg = QtGui.QColor("#0F1116")
         self._grid = QtGui.QColor(255, 255, 255, self.GRID_ALPHA)
         self._text = QtGui.QColor(185, 195, 210, 130)
 
@@ -510,15 +510,14 @@ class AudioVisualizerUltra(QtWidgets.QWidget):
         p.drawLine(QtCore.QPointF(area.left(), base_y), QtCore.QPointF(area.right(), base_y))
 
         n = self._bars_n
-        gap = max(3, int(area.width() * 0.0045))
-        total_gap = gap * (n + 1)
-        bar_w = max(4, (int(area.width()) - total_gap) // n)
+        gap = min(3.0, area.width() / (n * 4))
+        bar_w = (area.width() - gap * (n - 1)) / n
         max_h = int(area.height() * 0.70)
 
         # Glow pass: very restrained.
         p.save()
         p.setCompositionMode(QtGui.QPainter.CompositionMode_Plus)
-        x = area.left() + gap
+        x = area.left()
         for i, v in enumerate(self._bars):
             if v <= 0.0:
                 x += bar_w + gap
@@ -533,7 +532,7 @@ class AudioVisualizerUltra(QtWidgets.QWidget):
         p.restore()
 
         # Body pass: the actual spectrum bars.
-        x = area.left() + gap
+        x = area.left()
         for i, v in enumerate(self._bars):
             if v <= 0.0:
                 x += bar_w + gap
@@ -549,7 +548,8 @@ class AudioVisualizerUltra(QtWidgets.QWidget):
 
             p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 18), 1))
             p.setBrush(QtGui.QBrush(grad))
-            p.drawRoundedRect(rect, 2.8, 2.8)
+            radius = min(2.8, bar_w / 2)
+            p.drawRoundedRect(rect, radius, radius)
 
             pk = self._peaks[i]
             if pk > 0.0:
@@ -557,7 +557,8 @@ class AudioVisualizerUltra(QtWidgets.QWidget):
                 ypk = base_y - ph
                 peak_col = _hsv(hue_i + 10.0, 0.28, 0.94, self.PEAK_ALPHA)
                 p.setPen(QtGui.QPen(peak_col, 1.4))
-                p.drawLine(QtCore.QPointF(x + 0.8, ypk), QtCore.QPointF(x + bar_w - 0.8, ypk))
+                inset = min(0.8, bar_w / 4)
+                p.drawLine(QtCore.QPointF(x + inset, ypk), QtCore.QPointF(x + bar_w - inset, ypk))
 
             x += bar_w + gap
 

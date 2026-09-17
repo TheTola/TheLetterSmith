@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
 import html as _html
+import json
 import re
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Mapping
 from urllib.parse import quote, unquote, urlsplit
 
 BODY_RE = re.compile(r"<body\b[^>]*>(.*?)</body>", re.IGNORECASE | re.DOTALL)
@@ -285,6 +288,122 @@ _QT_DEFAULTS_STYLE = (
     '.lettersmith-defaults li.checked::marker{content:"\\2612"}'
     "</style>"
 )
+
+_STYLE_STATE_COMMENT_PREFIX = "lettersmith-style-state:v1:"
+_STYLE_STATE_COMMENT_RE = re.compile(
+    r"<!--\s*lettersmith-style-state:[\s\S]*?-->",
+    re.IGNORECASE,
+)
+_STYLE_STATE_DATA_RE = re.compile(
+    r"lettersmith-style-state:v([1-9][0-9]{0,5}):([A-Za-z0-9+/]+={0,2})\Z"
+)
+MAX_STYLE_STATE_BYTES = 1024 * 1024
+_MAX_STYLE_STATE_ENCODED_CHARACTERS = ((MAX_STYLE_STATE_BYTES + 2) // 3) * 4
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate style-state key")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_json(_value: str) -> object:
+    raise ValueError("Non-finite style-state value")
+
+
+def _decode_style_state_comment(
+    data: str,
+) -> tuple[int, dict[str, object], str] | None:
+    match = _STYLE_STATE_DATA_RE.fullmatch(data.strip())
+    if match is None:
+        return None
+    version = int(match.group(1))
+    encoded = match.group(2)
+    if len(encoded) > _MAX_STYLE_STATE_ENCODED_CHARACTERS:
+        return None
+    try:
+        payload = base64.b64decode(encoded, validate=True)
+        if (
+            len(payload) > MAX_STYLE_STATE_BYTES
+            or base64.b64encode(payload).decode("ascii") != encoded
+        ):
+            return None
+        state = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_nonfinite_json,
+        )
+    except (UnicodeError, ValueError, RecursionError):
+        return None
+    if (
+        not isinstance(state, dict)
+        or type(state.get("schema_version")) is not int
+        or state["schema_version"] != version
+    ):
+        return None
+    return version, state, encoded
+
+
+def _encode_style_state_comment(state: Mapping[str, object]) -> str:
+    if not isinstance(state, Mapping) or type(state.get("schema_version")) is not int:
+        raise ValueError("Invalid LetterSmith style state")
+    if state["schema_version"] != 1:
+        raise ValueError("Unsupported LetterSmith style-state version")
+    try:
+        payload = json.dumps(
+            state,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError) as error:
+        raise ValueError("Invalid LetterSmith style state") from error
+    if len(payload) > MAX_STYLE_STATE_BYTES:
+        raise ValueError("LetterSmith style state is too large")
+    encoded = base64.b64encode(payload).decode("ascii")
+    return f"<!-- {_STYLE_STATE_COMMENT_PREFIX}{encoded} -->"
+
+
+def strip_lettersmith_style_state(raw: str) -> str:
+    """Remove embedded editor-only style metadata without changing visible HTML."""
+    return _STYLE_STATE_COMMENT_RE.sub("", raw or "")
+
+
+def embed_lettersmith_style_state(
+    raw: str, state: Mapping[str, object]
+) -> str:
+    """Replace any existing style metadata with one non-rendering comment."""
+    comment = _encode_style_state_comment(state)
+    content = strip_lettersmith_style_state(raw)
+    marker_at = content.find(LETTERSMITH_MESSAGE_MARKER)
+    if marker_at >= 0:
+        insert_at = marker_at + len(LETTERSMITH_MESSAGE_MARKER)
+        return content[:insert_at] + comment + content[insert_at:]
+    return comment + content
+
+
+def extract_lettersmith_style_state(raw: str) -> dict[str, object] | None:
+    """Read a valid style-state envelope from safe message HTML, if present."""
+    safe = sanitize_message_html(raw)
+    match = _STYLE_STATE_COMMENT_RE.search(safe)
+    if match is None:
+        return None
+    parsed = _decode_style_state_comment(match.group()[4:-3])
+    return parsed[1] if parsed is not None and parsed[0] == 1 else None
+
+
+def has_unsupported_lettersmith_style_state(raw: str) -> bool:
+    """Identify preserved future-version metadata before an editor save."""
+    safe = sanitize_message_html(raw)
+    match = _STYLE_STATE_COMMENT_RE.search(safe)
+    if match is None:
+        return False
+    parsed = _decode_style_state_comment(match.group()[4:-3])
+    return parsed is not None and parsed[0] != 1
 
 
 def _normalize_newlines(text: str) -> str:
@@ -805,6 +924,7 @@ class _PassiveMessageHTMLParser(HTMLParser):
         self.open_tags: list[str] = []
         self.blocked_tags: list[str] = []
         self.marker_emitted = False
+        self.style_state_emitted = False
         self.output_characters = 0
         self.tag_count = 0
 
@@ -938,6 +1058,22 @@ class _PassiveMessageHTMLParser(HTMLParser):
             self._append_escaped_data(data)
 
     def handle_comment(self, data: str) -> None:
+        if not self._in_blocked_subtree() and not self.style_state_emitted:
+            parsed = _decode_style_state_comment(data)
+            if parsed is not None:
+                version, state, encoded = parsed
+                try:
+                    comment = (
+                        _encode_style_state_comment(state)
+                        if version == 1
+                        else f"<!-- lettersmith-style-state:v{version}:{encoded} -->"
+                    )
+                except ValueError:
+                    pass
+                else:
+                    self._append_output(comment)
+                    self.style_state_emitted = True
+                    return
         if (
             not self._in_blocked_subtree()
             and not self.marker_emitted

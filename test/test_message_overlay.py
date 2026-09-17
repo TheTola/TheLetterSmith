@@ -3,13 +3,16 @@ from __future__ import annotations
 import unittest
 import colorsys
 import os
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from Message_tab import (
+    MessageTab,
     RevisionHistoryDialog,
     _apply_adaptive_micro_contrast,
     _effective_message_overlay_opacity,
@@ -30,6 +33,32 @@ class MessageOverlayTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def test_preview_emits_full_resolution_message_and_wall(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            message_path = Path(directory) / "message.png"
+            wall_path = Path(directory) / "wall.png"
+            for path, size in (
+                (message_path, (2048, 3072)),
+                (wall_path, (1024, 1536)),
+            ):
+                image = QtGui.QImage(*size, QtGui.QImage.Format_RGB32)
+                image.fill(QtGui.QColor("white"))
+                self.assertTrue(image.save(str(path)))
+
+            emitted = []
+            tab = SimpleNamespace(
+                _png_path=lambda: message_path,
+                _render_wall_path=lambda: wall_path,
+                preview_image=SimpleNamespace(emit=emitted.append),
+                status=SimpleNamespace(setText=lambda _text: None),
+            )
+            MessageTab._emit_best_preview(tab)
+            self.assertEqual(emitted[-1].size(), QtCore.QSize(2048, 3072))
+
+            message_path.unlink()
+            MessageTab._emit_best_preview(tab)
+            self.assertEqual(emitted[-1].size(), QtCore.QSize(1024, 1536))
 
     def test_revision_history_is_a_frameless_lettersmith_panel(self) -> None:
         message_tab = QtWidgets.QWidget()
