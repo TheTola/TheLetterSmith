@@ -1570,7 +1570,7 @@ class ThemeServiceTests(unittest.TestCase):
         screen = mock.Mock()
         screen.availableGeometry.return_value = available
         with mock.patch(
-            "startup_theme.QtGui.QGuiApplication.screenAt",
+            "window_chrome.screen_for_launcher",
             return_value=screen,
         ):
             restored._restore_saved_position()

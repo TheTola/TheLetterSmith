@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -20,6 +21,7 @@ from sound_model import (
     library_path,
     load_library,
     load_project_state,
+    processed_dir,
     save_library,
     save_project_state,
 )
@@ -91,6 +93,270 @@ class SoundArchivePreviewTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+
+    def _wait_for(self, predicate, message: str) -> None:
+        timer = QtCore.QElapsedTimer()
+        timer.start()
+        while not predicate() and timer.elapsed() < 4000:
+            QtTest.QTest.qWait(20)
+        self.assertTrue(predicate(), message)
+
+    @contextmanager
+    def _handoff_tab(self, *, state="playing", playlist=False):
+        with tempfile.TemporaryDirectory() as directory:
+            tab = SoundTab(Path(directory))
+            try:
+                tab.show()
+                tab.activate_for_tab_change()
+                # Exercise the real audio backend with the repository's music fixtures.
+                sources = sorted((Path(__file__).resolve().parents[1] / "resources/stock/music").glob("*.mp3"))
+                self.assertGreaterEqual(len(sources), 2)
+                records = {}
+                for index, source in enumerate(sources[:2]):
+                    track_id = f"handoff-{index}"
+                    target = processed_dir(directory) / f"{track_id}.mp3"
+                    shutil.copyfile(source, target)
+                    records[track_id] = TrackRecord(
+                        track_id=track_id, content_hash=hashlib.sha256(source.read_bytes()).hexdigest(),
+                        display_title=f"Song {index}", original_name=source.name,
+                        original_file=target.name, processed_file=target.name,
+                        duration_seconds=140.0,
+                    )
+                tab.library.replace_records(records)
+                tab.library.changed.emit()
+                tab.player.set_muted(True)
+                tab.volume.setValue(23)
+                if state != "empty":
+                    tab.project_sound.set_single("handoff-0")
+                    if playlist:
+                        tab.project_sound.add_to_playlist(["handoff-1"])
+                    self._wait_for(lambda: tab.player.player.duration() > 5000, "Song A did not load")
+                    if state != "stopped":
+                        tab.player.play()
+                        tab.player.seek(5000)
+                        self._wait_for(lambda: tab.player.player.position() > 5000, "Song A did not advance")
+                    if state == "paused":
+                        tab.player.pause()
+                yield tab
+            finally:
+                tab.shutdown()
+                tab.close()
+                tab.deleteLater()
+                self.app.processEvents()
+                QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+    def _run_archive(self, tab, interact, *, recent=False) -> None:
+        errors = []
+        if recent:
+            dialog = StockMusicDialog(
+                tab.library, multi_select=False, parent=tab,
+                recent_track_ids=("handoff-0", "handoff-1"), allow_browse=True,
+            )
+        else:
+            dialog = ArchiveDialog(
+                tab.library, lambda: set(tab.project_sound.ordered_ids()),
+                tab._delete_archive_track, multi_select=False, parent=tab,
+            )
+        dialog.preview_output.setMuted(True)
+        overlaps = []
+
+        def check_overlap(_state):
+            if dialog.preview_player.playbackState() == QMediaPlayer.PlayingState and tab.player.is_playing():
+                overlaps.append(tab.player.player.position())
+
+        media_players = [*tab.player.players, dialog.preview_player]
+        for player in media_players:
+            player.playbackStateChanged.connect(check_overlap)
+
+        def run():
+            try:
+                interact(dialog)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                if dialog.isVisible():
+                    dialog.reject()
+
+        QtCore.QTimer.singleShot(0, run)
+        try:
+            tab._exec_music_popup(dialog)
+        finally:
+            for player in media_players:
+                player.playbackStateChanged.disconnect(check_overlap)
+        self.assertEqual(overlaps, [], "Main and archive music overlapped")
+        self.assertEqual(dialog.preview_player.playbackState(), QMediaPlayer.StoppedState)
+        self.assertTrue(dialog.preview_player.source().isEmpty())
+        if errors:
+            raise errors[0]
+
+    def _select_preview(self, dialog, track_id):
+        view = dialog.table if isinstance(dialog, ArchiveDialog) else dialog.recent_list
+        count = view.rowCount() if isinstance(dialog, ArchiveDialog) else view.count()
+        for row in range(count):
+            item = view.item(row, 0) if isinstance(dialog, ArchiveDialog) else view.item(row)
+            if item.data(QtCore.Qt.UserRole) == track_id:
+                if isinstance(dialog, ArchiveDialog):
+                    view.selectRow(row)
+                else:
+                    view.setCurrentRow(row)
+                break
+        else:
+            self.fail(f"Missing archive song {track_id}")
+        self._wait_for(
+            lambda: dialog.preview_player.playbackState() == QMediaPlayer.PlayingState,
+            "Archive song did not start",
+        )
+
+    def test_archive_handoff_preserves_position_across_songs_and_repeated_cycles(self) -> None:
+        with self._handoff_tab() as tab:
+            source = tab.player.player.source()
+            source_changes = QtTest.QSignalSpy(tab.player.player.sourceChanged)
+            for cycle in range(3):
+                paused = []
+
+                def interact(dialog):
+                    self.assertTrue(tab.player.is_playing())
+                    self._select_preview(dialog, "handoff-1")
+                    self.assertEqual(tab.player.player.playbackState(), QMediaPlayer.PausedState)
+                    paused.append(tab.player.player.position())
+                    QtTest.QTest.qWait(180)
+                    self._select_preview(dialog, "handoff-0")
+                    self.assertEqual(tab.player.player.position(), paused[0])
+                    tab.player.play()  # Other play requests cannot overlap a preview.
+                    self.assertFalse(tab.player.is_playing())
+                    self.assertEqual(tab.player.player.source(), source)
+                    self.assertEqual(tab.project_sound.state.selected_track_id, "handoff-0")
+                    if cycle == 1:
+                        dialog.choose_btn.click()  # Choosing the same song remains a no-op.
+                    elif cycle == 2:
+                        dialog.close()
+
+                self._run_archive(tab, interact)
+                self.assertTrue(tab.player.is_playing())
+                self.assertEqual(tab.player.player.position(), paused[0])
+                self._wait_for(lambda: tab.player.player.position() > paused[0], "Song A did not resume")
+                self.assertEqual(tab.player.current_track_id, "handoff-0")
+                self.assertEqual(source_changes.count(), 0)
+                self.assertEqual(tab.volume.value(), 23)
+                self.assertTrue(tab.player.is_muted())
+                self.assertAlmostEqual(tab.player.outputs[tab.player.active_slot].volume(), 0.23, places=2)
+
+    def test_archive_handoff_does_not_start_paused_stopped_or_missing_music(self) -> None:
+        for state in ("paused", "stopped", "empty"):
+            with self.subTest(state=state), self._handoff_tab(state=state) as tab:
+                before = (tab.player.player.playbackState(), tab.player.player.position())
+
+                def interact(dialog):
+                    self._select_preview(dialog, "handoff-1")
+                    QtTest.QTest.qWait(150)
+                    self.assertFalse(tab.player.is_playing())
+
+                self._run_archive(tab, interact)
+                self.assertEqual((tab.player.player.playbackState(), tab.player.player.position()), before)
+
+    def test_archive_handoff_without_a_preview_leaves_playback_untouched(self) -> None:
+        with self._handoff_tab() as tab:
+            changes = QtTest.QSignalSpy(tab.player.player.playbackStateChanged)
+            before = tab.player.player.position()
+            self._run_archive(tab, lambda _dialog: QtTest.QTest.qWait(160))
+            self.assertTrue(tab.player.is_playing())
+            self.assertGreater(tab.player.player.position(), before)
+            self.assertEqual(changes.count(), 0)
+
+    def test_archive_handoff_also_applies_to_recent_music_previews(self) -> None:
+        with self._handoff_tab() as tab:
+            paused = []
+
+            def interact(dialog):
+                self._select_preview(dialog, "handoff-1")
+                self.assertFalse(tab.player.is_playing())
+                paused.append(tab.player.player.position())
+
+            self._run_archive(tab, interact, recent=True)
+            self.assertTrue(tab.player.is_playing())
+            self.assertEqual(tab.player.player.position(), paused[0])
+
+    def test_archive_handoff_shutdown_does_not_resume_music(self) -> None:
+        with self._handoff_tab() as tab:
+            def interact(dialog):
+                self._select_preview(dialog, "handoff-1")
+                self.assertTrue(tab.shutdown())
+
+            self._run_archive(tab, interact)
+            self.assertTrue(tab._shutdown)
+            self.assertFalse(tab.player.is_playing())
+            self.assertTrue(all(player.source().isEmpty() for player in tab.player.players))
+            self.assertFalse(tab.player._loop_timer.isActive())
+            self.assertFalse(tab.player._crossfade_timer.isActive())
+
+    def test_archive_handoff_respects_explicit_pause_and_stop(self) -> None:
+        for action in ("pause", "stop"):
+            with self.subTest(action=action), self._handoff_tab() as tab:
+                def interact(dialog):
+                    self._select_preview(dialog, "handoff-1")
+                    getattr(tab.player, action)()
+
+                self._run_archive(tab, interact)
+                self.assertFalse(tab.player.is_playing())
+
+    def test_archive_handoff_keeps_explicit_use_song_behavior(self) -> None:
+        for state in ("playing", "paused"):
+            with self.subTest(state=state), self._handoff_tab(state=state) as tab:
+                def interact(dialog):
+                    self._select_preview(dialog, "handoff-1")
+                    dialog.choose_btn.click()
+
+                self._run_archive(tab, interact)
+                self.assertEqual(tab.project_sound.state.selected_track_id, "handoff-1")
+                self.assertEqual(tab.player.current_track_id, "handoff-1")
+                if state == "playing":
+                    self._wait_for(tab.player.is_playing, "The chosen replacement song did not start")
+                else:
+                    self._wait_for(lambda: tab.player.player.duration() > 0, "The replacement song did not load")
+                self.assertEqual(tab.player.is_playing(), state == "playing")
+
+    def test_archive_handoff_preserves_an_in_progress_crossfade(self) -> None:
+        with self._handoff_tab(playlist=True) as tab:
+            tab.player.seek(tab.player.player.duration() - 850)
+            self._wait_for(
+                lambda: tab.player._transitioning and all(
+                    player.playbackState() == QMediaPlayer.PlayingState for player in tab.player.players
+                ), "Crossfade did not start",
+            )
+            snapshot = []
+
+            def interact(dialog):
+                self._select_preview(dialog, "handoff-0")
+                self.assertTrue(all(player.playbackState() == QMediaPlayer.PausedState for player in tab.player.players))
+                snapshot.extend(player.position() for player in tab.player.players)
+                elapsed = tab.player._crossfade_elapsed
+                volumes = [output.volume() for output in tab.player.outputs]
+                QtTest.QTest.qWait(1100)
+                self.assertEqual([player.position() for player in tab.player.players], snapshot)
+                self.assertEqual(tab.player._crossfade_elapsed, elapsed)
+                self.assertEqual([output.volume() for output in tab.player.outputs], volumes)
+
+            self._run_archive(tab, interact)
+            self.assertTrue(tab.player._crossfade_timer.isActive())
+            self.assertEqual([player.position() for player in tab.player.players], snapshot)
+            self._wait_for(lambda: tab.player.current_track_id == "handoff-1", "Crossfade did not resume")
+
+    def test_archive_handoff_suspends_pending_loop_until_close(self) -> None:
+        with self._handoff_tab() as tab:
+            tab.player.seek(tab.player.player.duration() - 60)
+            self._wait_for(tab.player._loop_timer.isActive, "Natural end did not schedule the loop")
+            interval = tab.player._loop_timer.interval()
+
+            def interact(dialog):
+                self._select_preview(dialog, "handoff-1")
+                self.assertFalse(tab.player._loop_timer.isActive())
+                QtTest.QTest.qWait(interval + 100)
+                self.assertFalse(tab.player.is_playing())
+
+            self._run_archive(tab, interact)
+            self.assertTrue(tab.player._loop_timer.isActive())
+            self.assertEqual(tab.player._loop_timer.interval(), interval)
+            self._wait_for(tab.player.is_playing, "Natural loop did not resume")
 
     def test_music_mode_changes_use_blip_only_when_mode_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

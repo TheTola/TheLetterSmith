@@ -32,7 +32,10 @@ from settings_store import (
     SettingsStore,
     VISIONARY_URL_KEY,
 )
-from window_chrome import MINIMIZE_SYMBOL, StandardTitleBar
+from window_chrome import (
+    MINIMIZE_SYMBOL, StandardTitleBar, bounded_window_geometry,
+    place_window_on_launcher, screen_for_launcher,
+)
 from transactional_io import atomic_write_text, safe_write_json, set_path_hidden
 from ui_dialogs import LetterSmithConfirmationDialog, show_lettersmith_message
 from ui_help import set_control_help
@@ -443,7 +446,7 @@ class ClickThroughNotice(QtWidgets.QLabel):
 
         anchor_top = anchor.mapToGlobal(QtCore.QPoint(0, 0))
         anchor_center = anchor.mapToGlobal(anchor.rect().center())
-        screen = anchor.screen() or QtGui.QGuiApplication.screenAt(anchor_center)
+        screen = screen_for_launcher(anchor)
         available = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1280, 720)
         x = anchor_center.x() - (self.width() // 2)
         y = anchor_top.y() - self.height() - 8
@@ -513,9 +516,8 @@ class ListManagerDialog(QtWidgets.QDialog):
         if app is not None:
             app.installEventFilter(self)
 
-        screen = (parent.screen() if parent else QtGui.QGuiApplication.primaryScreen())
+        screen = screen_for_launcher(parent)
         available = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1280, 720)
-        self._available_geometry = available
         default_height = max(260, min(available.height() - 240, 360))
 
         self.resize(500, default_height)
@@ -789,18 +791,7 @@ class ListManagerDialog(QtWidgets.QDialog):
             del self._entries[header_index]
 
     def _position_within_screen(self) -> None:
-        available = self._available_geometry
-        parent = self.parentWidget()
-        center = parent.frameGeometry().center() if parent is not None and parent.isVisible() else available.center()
-        geo = self.frameGeometry()
-        geo.moveCenter(center)
-
-        max_x = available.left() + max(0, available.width() - geo.width())
-        max_y = available.top() + max(0, available.height() - geo.height())
-        self.move(
-            max(available.left(), min(geo.x(), max_x)),
-            max(available.top(), min(geo.y(), max_y)),
-        )
+        place_window_on_launcher(self)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
@@ -3822,7 +3813,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             )
 
     def _on_close(self):
-        if self._shutdown:
+        if self._shutdown or self._hide_timer.isActive():
             return
         self._proofread_visible_prompt_fields("close")
         if not self._persist_state_now():
@@ -3831,8 +3822,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 "Prompt Writer",
                 "The current Prompt Writer state could not be saved.",
             )
-        self.dismissed.emit()
         self.popdown()
+        self.dismissed.emit()
+
+    close_with_anim = _on_close
 
     def _start_visionary_pulse(self):
         try:
@@ -3883,13 +3876,19 @@ class PromptWriterPanel(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def popup(self):
+    @property
+    def is_open(self) -> bool:
+        """A closing animation is already closed for toggle/show requests."""
+        return not self._shutdown and self.isVisible() and not self._hide_timer.isActive()
+
+    def popup(self, launcher: Optional[QtWidgets.QWidget] = None):
+        was_open = self.is_open
         self._hide_timer.stop()
         self._animation_generation += 1
         if self._shutdown:
             return
         was_visible = self.isVisible()
-        if self._proofread_visible_prompt_fields("open"):
+        if not was_open and self._proofread_visible_prompt_fields("open"):
             if not self._persist_state_now():
                 LOGGER.warning(
                     "Prompt Writer open-time proofreading could not be persisted"
@@ -3902,29 +3901,33 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         if self.isMinimized():
             self.showNormal()
-        self.show()
-        self.raise_()
-
-        screen_obj = self.screen() or QtGui.QGuiApplication.primaryScreen()
-        avail = screen_obj.availableGeometry() if screen_obj else QtGui.QGuiApplication.primaryScreen().availableGeometry()
+        launcher = launcher if launcher is not None else self.parentWidget()
+        screen_obj = screen_for_launcher(launcher)
+        if screen_obj is None:
+            return
+        avail = screen_obj.availableGeometry()
 
         w = min(int(avail.width() * 0.816), 1104)
         h = min(int(avail.height() * 0.84), 860)
         target = QtCore.QRect(avail.x() + 24, avail.y() + 24, w, h)
+        if launcher is not None:
+            target.moveTopLeft(launcher.mapToGlobal(QtCore.QPoint(0, launcher.height() + 8)))
         if self._normal_geometry is not None and self._normal_geometry.isValid():
-            saved = self._normal_geometry
-            w = min(max(self.minimumWidth(), saved.width()), avail.width())
-            h = min(max(self.minimumHeight(), saved.height()), avail.height())
-            x = max(avail.left(), min(saved.x(), avail.right() - w + 1))
-            y = max(avail.top(), min(saved.y(), avail.bottom() - h + 1))
-            target = QtCore.QRect(x, y, w, h)
-        off = QtCore.QRect(target.x() - w, target.y(), w, h)
-
-        current = self.geometry()
-        if was_visible and not self.isMaximized():
-            target = current
-            off = current
+            target = QtCore.QRect(self._normal_geometry)
+        if was_open and not self.isMaximized():
+            target = self.geometry()
         self.setWindowOpacity(0.0 if not was_visible else min(1.0, self.windowOpacity()))
+        place_window_on_launcher(self, launcher, geometry=target, near=True)
+        self.show()
+        self.raise_()
+        target = place_window_on_launcher(self, launcher, geometry=target, near=True)
+        if was_open or self.isMaximized():
+            self.setWindowOpacity(1.0)
+            return
+        # Keep the slide animation on the same screen throughout its duration.
+        off = bounded_window_geometry(target.translated(-32, 0), avail, self.minimumSize())
+        if was_visible:
+            off = target
         self.setGeometry(off)
         self._geom_anim.stop(); self._geom_anim.setDuration(260)
         self._geom_anim.setStartValue(off); self._geom_anim.setEndValue(target)
@@ -3932,8 +3935,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._geom_anim.start()
 
         self._fade_anim.stop(); self._fade_anim.setDuration(220)
-        self._fade_anim.setStartValue(0.0); self._fade_anim.setEndValue(1.0)
-        self._fade_anim.finished.connect(lambda: self.setWindowOpacity(1.0), Qt.SingleShotConnection)
+        self._fade_anim.setStartValue(self.windowOpacity()); self._fade_anim.setEndValue(1.0)
         self._fade_anim.start()
 
     open_with_anim = popup
@@ -3955,7 +3957,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._fade_anim.stop()
         geom = self.geometry()
         self._normal_geometry = QtCore.QRect(geom)
-        off = QtCore.QRect(geom.x() - geom.width() - 20, geom.y(), geom.width(), geom.height())
+        screen = self.screen()
+        off = bounded_window_geometry(geom.translated(-32, 0), screen.availableGeometry()) if screen else geom
         self._geom_anim.stop(); self._geom_anim.setDuration(200)
         self._geom_anim.setEasingCurve(QEasingCurve.InCubic)
         self._geom_anim.setStartValue(geom); self._geom_anim.setEndValue(off)
@@ -3969,6 +3972,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def _finish_close_animation(self) -> None:
         if self._shutdown:
             return
+        self._hide_timer.stop()
         self._geom_anim.stop()
         self._fade_anim.stop()
         self.setWindowOpacity(0.0)
@@ -4009,7 +4013,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 pass
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        self.shutdown()
+        if not self._shutdown:
+            self._on_close()
+            self._finish_close_animation()
         super().closeEvent(event)
 
     def hide(self):

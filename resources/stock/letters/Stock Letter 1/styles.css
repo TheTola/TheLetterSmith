@@ -78,15 +78,15 @@ button{margin:0;border:0;background:none;color:inherit}
 }
 body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 
-#curtain-overlay{position:absolute;inset:0;z-index:9999;overflow:hidden;pointer-events:all;opacity:0;background:var(--stage-backdrop);will-change:opacity}
+#curtain-overlay{position:absolute;inset:0;z-index:9999;overflow:hidden;pointer-events:all;opacity:0;background:var(--stage-backdrop);will-change:opacity;cursor:default;user-select:none;-webkit-user-select:none;caret-color:transparent;touch-action:manipulation}
+#curtain-overlay[tabindex]{z-index:10003}
 #curtain-overlay.is-visible{animation:curtainIntroFadeIn var(--motion-major) forwards}
 #curtain-left,#curtain-right{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;z-index:10000;pointer-events:none;opacity:0;will-change:opacity,transform}
 #curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right{animation:curtainPanelFadeIn var(--motion-major) forwards}
 #curtain-overlay.curtain-fallback #curtain-left,#curtain-overlay.curtain-fallback #curtain-right{display:none}
-#begin-button{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);min-width:min(80vw,280px);padding:14px 30px;border:1px solid rgba(155,255,251,.42);border-radius:var(--pill-radius);background:linear-gradient(180deg,rgba(15,24,38,.88),rgba(6,10,18,.72));color:var(--text-main);font-size:clamp(22px,3.2vw,42px);font-weight:700;letter-spacing:.02em;cursor:pointer;z-index:10001;animation:pulse var(--duration-attention) infinite;box-shadow:var(--hud-shadow),0 0 0 1px rgba(0,255,255,.14)}
+#begin-button{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);min-width:min(80vw,280px);padding:14px 30px;border:1px solid rgba(155,255,251,.42);border-radius:var(--pill-radius);background:linear-gradient(180deg,rgba(15,24,38,.88),rgba(6,10,18,.72));color:var(--text-main);font-size:clamp(22px,3.2vw,42px);font-weight:700;letter-spacing:.02em;text-align:center;cursor:default;pointer-events:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;caret-color:transparent;z-index:10001;animation:pulse var(--duration-attention) infinite;box-shadow:var(--hud-shadow),0 0 0 1px rgba(0,255,255,.14)}
 #curtain-overlay:not(.is-visible) #begin-button{opacity:0}
 #begin-button.is-dismissed{animation:none;opacity:0;visibility:hidden;transition:opacity 160ms ease-out,visibility 0s linear 160ms}
-#begin-button:hover{background:linear-gradient(180deg,rgba(20,31,48,.94),rgba(8,12,20,.84))}
 #title-banner{position:absolute;top:50%;left:50%;z-index:10002;width:min(94vw,1000px,92vh);aspect-ratio:1/1;container-type:inline-size;display:grid;place-items:center;visibility:hidden;opacity:0;pointer-events:none;transform:translate(-50%,-50%) scale(.92);color:rgb(var(--title-banner-text-rgb));filter:drop-shadow(0 12px 20px rgba(0,0,0,.5));will-change:opacity,transform}
 #title-banner-art{grid-area:1/1;width:100%;height:100%;object-fit:contain;pointer-events:none;user-select:none}
 #title-banner span{grid-area:1/1;position:relative;z-index:1;width:68%;max-width:68%;font-family:var(--font-letter);font-size:6.8cqw;font-weight:700;font-style:italic;line-height:1.08;letter-spacing:.025em;text-align:center;overflow-wrap:anywhere;text-shadow:0 1px 0 rgba(255,255,255,.4),0 4px 9px rgba(0,0,0,.72);-webkit-text-stroke:clamp(1px,.18cqw,2px) rgba(0,0,0,.68);paint-order:stroke fill}
@@ -112,7 +112,7 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .nav-button:hover,.hud-button:hover{background:linear-gradient(180deg,rgba(25,37,55,.88),rgba(10,14,24,.76));border-color:var(--hud-border-strong);box-shadow:var(--hud-shadow-strong)}
 .nav-button:active,.hud-button:active{transform:scale(.98)}
 .nav-button img,.hud-button img{display:block;width:100%;height:100%;object-fit:contain;pointer-events:none;filter:drop-shadow(0 6px 12px rgba(0,0,0,.34))}
-#begin-button:focus-visible,.nav-button:focus-visible,.hud-button:focus-visible,#volume-slider:focus-visible{outline:3px solid rgba(255,255,255,.94);outline-offset:4px}
+.nav-button:focus-visible,.hud-button:focus-visible,#volume-slider:focus-visible{outline:3px solid rgba(255,255,255,.94);outline-offset:4px}
 
 .nav-button{position:absolute;top:calc(50% + 27px);width:calc(var(--nav-size) + (2 * var(--nav-pad)));height:calc(var(--nav-size) + (2 * var(--nav-pad)));padding:var(--nav-pad);border-radius:50%;z-index:100}
 #prev{left:var(--nav-offset);transform:translateY(-50%)}

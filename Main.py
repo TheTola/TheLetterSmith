@@ -409,8 +409,10 @@ def bootstrap_qt(
         )
 
     from ui_theme import install_button_text_guard
+    from window_chrome import install_window_placement_guard
 
     install_button_text_guard(application)
+    install_window_placement_guard(application)
     return application
 
 

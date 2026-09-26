@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import re
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -17,7 +17,7 @@ from letter_page import MESSAGE_RENDER_FONT_FAMILY, MESSAGE_RENDER_FONT_SIZE
 from settings_store import SettingsStore
 
 
-STYLE_SCHEMA_VERSION = 1
+STYLE_SCHEMA_VERSION = 2
 STYLE_KEYS = (
     "normal_text",
     "subtitle",
@@ -63,7 +63,7 @@ STYLE_PROPERTIES = tuple(
         "strikethrough",
     )
 )
-DOCUMENT_STYLE_SCHEMA_VERSION = 1
+DOCUMENT_STYLE_SCHEMA_VERSION = 2
 MAX_STYLE_BLOCKS = 50_000
 MAX_STYLE_OVERRIDE_SPANS = 250_000
 MAX_STYLE_BLOCK_LENGTH = 1_000_000
@@ -83,6 +83,67 @@ def _validate_style_key(key: str) -> None:
 
 
 @dataclass(frozen=True)
+class ParagraphStyleDefinition:
+    alignment: int = 1
+    direction: int = 2
+    line_height: float = 0
+    line_height_type: int = 0
+    top_margin: float = 0
+    bottom_margin: float = 0
+    left_margin: float = 0
+    right_margin: float = 0
+    text_indent: float = 0
+    indent: int = 0
+    list_style: int | None = None
+    list_indent: int = 1
+    list_prefix: str | None = None
+    list_suffix: str | None = None
+    list_start: int = 1
+
+    def __post_init__(self) -> None:
+        for name, lower, upper in (
+            ("alignment", 0, 0x1ff),
+            ("direction", 0, 2),
+            ("line_height_type", 0, 4),
+            ("indent", 0, 1000),
+            ("list_indent", 0, 1000),
+            ("list_start", -(2**31), 2**31 - 1),
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or not lower <= value <= upper:
+                raise InvalidStyleSetError(f"Invalid paragraph {name}")
+        for name in (
+            "line_height", "top_margin", "bottom_margin", "left_margin",
+            "right_margin", "text_indent",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or abs(value) > 1_000_000
+            ):
+                raise InvalidStyleSetError(f"Invalid paragraph {name}")
+        if self.list_style is not None and (
+            type(self.list_style) is not int or self.list_style not in range(-8, 0)
+        ):
+            raise InvalidStyleSetError("Invalid paragraph list style")
+        for name in ("list_prefix", "list_suffix"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or len(value) > 255):
+                raise InvalidStyleSetError(f"Invalid paragraph {name}")
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: object) -> ParagraphStyleDefinition:
+        if not isinstance(data, Mapping) or set(data) != {field.name for field in fields(cls)}:
+            raise InvalidStyleSetError("Incomplete paragraph style")
+        return cls(**data)
+
+
+@dataclass(frozen=True)
 class StyleDefinition:
     font_family: str
     font_size: float
@@ -91,6 +152,8 @@ class StyleDefinition:
     italic: bool
     underline: bool
     strikethrough: bool
+    # Legacy styles have no paragraph baseline and retain existing layout.
+    paragraph: ParagraphStyleDefinition | None = None
 
     def __post_init__(self) -> None:
         family = self.font_family
@@ -121,6 +184,8 @@ class StyleDefinition:
         for name in ("italic", "underline", "strikethrough"):
             if not isinstance(getattr(self, name), bool):
                 raise InvalidStyleSetError(f"Invalid {name} value")
+        if self.paragraph is not None and not isinstance(self.paragraph, ParagraphStyleDefinition):
+            raise InvalidStyleSetError("Invalid paragraph style")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -131,14 +196,20 @@ class StyleDefinition:
             "italic": self.italic,
             "underline": self.underline,
             "strikethrough": self.strikethrough,
+            "paragraph": self.paragraph.to_dict() if self.paragraph is not None else None,
         }
 
     @classmethod
     def from_dict(cls, data: object) -> StyleDefinition:
-        if not isinstance(data, Mapping) or set(data) != _STYLE_FIELDS:
+        if not isinstance(data, Mapping) or set(data) not in (
+            _STYLE_FIELDS, _STYLE_FIELDS | {"paragraph"},
+        ):
             raise InvalidStyleSetError("Incomplete named text style")
+        values = dict(data)
+        if values.get("paragraph") is not None:
+            values["paragraph"] = ParagraphStyleDefinition.from_dict(values["paragraph"])
         try:
-            return cls(**data)
+            return cls(**values)
         except TypeError as error:
             raise InvalidStyleSetError("Malformed named text style") from error
 
@@ -162,14 +233,13 @@ class NamedStyleSet:
         return self.definitions[key]
 
     def update_style(self, key: str, definition: StyleDefinition) -> NamedStyleSet:
-        """Explicit Update; propagate only a changed Normal font family."""
+        """Explicit Update; propagate only Normal's resulting font family."""
         _validate_style_key(key)
         if not isinstance(definition, StyleDefinition):
             raise InvalidStyleSetError("Invalid named text style definition")
         updated = dict(self.definitions)
-        old_family = updated["normal_text"].font_family
         updated[key] = definition
-        if key == "normal_text" and definition.font_family != old_family:
+        if key == "normal_text":
             for other_key in STYLE_KEYS[1:]:
                 updated[other_key] = replace(
                     updated[other_key], font_family=definition.font_family
@@ -189,7 +259,7 @@ class NamedStyleSet:
         if not isinstance(data, Mapping) or set(data) != {"version", "styles"}:
             raise InvalidStyleSetError("Incomplete style set")
         version = data["version"]
-        if type(version) is not int or version != STYLE_SCHEMA_VERSION:
+        if type(version) is not int or version not in (1, STYLE_SCHEMA_VERSION):
             raise InvalidStyleSetError(f"Unsupported style set version: {version!r}")
         styles = data["styles"]
         if not isinstance(styles, Mapping) or set(styles) != set(STYLE_KEYS):
@@ -277,7 +347,7 @@ def validate_document_style_state(
     }:
         raise InvalidStyleSetError("Incomplete document style state")
     version = data["schema_version"]
-    if type(version) is not int or version != DOCUMENT_STYLE_SCHEMA_VERSION:
+    if type(version) is not int or version not in (1, DOCUMENT_STYLE_SCHEMA_VERSION):
         raise InvalidStyleSetError(f"Unsupported document style version: {version!r}")
     definitions = NamedStyleSet.from_dict(data["definitions"])
     blocks = data["blocks"]

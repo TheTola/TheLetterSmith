@@ -27,9 +27,8 @@ def _available_font(font: QFont, requested_family: str) -> QFont:
 
 
 def preview_font(definition: StyleDefinition, base_font: QFont) -> QFont:
-    """Return the font used to draw a named style's menu label."""
+    """Preview style appearance at the UI font size, independent of document size."""
     font = QFont(base_font)
-    font.setPointSizeF(definition.font_size)
     font.setWeight(QFont.Weight(definition.font_weight))
     font.setItalic(definition.italic)
     font.setUnderline(definition.underline)
@@ -72,6 +71,33 @@ class _StylePreviewRow(QWidget):
         arrow = QLabel("▸", self)
         arrow.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         layout.addWidget(arrow)
+
+
+class StyleSelectionMenu(QMenu):
+    """Apply a style from its label; retain the arrow for its options submenu."""
+
+    def _apply_action(self, action) -> bool:
+        if action is None or not hasattr(action, "_named_text_preview_row"):
+            return False
+        self.close()
+        action.trigger()
+        return True
+
+    def mouseReleaseEvent(self, event) -> None:
+        action = self.actionAt(event.position().toPoint())
+        if (event.button() == Qt.LeftButton and action is not None
+                and event.position().x() < self.actionGeometry(action).right() - 28
+                and self._apply_action(action)):
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if (event.key() in (Qt.Key_Return, Qt.Key_Enter)
+                and self._apply_action(self.activeAction())):
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 def add_style_preview_submenu(menu: QMenu, label: str) -> QMenu:

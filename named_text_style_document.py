@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from PySide6.QtCore import Qt
@@ -22,6 +22,7 @@ from PySide6.QtGui import (
     QTextCharFormat,
     QTextCursor,
     QTextFormat,
+    QTextListFormat,
 )
 from PySide6.QtWidgets import QTextEdit
 
@@ -30,6 +31,7 @@ from named_text_styles import (
     STYLE_KEYS,
     STYLE_PROPERTIES,
     NamedStyleSet,
+    ParagraphStyleDefinition,
     StyleDefinition,
     validate_document_style_state,
 )
@@ -47,6 +49,19 @@ _ROOT_TABLE_OPEN = re.compile(
 _ROOT_TABLE_CLOSE = re.compile(
     r'(?is)</td>\s*</tr>\s*</table>(\s*</body>)'
 )
+_LIST_ITEM_OPEN = re.compile(r'(?is)<li\b[^>]*>')
+_STYLE_ATTRIBUTE = re.compile(r'(?is)\sstyle="([^"]*)"')
+
+
+def _merge_list_item_styles(match: re.Match[str]) -> str:
+    tag = match.group()
+    styles = _STYLE_ATTRIBUTE.findall(tag)
+    if len(styles) < 2:
+        return tag
+    # Qt emits separate character and paragraph style attributes on <li>.
+    # Combine them before HTML consumers discard the duplicate attribute.
+    combined = "; ".join(style.strip().rstrip(";") for style in styles)
+    return _STYLE_ATTRIBUTE.sub("", tag)[:-1] + f' style="{combined}">'
 
 
 @dataclass
@@ -94,6 +109,34 @@ def _apply_definition(
         fmt.setFontUnderline(definition.underline)
     if not skip_bits & _BITS["strikethrough"]:
         fmt.setFontStrikeOut(definition.strikethrough)
+
+
+def _list_properties(fmt: QTextListFormat) -> dict[str, object]:
+    return {
+        "list_style": fmt.style().value,
+        "list_indent": fmt.indent(),
+        "list_prefix": fmt.numberPrefix() if fmt.hasProperty(QTextFormat.ListNumberPrefix) else None,
+        "list_suffix": fmt.numberSuffix() if fmt.hasProperty(QTextFormat.ListNumberSuffix) else None,
+        "list_start": fmt.start(),
+    }
+
+
+def _paragraph_definition(block: QTextBlock) -> ParagraphStyleDefinition:
+    fmt = block.blockFormat()
+    text_list = block.textList()
+    return ParagraphStyleDefinition(
+        alignment=int(fmt.alignment()),
+        direction=fmt.layoutDirection().value,
+        line_height=fmt.lineHeight(),
+        line_height_type=fmt.lineHeightType(),
+        top_margin=fmt.topMargin(),
+        bottom_margin=fmt.bottomMargin(),
+        left_margin=fmt.leftMargin(),
+        right_margin=fmt.rightMargin(),
+        text_indent=fmt.textIndent(),
+        indent=fmt.indent(),
+        **(_list_properties(text_list.format()) if text_list is not None else {}),
+    )
 
 
 class NamedTextStyleDocument:
@@ -215,8 +258,11 @@ class NamedTextStyleDocument:
         definition: StyleDefinition,
         *,
         clear_overrides: bool,
+        apply_paragraph: bool = False,
         promote_range: tuple[int, int] | None = None,
     ) -> None:
+        if clear_overrides or apply_paragraph:
+            self._format_paragraph(block, definition.paragraph)
         for start, end, old_format in self._text_fragments(block):
             fmt = QTextCharFormat(old_format)
             bits = 0 if clear_overrides else _override_bits(fmt)
@@ -245,6 +291,56 @@ class NamedTextStyleDocument:
         block_cursor.setBlockCharFormat(fmt)
         if self.editor.textCursor().block() == block and not self.editor.textCursor().hasSelection():
             self.editor.setCurrentCharFormat(fmt)
+
+    @staticmethod
+    def _format_paragraph(
+        block: QTextBlock, definition: ParagraphStyleDefinition | None
+    ) -> None:
+        if definition is None:
+            return
+        cursor = QTextCursor(block)
+        current_list = block.textList()
+        if definition.list_style is None:
+            if current_list is not None:
+                current_list.remove(block)
+        else:
+            list_format = QTextListFormat()
+            list_format.setStyle(QTextListFormat.Style(definition.list_style))
+            list_format.setIndent(definition.list_indent)
+            # An unset suffix uses Qt's default period; an explicit empty
+            # suffix removes it. Keep that distinction when copying a list.
+            if definition.list_prefix is not None:
+                list_format.setNumberPrefix(definition.list_prefix)
+            if definition.list_suffix is not None:
+                list_format.setNumberSuffix(definition.list_suffix)
+            list_format.setStart(definition.list_start)
+            wanted = _list_properties(list_format)
+            if current_list is None or _list_properties(current_list.format()) != wanted:
+                if current_list is not None:
+                    current_list.remove(block)
+                # Consecutive paragraphs share numbering. Do not change the
+                # format of an existing list containing unrelated paragraphs.
+                previous = block.previous()
+                previous_list = previous.textList() if previous.isValid() else None
+                if (
+                    previous_list is not None
+                    and _list_properties(previous_list.format()) == wanted
+                    and QTextCursor(previous).currentFrame() == cursor.currentFrame()
+                ):
+                    previous_list.add(block)
+                else:
+                    cursor.createList(list_format)
+        fmt = cursor.blockFormat()
+        fmt.setAlignment(Qt.Alignment(definition.alignment))
+        fmt.setLayoutDirection(Qt.LayoutDirection(definition.direction))
+        fmt.setLineHeight(definition.line_height, definition.line_height_type)
+        fmt.setTopMargin(definition.top_margin)
+        fmt.setBottomMargin(definition.bottom_margin)
+        fmt.setLeftMargin(definition.left_margin)
+        fmt.setRightMargin(definition.right_margin)
+        fmt.setTextIndent(definition.text_indent)
+        fmt.setIndent(definition.indent)
+        cursor.setBlockFormat(fmt)
 
     def sync_empty_insertion_format(self) -> None:
         """Restore an empty styled paragraph's insertion format after navigation."""
@@ -352,21 +448,22 @@ class NamedTextStyleDocument:
     def _sample_definition(self) -> StyleDefinition | None:
         cursor = self.editor.textCursor()
         if not cursor.hasSelection():
-            return self._definition_from_format(self.editor.currentCharFormat())
-        start, end = cursor.selectionStart(), cursor.selectionEnd()
-        sample: StyleDefinition | None = None
-        block = self.editor.document().findBlock(start)
-        while block.isValid() and block.position() < end:
-            for span_start, span_end, fmt in self._text_fragments(block):
-                if span_end <= start or span_start >= end:
-                    continue
-                definition = self._definition_from_format(fmt)
-                if sample is None:
-                    sample = definition
-                elif definition != sample:
-                    return None
-            block = block.next()
-        return sample
+            return replace(
+                self._definition_from_format(self.editor.currentCharFormat()),
+                paragraph=_paragraph_definition(cursor.block()),
+            )
+        # A heading can contain links or emphasized words. Those runs must not
+        # disable Update to Match. Sample its first selected character and
+        # paragraph consistently, regardless of selection direction.
+        sample = QTextCursor(self.editor.document())
+        sample.setPosition(cursor.selectionStart())
+        block = sample.block()
+        if block.length() > 1:
+            sample.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor)
+        return replace(
+            self._definition_from_format(sample.charFormat()),
+            paragraph=_paragraph_definition(block),
+        )
 
     def can_sample(self) -> bool:
         return self._sample_definition() is not None
@@ -431,6 +528,8 @@ class NamedTextStyleDocument:
         promote_key: str | None = None,
         source_range: tuple[int, int] | None = None,
     ) -> None:
+        previous_set = self.active_set
+
         def change(_work: QTextCursor) -> None:
             self._write_root_set(style_set)
             self.active_set = style_set
@@ -442,6 +541,9 @@ class NamedTextStyleDocument:
                         block,
                         style_set.get(key),
                         clear_overrides=False,
+                        apply_paragraph=(
+                            style_set.get(key).paragraph != previous_set.get(key).paragraph
+                        ),
                         promote_range=(
                             source_range if key == promote_key else None
                         ),
@@ -550,6 +652,7 @@ class NamedTextStyleDocument:
         def change(_work: QTextCursor) -> None:
             cursor.insertBlock()
             self._set_block_style(cursor.block(), "normal_text")
+            self._format_paragraph(cursor.block(), self.active_set.get("normal_text").paragraph)
             fmt = QTextCharFormat(cursor.charFormat())
             _apply_definition(fmt, self.active_set.get("normal_text"))
             _set_override_bits(fmt, 0)
@@ -700,7 +803,7 @@ class NamedTextStyleDocument:
 
     def export_html(self) -> str:
         """Return Qt HTML without the root-frame table used for undo state."""
-        html = self.editor.toHtml()
+        html = _LIST_ITEM_OPEN.sub(_merge_list_item_styles, self.editor.toHtml())
         opened = _ROOT_TABLE_OPEN.search(html)
         if opened is None:
             return html

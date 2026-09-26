@@ -10,6 +10,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QUrl
 
 from app_icon import apply_qt_window_icon
+from window_chrome import place_window_on_launcher
 from config import canonical_play_root, canonical_stock_letters_root
 from project_paths import application_paths
 from publishing.expiration import publication_status
@@ -906,10 +907,11 @@ class CommandBarWindow(QtWidgets.QWidget):
         ):
             return False
         requested = QtCore.QPoint(x, y)
-        target_screen = QtGui.QGuiApplication.screenAt(requested)
-        target_screen = target_screen or screen or self.screen() or self._screen_hint
+        target_screen = screen or self._screen_hint or self.screen()
         target_screen = target_screen or QtGui.QGuiApplication.primaryScreen()
-        self.move_within_screen(requested, screen=target_screen)
+        place_window_on_launcher(
+            self, geometry=QtCore.QRect(requested, self.size()), screen=target_screen,
+        )
         return True
 
     def move_within_screen(
@@ -995,10 +997,9 @@ class CommandBarWindow(QtWidgets.QWidget):
             self._scan_timer.start()
             self._scan_initial_timer.start(0)
         if self._expanded_position is not None:
-            target_screen = QtGui.QGuiApplication.screenAt(self._expanded_position)
-            self.move_within_screen(
-                self._expanded_position,
-                screen=target_screen or self.screen() or self._screen_hint,
+            place_window_on_launcher(
+                self, geometry=QtCore.QRect(self._expanded_position, self.size()),
+                screen=self.screen() or self._screen_hint,
             )
         else:
             self._position_on_screen()

@@ -7,7 +7,7 @@ from dataclasses import replace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QMimeData
-from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QFont, QTextCharFormat, QTextCursor, QTextListFormat
 from PySide6.QtWidgets import QApplication, QTextEdit
 
 from named_text_style_document import NamedTextStyleDocument
@@ -106,6 +106,61 @@ class NamedTextStyleDocumentTests(unittest.TestCase):
         )
         styles.update_style("normal_text")
         self.assertEqual(styles.serialize()["blocks"][0]["overrides"], [])
+
+    def test_learned_list_styles_share_numbering_and_detach_only_styled_blocks(self) -> None:
+        editor = QTextEdit()
+        editor.setPlainText("One\nTwo\nThree\nPlain")
+        styles = NamedTextStyleDocument(editor, default_style_set())
+        first = editor.document().firstBlock()
+        second = first.next()
+        third = second.next()
+        plain = third.next()
+        editor.setTextCursor(QTextCursor(plain))
+        styles.update_style("normal_text")
+        cursor = QTextCursor(first)
+        cursor.setPosition(plain.position() - 1, QTextCursor.KeepAnchor)
+        list_format = QTextListFormat()
+        list_format.setStyle(QTextListFormat.ListDisc)
+        cursor.createList(list_format)
+        editor.setTextCursor(QTextCursor(first))
+        styles.update_style("title")
+        self.assertEqual(styles.active_set.get("title").paragraph.list_style, -1)
+
+        # Applying the learned plain style removes one item, not its siblings.
+        editor.setTextCursor(QTextCursor(second))
+        styles.apply_style("normal_text")
+        self.assertIsNone(second.textList())
+        self.assertEqual(first.textList(), third.textList())
+        self.assertEqual(first.textList().count(), 2)
+        styles.apply_style("title")
+        self.assertEqual(first.textList(), second.textList())
+        self.assertEqual(first.textList().count(), 3)
+
+        cursor = QTextCursor(plain)
+        list_format.setStyle(QTextListFormat.ListDecimal)
+        list_format.setStart(3)
+        cursor.createList(list_format)
+        editor.setTextCursor(cursor)
+        styles.update_style("heading_1")
+        cursor = QTextCursor(first)
+        cursor.setPosition(third.position() - 1, QTextCursor.KeepAnchor)
+        editor.setTextCursor(cursor)
+        styles.apply_style("heading_1")
+        self.assertEqual(first.textList(), second.textList())
+        self.assertEqual(first.textList().itemText(first), "3.")
+        self.assertEqual(second.textList().itemText(second), "4.")
+        self.assertEqual(third.textList().format().style(), QTextListFormat.ListDisc)
+        self.assertEqual(third.textList().count(), 1)
+        editor.undo()
+        self.assertEqual(first.textList(), third.textList())
+        self.assertEqual(first.textList().count(), 3)
+        list_format.setNumberSuffix("")
+        plain.textList().setFormat(list_format)
+        editor.setTextCursor(QTextCursor(plain))
+        styles.update_style("heading_2")
+        editor.setTextCursor(QTextCursor(first))
+        styles.apply_style("heading_2")
+        self.assertEqual(first.textList().itemText(first), "3")
 
 
 if __name__ == "__main__":

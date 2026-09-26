@@ -194,6 +194,9 @@ _ANCHOR_INLINE_TAGS = frozenset(
 _SAFE_STYLE_PROPERTIES = frozenset(
     {
         "-qt-block-indent",
+        "-qt-list-indent",
+        "-qt-list-number-prefix",
+        "-qt-list-number-suffix",
         "background-color",
         "border",
         "border-bottom",
@@ -289,7 +292,7 @@ _QT_DEFAULTS_STYLE = (
     "</style>"
 )
 
-_STYLE_STATE_COMMENT_PREFIX = "lettersmith-style-state:v1:"
+_SUPPORTED_STYLE_STATE_VERSIONS = (1, 2)
 _STYLE_STATE_COMMENT_RE = re.compile(
     r"<!--\s*lettersmith-style-state:[\s\S]*?-->",
     re.IGNORECASE,
@@ -350,7 +353,7 @@ def _decode_style_state_comment(
 def _encode_style_state_comment(state: Mapping[str, object]) -> str:
     if not isinstance(state, Mapping) or type(state.get("schema_version")) is not int:
         raise ValueError("Invalid LetterSmith style state")
-    if state["schema_version"] != 1:
+    if state["schema_version"] not in _SUPPORTED_STYLE_STATE_VERSIONS:
         raise ValueError("Unsupported LetterSmith style-state version")
     try:
         payload = json.dumps(
@@ -365,7 +368,7 @@ def _encode_style_state_comment(state: Mapping[str, object]) -> str:
     if len(payload) > MAX_STYLE_STATE_BYTES:
         raise ValueError("LetterSmith style state is too large")
     encoded = base64.b64encode(payload).decode("ascii")
-    return f"<!-- {_STYLE_STATE_COMMENT_PREFIX}{encoded} -->"
+    return f"<!-- lettersmith-style-state:v{state['schema_version']}:{encoded} -->"
 
 
 def strip_lettersmith_style_state(raw: str) -> str:
@@ -393,7 +396,7 @@ def extract_lettersmith_style_state(raw: str) -> dict[str, object] | None:
     if match is None:
         return None
     parsed = _decode_style_state_comment(match.group()[4:-3])
-    return parsed[1] if parsed is not None and parsed[0] == 1 else None
+    return parsed[1] if parsed is not None and parsed[0] in _SUPPORTED_STYLE_STATE_VERSIONS else None
 
 
 def has_unsupported_lettersmith_style_state(raw: str) -> bool:
@@ -403,7 +406,7 @@ def has_unsupported_lettersmith_style_state(raw: str) -> bool:
     if match is None:
         return False
     parsed = _decode_style_state_comment(match.group()[4:-3])
-    return parsed is not None and parsed[0] != 1
+    return parsed is not None and parsed[0] not in _SUPPORTED_STYLE_STATE_VERSIONS
 
 
 def _normalize_newlines(text: str) -> str:

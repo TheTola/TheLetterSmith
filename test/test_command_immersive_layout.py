@@ -154,15 +154,9 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                     )
                     self.assertFalse(window.help_anchor.isVisible())
                     self.assertLessEqual(
-                        abs(
-                            window.help_icon.geometry().center().y()
-                            - (
-                                window.preview_frame.mapTo(
-                                    window.body, QtCore.QPoint(0, 0)
-                                ).y()
-                                + window.preview_frame.height() // 2
-                            )
-                        ),
+                        abs(window.help_icon.geometry().center().y()
+                            - (window.preview_frame.mapTo(window.body, QtCore.QPoint()).y()
+                               + window.preview_frame.height() // 2)),
                         1,
                     )
 
@@ -304,6 +298,8 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
             window = Nexus(temp_dir)
             try:
                 window.show()
+                self.app.processEvents()
+                window.resize(window.width(), 650)
                 self.app.processEvents()
                 self.assertTrue(callable(window.title_bar.parent))
                 self.assertIs(window.title_bar.parent(), window.main_widget)
@@ -745,7 +741,7 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 window.close()
                 self.app.processEvents()
 
-    def test_forge_window_preview_keeps_design_viewport_on_resize(self) -> None:
+    def test_forge_window_preview_scales_above_controls_without_reloading(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             index = root / "preview.html"
@@ -829,8 +825,12 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                         delta=0.02,
                     )
                     measured = browser_viewport()
+                    # WebEngine's 25% zoom floor must not force a side column
+                    # or enlarge the main window on a small available screen.
+                    expected_width = min(FORGE_WINDOW_VIEWPORT.width(), content.width() * 4)
+                    expected_height = min(FORGE_WINDOW_VIEWPORT.height(), content.height() * 4)
                     self.assertLessEqual(
-                        abs(measured["width"] - FORGE_WINDOW_VIEWPORT.width()), 2,
+                        abs(measured["width"] - expected_width), 2,
                         f"{size=} {content=} {view.size()=} "
                         f"{view.zoomFactor()=} {view.isVisible()=} {measured=} "
                         f"mode={window._forge_preview_mode} "
@@ -838,7 +838,7 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                         f"timer={window._preview_geometry_timer.isActive()}",
                     )
                     self.assertLessEqual(
-                        abs(measured["height"] - FORGE_WINDOW_VIEWPORT.height()), 2
+                        abs(measured["height"] - expected_height), 2
                     )
                     self.assertEqual(len(loads), 1)
                     self.assertEqual(window.project_dirty.revision, revision)

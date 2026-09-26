@@ -54,9 +54,11 @@ from recent_media import recent_media, remember_image_copy
 from ui_dialogs import LetterSmithConfirmationDialog, LetterSmithDialog
 from ui_help import set_control_help
 from ui_sounds import UiSound, play_ui_sound
+from window_chrome import place_window_on_launcher
 from ui_theme import (
     PRIMARY_PAGE_LAYOUT,
     ButtonTier,
+    BUTTON_GEOMETRY_SCALE_PROPERTY,
     apply_button_tier,
     apply_tab_heading_style,
 )
@@ -278,15 +280,8 @@ class StockImageDialog(QtWidgets.QDialog):
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
         cursor = QtGui.QCursor.pos()
-        screen = QtGui.QGuiApplication.screenAt(cursor)
-        if screen is None:
-            screen = QtGui.QGuiApplication.primaryScreen()
-        if screen is None:
-            return
-        available = screen.availableGeometry()
-        x = min(max(cursor.x() + 8, available.left()), available.right() - self.width())
-        y = min(max(cursor.y() + 8, available.top()), available.bottom() - self.height())
-        self.move(x, y)
+        target = QtCore.QRect(cursor + QtCore.QPoint(8, 8), self.size())
+        place_window_on_launcher(self, geometry=target, near=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -593,6 +588,10 @@ class _ImageUtilityButton(ArtworkButton):
         self.set_artwork_stretch(False)
         self.set_text_word_wrap(True)
         apply_button_tier(self, ButtonTier.LARGE)
+        _mask_button_to_artwork(self)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
         _mask_button_to_artwork(self)
 
 
@@ -964,8 +963,7 @@ class ImageAssetCard(
             "missing",
         )
 
-        self.setFixedWidth(300)
-        self.setMinimumHeight(270)
+        self.setFixedSize(300, 270)
 
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Fixed,
@@ -1062,6 +1060,8 @@ class ImageAssetCard(
         self.clear_btn.setCursor(
             QtCore.Qt.PointingHandCursor
         )
+        self.clear_btn.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, 1.0)
+        self.clear_btn.apply_theme_assets()
         self.clear_btn.setProperty("themeRole", "clearAction")
         set_control_help(
             self.clear_btn,
@@ -1290,7 +1290,7 @@ class ImageAssetCard(
         )
 
         self.thumbnail.clear()
-        self.thumbnail.setFixedSize(150, 165)
+        self.thumbnail.setFixedSize(self._thumbnail_bounds())
 
         self.thumbnail.setText(
             "Click to select image"
@@ -1312,8 +1312,25 @@ class ImageAssetCard(
             "Settings — select an image before opening"
         )
 
+    def set_card_size(self, size: QtCore.QSize) -> None:
+        scale = min(1.0, max(0.55, (size.width() - 76) / 155))
+        self.clear_btn.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, scale)
+        apply_button_tier(self.clear_btn, ButtonTier.MEDIUM)
+        self.setFixedSize(size)
+        self._rescale()
+
+    def _thumbnail_bounds(self) -> QtCore.QSize:
+        margins = self.layout().contentsMargins()
+        controls = max(self.clear_btn.height(), self.settings_btn.height())
+        return QtCore.QSize(
+            max(40, min(168, self.width() - margins.left() - margins.right() - 2)),
+            max(40, min(155, self.height() - margins.top() - margins.bottom()
+                        - self.title_label.sizeHint().height() - controls
+                        - 2 * self.layout().spacing() - 2)),
+        )
+
     def _rescale(self) -> None:
-        maximum_content = QtCore.QSize(168, 155)
+        maximum_content = self._thumbnail_bounds()
         if self._movie is not None:
             if not self._movie_source_size.isEmpty():
                 content_size = self._movie_source_size.scaled(
@@ -1944,6 +1961,8 @@ class ImageTab(
             self.reset_btn,
             self.open_btn,
         ):
+            button.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, 1.0)
+            button.apply_theme_assets()
             if button.uses_artwork_presentation and not button.has_artwork:
                 button.setStyleSheet(
                     "QPushButton {"
@@ -2021,13 +2040,8 @@ class ImageTab(
             1,
             utility_position_column,
         )
-        self._minimum_cards_width = (
-            root.contentsMargins().left()
-            + root.contentsMargins().right()
-            + max(self.reset_btn.width(), self.open_btn.width())
-            + centered_cards.spacing()
-            + self.cards[1].width()
-        )
+        self._centered_cards = centered_cards
+        self._minimum_cards_width = 380
         self.setMinimumWidth(self._minimum_cards_width)
         policy = self.sizePolicy()
         policy.setHeightForWidth(True)
@@ -2075,7 +2089,7 @@ class ImageTab(
 
         set_control_help(
             self.pwrite_fab,
-            "Open Prompt Writer to create and manage image-generation prompts for your letter.",
+            "Open or close Prompt Writer to create and manage image-generation prompts for your letter.",
             accessible_name="Prompt Writer",
         )
 
@@ -2501,6 +2515,11 @@ class ImageTab(
             )
         )
 
+        # Scale the launcher with the shorter preview, keeping it below the tabs.
+        side = min(200, max(64, preview_frame.height()))
+        self.pwrite_fab.setIconSize(QSize(side, side))
+        self.pwrite_fab.setFixedSize(side, side)
+
         x_position = max(
             0,
             self.FAB_FIXED_X,
@@ -2550,7 +2569,7 @@ class ImageTab(
                 x_position,
                 max(
                     0,
-                    y_position,
+                    max(preview_position.y(), y_position),
                 ),
             )
         )
@@ -2598,29 +2617,49 @@ class ImageTab(
         super().hideEvent(event)
 
     def _columns_for_width(self, width: int) -> int:
-        step = self.cards[1].width() + self._cards_layout.horizontalSpacing()
-        return min(len(self.cards), max(1, 1 + (width - self._minimum_cards_width) // step))
+        # Fit four compact cards before adding a second row. The old 300 px
+        # width made the scroll area's minimum height grow as the window shrank.
+        return min(len(self.cards), max(1, (width - 200) // 174))
 
     def minimumSizeHint(self) -> QtCore.QSize:
-        hint = super().minimumSizeHint()
         if hasattr(self, "_minimum_cards_width"):
-            # A previous four-column grid must not prevent the viewport shrinking.
-            hint.setWidth(self._minimum_cards_width)
-        return hint
+            return QtCore.QSize(self._minimum_cards_width, self.heightForWidth(self.width()))
+        return super().minimumSizeHint()
 
     def heightForWidth(self, width: int) -> int:
         if not hasattr(self, "_minimum_cards_width"):
             return super().heightForWidth(width)
         columns = self._columns_for_width(width)
         rows = (len(self.cards) + columns - 1) // columns
-        previous_rows = (len(self.cards) + self._cards_columns - 1) // self._cards_columns
-        card_height = max(
-            max(card.minimumHeight(), card.minimumSizeHint().height())
-            for card in self.cards.values()
-        )
-        return super().minimumSizeHint().height() + (rows - previous_rows) * (
-            card_height + self._cards_layout.verticalSpacing()
-        )
+        return 88 + rows * 160 + (rows - 1) * self._cards_layout.verticalSpacing()
+
+    def _fit_cards(self) -> None:
+        columns = self._columns_for_width(self.width())
+        rows = (len(self.cards) + columns - 1) // columns
+        margins = self.layout().contentsMargins()
+        scale = min(1.0, max(0.45, (self.width() - 40) / 1600))
+        for button in (self.reset_btn, self.open_btn):
+            button.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, scale)
+            apply_button_tier(button, ButtonTier.LARGE)
+        utility_width = max(self.reset_btn.width(), self.open_btn.width())
+        width = min(300, max(164, (
+            self.width() - margins.left() - margins.right() - utility_width
+            - self._centered_cards.spacing() - (columns - 1) * self._cards_layout.spacing()
+        ) // columns))
+        height = min(270, max(160, (self.height() - 88
+            - (rows - 1) * self._cards_layout.spacing()) // rows))
+        for card in self.cards.values():
+            card.set_card_size(QtCore.QSize(width, height))
+        if columns != self._cards_columns:
+            self._cards_columns = columns
+            for card in self.cards.values():
+                self._cards_layout.removeWidget(card)
+            for index, card in self.cards.items():
+                self._cards_layout.addWidget(
+                    card, (index - 1) // columns, (index - 1) % columns,
+                    QtCore.Qt.AlignTop,
+                )
+            self.updateGeometry()
 
     def resizeEvent(
             self,
@@ -2629,20 +2668,7 @@ class ImageTab(
         super().resizeEvent(event)
 
         if hasattr(self, "_minimum_cards_width"):
-            columns = self._columns_for_width(self.width())
-            if columns != self._cards_columns:
-                self._cards_columns = columns
-                for card in self.cards.values():
-                    self._cards_layout.removeWidget(card)
-                for index, card in self.cards.items():
-                    self._cards_layout.addWidget(
-                        card,
-                        (index - 1) // columns,
-                        (index - 1) % columns,
-                        QtCore.Qt.AlignTop,
-                    )
-                self._cards_layout.invalidate()
-                self.updateGeometry()
+            self._fit_cards()
 
         if not self.isVisible():
             return
@@ -3355,16 +3381,16 @@ class ImageTab(
     ) -> None:
         window = self.window()
 
-        opener = getattr(
+        toggle = getattr(
             window,
-            "open_prompt_writer",
+            "toggle_prompt_writer",
             None,
         )
 
-        if not callable(opener):
+        if not callable(toggle):
             self._show_temporary_status(
                 (
-                    "Prompt Writer opener "
+                    "Prompt Writer toggle "
                     "not found on the main window."
                 ),
                 5000,
@@ -3372,27 +3398,13 @@ class ImageTab(
 
             return
 
-        existing_panel = getattr(
-            window,
-            "_prompt_writer_win",
-            None,
-        )
-
-        was_visible = (
-            isinstance(
-                existing_panel,
-                QtWidgets.QWidget,
-            )
-            and existing_panel.isVisible()
-        )
-
         try:
-            opener()
+            is_open = toggle()
 
         except Exception as error:
             self._show_temporary_status(
                 (
-                    f"Could not open "
+                    f"Could not toggle "
                     f"Prompt Writer: {error}"
                 ),
                 5000,
@@ -3402,9 +3414,9 @@ class ImageTab(
 
         self._show_temporary_status(
             (
-                "Prompt Writer focused."
-                if was_visible
-                else "Prompt Writer opened."
+                "Prompt Writer opened."
+                if is_open
+                else "Prompt Writer closed."
             )
         )
 

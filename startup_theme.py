@@ -8,6 +8,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from project_paths import application_paths
 from settings_store import SettingsStore
 from ui_fonts import resolve_registered_family
+from window_chrome import place_window_on_launcher
 from ui_theme import (
     CELESTIAL_ROSE_THEME,
     DEFAULT_FORGE_THEME_ID,
@@ -299,6 +300,7 @@ class ThemeFamilySelector(QtWidgets.QDialog):
         if not self._position_restored:
             self._position_restored = True
             self._restore_saved_position()
+        place_window_on_launcher(self)
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
         self._persist_current_position()
@@ -328,16 +330,8 @@ class ThemeFamilySelector(QtWidgets.QDialog):
             or isinstance(y, bool)
         ):
             return
-        requested = QtCore.QPoint(x, y)
-        screen = QtGui.QGuiApplication.screenAt(requested)
-        if screen is None:
-            return
-        available = screen.availableGeometry()
-        max_x = max(available.left(), available.right() - self.width() + 1)
-        max_y = max(available.top(), available.bottom() - self.height() + 1)
-        self.move(
-            min(max(requested.x(), available.left()), max_x),
-            min(max(requested.y(), available.top()), max_y),
+        place_window_on_launcher(
+            self, geometry=QtCore.QRect(QtCore.QPoint(x, y), self.size()),
         )
 
     def eventFilter(

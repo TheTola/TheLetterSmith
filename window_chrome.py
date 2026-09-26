@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import sys
 from typing import Callable, Optional
+from weakref import ref
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
+from shiboken6 import isValid
 from ui_theme import MAXIMIZE_THEME_ASSET, RESTORE_THEME_ASSET_CANDIDATES
 
 
@@ -31,6 +33,26 @@ def bounded_window_geometry(
         width,
         height,
     )
+
+
+def restored_window_geometry(
+    geometry: QtCore.QRect,
+    available: QtCore.QRect,
+    minimum: QtCore.QSize,
+    default_size: QtCore.QSize,
+) -> QtCore.QRect:
+    """Keep a screen-sized saved rectangle from masquerading as a restore."""
+    fitted = bounded_window_geometry(geometry, available, minimum)
+    # Legacy Qt geometry can retain an almost-maximized normal rectangle,
+    # inset by a native title bar even though our window is frameless.
+    if (
+        fitted.width() >= available.width() - TITLE_BAR_CONTROL_PX
+        and fitted.height() >= available.height() - TITLE_BAR_CONTROL_PX
+    ):
+        size = default_size.boundedTo(available.size() * 0.85).expandedTo(minimum)
+        fitted.setSize(size.boundedTo(available.size()))
+        fitted.moveCenter(available.center())
+    return fitted
 
 
 def fit_window_to_screen(
@@ -61,6 +83,138 @@ def fit_window_to_screen(
         if fitted != window.geometry():
             window.setGeometry(fitted)
     return fitted
+
+
+def screen_for_launcher(launcher: QtWidgets.QWidget | None) -> QtGui.QScreen | None:
+    """Resolve the control's current physical screen, never a tool's saved screen."""
+    if launcher is not None and isValid(launcher):
+        if not launcher.isVisible():
+            launcher = launcher.window()
+        center = launcher.mapToGlobal(launcher.rect().center())
+        screen = QtGui.QGuiApplication.screenAt(center)
+        if screen is not None:
+            return screen
+        return launcher.window().screen()
+    return QtGui.QGuiApplication.primaryScreen()
+
+
+def place_window_on_launcher(
+    window: QtWidgets.QWidget,
+    launcher: QtWidgets.QWidget | None = None,
+    *,
+    geometry: QtCore.QRect | None = None,
+    minimum: QtCore.QSize | None = None,
+    near: bool = False,
+    screen: QtGui.QScreen | None = None,
+) -> QtCore.QRect:
+    """Keep a tool's saved size/valid position within its launcher's work area."""
+    if launcher is not None and isValid(launcher):
+        window._lettersmith_launch_widget = ref(launcher)
+    if launcher is None:
+        launch_ref = getattr(window, "_lettersmith_launch_widget", None)
+        launcher = launch_ref() if launch_ref is not None else None
+    if launcher is None or not isValid(launcher):
+        launcher = window.parentWidget()
+    if launcher is None:
+        active = QtWidgets.QApplication.activeWindow()
+        launcher = active if active is not window else None
+    if screen is None or not isValid(screen):
+        screen = screen_for_launcher(launcher)
+    target = QtCore.QRect(geometry if geometry is not None else window.geometry())
+    if screen is None:
+        return target
+    available = screen.availableGeometry()
+    # QWidget geometry excludes native decorations; reserve them inside the work area.
+    client, frame = window.geometry(), window.frameGeometry()
+    margins = QtCore.QMargins(
+        max(0, client.left() - frame.left()), max(0, client.top() - frame.top()),
+        max(0, frame.right() - client.right()), max(0, frame.bottom() - client.bottom()),
+    )
+    client_area = available.marginsRemoved(margins)
+    size_floor = minimum if minimum is not None else window.minimumSize()
+    window.setMinimumSize(size_floor.boundedTo(client_area.size()))
+    if not client_area.contains(target.center()):
+        if launcher is not None and isValid(launcher):
+            anchor = QtCore.QRect(launcher.mapToGlobal(QtCore.QPoint()), launcher.size())
+            if near:
+                y = anchor.bottom() + 9
+                if y + target.height() > client_area.bottom() + 1:
+                    y = anchor.top() - target.height() - 8
+                target.moveTopLeft(QtCore.QPoint(anchor.left(), y))
+            else:
+                target.moveCenter(launcher.window().frameGeometry().center())
+        else:
+            target.moveCenter(client_area.center())
+    target = bounded_window_geometry(target, client_area, window.minimumSize())
+    if window.isMaximized() or window.isFullScreen():
+        if window.screen() is not screen:
+            window.setScreen(screen)
+            window.setGeometry(screen.geometry() if window.isFullScreen() else available)
+    elif target != window.geometry():
+        window.setGeometry(target)
+    return target
+
+
+class _WindowPlacementGuard(QtCore.QObject):
+    """Cover parented dialogs, menus and custom tools without policing user moves."""
+
+    def __init__(self, application: QtWidgets.QApplication) -> None:
+        super().__init__(application)
+        self._launcher = None
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if not isinstance(watched, QtWidgets.QWidget):
+            return False
+        if event.type() in (
+            QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseButtonRelease,
+            QtCore.QEvent.KeyPress, QtCore.QEvent.ContextMenu, QtCore.QEvent.ToolTip,
+        ):
+            launch_ref = ref(watched)
+            self._launcher = launch_ref
+
+            def clear_launcher() -> None:
+                if self._launcher is launch_ref:
+                    self._launcher = None
+
+            QtCore.QTimer.singleShot(0, self, clear_launcher)
+        if (
+            event.type() == QtCore.QEvent.Show
+            and not event.spontaneous()
+            and watched.isWindow()
+            and watched.parentWidget() is not None
+        ):
+            launcher = watched.parentWidget()
+            initiator = self._launcher() if self._launcher is not None else None
+            if (
+                initiator is not None and isValid(initiator)
+                and initiator.window() is launcher.window()
+            ):
+                launcher = initiator
+            watched._lettersmith_launch_widget = ref(launcher)
+            place_window_on_launcher(watched, launcher)
+
+            def finish_placement() -> None:
+                if watched.isVisible():
+                    place_window_on_launcher(watched)
+
+            # Final layout/native frame margins and custom showEvent positions are
+            # known after Show. The QObject context cancels this if the tool dies.
+            QtCore.QTimer.singleShot(0, watched, finish_placement)
+        return False
+
+
+def install_window_placement_guard(
+    application: QtWidgets.QApplication,
+) -> _WindowPlacementGuard:
+    """Install once at application startup; leave unparented main windows alone."""
+    attribute = "_lettersmith_window_placement_guard"
+    guard = getattr(application, attribute, None)
+    if not isinstance(guard, _WindowPlacementGuard):
+        guard = _WindowPlacementGuard(application)
+        application.installEventFilter(guard)
+        setattr(application, attribute, guard)
+    return guard
+
 
 _WM_NCHITTEST = 0x0084
 _WM_ENTERSIZEMOVE = 0x0231
@@ -174,6 +328,11 @@ class FramelessWindowController(QtCore.QObject):
             or self._window.windowHandle() is None
         ):
             return
+        # WinIdChange also arrives during destruction. winId() would recreate
+        # the closing dialog and native ancestor surfaces in the main window.
+        hwnd = int(self._window.internalWinId())
+        if not hwnd:
+            return
         import ctypes
         from ctypes import wintypes
 
@@ -186,7 +345,6 @@ class FramelessWindowController(QtCore.QObject):
             wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.c_int, wintypes.UINT,
         )
-        hwnd = int(self._window.winId())
         style = user32.GetWindowLongW(hwnd, -16)  # GWL_STYLE
         if not style & 0x00040000:  # WS_THICKFRAME
             # Qt removes this flag for frameless windows. Native resize hits
@@ -212,6 +370,28 @@ class FramelessWindowController(QtCore.QObject):
     def start_system_move(self) -> bool:
         handle = self._window.windowHandle()
         return bool(handle is not None and handle.startSystemMove())
+
+    def set_native_maximized(self, maximized: bool) -> bool:
+        """Keep Windows and Qt in the same state for a visible frameless window."""
+        if (
+            sys.platform != "win32"
+            or QtGui.QGuiApplication.platformName() != "windows"
+            or not self._window.isVisible()
+            or self._window.windowHandle() is None
+        ):
+            return False
+        import ctypes
+        from ctypes import wintypes
+
+        self._enable_native_resize_style()
+        user32 = ctypes.windll.user32
+        user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.ShowWindow.restype = wintypes.BOOL
+        # Qt's frameless showNormal/showMaximized path only moves the window.
+        # It cannot clear WS_MAXIMIZE after a native maximize or a maximized
+        # launch, so Windows rejects subsequent restores and border resizing.
+        user32.ShowWindow(int(self._window.winId()), 3 if maximized else 9)
+        return True
 
     def start_system_resize(self, edges: Qt.Edge) -> bool:
         if not edges or self._window.isMaximized() or self._window.isFullScreen():
@@ -305,7 +485,7 @@ class FramelessWindowController(QtCore.QObject):
             message_id = int(native_message.message)
             if message_id not in (_WM_NCHITTEST, _WM_ENTERSIZEMOVE, _WM_EXITSIZEMOVE):
                 return False, 0
-            if int(native_message.hWnd or 0) != int(self._window.winId()):
+            if int(native_message.hWnd or 0) != int(self._window.internalWinId()):
                 return False, 0
             if message_id == _WM_ENTERSIZEMOVE:
                 self._system_interaction_active = True

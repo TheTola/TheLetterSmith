@@ -7,11 +7,13 @@ from dataclasses import replace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMenu, QPushButton, QWidgetAction
 
 from named_text_style_preview import (
     add_style_preview_submenu,
+    preview_font,
     set_action_style_preview,
     set_slot_style_preview,
 )
@@ -52,11 +54,13 @@ class NamedTextStylePreviewTests(unittest.TestCase):
         subtitle_style = replace(
             base.get("subtitle"), font_family="Another Missing Font", font_color="#00ff00"
         )
+        ui_size = first._named_text_preview_row.label.font().pointSizeF()
         set_action_style_preview(first, title_style)
         set_action_style_preview(second, subtitle_style)
         first._named_text_preview_row.label.ensurePolished()
         shown_font = first._named_text_preview_row.label.font()
-        self.assertEqual(shown_font.pointSizeF(), 21)
+        self.assertEqual(shown_font.pointSizeF(), ui_size)
+        self.assertEqual(title_style.font_size, 21)
         self.assertEqual(shown_font.weight(), 700)
         self.assertTrue(shown_font.italic())
         self.assertTrue(shown_font.underline())
@@ -87,6 +91,21 @@ class NamedTextStylePreviewTests(unittest.TestCase):
         QTest.keyClick(menu, Qt.Key_Right)
         self.assertTrue(subtitle.isVisible())
         menu.hide()
+
+    def test_preview_preserves_point_and_pixel_ui_sizes_without_changing_definition(self) -> None:
+        for pixels in (False, True):
+            base_font = QFont("Arial", 10)
+            if pixels:
+                base_font.setPixelSize(15)
+            for document_size in (1, 40, 100):
+                with self.subTest(pixels=pixels, document_size=document_size):
+                    definition = replace(default_style_set().get("title"), font_size=document_size)
+                    font = preview_font(definition, base_font)
+                    self.assertEqual(font.pointSizeF(), base_font.pointSizeF())
+                    self.assertEqual(font.pixelSize(), base_font.pixelSize())
+                    self.assertEqual(definition.font_size, document_size)
+                    self.assertTrue(font.bold())
+                    self.assertFalse(base_font.bold())
 
     def test_saved_button_uses_heading_one_family_and_color(self) -> None:
         button = QPushButton("Style 1")

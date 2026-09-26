@@ -68,7 +68,7 @@ from ui_theme import (
 )
 from ui_fonts import COMMAND_FONT_FAMILY
 from ui_sounds import UiSound, install_ui_sounds, play_ui_sound
-from window_chrome import FramelessWindowController, fit_window_to_screen
+from window_chrome import FramelessWindowController, fit_window_to_screen, restored_window_geometry
 
 # ===================================================================================================================================================================================
 # Overlay integration
@@ -1545,14 +1545,14 @@ class TitleBar(QtWidgets.QWidget):
         self._window_state_generation += 1
         generation = self._window_state_generation
         if self._nexus.isMaximized():
-            target = self._normal_window_geometry
+            # Qt tracks native title-bar/Snap transitions as well as our button.
+            # The button's cache may predate a later manual move or resize.
+            target = self._nexus.normalGeometry()
             if target is None or not target.isValid():
-                normal = self._nexus.normalGeometry()
-                target = QtCore.QRect(normal) if normal.isValid() else None
-            self._nexus.setWindowState(
-                self._nexus.windowState() & ~Qt.WindowMaximized
-            )
-            self._nexus.showNormal()
+                target = self._normal_window_geometry
+            target = self._nexus._usable_normal_geometry(target)
+            if not self._nexus._window_controller.set_native_maximized(False):
+                self._nexus.showNormal()
             if target is not None:
                 QtCore.QTimer.singleShot(
                     0,
@@ -1565,7 +1565,8 @@ class TitleBar(QtWidgets.QWidget):
             current = self._nexus.geometry()
             if current.isValid() and not self._nexus.isFullScreen():
                 self._normal_window_geometry = QtCore.QRect(current)
-            self._nexus.showMaximized()
+            if not self._nexus._window_controller.set_native_maximized(True):
+                self._nexus.showMaximized()
 
         QtCore.QTimer.singleShot(
             0,
@@ -1577,12 +1578,12 @@ class TitleBar(QtWidgets.QWidget):
         generation: int,
         target: QtCore.QRect,
     ) -> None:
-        if generation != self._window_state_generation or not target.isValid():
+        if (
+            generation != self._window_state_generation or not target.isValid()
+            or self._nexus.isMaximized() or self._nexus.isMinimized()
+            or self._nexus.isFullScreen()
+        ):
             return
-        self._nexus.setWindowState(
-            self._nexus.windowState() & ~Qt.WindowMaximized
-        )
-        self._nexus.showNormal()
         self._normal_window_geometry = fit_window_to_screen(
             self._nexus, MIN_WINDOW_SIZE, target
         )
@@ -2077,6 +2078,7 @@ class Nexus(QtWidgets.QMainWindow):
             f"color:{self.theme_service.tokens.highlight};"
             "font:12px 'Segoe UI Semibold';padding:4px 6px;"
         )
+        self.preview_caption.installEventFilter(self)
         body_layout.addWidget(self.preview_caption, alignment=Qt.AlignHCenter)
 
         # =============================================================================================
@@ -2236,7 +2238,7 @@ class Nexus(QtWidgets.QMainWindow):
         # Remember last image pixmap for proper re-scaling on resize
         self._last_pixmap: Optional[QPixmap] = None
 
-        # Keep a reference to Prompt Writer window if opened via shortcut
+        # Cache one reusable panel; its is_open state excludes the closing animation.
         self._prompt_writer_win: Optional[QtWidgets.QWidget] = None
 
         # Initial sizing & tab
@@ -2484,7 +2486,8 @@ class Nexus(QtWidgets.QMainWindow):
             project_paths=self.project_paths,
             curtain_styles=self.curtain_styles,
         )
-        self.forge_tab.installEventFilter(self)
+        for tab in (self.sound_tab, self.message_tab, self.forge_tab):
+            tab.installEventFilter(self)
         self.command_tab = CommandTab(
             self.project_root,
             project_state=self.project_state,
@@ -2497,6 +2500,7 @@ class Nexus(QtWidgets.QMainWindow):
             0,
             Qt.AlignLeft | Qt.AlignVCenter,
         )
+        self.forge_tab.preview_format_panel.installEventFilter(self)
         self.forge_tab.preview_format_panel.setVisible(False)
 
         self.image_page = self._make_page_surface(
@@ -3290,7 +3294,7 @@ class Nexus(QtWidgets.QMainWindow):
         self.forge_tab.preview_format_panel.setVisible(idx == 3)
         stack_policy = self.page_stack.sizePolicy()
         stack_policy.setVerticalPolicy(
-            QtWidgets.QSizePolicy.Ignored if idx == 3
+            QtWidgets.QSizePolicy.Ignored if idx in {1, 2, 3}
             else self._page_stack_vertical_policy
         )
         self.page_stack.setSizePolicy(stack_policy)
@@ -3561,9 +3565,15 @@ class Nexus(QtWidgets.QMainWindow):
             else 0
         )
         self.preview_tools_layout.setContentsMargins(left_margin, 0, 0, 0)
-        if forge_visible:
-            self.help_anchor.setVisible(self._forge_compact_layout)
+        current_tab = self.tabbar.currentIndex()
+        compact = current_tab in {1, 2, 3} and self.body.height() - 24 < 600
+        if current_tab in {1, 2, 3}:
+            self.help_anchor.setVisible(current_tab == 2 and not compact)
         icon_size = round(HELP_ICON_PX * 0.9) if forge_visible else HELP_ICON_PX
+        if compact:
+            icon_size = 64
+        if current_tab in {1, 2, 3} and self.help_anchor.isHidden():
+            icon_size = min(icon_size, max(32, self.preview_frame.height()))
         if self.help_icon.width() != icon_size:
             self.help_anchor.setFixedSize(icon_size, icon_size)
             self.help_icon.setFixedSize(icon_size, icon_size)
@@ -3573,46 +3583,14 @@ class Nexus(QtWidgets.QMainWindow):
             self._show_help_asset("hover" if self.help_icon.underMouse() else "idle")
 
     def _set_forge_compact_layout(self, compact: bool) -> None:
-        if self._forge_compact_layout == compact:
-            return
         self._forge_compact_layout = compact
-        region_layout = self.preview_region.layout()
-        source = self.body_layout if compact else region_layout
-        source.removeWidget(self.preview_caption)
-        source.removeItem(self.preview_tools_layout)
-        self.preview_tools_layout.setParent(None)
-        parent = self.preview_region if compact else self.body
-        for widget in (self.preview_caption, self.forge_tab.preview_format_panel, self.help_anchor):
-            visible = not widget.isHidden()
-            widget.setParent(parent)
-            widget.setVisible(visible)
-        if compact:
-            region_layout.addWidget(self.preview_caption, alignment=Qt.AlignHCenter)
-            region_layout.addLayout(self.preview_tools_layout)
-        else:
-            self.body_layout.insertWidget(1, self.preview_caption, alignment=Qt.AlignHCenter)
-            self.body_layout.insertLayout(2, self.preview_tools_layout)
-        self.body_layout.setDirection(
-            QtWidgets.QBoxLayout.LeftToRight if compact else QtWidgets.QBoxLayout.TopToBottom
-        )
-        self.preview_tools_layout.setSpacing(7 if compact else 0)
-        self.forge_tab.preview_format_panel.layout().setDirection(
-            QtWidgets.QBoxLayout.TopToBottom if compact else QtWidgets.QBoxLayout.LeftToRight
-        )
-        region_layout.setSpacing(7 if compact else 0)
-        self.preview_region.setMinimumSize(0, 0)
-        self.preview_region.setMaximumSize(16_777_215, 16_777_215)
         self.forge_tab.set_compact_layout(compact)
         self._update_preview_tools_geometry()
 
     def _position_help_icon(self) -> None:
         current_tab = self.tabbar.currentIndex()
-        if current_tab in {1, 3} and not self._forge_compact_layout:
-            reference = (
-                self.forge_tab.preview_format_panel
-                if current_tab == 3 and self._project_tabs_initialized
-                else self.preview_frame
-            )
+        if current_tab in {1, 2, 3} and self.help_anchor.isHidden():
+            reference = self.preview_frame
             preview_top = reference.mapTo(self.body, QPoint(0, 0)).y()
             x = (
                 self.body.width()
@@ -3804,7 +3782,7 @@ class Nexus(QtWidgets.QMainWindow):
         self._update_forge_preview_zoom()
 
     def _update_forge_preview_zoom(self) -> None:
-        """Keep the embedded browser's CSS viewport at the target size."""
+        """Fit the design viewport, down to WebEngine's minimum supported zoom."""
         view = getattr(self, "html_preview", None)
         setter = getattr(view, "setZoomFactor", None)
         if not callable(setter):
@@ -3813,6 +3791,8 @@ class Nexus(QtWidgets.QMainWindow):
             zoom = 1.0
         else:
             width = max(1, view.width())
+            # Below 400 logical pixels, let the page use its responsive layout.
+            # A browser minimum must not move the preview beside the controls.
             zoom = max(0.25, min(5.0, width / FORGE_WINDOW_VIEWPORT.width()))
         current = getattr(view, "zoomFactor", lambda: 1.0)()
         if abs(current - zoom) > 0.0001:
@@ -3840,15 +3820,16 @@ class Nexus(QtWidgets.QMainWindow):
                 self._forge_viewport_measurement = measurement
                 width = int(measurement["width"])
                 height = int(measurement["height"])
+                expected_width = min(FORGE_WINDOW_VIEWPORT.width(), round(view.width() / 0.25))
+                expected_height = min(FORGE_WINDOW_VIEWPORT.height(), round(view.height() / 0.25))
                 if (
-                    abs(width - FORGE_WINDOW_VIEWPORT.width()) > 2
-                    or abs(height - FORGE_WINDOW_VIEWPORT.height()) > 2
+                    abs(width - expected_width) > 2
+                    or abs(height - expected_height) > 2
                 ):
                     _LOGGER.warning(
                         "Forge CSS viewport %sx%s differs from target %sx%s",
                         width, height,
-                        FORGE_WINDOW_VIEWPORT.width(),
-                        FORGE_WINDOW_VIEWPORT.height(),
+                        expected_width, expected_height,
                     )
             except (TypeError, ValueError, KeyError, RuntimeError):
                 return
@@ -4433,6 +4414,17 @@ class Nexus(QtWidgets.QMainWindow):
             pass
         return ""
 
+    def _usable_normal_geometry(self, geometry: QtCore.QRect | None) -> QtCore.QRect:
+        target = QtCore.QRect(geometry) if geometry is not None else QtCore.QRect()
+        if not target.isValid():
+            target = QtCore.QRect(self.pos(), QSize(WIN_W, WIN_H))
+        screen = self.screen()
+        if screen is None:
+            return target
+        return restored_window_geometry(
+            target, screen.availableGeometry(), self.minimumSize(), QSize(WIN_W, WIN_H),
+        )
+
     def _restore_window_preferences(self) -> None:
         encoded = str(self.settings_store.get("ui_window_geometry", ""))
         if encoded:
@@ -4457,6 +4449,9 @@ class Nexus(QtWidgets.QMainWindow):
             target = QtCore.QRect(*normal)
         fit_window_to_screen(self, MIN_WINDOW_SIZE, target)
         if maximized:
+            normal = self._usable_normal_geometry(self.geometry())
+            self.setGeometry(normal)
+            self.title_bar._normal_window_geometry = QtCore.QRect(normal)
             self.setWindowState(self.windowState() | Qt.WindowMaximized)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
@@ -4510,6 +4505,8 @@ class Nexus(QtWidgets.QMainWindow):
         normal = self.normalGeometry()
         if not normal.isValid():
             normal = self.geometry()
+        if self.isMaximized():
+            normal = self._usable_normal_geometry(normal)
         self.settings_store.update_fields(
             {
                 "ui_window_geometry": geometry,
@@ -4538,22 +4535,20 @@ class Nexus(QtWidgets.QMainWindow):
         max_width = max(1, body_width - PREVIEW_FRAME_EXTRA)
         region = getattr(self, "preview_region", None)
         if hasattr(self, "forge_tab"):
-            # Reserve a usable browser viewport as well as wrapped control text.
-            # Keep the breakpoint stable across preview modes and layout hints.
+            compact = current_tab in {1, 2, 3} and body_height < 600
+            if current_tab != 4:
+                self.body_layout.setContentsMargins(12, 6 if compact else 12, 12, 6 if compact else 12)
+                self.body_layout.setSpacing(4 if compact else 8 if current_tab == 3 else 10)
+            self.sound_tab.set_compact_layout(current_tab == 1 and body_height < 600)
+            if current_tab == 1:
+                self.sound_tab.fit_mode_height(body_width)
+            self.message_tab.set_compact_layout(current_tab == 2 and body_height < 600)
             self._set_forge_compact_layout(current_tab == 3 and body_height < 760)
+            if compact:
+                body_height += 12
 
         if current_tab == 3:
-            self.help_anchor.setVisible(self._forge_compact_layout)
             forge_tab = getattr(self, "forge_tab", None)
-            format_panel = getattr(forge_tab, "preview_format_panel", None)
-            compact = self._forge_compact_layout
-            if compact:
-                minimum_preview_width = round(FORGE_WINDOW_VIEWPORT.width() * 0.25) + PREVIEW_FRAME_EXTRA
-                preview_width = max(minimum_preview_width, min(540, int(body_width * 0.42)))
-                region.setFixedWidth(preview_width)
-                format_panel.setFixedWidth(preview_width - self.help_anchor.width() - 7)
-            else:
-                format_panel.setFixedWidth(468)
             panel_height = self.preview_tools_layout.minimumSize().height()
             controls_height = max(
                 forge_tab.minimumSizeHint().height(),
@@ -4569,7 +4564,7 @@ class Nexus(QtWidgets.QMainWindow):
             mode = getattr(self, "_forge_preview_mode", "landscape")
             height_budget = max(
                 PREVIEW_FRAME_EXTRA + 1,
-                body_height - panel_height - (0 if compact else controls_height) - caption_height - gaps,
+                body_height - panel_height - controls_height - caption_height - gaps,
             )
             source = (
                 FORGE_WINDOW_VIEWPORT if mode == "window"
@@ -4583,8 +4578,7 @@ class Nexus(QtWidgets.QMainWindow):
             )
             content = _fit_preview_content_size(
                 source,
-                (preview_width - PREVIEW_FRAME_EXTRA) if compact
-                else min(max_width, int(window_width * 0.666)),
+                min(max_width, int(window_width * 0.666)),
                 max_height,
             )
             self.preview_frame.setFixedSize(
@@ -4592,8 +4586,10 @@ class Nexus(QtWidgets.QMainWindow):
                 content.height() + PREVIEW_FRAME_EXTRA,
             )
             _activate_preview_frame_layout(self.preview_frame)
-            if isinstance(region, QtWidgets.QWidget) and not compact:
+            if isinstance(region, QtWidgets.QWidget):
                 region.setFixedHeight(self.preview_frame.height())
+                self.body_layout.activate()
+            self._update_preview_tools_geometry()
             self._update_forge_preview_zoom()
             return
 
@@ -4602,9 +4598,15 @@ class Nexus(QtWidgets.QMainWindow):
             tools_height = self.preview_tools_layout.minimumSize().height()
             caption_height = self.preview_caption.sizeHint().height() if self.preview_caption.isVisible() else 0
             gaps = max(0, self.body_layout.spacing()) * (3 if caption_height else 2)
+            controls_height = 0
+            if current_tab == 0 and hasattr(self, "image_tab"):
+                controls_height = self.image_tab.heightForWidth(body_width)
+            elif current_tab in {1, 2} and self._project_tabs_initialized:
+                tab = self.sound_tab if current_tab == 1 else self.message_tab
+                controls_height = max(tab.minimumSizeHint().height(), tab.heightForWidth(body_width))
             preview_budget = max(
                 1, body_height - tools_height - caption_height - gaps
-                - min(180, max(68, int(body_height * 0.4))) - PREVIEW_FRAME_EXTRA,
+                - controls_height - PREVIEW_FRAME_EXTRA,
             )
 
         if current_tab == 1:
@@ -4618,23 +4620,6 @@ class Nexus(QtWidgets.QMainWindow):
             region_height = content.height() + PREVIEW_FRAME_EXTRA
         else:
             content_height = min(max(1, int(window_height * 0.35)), preview_budget)
-            if current_tab == 2:
-                message_tab = getattr(self, "message_tab", None)
-                message_height = max(
-                    340,
-                    message_tab.minimumSizeHint().height()
-                    if message_tab is not None else 340,
-                )
-                message_height = min(message_height, max(180, int(body_height * 0.5)))
-                help_height = (
-                    self.help_icon.height() if self.help_icon.isVisible() else 0
-                )
-                gaps = max(0, self.body_layout.spacing()) * 2
-                content_height = min(
-                    content_height,
-                    max(1, body_height - message_height - help_height
-                        - gaps - PREVIEW_FRAME_EXTRA),
-                )
             source_pixmap = getattr(self, "_last_pixmap", None)
             source = (
                 source_pixmap.size()
@@ -4655,6 +4640,9 @@ class Nexus(QtWidgets.QMainWindow):
         _activate_preview_frame_layout(self.preview_frame)
         if isinstance(region, QtWidgets.QWidget):
             region.setFixedHeight(region_height)
+            self.body_layout.activate()
+        if hasattr(self, "forge_tab"):
+            self._update_preview_tools_geometry()
 
     def _refresh_preview_after_layout(self) -> None:
         self._update_preview_geometry()
@@ -4669,6 +4657,17 @@ class Nexus(QtWidgets.QMainWindow):
             if handled:
                 return True, result
         return super().nativeEvent(event_type, message)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # A modal editor can consume Leave without sending Enter back when it
+        # closes over a stationary pointer. Recover hover when the shell regains focus.
+        icon = getattr(self, "help_icon", None)
+        if (event.type() == QEvent.ActivationChange and self.isActiveWindow()
+                and icon is not None and icon.isVisible()
+                and icon.rect().contains(icon.mapFromGlobal(QtGui.QCursor.pos()))):
+            self._help_hide_timer.stop()
+            self._help_show_timer.start()
 
     def resizeEvent(self, event):
         self._update_preview_tools_geometry()
@@ -5208,19 +5207,36 @@ class Nexus(QtWidgets.QMainWindow):
             self.status("Prompt Writer state could not be saved.")
             return False
 
+    def toggle_prompt_writer(self) -> bool:
+        """Toggle the button's panel; shortcuts and tray actions remain show requests."""
+        panel = self._prompt_writer_win
+        if isinstance(panel, QtWidgets.QWidget):
+            try:
+                if panel.is_open:
+                    panel.close_with_anim()
+                    return False
+            except RuntimeError:
+                self._prompt_writer_win = None
+        self.open_prompt_writer()
+        panel = self._prompt_writer_win
+        return isinstance(panel, QtWidgets.QWidget) and panel.is_open
+
     def open_prompt_writer(self):
         """
-        Open Prompt Writer inline as an overlay panel (if available).
-        The visible launcher button is owned by Image_tab.py; Ctrl+Alt+P also opens it.
+        Show or focus the cached Prompt Writer without toggling it closed.
+        Ctrl+Alt+P and the tray action use this path.
         """
         if not self.project_state.is_project_ready:
             self.status("Enter a recipient before opening Prompt Writer.")
             self.recipient_page.focus_recipient()
             return
+        launcher = self.image_tab.pwrite_fab
+        if not launcher.isVisible():
+            launcher = self
         w = getattr(self, "_prompt_writer_win", None)
         if isinstance(w, QtWidgets.QWidget):
             try:
-                w.open_with_anim()
+                w.open_with_anim(launcher=launcher)
                 w.raise_()
                 w.activateWindow()
                 self.status("Prompt Writer focused.")
@@ -5242,9 +5258,9 @@ class Nexus(QtWidgets.QMainWindow):
                 lambda: self.project_dirty.mark_changed("prompt-writer")
             )
             w.project_changed.connect(self._record_protected_edit)
-            w.destroyed.connect(self._on_prompt_writer_destroyed)
+            w.destroyed.connect(lambda: self._on_prompt_writer_destroyed(w))
             w.dismissed.connect(self._on_prompt_writer_dismissed)
-            w.open_with_anim()
+            w.open_with_anim(launcher=launcher)
 
             self.status("Prompt Writer opened (inline).")
             self.toast("Prompt Writer")
@@ -5255,8 +5271,9 @@ class Nexus(QtWidgets.QMainWindow):
         self.status("Prompt Writer could not be opened.")
         self.toast("Prompt Writer unavailable")
 
-    def _on_prompt_writer_destroyed(self, *_args: object) -> None:
-        self._prompt_writer_win = None
+    def _on_prompt_writer_destroyed(self, panel: QtWidgets.QWidget) -> None:
+        if self._prompt_writer_win is panel:
+            self._prompt_writer_win = None
 
     def _on_prompt_writer_dismissed(self) -> None:
         self.status("Prompt Writer closed.")
@@ -5442,7 +5459,7 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _show_help_from_icon(self):
         idx = self.tabbar.currentIndex()
-        if idx == 4:  # Command ΓÇö hide help
+        if idx == 4 or QtWidgets.QApplication.activeModalWidget() is not None:
             return
         self._refresh_help_text(idx)
         self._reposition_help_popover()
@@ -5477,8 +5494,18 @@ class Nexus(QtWidgets.QMainWindow):
             watched is getattr(self, "body", None) and event.type() == QEvent.Resize
             or (event.type() == QEvent.LayoutRequest
                 and getattr(self, "_project_tabs_initialized", False)
-                and self.tabbar.currentIndex() == 3
-                and watched in (self.body, self.forge_tab))
+                and self.tabbar.currentIndex() in {1, 2, 3}
+                and watched in (self.body, self.sound_tab, self.message_tab, self.forge_tab))
+            or (watched in (
+                    getattr(self, "preview_caption", None),
+                    getattr(getattr(self, "forge_tab", None), "preview_format_panel", None),
+                )
+                and event.type() in (
+                    QEvent.Show, QEvent.Hide, QEvent.ShowToParent,
+                    QEvent.HideToParent, QEvent.LayoutRequest,
+                )
+                and getattr(self, "_project_tabs_initialized", False)
+                and self.tabbar.currentIndex() == 3)
         ):
             timer = getattr(self, "_preview_geometry_timer", None)
             if isinstance(timer, QtCore.QTimer):
@@ -5516,9 +5543,10 @@ class Nexus(QtWidgets.QMainWindow):
 
         if icon is not None and watched is icon:
             t = event.type()
-            if t in (QEvent.Enter, QEvent.HoverEnter):
+            if t in (QEvent.Enter, QEvent.HoverEnter, QEvent.MouseMove, QEvent.HoverMove):
                 self._help_hide_timer.stop()
-                self._help_show_timer.start()
+                if not pop.isVisible() and not self._help_show_timer.isActive():
+                    self._help_show_timer.start()
                 # Swap to hover movie while over the icon
                 self._show_help_asset("hover")
             elif t in (QEvent.Leave, QEvent.HoverLeave):

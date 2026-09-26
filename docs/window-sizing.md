@@ -238,24 +238,25 @@ The repair gives each existing layout and sizing system one responsibility:
    with full title/recipient/account values retained in tooltips. One coalesced
    timer handles long-action geometry, responding to width changes without
    accumulating callbacks or feeding height changes back into resizing. In the
-   compact arrangement, identity labels use the available row width and the
-   account summary receives space before its trailing spacer.
-3. `Nexus.py`: fit the preview into the space left by the controls' actual
-   height-for-width requirement. Below 760 logical pixels of available body
-   height, move the preview and format controls beside the Forge controls;
-   restore the vertical arrangement when the window grows. Reuse the existing
-   layouts and event-driven geometry timer. Scale Forge's Help icon and preserve
-   its artwork proportions and popup anchor. Forge's outer scrollbars are
-   disabled to keep the viewport width stable during text reflow; checks also
-   require zero scroll ranges and controls inside the viewport, so hidden
-   overflow does not count as fitting. The browser's Window mode derives zoom
-   from the actual web-view width, retaining its 1600x760 CSS viewport without
-   reloading solely because of resizing. Leaving Forge restores the shared
-   preview layout before the next tab is shown.
+   compact arrangement, controls shrink while the centered rows retain their
+   order. Long action artwork shrinks in both dimensions with text fit as the
+   lower bound.
+3. `Nexus.py`: keep the preview above the format row and feature controls at
+   every window size. Reserve the controls' actual height-for-width requirement
+   and scale the preview into the remaining space. Compact spacing, button
+   geometry and margins apply to Forge, Sound and Message; no side column or
+   layout reparenting is used. Sound reserves the active music card's minimum
+   height without inheriting the playlist list's preferred height. Help shrinks
+   beside the preview instead of reserving an extra row in short windows.
+   All three panels must have zero outer scroll ranges and reachable controls.
+   Window preview mode retains the 1600x760 CSS viewport while WebEngine can
+   scale to it. Below a 400x190 logical-pixel preview, its 25% zoom limit means
+   the page uses a smaller responsive viewport of the same aspect ratio. This
+   does not grow the app, move controls above/beside the preview, or reload it.
 
 The main regression risks are theme refreshes restoring old button minimums,
 wrapped labels requiring more height than `minimumSizeHint()`, repeated layout
-callbacks, and shared preview controls staying reparented after leaving Forge.
+callbacks, and previews overlapping controls after rapid resizing.
 The updated existing tests cover these boundaries, unchanged text sizes,
 all six themes, all three preview shapes and repeated shrinking/growing.
 
@@ -306,3 +307,141 @@ of live account checks did not eliminate the combined-run problem.
 
 Logs and the complete changed-file list are retained in
 `C:/Users/Oluwatola Ayedun/.codex/visualizations/2026/09/17/01a0b0fd-68b6-7062-8a6f-5209bc02bed7/finalize-main/`.
+
+## Maximized-launch restore repair (2026-09-18)
+
+This follow-up targets window state and native borders, without changing content
+layouts. The normal `Main.main()` startup was run with the current user profile
+and passive Qt/Win32 geometry logging. The custom button toggled between the
+1920x1032 work area and a nearly identical 1918x999 normal rectangle at (1921,32).
+The profile contained legacy `ui_window_geometry` and `ui_window_maximized=true`,
+without `ui_window_normal_geometry`.
+
+Two separate causes were confirmed before their respective repairs:
+
+* **Windows stays maximized:** a native Nexus launched maximized with a valid
+  1200x750 saved normal rectangle could not restore it through the existing button.
+  `IsZoomed(HWND)` remained true and `WS_MAXIMIZE` remained present, even when Qt
+  reported normal state. Windows rejected the requested 1200x750 rectangle and
+  kept 1920x1032. Qt 6.11.1's
+  [frameless state implementation](https://github.com/qt/qtbase/blob/v6.11.1/src/plugins/platforms/windows/qwindowswindow.cpp#L2657-L2679)
+  uses `MoveWindow` instead of `ShowWindow` for this transition. The controller
+  now uses native `SW_RESTORE`/`SW_MAXIMIZE` for the visible Windows main window;
+  the existing Qt path remains the fallback on other platforms.
+* **The saved normal rectangle is effectively maximized:** the restore path
+  previously accepted the screen-sized legacy rectangle unchanged. A bounded
+  normal rectangle within one title-control height of both work-area dimensions
+  now receives a centered, smaller default. Ordinary smaller rectangles retain
+  their exact bounds. The handler uses Qt's latest normal rectangle before its
+  button cache, so a later native maximize after manual resizing cannot restore
+  stale bounds. Saving while maximized also preserves the usable normal bounds.
+
+The minimum-size rule was measured separately: QWidget, QWindow and Windows'
+`WM_GETMINMAXINFO` all reported 960x600. Border/corner hit tests returned their
+correct native resize codes and `WS_THICKFRAME` was present. Neither the minimum
+nor the resize margin was changed. The deferred restore no longer forces normal
+state if a newer maximize/minimize/fullscreen transition has occurred.
+
+The toolbar-height gap was also measured separately. The maximized client and
+outer rectangles matched both Qt `availableGeometry()` and native monitor
+`rcWork` exactly: (1920,0,1920,1032). There was no extra application-reserved strip.
+The 32-pixel top gap belonged to the legacy restored rectangle; the 48 pixels
+below the work area were excluded by Windows itself. The custom title bar is
+inside the client area and remains 48 pixels high.
+
+Evidence is retained in
+`C:/Users/Oluwatola Ayedun/.codex/visualizations/2026/09/18/01a0b2c1-1e7a-7611-baab-7f92467b68f1/`.
+`native-state-baseline.json` and `native-state-fixed.json` compare the native and
+Qt state without a window-activation helper masking the failure. The native
+regression test explicitly requires `QT_QPA_PLATFORM=windows`; an offscreen run
+cannot validate Windows' maximized flag.
+
+Validation: ten focused geometry/frame checks passed offscreen, the existing
+button-click regression passed, and the new native Windows regression passed
+three consecutive cycles including changed normal bounds. Native placements on
+all three attached monitors maximized to their exact 1920x1032 work areas and
+restored to their preceding 1200x750 rectangles. Python compilation and
+`git diff --check` passed. The full suite was not run. Live mouse border/corner
+checks after restarting the user's main application remain pending while that
+application is in use; automated geometry changes do not substitute for them.
+
+## Launcher-based secondary-window placement (2026-09-18)
+
+Native Windows reproduction used the actual Nexus, Prompt Writer, Editor and
+theme selector with temporary project/settings storage. With Nexus on the left
+monitor, Editor restored at (120,80,1100,720) and the theme selector at
+(100,100,1125,630), both on the primary monitor. Editor's screen-fitting helper
+ranked the saved rectangle rather than its launcher; the selector explicitly
+selected the screen at the saved coordinates. The ordinary shared dialog and
+hidden Prompt Writer reopen stayed on the launcher screen in that baseline.
+Prompt Writer nevertheless chose its own screen, and its opening/closing slide
+ran outside the work area. Stock-image popups followed the cursor, while the
+list manager cached its initial screen geometry.
+
+`window_chrome.py` now provides one launcher-screen resolver and placement
+utility, installed through an application Show-event guard in `Main.py`.
+The guard captures the initiating control during input dispatch, handles parented
+dialogs/popups/custom tools, and checks final layout and outer-frame bounds after
+Show. It does not constrain later user moves or resizes. Actual QWidget frame
+extents are used; QWindow can report obsolete decorative margins for a frameless
+popup. Main windows retain their existing state/geometry controller.
+
+Valid positions on the launcher's screen and existing sizes are preserved.
+Other-screen/disconnected coordinates relocate and clamp to the launcher's
+current available geometry, including negative origins and native decorations.
+Only dimensions/minima exceeding that work area are reduced. Prompt Writer uses
+its visible launcher button and keeps its short slide/fade on the same screen.
+Editor, theme selector, stock-image tray, list manager and Command bar now use
+the shared rule instead of competing saved-screen/cursor/cached-screen rules.
+
+Validation:
+
+* Native Windows checks passed on all three attached 1920x1080 displays, each
+  with a 1920x1032 work area: Prompt Writer, Editor, shared dialogs, stock images,
+  stock music, Archive, list manager, theme selector, and compact/expanded Command
+  bar. Editor's cached Find/Replace dialog also followed its owner when reopened.
+  Prompt Writer's intermediate animation frames stayed within the work area.
+  Editor and selector were tested with saved coordinates on a different, still
+  connected monitor. A separate native decorated-dialog check passed.
+* Seven offscreen placement/editor/dropdown checks passed. They cover valid
+  saved bounds, removed-monitor coordinates, changed desktop arrangements,
+  negative/vertical origins, oversize minimums, a clicked control on a different
+  screen from its owner's center, custom Show handlers and frame bounds.
+  Monitor removal/rearrangement was simulated; Windows display settings were
+  not changed. Physically black monitors cannot be detected from Qt's connected
+  screen list; choosing the launcher's screen avoids using an unrelated one.
+* Existing theme-selector drag/dismiss/persistence (3), Prompt Writer open/close
+  proofreading (1), and Command bar compact/restore persistence (1) checks passed.
+  Eight existing main-window geometry/restore checks and the native maximized-
+  launch button regression also passed. Compilation and `git diff --check` passed.
+* In the user's normal `Main.main()` session the actual restore button changed
+  the main window from (1920,0,1920,1032) maximized to
+  (2001,17,1552,923) normal. Passive logging also observed Prompt Writer wholly
+  inside that launch monitor. The computer-use input guard interrupted the
+  subsequent manual border drag; final live border/corner checks remain pending.
+
+Evidence: `placement-baseline.json`, `placement-fixed.json`,
+`placement-native.log`, `placement-unit.log`, and the passive
+`geometry-history.jsonl` in the evidence directory above. The native regression
+is `test_native_tool_placement_across_connected_screens` in
+`test/test_window_sizing.py`; run it with `QT_QPA_PLATFORM=windows`. The full
+repository suite was not run.
+
+## Preview stays above controls (2026-09-18 correction)
+
+The compact side column was removed after user feedback. The former breakpoint
+changed the root layout to horizontal and stacked the format selectors, so making
+the window smaller moved the preview beside the controls. Compact mode now changes
+only dimensions, margins and spacing; the root and format-row directions remain
+unchanged. Long-action artwork keeps its aspect ratio and text remains readable.
+
+Validation: the sizing suite's 25 applicable tests pass after rerunning the
+corrected Forge matrix (three native-only tests skipped offscreen). This includes
+216 Sound/Message/Forge cases across six themes, long labels, playlist mode,
+three Forge preview shapes and sizes down to 960x516. Five additional native
+Windows checks passed for live browser scaling/input/fullscreen, tab placement,
+Sound Help alignment, Command immersion and the Sound preview height cap.
+The real Main.py application was reopened and manually corner-shrunk to 1012x600;
+Forge, Sound and Message kept their previews above reachable controls, with no
+outer panel scrollbars after tab transitions settled. Compilation and diff checks
+passed. The full repository suite was not run.

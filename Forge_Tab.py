@@ -1869,18 +1869,28 @@ class ForgeTab(QtWidgets.QWidget):
         self._unpublish_controls.setFixedWidth(unpublish_width)
 
     def set_compact_layout(self, compact: bool) -> None:
-        """Reflow beside the preview when the window cannot fit both vertically."""
+        """Shrink controls and spacing while keeping the preview above them."""
         if self._compact_layout == compact:
             return
         self._compact_layout = compact
-        self._heading_balance.setVisible(not compact)
-        self._unpublish_balance.setVisible(not compact)
-        self._identity_holder.setStretch(0, 0 if compact else 1)
-        self._identity_holder.setStretch(2, 0 if compact else 1)
         self._heading_row.setContentsMargins(0, 0, 0, 0 if compact else 5)
-        self._main_layout.setSpacing(3 if compact else 11)
-        self.identity_panel.layout().setContentsMargins(9, 4 if compact else 6, 9, 4 if compact else 6)
+        self._main_layout.setSpacing(2 if compact else 11)
+        self.identity_panel.layout().setContentsMargins(9, 2 if compact else 6, 9, 2 if compact else 6)
         self._actions_layout.setSpacing(2 if compact else 9)
+        format_layout = self.preview_format_panel.layout()
+        format_layout.setContentsMargins(11, 2 if compact else 6, 9, 2 if compact else 6)
+        for index in range(format_layout.count()):
+            format_layout.itemAt(index).layout().setSpacing(0 if compact else 4)
+        for button, tier in (
+            (self.readiness_btn, ButtonTier.SMALL),
+            (self.load_saved_btn, ButtonTier.STANDARD),
+            (self.load_stock_btn, ButtonTier.STANDARD),
+            (self.unpublish_btn, ButtonTier.SMALL),
+            (self.github_account_btn, ButtonTier.SMALL),
+        ):
+            button.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, 0.65 if compact else FORGE_GEOMETRY_SCALE)
+            button.apply_theme_assets()
+            apply_button_tier(button, tier)
         self._update_layout_margins()
         self._action_geometry_timer.start(0)
 
@@ -1974,9 +1984,17 @@ class ForgeTab(QtWidgets.QWidget):
             return
         for button in buttons:
             ratio = self._long_action_aspect_ratios.get(button, 0.0)
+            text_size = minimum_button_text_size(button)
+            maximum_width = (
+                max(text_size.width(), round(36 * ratio) + 4)
+                if self._compact_layout and ratio > 0 else 16_777_215
+            )
+            button.setMaximumWidth(maximum_width)
             content_width = max(1, button.width() - 4)
             height = round(content_width / ratio) + 4 if ratio > 0 else 63
-            button.setFixedHeight(max(height, minimum_button_text_size(button).height()))
+            if self._compact_layout and ratio <= 0:
+                height = min(height, 40)
+            button.setFixedHeight(max(height, text_size.height()))
 
     def apply_theme_assets(self, service: ThemeService) -> None:
         self._apply_forge_theme(

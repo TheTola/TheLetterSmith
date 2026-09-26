@@ -17,10 +17,10 @@
 
 <body>
   <main id="letter-preview">
-  <div id="curtain-overlay" aria-hidden="false" role="dialog" aria-modal="false" aria-labelledby="begin-button">
+  <div id="curtain-overlay" aria-hidden="false" role="button" tabindex="0" aria-labelledby="begin-button">
     <img id="curtain-left"  src="gallery/controls/cleft.png"  alt="" aria-hidden="true" decoding="async" fetchpriority="high">
     <img id="curtain-right" src="gallery/controls/cright.png" alt="" aria-hidden="true" decoding="async" fetchpriority="high">
-    <button id="begin-button" type="button">Tap to Begin</button>
+    <span id="begin-button" contenteditable="false">Tap to Begin</span>
   </div>
   <div
     id="title-banner"
@@ -39,6 +39,7 @@
 
   <button
     id="fullscreen-button"
+    inert
     class="hud-button viewer-action"
     type="button"
     title="Enter fullscreen"

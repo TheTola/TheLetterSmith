@@ -79,6 +79,7 @@ from ui_dialogs import (
 from ui_help import set_control_help
 from ui_sounds import UiSound, play_ui_sound
 from ui_theme import (
+    BUTTON_GEOMETRY_SCALE_PROPERTY,
     PRIMARY_PAGE_LAYOUT,
     ButtonTier,
     apply_button_tier,
@@ -875,6 +876,7 @@ class MessageTab(QtWidgets.QWidget):
         self._overlay_render_timer.timeout.connect(self._flush_overlay_update)
         self._sync_state = self._capture_sync_state()
         self._tab_active = False
+        self._compact_layout = False
 
         layout = QtWidgets.QVBoxLayout(self)
         PRIMARY_PAGE_LAYOUT.apply(layout)
@@ -1041,6 +1043,23 @@ class MessageTab(QtWidgets.QWidget):
         # Ensure fallback assets and load the current message immediately.
         self._check_existing()
         self._update_message_summary()
+
+    def set_compact_layout(self, compact: bool) -> None:
+        """Reduce control geometry without moving controls above the preview."""
+        if self._compact_layout == compact:
+            return
+        self._compact_layout = compact
+        if compact:
+            self.layout().setContentsMargins(12, 0, 12, 0)
+        else:
+            PRIMARY_PAGE_LAYOUT.apply(self.layout())
+        self.message_content_shell.layout().setSpacing(3 if compact else 5)
+        self.title_recipient_container.layout().setVerticalSpacing(4 if compact else 12)
+        for button in (self.btn, self.edit_btn, self.revisions_btn):
+            button.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, 0.7 if compact else 1.0)
+            button.apply_theme_assets()
+            apply_button_tier(button, ButtonTier.STANDARD)
+        self.updateGeometry()
 
     # ──────────────────────────────────────────────────────────────────
     # Show hook: every time user clicks into Message tab
@@ -2022,12 +2041,20 @@ class MessageTab(QtWidgets.QWidget):
         )
         dlg.autosaved.connect(self._handle_editor_autosaved)
         dlg.finished.connect(lambda _result: self._handle_editor_finished(dlg))
-        dlg.exec()
+        try:
+            dlg.exec()
+        finally:
+            # Each opening owns a fresh dialog. Release its native surfaces,
+            # menus and application event filters after finished was handled.
+            dlg.deleteLater()
 
     def _handle_editor_autosaved(self, html: str) -> None:
         if not html:
             return
         html = sanitize_message_html(html)
+        if html == self.current_html:
+            return
+        self._editor_preview_dirty = True
         self.current_html = html
         self._content_has_intentional_formatting = True
         self._update_message_summary(html)
@@ -2045,14 +2072,18 @@ class MessageTab(QtWidgets.QWidget):
             return
 
         new_html = sanitize_message_html(new_html)
+        changed = new_html != self.current_html
         self.current_html = new_html
         self._content_has_intentional_formatting = True
         self._update_message_summary(new_html)
         self._ensure_wall_exists()
-        self.text_selected.emit(new_html)
-        self._generate_image(new_html)
+        if changed or getattr(self, "_editor_preview_dirty", False) or not self._png_path().is_file():
+            self.text_selected.emit(new_html)
+            self._generate_image(new_html)
+        self._editor_preview_dirty = False
         self.status.setText("Message saved.")
-        self.project_changed.emit()
+        if changed:
+            self.project_changed.emit()
 
     # ──────────────────────────────────────────────────────────────────
     # Preview button

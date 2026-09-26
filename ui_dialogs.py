@@ -7,6 +7,7 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ui_theme import ensure_button_text_fits
+from window_chrome import place_window_on_launcher
 
 
 _FALLBACK_COLORS = {
@@ -151,9 +152,10 @@ class LetterSmithDialog(QtWidgets.QDialog):
             application.installEventFilter(self)
             self._outside_filter_installed = True
         parent = self.parentWidget()
+        target = self.geometry()
         if parent is not None:
-            center = parent.window().frameGeometry().center()
-            self.move(center - self.rect().center())
+            target.moveCenter(parent.window().frameGeometry().center())
+        place_window_on_launcher(self, geometry=target)
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
         application = QtWidgets.QApplication.instance()

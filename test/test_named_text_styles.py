@@ -9,9 +9,11 @@ from pathlib import Path
 from named_text_styles import (
     InvalidStyleSetError,
     NamedStyleSet,
+    ParagraphStyleDefinition,
     SavedStyleSetStore,
     STYLE_KEYS,
     STYLE_PROPERTIES,
+    STYLE_SCHEMA_VERSION,
     StyleSetOverwriteRequired,
     default_style_set,
     validate_document_style_state,
@@ -27,6 +29,7 @@ class NamedTextStyleTests(unittest.TestCase):
             font_family="Georgia",
             font_color="#aabbcc",
             underline=True,
+            paragraph=ParagraphStyleDefinition(alignment=2, line_height=150, line_height_type=1),
         )
         original = original.update_style("title", title)
         updated_normal = replace(
@@ -35,6 +38,7 @@ class NamedTextStyleTests(unittest.TestCase):
             font_size=23,
             font_color="#123456",
             italic=True,
+            paragraph=ParagraphStyleDefinition(top_margin=12, list_style=-1),
         )
         changed = original.update_style("normal_text", updated_normal)
         self.assertEqual(changed.get("normal_text"), updated_normal)
@@ -66,7 +70,7 @@ class NamedTextStyleTests(unittest.TestCase):
         self.assertEqual(NamedStyleSet.from_dict(original.to_dict()), original)
         for change in (
             lambda data: data["styles"]["title"].pop("underline"),
-            lambda data: data.update(version=2),
+            lambda data: data.update(version=STYLE_SCHEMA_VERSION + 1),
             lambda data: data["styles"]["title"].update(font_color="not a color"),
             lambda data: data["styles"]["title"].update(italic=0),
             lambda data: data["styles"].pop("heading_3"),
@@ -77,6 +81,45 @@ class NamedTextStyleTests(unittest.TestCase):
                 with self.assertRaises(InvalidStyleSetError):
                     NamedStyleSet.from_dict(data)
 
+    def test_legacy_styles_load_without_changing_paragraph_layout(self) -> None:
+        original = default_style_set()
+        legacy = original.to_dict()
+        legacy["version"] = 1
+        for definition in legacy["styles"].values():
+            definition.pop("paragraph")
+        self.assertEqual(NamedStyleSet.from_dict(legacy), original)
+        with tempfile.TemporaryDirectory() as folder:
+            settings = SettingsStore(Path(folder))
+            settings.update_fields({"editor_style_set_1": legacy})
+            self.assertEqual(SavedStyleSetStore(settings).load(1), original)
+
+    def test_explicit_normal_update_reunifies_an_independently_changed_family(self) -> None:
+        original = default_style_set()
+        original = original.update_style("title", replace(original.get("title"), font_family="Arial"))
+        changed = original.update_style("normal_text", original.get("normal_text"))
+        self.assertEqual(
+            changed.get("title"),
+            replace(original.get("title"), font_family=original.get("normal_text").font_family),
+        )
+
+    def test_paragraph_style_validation_and_roundtrip(self) -> None:
+        paragraph = ParagraphStyleDefinition(
+            alignment=2, direction=0, line_height=175, line_height_type=1,
+            top_margin=12, bottom_margin=8, left_margin=24, right_margin=16,
+            text_indent=-8, indent=2, list_style=-4, list_indent=3,
+            list_prefix="(", list_suffix=")", list_start=7,
+        )
+        original = default_style_set()
+        original = original.update_style("title", replace(original.get("title"), paragraph=paragraph))
+        self.assertEqual(NamedStyleSet.from_dict(original.to_dict()), original)
+        for changes in (
+            {"alignment": True}, {"direction": 3}, {"list_style": 42},
+            {"line_height": float("inf")}, {"text_indent": "12"},
+            {"list_start": 2**31}, {"list_prefix": []},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(InvalidStyleSetError):
+                ParagraphStyleDefinition.from_dict({**paragraph.to_dict(), **changes})
+
     def test_saved_slots_are_independent_and_preserve_unrelated_settings(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -85,7 +128,10 @@ class NamedTextStyleTests(unittest.TestCase):
             first.settings.update_fields({"recipient_name": "Ada"})
             original = default_style_set()
             different = original.update_style(
-                "title", replace(original.get("title"), font_family="Georgia")
+                "title", replace(
+                    original.get("title"), font_family="Georgia",
+                    paragraph=ParagraphStyleDefinition(alignment=2, list_style=-4),
+                )
             )
             self.assertTrue(first.save(1, original))
             self.assertTrue(second.save(2, different))

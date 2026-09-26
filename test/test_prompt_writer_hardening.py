@@ -150,6 +150,100 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.assertEqual(changed.count(), 1)
         self.assertTrue(self.panel._persist_timer.isActive())
 
+    def test_focus_request_preserves_current_prompt_writer_contents(self):
+        service = _FakeLanguageService()
+        self.panel = PromptWriterPanel(
+            project_root=str(self.project_root), language_service=service,
+        )
+        self.panel.popup()
+        self.panel.cmb_subject.setCurrentText("Subject")
+        self.panel.txt_global.setPlainText("Keep this draft")
+        self.panel._on_generate()
+        QtTest.QTest.qWait(300)
+        prompts = dict(self.panel._generated_prompts)
+        self.assertTrue(self.panel._generated_output_valid)
+        service.corrections["Keep this draft"] = "Changed draft."
+        service.calls.clear()
+
+        self.panel.popup()
+
+        self.assertTrue(self.panel.is_open)
+        self.assertEqual(self.panel.txt_global.toPlainText(), "Keep this draft")
+        self.assertEqual(self.panel._generated_prompts, prompts)
+        self.assertTrue(self.panel._generated_output_valid)
+        self.assertEqual(service.calls, [])
+        self.assertEqual(self.panel._fade_anim.state(), QtCore.QAbstractAnimation.Stopped)
+
+    def test_prompt_writer_reopen_cancels_the_closing_animation(self):
+        self.panel = PromptWriterPanel(
+            project_root=str(self.project_root), language_service=_FakeLanguageService(),
+        )
+        self.panel.popup()
+        QtTest.QTest.qWait(300)
+        dismissed_states = []
+        self.panel.dismissed.connect(lambda: dismissed_states.append(self.panel.is_open))
+        self.panel.close_with_anim()
+        self.assertFalse(self.panel.is_open)
+        self.assertTrue(self.panel.isVisible())
+        self.assertEqual(dismissed_states, [False])
+
+        self.panel.popup()
+        QtTest.QTest.qWait(300)
+
+        self.assertTrue(self.panel.is_open)
+        self.assertFalse(self.panel._hide_timer.isActive())
+        self.assertAlmostEqual(self.panel.windowOpacity(), 1.0, places=2)
+        self.panel.close_with_anim()
+        QtTest.QTest.qWait(200)
+        self.assertLess(self.panel.windowOpacity(), 0.1)
+        QtTest.QTest.qWait(80)
+        self.assertFalse(self.panel.isVisible())
+
+    def test_prompt_writer_native_close_keeps_the_cached_panel_reusable(self):
+        self.panel = PromptWriterPanel(
+            project_root=str(self.project_root), language_service=_FakeLanguageService(),
+        )
+        self.panel.popup()
+        self.panel.txt_global.setPlainText("Keep this draft")
+
+        self.panel.close()
+
+        self.assertFalse(self.panel.is_open)
+        self.assertFalse(self.panel.isVisible())
+        self.assertFalse(self.panel._shutdown)
+        self.assertFalse(self.panel._hide_timer.isActive())
+        self.assertFalse(self.panel._visionary_timer.isActive())
+        saved = json.loads(self.panel._state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["global"], "Keep this draft")
+        self.panel.popup()
+        QtTest.QTest.qWait(300)
+        self.assertTrue(self.panel.is_open)
+        self.assertEqual(self.panel.txt_global.toPlainText(), "Keep this draft")
+
+    def test_outside_click_and_deactivation_leave_prompt_writer_open(self):
+        owner = QtWidgets.QWidget()
+        self.addCleanup(owner.deleteLater)
+        button = QtWidgets.QPushButton("Main application control", owner)
+        clicked = QtTest.QSignalSpy(button.clicked)
+        self.panel = PromptWriterPanel(
+            owner, project_root=str(self.project_root), language_service=_FakeLanguageService(),
+        )
+        owner.show()
+        self.panel.popup()
+        self.panel.txt_global.setPlainText("Keep this draft")
+
+        QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
+        self.app.sendEvent(self.panel, QtCore.QEvent(QtCore.QEvent.WindowDeactivate))
+        self.app.sendEvent(self.app, QtCore.QEvent(QtCore.QEvent.ApplicationDeactivate))
+        QtTest.QTest.qWait(300)
+
+        self.assertEqual(clicked.count(), 1)
+        self.assertEqual(self.panel.windowModality(), QtCore.Qt.NonModal)
+        self.assertIsNone(self.app.activeModalWidget())
+        self.assertTrue(self.panel.is_open)
+        self.assertEqual(self.panel.txt_global.toPlainText(), "Keep this draft")
+        owner.close()
+
     def test_malformed_state_is_backed_up_before_repair(self):
         state_path = self.project_root / "prompt_writer_state.json"
         malformed = b"{not-json"

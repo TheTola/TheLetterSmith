@@ -137,7 +137,9 @@ from named_text_styles import (
     default_style_set,
 )
 from named_text_style_document import NamedTextStyleDocument
+from message_history import SIGNIFICANT_MESSAGE_CHANGES, message_change_count
 from named_text_style_preview import (
+    StyleSelectionMenu,
     add_style_preview_submenu,
     preview_font,
     preview_font_stylesheet,
@@ -151,7 +153,7 @@ from ui_dialogs import (
     LetterSmithInputDialog,
     show_lettersmith_message,
 )
-from window_chrome import StandardTitleBar, fit_window_to_screen
+from window_chrome import StandardTitleBar, place_window_on_launcher
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants & Helpers
@@ -1061,8 +1063,7 @@ class Editor(QDialog):
         )
 
         self._autosave_timer = QtCore.QTimer(self)
-        self._autosave_timer.setSingleShot(True)
-        self._autosave_timer.setInterval(900)
+        self._autosave_timer.setInterval(5 * 60 * 1000)
         self._autosave_timer.timeout.connect(self._autosave_now)
         self._language_check_timer = QtCore.QTimer(self)
         self._language_check_timer.setSingleShot(True)
@@ -1106,12 +1107,15 @@ class Editor(QDialog):
         except Exception as error:
             self._record_failure("load persisted message", error)
             self._last_persisted_html = ""
+        self._persisted_document_html = (
+            self._prepared_html() if not self._unsupported_style_state else self.message_html
+        )
         self._initializing = False
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
         self._update_font_controls_height()
-        fit_window_to_screen(self, QSize(640, 420))
+        place_window_on_launcher(self, minimum=QSize(640, 420))
 
     def _settings_file_changed(self, path: str) -> None:
         if self._closing:
@@ -1230,6 +1234,11 @@ class Editor(QDialog):
         self.editor.cursorPositionChanged.connect(self._update_readability_indicator)
         self.editor.selectionChanged.connect(self._update_readability_indicator)
         self._apply_editor_background()
+        # Restoring the root style metadata and applying the editor stylesheet
+        # can reset Qt's insertion format. Re-read the visible text at the cursor.
+        cursor = QTextCursor(self.editor.document())
+        cursor.setPosition(self.editor.textCursor().position())
+        self.editor.setTextCursor(cursor)
         self._sync_current_format()
         self._update_readability_indicator()
         self._schedule_language_check()
@@ -1850,12 +1859,17 @@ class Editor(QDialog):
         self.btn_named_style.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.btn_named_style.setMinimumWidth(145)
         self.btn_named_style.setAutoRaise(True)
-        self.named_style_menu = QMenu(self.btn_named_style)
+        self.named_style_menu = StyleSelectionMenu(self.btn_named_style)
         self.named_style_menu.setToolTipsVisible(True)
         self._style_update_actions: dict[str, QAction] = {}
         for key in STYLE_KEYS:
             label = STYLE_LABELS[key]
             submenu = add_style_preview_submenu(self.named_style_menu, label)
+            self.named_style_menu.actions()[-1].triggered.connect(
+                self._guarded_action(
+                    f"Apply {label}", lambda key=key: self._apply_named_style(key),
+                )
+            )
             submenu.setToolTipsVisible(True)
             apply_action = submenu.addAction(f"Apply {label}")
             apply_action.triggered.connect(
@@ -1880,10 +1894,10 @@ class Editor(QDialog):
         row_layout.setSpacing(5)
         self._style_slot_buttons: dict[int, QPushButton] = {}
         for slot in (1, 2, 3):
-            button = QPushButton(f"Style {slot}", row)
+            button = QPushButton(f"Change Style to\nStyle {slot}", row)
             button.setAutoDefault(False)
             button.setMinimumWidth(79)
-            button.setAccessibleName(f"Load Style {slot}")
+            button.setAccessibleName(f"Change Style to Style {slot}")
             button.clicked.connect(
                 self._guarded_action(
                     f"Load Style {slot}",
@@ -1946,7 +1960,8 @@ class Editor(QDialog):
         for action in self._style_update_actions.values():
             action.setEnabled(can_update)
             action.setToolTip(
-                "" if can_update else
+                "Copy formatting from the first selected character and paragraph."
+                if can_update else
                 "Select uniformly formatted text or place the cursor in representative text."
             )
         for slot, button in self._style_slot_buttons.items():
@@ -1959,7 +1974,7 @@ class Editor(QDialog):
                 button.setToolTip("Saved style set is invalid or unsupported.")
             else:
                 button.setToolTip(
-                    "Load this saved style set" if occupied
+                    f"Change Style to Style {slot}" if occupied
                     else "Empty — save the current style set through Options."
                 )
             set_slot_style_preview(button, saved_set)
@@ -2129,7 +2144,10 @@ class Editor(QDialog):
     def get_edited_html(self) -> str:
         if self._discard_changes:
             return self._last_persisted_html or self.message_html
-        return self._prepared_html()
+        content = self._prepared_html()
+        if self._last_persisted_html and content == self._persisted_document_html:
+            return self._last_persisted_html
+        return content
 
     def _prepared_html(self) -> str:
         if self._unsupported_style_state:
@@ -2157,17 +2175,25 @@ class Editor(QDialog):
             or not self.project_state.is_project_ready
         ):
             return
-        self._autosave_timer.start()
+        if not self._autosave_timer.isActive():
+            self._autosave_timer.start()
 
     def _autosave_now(self) -> None:
         if (
             self._initializing
+            or self._closing
+            or self._save_in_progress
+            or self._unsupported_style_state
             or not self.project_state.is_project_ready
         ):
             return
         try:
             content = self._prepared_html()
-            if not content or content == self._last_persisted_html:
+            changes = message_change_count(self._persisted_document_html, content)
+            if changes == 0:
+                self._autosave_timer.stop()
+                return
+            if changes <= SIGNIFICANT_MESSAGE_CHANGES:
                 return
             self.project_save_service.save_message(
                 content,
@@ -2176,6 +2202,8 @@ class Editor(QDialog):
             )
             self._sync_message_assets()
             self._last_persisted_html = content
+            self._persisted_document_html = content
+            self._autosave_timer.stop()
             self.autosaved.emit(content)
         except ProjectNotReadyError:
             return
@@ -2205,6 +2233,9 @@ class Editor(QDialog):
                 self._record_failure("proofread letter before save", error)
             self._autosave_timer.stop()
             content = self._prepared_html()
+            normalized_content = content
+            if self._last_persisted_html and content == self._persisted_document_html:
+                content = self._last_persisted_html
             self.project_save_service.save_message(
                 content,
                 workspace_path=self.message_path,
@@ -2212,6 +2243,7 @@ class Editor(QDialog):
             )
             self._sync_message_assets()
             self._last_persisted_html = content
+            self._persisted_document_html = normalized_content
             self.autosaved.emit(content)
             play_ui_sound(UiSound.SAVED)
             return True
@@ -2284,7 +2316,7 @@ class Editor(QDialog):
                 "open. Details were recorded in editor_error.log.",
             )
             return
-        if current == self._last_persisted_html:
+        if self._last_persisted_html and current == self._persisted_document_html:
             self._finish_close()
             return
         confirmation = LetterSmithConfirmationDialog(
@@ -2439,6 +2471,7 @@ class Editor(QDialog):
         if self._find_dialog is None:
             self._find_dialog = FindReplaceDialog(self)
         self._find_dialog.show()
+        place_window_on_launcher(self._find_dialog)
         self._find_dialog.raise_()
         self._find_dialog.activateWindow()
         self._find_dialog.find_input.setFocus(Qt.OtherFocusReason)

@@ -1,17 +1,108 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
+from html.parser import HTMLParser
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from message_html import sanitize_message_html
+from message_html import extract_lettersmith_style_state, sanitize_message_html
+from named_text_styles import NamedStyleSet, InvalidStyleSetError
 from transactional_io import atomic_write_text
 
 
 REVISION_FOLDER_NAME = "revisions"
 MAX_REVISIONS = 60
+SIGNIFICANT_MESSAGE_CHANGES = 15
+
+
+class _MessageContent(HTMLParser):
+    """Compare visible words and their formatting, not Qt's HTML serialization."""
+
+    def __init__(self, content: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tokens: list[tuple[str, tuple]] = []
+        self.stack: list[tuple[str, dict]] = [("", {})]
+        self.feed(sanitize_message_html(content))
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        style = dict(self.stack[-1][1])
+        for declaration in attrs.get("style", "").split(";"):
+            name, sep, value = declaration.partition(":")
+            name, value = name.strip().lower(), value.strip()
+            if sep and not name.startswith("-qt-"):
+                style[name] = re.sub(r"(?<=\d)\.0+(?=\D|$)", "", value)
+        implied = {
+            "b": ("font-weight", "700"), "strong": ("font-weight", "700"),
+            "i": ("font-style", "italic"), "em": ("font-style", "italic"),
+            "u": ("text-decoration", "underline"), "s": ("text-decoration", "line-through"),
+        }.get(tag)
+        if implied:
+            style[implied[0]] = implied[1]
+        if tag == "a" and attrs.get("href"):
+            style["href"] = attrs["href"]
+        for name in ("align", "dir", "start", "type", "rowspan", "colspan", "width", "height"):
+            if attrs.get(name) is not None:
+                style[name] = attrs[name]
+        if tag in ("ol", "ul"):
+            style["list"] = tag
+        if tag in ("p", "div", "li", "br"):
+            self.tokens.append(("\n", ()))
+        if tag == "img":
+            self.tokens.append(("image", tuple(sorted(attrs.items()))))
+        if tag not in ("br", "img", "hr", "meta", "link", "input"):
+            self.stack.append((tag, style))
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.stack) - 1, 0, -1):
+            if self.stack[index][0] == tag:
+                del self.stack[index:]
+                break
+
+    def handle_data(self, data):
+        if any(tag in ("head", "style", "title", "script") for tag, _style in self.stack):
+            return
+        style = tuple(sorted(self.stack[-1][1].items()))
+        self.tokens.extend((word, style) for word in re.findall(r"\w+|[^\w\s]", data))
+
+
+def _style_state(content: str):
+    state = extract_lettersmith_style_state(content)
+    if state is None:
+        return None
+    definitions = state.get("definitions")
+    try:
+        definitions = NamedStyleSet.from_dict(definitions).to_dict()
+    except (InvalidStyleSetError, TypeError, ValueError):
+        pass
+    return definitions, state.get("blocks")
+
+
+def message_change_count(before: str, after: str) -> int:
+    """Count net word/format changes; reverted edits do not count as activity."""
+    left, right = _MessageContent(before).tokens, _MessageContent(after).tokens
+    count = sum(
+        max(i2 - i1, j2 - j1)
+        for kind, i1, i2, j1, j2 in SequenceMatcher(None, left, right).get_opcodes()
+        if kind != "equal"
+    )
+    old_state, new_state = _style_state(before), _style_state(after)
+    if old_state is not None and (new_state is None or old_state[0] != new_state[0]):
+        # Updating a reusable style is an intentional formatting change even
+        # when no paragraph currently uses it. Adding the first metadata to a
+        # legacy letter is serialization, not a style-definition edit.
+        count = max(count, SIGNIFICANT_MESSAGE_CHANGES + 1)
+    return count
+
+
+def messages_equal(before: str, after: str) -> bool:
+    return before == after or (
+        _style_state(before) == _style_state(after)
+        and message_change_count(before, after) == 0
+    )
 
 
 @dataclass(frozen=True)
@@ -91,8 +182,16 @@ def snapshot_current(
     except OSError:
         return None
 
-    if skip_if_content is not None and current == skip_if_content:
+    if skip_if_content is not None and messages_equal(current, skip_if_content):
         return None
+
+    return _snapshot_content(path, current, reason)
+
+
+def _snapshot_content(path: Path, current: str, reason: str) -> Optional[Path]:
+    for revision in list_revisions(path):
+        if messages_equal(current, revision.path.read_text(encoding="utf-8")):
+            return None
 
     folder = revision_directory(path)
     folder.mkdir(parents=True, exist_ok=True)
@@ -120,10 +219,18 @@ def write_message_with_revision(
     if previous == content:
         return False
 
-    if previous:
-        snapshot_current(path, reason=reason, skip_if_content=content)
+    # Keep a checkpoint apart from the live file so small manual saves can
+    # accumulate into one meaningful revision, without losing the saved edits.
+    baseline_path = revision_directory(path) / ".baseline"
+    baseline = baseline_path.read_text(encoding="utf-8") if baseline_path.is_file() else previous
+    significant = bool(baseline) and message_change_count(baseline, content) > SIGNIFICANT_MESSAGE_CHANGES
+    if significant:
+        _snapshot_content(path, baseline, reason)
 
     _atomic_write(path, content)
+    if significant or not baseline_path.is_file():
+        baseline_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(baseline_path, content if significant or not baseline else baseline)
     return True
 
 
@@ -138,6 +245,7 @@ def restore_revision(message_path: str | Path, revision_path: str | Path) -> str
     content = sanitize_message_html(revision.read_text(encoding="utf-8"))
     snapshot_current(message, reason="before-restore", skip_if_content=content)
     _atomic_write(message, content)
+    _atomic_write(folder / ".baseline", content)
     prune_revisions(message)
     return content
 

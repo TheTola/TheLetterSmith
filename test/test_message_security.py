@@ -21,12 +21,66 @@ import message_html
 import transactional_io
 from Message_tab import MessageTab
 from config import CONTROL_FILES, REQUIRED_SLIDES
-from message_history import restore_revision, revision_directory, write_message_with_revision
+from message_history import (
+    restore_revision, revision_directory, write_message_with_revision,
+    list_revisions, message_change_count, snapshot_current,
+)
 from message_html import sanitize_message_html
 from settings_store import SettingsStore
 
 
 class MessageHTMLSecurityTests(unittest.TestCase):
+    def test_manual_saves_accumulate_significant_revisions_without_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "message.html"
+            original = '<p>' + ' '.join(f'word{i}' for i in range(30)) + '</p>'
+            self.assertTrue(write_message_with_revision(path, original, reason='manual-save'))
+            for _ in range(2):
+                self.assertFalse(write_message_with_revision(path, original, reason='manual-save'))
+            minor = original.replace('word0 ', 'WORD0 ')
+            self.assertTrue(write_message_with_revision(path, minor, reason='manual-save'))
+            self.assertIn('WORD0', path.read_text())
+            write_message_with_revision(path, original, reason='manual-save')
+            self.assertEqual(list_revisions(path), [])
+            changed = original
+            for index in range(16):
+                changed = changed.replace(f'word{index} ', f'changed{index} ')
+                write_message_with_revision(path, changed, reason='manual-save')
+                self.assertEqual(len(list_revisions(path)), int(index == 15))
+            revisions = list_revisions(path)
+            self.assertEqual(len(revisions), 1)
+            self.assertIn('word0 ', revisions[0].path.read_text())
+            # Restoring and then returning to the same checkpoint cannot create
+            # another copy of the original content.
+            restore_revision(path, revisions[0].path)
+            write_message_with_revision(path, changed, reason='autosave')
+            self.assertEqual(len(list_revisions(path)), 2)
+            self.assertIsNone(snapshot_current(path))
+
+    def test_revision_comparison_counts_net_words_and_formatting(self) -> None:
+        self.assertEqual(message_change_count('<p>Kassi</p>', '<p>KASSI</p>'), 1)
+        self.assertEqual(message_change_count('<p>Kassi</p>', '<p>Kassi</p>'), 0)
+        self.assertEqual(message_change_count('<b>word</b>', '<span style="font-weight:700">word</span>'), 0)
+        text = ' '.join(f'word{i}' for i in range(16))
+        self.assertEqual(message_change_count(f'<p>{text}</p>', f'<p style="font-family:Arial">{text}</p>'), 16)
+
+    def test_initial_style_metadata_and_hidden_css_do_not_create_revisions(self) -> None:
+        from named_text_styles import DOCUMENT_STYLE_SCHEMA_VERSION, default_style_set
+
+        before = '<p>Kassi</p>'
+        after = message_html.embed_lettersmith_style_state(
+            '<html><head><style>p, li { white-space: pre-wrap; }</style></head>'
+            '<body><p>KASSI</p></body></html>',
+            {"schema_version": DOCUMENT_STYLE_SCHEMA_VERSION,
+             "definitions": default_style_set().to_dict(), "blocks": []},
+        )
+        self.assertEqual(message_change_count(before, after), 1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "message.html"
+            write_message_with_revision(path, before, reason="manual-save")
+            self.assertTrue(write_message_with_revision(path, after, reason="manual-save"))
+            self.assertEqual(list_revisions(path), [])
+
     def test_style_state_comment_survives_sanitization_and_revisions(self) -> None:
         state = {
             "schema_version": 1,
@@ -71,15 +125,15 @@ class MessageHTMLSecurityTests(unittest.TestCase):
         self.assertIsNone(message_html.extract_lettersmith_style_state(malformed))
         self.assertNotIn("lettersmith-style-state", sanitize_message_html(malformed))
         with self.assertRaises(ValueError):
-            message_html.embed_lettersmith_style_state("<p>Hello</p>", {"schema_version": 2})
+            message_html.embed_lettersmith_style_state("<p>Hello</p>", {"schema_version": 3})
 
     def test_future_style_state_is_preserved_but_not_loaded(self) -> None:
         encoded = base64.b64encode(
-            b'{"schema_version":2,"future_field":"keep"}'
+            b'{"schema_version":3,"future_field":"keep"}'
         ).decode("ascii")
-        raw = f"<!-- lettersmith-style-state:v2:{encoded} --><p>Hello</p>"
+        raw = f"<!-- lettersmith-style-state:v3:{encoded} --><p>Hello</p>"
         safe = sanitize_message_html(raw)
-        self.assertIn(f"lettersmith-style-state:v2:{encoded}", safe)
+        self.assertIn(f"lettersmith-style-state:v3:{encoded}", safe)
         self.assertEqual(sanitize_message_html(safe), safe)
         self.assertTrue(message_html.has_unsupported_lettersmith_style_state(safe))
         self.assertIsNone(message_html.extract_lettersmith_style_state(safe))

@@ -959,8 +959,8 @@ document.addEventListener('DOMContentLoaded', () => {
     syncButtons();
     revealStage();
     activateImageAnimation(idx);
-    beginBtn.disabled = true;
-    beginBtn.style.pointerEvents = 'none';
+    overlay.removeAttribute('tabindex');
+    if (fullscreenBtn) fullscreenBtn.inert = false;
     runTitleBanner();
 
     let musicStarted = false;
@@ -1032,7 +1032,17 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  bindPress(beginBtn, (e) => { e.preventDefault(); openCurtain(); });
+  // Suppress native caret placement/selection; only the completed click starts
+  // playback, keeping the gesture on the overlay until release (including touch).
+  overlay.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  bindPress(overlay, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!e.repeat) openCurtain();
+  });
   prevBtn.addEventListener('click', () => go(-1));
   nextBtn.addEventListener('click', () => go(1));
   if (restartBtn){

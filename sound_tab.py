@@ -75,6 +75,7 @@ from ui_dialogs import (
 )
 from ui_sounds import UiSound, play_ui_sound
 from ui_theme import (
+    BUTTON_GEOMETRY_SCALE_PROPERTY,
     ROW_LAYOUT_SPACING,
     SECTION_LAYOUT_SPACING,
     SOUND_PAGE_LAYOUT,
@@ -2309,6 +2310,7 @@ class PlaylistPlayer(
         self._crossfade_from = -1
         self._crossfade_to = -1
         self._transitioning = False
+        self._preview_playback: tuple[tuple[int, ...], bool] | None = None
 
         self._apply_output_state()
 
@@ -2492,6 +2494,8 @@ class PlaylistPlayer(
     def play(
         self,
     ) -> None:
+        if self._preview_playback is not None:
+            return
         self._loop_timer.stop()
 
         if (
@@ -2518,6 +2522,8 @@ class PlaylistPlayer(
     def pause(
         self,
     ) -> None:
+        if self._preview_playback is not None:
+            self._preview_playback = ((), False)
         self._loop_timer.stop()
 
         self._cancel_crossfade(
@@ -2530,10 +2536,41 @@ class PlaylistPlayer(
             False
         )
 
+    def pause_for_preview(self) -> None:
+        """Lend playback to a popup without unloading either crossfade source."""
+        if self._preview_playback is not None:
+            return
+        playing_slots = tuple(
+            slot for slot, player in enumerate(self.players)
+            if player.playbackState() == QMediaPlayer.PlayingState
+        )
+        self._preview_playback = (playing_slots, self._loop_timer.isActive())
+        self._loop_timer.stop()
+        self._crossfade_timer.stop()
+        for slot in playing_slots:
+            self.players[slot].pause()
+        self.playbackChanged.emit(False)
+
+    def resume_after_preview(self, *, resume: bool = True) -> None:
+        playback = self._preview_playback
+        self._preview_playback = None
+        if playback is None or not resume:
+            return
+        playing_slots, loop_pending = playback
+        for slot in playing_slots:
+            self.players[slot].play()
+        if self._transitioning and playing_slots:
+            self._crossfade_timer.start()
+        if loop_pending:
+            self._loop_timer.start()
+        self.playbackChanged.emit(self.is_playing())
+
     def stop(
         self,
         reset_position: bool = True,
     ) -> None:
+        if self._preview_playback is not None:
+            self._preview_playback = ((), False)
         self._loop_timer.stop()
 
         self._cancel_crossfade(
@@ -2661,6 +2698,8 @@ class PlaylistPlayer(
 
         if (
             not self._transitioning
+            and self._preview_playback is None
+            and self.is_playing()
             and len(
                 self.queue
             )
@@ -2707,6 +2746,7 @@ class PlaylistPlayer(
             != QMediaPlayer.EndOfMedia
             or slot != self.active_slot
             or self._transitioning
+            or self._preview_playback is not None
             or self._loop_timer.isActive()
         ):
             return
@@ -3066,6 +3106,8 @@ class _ClickOutsidePopup(
     QtWidgets.QDialog
 ):
     """Frameless popup that dismisses without consuming the outside click."""
+
+    previewRequested = QtCore.Signal()
 
     def __init__(
         self,
@@ -3639,6 +3681,7 @@ class ArchiveDialog(
         if path is None:
             return
 
+        self.previewRequested.emit()
         self.preview_player.setSource(
             QUrl.fromLocalFile(
                 str(
@@ -3961,6 +4004,7 @@ class StockMusicDialog(
         )
         if path is None:
             return
+        self.previewRequested.emit()
         self.preview_player.setSource(
             QUrl.fromLocalFile(
                 str(path)
@@ -4179,8 +4223,6 @@ class PlaylistItemWidget(
                 border: none;
                 border-radius: 4px;
                 padding: 0;
-                min-width: 0;
-                min-height: 0;
                 font-size: 16px;
             }}
 
@@ -4300,6 +4342,7 @@ class SoundTab(QtWidgets.QWidget):
             self._pulse_playback_button
         )
 
+        self._compact_layout = False
         self._init_ui()
         self._connect_signals()
         self._reload_player_queue()
@@ -4338,6 +4381,48 @@ class SoundTab(QtWidgets.QWidget):
                 button.apply_theme_assets(
                     theme_service
                 )
+
+    def set_compact_layout(self, compact: bool) -> None:
+        """Keep the transport and both music modes reachable in short windows."""
+        if self._compact_layout == compact:
+            return
+        self._compact_layout = compact
+        if compact:
+            self.layout().setContentsMargins(12, 4, 12, 4)
+            self.layout().setSpacing(3)
+        else:
+            SOUND_PAGE_LAYOUT.apply(self.layout())
+        self.mode_stack.setMinimumHeight(0 if compact else 230)
+        self.single_panel.layout().setContentsMargins(
+            12 if compact else 24, 4 if compact else 24,
+            12 if compact else 24, 4 if compact else 24,
+        )
+        self.single_panel.layout().setSpacing(6 if compact else SECTION_LAYOUT_SPACING + 2)
+        self.playlist_panel.layout().setContentsMargins(
+            8 if compact else 18, 4 if compact else 18,
+            8 if compact else 18, 4 if compact else 18,
+        )
+        self.playlist_panel.layout().setSpacing(6 if compact else SECTION_LAYOUT_SPACING)
+        self.playlist_list.setMinimumHeight(64 if compact else 110)
+        for button, tier in (
+            (self.stock_btn, ButtonTier.STANDARD),
+            (self.archive_btn, ButtonTier.STANDARD),
+            (self.clear_btn, ButtonTier.STANDARD),
+            (self.single_action_btn, ButtonTier.MEDIUM),
+            (self.create_playlist_btn, ButtonTier.MEDIUM),
+        ):
+            button.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, 0.7 if compact else 1.0)
+            button.apply_theme_assets()
+            apply_button_tier(button, tier)
+        self.updateGeometry()
+
+    def fit_mode_height(self, available_width: int) -> None:
+        """Reserve the active card's contents, not the playlist's preferred size."""
+        margins = self.layout().contentsMargins()
+        width = max(1, available_width - margins.left() - margins.right())
+        panel = self.mode_stack.currentWidget()
+        height = max(panel.minimumSizeHint().height(), panel.heightForWidth(width))
+        self.mode_stack.setMinimumHeight(max(0 if self._compact_layout else 230, height))
 
     def _init_analysis(
         self,
@@ -4489,6 +4574,11 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         self.mode_stack = QtWidgets.QStackedWidget()
+        # fit_mode_height reserves the active card's measured contents. Ignore
+        # a playlist's preferred list height when distributing the spare space.
+        self.mode_stack.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Ignored,
+        )
         self.mode_stack.setMinimumHeight(230)
 
         self.single_panel = (
@@ -4515,6 +4605,7 @@ class SoundTab(QtWidgets.QWidget):
         self.now_playing = QtWidgets.QLabel(
             "No music selected"
         )
+        self.now_playing.setWordWrap(True)
 
         self.now_playing.setStyleSheet(
             """
@@ -4813,6 +4904,7 @@ class SoundTab(QtWidgets.QWidget):
         self.single_title = QtWidgets.QLabel(
             "No music selected"
         )
+        self.single_title.setWordWrap(True)
 
         self.single_title.setAlignment(
             Qt.AlignCenter
@@ -4989,6 +5081,9 @@ class SoundTab(QtWidgets.QWidget):
         self.playlist_list.setResizeMode(QtWidgets.QListView.Adjust)
         self.playlist_list.setGridSize(QtCore.QSize(282, 52))
         self.playlist_list.setMinimumHeight(110)
+        self.playlist_list.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Ignored,
+        )
         self.playlist_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.playlist_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.playlist_list.setStyleSheet(
@@ -5927,15 +6022,7 @@ class SoundTab(QtWidgets.QWidget):
             parent=self,
         )
 
-        dialog.tracksChosen.connect(
-            self._archive_tracks_chosen
-        )
-
-        try:
-            dialog.exec()
-        finally:
-            dialog._stop_preview()
-            dialog.deleteLater()
+        self._exec_music_popup(dialog)
 
     def _open_stock_for_current_mode(
         self,
@@ -5966,18 +6053,25 @@ class SoundTab(QtWidgets.QWidget):
             allow_browse=user_music,
         )
 
-        dialog.tracksChosen.connect(
-            self._archive_tracks_chosen
-        )
-
-        try:
-            dialog.exec()
-        finally:
-            dialog._stop_preview()
-            dialog.deleteLater()
+        self._exec_music_popup(dialog)
 
         if dialog.browse_requested:
             self._choose_new_files()
+
+    def _exec_music_popup(self, dialog: ArchiveDialog | StockMusicDialog) -> None:
+        chosen: list[str] = []
+        dialog.previewRequested.connect(self.player.pause_for_preview)
+        dialog.tracksChosen.connect(chosen.extend)
+        try:
+            dialog.exec()
+        finally:
+            # Release the preview before allowing normal playback to resume.
+            dialog._stop_preview()
+            self.player.resume_after_preview(resume=not self._shutdown and self._tab_active)
+            dialog.deleteLater()
+        if chosen and not self._shutdown:
+            # Applying a new letter selection retains its existing transport behavior.
+            self._archive_tracks_chosen(chosen)
 
     def _remember_tracks(self, track_ids: list[str]) -> None:
         if not self.project_state.is_project_ready:
