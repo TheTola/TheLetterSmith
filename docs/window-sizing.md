@@ -445,3 +445,19 @@ The real Main.py application was reopened and manually corner-shrunk to 1012x600
 Forge, Sound and Message kept their previews above reachable controls, with no
 outer panel scrollbars after tab transitions settled. Compilation and diff checks
 passed. The full repository suite was not run.
+
+## 900x480 compact desktop support (2026-09-28)
+
+The current minimum usable window is 900x480 logical pixels. Images now uses
+the compact layout and reserves its measured heading, status, and card height
+before the shared preview is sized. Sound, Message, and Forge also reserve their
+control heights; the preview stays above the controls and can shrink to a
+thumbnail. Help shrinks on short windows. Saved-letter and playlist scrolling
+remains inside those lists, while the outer tab panels keep their actions visible.
+
+Validation: the sizing suite passed 28 tests (three native-only skips), and all
+14 support-information tests passed. Native Windows checks covered 100%, 125%,
+150%, and 200% Qt scaling on the available display; final 125% resize repeats
+and 200% Images checks showed separate, clickable controls with no outer scroll.
+Screen-change geometry passed the mocked tests. A physical move between monitors
+could not be checked because only one display was connected.

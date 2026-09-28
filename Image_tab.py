@@ -593,6 +593,44 @@ class _ImageUtilityButton(ArtworkButton):
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
         _mask_button_to_artwork(self)
+        panel = self.parentWidget()
+        if isinstance(panel, _ImageUtilityPanel):
+            panel.position_buttons()
+
+
+class _ImageUtilityPanel(QtWidgets.QWidget):
+    def __init__(
+        self,
+        reset_btn: QtWidgets.QAbstractButton,
+        open_btn: QtWidgets.QAbstractButton,
+        gap: int,
+        parent: QtWidgets.QWidget,
+    ) -> None:
+        super().__init__(parent)
+        self._buttons = (reset_btn, open_btn)
+        self._gap = gap
+        for button in self._buttons:
+            button.setParent(self)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
+
+    def set_gap(self, gap: int) -> None:
+        self._gap = gap
+        self.position_buttons()
+
+    def position_buttons(self) -> None:
+        reset_btn, open_btn = self._buttons
+        total_height = reset_btn.height() + open_btn.height() + self._gap
+        self.setMinimumHeight(total_height)
+        top = max(0, (self.height() - total_height) // 2)
+        reset_btn.move(max(0, (self.width() - reset_btn.width()) // 2), top)
+        open_btn.move(
+            max(0, (self.width() - open_btn.width()) // 2),
+            top + reset_btn.height() + self._gap,
+        )
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self.position_buttons()
 
 
 class _ImageSettingsButton(ArtworkButton):
@@ -1834,6 +1872,7 @@ class ImageTab(
         self._image_import_result_holder: dict[str, object] | None = None
         self._image_import_index: int | None = None
 
+        self._compact_layout = False
         root = QtWidgets.QVBoxLayout(self)
 
         PRIMARY_PAGE_LAYOUT.apply(root)
@@ -2005,40 +2044,17 @@ class ImageTab(
         # Keep the utility controls beside the cards. The tab's vertical space
         # is intentionally compact, so placing large controls below the cards
         # clips their artwork and lets their widget rectangles overlap a card.
-        utility_position_column = (
-            QtWidgets.QVBoxLayout()
-        )
-
-        utility_position_column.setContentsMargins(
-            0,
-            0,
-            0,
-            0,
-        )
-
-        utility_position_column.setSpacing(
-            self.UTILITY_BUTTON_GAP
-        )
-
-        utility_position_column.addStretch(1)
-
-        utility_position_column.addWidget(
+        utility_panel = _ImageUtilityPanel(
             self.reset_btn,
-            0,
-            QtCore.Qt.AlignHCenter,
-        )
-
-        utility_position_column.addWidget(
             self.open_btn,
-            0,
-            QtCore.Qt.AlignHCenter,
+            self.UTILITY_BUTTON_GAP,
+            self,
         )
+        self._utility_panel = utility_panel
 
-        utility_position_column.addStretch(1)
-
-        centered_cards.insertLayout(
+        centered_cards.insertWidget(
             1,
-            utility_position_column,
+            utility_panel,
         )
         self._centered_cards = centered_cards
         self._minimum_cards_width = 380
@@ -2616,38 +2632,70 @@ class ImageTab(
 
         super().hideEvent(event)
 
+    def set_compact_layout(self, compact: bool) -> None:
+        if self._compact_layout == compact:
+            return
+        self._compact_layout = compact
+        if compact:
+            self.layout().setContentsMargins(12, 4, 12, 4)
+            self.layout().setSpacing(4)
+        else:
+            PRIMARY_PAGE_LAYOUT.apply(self.layout())
+        self._cards_layout.setSpacing(6 if compact else 10)
+        self._utility_panel.set_gap(6 if compact else self.UTILITY_BUTTON_GAP)
+        self._fit_cards()
+        self.updateGeometry()
+
     def _columns_for_width(self, width: int) -> int:
-        # Fit four compact cards before adding a second row. The old 300 px
-        # width made the scroll area's minimum height grow as the window shrank.
-        return min(len(self.cards), max(1, (width - 200) // 174))
+        margins = self.layout().contentsMargins()
+        gap = self._cards_layout.horizontalSpacing()
+        utility_width = max(self.reset_btn.width(), self.open_btn.width())
+        cards_width = (
+            width - margins.left() - margins.right()
+            - utility_width - self._centered_cards.spacing()
+        )
+        return min(len(self.cards), max(1, (cards_width + gap) // (164 + gap)))
 
     def minimumSizeHint(self) -> QtCore.QSize:
         if hasattr(self, "_minimum_cards_width"):
             return QtCore.QSize(self._minimum_cards_width, self.heightForWidth(self.width()))
         return super().minimumSizeHint()
 
+    def _card_area_overhead(self) -> int:
+        if not hasattr(self, "status"):
+            return 88
+        layout = self.layout()
+        margins = layout.contentsMargins()
+        return (margins.top() + margins.bottom()
+            + self.heading.sizeHint().height() + self.status.sizeHint().height()
+            + 2 * layout.spacing())
+
     def heightForWidth(self, width: int) -> int:
         if not hasattr(self, "_minimum_cards_width"):
             return super().heightForWidth(width)
         columns = self._columns_for_width(width)
         rows = (len(self.cards) + columns - 1) // columns
-        return 88 + rows * 160 + (rows - 1) * self._cards_layout.verticalSpacing()
+        return self._card_area_overhead() + rows * 160 + (rows - 1) * self._cards_layout.verticalSpacing()
 
     def _fit_cards(self) -> None:
-        columns = self._columns_for_width(self.width())
-        rows = (len(self.cards) + columns - 1) // columns
-        margins = self.layout().contentsMargins()
         scale = min(1.0, max(0.45, (self.width() - 40) / 1600))
+        if self._compact_layout:
+            scale = min(scale, 0.45)
         for button in (self.reset_btn, self.open_btn):
             button.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, scale)
             apply_button_tier(button, ButtonTier.LARGE)
         utility_width = max(self.reset_btn.width(), self.open_btn.width())
+        self._utility_panel.setFixedWidth(utility_width)
+        self._utility_panel.position_buttons()
+        columns = self._columns_for_width(self.width())
+        rows = (len(self.cards) + columns - 1) // columns
+        margins = self.layout().contentsMargins()
         width = min(300, max(164, (
             self.width() - margins.left() - margins.right() - utility_width
-            - self._centered_cards.spacing() - (columns - 1) * self._cards_layout.spacing()
+            - self._centered_cards.spacing() - (columns - 1) * self._cards_layout.horizontalSpacing()
         ) // columns))
-        height = min(270, max(160, (self.height() - 88
-            - (rows - 1) * self._cards_layout.spacing()) // rows))
+        height = min(270, max(160, (self.height() - self._card_area_overhead()
+            - (rows - 1) * self._cards_layout.verticalSpacing()) // rows))
         for card in self.cards.values():
             card.set_card_size(QtCore.QSize(width, height))
         if columns != self._cards_columns:
@@ -2660,6 +2708,9 @@ class ImageTab(
                     QtCore.Qt.AlignTop,
                 )
             self.updateGeometry()
+        self._centered_cards.invalidate()
+        self.layout().activate()
+        self._utility_panel.position_buttons()
 
     def resizeEvent(
             self,

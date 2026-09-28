@@ -1141,6 +1141,63 @@ class ReadinessWindow(QtWidgets.QFrame):
         self.close()
 
 
+class _IdentitySummaryLabel(QtWidgets.QLabel):
+    """Show at most two readable lines while retaining the full tooltip."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._complete_text = ""
+        self._updating_text = False
+        self.setTextFormat(Qt.PlainText)
+        self.setWordWrap(True)
+
+    def setText(self, text: str) -> None:
+        self._complete_text = text
+        self.setAccessibleName(text)
+        self._update_visible_text()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._update_visible_text()
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in (QtCore.QEvent.FontChange, QtCore.QEvent.StyleChange):
+            if hasattr(self, "_complete_text"):
+                self._update_visible_text()
+
+    def _update_visible_text(self) -> None:
+        if self._updating_text:
+            return
+        text = " ".join(self._complete_text.split())
+        width = self.contentsRect().width()
+        visible = text
+        if text and width > 0:
+            metrics = self.fontMetrics()
+            if metrics.horizontalAdvance(text) > width:
+                low, high = 0, len(text)
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    if metrics.horizontalAdvance(text[:middle]) <= width:
+                        low = middle
+                    else:
+                        high = middle - 1
+                split = text.rfind(" ", 0, low + 1)
+                if split > 0:
+                    first, remaining = text[:split], text[split + 1:]
+                else:
+                    first, remaining = text[:low], text[low:]
+                visible = first + "\n" + metrics.elidedText(
+                    remaining.lstrip(), Qt.ElideRight, width,
+                )
+        if visible != super().text():
+            self._updating_text = True
+            try:
+                super().setText(visible)
+            finally:
+                self._updating_text = False
+
+
 class ForgeTab(QtWidgets.QWidget):
     correction_requested = QtCore.Signal(str, str)
     project_restored = QtCore.Signal(dict)
@@ -1494,7 +1551,7 @@ class ForgeTab(QtWidgets.QWidget):
             Qt.Popup | Qt.FramelessWindowHint,
         )
         self.saved_panel.setObjectName("ForgeSavedPanel")
-        self.saved_panel.setMinimumSize(560, 480)
+        self.saved_panel.setMinimumSize(560, 400)
         self.saved_panel.setMaximumSize(1100, 720)
         self.saved_panel.setStyleSheet(
             "QFrame#ForgeSavedPanel{background:#101820;"
@@ -1663,17 +1720,16 @@ class ForgeTab(QtWidgets.QWidget):
         identity_row.setContentsMargins(9, 6, 9, 6)
         identity_row.setSpacing(9)
         identity_row.addWidget(self._muted_label("Title"))
-        self.identity_title = QtWidgets.QLabel()
+        self.identity_title = _IdentitySummaryLabel()
         self.identity_title.setStyleSheet("color:#f2fbff;font:600 10pt 'Segoe UI';")
         identity_row.addWidget(self.identity_title, 1)
         identity_row.addWidget(self._muted_label("Recipient"))
-        self.identity_recipient = QtWidgets.QLabel()
+        self.identity_recipient = _IdentitySummaryLabel()
         self.identity_recipient.setStyleSheet(
             "color:#f2fbff;font:600 10pt 'Segoe UI';"
         )
         for label in (self.identity_title, self.identity_recipient):
             label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
-            label.setWordWrap(True)
             label.setMaximumHeight(46)
         identity_row.addWidget(self.identity_recipient, 1)
         identity_holder = QtWidgets.QHBoxLayout()
@@ -1874,13 +1930,21 @@ class ForgeTab(QtWidgets.QWidget):
             return
         self._compact_layout = compact
         self._heading_row.setContentsMargins(0, 0, 0, 0 if compact else 5)
-        self._main_layout.setSpacing(2 if compact else 11)
-        self.identity_panel.layout().setContentsMargins(9, 2 if compact else 6, 9, 2 if compact else 6)
-        self._actions_layout.setSpacing(2 if compact else 9)
+        self._main_layout.setSpacing(0 if compact else 11)
+        self.identity_panel.layout().setContentsMargins(9, 0 if compact else 6, 9, 0 if compact else 6)
+        self._actions_layout.setSpacing(6 if compact else 9)
         format_layout = self.preview_format_panel.layout()
-        format_layout.setContentsMargins(11, 2 if compact else 6, 9, 2 if compact else 6)
+        format_layout.setContentsMargins(11, 1 if compact else 6, 9, 1 if compact else 6)
         for index in range(format_layout.count()):
             format_layout.itemAt(index).layout().setSpacing(0 if compact else 4)
+        self.readiness_summary.setMinimumWidth(220 if compact else 0)
+        self.github_account_summary.setMinimumWidth(220 if compact else 0)
+        self.github_account_summary.setMaximumWidth(max(
+            self.github_account_summary.fontMetrics().horizontalAdvance(
+                self.github_account_summary.text()
+            ) + (20 if self.github_account_summary.property("githubSignInWarning") else 0),
+            220 if compact else 0,
+        ))
         for button, tier in (
             (self.readiness_btn, ButtonTier.SMALL),
             (self.load_saved_btn, ButtonTier.STANDARD),
@@ -1994,6 +2058,8 @@ class ForgeTab(QtWidgets.QWidget):
             height = round(content_width / ratio) + 4 if ratio > 0 else 63
             if self._compact_layout and ratio <= 0:
                 height = min(height, 40)
+            elif self._compact_layout:
+                height = min(height, 50)
             button.setFixedHeight(max(height, text_size.height()))
 
     def apply_theme_assets(self, service: ThemeService) -> None:
@@ -2288,9 +2354,10 @@ class ForgeTab(QtWidgets.QWidget):
                 "border-radius:8px;padding:4px 9px;"
                 "font:700 9pt 'Segoe UI';}"
             )
-            self.github_account_summary.setMaximumWidth(
-                self.github_account_summary.fontMetrics().horizontalAdvance(summary) + 20
-            )
+            self.github_account_summary.setMaximumWidth(max(
+                self.github_account_summary.fontMetrics().horizontalAdvance(summary) + 20,
+                220 if self._compact_layout else 0,
+            ))
             return
         colors = getattr(self, "_theme_tokens", CYBER_FORGE_THEME.tokens)
         self.github_account_summary.setToolTip(summary)
@@ -2299,9 +2366,10 @@ class ForgeTab(QtWidgets.QWidget):
             f"color:{colors.muted_text};background:transparent;"
             "border:none;padding:0;font:600 9pt 'Segoe UI';}"
         )
-        self.github_account_summary.setMaximumWidth(
-            self.github_account_summary.fontMetrics().horizontalAdvance(summary)
-        )
+        self.github_account_summary.setMaximumWidth(max(
+            self.github_account_summary.fontMetrics().horizontalAdvance(summary),
+            220 if self._compact_layout else 0,
+        ))
 
     @QtCore.Slot(object)
     def _apply_github_state(self, result: object) -> None:
@@ -3075,6 +3143,8 @@ class ForgeTab(QtWidgets.QWidget):
             max(1, available.height() - 32),
         )
         self.saved_panel.resize(width, height)
+        width = self.saved_panel.width()
+        height = self.saved_panel.height()
         center = owner.mapToGlobal(owner.rect().center())
         x = max(
             available.left() + 16,

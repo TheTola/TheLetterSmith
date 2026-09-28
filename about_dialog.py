@@ -176,6 +176,7 @@ class SupportInformationOptionsDialog(LetterSmithDialog):
             width=620,
         )
         self.setMinimumHeight(500)
+        self.content_layout.setSpacing(16)
 
         explanation = QtWidgets.QLabel(
             "Letter Smith can include additional technical information that may "

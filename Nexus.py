@@ -159,7 +159,7 @@ def _color_rgba(color: QColor | str, alpha: int) -> str:
     )
 
 WIN_W, WIN_H = 1400, 900
-MIN_WINDOW_SIZE = QSize(960, 600)
+MIN_WINDOW_SIZE = QSize(900, 480)
 _PREVIEW_AR = 169 / 253  # preview frame aspect (matches your 169├ù253 scaling)
 SHELL_FONT_PX = 13
 SOUND_PREVIEW_MIN_HEIGHT = 220
@@ -3566,13 +3566,13 @@ class Nexus(QtWidgets.QMainWindow):
         )
         self.preview_tools_layout.setContentsMargins(left_margin, 0, 0, 0)
         current_tab = self.tabbar.currentIndex()
-        compact = current_tab in {1, 2, 3} and self.body.height() - 24 < 600
-        if current_tab in {1, 2, 3}:
-            self.help_anchor.setVisible(current_tab == 2 and not compact)
+        compact = current_tab in {0, 1, 2, 3} and self.body.height() - 24 < 600
+        if current_tab in {0, 1, 2, 3}:
+            self.help_anchor.setVisible(current_tab in {0, 2} and not compact)
         icon_size = round(HELP_ICON_PX * 0.9) if forge_visible else HELP_ICON_PX
         if compact:
             icon_size = 64
-        if current_tab in {1, 2, 3} and self.help_anchor.isHidden():
+        if current_tab in {0, 1, 2, 3} and self.help_anchor.isHidden():
             icon_size = min(icon_size, max(32, self.preview_frame.height()))
         if self.help_icon.width() != icon_size:
             self.help_anchor.setFixedSize(icon_size, icon_size)
@@ -3589,7 +3589,7 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _position_help_icon(self) -> None:
         current_tab = self.tabbar.currentIndex()
-        if current_tab in {1, 2, 3} and self.help_anchor.isHidden():
+        if current_tab in {0, 1, 2, 3} and self.help_anchor.isHidden():
             reference = self.preview_frame
             preview_top = reference.mapTo(self.body, QPoint(0, 0)).y()
             x = (
@@ -4535,17 +4535,19 @@ class Nexus(QtWidgets.QMainWindow):
         max_width = max(1, body_width - PREVIEW_FRAME_EXTRA)
         region = getattr(self, "preview_region", None)
         if hasattr(self, "forge_tab"):
-            compact = current_tab in {1, 2, 3} and body_height < 600
+            compact = current_tab in {0, 1, 2, 3} and body_height < 600
             if current_tab != 4:
                 self.body_layout.setContentsMargins(12, 6 if compact else 12, 12, 6 if compact else 12)
                 self.body_layout.setSpacing(4 if compact else 8 if current_tab == 3 else 10)
+            self.image_tab.set_compact_layout(current_tab == 0 and compact)
             self.sound_tab.set_compact_layout(current_tab == 1 and body_height < 600)
             if current_tab == 1:
                 self.sound_tab.fit_mode_height(body_width)
             self.message_tab.set_compact_layout(current_tab == 2 and body_height < 600)
             self._set_forge_compact_layout(current_tab == 3 and body_height < 760)
-            if compact:
-                body_height += 12
+            self._update_preview_tools_geometry()
+            margins = self.body_layout.contentsMargins()
+            body_height = max(1, self.body.height() - margins.top() - margins.bottom())
 
         if current_tab == 3:
             forge_tab = getattr(self, "forge_tab", None)
@@ -4603,7 +4605,7 @@ class Nexus(QtWidgets.QMainWindow):
                 controls_height = self.image_tab.heightForWidth(body_width)
             elif current_tab in {1, 2} and self._project_tabs_initialized:
                 tab = self.sound_tab if current_tab == 1 else self.message_tab
-                controls_height = max(tab.minimumSizeHint().height(), tab.heightForWidth(body_width))
+                controls_height = max(tab.minimumSizeHint().height(), tab.heightForWidth(body_width)) + 4
             preview_budget = max(
                 1, body_height - tools_height - caption_height - gaps
                 - controls_height - PREVIEW_FRAME_EXTRA,

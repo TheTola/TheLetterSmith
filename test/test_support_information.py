@@ -278,6 +278,30 @@ class SupportInformationUiTests(unittest.TestCase):
             "unchanged",
         )
 
+    def test_options_dialog_labels_and_actions_fit_900_by_480(self) -> None:
+        available = QtCore.QRect(0, 0, 900, 480)
+        host = self._host()
+        host.setGeometry(available)
+        host.show()
+        dialog = SupportInformationOptionsDialog(host)
+        self.addCleanup(dialog.deleteLater)
+        screen = mock.Mock()
+        screen.availableGeometry.return_value = available
+
+        with mock.patch("window_chrome.screen_for_launcher", return_value=screen):
+            dialog.show()
+            self.app.processEvents()
+
+        self.assertTrue(available.contains(dialog.frameGeometry()))
+        for label in dialog.findChildren(QtWidgets.QLabel):
+            if label.objectName() in {"LetterSmithDialogMessage", "LetterSmithDialogDetail"}:
+                self.assertGreaterEqual(label.height(), label.heightForWidth(label.width()))
+        for button in (dialog.cancel_button, dialog.copy_button):
+            bounds = QtCore.QRect(button.mapTo(dialog, QtCore.QPoint()), button.size())
+            self.assertTrue(dialog.rect().contains(bounds))
+        dialog.close()
+        host.close()
+
     def test_about_opens_options_and_cancel_stops_generation(self) -> None:
         dialog = AboutLetterSmithDialog(
             self._host(),

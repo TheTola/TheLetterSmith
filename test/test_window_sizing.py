@@ -107,6 +107,7 @@ class WindowSizingTests(unittest.TestCase):
                     QtTest.QTest.qWait(300)
                     for width, height in (
                         (1400, 900), (960, 900), (960, 600),
+                        (900, 480), (960, 516), (1024, 540),
                         (1920, 600), (1920, 1080), (1180, 820),
                     ):
                         with self.subTest(theme=theme, tab=index, size=(width, height)):
@@ -116,11 +117,21 @@ class WindowSizingTests(unittest.TestCase):
                             self.assertEqual(window.minimumSize(), initial_minimum)
                             page = window.page_stack.currentWidget()
                             self.assertEqual(page.geometry(), window.page_stack.contentsRect())
+                            if index != 4:
+                                preview = QtCore.QRect(
+                                    window.preview_frame.mapTo(window.body, QtCore.QPoint()),
+                                    window.preview_frame.size(),
+                                )
+                                self.assertTrue(window.body.rect().contains(preview))
+                                self.assertGreaterEqual(preview.height(), 40)
+                                self.assertLessEqual(preview.bottom(), window.page_stack.y())
+                                self.assertTrue(window.body.rect().contains(window.page_stack.geometry()))
                             if index == 0:
                                 tab = window.image_tab
                                 cards = list(tab.cards.values())
                                 for i, card in enumerate(cards):
                                     self.assertTrue(tab.rect().contains(card.geometry()))
+                                    self.assertLess(card.geometry().bottom(), tab.status.y())
                                     for other in cards[i + 1:]:
                                         self.assertFalse(card.geometry().intersects(other.geometry()))
                                     button = card.clear_btn
@@ -130,11 +141,18 @@ class WindowSizingTests(unittest.TestCase):
                                 self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
                                 self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
                                 self.assertGreaterEqual(tab.pwrite_fab.y(), window.tabbar.geometry().bottom())
-                                scroll.ensureWidgetVisible(cards[-1].clear_btn, 0, 0)
-                                self.app.processEvents()
-                                button = cards[-1].clear_btn
-                                rect = QtCore.QRect(button.mapTo(scroll.viewport(), QtCore.QPoint()), button.size())
-                                self.assertTrue(scroll.viewport().rect().contains(rect))
+                                for button in (tab.reset_btn, tab.open_btn,
+                                               *(card.clear_btn for card in cards)):
+                                    rect = QtCore.QRect(
+                                        button.mapTo(scroll.viewport(), QtCore.QPoint()),
+                                        button.size(),
+                                    )
+                                    self.assertTrue(scroll.viewport().rect().contains(rect),
+                                                    (theme, (width, height), button.text(), rect))
+                                self.assertGreaterEqual(
+                                    tab.open_btn.y() - tab.reset_btn.geometry().bottom() - 1,
+                                    6,
+                                )
                             elif index == 1:
                                 tab = window.sound_tab
                                 self.assertLess(tab.mode_stack.geometry().bottom(), tab.now_playing.y())
@@ -178,7 +196,7 @@ class WindowSizingTests(unittest.TestCase):
 
     def test_sound_and_message_fit_without_panel_scrolling(self) -> None:
         with self.window() as window:
-            window.setMinimumSize(960, 516)
+            window.setMinimumSize(900, 480)
             sound = window.sound_tab
             sound.single_title.setText("A long track title with spaces " * 3)
             sound.single_detail.setText("4:30 • " + "a-long-imported-audio-filename-" * 3 + ".mp3")
@@ -191,8 +209,9 @@ class WindowSizingTests(unittest.TestCase):
                     if mode is not None:
                         sound.mode_stack.setCurrentIndex(mode)
                     QtTest.QTest.qWait(300)
-                    for size in ((1400, 900), (960, 600), (960, 516),
-                                 (1920, 600), (1180, 820), (1400, 900)):
+                    for size in ((1400, 900), (900, 480), (960, 600),
+                                 (960, 516), (1024, 540), (1920, 600),
+                                 (1180, 820), (1400, 900)):
                         with self.subTest(theme=theme, tab=index, mode=mode, size=size):
                             window.resize(*size)
                             self.settle(window)
@@ -249,7 +268,7 @@ class WindowSizingTests(unittest.TestCase):
             "recipient_title": "A long letter title " * 12,
             "recipient_name": "A long recipient name " * 12,
         }) as window:
-            window.setMinimumSize(960, 516)
+            window.setMinimumSize(900, 480)
             window.tabbar.setCurrentIndex(3)
             tab = window.forge_tab
             buttons = (tab.readiness_btn, tab.load_saved_btn, tab.load_stock_btn,
@@ -263,7 +282,9 @@ class WindowSizingTests(unittest.TestCase):
                 fonts = [button.font().toString() for button in buttons]
                 for mode in ("landscape", "portrait", "window"):
                     window._forge_preview_mode = mode
-                    for size in ((1400, 900), (960, 516), (960, 840), (960, 900), (1920, 600), (1400, 900)):
+                    for size in ((1400, 900), (900, 480), (960, 516),
+                                 (1024, 540), (960, 840), (960, 900),
+                                 (1920, 600), (1400, 900)):
                         with self.subTest(theme=theme, mode=mode, size=size):
                             window.resize(*size)
                             window._update_preview_geometry()
@@ -285,19 +306,31 @@ class WindowSizingTests(unittest.TestCase):
                             for widget in (*buttons, tab.github_account_btn, tab.unpublish_btn):
                                 rect = QtCore.QRect(widget.mapTo(scroll.viewport(), QtCore.QPoint()), widget.size())
                                 self.assertTrue(scroll.viewport().rect().contains(rect), (widget.text(), rect))
+                            for label in (tab.identity_title, tab.identity_recipient):
+                                self.assertLessEqual(len(label.text().splitlines()), 2)
+                                for line in label.text().splitlines():
+                                    self.assertLessEqual(
+                                        label.fontMetrics().horizontalAdvance(line),
+                                        label.contentsRect().width(),
+                                    )
+                            for first, second in ((tab.preview_btn, tab.publish_btn),
+                                                  (tab.publish_btn, tab.open_published_btn)):
+                                first_rect = QtCore.QRect(first.mapTo(tab, QtCore.QPoint()), first.size())
+                                second_rect = QtCore.QRect(second.mapTo(tab, QtCore.QPoint()), second.size())
+                                self.assertGreaterEqual(second_rect.left() - first_rect.right() - 1, 6)
                             help_rect = QtCore.QRect(window.help_icon.pos(), window.help_icon.size())
                             self.assertTrue(window.body.rect().contains(help_rect))
                             self.assertFalse(window._preview_geometry_timer.isActive())
                             self.assertFalse(tab._action_geometry_timer.isActive())
                 self.assertTrue(tab.identity_title.toolTip())
                 self.assertTrue(tab.github_account_summary.toolTip())
-            window.resize(960, 516)
+            window.resize(900, 480)
             self.settle()
             window.tabbar.setCurrentIndex(0)
             QtTest.QTest.qWait(300)
             self.assertFalse(window._forge_compact_layout)
             self.assertEqual(window.body_layout.direction(), QtWidgets.QBoxLayout.TopToBottom)
-            self.assertEqual(window.help_icon.size(), QtCore.QSize(125, 125))
+            self.assertLessEqual(window.help_icon.width(), 64)
 
     def test_shell_layout_hidden_pages_and_content_do_not_grow_window(self) -> None:
         with self.window() as window:
@@ -329,6 +362,13 @@ class WindowSizingTests(unittest.TestCase):
                 window.resize(960, 600)
                 QtTest.QTest.qWait(500)
                 self.assertEqual(window.size(), QtCore.QSize(960, 600))
+                self.assertEqual(window.page_stack.currentIndex(), index)
+                self.assertEqual(
+                    window.page_stack.currentWidget().geometry(), window.page_stack.contentsRect(),
+                )
+                window.resize(900, 480)
+                QtTest.QTest.qWait(500)
+                self.assertEqual(window.size(), QtCore.QSize(900, 480))
                 self.assertEqual(window.page_stack.currentIndex(), index)
                 self.assertEqual(
                     window.page_stack.currentWidget().geometry(), window.page_stack.contentsRect(),

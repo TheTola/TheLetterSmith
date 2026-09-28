@@ -4388,21 +4388,25 @@ class SoundTab(QtWidgets.QWidget):
             return
         self._compact_layout = compact
         if compact:
-            self.layout().setContentsMargins(12, 4, 12, 4)
-            self.layout().setSpacing(3)
+            self.layout().setContentsMargins(12, 0, 12, 0)
+            self.layout().setSpacing(2)
         else:
             SOUND_PAGE_LAYOUT.apply(self.layout())
+        self._header_layout.setContentsMargins(4, 0, 4, 0 if compact else 2)
+        self._transport_layout.setContentsMargins(4, 2 if compact else 4,
+                                                 4, 2 if compact else 4)
+        self._status_layout.setContentsMargins(4, 0 if compact else 2, 4, 0)
         self.mode_stack.setMinimumHeight(0 if compact else 230)
         self.single_panel.layout().setContentsMargins(
-            12 if compact else 24, 4 if compact else 24,
-            12 if compact else 24, 4 if compact else 24,
+            12 if compact else 24, 1 if compact else 24,
+            12 if compact else 24, 1 if compact else 24,
         )
-        self.single_panel.layout().setSpacing(6 if compact else SECTION_LAYOUT_SPACING + 2)
+        self.single_panel.layout().setSpacing(4 if compact else SECTION_LAYOUT_SPACING + 2)
         self.playlist_panel.layout().setContentsMargins(
-            8 if compact else 18, 4 if compact else 18,
-            8 if compact else 18, 4 if compact else 18,
+            8 if compact else 18, 2 if compact else 18,
+            8 if compact else 18, 2 if compact else 18,
         )
-        self.playlist_panel.layout().setSpacing(6 if compact else SECTION_LAYOUT_SPACING)
+        self.playlist_panel.layout().setSpacing(4 if compact else SECTION_LAYOUT_SPACING)
         self.playlist_list.setMinimumHeight(64 if compact else 110)
         for button, tier in (
             (self.stock_btn, ButtonTier.STANDARD),
@@ -4508,6 +4512,7 @@ class SoundTab(QtWidgets.QWidget):
         header = QtWidgets.QHBoxLayout()
         header.setContentsMargins(4, 0, 4, 2)
         header.setSpacing(SECTION_LAYOUT_SPACING)
+        self._header_layout = header
 
         self.stock_btn = ThemedArtworkButton(
             "Stock Music",
@@ -4622,6 +4627,7 @@ class SoundTab(QtWidgets.QWidget):
         transport = QtWidgets.QHBoxLayout()
         transport.setContentsMargins(4, 4, 4, 4)
         transport.setSpacing(ROW_LAYOUT_SPACING)
+        self._transport_layout = transport
 
         self.prev_btn = QtWidgets.QToolButton()
 
@@ -4818,6 +4824,7 @@ class SoundTab(QtWidgets.QWidget):
         status_row = QtWidgets.QHBoxLayout()
         status_row.setContentsMargins(4, 2, 4, 0)
         status_row.setSpacing(ROW_LAYOUT_SPACING)
+        self._status_layout = status_row
 
         self.status = QtWidgets.QLabel(
             ""
