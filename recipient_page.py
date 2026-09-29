@@ -31,7 +31,6 @@ class RecipientPage(QtWidgets.QWidget):
 
         panel = QtWidgets.QFrame(self)
         panel.setObjectName("RecipientPanel")
-        panel.setMaximumWidth(520)
         panel.setStyleSheet(
             """
             QFrame#RecipientPanel {

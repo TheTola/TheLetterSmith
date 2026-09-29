@@ -26,7 +26,7 @@ from recipient_page import RecipientPage
 from readiness import evaluate_project_save_eligibility
 from saved_letters import SavedLetterCatalog
 from settings_store import SettingsStore
-from ui_theme import BUTTON_TIER_STYLES, ButtonTier, ThemeService
+from ui_theme import BUTTON_TIER_STYLES, THEMES, ButtonTier, ThemeService
 
 
 class IdentityFieldLockingTests(unittest.TestCase):
@@ -93,6 +93,43 @@ class IdentityFieldLockingTests(unittest.TestCase):
             ["aMANda mCCall", True],
         )
         page.deleteLater()
+
+    def test_recipient_actions_stay_inside_panel_without_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = ThemeService(
+                Path(__file__).resolve().parents[1],
+                settings=SettingsStore(directory),
+            )
+            page = RecipientPage()
+            try:
+                page.show()
+                buttons = (
+                    page.load_button,
+                    page.stock_button,
+                    page.begin_button,
+                )
+                for theme_id in THEMES:
+                    service.set_theme(theme_id, persist=False)
+                    service.apply_semantic_styles(page)
+                    page.apply_theme_assets(service)
+                    for width, height in ((900, 480), (1280, 720), (1920, 1080)):
+                        with self.subTest(theme=theme_id, size=(width, height)):
+                            page.resize(width, height)
+                            self.app.processEvents()
+                            panel = page._panel
+                            self.assertTrue(page.rect().contains(panel.geometry()))
+                            rects = [button.geometry() for button in buttons]
+                            for rect in rects:
+                                self.assertTrue(panel.rect().contains(rect))
+                            for previous, current in zip(rects, rects[1:]):
+                                self.assertGreaterEqual(
+                                    current.left() - previous.right() - 1,
+                                    6,
+                                )
+            finally:
+                page.close()
+                page.deleteLater()
+                self.app.processEvents()
 
     def test_recipient_page_rejects_reserved_recipient_with_popup(self) -> None:
         page = RecipientPage()
