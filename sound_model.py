@@ -16,6 +16,7 @@ from typing import Iterable, Optional
 
 from config import MUSIC_FILE, USER_SOUNDS_DIR
 from project_paths import application_paths
+from protected_projects import STOCK_PROJECT_KIND, protected_project_kind
 from transactional_io import file_change_token, set_path_hidden
 
 SOUND_MODEL_VERSION = 2
@@ -415,7 +416,45 @@ def _load_stock_records(project_root: str | Path) -> dict[str, TrackRecord]:
     return records
 
 
-def _stock_track_aliases(project_root: str | Path) -> dict[str, str]:
+def matching_bundled_stock_track(
+    project_root: str | Path,
+    source: str | Path,
+    records: Iterable[TrackRecord],
+    *,
+    original_name: str = "",
+) -> TrackRecord | None:
+    """Recognize older stock exports that omitted a short MP3 header."""
+    source_path = Path(source)
+    try:
+        source_size = source_path.stat().st_size
+    except OSError:
+        return None
+    if source_size <= 1024:
+        return None
+    source_bytes: bytes | None = None
+    for record in records:
+        if record.source_kind != "stock" or (
+            original_name and record.original_name != original_name
+        ):
+            continue
+        stock_source = resolve_track_path(project_root, record)
+        try:
+            omitted = stock_source.stat().st_size - source_size
+            if not 0 <= omitted <= 1024:
+                continue
+            if source_bytes is None:
+                source_bytes = source_path.read_bytes()
+            if stock_source.read_bytes().endswith(source_bytes):
+                return record
+        except OSError:
+            continue
+    return None
+
+
+def _stock_track_aliases(
+    project_root: str | Path,
+    legacy_ids: set[str],
+) -> dict[str, str]:
     """Map legacy archive/stock IDs to canonical bundled-track IDs."""
     stock_records = _load_stock_records(project_root)
     canonical_by_hash = {
@@ -436,10 +475,21 @@ def _stock_track_aliases(project_root: str | Path) -> dict[str, str]:
     for key, value in raw_tracks.items():
         if not isinstance(value, dict):
             continue
+        track_id = str(value.get("track_id", "")).strip() or str(key)
         content_hash = str(value.get("content_hash", "")).strip()
         canonical_id = canonical_by_hash.get(content_hash, "")
         if canonical_id:
-            aliases[str(value.get("track_id", "")).strip() or str(key)] = canonical_id
+            aliases[track_id] = canonical_id
+        elif track_id in legacy_ids:
+            processed_file = str(value.get("processed_file", "")).strip()
+            if processed_file and Path(processed_file).name == processed_file:
+                stock_record = matching_bundled_stock_track(
+                    project_root,
+                    processed_dir(project_root) / processed_file,
+                    stock_records.values(),
+                )
+                if stock_record is not None:
+                    aliases[track_id] = stock_record.track_id
     return aliases
 
 
@@ -535,7 +585,22 @@ def load_project_state(
         source_version = -1
     if source_version < 0 or source_version > SOUND_MODEL_VERSION:
         payload = _replace_invalid_json(path, default)
-    aliases = _stock_track_aliases(project_root)
+    legacy_ids: set[str] = set()
+    settings_file = application_paths(project_root).settings_file
+    try:
+        settings = json.loads(settings_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        settings = {}
+    if isinstance(settings, dict) and protected_project_kind(settings) == STOCK_PROJECT_KIND:
+        legacy_ids.update(
+            str(payload.get(key, "")).strip()
+            for key in ("single_track_id", "selected_track_id")
+        )
+        playlist = payload.get("playlist", [])
+        if isinstance(playlist, list):
+            legacy_ids.update(str(track_id).strip() for track_id in playlist)
+    legacy_ids.discard("")
+    aliases = _stock_track_aliases(project_root, legacy_ids)
     if aliases:
         single_track_id = str(payload.get("single_track_id", "")).strip()
         selected_track_id = str(payload.get("selected_track_id", "")).strip()

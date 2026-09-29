@@ -100,6 +100,7 @@ from sound_model import (
     import_runtime_track,
     library_path,
     load_library,
+    matching_bundled_stock_track,
     originals_dir,
     processed_dir,
     project_sound_path,
@@ -1511,6 +1512,18 @@ class SavedLetterRestorer:
             for track in sound_tracks:
                 source = sounds / track["filename"] if sounds else None
                 if source is None:
+                    continue
+                stock_record = (
+                    matching_bundled_stock_track(
+                        self.project_root,
+                        source,
+                        library_records.values(),
+                        original_name=track["original_name"],
+                    )
+                    if entry.stock else None
+                )
+                if stock_record is not None:
+                    imported_ids.append(stock_record.track_id)
                     continue
                 record = import_runtime_track(
                     self.project_root,

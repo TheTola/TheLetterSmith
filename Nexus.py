@@ -1844,7 +1844,7 @@ class _ThemedNewProjectButton(QtWidgets.QToolButton):
         self.setProperty("themeRole", "button")
         self.setAccessibleName("New Project")
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(NEW_PROJECT_ARTWORK_PX, NEW_PROJECT_ARTWORK_PX)
+        self.setFixedSize(NEW_PROJECT_ARTWORK_PX, 72)
         self.setIconSize(self.size())
 
     @property
@@ -3036,17 +3036,59 @@ class Nexus(QtWidgets.QMainWindow):
         button = getattr(self, "protected_new_project_btn", None)
         if button is None or not button.isVisible():
             return
+        preview_frame = getattr(self, "preview_frame", None)
         image_tab = getattr(self, "image_tab", None)
         prompt_button = getattr(image_tab, "pwrite_fab", None)
-        if prompt_button is None:
+        if preview_frame is None or prompt_button is None:
             return
 
         x_position = prompt_button.x()
-        y_position = (
-            prompt_button.y()
-            + prompt_button.height()
-            + NEW_PROJECT_ARTWORK_GAP
-        )
+        icon = button.icon()
+        if self.body.height() < 760:
+            preview_position = preview_frame.mapTo(self, QPoint(0, 0))
+            if self.tabbar.currentIndex() == 0 and prompt_button.isVisible():
+                x_position = prompt_button.geometry().right() + 1 + NEW_PROJECT_ARTWORK_GAP
+            available_width = max(
+                1,
+                min(
+                    NEW_PROJECT_ARTWORK_PX,
+                    preview_position.x() - x_position - NEW_PROJECT_ARTWORK_GAP,
+                ),
+            )
+            size = (
+                icon.actualSize(QSize(available_width, preview_frame.height()))
+                if not icon.isNull()
+                else QSize(available_width, min(56, preview_frame.height()))
+            )
+            y_position = preview_position.y() + (preview_frame.height() - size.height()) // 2
+        else:
+            size = (
+                icon.actualSize(QSize(NEW_PROJECT_ARTWORK_PX, NEW_PROJECT_ARTWORK_PX))
+                if not icon.isNull()
+                else QSize(NEW_PROJECT_ARTWORK_PX, 72)
+            )
+            y_position = (
+                prompt_button.y() + prompt_button.height() + NEW_PROJECT_ARTWORK_GAP
+                + (NEW_PROJECT_ARTWORK_PX - size.height()) // 2
+            )
+            if self.tabbar.currentIndex() == 1:
+                stock_button = getattr(getattr(self, "sound_tab", None), "stock_btn", None)
+                if stock_button is not None:
+                    y_position = min(
+                        y_position,
+                        stock_button.mapTo(self, QPoint(0, 0)).y() - size.height(),
+                    )
+            elif self.tabbar.currentIndex() == 3:
+                format_panel = getattr(
+                    getattr(self, "forge_tab", None), "preview_format_panel", None,
+                )
+                if format_panel is not None:
+                    y_position = min(
+                        y_position,
+                        format_panel.mapTo(self, QPoint(0, 0)).y() - size.height(),
+                    )
+        button.setFixedSize(size)
+        button.setIconSize(size)
         button.move(
             max(0, min(x_position, self.width() - button.width())),
             max(0, min(y_position, self.height() - button.height())),
@@ -4593,6 +4635,7 @@ class Nexus(QtWidgets.QMainWindow):
                 self.body_layout.activate()
             self._update_preview_tools_geometry()
             self._update_forge_preview_zoom()
+            self._position_protected_new_project_button()
             return
 
         preview_budget = body_height
@@ -4645,6 +4688,7 @@ class Nexus(QtWidgets.QMainWindow):
             self.body_layout.activate()
         if hasattr(self, "forge_tab"):
             self._update_preview_tools_geometry()
+            self._position_protected_new_project_button()
 
     def _refresh_preview_after_layout(self) -> None:
         self._update_preview_geometry()

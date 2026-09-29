@@ -174,6 +174,40 @@ class WindowSizingTests(unittest.TestCase):
                                               window.forge_tab.github_account_summary):
                                     self.assertGreaterEqual(label.height(), label.heightForWidth(label.width()))
 
+    def test_protected_new_project_stays_clear_on_main_tabs(self) -> None:
+        with self.window(settings={"protected_project_kind": "stock"}) as window:
+            button = window.protected_new_project_btn
+            for theme in THEMES:
+                window.theme_service.set_theme(theme)
+                for size in ((900, 480), (1012, 600), (1280, 720)):
+                    window.resize(*size)
+                    for index in range(4):
+                        window.tabbar.setCurrentIndex(index)
+                        QtTest.QTest.qWait(300)
+                        self.settle(window)
+                        with self.subTest(theme=theme, size=size, tab=index):
+                            self.assertTrue(button.isVisibleTo(window))
+                            button_rect = QtCore.QRect(
+                                button.mapTo(window, QtCore.QPoint()), button.size(),
+                            )
+                            preview_rect = QtCore.QRect(
+                                window.preview_frame.mapTo(window, QtCore.QPoint()),
+                                window.preview_frame.size(),
+                            )
+                            page_rect = QtCore.QRect(
+                                window.page_stack.mapTo(window, QtCore.QPoint()),
+                                window.page_stack.size(),
+                            )
+                            self.assertTrue(window.rect().contains(button_rect), button_rect)
+                            self.assertFalse(button_rect.intersects(preview_rect), button_rect)
+                            self.assertFalse(button_rect.intersects(page_rect), button_rect)
+                            if index == 0:
+                                prompt = window.image_tab.pwrite_fab
+                                prompt_rect = QtCore.QRect(
+                                    prompt.mapTo(window, QtCore.QPoint()), prompt.size(),
+                                )
+                                self.assertFalse(button_rect.intersects(prompt_rect), button_rect)
+
     def test_help_hover_recovers_after_a_modal_interrupts_enter(self) -> None:
         with self.window() as window:
             window.tabbar.setCurrentIndex(2)

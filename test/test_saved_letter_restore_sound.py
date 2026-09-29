@@ -6,9 +6,11 @@ import stat
 import tempfile
 import unittest
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+import project_paths
 import saved_letters
 import generate
 import sound_model
@@ -21,6 +23,7 @@ from config import (
 )
 from recipient_registry import RecipientRegistry
 from publishing.expiration import publication_status
+from project_paths import ApplicationPaths, configure_application_paths
 from readiness import ReadinessResult
 from save_schema import (
     PROMPT_WRITER_STATE_VERSION,
@@ -133,6 +136,51 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
     def _restore(self, root: Path, bundle: Path):
         entry = SavedLetterCatalog(root).list_entries()[0]
         return SavedLetterRestorer(root).restore(entry)
+
+    def test_stock_letters_restore_their_bundled_music_choices(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        previous_paths = project_paths._APPLICATION_PATHS
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configure_application_paths(replace(
+                ApplicationPaths.for_project(root), resource_root=repository,
+            ))
+            try:
+                entries = {
+                    entry.title: entry
+                    for entry in SavedLetterCatalog(root, stock_only=True).list_entries()
+                }
+                for number, title in ((1, "Dark"), (2, "Background Music"),
+                                      (3, "Sigma Music")):
+                    with self.subTest(stock_letter=number):
+                        SavedLetterRestorer(root).restore(entries[f"Stock: Letter {number}"])
+                        records = load_library(root)
+                        state = load_project_state(root, valid_ids=set(records))
+                        track = records[state.single_track_id]
+                        self.assertEqual(track.source_kind, "stock")
+                        self.assertEqual(track.display_title, title)
+                        if number == 1:
+                            legacy = import_runtime_track(
+                                root,
+                                repository / "resources/stock/letters/Stock Letter 1"
+                                / "gallery/sounds/music.mp3",
+                                display_title="065025864943abb3d29e9611",
+                            )
+                            save_project_state(root, ProjectSoundState(
+                                mode="single",
+                                single_track_id=legacy.track_id,
+                                selected_track_id=legacy.track_id,
+                            ))
+                            records = load_library(root)
+                            state = load_project_state(root, valid_ids=set(records))
+                            self.assertEqual(state.single_track_id, track.track_id)
+                            SettingsStore(root).update_fields({
+                                "protected_project_kind": "",
+                            })
+                            state = load_project_state(root, valid_ids=set(records))
+                            self.assertEqual(state.single_track_id, legacy.track_id)
+            finally:
+                configure_application_paths(previous_paths)
 
     def test_playlist_restore_deduplicates_and_preserves_archive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
