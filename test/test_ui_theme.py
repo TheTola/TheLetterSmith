@@ -1517,6 +1517,37 @@ class ThemeServiceTests(unittest.TestCase):
         self.assertFalse(male_glow.isEnabled())
         self.assertFalse(female_glow.isEnabled())
 
+    def test_startup_choices_fit_a_short_screen(self) -> None:
+        selector = ThemeFamilySelector(self.root)
+        self.addCleanup(selector.deleteLater)
+        selector.resize(1100, 720)
+        screen = mock.Mock()
+        screen.availableGeometry.return_value = QtCore.QRect(0, 0, 854, 492)
+        with mock.patch("window_chrome.screen_for_launcher", return_value=screen):
+            selector.show()
+            self.app.processEvents()
+            for width, height in ((854, 492), (680, 400)):
+                selector.resize(width, height)
+                self.app.processEvents()
+                with self.subTest(size=(width, height)):
+                    for widget in (
+                        selector.male_button,
+                        selector.female_button,
+                        selector.choice_divider,
+                    ):
+                        bounds = QtCore.QRect(
+                            widget.mapTo(selector, QtCore.QPoint()), widget.size()
+                        )
+                        self.assertTrue(selector.rect().contains(bounds), bounds)
+                    self.assertEqual(
+                        selector.male_button.iconSize().height(),
+                        selector.male_button.height() - 12,
+                    )
+                    self.assertEqual(
+                        selector.male_button.size(), selector.female_button.size()
+                    )
+        selector.reject()
+
     def test_startup_theme_selector_can_be_dragged(self) -> None:
         selector = ThemeFamilySelector(self.root)
         self.addCleanup(selector.deleteLater)

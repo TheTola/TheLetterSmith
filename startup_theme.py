@@ -103,6 +103,24 @@ class _GlowToolButton(QtWidgets.QToolButton):
         self.pressed.connect(self._animate_pressed)
         self.released.connect(self._animate_released)
 
+    def set_artwork_size(self, edge: int) -> None:
+        self._stop_icon_animations()
+        self.setFixedSize(edge, edge)
+        icon_edge = max(1, edge - 12)
+        depressed_edge = max(1, round(icon_edge * 0.9))
+        self._icon_size = QtCore.QSize(icon_edge, icon_edge)
+        self._depressed_icon_size = QtCore.QSize(depressed_edge, depressed_edge)
+        self.setIconSize(self._icon_size)
+        self._press_animation.setEndValue(self._depressed_icon_size)
+        self._restore_animation.setEndValue(self._icon_size)
+        self._bounce_animation.setKeyValueAt(
+            0.45, QtCore.QSize(round(icon_edge * 1.024), round(icon_edge * 1.024))
+        )
+        self._bounce_animation.setKeyValueAt(
+            0.72, QtCore.QSize(round(icon_edge * 0.968), round(icon_edge * 0.968))
+        )
+        self._bounce_animation.setEndValue(self._icon_size)
+
     def _stop_icon_animations(self) -> None:
         self._press_animation.stop()
         self._restore_animation.stop()
@@ -220,6 +238,32 @@ class ThemeFamilySelector(QtWidgets.QDialog):
         choices.addWidget(self.female_button)
         choices.addStretch(1)
         layout.addLayout(choices)
+        self._choices_layout = choices
+
+    def _fit_choices_to_dialog(self) -> None:
+        if not hasattr(self, "female_button"):
+            return
+        layout = self.layout()
+        margins = layout.contentsMargins()
+        max_width = (
+            self.width() - margins.left() - margins.right()
+            - self._choices_layout.spacing() * (self._choices_layout.count() - 1)
+            - self.choice_divider.width()
+        ) // 2
+        max_height = (
+            self.height() - margins.top() - margins.bottom()
+            - layout.spacing() - self.question_label.sizeHint().height() - 2
+        )
+        edge = max(1, min(512, max_width, max_height))
+        if self.male_button.width() == edge:
+            return
+        for button in (self.male_button, self.female_button):
+            button.set_artwork_size(edge)
+        self.choice_divider.setFixedHeight(max(1, edge - 12))
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._fit_choices_to_dialog()
 
     def _choice_button(
         self,
@@ -301,6 +345,7 @@ class ThemeFamilySelector(QtWidgets.QDialog):
             self._position_restored = True
             self._restore_saved_position()
         place_window_on_launcher(self)
+        self._fit_choices_to_dialog()
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
         self._persist_current_position()
