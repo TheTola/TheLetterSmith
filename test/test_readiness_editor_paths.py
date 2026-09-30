@@ -26,6 +26,8 @@ from config import (
     resolve_play_bundle_directory,
 )
 from protected_projects import (
+    EXAMPLE_PROJECT_KIND,
+    PROTECTED_PROJECT_MASTER_PATH_KEY,
     PROTECTED_PROJECT_KIND_KEY,
     STOCK_PROJECT_KIND,
 )
@@ -37,7 +39,7 @@ from readiness import (
     evaluate_project_save_eligibility,
     evaluate_readiness,
 )
-from settings_store import SettingsStore
+from settings_store import ACTIVE_PLAY_DIR_KEY, SettingsStore
 from sound_model import (
     ProjectSoundState,
     TrackRecord,
@@ -672,25 +674,59 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 eligibility = evaluate_project_save_eligibility(root)
                 self.assertFalse(eligibility.persistent_block_reason)
 
-    def test_protected_readiness_is_blank_and_publish_is_local(self) -> None:
+    def test_bundled_letters_are_already_published_and_openable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            SettingsStore(root).update_fields(
-                {PROTECTED_PROJECT_KIND_KEY: STOCK_PROJECT_KIND}
-            )
-            tab = ForgeTab(root)
-            result = tab.refresh_readiness()
-            self.assertEqual(result.items, ())
-            self.assertEqual(result.status, "")
-            self.assertEqual(tab.readiness_summary.text(), "")
-            self.assertTrue(tab._readiness_controls.isHidden())
-            with mock.patch.object(tab, "_prepare_preview") as prepare:
-                tab.publish_letter()
-            prepare.assert_called_once_with(
-                open_in_browser=False,
-                protected_publish=True,
-            )
-            tab.close()
+            for kind, relative in (
+                (STOCK_PROJECT_KIND, "resources/stock/letters/Stock Letter 1"),
+                (STOCK_PROJECT_KIND, "resources/stock/letters/Stock Letter 2"),
+                (STOCK_PROJECT_KIND, "resources/stock/letters/Stock Letter 3"),
+                (EXAMPLE_PROJECT_KIND, "resources/examples/example_letter"),
+            ):
+                with self.subTest(letter=relative):
+                    master = root / relative
+                    master.mkdir(parents=True, exist_ok=True)
+                    index = master / "index.html"
+                    index.write_text("bundled viewer", encoding="utf-8")
+                    SettingsStore(root).update_fields({
+                        PROTECTED_PROJECT_KIND_KEY: kind,
+                        PROTECTED_PROJECT_MASTER_PATH_KEY: str(master),
+                    })
+                    tab = ForgeTab(root)
+                    try:
+                        result = tab.refresh_readiness()
+                        self.assertEqual(result.items, ())
+                        self.assertEqual(result.status, "")
+                        self.assertEqual(tab.readiness_summary.text(), "")
+                        self.assertTrue(tab._readiness_controls.isHidden())
+                        self.assertEqual(tab.publish_btn.text(), "Published")
+                        self.assertFalse(tab.publish_btn.isEnabled())
+                        self.assertFalse(tab.unpublish_btn.isHidden())
+                        self.assertFalse(tab.unpublish_btn.isEnabled())
+                        self.assertTrue(tab.preview_btn.isEnabled())
+                        self.assertTrue(tab.open_published_btn.isEnabled())
+                        with mock.patch.object(
+                            QtGui.QDesktopServices, "openUrl", return_value=True
+                        ) as open_url:
+                            tab.open_published_letter()
+                        self.assertEqual(
+                            Path(open_url.call_args.args[0].toLocalFile()),
+                            index.resolve(),
+                        )
+                        with mock.patch.object(
+                            tab, "_flush_prompt_writer_state"
+                        ) as flush:
+                            with mock.patch.object(tab, "_start_operation") as start:
+                                tab._prepare_preview(open_in_browser=False)
+                            tab._update_metadata_silently(master, result)
+                        flush.assert_not_called()
+                        start.assert_called_once()
+                        tab._record_active_play_dir(master)
+                        self.assertFalse(
+                            SettingsStore(root).get(ACTIVE_PLAY_DIR_KEY)
+                        )
+                    finally:
+                        tab.close()
 
     def test_preview_options_follow_preview_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

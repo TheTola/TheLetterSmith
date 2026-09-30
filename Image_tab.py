@@ -1802,6 +1802,7 @@ class ImageTab(
     clear_preview = Signal()
 
     images_changed = Signal(str)
+    image_import_completed = Signal(int, str, str)
     cover_changed = Signal()
     animation_settings_changed = Signal(int)
 
@@ -2848,21 +2849,21 @@ class ImageTab(
         self,
         index: int,
         source_path: str,
-    ) -> None:
+    ) -> bool:
         if self._shutdown or index not in self.labels:
-            return
+            return False
         if not self.project_state.is_project_ready:
             self._show_temporary_status(
                 "A recipient is required before saving images.",
                 5000,
             )
-            return
+            return False
         if self._image_import_thread is not None:
             self._show_temporary_status(
                 "Another image is already being processed.",
                 3000,
             )
-            return
+            return False
 
         source = Path(source_path).resolve()
         if not source.is_file():
@@ -2870,7 +2871,7 @@ class ImageTab(
                 f"Image file does not exist: {source.name}",
                 5000,
             )
-            return
+            return False
 
         project_pages_directory: Path | None = None
         try:
@@ -2886,7 +2887,7 @@ class ImageTab(
                 f"The image project is not ready: {error}",
                 5000,
             )
-            return
+            return False
 
         baseline = image_asset_revision(self._user_pages_dir())
         identity = self.project_state.identity
@@ -2939,6 +2940,7 @@ class ImageTab(
             0,
         )
         thread.start()
+        return True
 
     @QtCore.Slot(object)
     def _image_import_prepared(self, result: object) -> None:
@@ -2958,6 +2960,7 @@ class ImageTab(
                 "The project changed before the image could be saved.",
                 5000,
             )
+            self.image_import_completed.emit(result.index, "", "The active letter changed.")
             return
         current_identity = self.project_state.identity
         if result.project_identity != (
@@ -2969,6 +2972,7 @@ class ImageTab(
                 "The active letter changed before the image could be saved.",
                 5000,
             )
+            self.image_import_completed.emit(result.index, "", "The active letter changed.")
             return
 
         try:
@@ -3031,6 +3035,7 @@ class ImageTab(
             )
             self.image_selected.emit(pixmap)
             self._commit_image_change("selected")
+            self.image_import_completed.emit(result.index, self.image_paths[result.index] or "", "")
             result.prepared.finalize()
             self._show_temporary_status(
                 f"{record['source_file']} saved."
@@ -3044,6 +3049,7 @@ class ImageTab(
                 f"Failed to process {self.labels[result.index][1]}: {error}",
                 5000,
             )
+            self.image_import_completed.emit(result.index, "", str(error))
         else:
             if result.source_path is not None:
                 try:
@@ -3110,6 +3116,7 @@ class ImageTab(
             f"Failed to process image: {message}",
             5000,
         )
+        self.image_import_completed.emit(index, "", message)
 
     @QtCore.Slot()
     def _image_import_thread_finished(self) -> None:

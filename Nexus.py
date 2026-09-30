@@ -26,6 +26,7 @@ from about_dialog import AboutLetterSmithDialog
 from settings_store import (
     DEFAULT_SETTINGS,
     DEFAULT_VISIONARY_URL,
+    PROMPT_WRITER_PROVIDER_KEY,
     SettingsStore,
     VISIONARY_URL_KEY,
     normalize_published_page_url,
@@ -2240,6 +2241,8 @@ class Nexus(QtWidgets.QMainWindow):
 
         # Cache one reusable panel; its is_open state excludes the closing animation.
         self._prompt_writer_win: Optional[QtWidgets.QWidget] = None
+        self._prompt_writer_browser = None
+        self._prompt_writer_browser_ready = False
 
         # Initial sizing & tab
         self.setMinimumSize(MIN_WINDOW_SIZE)
@@ -2746,6 +2749,7 @@ class Nexus(QtWidgets.QMainWindow):
             "last_music_folder",
             "settings_schema_version",
             "visionary_url",
+            PROMPT_WRITER_PROVIDER_KEY,
         }
         if any(not key.startswith("ui_") and key not in ignored for key in keys):
             self.project_dirty.mark_changed("settings")
@@ -5276,6 +5280,27 @@ class Nexus(QtWidgets.QMainWindow):
             self.status("Enter a recipient before opening Prompt Writer.")
             self.recipient_page.focus_recipient()
             return
+
+        browser = self._prompt_writer_browser
+        if not self._prompt_writer_browser_ready:
+            try:
+                from prompt_writer_browser import PromptWriterBrowser, ProviderSignInDialog
+
+                if browser is None:
+                    browser = PromptWriterBrowser(self)
+                    self._prompt_writer_browser = browser
+                selected = SettingsStore(self.project_root).get(PROMPT_WRITER_PROVIDER_KEY, "")
+                dialog = ProviderSignInDialog(browser, self, selected)
+                if dialog.exec() != QtWidgets.QDialog.Accepted:
+                    return
+                SettingsStore(self.project_root).update_fields(
+                    **{PROMPT_WRITER_PROVIDER_KEY: browser.provider}
+                )
+                self._prompt_writer_browser_ready = True
+            except Exception as error:
+                _LOGGER.exception("Prompt Writer provider sign-in failed: %s", error)
+                self.status("Prompt Writer provider could not be opened.")
+                return
         launcher = self.image_tab.pwrite_fab
         if not launcher.isVisible():
             launcher = self
@@ -5299,6 +5324,7 @@ class Nexus(QtWidgets.QMainWindow):
                 project_root=self.project_root,
             )
             self._prompt_writer_win = w
+            w.attach_browser(browser, self.image_tab)
             self.theme_service.apply_semantic_styles(w)
             w.project_changed.connect(
                 lambda: self.project_dirty.mark_changed("prompt-writer")

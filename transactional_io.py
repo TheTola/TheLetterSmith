@@ -98,9 +98,8 @@ def _with_transient_retry(operation: Callable[[], Any]) -> Any:
 
 
 def _temporary_path(target: Path) -> Path:
-    return target.with_name(
-        f".{target.name}.tmp.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}"
-    )
+    # Keep nested generated assets below the Windows path-length limit.
+    return target.with_name(f".tmp.{uuid.uuid4().hex}")
 
 
 def file_change_token(

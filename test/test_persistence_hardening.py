@@ -37,6 +37,7 @@ from sound_model import (
     save_project_state,
 )
 from transactional_io import (
+    _temporary_path,
     atomic_copy_file,
     atomic_write_json,
     enforce_internal_tree_visibility,
@@ -46,6 +47,33 @@ from transactional_io import (
 
 
 class PersistenceHardeningTests(unittest.TestCase):
+    def test_atomic_copy_uses_short_sibling_on_long_windows_path(self) -> None:
+        if os.name != "nt":
+            self.skipTest("Windows path-length behavior is platform-specific.")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = (
+                Path("Demo Preview")
+                / ("a" * 36 + ".build-staging." + "b" * 32)
+                / "gallery/fonts/cormorantgaramond"
+            )
+            base = root / staging
+            padding = max(1, 205 - len(str(base)) - 1)
+            destination = (
+                root
+                / ("p" * padding)
+                / staging
+                / "CormorantGaramond-Italic[wght].ttf"
+            )
+            self.assertLess(len(str(destination)), 260)
+            self.assertLess(len(str(_temporary_path(destination))), 260)
+            source = root / "source.ttf"
+            source.write_bytes(b"bundled font")
+
+            atomic_copy_file(source, destination)
+
+            self.assertEqual(destination.read_bytes(), b"bundled font")
+
     def test_internal_visibility_hides_state_but_not_user_content(self) -> None:
         if os.name != "nt":
             self.skipTest("Windows hidden attributes are platform-specific.")

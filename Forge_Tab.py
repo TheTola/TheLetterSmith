@@ -41,8 +41,11 @@ from readiness import ReadinessResult, evaluate_readiness
 from project_paths import ProjectPathResolver, application_paths
 from project_timestamps import PROJECT_PUBLISHED_AT_KEY
 from protected_projects import (
+    PROTECTED_PROJECT_MASTER_PATH_KEY,
     PROTECTED_PROJECT_KIND_KEY,
+    STOCK_PROJECT_KIND,
     is_protected_project as settings_is_protected_project,
+    protected_project_kind,
 )
 from project_state import (
     ApplicationState,
@@ -1330,7 +1333,6 @@ class ForgeTab(QtWidgets.QWidget):
             _LOGGER.exception("Forge build currency could not be determined.")
             self._preview_refresh_pending = True
         self._preview_refresh_requested = False
-        self._protected_published = False
         self._readiness_requested = False
         self._tab_active = False
         self._pending_scroll_position = (0, 0)
@@ -3011,20 +3013,21 @@ class ForgeTab(QtWidgets.QWidget):
         snapshot = self.settings.snapshot()
         protected = self.is_protected_project(snapshot)
         publication_valid = self._known_valid_publication(snapshot)
-        published = not protected and publication_valid
+        published = protected or publication_valid
         published_fingerprint = str(
             snapshot.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")
         ).strip()
         current_fingerprint = str(self._project_fingerprint).strip()
         publication_changed = bool(
-            published
+            not protected
+            and published
             and (
                 not published_fingerprint
                 or not current_fingerprint
                 or published_fingerprint != current_fingerprint
             )
         )
-        publication_locked = published and not publication_changed
+        publication_locked = protected or (published and not publication_changed)
         self.publish_btn.setText(
             "Update Published Letter"
             if publication_changed
@@ -3037,6 +3040,8 @@ class ForgeTab(QtWidgets.QWidget):
             self.publish_btn,
             "Update the existing online letter without changing its public link."
             if publication_changed
+            else "Bundled demonstration letters are already published."
+            if protected
             else "This letter is published and matches the current local version."
             if published
             else "Publish the finished letter and create its shareable link.",
@@ -3081,8 +3086,14 @@ class ForgeTab(QtWidgets.QWidget):
             button.setVisible(not publishing_active)
         self.unpublish_btn.setVisible(published)
         self.unpublish_btn.setAccessibleName("Unpublish Letter")
+        set_control_help(
+            self.unpublish_btn,
+            "Bundled demonstration letters cannot be unpublished."
+            if protected
+            else "Remove the online copy while preserving the local letter.",
+        )
         self.unpublish_btn.set_action_state(
-            broken=not published,
+            broken=protected or not published,
             invisible=self._busy,
         )
         if primary_visibility_changed:
@@ -3091,18 +3102,37 @@ class ForgeTab(QtWidgets.QWidget):
     def _known_valid_publication(self, snapshot: dict | None = None) -> bool:
         state = self.settings.snapshot() if snapshot is None else snapshot
         if self.is_protected_project(state):
-            index = self._current_play_index()
-            return bool(
-                self._protected_published
-                and index is not None
-                and index.is_file()
-            )
+            return self._protected_master_index(state) is not None
         return bool(
             publication_status(state) == "published"
             and normalize_published_page_url(
                 state.get(PUBLISHED_PAGE_URL_KEY, "")
             )
             and not self._published_url_unavailable(state)
+        )
+
+    def _protected_master_index(self, snapshot: dict | None = None) -> Optional[Path]:
+        state = self.settings.snapshot() if snapshot is None else snapshot
+        kind = protected_project_kind(state)
+        if not kind:
+            return None
+        master_path = str(state.get(PROTECTED_PROJECT_MASTER_PATH_KEY, "")).strip()
+        if not master_path:
+            return None
+        paths = application_paths(self.project_root)
+        bundled_root = (
+            paths.stock_letters_root
+            if kind == STOCK_PROJECT_KIND
+            else paths.examples_root
+        ).resolve()
+        try:
+            index = (Path(master_path) / "index.html").resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return (
+            index
+            if index.is_relative_to(bundled_root) and index.is_file()
+            else None
         )
 
     def show_saved_letters(self) -> None:
@@ -3509,7 +3539,6 @@ class ForgeTab(QtWidgets.QWidget):
         self._source_revision += 1
         self._preview_refresh_pending = True
         self._preview_refresh_requested = False
-        self._protected_published = False
         self.saved_page_url = ""
         self.saved_panel.hide()
         self.readiness_window.hide()
@@ -4110,8 +4139,6 @@ class ForgeTab(QtWidgets.QWidget):
             )
             return
         self._last_play_dir = None
-        if self.is_protected_project():
-            self._protected_published = False
         self.project_state.transition(
             ApplicationState.PROJECT_READY,
             identity=restored.identity,
@@ -4246,14 +4273,13 @@ class ForgeTab(QtWidgets.QWidget):
         self,
         *,
         open_in_browser: bool,
-        protected_publish: bool = False,
     ) -> None:
         if self._busy:
             return
-        if not self._flush_prompt_writer_state():
+        if not self.is_protected_project() and not self._flush_prompt_writer_state():
             return
         self._refresh_source_fingerprint()
-        readiness = self._required_gate(for_publish=protected_publish)
+        readiness = self._required_gate()
         if readiness is None:
             return
         ensure_output_dirs(self.project_root)
@@ -4301,15 +4327,9 @@ class ForgeTab(QtWidgets.QWidget):
         self._start_operation(
             "Preparing preview…",
             task,
-            (
-                self._protected_publish_completed
-                if protected_publish
-                else (
-                    self._preview_completed
-                    if open_in_browser
-                    else self._embedded_preview_completed
-                )
-            ),
+            self._preview_completed
+            if open_in_browser
+            else self._embedded_preview_completed,
             "Preview could not be updated. The previous preview was preserved.",
             on_failure=self.preview_failed.emit,
         )
@@ -4340,12 +4360,16 @@ class ForgeTab(QtWidgets.QWidget):
             self._preview_refresh_requested = True
         else:
             self.request_preview()
-        self._pending_metadata_update = (
-            Path(play_dir),
-            readiness,
-            record_activity,
-        )
-        self._metadata_timer.start(0)
+        if self.is_protected_project():
+            self._metadata_timer.stop()
+            self._pending_metadata_update = None
+        else:
+            self._pending_metadata_update = (
+                Path(play_dir),
+                readiness,
+                record_activity,
+            )
+            self._metadata_timer.start(0)
         return self._last_play_dir, index
 
     def _preview_completed(self, result: object) -> None:
@@ -4372,24 +4396,6 @@ class ForgeTab(QtWidgets.QWidget):
         if index.is_file():
             self._set_status("Preview updated.")
 
-    def _protected_publish_completed(self, result: object) -> None:
-        _play_dir, index = self._finish_preview(
-            result,
-            record_activity=False,
-        )
-        self._protected_published = index.is_file()
-        self._sync_published_url()
-        if self._protected_published:
-            play_ui_sound(UiSound.PUBLISH_COMPLETE)
-            self._set_status(
-                "Published for this demonstration. Open Letter is ready."
-            )
-        else:
-            self._set_status(
-                "The demonstration preview could not be opened.",
-                error=True,
-            )
-
     def _run_pending_metadata_update(self) -> None:
         pending = self._pending_metadata_update
         self._pending_metadata_update = None
@@ -4405,10 +4411,7 @@ class ForgeTab(QtWidgets.QWidget):
         if self._busy or self._publication_operation:
             return
         if self.is_protected_project():
-            self._prepare_preview(
-                open_in_browser=False,
-                protected_publish=True,
-            )
+            self._set_status("This demonstration is already published.")
             return
         if not self._flush_prompt_writer_state():
             return
@@ -5021,6 +5024,8 @@ class ForgeTab(QtWidgets.QWidget):
         self._begin_github_access_setup(session, access)
 
     def _record_active_play_dir(self, play_dir: Path) -> None:
+        if self.is_protected_project():
+            return
         candidate = Path(play_dir).resolve()
         if not candidate.is_dir() or not (candidate / "index.html").is_file():
             return
@@ -5041,6 +5046,8 @@ class ForgeTab(QtWidgets.QWidget):
         *,
         record_activity: bool = False,
     ) -> None:
+        if self.is_protected_project():
+            return
         if not self._flush_prompt_writer_state():
             return
         try:
@@ -5097,9 +5104,9 @@ class ForgeTab(QtWidgets.QWidget):
             set_control_help(
                 self.open_published_btn,
                 (
-                    "Open this demonstration's local letter preview."
+                    "Open this bundled demonstration letter."
                     if available
-                    else "Publish this demonstration to open its local preview."
+                    else "The bundled demonstration letter is unavailable."
                 ),
             )
             self._update_letter_action_button_states()
@@ -5137,14 +5144,10 @@ class ForgeTab(QtWidgets.QWidget):
 
     def open_published_letter(self) -> None:
         if self.is_protected_project():
-            index = self._current_play_index()
-            if (
-                not self._protected_published
-                or index is None
-                or not index.is_file()
-            ):
+            index = self._protected_master_index()
+            if index is None:
                 self._set_status(
-                    "Publish this demonstration before opening it.",
+                    "The bundled demonstration letter is unavailable.",
                     error=True,
                 )
                 return

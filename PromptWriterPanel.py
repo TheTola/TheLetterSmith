@@ -163,6 +163,8 @@ class PageSpec:
     detail_widget: Optional[QtWidgets.QPlainTextEdit] = None
     preview_widget: Optional[QtWidgets.QTextEdit] = None
     copy_button: Optional[QtWidgets.QPushButton] = None
+    generate_button: Optional[QtWidgets.QPushButton] = None
+    image_widget: Optional[QtWidgets.QLabel] = None
     detail_label: Optional[QtWidgets.QLabel] = None
     preview_title: Optional[QtWidgets.QLabel] = None
     preview_card: Optional[QtWidgets.QFrame] = None
@@ -1522,6 +1524,7 @@ def empty_prompt_writer_state() -> dict:
         "resolved_instructions": {},
         "generated_prompts": {},
         "generated_input_signature": "",
+        "approved_images": [],
     }
 
 
@@ -1610,6 +1613,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._generated_input_signature = ""
         self._generated_output_valid = False
         self._generation_in_progress = False
+        self._site_request_in_progress = False
+        self._browser = None
+        self._image_tab = None
+        self._approved_pages: set[str] = set()
+        self._pending_approval_key = ""
         self._colors_path_used: Optional[Path] = None
         self._last_focused_widget: Optional[QtWidgets.QTextEdit] = None
         self._list_manager_dialogs: Dict[str, ListManagerDialog] = {}
@@ -2029,6 +2037,13 @@ class PromptWriterPanel(QtWidgets.QWidget):
                         item for item in value if isinstance(item, str)
                     ]
 
+        approved_raw = state.get("approved_images", [])
+        if not isinstance(approved_raw, list):
+            approved_raw = []
+        approved_images = [
+            page.key for page in self._page_specs if page.key in approved_raw
+        ]
+
         return {
             "version": PROMPT_WRITER_STATE_VERSION,
             "type": _normalize_text(state.get("type", ""), strip=True, max_length=300),
@@ -2039,6 +2054,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "checks": _normalize_exclusive_check_states(checks_raw),
             "resolved_instructions": resolved_instructions,
             "generated_prompts": generated_prompts,
+            "approved_images": approved_images,
             "generated_input_signature": _normalize_text(
                 state.get("generated_input_signature", ""),
                 strip=True,
@@ -2177,6 +2193,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 if self._generated_output_valid
                 else ""
             ),
+            "approved_images": sorted(self._approved_pages),
         }
 
     def reload_project_state(self) -> bool:
@@ -2260,6 +2277,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             state = self._normalize_persisted_state(state)
             if not state:
                 return True
+            self._approved_pages = set(state.get("approved_images", []))
 
             # Selects
             try:
@@ -2324,6 +2342,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             except (RuntimeError, TypeError, ValueError, UnicodeError) as error:
                 LOGGER.exception("Prompt Writer generated-output restoration failed: %s", error)
                 self._invalidate_generated_output()
+            self._refresh_approved_previews()
 
         except (OSError, RuntimeError, TypeError, ValueError, UnicodeError) as error:
             LOGGER.exception("Prompt Writer state restoration failed for %s: %s", self._state_path, error)
@@ -2362,7 +2381,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         header.setContentsMargins(10, 8, 10, 8)
         header.setSpacing(8)
 
-        self.btn_generate = QtWidgets.QPushButton("Generate")
+        self.btn_generate = QtWidgets.QPushButton("Create Prompt")
         self.btn_generate.setObjectName("primaryButton")
         self.btn_copy = QtWidgets.QPushButton("Copy All")
         self.btn_copy.setObjectName("secondaryButton")
@@ -2374,7 +2393,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             b.setCursor(Qt.PointingHandCursor)
         set_control_help(
             self.btn_generate,
-            "Generate coordinated prompts for the cover, letter, wall, and back images.",
+            "Create coordinated prompts for the cover, letter, wall, and back images.",
         )
         set_control_help(
             self.btn_copy,
@@ -2743,11 +2762,24 @@ class PromptWriterPanel(QtWidgets.QWidget):
         output_title.setObjectName("columnTitle")
         right_v.addWidget(output_title)
         output_hint = QtWidgets.QLabel(
-            "Generate the coordinated set, then copy one prompt or all four."
+            "Create the coordinated set, then copy or generate each image."
         )
         output_hint.setObjectName("columnHint")
         output_hint.setWordWrap(True)
         right_v.addWidget(output_hint)
+
+        output_nav = QtWidgets.QHBoxLayout()
+        self.btn_prompt_list = QtWidgets.QPushButton("Prompts")
+        self.btn_conversation = QtWidgets.QPushButton("Conversation")
+        self.btn_conversation.setVisible(False)
+        output_nav.addWidget(self.btn_prompt_list)
+        output_nav.addWidget(self.btn_conversation)
+        output_nav.addStretch()
+        right_v.addLayout(output_nav)
+        self._site_status = QtWidgets.QLabel("")
+        self._site_status.setWordWrap(True)
+        self._site_status.setVisible(False)
+        right_v.addWidget(self._site_status)
 
         self._preview_scroll = QtWidgets.QScrollArea()
         self._preview_scroll.setWidgetResizable(True)
@@ -2784,6 +2816,15 @@ class PromptWriterPanel(QtWidgets.QWidget):
             )
             copy_btn.setEnabled(False)
             header_row.addWidget(copy_btn)
+            generate_btn = QtWidgets.QPushButton("Generate")
+            generate_btn.setObjectName("promptGenerateButton")
+            generate_btn.setCursor(Qt.PointingHandCursor)
+            generate_btn.setVisible(False)
+            set_control_help(
+                generate_btn,
+                f"Send the complete {page.display_label} to the selected image service.",
+            )
+            header_row.addWidget(generate_btn)
             bl.addLayout(header_row)
 
             editor = FocusablePlainTextEdit()
@@ -2795,19 +2836,35 @@ class PromptWriterPanel(QtWidgets.QWidget):
             editor.setMaximumHeight(260)
             editor.document().setDocumentMargin(8)
             bl.addWidget(editor)
+            image_label = QtWidgets.QLabel()
+            image_label.setAlignment(Qt.AlignCenter)
+            image_label.setFixedSize(168, 155)
+            image_label.setVisible(False)
+            bl.addWidget(image_label, alignment=Qt.AlignHCenter)
 
             self._preview_layout.addWidget(block)
             page.preview_widget = editor
             page.copy_button = copy_btn
+            page.generate_button = generate_btn
+            page.image_widget = image_label
             page.preview_title = header_label
             page.preview_card = block
 
             copy_btn.clicked.connect(lambda _, page_key=page.key: self._copy_prompt(page_key))
+            generate_btn.clicked.connect(
+                lambda _, page_key=page.key: self._generate_with_provider(page_key)
+            )
             editor.focused.connect(lambda ed=editor: self._set_last_focused(ed))
 
         self._preview_layout.addStretch(1)
         self._preview_scroll.setWidget(preview_container)
-        right_v.addWidget(self._preview_scroll, 1)
+        self._output_stack = QtWidgets.QStackedWidget()
+        self._output_stack.addWidget(self._preview_scroll)
+        right_v.addWidget(self._output_stack, 1)
+        self.btn_prompt_list.clicked.connect(
+            lambda: self._output_stack.setCurrentWidget(self._preview_scroll)
+        )
+        self.btn_conversation.clicked.connect(self._show_conversation)
 
     def _apply_styles(self):
         stylesheet = """
@@ -2952,7 +3009,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             QTextEdit#promptOutput:focus {
                 border-color: #00b2b2;
             }
-            QPushButton#promptCopyButton {
+            QPushButton#promptCopyButton, QPushButton#promptGenerateButton {
                 padding: 4px 10px;
             }
             QScrollArea {
@@ -3120,6 +3177,125 @@ class PromptWriterPanel(QtWidgets.QWidget):
         except (RuntimeError, TypeError, ValueError) as error:
             LOGGER.exception("Prompt Writer signal wiring failed: %s", error)
 
+    def attach_browser(self, browser: object, image_tab: object | None = None) -> None:
+        """Display one live conversation for all four generated prompts."""
+        self._browser = browser
+        self._image_tab = image_tab
+        view = browser.view
+        if self._output_stack.indexOf(view) < 0:
+            self._output_stack.addWidget(view)
+        self.btn_conversation.setText(browser.provider)
+        self.btn_conversation.setVisible(True)
+        self.lbl_visionary_prefix.setText("Create images with")
+        self.btn_visionary.setText(browser.provider)
+        self.btn_visionary.clicked.disconnect(self._open_visionary)
+        self.btn_visionary.clicked.connect(self._show_conversation)
+        set_control_help(self.btn_visionary, f"Open the {browser.provider} conversation in Prompt Writer.")
+        if image_tab is not None:
+            image_tab.image_import_completed.connect(self._on_image_import_completed)
+            image_tab.images_changed.connect(self._refresh_approved_previews)
+        if hasattr(browser, "imageReady"):
+            browser.imageReady.connect(self._on_browser_image_ready)
+            browser.imageFailed.connect(self._on_browser_image_failed)
+            browser.imageApprovalStarted.connect(self._on_browser_image_started)
+        self._refresh_approved_previews()
+        self._sync_action_button_states()
+
+    def _show_conversation(self) -> None:
+        if self._browser is not None:
+            self._output_stack.setCurrentWidget(self._browser.view)
+
+    def _generate_with_provider(self, page_key: str) -> None:
+        if not self._generated_output_valid or self._browser is None:
+            return
+        prompt = self._generated_prompts.get(page_key, "").strip()
+        if not prompt or self._site_request_in_progress:
+            return
+        page = next(page for page in self._page_specs if page.key == page_key)
+        if hasattr(self._browser, "set_approval_target"):
+            self._browser.set_approval_target(page_key, page.display_label.removesuffix(" Prompt"))
+        self._site_request_in_progress = True
+        self._site_status.setText(f"Sending {page_key} prompt to {self._browser.provider}...")
+        self._site_status.setVisible(True)
+        self._show_conversation()
+        self._sync_action_button_states()
+        self._browser.submit_prompt(prompt, self._on_provider_submission)
+
+    def _on_provider_submission(self, ok: bool, message: str) -> None:
+        self._site_request_in_progress = False
+        if ok:
+            message += " Right-click the finished image and choose Use image."
+        self._site_status.setText(message)
+        self._site_status.setVisible(True)
+        self._sync_action_button_states()
+
+    def _on_browser_image_started(self, page_key: str) -> None:
+        self._site_status.setText(f"Saving the selected {page_key} image...")
+        self._site_status.setVisible(True)
+
+    def _on_browser_image_failed(self, message: str) -> None:
+        self._site_status.setText(message)
+        self._site_status.setVisible(True)
+
+    def _on_browser_image_ready(self, page_key: str, path: str) -> None:
+        if self._image_tab is None or self._pending_approval_key:
+            self._on_browser_image_failed("Finish the current image before choosing another.")
+            return
+        index = next(
+            (number for number, page in enumerate(self._page_specs, 1) if page.key == page_key),
+            0,
+        )
+        if not index:
+            self._on_browser_image_failed("The selected image has no matching page.")
+            return
+        self._pending_approval_key = page_key
+        try:
+            started = self._image_tab.set_image_path(index, path)
+        except Exception as error:
+            LOGGER.exception("Prompt Writer image import failed: %s", error)
+            started = False
+        if not started:
+            self._pending_approval_key = ""
+            self._on_browser_image_failed("The image could not be saved to its page.")
+
+    def _on_image_import_completed(self, index: int, path: str, error: str) -> None:
+        page_key = self._pending_approval_key
+        if not page_key or index != next(
+            (number for number, page in enumerate(self._page_specs, 1) if page.key == page_key),
+            0,
+        ):
+            return
+        self._pending_approval_key = ""
+        if not path:
+            self._on_browser_image_failed(error or "The image could not be saved.")
+            return
+        self._approved_pages.add(page_key)
+        self._refresh_approved_previews()
+        self._output_stack.setCurrentWidget(self._preview_scroll)
+        self._site_status.setText(f"{page_key.title()} image saved to the Image tab.")
+        self._site_status.setVisible(True)
+        self.project_changed.emit()
+        self._persist_state_now()
+
+    def _refresh_approved_previews(self, *_args: object) -> None:
+        image_paths = getattr(self._image_tab, "image_paths", {})
+        for index, page in enumerate(self._page_specs, 1):
+            label = page.image_widget
+            if label is None or page.preview_widget is None:
+                continue
+            path = image_paths.get(index) if page.key in self._approved_pages else None
+            pixmap = QtGui.QPixmap(str(path)) if path else QtGui.QPixmap()
+            if pixmap.isNull():
+                label.clear()
+                label.setVisible(False)
+                page.preview_widget.setVisible(True)
+            else:
+                label.setPixmap(pixmap.scaled(
+                    label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation,
+                ))
+                label.setVisible(True)
+                page.preview_widget.setVisible(False)
+
     def _set_generated_output_valid(self, valid: bool) -> None:
         signature_matches = bool(
             self._generated_input_signature
@@ -3175,6 +3351,13 @@ class PromptWriterPanel(QtWidgets.QWidget):
                         self._generated_output_valid
                         and bool(self._generated_prompts.get(page.key, "").strip())
                     ),
+                )
+            if page.generate_button is not None:
+                page.generate_button.setVisible(
+                    self._browser is not None and self._generated_output_valid
+                )
+                page.generate_button.setEnabled(
+                    not busy and not self._site_request_in_progress
                 )
 
     def _invalidate_generated_output(self) -> None:
@@ -3620,6 +3803,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     )
 
             self._generated_prompts = dict(prompts)
+            self._approved_pages.clear()
+            self._refresh_approved_previews()
             subject_lead_in = shared_prompt_data.get("order", [])
             if isinstance(subject_lead_in, (list, tuple)):
                 subject_lead_in = list(subject_lead_in)
@@ -3758,6 +3943,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 if page.detail_widget is not None:
                     page.detail_widget.clear()
             self._invalidate_generated_output()
+            self._approved_pages.clear()
+            self._refresh_approved_previews()
             for dialog in tuple(self._list_manager_dialogs.values()):
                 try:
                     dialog.entry_edit.clear()
@@ -3993,6 +4180,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
             return
         self._proofread_visible_prompt_fields("shutdown")
         self._shutdown = True
+
+        if self._browser is not None:
+            view = self._browser.view
+            if self._output_stack.indexOf(view) >= 0:
+                self._output_stack.removeWidget(view)
+                if hasattr(self._browser, "park_view"):
+                    self._browser.park_view()
+                else:
+                    view.setParent(None)
+                    view.hide()
 
         self._persist_timer.stop()
         try:

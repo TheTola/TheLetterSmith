@@ -7,6 +7,7 @@ import unittest
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -61,6 +62,12 @@ class WindowSizingTests(unittest.TestCase):
             account_patch = mock.patch("Forge_Tab.ForgeTab._validate_github_account_async")
             account_patch.start()
             window = Nexus(directory)
+            window._prompt_writer_browser = SimpleNamespace(
+                provider="ChatGPT",
+                view=QtWidgets.QWidget(),
+                submit_prompt=lambda _prompt, callback: callback(True, "sent"),
+            )
+            window._prompt_writer_browser_ready = True
             try:
                 window.show()
                 QtTest.QTest.qWait(80)

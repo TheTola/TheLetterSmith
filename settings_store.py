@@ -42,6 +42,7 @@ PUBLISHED_GITHUB_OWNER_KEY = "published_github_owner"
 PUBLISHED_GITHUB_REPOSITORY_KEY = "published_github_repository"
 ACTIVE_PLAY_DIR_KEY = "active_play_dir"
 VISIONARY_URL_KEY = "visionary_url"
+PROMPT_WRITER_PROVIDER_KEY = "prompt_writer_provider"
 DEFAULT_VISIONARY_URL = (
     "https://chatgpt.com/g/g-68ce5925196c8191a222e24d29323813-the-visionary"
 )
@@ -104,6 +105,7 @@ DEFAULT_SETTINGS = {
     PUBLISHED_GITHUB_REPOSITORY_KEY: "",
     ACTIVE_PLAY_DIR_KEY: "",
     VISIONARY_URL_KEY: DEFAULT_VISIONARY_URL,
+    PROMPT_WRITER_PROVIDER_KEY: "",
 }
 
 PUBLICATION_SETTING_KEYS = (
@@ -913,6 +915,11 @@ class SettingsStore:
             or DEFAULT_VISIONARY_URL
         )
 
+        provider = normalized.get(PROMPT_WRITER_PROVIDER_KEY, "")
+        normalized[PROMPT_WRITER_PROVIDER_KEY] = (
+            provider if provider in {"ChatGPT", "Gemini"} else ""
+        )
+
         # Curtain style
         normalized[
             "curtain_style"
@@ -958,6 +965,7 @@ __all__ = [
     "PROJECT_PUBLISHED_AT_KEY",
     "REQUIRED_FEATURES_KEY",
     "VISIONARY_URL_KEY",
+    "PROMPT_WRITER_PROVIDER_KEY",
     "SETTINGS_FILENAME",
     "SETTINGS_SCHEMA_KEY",
     "SETTINGS_SCHEMA_VERSION",
