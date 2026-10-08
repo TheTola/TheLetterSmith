@@ -46,6 +46,8 @@ from image_animation import (
     reconcile_external_image_assets,
     update_slot_gif_settings,
 )
+from page_controls import PageControls, page_controller
+from page_layout import LAYOUT_FILE, PAGE_INDICES, page_labels
 from project_paths import ProjectPathResolver, application_paths
 from project_save import ProjectSaveService
 from project_state import ProjectStateController
@@ -1835,24 +1837,9 @@ class ImageTab(
             resolver=project_paths,
         )
 
-        self.labels = {
-            1: (
-                "Cover Page Image",
-                "cover.png",
-            ),
-            2: (
-                "Main Letter Image",
-                "letter.png",
-            ),
-            3: (
-                "Letter Background Image",
-                "wall.png",
-            ),
-            4: (
-                "Final Backdrop Image",
-                "back.png",
-            ),
-        }
+        self.page_controller = page_controller(self.project_root)
+        self.page_controller.reload()
+        self.labels = self._page_labels()
 
         self.image_paths: dict[
             int,
@@ -1905,54 +1892,20 @@ class ImageTab(
         self._cards_layout = cards_layout
         self._cards_columns = 2
 
-        for index in (
-            1,
-            2,
-            3,
-            4,
-        ):
-            title, _filename = (
-                self.labels[index]
-            )
+        for index, (title, _filename) in self.labels.items():
+            self.cards[index] = self._make_page_card(index, title)
+        for position, card in enumerate(self.cards.values()):
+            cards_layout.addWidget(card, 0, position)
 
-            card = ImageAssetCard(
-                index,
-                title,
-                self.project_root,
-                self,
-            )
-            card.set_playback_active(
-                self._tab_active
-            )
-
-            card.select_requested.connect(
-                self._pick_image_dialog
-            )
-
-            card.clear_requested.connect(
-                self.clear_image
-            )
-
-            card.settings_requested.connect(
-                self.open_image_settings
-            )
-
-            card.preview_requested.connect(
-                self.preview_from_gallery
-            )
-
-            card.file_dropped.connect(
-                self._set_image_from_drop
-            )
-
-            self.cards[index] = card
-
-            cards_layout.addWidget(
-                card,
-                (index - 1) // 2,
-                (index - 1) % 2,
-                QtCore.Qt.AlignTop,
-            )
+        self.page_controls = PageControls(self.page_controller, self)
+        root.addWidget(self.page_controls)
+        self._cards_container = QtWidgets.QWidget()
+        self._cards_container.setLayout(cards_layout)
+        self._cards_scroll = QtWidgets.QScrollArea()
+        self._cards_scroll.setWidgetResizable(True)
+        self._cards_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self._cards_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self._cards_scroll.setWidget(self._cards_container)
 
         centered_cards = (
             QtWidgets.QHBoxLayout()
@@ -1969,13 +1922,7 @@ class ImageTab(
             12
         )
 
-        centered_cards.addStretch(1)
-
-        centered_cards.addLayout(
-            cards_layout
-        )
-
-        centered_cards.addStretch(1)
+        centered_cards.addWidget(self._cards_scroll, 1)
 
         root.addLayout(
             centered_cards
@@ -2054,7 +2001,7 @@ class ImageTab(
         self._utility_panel = utility_panel
 
         centered_cards.insertWidget(
-            1,
+            0,
             utility_panel,
         )
         self._centered_cards = centered_cards
@@ -2120,6 +2067,9 @@ class ImageTab(
 
         self.pwrite_fab.hide()
 
+        self.page_controller.change_guard = lambda: self._image_import_thread is None
+        self.page_controller.changed.connect(self._page_layout_changed)
+        self.page_controller.selection_changed.connect(self._select_layout_page)
         self.refresh_cards()
         self._disk_fingerprint = image_fingerprint(
             self._project_dir()
@@ -2203,6 +2153,8 @@ class ImageTab(
         return True
 
     def refresh_cards(self) -> bool:
+        if hasattr(self, "page_controller"):
+            self.page_controller.reload()
         pages_directory = self._user_pages_dir()
         reconciled = reconcile_external_image_assets(
             pages_directory
@@ -2420,13 +2372,14 @@ class ImageTab(
             "final_backdrop_image": 4,
         }
 
-        index = mapping.get(
-            normalized
-        )
+        index = PAGE_INDICES.get(normalized, mapping.get(normalized))
 
         if index is None:
             return
 
+        if index not in self.cards:
+            return
+        self.page_controller.select(INDEX_TO_SLOT[index])
         card = self.cards[index]
 
         card.thumbnail.setFocus(
@@ -2618,6 +2571,7 @@ class ImageTab(
 
         self.activate_for_tab_change()
         self._schedule_prompt_writer_position()
+        QtCore.QTimer.singleShot(0, self._show_selected_page)
 
     def hideEvent(
             self,
@@ -2648,70 +2602,91 @@ class ImageTab(
         self.updateGeometry()
 
     def _columns_for_width(self, width: int) -> int:
-        margins = self.layout().contentsMargins()
-        gap = self._cards_layout.horizontalSpacing()
-        utility_width = max(self.reset_btn.width(), self.open_btn.width())
-        cards_width = (
-            width - margins.left() - margins.right()
-            - utility_width - self._centered_cards.spacing()
-        )
-        return min(len(self.cards), max(1, (cards_width + gap) // (164 + gap)))
+        return len(self.cards)
 
     def minimumSizeHint(self) -> QtCore.QSize:
-        if hasattr(self, "_minimum_cards_width"):
-            return QtCore.QSize(self._minimum_cards_width, self.heightForWidth(self.width()))
-        return super().minimumSizeHint()
+        return QtCore.QSize(getattr(self, "_minimum_cards_width", 380), 360)
 
     def _card_area_overhead(self) -> int:
-        if not hasattr(self, "status"):
-            return 88
-        layout = self.layout()
-        margins = layout.contentsMargins()
-        return (margins.top() + margins.bottom()
-            + self.heading.sizeHint().height() + self.status.sizeHint().height()
-            + 2 * layout.spacing())
+        return 145
 
     def heightForWidth(self, width: int) -> int:
-        if not hasattr(self, "_minimum_cards_width"):
-            return super().heightForWidth(width)
-        columns = self._columns_for_width(width)
-        rows = (len(self.cards) + columns - 1) // columns
-        return self._card_area_overhead() + rows * 160 + (rows - 1) * self._cards_layout.verticalSpacing()
+        return 360
 
     def _fit_cards(self) -> None:
+        self._cards_columns = len(self.cards)
         scale = min(1.0, max(0.45, (self.width() - 40) / 1600))
         if self._compact_layout:
             scale = min(scale, 0.45)
         for button in (self.reset_btn, self.open_btn):
             button.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, scale)
             apply_button_tier(button, ButtonTier.LARGE)
-        utility_width = max(self.reset_btn.width(), self.open_btn.width())
-        self._utility_panel.setFixedWidth(utility_width)
+        self._utility_panel.setFixedWidth(max(self.reset_btn.width(), self.open_btn.width()))
         self._utility_panel.position_buttons()
-        columns = self._columns_for_width(self.width())
-        rows = (len(self.cards) + columns - 1) // columns
-        margins = self.layout().contentsMargins()
-        width = min(300, max(164, (
-            self.width() - margins.left() - margins.right() - utility_width
-            - self._centered_cards.spacing() - (columns - 1) * self._cards_layout.horizontalSpacing()
-        ) // columns))
-        height = min(270, max(160, (self.height() - self._card_area_overhead()
-            - (rows - 1) * self._cards_layout.verticalSpacing()) // rows))
+        height = min(270, max(160, self.height() - self._card_area_overhead() - 24))
+        width = min(300, max(164, height + 30))
         for card in self.cards.values():
             card.set_card_size(QtCore.QSize(width, height))
-        if columns != self._cards_columns:
-            self._cards_columns = columns
-            for card in self.cards.values():
-                self._cards_layout.removeWidget(card)
-            for index, card in self.cards.items():
-                self._cards_layout.addWidget(
-                    card, (index - 1) // columns, (index - 1) % columns,
-                    QtCore.Qt.AlignTop,
-                )
-            self.updateGeometry()
+        self._cards_scroll.setMinimumHeight(height + 24)
         self._centered_cards.invalidate()
-        self.layout().activate()
-        self._utility_panel.position_buttons()
+
+    def _page_labels(self):
+        pages = self.page_controller.pages
+        labels = page_labels(pages)
+        return {PAGE_INDICES[page.key]: (labels[page.key] + " Image", page.filename) for page in pages}
+
+    def _make_page_card(self, index, title):
+        card = ImageAssetCard(index, title, self.project_root, self)
+        card.set_playback_active(self._tab_active)
+        card.select_requested.connect(lambda i: self.page_controller.select(INDEX_TO_SLOT[i]))
+        card.select_requested.connect(self._pick_image_dialog)
+        card.clear_requested.connect(self.clear_image)
+        card.settings_requested.connect(self.open_image_settings)
+        card.preview_requested.connect(self.preview_from_gallery)
+        card.file_dropped.connect(self._set_image_from_drop)
+        return card
+
+    def _page_layout_changed(self, persisted=False):
+        labels = self._page_labels()
+        for card in self.cards.values():
+            self._cards_layout.removeWidget(card)
+        for index in set(self.cards) - set(labels):
+            card = self.cards.pop(index)
+            card.release_asset_handle()
+            card.hide()
+            card.deleteLater()
+        self.labels = labels
+        self.image_paths = {index: self.image_paths.get(index) for index in labels}
+        for position, (index, (title, _filename)) in enumerate(labels.items()):
+            if index not in self.cards:
+                self.cards[index] = self._make_page_card(index, title)
+            card = self.cards[index]
+            card.title_label.setText(title)
+            self._cards_layout.addWidget(card, 0, position)
+            card.show()
+        self.cards = {index: self.cards[index] for index in labels}
+        self.refresh_cards()
+        self._fit_cards()
+        if persisted:
+            try:
+                self.project_save_service.copy_workspace_file(
+                    Path(self._user_pages_dir()) / LAYOUT_FILE,
+                    Path("pages") / LAYOUT_FILE,
+                )
+            except Exception as error:
+                self._show_temporary_status(f"Page layout saved locally; project copy failed: {error}", 5000)
+            self._commit_image_change("page_layout")
+
+    def _select_layout_page(self, key):
+        card = self.cards.get(PAGE_INDICES.get(key))
+        if card is not None:
+            self._cards_scroll.ensureWidgetVisible(card, 12, 0)
+            for index, item in self.cards.items():
+                item.setAccessibleName(self.labels[index][0] + (" selected" if item is card else ""))
+                item.title_label.setText(self.labels[index][0] + (" •" if item is card else ""))
+
+    def _show_selected_page(self):
+        self._select_layout_page(self.page_controller.selected)
 
     def resizeEvent(
             self,
@@ -2771,7 +2746,10 @@ class ImageTab(
 
     def _stock_image_paths(self, index: int) -> tuple[Path, ...]:
         slot = INDEX_TO_SLOT.get(index)
-        filenames = STOCK_IMAGE_FILES.get(index, ())
+        page = next((page for page in self.page_controller.pages if page.key == slot), None)
+        if page is not None:
+            slot = page.kind
+        filenames = STOCK_IMAGE_FILES.get(PAGE_INDICES.get(slot), ())
         if not slot:
             return ()
         stock_directory = (

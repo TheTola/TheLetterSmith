@@ -1,8 +1,11 @@
 # PromptWriterPanel.py
-# Prompt Writer for eLetter — generates four separate prompts (cover, letter, wall, back)
+# Prompt Writer for eLetter — generates prompts for the selected page layout
 # Windowed layout (stacked "windows"), per-window copy buttons, global Copy All.
 
 from __future__ import annotations
+
+from page_controls import PageControls, page_controller
+from page_layout import DEFAULT_PAGES, PAGE_KEYS, PAGE_INDICES, page_labels, pages_payload
 
 import sys
 import hashlib
@@ -201,17 +204,21 @@ PAGE_SPECS: Tuple[PageSpec, ...] = (
     ),
     PageSpec(
         key="back",
-        display_label="Back Prompt",
+        display_label="End Prompt",
         output_filename="back.png",
         color_key="back",
-        baseline="The Back Page is a simple, graceful closing image that echoes the cover while providing a sense of finality.",
+        baseline="The End Page is a simple, graceful closing image that echoes the cover while providing a sense of finality.",
         detail_help="Use it for back-page details or closing visual accents.",
     ),
 )
 
 
 def _page_spec_for(identifier: object) -> Optional[PageSpec]:
+    if isinstance(identifier, PageSpec):
+        return identifier
     text = _normalize_text(identifier, strip=True, max_length=80).casefold()
+    if text == "back prompt":
+        text = "back"
     if not text:
         return None
     return next(
@@ -330,11 +337,13 @@ class PromptPayload:
     effort_line: str = ""
     guidance_lines: Tuple[str, ...] = ()
     format_paragraph: str = ""
+    page_color_key: str = ""
+    page_display_label: str = ""
 
     @property
     def image_name(self) -> str:
         page = _page_spec_for(self.page_key)
-        return page.display_label if page is not None else self.page_key
+        return self.page_display_label or (page.display_label if page is not None else self.page_key)
 
     def first_paragraph(self) -> str:
         return _as_prompt_sentence(_join_nonempty(self.role_sentence, self.order_fragment, self.subject_fragment))
@@ -1168,7 +1177,7 @@ def render_prompt_html(
 ) -> str:
     """Render the preview with colored values (preview should match emitted text)."""
     page = _page_spec_for(payload.page_key)
-    col_img = page.preview_color if page is not None else color_for("back")
+    col_img = color_for(payload.page_color_key) if payload.page_color_key else (page.preview_color if page is not None else color_for("back"))
     parts: list[str] = []
 
     first = _join_nonempty(payload.role_sentence, payload.order_fragment)
@@ -1409,7 +1418,7 @@ def _pick_random_order(name: str) -> Tuple[Optional[List[str]], Optional[Path]]:
 def _build_prompt_payload(
     subject: str,
     data: dict,
-    page_identifier: str,
+    page_identifier: str | PageSpec,
     *,
     type_choice: Optional[str] = None,
     color_choice: Optional[str] = None,
@@ -1472,6 +1481,8 @@ def _build_prompt_payload(
         effort_line=effort_line,
         guidance_lines=guidance_lines,
         format_paragraph=format_paragraph,
+        page_color_key=page.color_key if page is not None else "",
+        page_display_label=display_label,
     )
     return payload, dbg
 
@@ -1479,7 +1490,7 @@ def _build_prompt_payload(
 def assemble_prompt_for_image(
     subject: str,
     data: dict,
-    page_identifier: str,
+    page_identifier: str | PageSpec,
     *,
     type_choice: Optional[str] = None,
     color_choice: Optional[str] = None,
@@ -1607,7 +1618,14 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "format": default_format,
         }
 
-        self._page_specs = [replace(page) for page in PAGE_SPECS]
+        self.page_controller = page_controller(self.project_root)
+        self.page_controller.reload()
+        prototypes = {page.key: page for page in PAGE_SPECS}
+        self._all_page_specs = {
+            key: replace(prototypes.get(key, prototypes["letter"]), key=key, output_filename=f"{key}.png")
+            for key in PAGE_KEYS
+        }
+        self._page_specs = list(self._all_page_specs.values())
         self._generated_prompts: Dict[str, str] = {}
         self._resolved_instructions: Dict[str, object] = {}
         self._generated_input_signature = ""
@@ -1633,11 +1651,46 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self.apply_theme_assets(theme_service)
         self.refresh_semantic_palette()
         self._connect_signals()
+        self.page_controller.changed.connect(self._page_layout_changed)
+        self.page_controller.selection_changed.connect(self._select_layout_page)
+        self._page_layout_changed()
 
         self._load_colors_into_combo()
         self._start_visionary_pulse()
         self.reload_project_state()
         self._sync_action_button_states()
+
+    def _page_layout_changed(self, persisted=False):
+        labels = page_labels(self.page_controller.pages)
+        prototypes = {page.key: page for page in PAGE_SPECS}
+        self._page_specs = []
+        for definition in self.page_controller.pages:
+            page = self._all_page_specs[definition.key]
+            prototype = prototypes[definition.kind]
+            page.display_label = labels[definition.key] + " Prompt"
+            page.color_key = definition.kind
+            page.baseline = prototype.baseline
+            page.detail_help = prototype.detail_help
+            page.detail_label.setText(labels[definition.key])
+            page.detail_widget.setPlaceholderText(f"Add details for {labels[definition.key]}.")
+            page.preview_title.setText(page.display_label)
+            self._page_specs.append(page)
+        self._select_layout_page(self.page_controller.selected)
+        self.refresh_semantic_palette()
+        if persisted:
+            if self._browser is not None and hasattr(self._browser, "set_approval_target"):
+                self._browser.set_approval_target("", "")
+            self._invalidate_generated_output()
+            self._schedule_persist_state()
+            self.project_changed.emit()
+
+    def _select_layout_page(self, key):
+        active = {page.key for page in self._page_specs}
+        for page in self._all_page_specs.values():
+            visible = page.key == key and page.key in active
+            page.detail_widget.setVisible(visible)
+            page.detail_label.setVisible(visible)
+            page.preview_card.setVisible(visible)
 
     def _module_path(self, name: str) -> Path:
         return self._builtin_modules_dir() / name
@@ -2015,14 +2068,17 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         generated_prompts: Dict[str, str] = {}
         page_details: Dict[str, str] = {}
-        for page in self._page_specs:
+        for page in self._all_page_specs.values():
             page_details[page.key] = _normalize_text(state.get(page.key, ""))
             generated_value = generated_raw.get(
                 page.key,
-                generated_raw.get(page.display_label, ""),
+                generated_raw.get(
+                    page.display_label,
+                    generated_raw.get("Back Prompt", "") if page.key == "back" else "",
+                ),
             )
             generated_text = generated_value if isinstance(generated_value, str) else ""
-            if generated_text.strip():
+            if page in self._page_specs and generated_text.strip():
                 generated_prompts[page.key] = generated_text
 
         resolved_raw = state.get("resolved_instructions", {})
@@ -2139,6 +2195,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 for page in self._page_specs
             }
         )
+        if self.page_controller.pages != DEFAULT_PAGES:
+            input_state["pages"] = pages_payload(self.page_controller.pages)
         encoded = json.dumps(
             input_state,
             ensure_ascii=False,
@@ -2168,7 +2226,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             page.key: page.detail_widget.toPlainText()
             if page.detail_widget is not None
             else ""
-            for page in self._page_specs
+            for page in self._all_page_specs.values()
         }
 
         return {
@@ -2198,6 +2256,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def reload_project_state(self) -> bool:
         """Replace the live workspace with the active project's saved state."""
+        self.page_controller.reload()
         widgets: List[QtCore.QObject] = [
             self.cmb_subject,
             self.cmb_type,
@@ -2205,7 +2264,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self.txt_global,
             *(
                 page.detail_widget
-                for page in self._page_specs
+                for page in self._all_page_specs.values()
                 if page.detail_widget is not None
             ),
             *(checkbox for checkbox, _ in self._checkbox_state_specs()),
@@ -2304,7 +2363,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             # Text
             try:
                 self.txt_global.setPlainText(str(state.get("global", "") or ""))
-                for page in self._page_specs:
+                for page in self._all_page_specs.values():
                     if page.detail_widget is not None:
                         page.detail_widget.setPlainText(str(state.get(page.key, "") or ""))
             except (RuntimeError, TypeError, ValueError) as error:
@@ -2397,7 +2456,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         )
         set_control_help(
             self.btn_copy,
-            "Copy all four generated image prompts to the clipboard.",
+            "Copy all generated image prompts to the clipboard.",
         )
         set_control_help(
             self.btn_erase,
@@ -2739,7 +2798,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 f"Anything written here is added only to the {page.output_filename} prompt. "
                 f"{page.detail_help}"
             )
-            label = QtWidgets.QLabel(page.output_filename)
+            label = QtWidgets.QLabel(page.display_label.removesuffix(" Prompt"))
             label.setProperty("pageDetailLabel", True)
             _set_help(label, help_text)
             _set_help(editor, help_text)
@@ -2767,6 +2826,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
         output_hint.setObjectName("columnHint")
         output_hint.setWordWrap(True)
         right_v.addWidget(output_hint)
+        self.page_controls = PageControls(self.page_controller)
+        right_v.addWidget(self.page_controls)
 
         output_nav = QtWidgets.QHBoxLayout()
         self.btn_prompt_list = QtWidgets.QPushButton("Prompts")
@@ -3178,7 +3239,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             LOGGER.exception("Prompt Writer signal wiring failed: %s", error)
 
     def attach_browser(self, browser: object, image_tab: object | None = None) -> None:
-        """Display one live conversation for all four generated prompts."""
+        """Display one live conversation for all generated prompts."""
         self._browser = browser
         self._image_tab = image_tab
         view = browser.view
@@ -3242,7 +3303,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._on_browser_image_failed("Finish the current image before choosing another.")
             return
         index = next(
-            (number for number, page in enumerate(self._page_specs, 1) if page.key == page_key),
+            (PAGE_INDICES[page.key] for page in self._page_specs if page.key == page_key),
             0,
         )
         if not index:
@@ -3261,7 +3322,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def _on_image_import_completed(self, index: int, path: str, error: str) -> None:
         page_key = self._pending_approval_key
         if not page_key or index != next(
-            (number for number, page in enumerate(self._page_specs, 1) if page.key == page_key),
+            (PAGE_INDICES[page.key] for page in self._page_specs if page.key == page_key),
             0,
         ):
             return
@@ -3279,7 +3340,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def _refresh_approved_previews(self, *_args: object) -> None:
         image_paths = getattr(self._image_tab, "image_paths", {})
-        for index, page in enumerate(self._page_specs, 1):
+        for page in self._page_specs:
+            index = PAGE_INDICES[page.key]
             label = page.image_widget
             if label is None or page.preview_widget is None:
                 continue
@@ -3626,7 +3688,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def _validate_generated_prompt_set(self, prompts: Dict[str, str]) -> None:
         expected = {page.key for page in self._page_specs}
         if set(prompts) != expected:
-            raise ValueError("generation did not produce all four prompts")
+            raise ValueError("generation did not produce a prompt for every selected page")
         unresolved = re.compile(r"\{\{[^{}]+\}\}")
         for key, prompt in prompts.items():
             text = _normalize_text(prompt, strip=True, max_length=0)
@@ -3781,7 +3843,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 prompt, payload, dbg = assemble_prompt_for_image(
                     subject,
                     per_image_data,
-                    page.key,
+                    page,
                     type_choice=t,
                     color_choice=c,
                     guidance=guidance,
@@ -3886,10 +3948,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def _copy_prompt(self, page_identifier: str) -> None:
         if not self._generated_output_valid:
             return
-        page = _page_spec_for(page_identifier)
-        if page is None:
-            return
-        panel_page = next((item for item in self._page_specs if item.key == page.key), None)
+        panel_page = next((item for item in self._page_specs if page_identifier in (item.key, item.display_label, item.output_filename)), None)
         if panel_page is None:
             return
         text = self._generated_prompts.get(panel_page.key, "").strip()
@@ -3919,7 +3978,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self.txt_global,
             *(
                 page.detail_widget
-                for page in self._page_specs
+                for page in self._all_page_specs.values()
                 if page.detail_widget is not None
             ),
             *(checkbox for checkbox, _ in self._checkbox_state_specs()),
@@ -3939,7 +3998,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
             self._last_focused_widget = None
             self.txt_global.clear()
-            for page in self._page_specs:
+            for page in self._all_page_specs.values():
                 if page.detail_widget is not None:
                     page.detail_widget.clear()
             self._invalidate_generated_output()

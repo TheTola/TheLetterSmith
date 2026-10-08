@@ -490,13 +490,8 @@ class PromptWriterHardeningTests(unittest.TestCase):
             self.panel.lbl_helpful: PROMPT_COLORS["helpful"],
             self.panel.lbl_global: PROMPT_COLORS["global"],
         }
-        page_labels = {
-            label.text(): label
-            for label in self.panel.findChildren(QtWidgets.QLabel)
-            if label.text() in {page.output_filename for page in self.panel._page_specs}
-        }
         for page in self.panel._page_specs:
-            source_labels[page_labels[page.output_filename]] = page.preview_color
+            source_labels[page.detail_label] = page.preview_color
 
         self.assertEqual(len(set(source_labels.values())), len(source_labels))
         for label, expected in source_labels.items():

@@ -16,6 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from page_layout import load_pages  # noqa: E402
 from config import (  # noqa: E402
     MESSAGE_ASSETS_DIR,
     PLAY_METADATA_FILE,
@@ -129,7 +130,9 @@ def _static_image_manifest(pages: Path) -> dict[str, Any]:
             "an image manifest cannot be inferred safely for animated pages"
         )
     slots: dict[str, dict[str, Any]] = {}
-    for slot, definition in SLOT_DEFINITIONS.items():
+    for page in load_pages(pages):
+        slot = page.key
+        definition = SLOT_DEFINITIONS[slot]
         filename = f"{definition['basename']}.png"
         path = pages / filename
         if path.is_symlink() or not path.is_file():

@@ -46,7 +46,8 @@ from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import unquote, urlsplit
 
-from Template import TEMPLATE_HTML, TEMPLATE_CSS, TEMPLATE_JS
+from Template import TEMPLATE_HTML, TEMPLATE_CSS, TEMPLATE_JS, template_for_pages
+from page_layout import load_pages, page_files
 from curtain_cache import CurtainVariantCache, load_curtain_variant_cache
 from curtain_color import (
     curtain_variant_rgbs,
@@ -102,7 +103,6 @@ from config import (
     validate_controls,
     USER_PAGES_DIR,
     USER_CONTROLS_DIR,
-    REQUIRED_SLIDES,
     CONTROL_FILES,
     MESSAGE_ASSETS_DIR,
     MESSAGE_HTML_FILE,
@@ -847,7 +847,7 @@ def validate_play_bundle(directory: str | Path) -> Path:
         root / "index.html",
         root / "styles.css",
         root / "script.js",
-        *(root / "gallery/pages" / name for name in REQUIRED_SLIDES),
+        *(root / "gallery/pages" / name for name in page_files(root / "gallery/pages")),
         root / "gallery/pages" / IMAGE_MANIFEST_NAME,
         *(root / "gallery/controls" / name for name in CONTROL_FILES),
         root / "gallery/controls" / BANNER_FILE,
@@ -1186,7 +1186,7 @@ def build_play_bundle_to(
     )
     csp_nonce = secrets.token_urlsafe(24)
     html = (
-        TEMPLATE_HTML
+        template_for_pages(load_pages(pages_src))
         .replace("{{CSP_NONCE}}", csp_nonce)
         .replace("{{TITLE}}", _html.escape(title, quote=True))
         .replace(

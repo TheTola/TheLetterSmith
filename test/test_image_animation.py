@@ -1186,25 +1186,25 @@ class ImageAnimationTests(unittest.TestCase):
             finally:
                 image_tab.close()
 
-    def test_image_cards_wrap_when_window_narrows(self) -> None:
+    def test_image_cards_scroll_horizontally_when_window_narrows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             image_tab = ImageTab(directory)
             try:
-                image_tab.resize(1920, 820)
-                image_tab.show()
-                self.app.processEvents()
-                self.assertEqual(image_tab._cards_columns, 4)
-
                 image_tab.resize(1180, 820)
+                image_tab.show()
+                image_tab.page_controls.count.setValue(10)
                 self.app.processEvents()
-                self.assertEqual(image_tab.width(), 1180)
-                self.assertEqual(image_tab._cards_columns, 2)
-                self.assertGreater(
-                    image_tab.cards[3].y(), image_tab.cards[1].y()
-                )
-                for card in image_tab.cards.values():
-                    self.assertLessEqual(card.geometry().right(), image_tab.width())
+                self.assertEqual(image_tab._cards_columns, 10)
+                self.assertEqual(len({card.y() for card in image_tab.cards.values()}), 1)
+                self.assertGreater(image_tab._cards_scroll.horizontalScrollBar().maximum(), 0)
+                image_tab.page_controller.select("back")
+                self.app.processEvents()
+                self.assertGreater(image_tab._cards_scroll.horizontalScrollBar().value(), 0)
+                image_tab.page_controller.select("cover")
+                self.app.processEvents()
+                self.assertEqual(image_tab._cards_scroll.horizontalScrollBar().value(), 0)
             finally:
+                image_tab.shutdown()
                 image_tab.close()
 
 

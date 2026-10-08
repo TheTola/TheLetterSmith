@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from page_layout import load_pages, page_files, pages_payload
+
 import json
 import io
 import logging
@@ -25,7 +27,6 @@ from config import (
     CONTROL_FILES,
     MESSAGE_ASSETS_DIR,
     PLAY_METADATA_FILE,
-    REQUIRED_SLIDES,
     USER_MESSAGE_DIR,
     USER_PAGES_DIR,
     USER_SOUNDS_DIR,
@@ -1267,7 +1268,7 @@ class SavedLetterCatalog:
                 not (pages / name).is_symlink()
                 and (pages / name).is_file()
                 and _readable_file(pages / name)
-                for name in REQUIRED_SLIDES
+                for name in page_files(pages)
             )
             and all(
                 not (controls / name).is_symlink()
@@ -1956,7 +1957,7 @@ class SavedLetterRestorer:
     ) -> None:
         missing = [
             name
-            for name in REQUIRED_SLIDES
+            for name in page_files(pages)
             if not (pages / name).is_file()
             or (pages / name).is_symlink()
             or not _readable_file(pages / name)
@@ -2340,10 +2341,11 @@ def update_saved_metadata(
                 "state_file": PROMPT_WRITER_STATE_FILE,
                 "state": prompt_writer_state,
             },
+            "page_layout": pages_payload(load_pages(root / USER_PAGES_DIR)),
             "editable_assets": {
                 "pages": {
                     name: f"gallery/pages/{name}"
-                    for name in REQUIRED_SLIDES
+                    for name in page_files(root / USER_PAGES_DIR)
                 },
                 "message": "gallery/message/message.html",
                 "message_assets": MESSAGE_ASSETS_DIR,

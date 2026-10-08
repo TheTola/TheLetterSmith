@@ -1994,7 +1994,7 @@ class Nexus(QtWidgets.QMainWindow):
         self.tabbar = QtWidgets.QTabBar()
         self.tabbar.setObjectName("MainTabBar")
         tab_help = (
-            ("Images", "Select and prepare the four images for this letter."),
+            ("Images", "Select and prepare 2–10 pages for this letter."),
             ("Sound", "Choose one song or arrange a playlist for this letter."),
             ("Message", "Write, import, and format the letter's message."),
             ("Forge", "Review, preview, load, publish, and share the letter."),
@@ -5482,11 +5482,12 @@ class Nexus(QtWidgets.QMainWindow):
         if idx == 0:
             header = "<b>✨The Images Tab✨</b>"
             body = (
-                "Here you choose the four images that make up your letter: "
-                "the Cover Page, Main Letter, Letter Background, and Final "
-                "Backdrop. Click an image card to select or replace it, or "
+                "Choose 2–10 pages, with Cover first and End last. Select "
+                "Letter or Wall for each middle page; Walls display your message. "
+                "Use the arrows to browse and Move left/right to reorder middle pages. "
+                "Click an image card to select or replace it, or "
                 "hover over it to view it in the main preview. You can clear "
-                "individual images, reset all four, open the Gallery, or use "
+                "individual images, reset the images, open the Gallery, or use "
                 "Prompt Writer to create image prompts."
             )
         elif idx == 1:

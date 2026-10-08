@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from page_layout import load_pages, page_files, page_labels
+
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,7 +9,6 @@ from typing import Mapping
 
 from config import (
     MESSAGE_HTML_FILE,
-    REQUIRED_SLIDES,
     USER_PAGES_DIR,
 )
 from message_format import message_plain_text
@@ -184,7 +185,7 @@ def evaluate_project_save_eligibility(
     completed_tabs: list[str] = []
     if all(
         (pages / name).is_file()
-        for name in REQUIRED_SLIDES
+        for name in page_files(pages)
     ):
         completed_tabs.append("images")
     if _sound_is_complete(root):
@@ -212,6 +213,8 @@ def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
     has_music = _sound_is_complete(root)
     has_message = _message_is_complete(root)
     title_ready, title_detail = _title_readiness(root, settings)
+    layout = load_pages(pages)
+    labels = page_labels(layout)
 
     definitions = (
         (
@@ -232,41 +235,14 @@ def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
             "message",
             "title",
         ),
-        (
-            "cover",
-            "Cover Image",
-            (pages / "cover.png").is_file(),
-            True,
-            "Choose the cover image.",
-            "images",
-            "cover",
-        ),
-        (
-            "letter",
-            "Main Letter Image",
-            (pages / "letter.png").is_file(),
-            True,
-            "Choose the main letter image.",
-            "images",
-            "letter",
-        ),
-        (
-            "wall",
-            "Letter Background",
-            (pages / "wall.png").is_file(),
-            True,
-            "Choose the letter background.",
-            "images",
-            "wall",
-        ),
-        (
-            "back",
-            "Final Backdrop",
-            (pages / "back.png").is_file(),
-            True,
-            "Choose the final backdrop.",
-            "images",
-            "back",
+        *(
+            (
+                page.key, labels[page.key] + " Image",
+                (pages / page.filename).is_file(), True,
+                f"Choose the {labels[page.key]} image.",
+                "images", page.key,
+            )
+            for page in layout
         ),
         (
             "message",

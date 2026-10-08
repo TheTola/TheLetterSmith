@@ -68,7 +68,7 @@ TEMPLATE_HTML = r"""
       <img src="gallery/pages/letter.png" alt="Main Letter" decoding="async">
     </section>
 
-    <section class="slide" data-index="2" id="slide-2">
+    <section class="slide" data-index="2" data-page-type="wall" id="slide-2">
       <img src="gallery/pages/wall.png" alt="Text Wall Background" decoding="async">
       <div class="text-wall" id="textWall" role="dialog" aria-modal="false" aria-label="Message text" aria-hidden="true" tabindex="-1" style="{{MESSAGE_OVERLAY_STYLE}}">
         <button id="close-text" class="hud-button hud-button-close" type="button" title="Close Text" aria-label="Close message" aria-controls="textWall">&times;</button>
@@ -437,9 +437,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const flipPool = Array.from({length: 10}, (_, i) => `gallery/sounds/flip${i+1}.mp3`);
   const glissSrc = 'gallery/sounds/glissando.mp3';
   const deferredAssets = [
-    { as: 'image', href: 'gallery/pages/letter.png' },
-    { as: 'image', href: 'gallery/pages/wall.png' },
-    { as: 'image', href: 'gallery/pages/back.png' },
+    ...slides.slice(1).map((slide) => ({ as: 'image', href: slide.querySelector('img').getAttribute('src') })),
     { as: 'image', href: 'gallery/controls/ppage.png' },
     { as: 'image', href: 'gallery/controls/npage.png' },
     { as: 'image', href: 'gallery/controls/volon.png' },
@@ -471,7 +469,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function installAdaptiveMicroContrast(){
     const content = document.getElementById('textWallContent');
-    const wallImage = document.querySelector('#slide-2 > img');
+    let wallImage = document.querySelector('[data-page-type="wall"] > img');
     if (!content || !wallImage){
       return { schedule(){} };
     }
@@ -600,6 +598,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function run(){
       frame=0;
       if (!wall.classList.contains('is-open')) return;
+      wallImage = slides[idx].querySelector('img');
       const sampleImage=prepareImage();
       if (!sampleImage) return;
       const imageRect=wallImage.getBoundingClientRect(), wallRect=wall.getBoundingClientRect();
@@ -704,7 +703,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     wall.addEventListener('scroll',schedule,{passive:true});
     window.addEventListener('resize',schedule,{passive:true});
-    wallImage.addEventListener('load',()=>{ imageSample=null; schedule(); });
+    slides.forEach((slide) => slide.querySelector('img').addEventListener('load',()=>{ imageSample=null; schedule(); }));
     return {schedule};
   }
 
@@ -1065,7 +1064,7 @@ document.addEventListener('DOMContentLoaded', () => {
     requestAnimationFrame(() => overlay.classList.add('is-visible'));
   }
 
-  function isWallPage(){ return idx === 2; }
+  function isWallPage(){ return slides[idx].dataset.pageType === "wall"; }
   function setDisabled(btn, disabled){
     btn.disabled = !!disabled;
     btn.setAttribute('aria-disabled', disabled ? 'true' : 'false');
@@ -1190,7 +1189,7 @@ document.addEventListener('DOMContentLoaded', () => {
       s.classList.remove('peek');
       s.classList.remove('ghost');
     });
-    if (idx === 2) wallClosedByUser = false;
+    if (isWallPage()) wallClosedByUser = false;
     if (opts.playSound !== false) playFlip();
     syncButtons();
     syncWallUI();
@@ -1731,3 +1730,25 @@ document.addEventListener('DOMContentLoaded', () => {
   waitForCriticalAssets().finally(startCurtainIntro);
 });
 """
+
+
+def template_for_pages(pages):
+    """Render the selected page order with one shared message overlay."""
+    from page_layout import page_labels
+    labels = page_labels(pages)
+    start = TEMPLATE_HTML.index('    <section class="slide active"')
+    end = TEMPLATE_HTML.index('    <button id="prev"', start)
+    wall_start = TEMPLATE_HTML.index('      <div class="text-wall"', start)
+    wall_end = TEMPLATE_HTML.index('    </section>', wall_start)
+    overlay = TEMPLATE_HTML[wall_start:wall_end]
+    sections = []
+    for index, page in enumerate(pages):
+        active = " active" if index == 0 else ""
+        priority = ' fetchpriority="high"' if index == 0 else ""
+        sections.append(
+            f'    <section class="slide{active}" data-index="{index}" '
+            f'data-page-type="{page.kind}" id="slide-{index}">\n'
+            f'      <img src="gallery/pages/{page.filename}" alt="{labels[page.key]}" '
+            f'decoding="async"{priority}>\n    </section>\n'
+        )
+    return TEMPLATE_HTML[:start] + "\n".join(sections) + overlay + TEMPLATE_HTML[end:]

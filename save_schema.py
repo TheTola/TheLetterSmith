@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from transactional_io import safe_write_json
+from page_layout import normalize_pages
 
 
 CURRENT_SAVE_SCHEMA_VERSION = "1.0"
@@ -499,7 +500,12 @@ def validate_saved_letter_metadata(
     _require_object(validated, "readiness")
     editable_assets = _require_object(validated, "editable_assets")
     pages = _require_object(editable_assets, "pages")
-    for filename in REQUIRED_PAGE_FILES:
+    try:
+        layout = normalize_pages(validated.get("page_layout"))
+    except ValueError as error:
+        raise SaveSchemaError(str(error)) from error
+    for page in layout:
+        filename = page.filename
         _require_relative_file(
             pages.get(filename),
             f"editable_assets.pages.{filename}",

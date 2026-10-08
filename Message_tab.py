@@ -1861,8 +1861,11 @@ class MessageTab(QtWidgets.QWidget):
         return Path(self.project_root) / MESSAGE_IMAGE_FILE
 
     def _wall_path(self) -> Path:
-        # SOURCE OF TRUTH: gallery/user/pages/wall.png
-        return Path(self.project_root) / USER_PAGES_DIR / "wall.png"
+        from page_layout import load_pages
+        pages = Path(self.project_root) / USER_PAGES_DIR
+        wall = next((page for page in load_pages(pages) if page.kind == "wall"), None)
+        # A layout with no Walls has no message backdrop to render.
+        return pages / (wall.filename if wall is not None else "no-wall-selected.png")
 
     def _sync_project_render_assets(self) -> None:
         if not self.project_state.is_project_ready:
@@ -1880,7 +1883,7 @@ class MessageTab(QtWidgets.QWidget):
             ),
             (
                 self._wall_path(),
-                Path("pages") / "wall.png",
+                Path("pages") / self._wall_path().name,
             ),
         ):
             if not source.is_file():
@@ -1984,7 +1987,7 @@ class MessageTab(QtWidgets.QWidget):
             full_pix = QPixmap(str(wall_path))
             if not full_pix.isNull():
                 self.preview_image.emit(full_pix)
-                self.status.setText("🧱 Showing wall.png")
+                self.status.setText("🧱 Showing the first Wall page")
                 return
 
         self.status.setText("❌ Choose a letter background in Images.")

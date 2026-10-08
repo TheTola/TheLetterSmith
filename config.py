@@ -1181,7 +1181,9 @@ def validate_required_images(
     reconcile_external_image_assets(base)
 
     missing: list[str] = []
-    for filename in REQUIRED_SLIDES:
+    from page_layout import page_files
+
+    for filename in page_files(base):
         if (base / filename).is_file():
             continue
         missing.append(filename)

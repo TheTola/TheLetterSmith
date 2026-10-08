@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from page_layout import load_pages, save_pages
+
 from dataclasses import dataclass
 from io import BytesIO
 import hashlib
@@ -96,6 +98,10 @@ SLOT_DEFINITIONS = {
         "basename": "back",
     },
 }
+SLOT_DEFINITIONS.update({
+    f"page_{number}": {"index": number + 4, "label": f"Page {number}", "basename": f"page_{number}"}
+    for number in range(1, 7)
+})
 INDEX_TO_SLOT = {
     int(definition["index"]): slot
     for slot, definition in SLOT_DEFINITIONS.items()
@@ -755,9 +761,12 @@ def build_runtime_image_assets(
     animations: dict[str, dict[str, Any]] = {}
     fallback_sources = dict(fallback_page_sources or {})
 
-    for slot, definition in SLOT_DEFINITIONS.items():
+    layout = load_pages(source_pages)
+    save_pages(destination_pages, layout)
+    for slide_index, page in enumerate(layout):
+        slot = page.key
+        definition = SLOT_DEFINITIONS[slot]
         basename = str(definition["basename"])
-        slide_index = int(definition["index"]) - 1
         source_png = source_pages / f"{basename}.png"
         using_fallback = False
         if not source_png.is_file():
@@ -908,7 +917,9 @@ def validate_runtime_image_manifest(pages_directory: str | Path) -> dict[str, An
     if not isinstance(slots, dict):
         raise ValueError("The generated image manifest has no image slots.")
 
-    for slot, definition in SLOT_DEFINITIONS.items():
+    for page in load_pages(pages):
+        slot = page.key
+        definition = SLOT_DEFINITIONS[slot]
         record = slots.get(slot)
         if not isinstance(record, dict):
             raise ValueError(f"The generated {definition['label']} record is missing.")
