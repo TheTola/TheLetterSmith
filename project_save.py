@@ -79,6 +79,33 @@ class ProjectSaveService:
     def can_save(self) -> bool:
         return self.save_eligibility().can_save
 
+    def save_project(self, directory: str | Path | None = None, *, expected_revision: str | None = None):
+        """Save the canonical authored draft, independently of output readiness."""
+        from project_session import get_project_session
+        stored = get_project_session(self.project_root).save()
+        if directory is None:
+            return stored
+        from project_repository import ProjectRepository
+        return ProjectRepository(directory).save(stored.project, asset_root=stored.asset_root,
+                                                  expected_revision=expected_revision)
+
+    def load_project(self, directory: str | Path):
+        """Activate a portable canonical draft after complete source validation.
+
+        ``directory`` is a ProjectRepository directory, or a viewer package
+        containing .lettersmith-project. The source is never modified. Existing
+        UI consumers project this model through the shared compatibility bridge.
+        """
+        from project_repository import ProjectRepository
+        from saved_letters import SavedLetterRestorer
+        source = ProjectRepository(directory)
+        if not source.exists:
+            source = ProjectRepository(Path(directory) / ".lettersmith-project")
+        loaded = source.load()
+        stored = SavedLetterRestorer(self.project_root).restore_canonical(loaded)
+        self.project_state.initialize()
+        return stored
+
     def current_context(self) -> ProjectContext:
         try:
             identity = self.project_state.require_ready()
@@ -128,6 +155,7 @@ class ProjectSaveService:
             content,
             reason=reason,
         )
+        self.save_project()
         if not self.can_save():
             return workspace
         context = self.current_context()
@@ -155,6 +183,7 @@ class ProjectSaveService:
             raise ProjectSaveError(
                 f"Workspace file does not exist: {source}"
             )
+        self.save_project()
         if not self.can_save():
             return source
         context = self.current_context()
@@ -175,6 +204,7 @@ class ProjectSaveService:
         source_root = Path(workspace_directory).resolve()
         if not source_root.is_dir():
             return ()
+        self.save_project()
         if not self.can_save():
             return ()
         context = self.current_context()
@@ -220,6 +250,7 @@ class ProjectSaveService:
         eligibility = self.save_eligibility()
         if not eligibility.can_save:
             raise ProjectNotReadyError(eligibility.blocked_reason)
+        stored_project = self.save_project()
         context = self.current_context()
         transaction = PathTransaction(
             context.autosave_directory,
@@ -240,6 +271,11 @@ class ProjectSaveService:
                 )
             else:
                 staging.mkdir(parents=True)
+            from project_repository import ProjectRepository
+            canonical = ProjectRepository(staging / ".lettersmith-project")
+            previous_revision = canonical.load().revision if canonical.exists else None
+            canonical.save(stored_project.project, asset_root=stored_project.asset_root,
+                           expected_revision=previous_revision)
             staged_context = ProjectContext(
                 recipient_id=context.recipient_id,
                 recipient_display_name=context.recipient_display_name,
@@ -364,6 +400,7 @@ class ProjectSaveService:
         """Preserve unowned autosave entries without cloning managed trees."""
         staging.mkdir(parents=True)
         replaced_paths = (
+            Path(".lettersmith-project"),
             Path("pages"),
             Path("message"),
             Path(MESSAGE_ASSETS_DIR),

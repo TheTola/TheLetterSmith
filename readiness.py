@@ -205,6 +205,10 @@ def evaluate_project_save_eligibility(
 
 def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
     root = Path(project_root).resolve()
+    from project_consumers import session_for
+    session = session_for(root)
+    if session is not None and not session.is_restoring:
+        session.synchronize_workspace()
     settings = SettingsStore(root).snapshot()
     if is_protected_project(settings):
         return ReadinessResult((), 0, "")
@@ -273,6 +277,11 @@ def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
         ),
     )
     items = tuple(ReadinessItem(*definition) for definition in definitions)
+    from project_consumers import consumer_issue
+    compatibility_issue = consumer_issue(root, "output")
+    if compatibility_issue:
+        items += (ReadinessItem("page_foundation", "Page-aware output", False, True,
+                               compatibility_issue, "forge", "pages"),)
     completed = sum(item.ready for item in items)
     percentage = round((completed / len(items)) * 100)
     required_missing = any(not item.ready and item.required for item in items)

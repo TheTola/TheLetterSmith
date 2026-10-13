@@ -432,6 +432,9 @@ def _safe_child(parent: Path, child: Path) -> bool:
 
 
 def _remove_path(path: Path) -> None:
+    if os.name == "nt" and not str(path).startswith("\\\\?\\"):
+        absolute = str(path.absolute())
+        path = Path("\\\\?\\UNC\\" + absolute[2:] if absolute.startswith("\\\\") else "\\\\?\\" + absolute)
     def remove() -> None:
         if path.is_dir() and not path.is_symlink():
             shutil.rmtree(path, onexc=_remove_readonly_and_retry)

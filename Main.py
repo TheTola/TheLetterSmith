@@ -724,7 +724,8 @@ def main() -> None:
         beta_diagnostics,
     )
 
-    _upgrade_saved_letters_at_startup(root)
+    # Saved projects migrate into isolated working copies when explicitly opened.
+    # Startup must never bulk-rewrite the user's library.
 
     # GitHub connection is resolved before the theme prompt. Stored secure
     # credentials bypass the modal; disconnected users must connect or cancel.

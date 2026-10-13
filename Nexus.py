@@ -1893,6 +1893,8 @@ class _ThemedNewProjectButton(QtWidgets.QToolButton):
 
 
 class Nexus(QtWidgets.QMainWindow):
+    foundation_changed = QtCore.Signal(object)
+
     def __init__(self, project_root: str | Path):
         super().__init__()
         self.project_root = str(project_root)
@@ -1922,6 +1924,13 @@ class Nexus(QtWidgets.QMainWindow):
             resolver=self.project_paths,
         )
         initial_project_state = self.project_state.initialize()
+        from project_session import get_project_session
+
+        self.project_session = get_project_session(self.project_root)
+        # Recovery may have restored settings from the committed generation.
+        initial_project_state = self.project_state.initialize()
+        self.foundation_changed.connect(self._on_foundation_changed)
+        self.project_session.add_listener(self.foundation_changed.emit)
         self._project_tabs_initialized = False
         self._curtain_preparation_generation = 0
         self._curtain_preparation_tasks: dict[
@@ -2737,6 +2746,9 @@ class Nexus(QtWidgets.QMainWindow):
         _settings: dict,
         keys: tuple[str, ...],
     ) -> None:
+        session = getattr(self, "project_session", None)
+        if session is not None and session.is_restoring:
+            return
         self._sync_protected_project_ui(_settings)
         if "recipient_title" in keys:
             self.title_bar.set_project_title(
@@ -2753,6 +2765,13 @@ class Nexus(QtWidgets.QMainWindow):
         }
         if any(not key.startswith("ui_") and key not in ignored for key in keys):
             self.project_dirty.mark_changed("settings")
+
+    def _on_foundation_changed(self, event) -> None:
+        if event.kind in {"selection", "project_replaced", "persisted"}:
+            return
+        self.project_dirty.mark_changed(f"pages:{event.kind}")
+        if self._project_tabs_initialized:
+            self.forge_tab.schedule_refresh()
 
     def _on_project_state_transition(
         self,
@@ -2825,6 +2844,7 @@ class Nexus(QtWidgets.QMainWindow):
             self.project_state.establish_project(
                 recipient,
                 custom_capitalization=custom_capitalization,
+                project_id=self.project_session.project.project_id,
             )
         except (RuntimeError, ValueError, OSError) as error:
             self.recipient_page.show_error(str(error))
@@ -2984,6 +3004,10 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _on_project_restored(self, _payload: Optional[dict] = None) -> None:
         """Coordinate public refresh contracts after an atomic restore."""
+        with self.project_session.restoring():
+            self._refresh_restored_project(_payload)
+
+    def _refresh_restored_project(self, _payload: Optional[dict] = None) -> None:
         self._protected_change_tracking_suspended = True
         panel = getattr(self, "_prompt_writer_win", None)
         if isinstance(panel, QtWidgets.QWidget):
@@ -4856,6 +4880,9 @@ class Nexus(QtWidgets.QMainWindow):
             if callable(stop_settings_movie):
                 stop_settings_movie()
             settings_store = getattr(self, "settings_store", None)
+            session = getattr(self, "project_session", None)
+            if session is not None:
+                session.remove_listener(self.foundation_changed.emit)
             settings_changed = getattr(settings_store, "changed", None)
             settings_callback = getattr(self, "_on_project_settings_changed", None)
             if settings_changed is not None and callable(settings_callback):
@@ -4906,6 +4933,11 @@ class Nexus(QtWidgets.QMainWindow):
                 self.project_state.shutdown()
             except Exception:
                 _LOGGER.exception("Project state shutdown failed.")
+            from project_session import release_project_session
+
+            project_root = getattr(self, "project_root", None)
+            if project_root is not None:
+                release_project_session(project_root)
             if self._tray_icon is not None:
                 self._tray_icon.hide()
             self._shutdown_complete = True

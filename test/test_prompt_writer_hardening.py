@@ -456,7 +456,9 @@ class PromptWriterHardeningTests(unittest.TestCase):
                 corrected_fields[page.key],
             )
         self.assertFalse(self.panel._generated_output_valid)
-        self.assertEqual(self.panel._generated_prompts, {})
+        self.assertEqual(self.panel._generated_prompts, {
+            page.key: f"Saved {page.key} prompt" for page in self.panel._page_specs
+        })
         saved = json.loads(
             (self.project_root / "prompt_writer_state.json").read_text(
                 encoding="utf-8"
@@ -932,7 +934,21 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
 
         self.assertFalse(self.panel._generated_output_valid)
-        self.assertFalse(self.panel._generated_prompts)
+        self.assertEqual(self.panel._generated_prompts["cover"], "{{unresolved}}")
+
+    def test_stale_partial_prompt_snapshots_round_trip_without_regeneration(self):
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+        exact = "  Edited café \r\n\n prompt  "
+        self.panel._generated_prompts = {"cover": exact}
+        self.panel._resolved_instructions = {"role": "Chosen once"}
+        self.panel.txt_global.setPlainText("Changed shared direction")
+        self.assertFalse(self.panel._generated_output_valid)
+        self.assertTrue(self.panel.persist_project_state())
+        with mock.patch.object(self.panel, "_roll_shared_prompt_data", side_effect=AssertionError("load rerolled")):
+            self.assertTrue(self.panel.reload_project_state())
+        self.assertEqual(self.panel._generated_prompts, {"cover": exact})
+        self.assertEqual(self.panel._resolved_instructions, {"role": "Chosen once"})
+        self.assertFalse(self.panel._generated_output_valid)
 
     def test_complete_workspace_restores_historical_values_and_exact_prompts(self):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))

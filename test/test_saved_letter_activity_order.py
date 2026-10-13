@@ -305,7 +305,7 @@ class SavedLetterActivityOrderTests(unittest.TestCase):
                 "",
             )
 
-    def test_legacy_project_uses_2025_until_first_successful_load(self) -> None:
+    def test_legacy_load_assigns_working_timestamp_without_rewriting_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundle = _saved_bundle(root, "Legacy Letter")
@@ -313,21 +313,20 @@ class SavedLetterActivityOrderTests(unittest.TestCase):
             entry = catalog.list_entries(force_refresh=True)[0]
             self.assertEqual(entry.created_sort_date, LEGACY_PROJECT_DATE)
             self.assertEqual(entry.project_created_at, "")
+            source_bytes = (bundle / PLAY_METADATA_FILE).read_bytes()
 
             SavedLetterRestorer(root).restore(entry)
 
             metadata = json.loads(
                 (bundle / PLAY_METADATA_FILE).read_text(encoding="utf-8")
             )
-            migrated = metadata.get(PROJECT_CREATED_AT_KEY, "")
+            self.assertEqual((bundle / PLAY_METADATA_FILE).read_bytes(), source_bytes)
+            self.assertEqual(metadata.get(PROJECT_CREATED_AT_KEY, ""), "")
+            migrated = SettingsStore(root).get(PROJECT_CREATED_AT_KEY, "")
             self.assertIsNotNone(parse_project_timestamp(migrated))
-            self.assertEqual(
-                SettingsStore(root).get(PROJECT_CREATED_AT_KEY, ""),
-                migrated,
-            )
             refreshed = catalog.refresh_entry(bundle)
             self.assertIsNotNone(refreshed)
-            self.assertNotEqual(refreshed[0].created_sort_date, LEGACY_PROJECT_DATE)
+            self.assertEqual(refreshed[0].created_sort_date, LEGACY_PROJECT_DATE)
 
     def test_saved_sort_uses_calendar_date_then_alphabetical_title(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
