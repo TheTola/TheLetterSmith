@@ -743,7 +743,9 @@ def sync_current_compatibility(
     state: ProjectSoundState,
     records: dict[str, TrackRecord],
 ) -> bool:
-    state.normalize(set(records))
+    # A missing library entry is still an authored assignment. Compatibility
+    # media may disappear until it is repaired, but the saved choice must not.
+    state.normalize()
     selected = state.selected_track_id
     ordered = state.ordered_track_ids()
     if selected not in ordered:
