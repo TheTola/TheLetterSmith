@@ -11,6 +11,14 @@ from project_session import ProjectSession
 
 
 class ProjectSessionTests(unittest.TestCase):
+    def test_presentation_changes_invalidate_prompt_work_even_when_reverted(self):
+        session = self.session
+        token = session.capture_target(self.ids[0], fields=("prompt",))
+        session.project.update_project_data("presentation", {"artwork_output": {"width": 900, "height": 1600}})
+        session.project.update_project_data("presentation", {"artwork_output": {}})
+        self.assertFalse(session.target_is_current(token))
+        self.assertTrue(session.project.get_prompt(self.ids[0])["stale"])
+
     def setUp(self):
         self.session = ProjectSession(create_project(('cover', 'letter', 'illustration', 'letter', 'end_page')))
         self.ids = [page['id'] for page in self.session.project.pages]

@@ -45,6 +45,37 @@ def legacy_fixture(*, count=4):
 
 
 class ProjectModelTests(unittest.TestCase):
+    def test_prompt_recovery_shared_resolution_and_geometry(self):
+        project = create_project(["letter", "end_page"])
+        page_id = project.pages[0]["id"]
+        original = "  exact café\r\n雪\n "
+        project.update_prompt(page_id, {"text": original, "directions": "A"})
+        project.replace_prompt(page_id, {"text": "new", "resolved_components": {"role": "artist"}, "stale": False})
+        project.update_prompt(page_id, {"directions": "B"})
+        project = ProjectModel.from_dict(project.to_dict())
+        self.assertTrue(project.restore_previous_prompt(page_id))
+        self.assertEqual(project.get_prompt(page_id)["text"], original)
+        self.assertEqual(project.get_prompt(page_id)["directions"], "B")
+        self.assertTrue(project.get_prompt(page_id)["stale"])
+        calls = []
+        def resolve():
+            calls.append(True)
+            return {"role": str(len(calls))}
+        self.assertEqual(project.resolve_prompt_components(resolve), {"role": "1"})
+        self.assertEqual(project.resolve_prompt_components(resolve), {"role": "1"})
+        self.assertEqual(project.resolve_prompt_components(resolve, reroll=True), {"role": "2"})
+        project.update_project_data("presentation", {"artwork_output": {"width": 1600, "height": 900}})
+        self.assertEqual(project.prompt_geometry(page_id)["aspect_ratio"], "16:9")
+        self.assertEqual(project.prompt_geometry(page_id)["text_area"], {"mode": "responsive_center"})
+        message = project.get_message(page_id)
+        message["layout"] = {"units": "normalized", "x": 0.1, "y": 0.2, "width": 0.3, "height": 0.6}
+        project.update_message(page_id, message)
+        self.assertEqual(project.prompt_geometry(page_id)["text_area"], message["layout"])
+        message["layout"]["width"] = 2
+        project.update_message(page_id, message)
+        with self.assertRaises(ProjectModelError):
+            project.prompt_geometry(page_id)
+
     def test_types_and_templates(self):
         self.assertEqual(tuple(PAGE_TYPES), CLASSIC_PAGE_TYPES)
         self.assertEqual([item.artwork_template for item in PAGE_TYPES.values()], ["cover", "letter", "wall", "back"])

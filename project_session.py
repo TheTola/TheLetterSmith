@@ -161,7 +161,7 @@ class ProjectSession:
         values = {key: _input_value(key, page.get(key)) for key in fields}
         if include_shared:
             payload = self.project.to_dict()
-            values['$shared'] = {key: payload.get(key, {}) for key in ('shared_settings', 'prompt_settings')}
+            values['$shared'] = {key: payload.get(key, {}) for key in ('shared_settings', 'prompt_settings', 'presentation')}
         return hashlib.sha256(json.dumps(values, ensure_ascii=False, sort_keys=True,
                                          separators=(',', ':')).encode('utf-8')).hexdigest()
 
