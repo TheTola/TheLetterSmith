@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import tempfile
 import traceback
 import weakref
 from collections import OrderedDict
@@ -374,6 +376,86 @@ def _forge_source_fingerprint(project_root: Path) -> str:
         return ""
 
 
+def _forge_project_context(project_root: Path) -> tuple:
+    """Capture ownership independently from the selected page or output path."""
+    from project_session import peek_project_session
+    session = peek_project_session(project_root)
+    if session is not None:
+        return session, session.session_id, session.project.project_id
+    return None, "", str(SettingsStore(project_root).get("project_id", ""))
+
+
+def _forge_context_is_current(project_root: Path, context: tuple | None) -> bool:
+    if context is None:  # Results from the legacy synchronous entry points.
+        return True
+    return (
+        _forge_project_context(project_root) == context
+        and (context[0] is None or not context[0].is_restoring)
+    )
+
+
+def _require_forge_context(project_root: Path, context: tuple | None) -> None:
+    if not _forge_context_is_current(project_root, context):
+        raise _ForgeOperationError(
+            "The project changed. The previous operation was not applied to this project."
+        )
+
+
+def _apply_forge_context(project_root: Path, context: tuple | None, operation: Callable[[], object]):
+    """Serialize a completed operation with canonical project replacement."""
+    _require_forge_context(project_root, context)
+    session = context[0] if context else None
+    if session is None:
+        return operation()
+    pages = session.project.pages
+    if not pages:
+        raise _ForgeOperationError("The project has no pages for this operation.")
+    target = session.capture_target(pages[0]["id"], fields=(), include_shared=False)
+    results = []
+    def apply(_model, _page_id):
+        _require_forge_context(project_root, context)
+        results.append(operation())
+    if not session.apply_result(target, apply):
+        raise _ForgeOperationError("The project changed before the operation could finish.")
+    return results[0]
+
+
+def _capture_forge_render(project_root: Path, *, output_mode: str):
+    from project_session import peek_project_session
+    session = peek_project_session(project_root)
+    if session is None:
+        return None
+    from forge_render import capture_render
+    return capture_render(session, output_mode=output_mode)
+
+
+def _require_display_revision(directory: Path, project_id: str, fingerprint: str) -> None:
+    from forge_render import DISPLAY_MANIFEST, validate_display_output
+
+    root = validate_display_output(directory)
+    manifest = json.loads((root / DISPLAY_MANIFEST).read_text(encoding="utf-8"))
+    if (manifest.get("project_id") != project_id
+            or manifest.get("source_fingerprint") != fingerprint
+            or manifest.get("output_mode") != "display"):
+        raise _ForgeOperationError("The prepared presentation changed. Prepare publishing again.")
+
+
+def _stage_publish_display(project_root: Path, play_dir: Path, render_input):
+    """Retain the exact public payload across authentication and later edits."""
+    from forge_render import copy_display_output
+
+    temporary_root = application_paths(project_root).temporary_root
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    temporary = tempfile.TemporaryDirectory(prefix="publish-", dir=temporary_root)
+    try:
+        payload = copy_display_output(play_dir, Path(temporary.name) / "display")
+        _require_display_revision(payload, render_input.project_id, render_input.source_fingerprint)
+    except Exception:
+        temporary.cleanup()
+        raise
+    return temporary
+
+
 def _publication_fields_from_result(publish_result: PublishResult) -> dict:
     publication = {
         PUBLISHED_PAGE_URL_KEY: normalize_published_page_url(
@@ -406,6 +488,22 @@ def _publication_fields_from_result(publish_result: PublishResult) -> dict:
     }
     publication[PROJECT_PUBLISHED_AT_KEY] = publication[PUBLISHED_AT_KEY]
     return publication
+
+
+def _record_verified_publication(project_root: Path, context: tuple | None, publication: dict) -> None:
+    """Persist confirmed transport success even if shutdown drops the UI callback."""
+    if publication_status(publication) != "published":
+        raise _ForgeOperationError("Publishing completed without a verified public page.")
+
+    def record():
+        session = context[0] if context else None
+        if session is not None:
+            if any(session.project.to_dict()["publication"].get(key) != value for key, value in publication.items()):
+                session.project.update_project_data("publication", publication)
+                session.save(sync_workspace=False)
+        SettingsStore(project_root).update_fields(publication)
+
+    _apply_forge_context(project_root, context, record)
 
 
 class _ForgeOperationError(RuntimeError):
@@ -1218,6 +1316,7 @@ class ForgeTab(QtWidgets.QWidget):
     _cover_decode_completed = QtCore.Signal(int, object, object)
     _catalog_reconcile_completed = QtCore.Signal(int, str, object, str)
     _github_state_changed = QtCore.Signal(object)
+    _project_session_changed = QtCore.Signal(object)
 
     def __init__(
         self,
@@ -1325,9 +1424,13 @@ class ForgeTab(QtWidgets.QWidget):
         self._project_fingerprint = _forge_source_fingerprint(self.project_root)
         self._source_revision = 0
         try:
+            from project_session import peek_project_session
+            canonical_preview = peek_project_session(self.project_root) is not None
             self._preview_refresh_pending = not generate.is_play_bundle_current(
                 self.project_root,
-                source_fingerprint=self._project_fingerprint or None,
+                **({"output_mode": "preview"} if canonical_preview else {
+                    "source_fingerprint": self._project_fingerprint or None,
+                }),
             )
         except Exception:
             _LOGGER.exception("Forge build currency could not be determined.")
@@ -1337,7 +1440,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._tab_active = False
         self._pending_scroll_position = (0, 0)
         self._pending_metadata_update: Optional[
-            tuple[Path, ReadinessResult, bool]
+            tuple[Path, ReadinessResult, bool, tuple | None]
         ] = None
 
         self.readiness_window = ReadinessWindow(self.project_root)
@@ -1411,6 +1514,13 @@ class ForgeTab(QtWidgets.QWidget):
         self._metadata_timer = QtCore.QTimer(self)
         self._metadata_timer.setSingleShot(True)
         self._metadata_timer.timeout.connect(self._run_pending_metadata_update)
+
+        from project_session import peek_project_session
+        self._render_session = peek_project_session(self.project_root)
+        self._project_session_changed.connect(self._on_project_session_changed)
+        self._render_session_listener = self._project_session_changed.emit
+        if self._render_session is not None:
+            self._render_session.add_listener(self._render_session_listener)
 
         self.refresh_project_state(refresh_source=False)
         QtCore.QTimer.singleShot(0, self._validate_github_account_async)
@@ -2776,6 +2886,19 @@ class ForgeTab(QtWidgets.QWidget):
             return
         self._refresh_timer.start()
 
+    @QtCore.Slot(object)
+    def _on_project_session_changed(self, event: object) -> None:
+        if self._shutdown or getattr(event, "kind", "") == "selection":
+            return
+        if getattr(event, "kind", "") == "project_replaced":
+            self._pending_metadata_update = None
+            self._pending_publish_context = None
+            self._last_play_dir = None
+            self._preview_refresh_pending = True
+            self.preview_files_release_requested.emit()
+        # A content notification marks currency; refreshing never restarts playback.
+        self.schedule_refresh()
+
     def refresh_project_state(self, *, refresh_source: bool = True) -> None:
         if refresh_source:
             self._refresh_source_fingerprint()
@@ -2844,6 +2967,17 @@ class ForgeTab(QtWidgets.QWidget):
 
     def _handle_readiness_correction(self, tab: str, target: str) -> None:
         self.dismiss_readiness()
+        from project_session import peek_project_session
+        session = peek_project_session(self.project_root)
+        if session is not None:
+            try:
+                page = session.project.get_page(target)
+            except KeyError:
+                pass
+            else:
+                session.select_page(page["id"])
+                # Adapt only at the existing shell boundary; ownership stays by ID.
+                target = page["recovery"].get("legacy_key", target) if tab == "images" else "message"
         self.correction_requested.emit(tab, target)
 
     def set_readiness_context_visible(self, visible: bool) -> None:
@@ -3045,6 +3179,14 @@ class ForgeTab(QtWidgets.QWidget):
             else "This letter is published and matches the current local version."
             if published
             else "Publish the finished letter and create its shareable link.",
+        )
+        preview_stale = bool(getattr(self, "_preview_refresh_pending", False) and getattr(self, "_last_play_dir", None))
+        self.preview_btn.setText("Update Preview" if preview_stale else "Preview Letter")
+        self.preview_btn.setAccessibleName(self.preview_btn.text())
+        set_control_help(
+            self.preview_btn,
+            "The available preview is an older revision. Update it to show the current project."
+            if preview_stale else "Build and open a local preview of the finished letter.",
         )
         self.preview_btn.set_action_state(
             broken=not protected and not readiness.can_preview,
@@ -4229,7 +4371,7 @@ class ForgeTab(QtWidgets.QWidget):
             item for item in readiness.missing_items if item.required
         ]
         if missing:
-            self._set_status(f"{missing[0].label} is required.", error=True)
+            self._set_status(f"{missing[0].label}: {missing[0].detail}", error=True)
         return None
 
     def _flush_prompt_writer_state(self) -> bool:
@@ -4257,7 +4399,7 @@ class ForgeTab(QtWidgets.QWidget):
         if not self.refresh_readiness().can_preview:
             self._preview_refresh_pending = True
             return
-        if self._busy:
+        if self._busy or self._publication_operation:
             self._preview_refresh_pending = True
             self._preview_refresh_requested = True
             return
@@ -4274,7 +4416,7 @@ class ForgeTab(QtWidgets.QWidget):
         *,
         open_in_browser: bool,
     ) -> None:
-        if self._busy:
+        if self._busy or self._publication_operation:
             return
         if not self.is_protected_project() and not self._flush_prompt_writer_state():
             return
@@ -4285,26 +4427,33 @@ class ForgeTab(QtWidgets.QWidget):
         ensure_output_dirs(self.project_root)
         message_path = self.project_root / MESSAGE_HTML_FILE
         try:
-            message = (
+            project_context = _forge_project_context(self.project_root)
+            render_input = _capture_forge_render(self.project_root, output_mode="preview")
+            message = None if render_input is not None else (
                 read_text_normalized(message_path)
                 if message_path.is_file()
                 else ""
             )
         except Exception:
-            _LOGGER.exception("Could not read the current message.")
-            self._set_status("Message content could not be read.", error=True)
+            _LOGGER.exception("Could not capture the current presentation.")
+            self._set_status("Presentation content could not be read.", error=True)
             return
 
+        self._refresh_source_fingerprint()
         source_revision = self._source_revision
         requested_fingerprint = self._project_fingerprint
 
-        def task() -> tuple[Path, bool, ReadinessResult, int, str, str]:
+        def task() -> tuple:
             try:
+                _require_forge_context(self.project_root, project_context)
                 play_dir, rebuilt = generate.ensure_play_bundle(
                     self.project_root,
                     message_html=message,
                     force=False,
                     source_fingerprint=requested_fingerprint or None,
+                    **({"render_input": render_input, "output_mode": "preview",
+                        "cancelled": lambda: QtCore.QThread.currentThread().isInterruptionRequested(),
+                        } if render_input is not None else {}),
                 )
             except generate.FontExportError as error:
                 raise _ForgeOperationError(str(error)) from error
@@ -4320,6 +4469,7 @@ class ForgeTab(QtWidgets.QWidget):
                 source_revision,
                 requested_fingerprint,
                 _forge_source_fingerprint(self.project_root),
+                project_context,
             )
 
         self._preview_refresh_pending = True
@@ -4342,11 +4492,16 @@ class ForgeTab(QtWidgets.QWidget):
     ) -> tuple[Path, Path]:
         values = tuple(result)
         play_dir, _rebuilt, readiness = values[:3]
+        project_context = values[6] if len(values) >= 7 else None
+        _require_forge_context(self.project_root, project_context)
         source_changed = False
         if len(values) >= 6:
             source_revision = int(values[3])
             requested_fingerprint = str(values[4])
-            completed_fingerprint = str(values[5])
+            completed_fingerprint = (
+                _forge_source_fingerprint(self.project_root)
+                if project_context is not None else str(values[5])
+            )
             self._project_fingerprint = completed_fingerprint
             source_changed = (
                 self._source_revision != source_revision
@@ -4368,6 +4523,7 @@ class ForgeTab(QtWidgets.QWidget):
                 Path(play_dir),
                 readiness,
                 record_activity,
+                project_context,
             )
             self._metadata_timer.start(0)
         return self._last_play_dir, index
@@ -4377,6 +4533,9 @@ class ForgeTab(QtWidgets.QWidget):
             result,
             record_activity=True,
         )
+        if self._preview_refresh_pending:
+            self._set_status("The draft changed while preparing the preview. Updating it again…")
+            return
         opened = index.is_file() and QtGui.QDesktopServices.openUrl(
             QUrl.fromLocalFile(str(index.resolve()))
         )
@@ -4393,6 +4552,9 @@ class ForgeTab(QtWidgets.QWidget):
             result,
             record_activity=False,
         )
+        if self._preview_refresh_pending:
+            self._set_status("The draft changed while preparing the preview. Updating it again…")
+            return
         if index.is_file():
             self._set_status("Preview updated.")
 
@@ -4400,7 +4562,9 @@ class ForgeTab(QtWidgets.QWidget):
         pending = self._pending_metadata_update
         self._pending_metadata_update = None
         if pending is not None:
-            play_dir, readiness, record_activity = pending
+            play_dir, readiness, record_activity = pending[:3]
+            if not _forge_context_is_current(self.project_root, pending[3] if len(pending) > 3 else None):
+                return
             self._update_metadata_silently(
                 play_dir,
                 readiness,
@@ -4438,26 +4602,33 @@ class ForgeTab(QtWidgets.QWidget):
 
         message_path = self.project_root / MESSAGE_HTML_FILE
         try:
-            message = (
+            project_context = _forge_project_context(self.project_root)
+            render_input = _capture_forge_render(self.project_root, output_mode="display")
+            message = None if render_input is not None else (
                 read_text_normalized(message_path)
                 if message_path.is_file()
                 else ""
             )
         except Exception:
-            _LOGGER.exception("Could not read the current message.")
-            self._set_status("Message content could not be read.", error=True)
+            _LOGGER.exception("Could not capture the current presentation.")
+            self._set_status("Presentation content could not be read.", error=True)
             return
 
+        self._refresh_source_fingerprint()
         source_revision = self._source_revision
-        requested_fingerprint = self._project_fingerprint
+        requested_fingerprint = render_input.source_fingerprint if render_input is not None else self._project_fingerprint
 
         def task() -> tuple:
             try:
+                _require_forge_context(self.project_root, project_context)
                 play_dir, _rebuilt = generate.ensure_play_bundle(
                     self.project_root,
                     message_html=message,
                     force=False,
                     source_fingerprint=requested_fingerprint or None,
+                    **({"render_input": render_input, "output_mode": "display",
+                        "cancelled": lambda: QtCore.QThread.currentThread().isInterruptionRequested(),
+                        } if render_input is not None else {}),
                 )
             except generate.FontExportError as error:
                 raise _ForgeOperationError(str(error)) from error
@@ -4467,25 +4638,39 @@ class ForgeTab(QtWidgets.QWidget):
                     "letter preview and try publishing again."
                 ) from error
             play_path = Path(play_dir).resolve()
-            metadata = update_saved_metadata(
-                play_path,
-                self.project_root,
-                readiness,
+            _require_forge_context(self.project_root, project_context)
+            metadata = _apply_forge_context(
+                self.project_root, project_context,
+                lambda: update_saved_metadata(play_path, self.project_root, readiness),
             )
             metadata["source_fingerprint"] = requested_fingerprint
+            if render_input is not None:
+                metadata.update(dict(render_input.snapshot["publication"]))
+                metadata["project_id"] = render_input.project_id
+                metadata["source_fingerprint"] = render_input.source_fingerprint
+                for key in ("recipient_name", "recipient_title"):
+                    if key in render_input.snapshot["metadata"]:
+                        metadata[key] = render_input.snapshot["metadata"][key]
             record_saved_letter_activity(play_path)
             snapshot = self._publication_connection_snapshot()
             session = snapshot.session
             access = snapshot.access
+            completed_fingerprint = _forge_source_fingerprint(self.project_root)
+            prepared_output = (
+                _stage_publish_display(self.project_root, play_path, render_input)
+                if render_input is not None else None
+            )
             return (
                 play_path,
                 readiness,
                 metadata,
                 source_revision,
                 requested_fingerprint,
-                _forge_source_fingerprint(self.project_root),
+                completed_fingerprint,
                 session,
                 access,
+                project_context,
+                prepared_output,
             )
 
         self.preview_files_release_requested.emit()
@@ -4503,8 +4688,11 @@ class ForgeTab(QtWidgets.QWidget):
 
     def _publish_prepared(self, result: object) -> None:
         values = tuple(result)
-        if len(values) != 8:
+        if len(values) not in (8, 9, 10):
             raise TypeError("The prepared publication result is invalid.")
+        project_context = values[8] if len(values) >= 9 else None
+        prepared_output = values[9] if len(values) >= 10 else None
+        _require_forge_context(self.project_root, project_context)
         (
             play_dir,
             readiness,
@@ -4514,9 +4702,11 @@ class ForgeTab(QtWidgets.QWidget):
             completed_fingerprint,
             session,
             access,
-        ) = values
+        ) = values[:8]
         self._last_play_dir = Path(play_dir)
         self._record_active_play_dir(self._last_play_dir)
+        if project_context is not None:
+            completed_fingerprint = _forge_source_fingerprint(self.project_root)
         self._project_fingerprint = str(completed_fingerprint)
         source_changed = (
             self._source_revision != int(source_revision)
@@ -4535,6 +4725,8 @@ class ForgeTab(QtWidgets.QWidget):
             int(source_revision),
             str(requested_fingerprint),
             str(completed_fingerprint),
+            project_context,
+            prepared_output,
         )
         self._pending_publish_retry_attempt = 0
         if not isinstance(session, GitHubSession):
@@ -4596,9 +4788,16 @@ class ForgeTab(QtWidgets.QWidget):
             source_revision,
             requested_fingerprint,
             _prepared_fingerprint,
-        ) = context
+        ) = context[:6]
+        project_context = context[6] if len(context) > 6 else None
+        prepared_output = context[7] if len(context) > 7 else None
+        if not _forge_context_is_current(self.project_root, project_context):
+            self._abort_publication_activity("publish")
+            self._set_status("The project changed. Start publishing again from the current project.", error=True)
+            return
 
         def task() -> tuple:
+            _require_forge_context(self.project_root, project_context)
             api = self._github_service.authorized_api(session)
             connection_snapshot = self._github_service.snapshot
             effective_session = connection_snapshot.session or session
@@ -4610,19 +4809,36 @@ class ForgeTab(QtWidgets.QWidget):
                 connection_generation=connection_snapshot.generation,
                 cancelled=lambda: (
                     QtCore.QThread.currentThread().isInterruptionRequested()
+                    or not _forge_context_is_current(self.project_root, project_context)
                 ),
+                persist_publication=False,
             )
-            publish_result = publisher.publish(Path(play_dir), dict(metadata))
+            if project_context is not None and project_context[0] is not None:
+                if prepared_output is None:
+                    raise _ForgeOperationError("Prepare the current presentation before publishing.")
+                payload = Path(prepared_output.name) / "display"
+                _require_display_revision(payload, project_context[2], requested_fingerprint)
+                _require_forge_context(self.project_root, project_context)
+                publish_result = publisher.publish(payload, dict(metadata))
+            else:
+                publish_result = publisher.publish(Path(play_dir), dict(metadata))
             snapshot_path = None
             snapshot_failed = False
-            if getattr(publish_result, "success", False):
+            if getattr(publish_result, "success", False) and _forge_context_is_current(self.project_root, project_context):
                 publication = _publication_fields_from_result(publish_result)
                 if publication_status(publication) == "published":
+                    _record_verified_publication(self.project_root, project_context, publication)
                     try:
-                        snapshot_path = save_published_snapshot(
-                            play_dir,
-                            self.project_root,
-                            publication,
+                        def save_matching_snapshot():
+                            if project_context is not None and project_context[0] is not None:
+                                _require_display_revision(Path(play_dir), project_context[2], requested_fingerprint)
+                                if _forge_source_fingerprint(self.project_root) != requested_fingerprint:
+                                    raise _ForgeOperationError("The current draft differs from the published presentation.")
+                            return save_published_snapshot(play_dir, self.project_root, publication)
+
+                        snapshot_path = _apply_forge_context(
+                            self.project_root, project_context,
+                            save_matching_snapshot,
                         )
                     except Exception:
                         _LOGGER.exception(
@@ -4639,6 +4855,7 @@ class ForgeTab(QtWidgets.QWidget):
                 _forge_source_fingerprint(self.project_root),
                 snapshot_path,
                 snapshot_failed,
+                project_context,
             )
 
         self._update_publication_activity(
@@ -4654,6 +4871,12 @@ class ForgeTab(QtWidgets.QWidget):
 
     def _publish_completed(self, result: object) -> None:
         values = tuple(result)
+        project_context = values[9] if len(values) >= 10 else None
+        if not _forge_context_is_current(self.project_root, project_context):
+            self._pending_publish_context = None
+            self._finish_publication_activity("publish")
+            self._set_status("The publication result belongs to a previous project. This project's publication details were preserved.", error=True)
+            return
         play_dir, readiness, metadata, publish_result = values[:4]
         snapshot_path = Path(values[7]) if len(values) >= 9 and values[7] else None
         snapshot_failed = bool(values[8]) if len(values) >= 9 else False
@@ -4661,7 +4884,10 @@ class ForgeTab(QtWidgets.QWidget):
         if len(values) >= 7:
             source_revision = int(values[4])
             requested_fingerprint = str(values[5])
-            completed_fingerprint = str(values[6])
+            completed_fingerprint = (
+                _forge_source_fingerprint(self.project_root)
+                if project_context is not None else str(values[6])
+            )
             self._project_fingerprint = completed_fingerprint
             source_changed = (
                 self._source_revision != source_revision
@@ -4711,7 +4937,7 @@ class ForgeTab(QtWidgets.QWidget):
             )
             self._finish_publication_activity("publish")
             return
-        self.settings.update_fields(publication)
+        _record_verified_publication(self.project_root, project_context, publication)
         self.published_url_changed.emit(url)
         self.refresh_project_state()
         try:
@@ -5301,8 +5527,9 @@ class ForgeTab(QtWidgets.QWidget):
         if thread is not None:
             thread.deleteLater()
         refresh_requested = self._preview_refresh_requested
-        self._preview_refresh_requested = False
-        if refresh_requested and self._tab_active:
+        publication_active = bool(getattr(self, "_publication_operation", ""))
+        self._preview_refresh_requested = refresh_requested and publication_active
+        if refresh_requested and self._tab_active and not publication_active:
             QtCore.QTimer.singleShot(0, self.ensure_preview_current)
 
     def _set_busy(self, busy: bool) -> None:
@@ -5457,6 +5684,9 @@ class ForgeTab(QtWidgets.QWidget):
                 _LOGGER.exception("Pending Forge metadata could not be finalized.")
 
         self._shutdown = True
+        render_session = getattr(self, "_render_session", None)
+        if render_session is not None:
+            render_session.remove_listener(self._render_session_listener)
         github_service = getattr(self, "_github_service", None)
         github_listener = getattr(self, "_github_state_listener", None)
         if github_service is not None and github_listener is not None:

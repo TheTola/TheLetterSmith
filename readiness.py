@@ -35,6 +35,7 @@ class ReadinessItem:
     detail: str
     correction_tab: str
     correction_target: str
+    preview_required: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -49,17 +50,21 @@ class ReadinessResult:
 
     @property
     def can_preview(self) -> bool:
-        return all(item.ready for item in self.items if item.required)
+        return all(
+            item.ready
+            for item in self.items
+            if (item.required if item.preview_required is None else item.preview_required)
+        )
 
     @property
     def can_publish(self) -> bool:
-        return self.can_preview
+        return all(item.ready for item in self.items if item.required)
 
 
 def music_is_required(settings: Mapping[str, object]) -> bool:
     """Return the canonical music-readiness requirement for a settings snapshot."""
     required_features = settings.get(REQUIRED_FEATURES_KEY, {})
-    if isinstance(required_features, dict):
+    if isinstance(required_features, Mapping):
         return bool(
             required_features.get(
                 "music",
@@ -203,6 +208,111 @@ def evaluate_project_save_eligibility(
     )
 
 
+def _readiness_result(items: tuple[ReadinessItem, ...]) -> ReadinessResult:
+    completed = sum(item.ready for item in items)
+    percentage = round((completed / len(items)) * 100) if items else 100
+    result = ReadinessResult(items, percentage, "")
+    optional_missing = {
+        item.key for item in items if not item.ready and not item.required
+    }
+    if not result.can_publish:
+        status = "Preview Only — Review Required" if result.can_preview else "Not Ready"
+    elif not optional_missing:
+        status = "Ready"
+    elif optional_missing == {"music"}:
+        status = "Ready — Missing Music"
+    else:
+        status = "Ready — Missing Optional Features"
+    return ReadinessResult(items, percentage, status)
+
+
+def _canonical_readiness(root: Path, session, settings: dict) -> ReadinessResult:
+    from forge_render import capture_render, render_has_music, validate_render
+    from project_model import PAGE_TYPES
+
+    if session.is_restoring:
+        return _readiness_result((ReadinessItem(
+            "project_restoring", "Project", False, True,
+            "Wait for the project to finish opening.", "forge", "pages",
+        ),))
+    render = capture_render(session, output_mode="preview")
+    snapshot = render.snapshot
+    # Canonical authored values override compatibility settings. The application
+    # store still supplies preferences which are deliberately not project data.
+    settings = {
+        **settings,
+        **snapshot["shared_settings"],
+        **snapshot["metadata"],
+        **snapshot["publication"],
+        "project_id": snapshot["project_id"],
+    }
+    title_ready, title_detail = _title_readiness(root, settings)
+    items = [
+        ReadinessItem(
+            "recipient", "Recipient",
+            bool(str(settings.get("recipient_name", "")).strip()), True,
+            "Add the recipient in Message.", "message", "recipient",
+        ),
+        ReadinessItem(
+            "title", "Letter Title", title_ready, True, title_detail,
+            "message", "title",
+        ),
+    ]
+    issues = list(validate_render(render))
+    remaining = list(issues)
+    for position, page in enumerate(snapshot["pages"], 1):
+        page_id = page["id"]
+        name = page["name"].strip() or PAGE_TYPES[page["type"]].label
+        label = f"Page {position} — {name}"
+        features = [("images", "artwork", "Artwork", "images")]
+        if PAGE_TYPES[page["type"]].supports_message:
+            features.append(("messages", "message", "Message", "message"))
+        for feature, key, field_label, tab in features:
+            problems = [issue for issue in remaining
+                        if issue.page_id == page_id and issue.feature == feature]
+            remaining = [issue for issue in remaining if issue not in problems]
+            items.append(ReadinessItem(
+                f"page:{page_id}:{key}", f"{label}: {field_label}",
+                not problems,
+                any(issue.blocks_output for issue in problems) if problems else True,
+                " ".join(issue.message for issue in problems)
+                if problems else f"{field_label} is ready.",
+                tab, page_id,
+                any(issue.blocks_preview for issue in problems) if problems else True,
+            ))
+    sound_issues = [issue for issue in remaining if issue.feature == "sound"]
+    remaining = [issue for issue in remaining if issue not in sound_issues]
+    music_required = music_is_required(settings)
+    items.append(ReadinessItem(
+        "music", "Music", render_has_music(render) and not sound_issues,
+        music_required or any(issue.blocks_output for issue in sound_issues),
+        " ".join(issue.message for issue in sound_issues) or "Choose music in Sound.",
+        "sound", "music",
+        music_required or any(issue.blocks_preview for issue in sound_issues),
+    ))
+    pages = {page["id"]: (position, page)
+             for position, page in enumerate(snapshot["pages"], 1)}
+    for index, issue in enumerate(remaining):
+        label = "Presentation"
+        if issue.page_id in pages:
+            position, page = pages[issue.page_id]
+            name = page["name"].strip() or PAGE_TYPES[page["type"]].label
+            label = f"Page {position} — {name}"
+        items.append(ReadinessItem(
+            f"render:{issue.page_id or 'project'}:{issue.code}:{index}",
+            label, False, issue.blocks_output, issue.message,
+            "message" if issue.feature == "messages" else issue.feature,
+            issue.page_id or "pages", issue.blocks_preview,
+        ))
+    items.append(ReadinessItem(
+        "published_url", "Published Letter Link",
+        publication_status(settings) == "published", False,
+        "Enter a valid Published Page URL in Message or publish the letter in Forge.",
+        "forge", "publish",
+    ))
+    return _readiness_result(tuple(items))
+
+
 def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
     root = Path(project_root).resolve()
     from project_consumers import session_for
@@ -212,6 +322,8 @@ def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
     settings = SettingsStore(root).snapshot()
     if is_protected_project(settings):
         return ReadinessResult((), 0, "")
+    if session is not None:
+        return _canonical_readiness(root, session, settings)
     pages = root / USER_PAGES_DIR
     music_required = music_is_required(settings)
     has_music = _sound_is_complete(root)
@@ -277,23 +389,4 @@ def evaluate_readiness(project_root: str | Path) -> ReadinessResult:
         ),
     )
     items = tuple(ReadinessItem(*definition) for definition in definitions)
-    from project_consumers import consumer_issue
-    compatibility_issue = consumer_issue(root, "output")
-    if compatibility_issue:
-        items += (ReadinessItem("page_foundation", "Page-aware output", False, True,
-                               compatibility_issue, "forge", "pages"),)
-    completed = sum(item.ready for item in items)
-    percentage = round((completed / len(items)) * 100)
-    required_missing = any(not item.ready and item.required for item in items)
-    optional_missing = {
-        item.key for item in items if not item.ready and not item.required
-    }
-    if required_missing:
-        status = "Not Ready"
-    elif not optional_missing:
-        status = "Ready"
-    elif optional_missing == {"music"}:
-        status = "Ready \u2014 Missing Music"
-    else:
-        status = "Ready \u2014 Missing Optional Features"
-    return ReadinessResult(items, percentage, status)
+    return _readiness_result(items)

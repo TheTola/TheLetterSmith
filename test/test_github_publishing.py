@@ -1135,6 +1135,28 @@ class GitHubPublishingTests(unittest.TestCase):
                 any("content" in entry for entry in api.last_tree_updates)
             )
 
+    def test_forge_can_defer_publication_metadata_until_ownership_is_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = self._build(root)
+            project_id = str(uuid.uuid4())
+            api = _PublishingAPI(project_id)
+            settings = SettingsStore(root)
+            before = settings.snapshot()
+            publisher = GitHubPagesPublisher(
+                root, self.session, configuration=self.configuration,
+                api=api, public_fetcher=api.public_fetch,
+                persist_publication=False,
+            )
+            result = publisher.publish(build, {
+                "project_id": project_id, "recipient_title": "Synthetic display",
+                "source_fingerprint": "captured-revision",
+            })
+            self.assertTrue(result.success, result.message)
+            self.assertEqual(result.source_fingerprint, "captured-revision")
+            self.assertEqual(settings.snapshot(), before)
+            self.assertIn("synthetic-display/index.html", api.remote_files)
+
     def test_republish_keeps_path_replaces_files_and_removes_stale_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

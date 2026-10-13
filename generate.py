@@ -605,10 +605,18 @@ def play_bundle_directory(project_root: str | Path) -> Path:
     root = Path(project_root).resolve()
     settings_store = SettingsStore(root)
     settings = settings_store.snapshot()
+    from project_session import peek_project_session
+    session = peek_project_session(root)
+    project_id = session.project.project_id if session is not None else ensure_project_identity(root)
+    if session is not None:
+        snapshot = session.snapshot()
+        for field in ("shared_settings", "presentation", "metadata"):
+            settings.update({key: value for key, value in snapshot.get(field, {}).items()
+                             if key in _FINGERPRINT_SETTING_KEYS})
     if is_protected_project(settings):
         return demo_preview_directory(
             root,
-            ensure_project_identity(root),
+            project_id,
         )
     recipient = _recipient_from_settings(settings)
     title = _title_from_settings(settings, recipient)
@@ -617,7 +625,7 @@ def play_bundle_directory(project_root: str | Path) -> Path:
         root,
         recipient=recipient,
         title=title,
-        project_id=ensure_project_identity(root),
+        project_id=project_id,
         active_play_dir=active_value,
     )
     if (
@@ -715,9 +723,14 @@ def _hash_file(digest: "hashlib._Hash", root: Path, path: Path) -> None:
 
 
 @performance_timed("forge.source_fingerprint")
-def build_source_fingerprint(project_root: str | Path) -> str:
+def build_source_fingerprint(project_root: str | Path, *, output_mode: str = "display") -> str:
     """Hash only inputs that materially change the generated viewer."""
     root = Path(project_root).resolve()
+    from project_session import peek_project_session
+    session = peek_project_session(root)
+    if session is not None:
+        from forge_render import capture_render
+        return capture_render(session, output_mode).source_fingerprint
     paths = application_paths(root)
     digest = hashlib.sha256()
     digest.update(b"lettersmith-source-fingerprint-v2\0")
@@ -843,6 +856,9 @@ def _validate_runtime_asset_reference(
 def validate_play_bundle(directory: str | Path) -> Path:
     """Validate the complete static viewer contract before it becomes live."""
     root = Path(directory).resolve()
+    from forge_render import DISPLAY_MANIFEST, validate_display_output
+    if (root / DISPLAY_MANIFEST).is_file():
+        return validate_display_output(root)
     required = (
         root / "index.html",
         root / "styles.css",
@@ -975,6 +991,7 @@ def is_play_bundle_current(
     project_root: str | Path,
     *,
     source_fingerprint: Optional[str] = None,
+    output_mode: str = "display",
 ) -> bool:
     root = Path(project_root).resolve()
     build = play_bundle_directory(root)
@@ -982,7 +999,7 @@ def is_play_bundle_current(
         validate_play_bundle(build)
         state = json.loads((build / BUILD_STATE_FILE).read_text(encoding="utf-8"))
         fingerprint = (
-            build_source_fingerprint(root)
+            build_source_fingerprint(root, output_mode=output_mode)
             if source_fingerprint is None
             else source_fingerprint
         )
@@ -1003,9 +1020,20 @@ def build_play_bundle_to(
     source_fingerprint: Optional[str] = None,
     validate_output: bool = True,
     reuse_play_directory: str | Path | None = None,
+    render_input=None,
+    output_mode: str = "display",
+    cancelled=None,
 ) -> Path:
     """Generate and validate a complete Play bundle in ``destination``."""
     pr = Path(project_root).resolve()
+    from project_session import peek_project_session
+    session = peek_project_session(pr)
+    if session is not None and (message_html is None or render_input is not None):
+        from forge_render import build_render_to, capture_render, render_is_current, StaleRenderError
+        render = render_input or capture_render(session, output_mode)
+        if not render_is_current(session, render):
+            raise StaleRenderError("The captured project changed before rendering.")
+        return build_render_to(render, destination, seed_sfx=seed_sfx, reuse_play_directory=reuse_play_directory, cancelled=cancelled)
     from project_consumers import prepare_consumer
     prepare_consumer(pr, "output")
     paths = application_paths(pr)
@@ -1300,9 +1328,20 @@ def generate_play_bundle(
     open_in_browser: bool = False,
     seed_sfx: bool = True,
     source_fingerprint: Optional[str] = None,
+    render_input=None,
+    output_mode: str = "display",
+    cancelled=None,
 ) -> Path:
     """Transactionally replace the active recipient/title Play bundle."""
     pr = Path(project_root).resolve()
+    from project_session import peek_project_session
+    session = peek_project_session(pr)
+    if session is not None and (message_html is None or render_input is not None):
+        from forge_render import generate_render
+        result = generate_render(session, render_input=render_input, output_mode=output_mode, seed_sfx=seed_sfx, cancelled=cancelled)
+        if open_in_browser:
+            webbrowser.open((result / "index.html").as_uri())
+        return result
     from project_consumers import prepare_consumer
     prepare_consumer(pr, "output")
     ensure_output_dirs(pr)
@@ -1392,9 +1431,25 @@ def ensure_play_bundle(
     seed_sfx: bool = True,
     force: bool = False,
     source_fingerprint: Optional[str] = None,
+    render_input=None,
+    output_mode: str = "display",
+    cancelled=None,
 ) -> tuple[Path, bool]:
     """Return a validated build, rebuilding only when its inputs are stale."""
     root = Path(project_root).resolve()
+    from project_session import peek_project_session
+    session = peek_project_session(root)
+    if session is not None and (message_html is None or render_input is not None):
+        from forge_render import capture_render, generate_render, render_is_current, StaleRenderError
+        render = render_input or capture_render(session, output_mode)
+        if cancelled is not None and cancelled():
+            raise StaleRenderError("Preview update was cancelled.")
+        if not render_is_current(session, render):
+            raise StaleRenderError("The captured project changed before rendering.")
+        build = play_bundle_directory(root)
+        if not force and is_play_bundle_current(root, source_fingerprint=render.source_fingerprint):
+            return build, False
+        return generate_render(session, render_input=render, seed_sfx=seed_sfx, cancelled=cancelled), True
     from project_consumers import prepare_consumer
     prepare_consumer(root, "output")
     build = play_bundle_directory(root)
