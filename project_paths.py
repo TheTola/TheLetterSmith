@@ -76,6 +76,7 @@ class ApplicationPaths:
     project_sound_state_file: Path
     current_sound_manifest_file: Path
     settings_file: Path
+    profile_root: Path | None = None
 
     @classmethod
     def for_project(cls, project_root: str | Path) -> "ApplicationPaths":
@@ -124,6 +125,8 @@ class ApplicationPaths:
             frozen_root = getattr(sys, "_MEIPASS", None)
             resource_root = frozen_root or Path(__file__).resolve().parent
         resources = _resolved(resource_root)
+        profile_value = str(environment.get("LETTER_SMITH_PROFILE_ROOT", "")).strip()
+        profile = _resolved(profile_value) if profile_value else None
         home_root = _resolved(
             home
             or environment.get(
@@ -165,6 +168,15 @@ class ApplicationPaths:
             or environment.get("LETTER_SMITH_TEMP_ROOT")
             or (cache / "temp")
         )
+        if profile is not None:
+            # One override isolates every writable runtime path, including saved
+            # letters and reusable libraries. Resources remain read-only inputs.
+            app_data = profile / "app"
+            cache = profile / "cache"
+            documents = profile / "documents"
+            workspace = app_data / "Active Project"
+            sound_workspace = workspace / "gallery" / "user" / "sounds" / "appssong"
+            temporary = cache / "temp"
         return cls(
             resource_root=resources,
             workspace_root=workspace,
@@ -188,6 +200,7 @@ class ApplicationPaths:
             project_sound_state_file=sound_workspace / "project_sound.json",
             current_sound_manifest_file=sound_workspace / "current.json",
             settings_file=app_data / "settings" / "settings.json",
+            profile_root=profile,
         )
 
     @property
@@ -314,6 +327,19 @@ class ApplicationPaths:
         """Create writable roots and copy legacy data without overwriting it."""
         self.ensure_writable_roots()
         self.enforce_internal_visibility()
+        if self.profile_root is not None:
+            # Development profiles must never import private source-tree state
+            # or the normal user's active project on first launch.
+            source = self.app_resource_path("controls")
+            destination = self.workspace_root / "gallery/user/card/controls"
+            if source.is_dir():
+                for item in source.rglob("*"):
+                    if item.is_file() and not item.is_symlink():
+                        target = destination / item.relative_to(source)
+                        if not target.exists():
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(item, target)
+            return
         if legacy_root is None or self.workspace_root == self.resource_root:
             _LOGGER.debug("Writable application storage is ready: %s", self.app_data_root)
             return

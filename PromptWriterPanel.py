@@ -1636,6 +1636,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._image_tab = None
         self._approved_pages: set[str] = set()
         self._pending_approval_key = ""
+        self._browser_targets = {}
         self._colors_path_used: Optional[Path] = None
         self._last_focused_widget: Optional[QtWidgets.QTextEdit] = None
         self._list_manager_dialogs: Dict[str, ListManagerDialog] = {}
@@ -2038,6 +2039,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
         """
         try:
             self._persist_timer.stop()
+            if self.page_controller.compatibility_error:
+                return False
             if self._state_write_blocked:
                 LOGGER.error(
                     "Prompt Writer state was written by a newer version and "
@@ -2078,7 +2081,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 ),
             )
             generated_text = generated_value if isinstance(generated_value, str) else ""
-            if page in self._page_specs and generated_text.strip():
+            if generated_text:
                 generated_prompts[page.key] = generated_text
 
         resolved_raw = state.get("resolved_instructions", {})
@@ -2110,6 +2113,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "checks": _normalize_exclusive_check_states(checks_raw),
             "resolved_instructions": resolved_instructions,
             "generated_prompts": generated_prompts,
+            "generated_output_stale": bool(state.get("generated_output_stale", False)),
             "approved_images": approved_images,
             "generated_input_signature": _normalize_text(
                 state.get("generated_input_signature", ""),
@@ -2244,8 +2248,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "generated_prompts": {
                 image_name: prompt
                 for image_name, prompt in self._generated_prompts.items()
-                if self._generated_output_valid and prompt.strip()
+                if isinstance(prompt, str)
             },
+            "generated_output_stale": not self._generated_output_valid,
             "generated_input_signature": (
                 self._generated_input_signature
                 if self._generated_output_valid
@@ -2257,6 +2262,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def reload_project_state(self) -> bool:
         """Replace the live workspace with the active project's saved state."""
         self.page_controller.reload()
+        if self._browser is not None:
+            self._browser.set_approval_target("", "")
+        self._browser_targets.clear()
         widgets: List[QtCore.QObject] = [
             self.cmb_subject,
             self.cmb_type,
@@ -2274,6 +2282,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._persist_timer.stop()
         self._state_persistence_suspended = True
         try:
+            self._invalidate_generated_output(discard=True)
             return self._restore_persisted_state()
         finally:
             for blocker in blockers:
@@ -2333,9 +2342,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     _backup_invalid_prompt_writer_state(self._state_path)
                     state = None
 
-            state = self._normalize_persisted_state(state)
-            if not state:
-                return True
+            state = self._normalize_persisted_state(state or empty_prompt_writer_state())
             self._approved_pages = set(state.get("approved_images", []))
 
             # Selects
@@ -2382,7 +2389,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             try:
                 generated_prompts = dict(state.get("generated_prompts", {}))
                 if generated_prompts:
-                    self._validate_generated_prompt_set(generated_prompts)
                     self._generated_prompts = generated_prompts
                     self._resolved_instructions = dict(
                         state.get("resolved_instructions", {})
@@ -2395,7 +2401,13 @@ class PromptWriterPanel(QtWidgets.QWidget):
                         txt = self._generated_prompts.get(page.key, "")
                         if page.preview_widget is not None and txt.strip():
                             self._set_colored_saved_preview(page, txt)
-                    self._set_generated_output_valid(True)
+                    self._set_generated_output_valid(
+                        not state.get("generated_output_stale", False)
+                    )
+                    # Validation controls whether these snapshots can be used;
+                    # it must never delete an authored or historical prompt.
+                    if self._generated_output_valid:
+                        self._validate_generated_prompt_set(generated_prompts)
                 else:
                     self._invalidate_generated_output()
             except (RuntimeError, TypeError, ValueError, UnicodeError) as error:
@@ -3291,6 +3303,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._sync_action_button_states()
 
     def _on_browser_image_started(self, page_key: str) -> None:
+        from project_consumers import page_id_for_key, session_for
+        session = session_for(self.project_root)
+        page_id = page_id_for_key(self.project_root, page_key)
+        if session is not None and page_id is not None:
+            self._browser_targets[page_key] = session.capture_target(page_id)
         self._site_status.setText(f"Saving the selected {page_key} image...")
         self._site_status.setVisible(True)
 
@@ -3299,6 +3316,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._site_status.setVisible(True)
 
     def _on_browser_image_ready(self, page_key: str, path: str) -> None:
+        from project_consumers import session_for
+        session = session_for(self.project_root)
+        target = self._browser_targets.pop(page_key, None)
+        if session is not None and (target is None or not session.target_is_current(target)):
+            self._on_browser_image_failed("The original page changed or its project was replaced. Choose the image again for its intended page.")
+            return
         if self._image_tab is None or self._pending_approval_key:
             self._on_browser_image_failed("Finish the current image before choosing another.")
             return
@@ -3422,13 +3445,15 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     not busy and not self._site_request_in_progress
                 )
 
-    def _invalidate_generated_output(self) -> None:
-        self._generated_prompts = {}
-        self._resolved_instructions = {}
+    def _invalidate_generated_output(self, *, discard: bool = False) -> None:
+        if discard:
+            self._generated_prompts = {}
+            self._resolved_instructions = {}
         self._generated_input_signature = ""
-        for page in self._page_specs:
-            if page.preview_widget is not None:
-                page.preview_widget.clear()
+        if discard:
+            for page in self._all_page_specs.values():
+                if page.preview_widget is not None:
+                    page.preview_widget.clear()
         self._set_generated_output_valid(False)
 
     def _on_prompt_input_changed(self, *_args: object) -> None:
@@ -3792,6 +3817,14 @@ class PromptWriterPanel(QtWidgets.QWidget):
             blocker.unblock()
 
     def _on_generate(self):
+        if self.page_controller.compatibility_error:
+            show_lettersmith_message(self, "Prompt Writer", self.page_controller.compatibility_error)
+            return
+        from project_consumers import consumer_issue
+        issue = consumer_issue(self.project_root, "prompt_generation")
+        if issue:
+            show_lettersmith_message(self, "Prompt Writer", issue)
+            return
         if self._generation_in_progress:
             return
         subject = self.cmb_subject.currentText().strip()
@@ -4001,7 +4034,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             for page in self._all_page_specs.values():
                 if page.detail_widget is not None:
                     page.detail_widget.clear()
-            self._invalidate_generated_output()
+            self._invalidate_generated_output(discard=True)
             self._approved_pages.clear()
             self._refresh_approved_previews()
             for dialog in tuple(self._list_manager_dialogs.values()):

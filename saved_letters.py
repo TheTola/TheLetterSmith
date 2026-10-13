@@ -9,7 +9,9 @@ import os
 import re
 import shutil
 import stat
+import tempfile
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from html import unescape
@@ -623,7 +625,18 @@ def _saved_prompt_writer_state(
     )
     if state_path is not None:
         return _read_json_object(state_path, label="saved Prompt Writer state")
+    if not is_current_save_schema(metadata):
+        return {}
     raise SavedLetterRestoreError("The saved Prompt Writer state is missing.")
+
+
+def _legacy_saved_page_files(pages: Path) -> tuple[str, ...]:
+    """Actual classic slots, including the historically optional Wall."""
+    from page_layout import LAYOUT_FILE
+    if (pages / LAYOUT_FILE).exists():
+        return page_files(pages)
+    return tuple(name for key in ("cover", "letter", "wall", "back")
+                 for name in (f"{key}.png", f"{key}.gif") if (pages / name).is_file())
 
 
 def _runtime_directory(
@@ -1268,7 +1281,7 @@ class SavedLetterCatalog:
                 not (pages / name).is_symlink()
                 and (pages / name).is_file()
                 and _readable_file(pages / name)
-                for name in page_files(pages)
+                for name in _legacy_saved_page_files(pages)
             )
             and all(
                 not (controls / name).is_symlink()
@@ -1400,7 +1413,227 @@ class SavedLetterRestorer:
             application_paths(self.project_root).examples_root.resolve(),
         )
 
+    def restore_canonical(self, loaded, *, entry: SavedLetter | None = None, _recover_committed: bool = False):
+        from contextlib import nullcontext
+        from project_repository import activation_lock, active_project_repository, begin_activation, finish_activation, _writer_lock
+        from project_session import get_project_session
+        session = get_project_session(self.project_root)
+        repository = active_project_repository(self.project_root)
+        commit_lock = _writer_lock(repository.directory) if _recover_committed else nullcontext()
+        with session.restoring(), activation_lock(self.project_root), commit_lock:
+            if _recover_committed:
+                loaded = active_project_repository(self.project_root).load()
+            begin_activation(self.project_root, expected_revision=loaded.revision if _recover_committed else session.storage_revision)
+            stored = self._restore_canonical(loaded, entry=entry, preserve_commit=_recover_committed)
+            finish_activation(self.project_root)
+            return stored
+
+    def _restore_canonical(self, loaded, *, entry: SavedLetter | None = None, preserve_commit: bool = False):
+        """Restore a validated canonical draft and all current consumer views.
+
+        The source generation is immutable. Compatibility trees, settings, and
+        sound use the existing rollback mechanisms; the canonical pointer is
+        committed only after those preparations succeed.
+        """
+        from project_consumers import project_legacy_views
+        from project_model import ProjectModel
+        from project_repository import active_project_repository, legacy_workspace_payload, _safe_file
+        from project_session import ProjectSession, get_project_session
+        from settings_store import DEFAULT_SETTINGS
+        from transactional_io import atomic_copy_file
+        session = get_project_session(self.project_root)
+        settings_before = self.settings.snapshot()
+        payload = loaded.project.to_dict()
+        if entry is not None and (entry.example or entry.stock):
+            payload["project_id"] = str(uuid.uuid4())
+        restored = dict(settings_before)
+        for key in (*RESTORABLE_SETTING_KEYS, *PUBLICATION_METADATA_KEYS,
+                    PROJECT_CREATED_AT_KEY, "recipient_name", "recipient_title", "recipient_id",
+                    "recipient_display_name", "recipient_normalized_key", ACTIVE_PLAY_DIR_KEY,
+                    PROTECTED_PROJECT_KIND_KEY, PROTECTED_PROJECT_MASTER_PATH_KEY):
+            restored[key] = DEFAULT_SETTINGS.get(key, "")
+        for area in ("shared_settings", "presentation", "publication", "metadata"):
+            for key, value in payload[area].items():
+                if key in (*RESTORABLE_SETTING_KEYS, *PUBLICATION_METADATA_KEYS,
+                           PROJECT_CREATED_AT_KEY, "recipient_name", "recipient_title"):
+                    restored[key] = value
+        restored["project_id"] = payload["project_id"]
+        restored[PROJECT_SCHEMA_KEY] = PROJECT_METADATA_SCHEMA_VERSION
+        if entry is not None:
+            if entry.example or entry.stock:
+                restored[PROTECTED_PROJECT_KIND_KEY] = STOCK_PROJECT_KIND if entry.stock else EXAMPLE_PROJECT_KIND
+                restored[PROTECTED_PROJECT_MASTER_PATH_KEY] = str(entry.path.resolve())
+            elif entry.path.resolve().is_relative_to(canonical_play_root(self.project_root)):
+                restored[ACTIVE_PLAY_DIR_KEY] = str(entry.path.resolve())
+        if str(restored.get("recipient_name", "")).strip():
+            record = self.registry.get_or_create(restored["recipient_name"], custom_capitalization=True)
+            restored.update(recipient_id=record.recipient_id,
+                            recipient_display_name=record.display_name,
+                            recipient_normalized_key=record.normalized_key,
+                            recipient_name=record.display_name)
+        transactions = [PathTransaction(self.project_root / relative,
+                                       staging_suffix=".load-staging", backup_suffix=".load-backup",
+                                       unique_staging=True)
+                        for relative in (USER_PAGES_DIR, USER_MESSAGE_DIR, MESSAGE_ASSETS_DIR)]
+        snapshots = [_FileSnapshot.capture(path) for path in
+                     (current_music_path(self.project_root), current_manifest_path(self.project_root),
+                      project_sound_path(self.project_root), self.project_root / PROMPT_WRITER_STATE_FILE)]
+        archive_snapshot = _SoundArchiveSnapshot.capture(self.project_root)
+        settings_changed = False
+        committed = []
+        self.project_root.mkdir(parents=True, exist_ok=True)
+        with session.restoring(), tempfile.TemporaryDirectory(prefix=".foundation-load-", dir=self.project_root) as temporary:
+            stage_root = Path(temporary)
+            working = ProjectSession(ProjectModel.from_dict(payload), project_root=stage_root, asset_root=loaded.asset_root)
+            if 2 <= len(working.project.pages) <= 10:
+                project_legacy_views(working)
+            else:
+                (stage_root / USER_PAGES_DIR).mkdir(parents=True)
+                atomic_write_json(stage_root / PROMPT_WRITER_STATE_FILE, {"version": 6})
+            (stage_root / USER_MESSAGE_DIR).mkdir(parents=True, exist_ok=True)
+            if not (stage_root / USER_MESSAGE_DIR / "message.html").exists():
+                atomic_write_bytes(stage_root / USER_MESSAGE_DIR / "message.html", b"")
+            # Keep embedded resources at the paths used by existing rich HTML.
+            resources = list(payload.get("extensions", {}).get("resource_files", []))
+            message_resources = []
+            for page in payload["pages"]:
+                if page.get("message"):
+                    for resource in page["message"].get("resources", []):
+                        reference = resource if isinstance(resource, str) else next((resource.get(key) for key in ("asset", "path", "source", "src") if resource.get(key)), None)
+                        if reference:
+                            message_resources.append(reference)
+            resources.extend(message_resources)
+            for relative in resources:
+                normalized = str(relative).replace("\\", "/")
+                if not normalized.startswith((MESSAGE_ASSETS_DIR + "/", "gallery/message/", USER_MESSAGE_DIR + "/")) and relative not in message_resources:
+                    continue
+                source = _safe_file(loaded.asset_root, normalized)
+                if source.is_file():
+                    target = normalized.replace("gallery/message/", USER_MESSAGE_DIR + "/", 1) if normalized.startswith("gallery/message/") else normalized
+                    if not target.startswith("gallery/"):
+                        target = USER_MESSAGE_DIR + "/" + target
+                    atomic_copy_file(source, _safe_file(stage_root, target))
+            try:
+                for transaction, relative in zip(transactions, (USER_PAGES_DIR, USER_MESSAGE_DIR, MESSAGE_ASSETS_DIR)):
+                    staging = transaction.prepare()
+                    source = stage_root / relative
+                    if source.is_dir():
+                        copy_directory_tree_no_links(source, staging)
+                    transaction.commit(replace=source.is_dir(), keep_backup=True)
+                    committed.append(transaction)
+                atomic_copy_file(stage_root / PROMPT_WRITER_STATE_FILE, self.project_root / PROMPT_WRITER_STATE_FILE)
+                sound = payload["sound"]
+                records = load_library(self.project_root)
+                imported = []
+                original_ids = []
+                for track in sound.get("tracks", []):
+                    reference = track.get("asset") or ("gallery/sounds/" + track["filename"] if track.get("filename") else None)
+                    if reference is None:
+                        continue
+                    source = _safe_file(loaded.asset_root, reference)
+                    if not source.is_file():
+                        continue
+                    record = import_runtime_track(self.project_root, source,
+                                                  display_title=track.get("display_title", ""),
+                                                  original_name=track.get("original_name", source.name),
+                                                  content_hash="", duration_seconds=track.get("duration_seconds", 0),
+                                                  records=records, persist=False)
+                    imported.append(record.track_id)
+                    original_ids.append(track.get("track_id", ""))
+                if imported:
+                    save_library(self.project_root, records)
+                selected_index = sound.get("selected_track_index", 0)
+                if sound.get("selected_track_id") in original_ids:
+                    selected_index = original_ids.index(sound["selected_track_id"])
+                if not isinstance(selected_index, int) or not 0 <= selected_index < len(imported):
+                    selected_index = 0
+                playlist = sound.get("mode") == "playlist"
+                state = ProjectSoundState(mode="playlist" if playlist else "single",
+                                          single_track_id=imported[0] if imported and not playlist else "",
+                                          playlist=imported if playlist else [],
+                                          playlist_expanded=bool(sound.get("playlist_expanded", True)),
+                                          selected_track_id=imported[selected_index] if imported else "")
+                save_project_state(self.project_root, state)
+                sync_current_compatibility(self.project_root, state, records)
+                self.settings.replace_snapshot(restored)
+                settings_changed = True
+                if preserve_commit:
+                    # Replaying disposable views must not edit the committed
+                    # document, its page revisions, or its storage pointer.
+                    canonical = loaded.project.to_dict()
+                    projected = {page["id"]: page for page in working.project.pages}
+                    for page in canonical["pages"]:
+                        key = projected[page["id"]]["recovery"].get("legacy_key")
+                        if key:
+                            page["recovery"]["legacy_key"] = key
+                    canonical["extensions"]["legacy_workspace_snapshot"] = legacy_workspace_payload(self.project_root)
+                    canonical["extensions"]["legacy_authored_snapshot"] = {
+                        key: deepcopy(canonical[key]) for key in ("sound", "shared_settings", "presentation")}
+                    # Keep freshly assigned adapter associations in memory so
+                    # the next save cannot reimport them as additional pages.
+                    stored = replace(loaded, project=ProjectModel.from_dict(canonical))
+                else:
+                    canonical = working.project.to_dict()
+                    canonical["extensions"]["legacy_workspace_snapshot"] = legacy_workspace_payload(self.project_root)
+                    canonical["extensions"]["legacy_authored_snapshot"] = {
+                        key: deepcopy(canonical[key]) for key in ("sound", "shared_settings", "presentation")}
+                    stored = active_project_repository(self.project_root).save(
+                        ProjectModel.from_dict(canonical), asset_root=loaded.asset_root,
+                        expected_revision=session.storage_revision, migration_report=loaded.migration_report)
+            except Exception:
+                for transaction in reversed(committed):
+                    transaction.rollback()
+                for transaction in transactions:
+                    transaction.abort()
+                for snapshot in snapshots:
+                    snapshot.restore()
+                archive_snapshot.restore()
+                if settings_changed:
+                    self.settings.replace_snapshot(settings_before)
+                raise
+            for transaction in transactions:
+                try:
+                    transaction.finalize()
+                except OSError:
+                    _LOGGER.exception("Could not remove completed canonical restore backup: %s", transaction.final_path)
+            session.replace(stored.project, storage_revision=stored.revision, asset_root=stored.asset_root)
+        return stored
+
     def restore(self, entry: SavedLetter) -> RestoredProject:
+        # Reject invalid sources before obtaining/changing the active session.
+        self._validated_saved_letter_content(entry.path)
+        from project_repository import ProjectRepository
+        from project_session import get_project_session
+        source = ProjectRepository(entry.path / ".lettersmith-project")
+        if source.exists:
+            self.restore_canonical(source.load(), entry=entry)
+            settings = self.settings.snapshot()
+            return RestoredProject(
+                play_dir=entry.path.resolve(), project_id=str(settings["project_id"]),
+                recipient_id=str(settings.get("recipient_id", "")), recipient=str(settings.get("recipient_name", "")),
+                recipient_normalized_key=str(settings.get("recipient_normalized_key", "")),
+                title=str(settings.get("recipient_title", "")),
+                published_url=str(settings.get(PUBLISHED_PAGE_URL_KEY, "")),
+                project_created_at=str(settings.get(PROJECT_CREATED_AT_KEY, "")),
+                project_published_at=str(settings.get(PROJECT_PUBLISHED_AT_KEY, "")),
+                published_public_path=str(settings.get(PUBLISHED_PUBLIC_PATH_KEY, "")),
+                published_at=str(settings.get(PUBLISHED_AT_KEY, "")),
+                published_expires_at=str(settings.get(PUBLISHED_EXPIRES_AT_KEY, "")),
+                publication_provider=str(settings.get(PUBLICATION_PROVIDER_KEY, "")),
+                publication_verified=settings.get(PUBLICATION_VERIFIED_KEY) is True,
+                published_source_fingerprint=str(settings.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")),
+                published_github_owner=str(settings.get(PUBLISHED_GITHUB_OWNER_KEY, "")),
+                published_github_repository=str(settings.get(PUBLISHED_GITHUB_REPOSITORY_KEY, "")),
+            )
+        session = get_project_session(self.project_root)
+        from project_repository import activation_lock, begin_activation, finish_activation
+        with session.restoring(), activation_lock(self.project_root):
+            begin_activation(self.project_root, expected_revision=session.storage_revision)
+            restored = self._restore(entry)
+            finish_activation(self.project_root)
+            return restored
+
+    def _restore(self, entry: SavedLetter) -> RestoredProject:
         # Validate the selected catalog path before identity migration or any
         # active-project mutation. Autosave storage is write-only here.
         (
@@ -1416,6 +1649,16 @@ class SavedLetterRestorer:
         ) = self._validated_saved_letter_content(
             entry.path,
         )
+        from project_repository import ProjectRepository, read_legacy_project
+        source_repository = ProjectRepository(play_dir / ".lettersmith-project")
+        try:
+            source_stored = source_repository.load() if source_repository.exists else None
+            migration = None if source_stored else read_legacy_project(play_dir, saved=True)
+            canonical_project = source_stored.project if source_stored else migration.project
+        except (ValueError, RuntimeError) as error:
+            raise SavedLetterRestoreError(f"The project foundation could not be loaded: {error}") from error
+        from project_session import get_project_session
+        session = get_project_session(self.project_root)
         created_timestamp = str(
             metadata.get(PROJECT_CREATED_AT_KEY, "")
         ).strip()
@@ -1433,7 +1676,18 @@ class SavedLetterRestorer:
             or valid_project_timestamp(metadata.get(PUBLISHED_AT_KEY))
         )
         metadata[PROJECT_PUBLISHED_AT_KEY] = project_published_timestamp
-        entry = self.ensure_entry_identity(entry)
+        # Opening a legacy package creates a working identity without rewriting
+        # its only source. Explicit recipient assignment remains a separate action.
+        if entry.needs_recipient_assignment:
+            raise RecipientAssignmentRequired(entry)
+        record = self.registry.get_or_create(
+            entry.recipient or ("A Friend" if entry.example else "Stock"),
+            custom_capitalization=True,
+            recipient_id=entry.recipient_id or None,
+        )
+        entry = replace(entry, recipient_id=record.recipient_id,
+                        project_id=(str(uuid.uuid4()) if entry.example or entry.stock
+                                    else entry.project_id or canonical_project.project_id))
         settings_before = self.settings.snapshot()
         restored_settings = self._prepare_settings(
             metadata,
@@ -1487,6 +1741,13 @@ class SavedLetterRestorer:
 
         try:
             copy_directory_tree_no_links(pages, pages_tx.prepare())
+            if not is_current_save_schema(metadata):
+                from page_layout import LAYOUT_FILE, LetterPage, save_pages
+                if not (pages_tx.staging_path / LAYOUT_FILE).exists():
+                    layout = tuple(LetterPage(page["recovery"]["legacy_key"], page["recovery"]["legacy_type"])
+                                   for page in canonical_project.pages)
+                    if 2 <= len(layout) <= 10:
+                        save_pages(pages_tx.staging_path, layout)
             message_staging = message_tx.prepare()
             copy_directory_tree_no_links(message, message_staging)
             _sanitize_staged_message_tree(message_staging)
@@ -1582,15 +1843,25 @@ class SavedLetterRestorer:
             self.settings.replace_snapshot(restored_settings)
             settings_committed = True
             self._verify_committed_state()
-            if needs_created_timestamp and not (
-                entry.example or entry.stock or entry.recovery
-            ):
-                persisted_metadata = _read_metadata(play_dir, strict=True)
-                persisted_metadata[PROJECT_CREATED_AT_KEY] = created_timestamp
-                atomic_write_json(
-                    play_dir / PLAY_METADATA_FILE,
-                    persisted_metadata,
-                )
+            from project_model import ProjectModel
+            from project_repository import active_project_repository, legacy_workspace_payload
+            canonical_data = canonical_project.to_dict()
+            canonical_data["project_id"] = restored_settings["project_id"]
+            canonical_data["metadata"][PROJECT_CREATED_AT_KEY] = restored_settings.get(PROJECT_CREATED_AT_KEY, "")
+            canonical_data["extensions"]["legacy_workspace_snapshot"] = legacy_workspace_payload(self.project_root)
+            canonical_data["extensions"]["legacy_authored_snapshot"] = {
+                key: deepcopy(canonical_data[key]) for key in ("sound", "shared_settings", "presentation")}
+            canonical_project = ProjectModel.from_dict(canonical_data)
+            active_repository = active_project_repository(self.project_root)
+            committed_project = active_repository.save(
+                canonical_project,
+                asset_root=source_stored.asset_root if source_stored else play_dir,
+                expected_revision=session.storage_revision,
+                migration_report=(migration.report.to_dict() if migration and hasattr(migration.report, "to_dict") else {}),
+            )
+            session.replace(committed_project.project,
+                            storage_revision=committed_project.revision,
+                            asset_root=committed_project.asset_root)
         except Exception as error:
             _LOGGER.exception(
                 "Saved-letter restoration failed for %s",
@@ -1913,15 +2184,20 @@ class SavedLetterRestorer:
                 "The selected saved letter is missing editable content."
             )
         metadata = _read_metadata(play_dir, strict=True)
+        current_metadata = is_current_save_schema(metadata)
         try:
-            metadata = validate_saved_letter_metadata(metadata)
+            if current_metadata:
+                metadata = validate_saved_letter_metadata(metadata)
+            elif metadata.get("schema_version") not in (None, "", 1, 2, 3, 4, "1", "2", "3", "4"):
+                raise SaveSchemaError("unsupported legacy saved-letter schema")
         except SaveSchemaError as error:
             raise SavedLetterRestoreError(
                 f"The saved-letter metadata is invalid: {error}."
             ) from error
         self._validate_pages(
             pages,
-            require_manifest=is_current_save_schema(metadata),
+            require_manifest=current_metadata,
+            legacy=not current_metadata,
         )
         self._validate_message(play_dir, message)
         try:
@@ -1954,10 +2230,11 @@ class SavedLetterRestorer:
         pages: Path,
         *,
         require_manifest: bool = False,
+        legacy: bool = False,
     ) -> None:
         missing = [
             name
-            for name in page_files(pages)
+            for name in (_legacy_saved_page_files(pages) if legacy else page_files(pages))
             if not (pages / name).is_file()
             or (pages / name).is_symlink()
             or not _readable_file(pages / name)
@@ -2388,6 +2665,20 @@ def update_saved_metadata(
     metadata.pop("public_path", None)
     metadata.pop("build_location", None)
     atomic_write_json(metadata_path, metadata)
+    from project_session import get_project_session
+    from project_repository import ProjectRepository, read_legacy_project
+    session = get_project_session(root)
+    stored = session.save()
+    repository = ProjectRepository(destination / ".lettersmith-project")
+    previous_revision = repository.load().revision if repository.exists else None
+    # Metadata refresh also serves existing packages without an open image
+    # workspace. Preserve that package's actual pages in this compatibility case.
+    package_project, package_assets = stored.project, stored.asset_root
+    if not package_project.pages and _legacy_saved_page_files(destination / "gallery/pages"):
+        package_project = read_legacy_project(destination, saved=True).project
+        package_assets = destination
+    repository.save(package_project, asset_root=package_assets,
+                    expected_revision=previous_revision)
     return metadata
 
 
@@ -2411,6 +2702,12 @@ def update_saved_publication_metadata(
         document_type=SAVED_LETTER_DOCUMENT_TYPE,
     )
     atomic_write_json(metadata_path, metadata)
+    from project_repository import ProjectRepository
+    repository = ProjectRepository(destination / ".lettersmith-project")
+    if repository.exists:
+        stored = repository.load()
+        stored.project.update_project_data("publication", _publication_metadata(SettingsStore(project_root).snapshot()))
+        repository.save(stored.project, asset_root=stored.asset_root, expected_revision=stored.revision)
     return metadata
 
 

@@ -1859,6 +1859,7 @@ class ImageTab(
         self._image_import_worker: _ImageImportWorker | None = None
         self._image_import_result_holder: dict[str, object] | None = None
         self._image_import_index: int | None = None
+        self._image_import_target = None
 
         self._compact_layout = False
         root = QtWidgets.QVBoxLayout(self)
@@ -2665,6 +2666,10 @@ class ImageTab(
             self._cards_layout.addWidget(card, 0, position)
             card.show()
         self.cards = {index: self.cards[index] for index in labels}
+        for card in self.cards.values():
+            card.setEnabled(not bool(self.page_controller.compatibility_error))
+        if self.page_controller.compatibility_error:
+            self._show_temporary_status(self.page_controller.compatibility_error, 10000)
         self.refresh_cards()
         self._fit_cards()
         if persisted:
@@ -2828,6 +2833,9 @@ class ImageTab(
         index: int,
         source_path: str,
     ) -> bool:
+        if self.page_controller.compatibility_error:
+            self._show_temporary_status(self.page_controller.compatibility_error, 10000)
+            return False
         if self._shutdown or index not in self.labels:
             return False
         if not self.project_state.is_project_ready:
@@ -2875,6 +2883,13 @@ class ImageTab(
         )
         self._image_import_generation += 1
         generation = self._image_import_generation
+        from project_consumers import page_id_for_key, session_for
+        session = session_for(self.project_root)
+        page_id = page_id_for_key(self.project_root, INDEX_TO_SLOT[index])
+        self._image_import_target = (
+            session.capture_target(page_id, fields=("type", "artwork"), include_shared=False)
+            if session is not None and page_id is not None else None
+        )
         holder: dict[str, object] = {}
         thread = QtCore.QThread(self)
         worker = _ImageImportWorker(
@@ -2931,6 +2946,15 @@ class ImageTab(
 
         if self._shutdown or result.generation != self._image_import_generation:
             result.prepared.abort()
+            return
+        from project_consumers import session_for
+        session = session_for(self.project_root)
+        if self._image_import_target is not None and (
+            session is None or not session.target_is_current(self._image_import_target)
+        ):
+            result.prepared.abort()
+            self._show_temporary_status("The original image page changed or its project was replaced.", 5000)
+            self.image_import_completed.emit(result.index, "", "The original page changed.")
             return
         if not self.project_state.is_project_ready:
             result.prepared.abort()
@@ -3118,6 +3142,10 @@ class ImageTab(
         self,
         index: int,
     ) -> None:
+        compatibility_error = getattr(getattr(self, "page_controller", None), "compatibility_error", "")
+        if compatibility_error:
+            self._show_temporary_status(compatibility_error, 10000)
+            return
         if index not in self.labels:
             return
         slot = INDEX_TO_SLOT[index]
@@ -3195,6 +3223,9 @@ class ImageTab(
         self,
         index: int,
     ) -> None:
+        if self.page_controller.compatibility_error:
+            self._show_temporary_status(self.page_controller.compatibility_error, 10000)
+            return
         if index not in self.labels:
             return
         selected_path = self.image_paths.get(index)

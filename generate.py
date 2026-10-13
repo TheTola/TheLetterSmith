@@ -1006,6 +1006,8 @@ def build_play_bundle_to(
 ) -> Path:
     """Generate and validate a complete Play bundle in ``destination``."""
     pr = Path(project_root).resolve()
+    from project_consumers import prepare_consumer
+    prepare_consumer(pr, "output")
     paths = application_paths(pr)
     target = Path(destination).resolve()
     _validate_template_placeholders()
@@ -1301,6 +1303,8 @@ def generate_play_bundle(
 ) -> Path:
     """Transactionally replace the active recipient/title Play bundle."""
     pr = Path(project_root).resolve()
+    from project_consumers import prepare_consumer
+    prepare_consumer(pr, "output")
     ensure_output_dirs(pr)
     final_play_dir = play_bundle_directory(pr)
     _preserve_published_play_bundle(pr, final_play_dir)
@@ -1391,6 +1395,8 @@ def ensure_play_bundle(
 ) -> tuple[Path, bool]:
     """Return a validated build, rebuilding only when its inputs are stale."""
     root = Path(project_root).resolve()
+    from project_consumers import prepare_consumer
+    prepare_consumer(root, "output")
     build = play_bundle_directory(root)
     fingerprint = (
         build_source_fingerprint(root)
