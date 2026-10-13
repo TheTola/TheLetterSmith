@@ -7,10 +7,9 @@ import json
 from pathlib import Path
 
 from transactional_io import atomic_write_json
+from project_model import MAX_PAGES, MIN_PAGES, PAGE_TYPES
 
 LAYOUT_FILE = "lettersmith-pages.json"
-MIN_PAGES = 2
-MAX_PAGES = 10
 PAGE_KEYS = ("cover", "letter", "wall", "back", *(f"page_{i}" for i in range(1, 7)))
 PAGE_INDICES = {key: index for index, key in enumerate(PAGE_KEYS, 1)}
 
@@ -46,11 +45,6 @@ def normalize_pages(value: object) -> tuple[LetterPage, ...]:
         pages.append(LetterPage(key, kind))
     if len({page.key for page in pages}) != len(pages):
         raise ValueError("Page identities must be unique.")
-    if pages[0] != DEFAULT_PAGES[0] or pages[-1] != DEFAULT_PAGES[-1]:
-        raise ValueError("Cover must be first and End must be last.")
-    if any(page.key in {"cover", "back"} or page.kind not in {"letter", "wall"}
-           for page in pages[1:-1]):
-        raise ValueError("Middle pages must be Letters or Walls.")
     return tuple(pages)
 
 
@@ -82,7 +76,8 @@ def page_labels(pages: tuple[LetterPage, ...]) -> dict[str, str]:
     labels = {}
     for page in pages:
         counts[page.kind] += 1
-        label = "End" if page.kind == "back" else page.kind.title()
+        label = next(definition.label for definition in PAGE_TYPES.values()
+                     if definition.artwork_template == page.kind)
         if totals[page.kind] > 1:
             label += f" {counts[page.kind]}"
         labels[page.key] = label
@@ -95,6 +90,14 @@ def page_files(directory: str | Path) -> tuple[str, ...]:
 
 def resized_pages(pages: tuple[LetterPage, ...], count: int) -> tuple[LetterPage, ...]:
     count = max(MIN_PAGES, min(MAX_PAGES, count))
+    if not pages or pages[0] != DEFAULT_PAGES[0] or pages[-1] != DEFAULT_PAGES[-1]:
+        resized = list(pages[:count])
+        for key in PAGE_KEYS:
+            if len(resized) >= count:
+                break
+            if key not in {page.key for page in resized}:
+                resized.append(LetterPage(key, "letter"))
+        return tuple(resized)
     middle = list(pages[1:-1])[:count - 2]
     for key in PAGE_KEYS:
         if len(middle) >= count - 2:

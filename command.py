@@ -456,6 +456,9 @@ def _reset_active_paths(
         controller.begin_new_project(
             additional_settings=settings_updates,
         )
+        from project_session import reset_project_session
+
+        reset_project_session(root)
     except Exception:
         LOGGER.exception("New Project transaction failed; rolling back.")
         try:
@@ -534,18 +537,25 @@ def reset_everything(
             "Finish the current Forge operation before starting a new project."
         )
     _release_active_project_media(window)
+    from project_repository import activation_lock, begin_activation, finish_activation
+    from project_session import get_project_session
+    session = get_project_session(root)
+    session.save()
     settings_before = SettingsStore(root).snapshot()
-    total_files, total_dirs = _reset_active_paths(
-        root,
-        settings_before=settings_before,
-        controller=controller,
-        settings_updates=(
-            RESET_SETTINGS
-            if settings_updates is None
-            else settings_updates
-        ),
-        delete_saved_project=delete_saved_project,
-    )
+    with session.restoring(), activation_lock(root):
+        begin_activation(root, expected_revision=session.storage_revision)
+        total_files, total_dirs = _reset_active_paths(
+            root,
+            settings_before=settings_before,
+            controller=controller,
+            settings_updates=(
+                RESET_SETTINGS
+                if settings_updates is None
+                else settings_updates
+            ),
+            delete_saved_project=delete_saved_project,
+        )
+        finish_activation(root)
     return total_files, total_dirs
 
 

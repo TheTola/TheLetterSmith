@@ -1172,6 +1172,10 @@ class MessageTab(QtWidgets.QWidget):
 
     def sync_to_disk(self) -> bool:
         """Persist Message metadata and finish render state before tab exit."""
+        from project_consumers import consumer_issue
+        if consumer_issue(self.project_root, "message"):
+            self._save_settings()
+            return False
         self._overlay_render_timer.stop()
         overlay_settings_flushed = self._flush_overlay_settings(
             emit_project_changed=False,
@@ -1474,6 +1478,8 @@ class MessageTab(QtWidgets.QWidget):
         RevisionHistoryDialog(self).exec()
 
     def restore_message_revision(self, revision_path: Path) -> bool:
+        if not self._message_consumer_available():
+            return False
         try:
             restored = restore_revision(self._html_path(), revision_path)
         except Exception as error:
@@ -2013,6 +2019,9 @@ class MessageTab(QtWidgets.QWidget):
     # Editor
     # ──────────────────────────────────────────────────────────────────
     def open_editor(self) -> None:
+        if not self._message_consumer_available():
+            return
+        self._editor_page_target = self._capture_message_target(fields=("type",))
         if not self.project_state.is_project_ready:
             self.status.setText(
                 "A recipient is required before editing."
@@ -2052,6 +2061,8 @@ class MessageTab(QtWidgets.QWidget):
             dlg.deleteLater()
 
     def _handle_editor_autosaved(self, html: str) -> None:
+        if not self._message_target_current(getattr(self, "_editor_page_target", None)):
+            return
         if not html:
             return
         html = sanitize_message_html(html)
@@ -2066,6 +2077,8 @@ class MessageTab(QtWidgets.QWidget):
         self.project_changed.emit()
 
     def _handle_editor_finished(self, dlg: QtWidgets.QDialog) -> None:
+        if not self._message_target_current(getattr(self, "_editor_page_target", None)):
+            return
         try:
             new_html = dlg.get_edited_html()  # type: ignore[attr-defined]
         except Exception:
@@ -2108,10 +2121,13 @@ class MessageTab(QtWidgets.QWidget):
             return ""
 
     def _process_file(self, path: str) -> None:
+        if not self._message_consumer_available():
+            return
         process = self._message_import_process
         if process is not None:
             self.status.setText("A message is already being imported.")
             return
+        self._message_import_target = self._capture_message_target(fields=("type", "message"))
 
         result_path: Path | None = None
         try:
@@ -2168,6 +2184,7 @@ class MessageTab(QtWidgets.QWidget):
         if process is None or self.sender() is not process:
             return
         source = self._message_import_source
+        target = getattr(self, "_message_import_target", None)
         result_path = self._message_import_result_path
         error_message = self._message_import_error
         imported_html = ""
@@ -2185,6 +2202,8 @@ class MessageTab(QtWidgets.QWidget):
             except MessageImportError as error:
                 error_message = str(error)
         self._release_message_import()
+        if not self._message_target_current(target):
+            return
         if error_message:
             self.status.setText(error_message)
             return
@@ -2218,6 +2237,7 @@ class MessageTab(QtWidgets.QWidget):
         self._message_import_result_path = None
         self._message_import_source = None
         self._message_import_error = ""
+        self._message_import_target = None
         if hasattr(self, "btn"):
             self.btn.setEnabled(True)
         if process is not None:
@@ -2253,6 +2273,8 @@ class MessageTab(QtWidgets.QWidget):
         return stopped
 
     def _apply_imported_message(self, path: str, imported_html: str) -> None:
+        if not self._message_consumer_available():
+            return
         if not imported_html.strip():
             self.status.setText("That file had no extractable text.")
             return
@@ -2288,6 +2310,11 @@ class MessageTab(QtWidgets.QWidget):
     # Render message.png (stable, saved in same folder as message.html)
     # ──────────────────────────────────────────────────────────────────
     def _generate_image(self, html: str) -> int | None:
+        from project_consumers import consumer_issue
+        issue = consumer_issue(self.project_root, "message")
+        if issue:
+            self.status.setText(issue)
+            return None
         """Queue the latest full-resolution message.png render."""
         html = sanitize_message_html(html)
         if self._render_shutdown:
@@ -2374,6 +2401,33 @@ class MessageTab(QtWidgets.QWidget):
             resume=True,
         ):
             raise RuntimeError("Message rendering did not stop before restore")
+
+    def _message_consumer_available(self) -> bool:
+        from project_consumers import prepare_consumer
+        try:
+            prepare_consumer(self.project_root, "message")
+        except (ValueError, RuntimeError, OSError) as error:
+            self.status.setText(str(error))
+            return False
+        return True
+
+    def _capture_message_target(self, *, fields):
+        from project_consumers import session_for
+        session = session_for(self.project_root)
+        if session is None:
+            return None
+        pages = [page for page in session.project.pages if page["message"] is not None]
+        return session.capture_target(pages[0]["id"], fields=fields, include_shared=False) if len(pages) == 1 else None
+
+    def _message_target_current(self, target) -> bool:
+        if target is None:
+            return True
+        from project_consumers import session_for
+        session = session_for(self.project_root)
+        if session is not None and session.target_is_current(target):
+            return True
+        self.status.setText("The original message page changed or its project was replaced. The delayed result was not applied.")
+        return False
 
     def reset_project_message(self) -> None:
         """Clear the live Message workspace after New Project commits."""

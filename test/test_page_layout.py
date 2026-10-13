@@ -77,7 +77,7 @@ class PageLayoutTests(unittest.TestCase):
     def test_multiple_walls_have_clear_labels_and_one_message_overlay(self):
         pages = (DEFAULT_PAGES[0], LetterPage("letter", "wall"),
                  LetterPage("wall", "wall"), LetterPage("page_1", "letter"), DEFAULT_PAGES[-1])
-        self.assertEqual(list(page_labels(pages).values()), ["Cover", "Wall 1", "Wall 2", "Letter", "End"])
+        self.assertEqual(list(page_labels(pages).values()), ["Cover", "Letter 1", "Letter 2", "Illustration", "End Page"])
         html = template_for_pages(pages)
         self.assertEqual(html.count('<section class="slide'), 5)
         self.assertEqual(html.count('data-page-type="wall"'), 2)
@@ -127,7 +127,7 @@ class PageLayoutTests(unittest.TestCase):
                 panel.page_controls.kind.setCurrentIndex(panel.page_controls.kind.findData("wall"))
                 panel.page_controls.move_left.click()
                 self.assertEqual(tab.page_controller.pages[2], LetterPage("page_1", "wall"))
-                self.assertEqual(tab.labels[5][0], "Wall 1 Image")
+                self.assertEqual(tab.labels[5][0], "Letter 1 Image")
                 self.assertEqual(panel._page_specs[2].detail_widget.toPlainText(), "Blue garden")
                 panel._on_generate()
                 self.assertEqual(len(panel._generated_prompts), 6)
