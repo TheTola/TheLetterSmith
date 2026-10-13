@@ -803,7 +803,12 @@ class PromptWriterHardeningTests(unittest.TestCase):
 
         changes = []
         dialog.entries_changed.connect(changes.append)
-        dialog.entry_edit.setText("  blue and lavender purple  ")
+        self.assertFalse(dialog.entry_edit.isReadOnly())
+        self.assertFalse(dialog.btn_update.isEnabled())
+        self.assertFalse(dialog.btn_remove.isEnabled())
+        dialog.entry_edit.selectAll()
+        QtTest.QTest.keyClicks(dialog.entry_edit, "  blue and lavender purple  ")
+        self.assertEqual(dialog.entry_edit.text(), "  blue and lavender purple  ")
         QtTest.QTest.mouseClick(dialog.btn_add, QtCore.Qt.LeftButton)
         self.app.processEvents()
 
@@ -820,13 +825,116 @@ class PromptWriterHardeningTests(unittest.TestCase):
             1,
         )
 
-        dialog.entry_edit.setText("New Cyan Scheme")
+        dialog.entry_edit.selectAll()
+        QtTest.QTest.keyClicks(dialog.entry_edit, "New Cyan Scheme")
+        dialog._update_entry()
+        dialog._remove_entry()
+        self.assertEqual(dialog._entries[1].text, "Blue and Lavender Purple")
         QtTest.QTest.mouseClick(dialog.btn_add, QtCore.Qt.LeftButton)
         self.app.processEvents()
 
         self.assertFalse(dialog._duplicate_notice.isVisible())
         self.assertIn("New Cyan Scheme", [entry.text for entry in dialog._entries])
+        self.assertEqual(dialog._selected_entry().text, "New Cyan Scheme")
+        self.assertEqual(dialog.entry_edit.text(), "New Cyan Scheme")
         self.assertEqual(len(changes), 1)
+
+    def test_added_color_is_selected_without_rebuilding_or_losing_pending_text(self):
+        self.panel = PromptWriterPanel(
+            project_root=str(self.project_root), language_service=_FakeLanguageService()
+        )
+        self.panel.popup()
+        QtTest.QTest.qWait(300)
+        self.panel.cmb_subject.setCurrentText("Subject")
+        self.panel.cmb_color.setCurrentText("Ruby")
+        self.panel.txt_global.setPlainText("  Shared café direction\n\n  ")
+        self.panel.cb_paint.setChecked(True)
+        for page in self.panel._page_specs:
+            page.detail_widget.setPlainText(f"  {page.key} direction 雪\n\n")
+        self.panel._generated_prompts = {
+            page.key: f"  Manual {page.key} café\r\n\n雪  "
+            for page in self.panel._page_specs
+        }
+        self.panel._resolved_instructions = {"role": "Chosen once"}
+        self.panel._generated_input_signature = self.panel._current_prompt_input_signature()
+        self.panel._set_generated_output_valid(True)
+        before = self.panel._capture_state()
+        library_path = self.panel._resolve_managed_list_path("color")
+        builtin_bytes = library_path.read_bytes()
+        dismissed = QtTest.QSignalSpy(self.panel.dismissed)
+
+        with (
+            mock.patch.object(self.panel, "_on_generate", side_effect=AssertionError("rebuilt")),
+            mock.patch.object(self.panel, "_roll_shared_prompt_data", side_effect=AssertionError("rerolled")),
+        ):
+            self.panel._open_list_manager("color")
+            dialog = self.panel._list_manager_dialogs["color"]
+            self.addCleanup(dialog.close)
+            self.app.processEvents()
+            dialog.entry_edit.selectAll()
+            QtTest.QTest.keyClicks(dialog.entry_edit, "New Cyan Scheme")
+            QtTest.QTest.mouseClick(dialog.btn_add, QtCore.Qt.LeftButton)
+            self.app.processEvents()
+
+            self.assertEqual(self.panel.cmb_color.currentText(), "New Cyan Scheme")
+            self.assertEqual(dialog._selected_entry().text, "New Cyan Scheme")
+            self.assertEqual(dialog.entry_edit.text(), "New Cyan Scheme")
+            self.assertTrue(dialog.isVisible())
+            self.assertTrue(self.panel.is_open)
+            self.assertEqual(dismissed.count(), 0)
+            self.assertFalse(self.panel._generated_output_valid)
+            after = self.panel._capture_state()
+            for key in (
+                "subject", "type", "global", "checks", "resolved_instructions",
+                "generated_prompts", *(page.key for page in self.panel._page_specs),
+            ):
+                self.assertEqual(after[key], before[key], key)
+            self.assertEqual(library_path.read_bytes(), builtin_bytes)
+            colors = json.loads(self.panel._user_colors_path().read_text(encoding="utf-8"))["colors"]
+            self.assertIn("New Cyan Scheme", colors)
+            self.assertIn("Legacy User Color", colors)
+            self.assertTrue(self.panel.persist_project_state())
+            self.assertTrue(self.panel.reload_project_state())
+            self.assertEqual(self.panel.cmb_color.currentText(), "New Cyan Scheme")
+            self.assertEqual(self.panel._generated_prompts, before["generated_prompts"])
+            self.assertEqual(self.panel.txt_global.toPlainText(), before["global"])
+            for page in self.panel._page_specs:
+                self.assertEqual(page.detail_widget.toPlainText(), before[page.key])
+
+    def test_failed_color_add_retains_draft_and_does_not_activate_unsaved_value(self):
+        self.panel = PromptWriterPanel(project_root=str(self.project_root))
+        self.panel.cmb_color.setCurrentText("Ruby")
+        self.panel._open_list_manager("color")
+        dialog = self.panel._list_manager_dialogs["color"]
+        self.addCleanup(dialog.close)
+        self.app.processEvents()
+        original_entries = list(dialog._entries)
+        original_row = dialog._selected_row()
+        library_bytes = self.panel._user_colors_path().read_bytes()
+        changes = QtTest.QSignalSpy(dialog.entries_changed)
+        draft = "  New Copper Scheme  "
+        dialog.entry_edit.selectAll()
+        QtTest.QTest.keyClicks(dialog.entry_edit, draft)
+
+        with (
+            mock.patch("PromptWriterPanel.safe_write_json", side_effect=OSError("test write failure")),
+            mock.patch("PromptWriterPanel.show_lettersmith_message") as show_message,
+        ):
+            QtTest.QTest.mouseClick(dialog.btn_add, QtCore.Qt.LeftButton)
+
+        self.assertEqual(show_message.call_args.args[1], "Save failed")
+        self.assertEqual(changes.count(), 0)
+        self.assertEqual(self.panel.cmb_color.currentText(), "Ruby")
+        self.assertEqual(dialog._entries, original_entries)
+        self.assertEqual(dialog._selected_row(), original_row)
+        self.assertEqual(dialog.entry_edit.text(), draft)
+        self.assertEqual(self.panel._user_colors_path().read_bytes(), library_bytes)
+        self.assertTrue(dialog.isVisible())
+
+        QtTest.QTest.mouseClick(dialog.btn_add, QtCore.Qt.LeftButton)
+        self.assertEqual(changes.count(), 1)
+        self.assertEqual(self.panel.cmb_color.currentText(), "New Copper Scheme")
+        self.assertEqual(dialog._selected_entry().text, "New Copper Scheme")
 
     def test_color_reload_has_one_user_header_and_deduplicates_builtin_conflicts(self):
         modules = self.project_root / "Prompter" / "modules"

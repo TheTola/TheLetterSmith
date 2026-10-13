@@ -516,6 +516,9 @@ class ListManagerDialog(QtWidgets.QDialog):
         self._allow_headers = bool(allow_headers)
         self._auto_user_header = _normalize_text(auto_user_header, strip=True, max_length=120)
         self._user_owned_only = bool(user_owned_only)
+        self._save_entries_callback: Optional[
+            Callable[[List[ManagedListEntry], Optional[str]], bool]
+        ] = None
         self._header_color = QColor(COL_HEADER_TEXT)
         self._duplicate_notice = ClickThroughNotice(self)
         self.setWindowTitle(f"Manage {title}")
@@ -840,10 +843,8 @@ class ListManagerDialog(QtWidgets.QDialog):
         if self._is_selectable_row(row):
             entry = self._entries[row]
             self.entry_edit.setText(entry.text)
-            self.entry_edit.setReadOnly(self._user_owned_only and not entry.is_user)
         else:
             self.entry_edit.clear()
-            self.entry_edit.setReadOnly(False)
         self._sync_button_state()
 
     def _sync_button_state(self) -> None:
@@ -852,11 +853,16 @@ class ListManagerDialog(QtWidgets.QDialog):
         self.btn_update.setEnabled(editable)
         self.btn_remove.setEnabled(editable)
 
-    def _emit_entries_changed(self) -> None:
-        self.entries_changed.emit([
+    def _emit_entries_changed(self, *, selected_text: Optional[str] = None) -> bool:
+        entries = [
             ManagedListEntry(entry.text, entry.is_header, entry.is_user)
             for entry in self._entries
-        ])
+        ]
+        if self._save_entries_callback is not None:
+            if not self._save_entries_callback(entries, selected_text):
+                return False
+        self.entries_changed.emit(entries)
+        return True
 
     def _submit_from_enter(self) -> None:
         if self._is_editable_row(self._selected_row()):
@@ -873,6 +879,9 @@ class ListManagerDialog(QtWidgets.QDialog):
         if conflict is not None:
             self._show_duplicate_notice(conflict)
             return
+        previous_entries = list(self._entries)
+        previous_row = self._selected_row()
+        draft_text = self.entry_edit.text()
         if self._allow_headers and self._auto_user_header:
             insert_at = self._insert_under_auto_header(ManagedListEntry(entry.text, False, True))
         else:
@@ -880,7 +889,11 @@ class ListManagerDialog(QtWidgets.QDialog):
             insert_at = row + 1 if row >= 0 else len(self._entries)
             self._entries.insert(insert_at, ManagedListEntry(entry.text, False, True))
         self._refresh_list(insert_at)
-        self._emit_entries_changed()
+        if not self._emit_entries_changed(selected_text=entry.text):
+            self._entries = previous_entries
+            self._refresh_list(previous_row)
+            self.entry_edit.setText(draft_text)
+            return
         play_ui_sound(UiSound.ADDED)
 
     def _update_entry(self) -> None:
@@ -1951,10 +1964,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
         _FILE_CACHE.pop(path, None)
         _FILE_CACHE.pop(path.name, None)
 
-    def _apply_managed_list_changes(self, key: str, entries: List[ManagedListEntry]) -> None:
+    def _apply_managed_list_changes(
+        self,
+        key: str,
+        entries: List[ManagedListEntry],
+        *,
+        selected_text: Optional[str] = None,
+    ) -> bool:
         if self._list_save_in_progress:
             LOGGER.warning("Prompt Writer list save ignored while another save is active: %s", key)
-            return
+            return False
         self._list_save_in_progress = True
         config = self._managed_list_config(key)
         path = (
@@ -1982,7 +2001,15 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 )
             self._clear_managed_list_cache(path)
             self._reload_managed_list(key)
+            if selected_text is not None:
+                combo = self._managed_combo_for_key(key)
+                index = self._find_combo_text(
+                    combo, selected_text, normalized=key == "color"
+                )
+                if index >= 0:
+                    combo.setCurrentIndex(index)
             self._schedule_persist_state(0)
+            return True
         except (OSError, UnicodeError, ValueError, TypeError) as error:
             LOGGER.exception("Prompt Writer list save failed: %s (%s)", path, error)
             show_lettersmith_message(
@@ -1990,6 +2017,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 "Save failed",
                 f"Could not save {config['title']} to:\n{path}\n\n{error}",
             )
+            return False
         finally:
             self._list_save_in_progress = False
 
@@ -2010,7 +2038,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
             app_font_family=self._app_font_family,
             parent=self,
         )
-        dialog.entries_changed.connect(lambda entries, list_key=key: self._apply_managed_list_changes(list_key, entries))
+        dialog._save_entries_callback = (
+            lambda entries, selected_text, list_key=key: self._apply_managed_list_changes(
+                list_key, entries, selected_text=selected_text
+            )
+        )
         dialog.finished.connect(lambda *_args, list_key=key: self._list_manager_dialogs.pop(list_key, None))
         self._list_manager_dialogs[key] = dialog
         dialog.apply_theme_tokens(self._theme_tokens)
