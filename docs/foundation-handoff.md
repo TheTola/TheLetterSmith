@@ -1,11 +1,13 @@
 # Parallel feature handoff
 
 The checkout started at `6d015d2e1d93d4773dc99df6ac2a2eca31bf52c1`.
-The foundation is currently uncommitted alongside pre-existing changes; that
-commit alone does **not** contain this foundation. Review the working-tree
-changes and establish one shared foundation commit before creating feature
-worktrees. Do not discard unrelated work or describe the starting commit as a
-tested foundation revision. No dependent feature tasks were started here.
+That starting commit alone does **not** contain this foundation. The foundation
+was reviewed and isolated for commit on 2026-10-13 at the user's request. Use the
+commit containing this handoff and the five foundation modules as the shared
+baseline; record its exact hash when creating dependent worktrees. Unrelated
+publishing, release, settings, and startup diagnostics work was excluded.
+The verification report separates historical working-tree runs from the staged
+foundation snapshot checks. No dependent feature implementation is included.
 
 Read [foundation-contract.md](foundation-contract.md),
 [foundation-migration.md](foundation-migration.md), and

@@ -78,6 +78,29 @@ class ProjectRepositoryTests(unittest.TestCase):
                 actual = loaded.asset_root / loaded.project.get_page(page_id)["artwork"]["asset"]
                 self.assertEqual(actual.read_bytes(), (root / original).read_bytes())
 
+    def test_shared_artwork_and_message_resource_survives_portable_save(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            Image.new("RGB", (8, 12), "red").save(root / "shared.png")
+            original = (root / "shared.png").read_bytes()
+            project = create_project(("cover", "letter"))
+            cover_id, letter_id = [page["id"] for page in project.pages]
+            project.update_artwork(cover_id, {"asset": "shared.png", "media_type": "image/png"})
+            document = project.get_message(letter_id)
+            document.update(html='<p><img src="shared.png"></p>', resources=["shared.png"])
+            project.update_message(letter_id, document)
+            repository = ProjectRepository(root / "saved")
+            repository.save(project, asset_root=root)
+            loaded = repository.load()
+            portable = ProjectRepository(root / "portable")
+            portable.save(loaded.project, asset_root=loaded.asset_root)
+            for stored in (loaded, portable.load()):
+                self.assertEqual(stored.project.get_message(letter_id), document)
+                artwork = stored.project.get_page(cover_id)["artwork"]["asset"]
+                self.assertTrue(artwork.startswith("a/"))
+                self.assertEqual((stored.asset_root / artwork).read_bytes(), original)
+                self.assertEqual((stored.asset_root / "shared.png").read_bytes(), original)
+
     def test_revision_conflict_and_interrupted_commit_leave_old_generation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

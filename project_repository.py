@@ -312,14 +312,20 @@ class ProjectRepository:
                     stored_relative = relative
                     if relative in artwork_references:
                         stored_relative = f"a/{digest[:32]}{source.suffix.lower()}"
-                        if stored_relative in files and files[stored_relative] != digest:
-                            raise ProjectConflictError("asset_collision", "Resource names collided; no project was committed.")
                         for page in owned_pages:
                             if page.get("artwork", {}).get("asset") == relative:
                                 page["artwork"]["asset"] = stored_relative
-                    destination = _safe_file(staging, stored_relative)
-                    atomic_write_bytes(destination, value)
-                    files[stored_relative] = digest
+                    destinations = {stored_relative}
+                    # Rich HTML and other resource owners retain their exact
+                    # paths even when the same bytes are also page artwork.
+                    if relative in _resource_references(payload):
+                        destinations.add(relative)
+                    for destination_relative in destinations:
+                        if destination_relative in files and files[destination_relative] != digest:
+                            raise ProjectConflictError("asset_collision", "Resource names collided; no project was committed.")
+                        destination = _safe_file(staging, destination_relative)
+                        atomic_write_bytes(destination, value)
+                        files[destination_relative] = digest
                 except OSError as error:
                     raise ProjectRepositoryError("resource_write_failed", "Cannot stage project resource.", path=source) from error
             if missing:
