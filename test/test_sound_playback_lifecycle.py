@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
 import wave
@@ -9,6 +12,12 @@ from pathlib import Path
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+if __name__ == "__main__" and sys.argv[1:2] == ["--native-transport"]:
+    repository = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repository))
+    from project_paths import ApplicationPaths, configure_application_paths
+    configure_application_paths(ApplicationPaths.for_runtime(repository))
 
 from PySide6 import QtCore, QtTest, QtWidgets
 from PySide6.QtMultimedia import QMediaPlayer
@@ -155,6 +164,37 @@ class SoundPlaybackLifecycleTests(unittest.TestCase):
             self.assertTrue(player.player.source().isEmpty())
             self.assertEqual(player.transport_state, "unavailable")
 
+    def _native_transport_result(self, scenario: str) -> dict:
+        # QTest.qWait hangs at native EndOfMedia on the local Windows backend,
+        # including a single track. Exercise the real application event loop in
+        # an isolated process with both an internal watchdog and a parent bound.
+        with tempfile.TemporaryDirectory(prefix="ls-native-") as directory:
+            environment = dict(os.environ, LETTER_SMITH_PROFILE_ROOT=directory,
+                               QT_QPA_PLATFORM="offscreen")
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--native-transport", scenario],
+                cwd=Path(__file__).resolve().parents[1], env=environment,
+                capture_output=True, text=True, timeout=16,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_native_crossfade_repeats_with_cached_source_duration(self) -> None:
+        result = self._native_transport_result("crossfade")
+        self.assertEqual(result["tracks"], ["first", "second", "first", "second"])
+        self.assertEqual(result["slots"], [0, 1, 0, 1])
+        self.assertEqual(result["durations"], [2000, 2000])
+        self.assertEqual(result["state"], "playing")
+        self.assertTrue(result["shutdown_quiet"])
+
+    def test_native_single_track_repeats_after_end_delay(self) -> None:
+        result = self._native_transport_result("single")
+        self.assertEqual(result["tracks"], ["first", "first"])
+        self.assertGreaterEqual(result["end_count"], 1)
+        self.assertEqual(result["durations"][0], 2000)
+        self.assertEqual(result["state"], "playing")
+        self.assertTrue(result["shutdown_quiet"])
+
 
 class MissingSoundAssignmentTests(unittest.TestCase):
     def test_missing_assignment_survives_reload_reorder_and_remove(self) -> None:
@@ -228,5 +268,74 @@ class MissingSoundAssignmentTests(unittest.TestCase):
         self.assertEqual(state.normalize().playlist, ["a", "b"])
 
 
+def _run_native_transport(scenario: str) -> None:
+    import faulthandler
+    faulthandler.dump_traceback_later(12, exit=True)
+    app = QtWidgets.QApplication([])
+    profile = Path(os.environ["LETTER_SMITH_PROFILE_ROOT"])
+    paths = {}
+    for name in ("first", "second"):
+        path = profile / f"{name}.wav"
+        with wave.open(str(path), "wb") as audio:
+            audio.setnchannels(2)
+            audio.setsampwidth(2)
+            audio.setframerate(44100)
+            audio.writeframes(b"\0\0\0\0" * 88200)
+        paths[name] = path
+    player = PlaylistPlayer(paths.get)
+    player.set_muted(True)
+    result = {"tracks": [], "slots": [], "end_count": 0}
+    errors = []
+
+    def changed(track: str) -> None:
+        result["tracks"].append(track)
+        result["slots"].append(player.active_slot)
+
+    def media_status(status) -> None:
+        if status == QMediaPlayer.EndOfMedia:
+            result["end_count"] += 1
+
+    player.trackChanged.connect(changed)
+    player.error.connect(errors.append)
+    for native in player.players:
+        native.mediaStatusChanged.connect(media_status)
+    expected_count = 2 if scenario == "single" else 4
+    monitor = QtCore.QTimer()
+    monitor.setInterval(20)
+    monitor.timeout.connect(
+        lambda: app.quit() if errors or len(result["tracks"]) >= expected_count else None
+    )
+    deadline = QtCore.QTimer()
+    deadline.setSingleShot(True)
+    deadline.timeout.connect(app.quit)
+    try:
+        player.set_queue(["first"] if scenario == "single" else ["first", "second"])
+        player.play()
+        monitor.start()
+        deadline.start(8000)
+        app.exec()
+        result["durations"] = list(player._durations)
+        result["state"] = player.transport_state
+        assert not errors, errors
+        assert len(result["tracks"]) == expected_count, result
+        assert player.is_playing(), result
+    finally:
+        monitor.stop()
+        deadline.stop()
+        player.shutdown()
+    count = len(result["tracks"])
+    drained = QtCore.QEventLoop()
+    QtCore.QTimer.singleShot(100, drained.quit)
+    drained.exec()
+    result["shutdown_quiet"] = not player.is_playing() and len(result["tracks"]) == count
+    player.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(player, QtCore.QEvent.DeferredDelete)
+    faulthandler.cancel_dump_traceback_later()
+    print(json.dumps(result))
+
+
 if __name__ == "__main__":
-    unittest.main()
+    if sys.argv[1:2] == ["--native-transport"]:
+        _run_native_transport(sys.argv[2])
+    else:
+        unittest.main()

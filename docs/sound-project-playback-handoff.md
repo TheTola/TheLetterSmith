@@ -1,6 +1,6 @@
 # Sound interface and project-wide playback handoff
 
-Date: 2026-10-13. Branch: `codex/sound-project-playback`.
+Updated: 2026-10-15. Branch: `codex/sound-project-playback`.
 
 This is a partial feature implementation, not merged release acceptance.
 
@@ -9,8 +9,12 @@ This is a partial feature implementation, not merged release acceptance.
 The primary checkout started at
 `6d015d2e1d93d4773dc99df6ac2a2eca31bf52c1` with uncommitted foundation and
 unrelated work. That revision alone did not contain the completed foundation.
-The isolated foundation-only snapshot used here is
-`5daa5e3b29bf1b6ca3019f56f1bb9c0d2aca6954`. The feature worktree is
+The initial foundation-only snapshot was
+`5daa5e3b29bf1b6ca3019f56f1bb9c0d2aca6954`. On 2026-10-15 the feature commit was
+rebased onto the completed shared foundation commit `1612235`. This includes the
+foundation owner's resource-alias preservation fix. The original feature commit
+`708855a` remains on `codex/sound-before-foundation-update`; the rebased feature
+commit is `b6d7ced`. The feature worktree is
 `C:\Users\Oluwatola Ayedun\.codex\worktrees\sound-project-playback\SmithLetter`.
 This task did not modify the primary checkout or merge sibling feature work.
 
@@ -30,8 +34,9 @@ were used. Stock resources were read-only inputs.
 A legacy foundation fixture changed this worktree's `settings.json` by adding
 an empty `prompt_writer_provider`. Its exact diff was verified and restored to
 the baseline bytes after tests. It is not included in the feature commit.
-The task changes are isolated in the commit containing this handoff, directly
-after the foundation snapshot above; no remote operation was performed.
+Task changes remain isolated after the shared foundation baseline; no remote
+operation was performed. Reinspection of the completed foundation confirmed all
+four Sound/Forge integration blockers below remain unchanged.
 
 ## Modified paths and scope
 
@@ -179,12 +184,14 @@ The same runner was invoked separately with each module in this table:
 | `test_sound_visualizer_fallback` | 12 passed | 12 passed |
 | `test_saved_letter_restore_sound` | 28 passed | 28 passed |
 | `test_sound_project_playback` | New | 19 passed |
-| `test_sound_playback_lifecycle` | New | 12 passed |
+| `test_sound_playback_lifecycle` | New | 14 passed |
 | `test_window_sizing.WindowSizingTests.test_sound_and_message_fit_without_panel_scrolling` | Not separately run before edits | 1 passed, across all existing themes/modes/sizes |
 
 Baseline Sound selection: **74 passed**, no pre-existing failures in these four
 suites. Final Sound discovery (`-m unittest discover -s test -p 'test_sound*.py' -q`):
-**77 passed**; saved-sound restore separately: **28 passed**. The sizing check
+**79 passed** in 26.152 seconds on the shared foundation; saved-sound restore
+separately: **28 passed** in 7.550 seconds. The earlier 77-test run predates the
+two natural-playback regressions. The sizing check
 separately passed its existing theme/mode/size matrix. The vertical-list assertion initially failed against the old
 wrapping expectation; it was intentionally revised for the chosen ordered layout,
 not classified as a pre-existing failure. `git diff --check` passed for the complete task diff.
@@ -192,10 +199,12 @@ The sizing check initially exposed lost visualizer height and hidden-mode height
 reservation. The compact controls and active-card layout were corrected; its
 original no-scroll, control-bounds and minimum-preview assertions now pass.
 
-The root agent also reported **62 passing foundation tests** across
+The original snapshot passed **62 foundation tests** across
 `test_project_model`, `test_project_repository`, `test_project_session`, and
 `test_foundation_consumers`, using the repository unittest loader with `test`
-first on `sys.path`. These counts are separate from the Sound selection.
+first on `sys.path`. After rebasing onto `1612235`, the same selection passed
+**63 tests** in 7.190 seconds, including the new resource-alias regression.
+These counts are separate from the Sound selection.
 
 Coverage includes minimum/five/maximum supported page counts (2/5/10), repeated
 Letter pages, add/reorder/retype/delete/restore preserving project-wide sound,
@@ -227,22 +236,46 @@ Native screenshots, visually inspected:
 - `C:\Users\Oluwatola Ayedun\.codex\visualizations\2026\10\13\01a13763-c742-7670-891a-2d6ebcf71ae0\sound-smoke\sound-native-900.png`
 - `C:\Users\Oluwatola Ayedun\.codex\visualizations\2026\10\13\01a13763-c742-7670-891a-2d6ebcf71ae0\sound-smoke\sound-native-1400.png`
 
-An additional natural automatic-crossfade experiment hung inside native Qt's
-event loop after loading the second short WAV. The same hang was reproduced
-with the untouched baseline PlaylistPlayer implementation; 8 kHz mono and
-44.1 kHz stereo fixtures were tried. Owned hung processes were terminated and
-no hanging test was retained. Existing controlled crossfade/order/handoff tests
-pass, but natural-end/crossfade acceptance and audible listening remain open.
-Successful real non-MP3 conversion was not exercised; cancellation/failure used
-the production worker with injected conversion failure. No macOS, packaged
+The initial `QTest.qWait` natural-end experiment hung, including with the untouched
+baseline and single-track playback. On 2026-10-15 the same media completed normal
+playback under `QApplication.exec()`. Two bounded subprocess regressions now use
+that production event loop with offscreen Qt and the real native media backend:
+two-track crossfades repeat, single-track EndOfMedia repeats after its existing
+delay, and shutdown remains quiet. Each child has a 12-second watchdog and a
+16-second parent timeout. Muted 2-second 44.1 kHz stereo WAV fixtures are used.
+
+These checks exposed a duration-cache regression in the feature's source guards:
+reusing an unchanged URL does not emit Qt's `durationChanged` again, leaving the
+duration at zero and disabling subsequent crossfades. Reading `player.duration()`
+after `setSource()` preserves the backend's actual cached duration. Before the fix,
+the four track starts used slots `0,1,0,0` (the final start fell back to an end
+delay); afterward they use `0,1,0,1`, with both durations equal to 2000 ms. The
+14-test lifecycle suite passed, including both real natural-playback regressions.
+The `QTest.qWait` harness hang remains an environment limitation; it no longer
+blocks the production-event-loop checks. Audible listening remains unverified.
+Successful real WAV-to-MP3 conversion was verified on 2026-10-15 through
+`_ImportWorker.run()` with no converter mocks. FFprobe measured the generated
+44.1 kHz stereo fixture at 2.0 seconds. Registration, assignment/save/reload, and
+removal preserved the input, archived original, processed MP3 and catalog record.
+The worktree uses copies of the primary checkout's existing ignored FFmpeg and
+FFprobe executables; SHA-256 matched, and no tools were downloaded. Reproduce with:
+
+```powershell
+& 'C:\Users\Oluwatola Ayedun\Desktop\SmithLetter\.venv\Scripts\python.exe' "$env:TEMP\lss-accept-3a0ab45b\real_wav_import.py" 'C:\Users\Oluwatola Ayedun\.codex\worktrees\sound-project-playback\SmithLetter'
+```
+
+The script and `conversion.log`/`foundation.log` are in
+`%TEMP%\lss-accept-3a0ab45b`; the script creates and removes its isolated profile
+and synthetic files. Cancellation/failure coverage separately used the production
+worker with injected conversion failure. No macOS, packaged
 application, full release, external generation or publishing acceptance ran.
 The broader pre-existing failures in the foundation report remain outside this
 branch's claims.
 
 ## Integration handoff
 
-Integrate the feature commit only after reviewing the foundation snapshot against
-the shared foundation baseline; do not apply its parent over unrelated local work.
+The feature branch now starts from the completed shared foundation `1612235`.
+Integrate its feature commits without applying the superseded snapshot branch.
 Coordinate the four foundation/Forge changes above.
 After those contracts land, replace compatibility-only sound ownership with the
 canonical contract and verify real New Project, save/reload, A→B→A replacement,
@@ -259,5 +292,5 @@ Do not merge this report as a claim that sibling features or the release passed.
 - **Cross-feature verification:** actual foundation model/repository checks,
   existing saved-sound restore tests, offscreen Sound checks, and the scripted
   native Windows shell/media check ran. Canonical
-  Sound/Forge consumption, audible/natural-end media, sibling feature
+  Sound/Forge consumption, audible listening, sibling feature
   integration, packaged artifacts, and publishing remain unverified.

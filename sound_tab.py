@@ -2364,6 +2364,9 @@ class PlaylistPlayer(
         self._durations[slot] = 0
         self._bind_player(slot)
         player.setSource(source)
+        # Qt keeps a cached source when its URL is unchanged and does not emit
+        # durationChanged again. Preserve its duration for the next crossfade.
+        self._durations[slot] = max(0, int(player.duration()))
 
     def _publish_transport_state(self) -> None:
         playing = self.is_playing()
