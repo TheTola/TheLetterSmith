@@ -120,26 +120,49 @@ class PageLayoutTests(unittest.TestCase):
             tab = ImageTab(root)
             panel = self._panel(root)
             try:
-                tab.page_controls.count.setValue(6)
+                extra_id = tab.add_page("illustration")
+                tab.add_page("illustration")
                 self.assertEqual(len(panel._page_specs), 6)
-                panel._all_page_specs["page_1"].detail_widget.setPlainText("Blue garden")
-                panel.page_controller.select("page_1")
-                panel.page_controls.kind.setCurrentIndex(panel.page_controls.kind.findData("wall"))
-                panel.page_controls.move_left.click()
-                self.assertEqual(tab.page_controller.pages[2], LetterPage("page_1", "wall"))
-                self.assertEqual(tab.labels[5][0], "Letter 1 Image")
+                extra_key = tab.session.project.get_page(extra_id)["recovery"]["legacy_key"]
+                panel._all_page_specs[extra_key].detail_widget.setPlainText("Blue garden")
+                tab.session.select_page(extra_id)
+                tab.change_page_type(extra_id, "letter")
+                order = [page["id"] for page in tab.session.project.pages]
+                order.remove(extra_id)
+                order.insert(2, extra_id)
+                tab.reorder_pages(order)
+                self.assertEqual(tab.session.project.pages[2]["id"], extra_id)
+                self.assertEqual(panel.page_controller.pages[2], LetterPage(extra_key, "wall"))
+                self.assertIn("Letter", tab.page_list.item(2).text())
                 self.assertEqual(panel._page_specs[2].detail_widget.toPlainText(), "Blue garden")
                 panel._on_generate()
                 self.assertEqual(len(panel._generated_prompts), 6)
-                self.assertIn("The Wall Page", panel._generated_prompts["page_1"])
-                panel._copy_prompt("page_1")
-                self.assertEqual(self.app.clipboard().text(), panel._generated_prompts["page_1"])
-                panel.page_controls.count.setValue(2)
-                self.assertFalse(panel._generated_output_valid)
-                self.assertEqual(list(tab.cards), [1, 4])
-                panel.page_controls.count.setValue(10)
+                self.assertIn("The Wall Page", panel._generated_prompts[extra_key])
+                panel._copy_prompt(extra_key)
+                self.assertEqual(self.app.clipboard().text(), panel._generated_prompts[extra_key])
+                prompts_before_delete = {
+                    page["id"]: panel._generated_prompts[page["recovery"]["legacy_key"]]
+                    for page in tab.session.project.pages
+                }
+                for page_id in order[1:-1]:
+                    tab.delete_page(page_id, confirm=False)
+                # Deletion preserves the remaining authored prompts, while
+                # the shared adapter removes deleted pages from active views.
+                remaining = tab.session.project.pages
+                self.assertEqual([page.key for page in panel._page_specs],
+                                 [page["recovery"]["legacy_key"] for page in remaining])
+                for page in remaining:
+                    self.assertEqual(page["prompt"]["text"], prompts_before_delete[page["id"]])
+                self.assertEqual(tab.page_list.count(), 2)
+                for _ in order[1:-1]:
+                    self.assertTrue(tab.undo_delete())
+                self.assertEqual([page["id"] for page in tab.session.project.pages], order)
+                for page in tab.session.project.pages:
+                    self.assertEqual(page["prompt"]["text"], prompts_before_delete[page["id"]])
+                for _ in range(4):
+                    tab.add_page("illustration")
                 self.assertEqual(len(panel._page_specs), 10)
-                self.assertEqual(panel._all_page_specs["page_1"].detail_widget.toPlainText(), "Blue garden")
+                self.assertEqual(panel._all_page_specs[extra_key].detail_widget.toPlainText(), "Blue garden")
                 panel._on_generate()
                 self.assertTrue(panel._generated_output_valid)
                 self.assertEqual(len(panel._generated_prompts), 10)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -28,9 +29,7 @@ from Image_tab import (
     ImageSettingsDialog,
     ImageTab,
     StockImageDialog,
-    _PreparedImageImportResult,
     _ImageThumbnail,
-    _ResetImagesConfirmationDialog,
 )
 from image_animation import (
     FOREVER,
@@ -48,11 +47,34 @@ from image_animation import (
 )
 from portable_export import create_single_html
 from Message_tab import MessageTab
-from project_state import ProjectStateController
+from project_repository import active_project_repository
+from project_session import release_project_session
 from recent_media import _history_path, recent_media, remember_image_copy, remember_media
 from settings_store import SettingsStore
-from ui_sounds import UiSound
-from ui_theme import BUTTON_TIER_STYLES, THEMES, ButtonTier, ThemeService
+from ui_theme import THEMES, ThemeService
+
+
+@contextmanager
+def _workspace_tab(root):
+    tab = ImageTab(root)
+    try:
+        yield tab
+    finally:
+        tab.shutdown()
+        tab.close()
+        tab.deleteLater()
+        QtWidgets.QApplication.processEvents()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        release_project_session(root)
+
+
+def _wait_for_import(tab, timeout=8):
+    deadline = time.monotonic() + timeout
+    while tab._image_import_thread is not None:
+        QtWidgets.QApplication.processEvents()
+        if time.monotonic() >= deadline:
+            raise AssertionError("Image import thread did not finish.")
+        time.sleep(0.01)
 
 
 class _FakeMovie:
@@ -281,6 +303,20 @@ class ImageAnimationTests(unittest.TestCase):
         dialog.reset_defaults()
         self.assertEqual(dialog.gif_settings()["start_delay_ms"], 0)
         self.assertEqual(dialog.gif_settings()["loop_pause_ms"], 0)
+
+    def test_gif_controls_retain_ping_pong_when_speed_and_count_change(self) -> None:
+        dialog = ImageSettingsDialog(
+            "Cover Page Image", animated_gif=True,
+            settings={"playback_mode": "ping_pong", "play_count": 2, "speed_percent": 100},
+        )
+        self.addCleanup(dialog.deleteLater)
+        dialog.speed.setCurrentText("50%")
+        dialog.play_count.setCurrentText("3")
+        self.assertEqual(dialog.gif_settings()["playback_mode"], "ping_pong")
+        self.assertEqual(dialog.gif_settings()["speed_percent"], 50)
+        self.assertEqual(dialog.gif_settings()["play_count"], 3)
+        dialog.play_count.setCurrentText("Original")
+        self.assertEqual(dialog.gif_settings()["playback_mode"], "original")
 
     def test_gif_controls_outside_click_and_escape_discard(self) -> None:
         previews = []
@@ -797,6 +833,21 @@ class ImageAnimationTests(unittest.TestCase):
         finally:
             browse_dialog.close()
 
+    def test_stock_images_remain_available_alongside_recent_images(self) -> None:
+        stock = Path("stock.png")
+        recent = Path("recent.png")
+        dialog = StockImageDialog("Cover", (stock,), recent_paths=(recent,),
+                                  recent_labels=("Previous import",), allow_browse=True)
+        try:
+            self.assertEqual(dialog._images.count(), 1)
+            self.assertEqual(dialog._recent_images.count(), 1)
+            dialog._images.itemClicked.emit(dialog._images.item(0))
+            self.assertEqual(dialog.selected_path(), stock)
+            self.assertEqual(dialog.result(), QtWidgets.QDialog.Accepted)
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+
     def test_recent_images_are_limited_to_each_project_slot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -818,8 +869,8 @@ class ImageAnimationTests(unittest.TestCase):
                 "Cover Page", paths[:3], recent_paths=paths[1:], allow_browse=True
             )
             try:
-                self.assertEqual(dialog.size(), QtCore.QSize(420, 205))
-                self.assertIsNone(dialog._images)
+                self.assertEqual(dialog.size(), QtCore.QSize(420, 351))
+                self.assertEqual(dialog._images.count(), 3)
                 self.assertEqual(dialog._recent_images.count(), 3)
                 self.assertEqual(
                     dialog.findChildren(QtWidgets.QLabel)[0].text(),
@@ -862,31 +913,17 @@ class ImageAnimationTests(unittest.TestCase):
             )
 
     def test_recent_images_open_without_stock_images(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, _workspace_tab(directory) as tab:
             recent_path = Path(directory) / "recent.png"
             Image.new("RGB", (8, 8), "red").save(recent_path)
-            tab = mock.Mock()
-            tab.labels = {1: ("Cover Page Image", "cover.png")}
-            tab.project_root = Path(directory)
-            tab.project_state.identity.project_id = "project-a"
-            with (
-                mock.patch(
-                    "Image_tab.recent_media",
-                    return_value=((str(recent_path), recent_path.name),),
-                ),
-                mock.patch("Image_tab.StockImageDialog") as dialog_type,
-            ):
-                dialog_type.return_value.exec.return_value = (
-                    QtWidgets.QDialog.Rejected
-                )
-                ImageTab.open_stock_gallery(tab, 1)
-
-            tab._stock_image_paths.assert_not_called()
-            tab._show_temporary_status.assert_not_called()
+            page_id = tab.session.selected_page_id
+            remember_media(directory, tab.session.project.project_id, f"image:{page_id}",
+                           str(recent_path), recent_path.name)
+            with mock.patch("Image_tab.StockImageDialog") as dialog_type:
+                dialog_type.return_value.exec.return_value = QtWidgets.QDialog.Rejected
+                tab._stock_selected()
             self.assertEqual(dialog_type.call_args.args[1], ())
-            self.assertEqual(
-                dialog_type.call_args.kwargs["recent_paths"], (recent_path,)
-            )
+            self.assertEqual(dialog_type.call_args.kwargs["recent_paths"], (recent_path,))
 
     def test_recent_image_uses_owned_copy_after_source_is_removed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -905,116 +942,57 @@ class ImageAnimationTests(unittest.TestCase):
             self.assertTrue(Path(recent[0][0]).is_file())
             self.assertEqual(recent_media(root, project_id, "image:letter"), ())
 
-    def test_empty_image_uses_stock_tray_and_filled_image_browses(self) -> None:
-        tab = mock.Mock()
-        tab.labels = {1: ("Cover Page", "cover.png")}
-        tab.image_paths = {1: None}
-
-        ImageTab._pick_image_dialog(tab, 1)
-
-        tab.open_stock_gallery.assert_called_once_with(1)
-        tab._browse_image_file.assert_not_called()
-
-        tab.image_paths[1] = "cover.png"
-        ImageTab._pick_image_dialog(tab, 1)
-
-        tab._browse_image_file.assert_called_once_with(1)
+    def test_empty_and_populated_artwork_keep_import_and_stock_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, _workspace_tab(directory) as tab:
+            self.assertEqual(tab.import_button.text(), "Import Image")
+            self.assertTrue(tab.stock_button.isEnabled())
+            source = Path(directory) / "artwork.png"
+            self._write_png(source)
+            target = tab.artwork.capture_target(tab.session.selected_page_id)
+            self.assertTrue(tab.artwork.apply_import(target, tab.artwork.stage_import(source)))
+            self.app.processEvents()
+            self.assertEqual(tab.import_button.text(), "Replace Image")
+            self.assertTrue(tab.stock_button.isEnabled())
 
     def test_image_and_message_imports_open_in_downloads(self) -> None:
-        image_tab = mock.Mock()
-        image_tab.labels = {1: ("Cover Page", "cover.png")}
-        message_tab = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory, _workspace_tab(directory) as image_tab:
+            with (
+                mock.patch("images_workspace.QtCore.QStandardPaths.writableLocation",
+                           return_value="C:/Users/Test/Downloads"),
+                mock.patch.object(QtWidgets.QFileDialog, "getOpenFileName", return_value=("", "")) as image_chooser,
+            ):
+                image_tab._browse_selected()
+            self.assertEqual(image_chooser.call_args.args[2], "C:/Users/Test/Downloads")
+            self.assertIn("*.gif", image_chooser.call_args.args[3])
         with (
-            mock.patch(
-                "Image_tab.QtCore.QStandardPaths.writableLocation",
-                return_value="C:/Users/Test/Downloads",
-            ),
-            mock.patch.object(
-                QtWidgets.QFileDialog,
-                "getOpenFileName",
-                return_value=("", ""),
-            ) as image_chooser,
+            mock.patch("Message_tab.QtCore.QStandardPaths.writableLocation",
+                       return_value="C:/Users/Test/Downloads"),
+            mock.patch.object(QtWidgets.QFileDialog, "getOpenFileName", return_value=("", "")) as message_chooser,
         ):
-            ImageTab._browse_image_file(image_tab, 1)
-
-        with (
-            mock.patch(
-                "Message_tab.QtCore.QStandardPaths.writableLocation",
-                return_value="C:/Users/Test/Downloads",
-            ),
-            mock.patch.object(
-                QtWidgets.QFileDialog,
-                "getOpenFileName",
-                return_value=("", ""),
-            ) as message_chooser,
-        ):
-            MessageTab.select_file(message_tab)
-
-        self.assertEqual(image_chooser.call_args.args[2], "C:/Users/Test/Downloads")
-        self.assertIn("*.gif", image_chooser.call_args.args[3])
+            MessageTab.select_file(mock.Mock())
         self.assertEqual(message_chooser.call_args.args[2], "C:/Users/Test/Downloads")
 
     def test_saved_gif_settings_refresh_preview_immediately(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            pages = Path(directory) / "pages"
+        with tempfile.TemporaryDirectory() as directory, _workspace_tab(directory) as tab:
             source = Path(directory) / "source.gif"
             self._write_gif(source)
-            install_image_asset(pages, "cover", source)
+            page_id = tab.session.selected_page_id
+            self.assertTrue(tab.artwork.apply_import(tab.artwork.capture_target(page_id), tab.artwork.stage_import(source)))
             dialog = mock.Mock()
             dialog.exec.return_value = QtWidgets.QDialog.Accepted
-            dialog.gif_settings.return_value = {
-                "animation_enabled": True,
-                "speed_percent": 225,
-            }
-            tab = SimpleNamespace(
-                labels={1: ("Cover Page", "cover.png")},
-                _user_pages_dir=mock.Mock(return_value=str(pages)),
-                project_save_service=SimpleNamespace(
-                    copy_workspace_file=mock.Mock()
-                ),
-                refresh_cards=mock.Mock(),
-                _commit_image_change=mock.Mock(),
-                animation_settings_changed=SimpleNamespace(emit=mock.Mock()),
-                _show_temporary_status=mock.Mock(),
-            )
-
-            with mock.patch(
-                "Image_tab.ImageSettingsDialog",
-                return_value=dialog,
-            ):
-                ImageTab.open_image_settings(tab, 1)
-
-            tab.refresh_cards.assert_called_once_with()
-            saved = load_image_manifest(pages)["slots"]["cover"]["settings"]
+            dialog.gif_settings.return_value = {"animation_enabled": True, "speed_percent": 225}
+            with mock.patch("Image_tab.ImageSettingsDialog", return_value=dialog):
+                tab._animation_selected()
+            saved = tab.session.project.get_page(page_id)["artwork"]["animation"]
             self.assertTrue(saved["animation_enabled"])
             self.assertEqual(saved["speed_percent"], 225)
-            reopened = ImageSettingsDialog(
-                "Cover Page Image", animated_gif=True, settings=saved,
-            )
+            self.assertEqual(tab.card._movie.speed(), 225)
+            stored = active_project_repository(directory).load()
+            self.assertEqual(stored.project.get_page(page_id)["artwork"]["animation"]["speed_percent"], 225)
+            reopened = ImageSettingsDialog("Cover Page Image", animated_gif=True, settings=saved)
             self.addCleanup(reopened.deleteLater)
             self.assertEqual(reopened.speed.currentText(), "Custom…")
             self.assertEqual(reopened.custom_speed.value(), 225)
-
-    def test_reset_confirmation_is_frameless_modal_and_color_coded(self) -> None:
-        dialog = _ResetImagesConfirmationDialog()
-        try:
-            self.assertTrue(
-                dialog.windowFlags()
-                & QtCore.Qt.FramelessWindowHint
-            )
-            self.assertTrue(dialog.isModal())
-            self.assertEqual(
-                dialog.windowModality(),
-                QtCore.Qt.ApplicationModal,
-            )
-            self.assertEqual(dialog.yes_button.text(), "Yes")
-            self.assertEqual(dialog.no_button.text(), "No")
-            self.assertEqual(dialog.yes_button.size(), dialog.no_button.size())
-            self.assertEqual(dialog.yes_button.height(), 42)
-            self.assertIn("#ff626c", dialog.styleSheet())
-            self.assertIn("#00d0ff", dialog.styleSheet())
-        finally:
-            dialog.close()
 
     def test_thumbnail_frame_uses_each_theme_secondary_color(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1109,287 +1087,129 @@ class ImageAnimationTests(unittest.TestCase):
             finally:
                 card.release_asset_handle()
 
-    def test_reset_requires_yes_before_clearing_images(self) -> None:
-        tab = mock.Mock()
-        with mock.patch(
-            "Image_tab._ResetImagesConfirmationDialog"
-        ) as dialog_type:
-            dialog_type.return_value.exec.return_value = (
-                QtWidgets.QDialog.DialogCode.Rejected
-            )
-            ImageTab.reset_images(tab)
-            tab._reset_images_confirmed.assert_not_called()
-
-            dialog_type.return_value.exec.return_value = (
-                QtWidgets.QDialog.DialogCode.Accepted
-            )
-            ImageTab.reset_images(tab)
-            tab._reset_images_confirmed.assert_called_once_with()
-
-    def test_confirmed_reset_uses_the_clear_image_sound_once(self) -> None:
-        card = SimpleNamespace(
-            release_asset_handle=mock.Mock(),
-            clear_pixmap=mock.Mock(),
-        )
-        tab = SimpleNamespace(
-            labels={1: ("Cover Page", "cover.png")},
-            cards={1: card},
-            image_paths={1: "cover.png"},
-            project_state=SimpleNamespace(is_project_ready=False),
-            _user_pages_dir=mock.Mock(return_value="pages"),
-            clear_preview=SimpleNamespace(emit=mock.Mock()),
-            _commit_image_change=mock.Mock(),
-            _show_temporary_status=mock.Mock(),
-        )
-
-        with (
-            mock.patch("Image_tab.clear_slot_asset"),
-            mock.patch("Image_tab.play_ui_sound") as play_sound,
-        ):
-            ImageTab._reset_images_confirmed(tab)
-
-        play_sound.assert_called_once_with(UiSound.REMOVED)
-
-    def test_image_utility_buttons_preserve_artwork_and_do_not_overlap_cards(self) -> None:
-        expected_size = BUTTON_TIER_STYLES[ButtonTier.LARGE].size
-
-        with tempfile.TemporaryDirectory() as directory:
-            image_tab = ImageTab(directory)
-            image_tab.resize(1180, 340)
-            image_tab.show()
+    def test_selected_page_toolbar_does_not_overlap_artwork(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, _workspace_tab(directory) as tab:
+            tab.resize(1100, 720)
+            tab.show()
             self.app.processEvents()
-            image_tab.reset_btn.apply_theme_assets(None)
-            image_tab.open_btn.apply_theme_assets(None)
+            artwork = QtCore.QRect(tab.card.mapTo(tab, QtCore.QPoint()), tab.card.size())
+            for button in (tab.import_button, tab.stock_button, tab.crop_button, tab.more_button):
+                bounds = QtCore.QRect(button.mapTo(tab, QtCore.QPoint()), button.size())
+                self.assertFalse(bounds.intersects(artwork))
+                self.assertTrue(button.text())
+
+    def test_compact_page_navigator_scrolls_to_keyboard_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, _workspace_tab(directory) as tab:
+            from project_model import MAX_PAGES
+            while len(tab.session.project.pages) < MAX_PAGES:
+                tab.add_page("illustration")
+            tab.resize(750, 520)
+            tab.show()
             self.app.processEvents()
-            try:
-                self.assertEqual(
-                    image_tab.reset_btn.size(),
-                    expected_size,
-                )
-                self.assertEqual(
-                    image_tab.open_btn.size(),
-                    expected_size,
-                )
-                self.assertEqual(image_tab.reset_btn.property("buttonTier"), "large")
-                self.assertEqual(image_tab.open_btn.property("buttonTier"), "large")
-                self.assertFalse(image_tab.reset_btn._artwork_stretch)
-                self.assertFalse(image_tab.open_btn._artwork_stretch)
-                for button in (
-                    image_tab.reset_btn,
-                    image_tab.open_btn,
-                ):
-                    self.assertFalse(
-                        button.geometry().intersects(
-                            image_tab.cards[1].geometry()
-                        )
-                    )
-            finally:
-                image_tab.close()
-
-    def test_image_cards_scroll_horizontally_when_window_narrows(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            image_tab = ImageTab(directory)
-            try:
-                image_tab.resize(1180, 820)
-                image_tab.show()
-                image_tab.page_controls.count.setValue(10)
-                self.app.processEvents()
-                self.assertEqual(image_tab._cards_columns, 10)
-                self.assertEqual(len({card.y() for card in image_tab.cards.values()}), 1)
-                self.assertGreater(image_tab._cards_scroll.horizontalScrollBar().maximum(), 0)
-                image_tab.page_controller.select("back")
-                self.app.processEvents()
-                self.assertGreater(image_tab._cards_scroll.horizontalScrollBar().value(), 0)
-                image_tab.page_controller.select("cover")
-                self.app.processEvents()
-                self.assertEqual(image_tab._cards_scroll.horizontalScrollBar().value(), 0)
-            finally:
-                image_tab.shutdown()
-                image_tab.close()
-
+            self.assertEqual(tab.page_list.count(), MAX_PAGES)
+            self.assertGreater(tab.page_list.verticalScrollBar().maximum(), 0)
+            tab.page_list.setCurrentRow(MAX_PAGES - 1)
+            tab.page_list.scrollToItem(tab.page_list.currentItem())
+            self.app.processEvents()
+            self.assertGreater(tab.page_list.verticalScrollBar().value(), 0)
+            self.assertEqual(tab.session.selected_page_id, tab.session.project.pages[-1]["id"])
 
 class ImageTabPerformanceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 
-    @staticmethod
-    def _tab_stub(fingerprint: str = "same") -> SimpleNamespace:
-        return SimpleNamespace(
-            _disk_fingerprint=fingerprint,
-            _project_dir=mock.Mock(return_value="project"),
-            refresh_cards=mock.Mock(return_value=False),
-            _emit_cover_change_if_needed=mock.Mock(return_value=False),
-            images_changed=mock.Mock(),
-        )
+    def test_unchanged_sync_reuses_artwork_preview_and_thumbnail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, _workspace_tab(directory) as tab:
+            source = Path(directory) / "source.png"
+            ImageAnimationTests._write_png(source)
+            page_id = tab.session.selected_page_id
+            tab.artwork.apply_import(tab.artwork.capture_target(page_id), tab.artwork.stage_import(source))
+            cached = tab._thumbnail_cache[page_id]
+            with mock.patch.object(tab.card, "set_asset_path", wraps=tab.card.set_asset_path) as display:
+                tab.sync_from_disk()
+                tab.sync_from_disk()
+            display.assert_not_called()
+            self.assertIs(tab._thumbnail_cache[page_id], cached)
 
-    def test_unchanged_sync_skips_card_rebuild_and_second_fingerprint(self) -> None:
-        tab = self._tab_stub()
+    def test_artwork_change_invalidates_only_its_own_thumbnail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, _workspace_tab(directory) as tab:
+            source = Path(directory) / "source.png"
+            ImageAnimationTests._write_png(source)
+            first, second = [page["id"] for page in tab.session.project.pages[:2]]
+            for page_id in (first, second):
+                tab.artwork.apply_import(tab.artwork.capture_target(page_id), tab.artwork.stage_import(source))
+            untouched = tab._thumbnail_cache[second]
+            before = tab._thumbnail_cache[first]
+            Image.new("RGB", (20, 30), "blue").save(source)
+            tab.artwork.apply_import(tab.artwork.capture_target(first), tab.artwork.stage_import(source))
+            self.assertIs(tab._thumbnail_cache[second], untouched)
+            self.assertNotEqual(tab._thumbnail_cache[first][0], before[0])
 
-        with mock.patch(
-            "Image_tab.image_fingerprint",
-            return_value="same",
-        ) as fingerprint:
-            changed = ImageTab.sync_from_disk(tab)
-
-        self.assertFalse(changed)
-        fingerprint.assert_called_once_with("project")
-        tab.refresh_cards.assert_not_called()
-        tab.images_changed.emit.assert_not_called()
-
-    def test_reconciliation_is_the_only_sync_that_refingerprints(self) -> None:
-        tab = self._tab_stub("before")
-        tab.refresh_cards.return_value = True
-
-        with mock.patch(
-            "Image_tab.image_fingerprint",
-            side_effect=("external", "reconciled"),
-        ) as fingerprint:
-            changed = ImageTab.sync_from_disk(tab)
-
-        self.assertTrue(changed)
-        self.assertEqual(fingerprint.call_count, 2)
-        self.assertEqual(tab._disk_fingerprint, "reconciled")
-        tab.refresh_cards.assert_called_once_with()
-        tab.images_changed.emit.assert_called_once_with("disk")
-
-    def test_unchanged_sync_to_disk_skips_card_rebuild(self) -> None:
-        tab = self._tab_stub()
-
-        with mock.patch(
-            "Image_tab.image_fingerprint",
-            return_value="same",
-        ) as fingerprint:
-            changed = ImageTab.sync_to_disk(tab)
-
-        self.assertFalse(changed)
-        fingerprint.assert_called_once_with("project")
-        tab.refresh_cards.assert_not_called()
-        tab.images_changed.emit.assert_not_called()
+    def test_sync_to_disk_flushes_pending_page_name_to_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, _workspace_tab(directory) as tab:
+            page_id = tab.session.selected_page_id
+            tab.name_edit.setText("Pending page name")
+            tab.name_edit.textEdited.emit("Pending page name")
+            tab.sync_to_disk()
+            self.assertEqual(tab.session.project.get_page(page_id)["name"], "Pending page name")
+            self.assertEqual(active_project_repository(directory).load().project.get_page(page_id)["name"], "Pending page name")
 
     def test_image_preprocessing_runs_off_ui_thread_and_rejects_overlap(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            state = ProjectStateController(root)
-            state.initialize()
-            state.establish_project(
-                "Amanda Miller",
-                custom_capitalization=True,
-            )
-            SettingsStore(root).update_fields(
-                {"recipient_title": "Morning Joy"}
-            )
-            pages = root / "gallery/user/pages"
-            pages.mkdir(parents=True)
-            for name in ("letter.png", "wall.png", "back.png"):
-                Image.new("RGBA", (16, 16), "red").save(
-                    pages / name,
-                    format="PNG",
-                )
-            source = root / "replacement.png"
-            Image.new("RGBA", (512, 512), "green").save(source, format="PNG")
-            tab = ImageTab(root, project_state=state)
-            self.assertFalse(tab.project_save_service.can_save())
-            started = threading.Event()
-            release = threading.Event()
-            worker_threads: list[QtCore.QThread] = []
-
+        with tempfile.TemporaryDirectory() as directory, _workspace_tab(directory) as tab:
+            source = Path(directory) / "source.png"
+            Image.new("RGB", (512, 512), "green").save(source)
+            page_id = tab.session.selected_page_id
+            started, release = threading.Event(), threading.Event()
+            worker_threads = []
+            stage = tab.artwork.stage_import
             def delayed_prepare(*args, **kwargs):
                 worker_threads.append(QtCore.QThread.currentThread())
                 started.set()
                 if not release.wait(5):
                     raise RuntimeError("Test image import did not resume.")
-                return prepare_image_asset_import(*args, **kwargs)
-
-            try:
-                with mock.patch(
-                    "Image_tab.prepare_image_asset_import",
-                    side_effect=delayed_prepare,
-                ):
-                    tab.set_image_path(1, str(source))
+                return stage(*args, **kwargs)
+            with mock.patch.object(tab.artwork, "stage_import", side_effect=delayed_prepare):
+                try:
+                    self.assertTrue(tab.import_image(page_id, str(source)))
                     self.assertTrue(started.wait(2))
                     first_thread = tab._image_import_thread
-                    first_generation = tab._image_import_generation
-
-                    tab.set_image_path(1, str(source))
-
+                    self.assertFalse(tab.import_image(page_id, str(source)))
                     self.assertIs(tab._image_import_thread, first_thread)
-                    self.assertEqual(tab._image_import_generation, first_generation)
+                finally:
                     release.set()
-                    deadline = time.monotonic() + 5
-                    while tab._image_import_thread is not None:
-                        self.app.processEvents()
-                        if time.monotonic() >= deadline:
-                            self.fail("Image import thread did not finish.")
-                        time.sleep(0.01)
-
-                self.assertTrue(worker_threads)
-                self.assertIsNot(worker_threads[0], self.app.thread())
-                with Image.open(root / "gallery/user/pages/cover.png") as installed:
-                    self.assertEqual(installed.getpixel((0, 0))[:3], (0, 128, 0))
-                context = tab.project_save_service.current_context()
-                self.assertTrue(
-                    (context.autosave_directory / "pages/cover.png").is_file()
-                )
-            finally:
-                release.set()
-                tab.shutdown()
-                tab.close()
-                state.shutdown()
+                _wait_for_import(tab)
+            self.assertIsNot(worker_threads[0], self.app.thread())
+            with Image.open(tab.artwork.resolve_asset(page_id)) as installed:
+                self.assertEqual(installed.getpixel((0, 0))[:3], (0, 128, 0))
+            stored = active_project_repository(directory).load()
+            self.assertTrue((stored.asset_root / stored.project.get_page(page_id)["artwork"]["asset"]).is_file())
 
     def test_project_restore_invalidates_late_image_import_result(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            state = ProjectStateController(root)
-            state.initialize()
-            state.establish_project(
-                "Amanda Miller",
-                custom_capitalization=True,
-            )
-            tab = ImageTab(root, project_state=state)
-            generation = tab._image_import_generation
-            worker = mock.Mock()
-            worker_thread = mock.Mock()
-            worker_thread.isRunning.return_value = True
-            worker_thread.wait.return_value = False
-            tab._image_import_thread = worker_thread
-            tab._image_import_worker = worker
-            tab._image_import_result_holder = {}
-            tab._image_import_index = 1
-
-            try:
-                with self.assertRaises(RuntimeError):
-                    tab.prepare_for_project_restore(timeout_ms=10)
-                worker.cancel.assert_called_once_with()
-                worker_thread.requestInterruption.assert_called_once_with()
-                worker_thread.wait.assert_called_once_with(10)
-                worker_thread.setParent.assert_called_once_with(None)
-                self.assertEqual(tab._image_import_generation, generation + 1)
-                self.assertIsNone(tab._image_import_thread)
-
-                prepared = mock.Mock()
-                result = _PreparedImageImportResult(
-                    generation=generation,
-                    index=1,
-                    project_identity=("recipient", "project"),
-                    baseline_fingerprint="baseline",
-                    project_pages_directory=None,
-                    prepared=prepared,
-                    preview_image=QtGui.QImage(),
-                )
-                holder = {"result": result}
-                tab._image_import_result_holder = holder
-                tab._image_import_prepared(result)
-                prepared.abort.assert_called_once_with()
-                self.assertNotIn("result", holder)
-
-                self.assertFalse(
-                    (root / "gallery/user/pages/cover.png").exists()
-                )
-            finally:
-                tab.shutdown()
-                tab.close()
-                state.shutdown()
+        with tempfile.TemporaryDirectory() as directory, _workspace_tab(directory) as tab:
+            source = Path(directory) / "source.png"
+            ImageAnimationTests._write_png(source)
+            page_id = tab.session.selected_page_id
+            before = tab.session.project.to_dict()
+            entered, release = threading.Event(), threading.Event()
+            stage = tab.artwork.stage_import
+            def delayed_prepare(*args, **kwargs):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("Test image import did not resume.")
+                return stage(*args, **kwargs)
+            with mock.patch.object(tab.artwork, "stage_import", side_effect=delayed_prepare):
+                try:
+                    self.assertTrue(tab.import_image(page_id, str(source)))
+                    self.assertTrue(entered.wait(2))
+                    with self.assertRaises(RuntimeError):
+                        tab.prepare_for_project_restore(timeout_ms=10)
+                    self.assertTrue(tab._import_cancelled.is_set())
+                finally:
+                    release.set()
+                _wait_for_import(tab)
+            self.assertEqual(tab.session.project.to_dict(), before)
+            self.assertEqual(list(Path(directory).glob(".artwork-import-*")), [])
 
     def test_movie_pauses_and_resumes_without_reconstruction(self) -> None:
         movie = _FakeMovie(QtGui.QMovie.Running)
@@ -1470,6 +1290,42 @@ class ImageTabPerformanceTests(unittest.TestCase):
             self.assertEqual(card._preview_phase, "end")
             self.assertEqual(card._movie.currentFrameNumber(), 2)
             card.release_asset_handle()
+
+    def test_ping_pong_preview_reverses_frames_and_stops_on_last_forward_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.gif"
+            ImageAnimationTests._write_gif(source, durations=(40, 40, 40))
+            original_bytes = source.read_bytes()
+            card = ImageAssetCard(1, "Cover", directory)
+            self.addCleanup(card.deleteLater)
+            try:
+                card.set_asset_path(str(source), animated_gif=True, settings={
+                    "playback_mode": "ping_pong", "play_count": 2,
+                    "speed_percent": 50, "start_delay_ms": 100, "loop_pause_ms": 60,
+                })
+                movie = card._movie
+                observed = [movie.currentFrameNumber()]
+                movie.frameChanged.connect(observed.append)
+                self.assertEqual(card._preview_phase, "start")
+                self.assertTrue(card._preview_timer.isActive())
+                deadline = time.monotonic() + 3
+                while card._preview_phase != "end" and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.005)
+                displayed = [frame for index, frame in enumerate(observed)
+                             if index == 0 or observed[index - 1] != frame]
+                self.assertEqual(displayed, [0, 1, 2, 1, 0, 1, 2])
+                self.assertEqual(card._completed_cycles, 2)
+                self.assertEqual(card._preview_phase, "end")
+                self.assertEqual(movie.currentFrameNumber(), 2)
+                self.assertGreaterEqual(movie.nextFrameDelay(), 70)
+                card.set_playback_active(False)
+                card.set_playback_active(True)
+                self.assertEqual(card._preview_phase, "end")
+                self.assertEqual(movie.currentFrameNumber(), 2)
+                self.assertEqual(source.read_bytes(), original_bytes)
+            finally:
+                card.release_asset_handle()
 
     def test_stopped_gif_card_keeps_preview_frame_without_movie(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1559,33 +1415,25 @@ class ImageTabPerformanceTests(unittest.TestCase):
         self.assertEqual(movie.state(), QtGui.QMovie.NotRunning)
         self.assertEqual(movie.start_calls, 0)
 
-    def test_tab_lifecycle_controls_all_card_movies(self) -> None:
-        cards = {
-            1: mock.Mock(),
-            2: mock.Mock(),
-        }
-        tab = SimpleNamespace(
-            _tab_active=True,
-            cards=cards,
-            sync_from_disk=mock.Mock(),
-            sync_to_disk=mock.Mock(),
-        )
-
-        ImageTab.deactivate_for_tab_change(tab)
-
-        self.assertFalse(tab._tab_active)
-        tab.sync_to_disk.assert_called_once_with()
-        for card in cards.values():
-            card.set_playback_active.assert_called_once_with(False)
-            card.release_asset_handle.assert_not_called()
-
-        ImageTab.activate_for_tab_change(tab)
-
-        self.assertTrue(tab._tab_active)
-        tab.sync_from_disk.assert_called_once_with()
-        for card in cards.values():
-            card.set_playback_active.assert_called_with(True)
-
+    def test_tab_lifecycle_pauses_and_resumes_selected_artwork(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, _workspace_tab(directory) as tab:
+            source = Path(directory) / "source.gif"
+            ImageAnimationTests._write_gif(source)
+            page_id = tab.session.selected_page_id
+            tab.artwork.apply_import(tab.artwork.capture_target(page_id), tab.artwork.stage_import(source))
+            tab.activate_for_tab_change()
+            self.app.processEvents()
+            movie = tab.card._movie
+            self.assertIsNotNone(movie)
+            self.assertEqual(movie.state(), QtGui.QMovie.Running)
+            tab.deactivate_for_tab_change()
+            self.assertFalse(tab._tab_active)
+            self.assertIs(tab.card._movie, movie)
+            self.assertEqual(movie.state(), QtGui.QMovie.Paused)
+            tab.activate_for_tab_change()
+            self.assertTrue(tab._tab_active)
+            self.assertIs(tab.card._movie, movie)
+            self.assertEqual(movie.state(), QtGui.QMovie.Running)
 
 if __name__ == "__main__":
     unittest.main()

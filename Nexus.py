@@ -2108,6 +2108,9 @@ class Nexus(QtWidgets.QMainWindow):
             self.protected_new_project_btn,
             "Leave this demonstration and begin your own letter.",
         )
+        help_row.addWidget(
+            self.protected_new_project_btn, 0, Qt.AlignLeft | Qt.AlignVCenter,
+        )
         help_row.addStretch(1)
         self.preview_tools_layout = help_row
 
@@ -2641,6 +2644,8 @@ class Nexus(QtWidgets.QMainWindow):
         self.image_tab.clear_preview.connect(
             self._on_image_tab_clear_preview
         )
+        self.image_tab.prompt_requested.connect(self.open_prompt_writer)
+        self.image_tab.message_requested.connect(self.open_page_message)
         self.message_tab.preview_image.connect(
             lambda pixmap: self._show_image_for_tab(2, pixmap)
         )
@@ -3064,64 +3069,14 @@ class Nexus(QtWidgets.QMainWindow):
         button = getattr(self, "protected_new_project_btn", None)
         if button is None or not button.isVisible():
             return
-        preview_frame = getattr(self, "preview_frame", None)
-        image_tab = getattr(self, "image_tab", None)
-        prompt_button = getattr(image_tab, "pwrite_fab", None)
-        if preview_frame is None or prompt_button is None:
-            return
-
-        x_position = prompt_button.x()
         icon = button.icon()
-        if self.body.height() < 760:
-            preview_position = preview_frame.mapTo(self, QPoint(0, 0))
-            if self.tabbar.currentIndex() == 0 and prompt_button.isVisible():
-                x_position = prompt_button.geometry().right() + 1 + NEW_PROJECT_ARTWORK_GAP
-            available_width = max(
-                1,
-                min(
-                    NEW_PROJECT_ARTWORK_PX,
-                    preview_position.x() - x_position - NEW_PROJECT_ARTWORK_GAP,
-                ),
-            )
-            size = (
-                icon.actualSize(QSize(available_width, preview_frame.height()))
-                if not icon.isNull()
-                else QSize(available_width, min(56, preview_frame.height()))
-            )
-            y_position = preview_position.y() + (preview_frame.height() - size.height()) // 2
-        else:
-            size = (
-                icon.actualSize(QSize(NEW_PROJECT_ARTWORK_PX, NEW_PROJECT_ARTWORK_PX))
-                if not icon.isNull()
-                else QSize(NEW_PROJECT_ARTWORK_PX, 72)
-            )
-            y_position = (
-                prompt_button.y() + prompt_button.height() + NEW_PROJECT_ARTWORK_GAP
-                + (NEW_PROJECT_ARTWORK_PX - size.height()) // 2
-            )
-            if self.tabbar.currentIndex() == 1:
-                stock_button = getattr(getattr(self, "sound_tab", None), "stock_btn", None)
-                if stock_button is not None:
-                    y_position = min(
-                        y_position,
-                        stock_button.mapTo(self, QPoint(0, 0)).y() - size.height(),
-                    )
-            elif self.tabbar.currentIndex() == 3:
-                format_panel = getattr(
-                    getattr(self, "forge_tab", None), "preview_format_panel", None,
-                )
-                if format_panel is not None:
-                    y_position = min(
-                        y_position,
-                        format_panel.mapTo(self, QPoint(0, 0)).y() - size.height(),
-                    )
+        size = (
+            icon.actualSize(QSize(NEW_PROJECT_ARTWORK_PX, 56))
+            if not icon.isNull()
+            else QSize(NEW_PROJECT_ARTWORK_PX, 40)
+        )
         button.setFixedSize(size)
         button.setIconSize(size)
-        button.move(
-            max(0, min(x_position, self.width() - button.width())),
-            max(0, min(y_position, self.height() - button.height())),
-        )
-        button.raise_()
 
     def _record_protected_edit(self) -> None:
         if self._protected_change_tracking_suspended:
@@ -3357,14 +3312,15 @@ class Nexus(QtWidgets.QMainWindow):
         else:
             self.preview_stack.setCurrentIndex(0)
         self.preview_caption.setVisible(False)
-        self.preview_frame.setVisible(idx != 4)
+        self.preview_frame.setVisible(idx not in {0, 4})
         if idx != 3:
             self._set_forge_compact_layout(False)
-        self.preview_region.setVisible(idx != 4)
+        self.preview_region.setVisible(idx not in {0, 4})
         self.forge_tab.preview_format_panel.setVisible(idx == 3)
         stack_policy = self.page_stack.sizePolicy()
         stack_policy.setVerticalPolicy(
-            QtWidgets.QSizePolicy.Ignored if idx in {1, 2, 3}
+            QtWidgets.QSizePolicy.Expanding if idx == 0
+            else QtWidgets.QSizePolicy.Ignored if idx in {1, 2, 3}
             else self._page_stack_vertical_policy
         )
         self.page_stack.setSizePolicy(stack_policy)
@@ -3660,14 +3616,14 @@ class Nexus(QtWidgets.QMainWindow):
     def _position_help_icon(self) -> None:
         current_tab = self.tabbar.currentIndex()
         if current_tab in {0, 1, 2, 3} and self.help_anchor.isHidden():
-            reference = self.preview_frame
+            reference = self.page_stack if current_tab == 0 else self.preview_frame
             preview_top = reference.mapTo(self.body, QPoint(0, 0)).y()
             x = (
                 self.body.width()
                 - self.body_layout.contentsMargins().right()
                 - self.help_icon.width()
             )
-            y = preview_top + max(
+            y = preview_top if current_tab == 0 else preview_top + max(
                 0, (reference.height() - self.help_icon.height()) // 2
             )
             self.help_icon.move(x, y)
@@ -4065,12 +4021,16 @@ class Nexus(QtWidgets.QMainWindow):
             self.tabbar.setCurrentIndex(0)
             del tab_blocker
             self.page_stack.setCurrentIndex(0)
+            stack_policy = self.page_stack.sizePolicy()
+            stack_policy.setVerticalPolicy(QtWidgets.QSizePolicy.Expanding)
+            self.page_stack.setSizePolicy(stack_policy)
             self._detach_sound_preview()
         self._last_pixmap = None
         self._clear_preview()
         try:
             self.preview_stack.setCurrentIndex(0)
-            self.preview_frame.setVisible(True)
+            self.preview_frame.setVisible(not self._project_tabs_initialized)
+            self.preview_region.setVisible(not self._project_tabs_initialized)
             self.preview_caption.setVisible(False)
             if self._project_tabs_initialized:
                 self.forge_tab.preview_format_panel.setVisible(False)
@@ -4619,6 +4579,14 @@ class Nexus(QtWidgets.QMainWindow):
             margins = self.body_layout.contentsMargins()
             body_height = max(1, self.body.height() - margins.top() - margins.bottom())
 
+        if current_tab == 0:
+            self.preview_frame.hide()
+            if isinstance(region, QtWidgets.QWidget):
+                region.hide()
+            self.body_layout.activate()
+            self._position_protected_new_project_button()
+            return
+
         if current_tab == 3:
             forge_tab = getattr(self, "forge_tab", None)
             panel_height = self.preview_tools_layout.minimumSize().height()
@@ -4786,10 +4754,20 @@ class Nexus(QtWidgets.QMainWindow):
             self.forge_tab.readiness_window.position_near_image_area()
         super().moveEvent(event)
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         """Release live tab and WebEngine resources exactly once."""
-        if self._shutdown_complete or self._shutdown_in_progress:
-            return
+        if self._shutdown_complete:
+            return True
+        if self._shutdown_in_progress:
+            return False
+        image_tab = getattr(self, "image_tab", None)
+        if (
+            self._project_tabs_initialized
+            and image_tab is not None
+            and not image_tab.shutdown(timeout_ms=0)
+        ):
+            self.status("Image import is being canceled; shutdown is not complete.")
+            return False
         self._shutdown_in_progress = True
         self._forge_viewport_timer.stop()
         self._preview_geometry_timer.stop()
@@ -4920,10 +4898,6 @@ class Nexus(QtWidgets.QMainWindow):
                     self.message_tab.shutdown()
                 except Exception:
                     _LOGGER.exception("Message shutdown failed.")
-                try:
-                    self.image_tab.shutdown()
-                except Exception:
-                    _LOGGER.exception("Image shutdown failed.")
             try:
                 self._dispose_forge_preview()
             except Exception:
@@ -4943,6 +4917,7 @@ class Nexus(QtWidgets.QMainWindow):
             self._shutdown_complete = True
             self._shutdown_in_progress = False
             _LOGGER.info("Application resource shutdown completed.")
+        return True
 
     def _dispose_forge_preview(self) -> None:
         """Close the fullscreen host and the view-owned WebEngine page."""
@@ -5189,7 +5164,7 @@ class Nexus(QtWidgets.QMainWindow):
         show_action = menu.addAction("Show Letter Smith")
         show_action.triggered.connect(self._restore_from_system_tray)
         prompt_action = menu.addAction("Open Prompt Writer")
-        prompt_action.triggered.connect(self.open_prompt_writer)
+        prompt_action.triggered.connect(lambda: self.open_prompt_writer())
         menu.addSeparator()
         quit_action = menu.addAction("Quit Letter Smith")
         quit_action.triggered.connect(self._quit_from_system_tray)
@@ -5220,6 +5195,23 @@ class Nexus(QtWidgets.QMainWindow):
         self.close()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        image_tab = getattr(self, "image_tab", None)
+        if (
+            self._project_tabs_initialized
+            and image_tab is not None
+            and not image_tab._stop_import(0)
+        ):
+            if not getattr(self, "_close_after_image_import", False):
+                self._close_after_image_import = True
+                thread = image_tab._image_import_thread
+                thread.finished.connect(
+                    self._resume_close_after_image_import, QtCore.Qt.QueuedConnection,
+                )
+                if thread.isFinished():
+                    QtCore.QTimer.singleShot(0, self._resume_close_after_image_import)
+            self.status("Canceling image import before closing…")
+            event.ignore()
+            return
         forge_tab = getattr(self, "forge_tab", None)
         if (
             self._project_tabs_initialized
@@ -5238,8 +5230,15 @@ class Nexus(QtWidgets.QMainWindow):
             self.status("Finish the current Sound operation before closing.")
             event.ignore()
             return
-        self.shutdown()
+        if not self.shutdown():
+            event.ignore()
+            return
         super().closeEvent(event)
+
+    def _resume_close_after_image_import(self) -> None:
+        self._close_after_image_import = False
+        if not self._shutdown_complete:
+            self.close()
 
     # =============================================================================================
     # Prompt Writer opener (used by Image_tab FAB and Ctrl+Alt+P shortcut)
@@ -5303,7 +5302,82 @@ class Nexus(QtWidgets.QMainWindow):
         panel = self._prompt_writer_win
         return isinstance(panel, QtWidgets.QWidget) and panel.is_open
 
-    def open_prompt_writer(self):
+    def open_page_message(self, page_id: str) -> None:
+        """Route a page to Messages without choosing a different Letter page."""
+        session = self.project_session
+        try:
+            page = session.project.get_page(page_id)
+            if page["type"] != "letter":
+                self.status("Only Letter pages have an editable message.")
+                return
+            target = session.capture_target(
+                page_id, fields=("type",), include_shared=False,
+            )
+            session.select_page(page_id)
+        except (KeyError, ValueError, RuntimeError):
+            self.status("The selected page is no longer available.")
+            return
+
+        page_editor = getattr(self.message_tab, "open_page_message", None)
+        if not callable(page_editor):
+            letter_ids = [
+                item["id"] for item in session.project.pages
+                if item["type"] == "letter"
+            ]
+            if letter_ids != [page_id]:
+                self.status(
+                    "This project has multiple Letter pages. Opening this message "
+                    "requires the page-aware Messages integration."
+                )
+                return
+
+        self.tabbar.setCurrentIndex(2)
+        if not session.apply_result(
+            target, lambda _model, original_id: session.select_page(original_id),
+        ):
+            self.status("The selected page changed before Messages could open.")
+            return
+        if callable(page_editor):
+            page_editor(page_id)
+        else:
+            if [
+                item["id"] for item in session.project.pages
+                if item["type"] == "letter"
+            ] != [page_id]:
+                self.status(
+                    "This project has multiple Letter pages. Opening this message "
+                    "requires the page-aware Messages integration."
+                )
+                return
+            self.message_tab.open_message_editor()
+
+    def _prepare_prompt_writer_page(self, page_id: str):
+        from page_controls import page_controller
+        from page_layout import PAGE_KEYS
+        from project_consumers import consumer_issue, page_id_for_key, project_legacy_views
+
+        session = self.project_session
+        session.project.get_page(page_id)
+        issue = consumer_issue(self.project_root, "prompts")
+        if issue:
+            raise ValueError(issue)
+        project_legacy_views(session)
+        key = session.project.get_page(page_id)["recovery"].get("legacy_key")
+        if key not in PAGE_KEYS or page_id_for_key(self.project_root, key) != page_id:
+            raise ValueError("The selected page has no matching Prompt Writer page.")
+        controller = page_controller(self.project_root)
+        self._prompt_writer_page_controller = controller
+        controller.reload()
+        if controller.compatibility_error:
+            raise ValueError(controller.compatibility_error)
+        if (
+            key not in {page.key for page in controller.pages}
+            or page_id_for_key(self.project_root, key) != page_id
+        ):
+            raise ValueError("The selected page has no matching Prompt Writer page.")
+        return controller, key
+
+    def open_prompt_writer(self, page_id: str | None = None):
         """
         Show or focus the cached Prompt Writer without toggling it closed.
         Ctrl+Alt+P and the tray action use this path.
@@ -5312,6 +5386,18 @@ class Nexus(QtWidgets.QMainWindow):
             self.status("Enter a recipient before opening Prompt Writer.")
             self.recipient_page.focus_recipient()
             return
+
+        session = self.project_session
+        target = None
+        if page_id is not None:
+            try:
+                self._prepare_prompt_writer_page(page_id)
+                target = session.capture_target(
+                    page_id, fields=("type",), include_shared=False,
+                )
+            except (KeyError, OSError, ValueError, RuntimeError) as error:
+                self.status(f"Prompt Writer cannot open this page: {error}")
+                return
 
         browser = self._prompt_writer_browser
         if not self._prompt_writer_browser_ready:
@@ -5332,6 +5418,20 @@ class Nexus(QtWidgets.QMainWindow):
             except Exception as error:
                 _LOGGER.exception("Prompt Writer provider sign-in failed: %s", error)
                 self.status("Prompt Writer provider could not be opened.")
+                return
+        if target is not None:
+            if not session.target_is_current(target):
+                self.status("The selected page changed before Prompt Writer could open.")
+                return
+            try:
+                controller, key = self._prepare_prompt_writer_page(target.page_id)
+                if not session.apply_result(
+                    target, lambda _model, _page_id: controller.select(key),
+                ):
+                    self.status("The selected page changed before Prompt Writer could open.")
+                    return
+            except (KeyError, OSError, ValueError, RuntimeError) as error:
+                self.status(f"Prompt Writer cannot open this page: {error}")
                 return
         launcher = self.image_tab.pwrite_fab
         if not launcher.isVisible():
@@ -5512,15 +5612,18 @@ class Nexus(QtWidgets.QMainWindow):
     def _refresh_help_text(self, idx: int):
         # Header (per tab)
         if idx == 0:
+            from project_model import MIN_PAGES, MAX_PAGES
+
             header = "<b>✨The Images Tab✨</b>"
             body = (
-                "Choose 2–10 pages, with Cover first and End last. Select "
-                "Letter or Wall for each middle page; Walls display your message. "
-                "Use the arrows to browse and Move left/right to reorder middle pages. "
-                "Click an image card to select or replace it, or "
-                "hover over it to view it in the main preview. You can clear "
-                "individual images, reset the images, open the Gallery, or use "
-                "Prompt Writer to create image prompts."
+                "Select a page to organize its artwork. Add Page and Duplicate "
+                "insert after the selected page; Add Page appends when none is "
+                "selected. Use Move Up/Down to reorder "
+                f"pages; page types may repeat in any order. Keep {MIN_PAGES}–{MAX_PAGES} pages for "
+                "a finished letter. Replace or remove artwork on the selected "
+                "page, and use GIF controls for animated images. Prompt Writer "
+                "opens for that page; Edit Letter Text is available for Letter pages. "
+                "Removing a page retains its source artwork and supports Undo."
             )
         elif idx == 1:
             header = "<b>✨The Sound Tab✨</b>"

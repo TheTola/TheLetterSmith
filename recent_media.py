@@ -101,15 +101,18 @@ def remember_image_copy(
     label: str,
 ) -> None:
     """Retain one imported image independently of the working slot and original."""
-    if slot not in {"cover", "letter", "wall", "back"}:
-        raise ValueError("Unknown image slot.")
+    if not isinstance(slot, str) or not slot:
+        raise ValueError("An image page ID is required.")
+    # Keep historical folders readable; canonical IDs may contain characters
+    # that cannot safely be used as a filesystem component.
+    folder = slot if slot in {"cover", "letter", "wall", "back"} else hashlib.sha256(slot.encode("utf-8")).hexdigest()
     identity = str(UUID(project_id))
     image = Path(source).resolve(strict=True)
     if not image.is_file() or image.suffix.lower() not in {".png", ".gif"}:
         raise ValueError("The imported image is unavailable.")
     with image.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    directory = _history_path(project_root).parent / "recent_images" / identity / slot
+    directory = _history_path(project_root).parent / "recent_images" / identity / folder
     destination = directory / f"{digest}{image.suffix.lower()}"
     with _LOCK:
         directory.mkdir(parents=True, exist_ok=True)

@@ -125,41 +125,37 @@ class WindowSizingTests(unittest.TestCase):
                             page = window.page_stack.currentWidget()
                             self.assertEqual(page.geometry(), window.page_stack.contentsRect())
                             if index != 4:
-                                preview = QtCore.QRect(
-                                    window.preview_frame.mapTo(window.body, QtCore.QPoint()),
-                                    window.preview_frame.size(),
-                                )
-                                self.assertTrue(window.body.rect().contains(preview))
-                                self.assertGreaterEqual(preview.height(), 40)
-                                self.assertLessEqual(preview.bottom(), window.page_stack.y())
                                 self.assertTrue(window.body.rect().contains(window.page_stack.geometry()))
+                                if index != 0:
+                                    preview = QtCore.QRect(
+                                        window.preview_frame.mapTo(window.body, QtCore.QPoint()),
+                                        window.preview_frame.size(),
+                                    )
+                                    self.assertTrue(window.body.rect().contains(preview))
+                                    self.assertGreaterEqual(preview.height(), 40)
+                                    self.assertLessEqual(preview.bottom(), window.page_stack.y())
                             if index == 0:
                                 tab = window.image_tab
-                                cards = list(tab.cards.values())
-                                for i, card in enumerate(cards):
-                                    self.assertTrue(tab.rect().contains(card.geometry()))
-                                    self.assertLess(card.geometry().bottom(), tab.status.y())
-                                    for other in cards[i + 1:]:
-                                        self.assertFalse(card.geometry().intersects(other.geometry()))
-                                    button = card.clear_btn
-                                    rect = QtCore.QRect(button.mapTo(card, QtCore.QPoint()), button.size())
-                                    self.assertTrue(card.rect().contains(rect), (card.size(), rect))
+                                self.assertFalse(window.preview_frame.isVisibleTo(window))
+                                self.assertFalse(window.preview_region.isVisibleTo(window))
+                                card_rect = QtCore.QRect(tab.card.mapTo(tab, QtCore.QPoint()), tab.card.size())
+                                self.assertTrue(tab.rect().contains(card_rect))
+                                self.assertLess(card_rect.bottom(), tab.status.y())
+                                self.assertFalse(tab.card.clear_btn.isVisibleTo(window))
+                                self.assertFalse(tab.card.settings_btn.isVisibleTo(window))
                                 scroll = window.image_controls_scroll
                                 self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
                                 self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
-                                self.assertGreaterEqual(tab.pwrite_fab.y(), window.tabbar.geometry().bottom())
-                                for button in (tab.reset_btn, tab.open_btn,
-                                               *(card.clear_btn for card in cards)):
+                                for button in (tab.add_button, tab.up_button, tab.down_button,
+                                               tab.duplicate_button, tab.delete_button, tab.undo_button,
+                                               tab.import_button, tab.stock_button, tab.crop_button,
+                                               tab.more_button, tab.pwrite_fab):
                                     rect = QtCore.QRect(
                                         button.mapTo(scroll.viewport(), QtCore.QPoint()),
                                         button.size(),
                                     )
                                     self.assertTrue(scroll.viewport().rect().contains(rect),
                                                     (theme, (width, height), button.text(), rect))
-                                self.assertGreaterEqual(
-                                    tab.open_btn.y() - tab.reset_btn.geometry().bottom() - 1,
-                                    6,
-                                )
                             elif index == 1:
                                 tab = window.sound_tab
                                 self.assertLess(tab.mode_stack.geometry().bottom(), tab.now_playing.y())
@@ -206,9 +202,12 @@ class WindowSizingTests(unittest.TestCase):
                                 window.page_stack.size(),
                             )
                             self.assertTrue(window.rect().contains(button_rect), button_rect)
-                            self.assertFalse(button_rect.intersects(preview_rect), button_rect)
+                            if window.preview_frame.isVisibleTo(window):
+                                self.assertFalse(button_rect.intersects(preview_rect), button_rect)
                             self.assertFalse(button_rect.intersects(page_rect), button_rect)
                             if index == 0:
+                                self.assertFalse(window.preview_frame.isVisibleTo(window))
+                                self.assertTrue(window.image_tab.card.isVisibleTo(window))
                                 prompt = window.image_tab.pwrite_fab
                                 prompt_rect = QtCore.QRect(
                                     prompt.mapTo(window, QtCore.QPoint()), prompt.size(),
@@ -910,20 +909,31 @@ class WindowSizingTests(unittest.TestCase):
             host.close()
             host.deleteLater()
 
-    def test_prompt_writer_button_toggles_one_instance_and_show_requests_focus(self) -> None:
+    def test_prompt_writer_button_opens_one_instance_and_show_requests_focus(self) -> None:
         from PromptWriterPanel import PromptWriterPanel
+        from project_consumers import project_legacy_views
+        from project_model import create_project
 
         with self.window() as window:
+            session = window.project_session
+            session.replace(create_project(project_id=session.project.project_id),
+                            asset_root=window.project_root)
+            project_legacy_views(session)
+            session.save(sync_workspace=False)
+            selected = session.selected_page_id
             button = window.image_tab.pwrite_fab
+            self.assertTrue(button.isEnabled())
             QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
             panel = window._prompt_writer_win
             self.assertIsInstance(panel, PromptWriterPanel)
             self.assertTrue(panel.is_open)
 
-            # A second click closes; a third during the animation reopens it.
-            for expected in (False, True, False, True):
+            # The page action opens or focuses the same panel, including during
+            # its opening animation, without changing the selected page.
+            for _ in range(4):
                 QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
-                self.assertEqual(panel.is_open, expected)
+                self.assertTrue(panel.is_open)
+                self.assertEqual(session.selected_page_id, selected)
                 self.assertIs(window._prompt_writer_win, panel)
                 self.assertEqual(len(window.findChildren(PromptWriterPanel)), 1)
             QtTest.QTest.qWait(300)
@@ -961,6 +971,63 @@ class WindowSizingTests(unittest.TestCase):
             window._on_prompt_writer_destroyed(panel)
             self.assertIs(window._prompt_writer_win, replacement)
             self.assertEqual(len(window.findChildren(PromptWriterPanel)), 1)
+
+    def test_close_waits_for_image_import_without_disposing_live_worker(self) -> None:
+        import threading
+        import time
+        from PIL import Image
+        from project_consumers import project_legacy_views
+        from project_model import create_project
+
+        with self.window() as window:
+            session = window.project_session
+            session.replace(create_project(project_id=session.project.project_id),
+                            asset_root=window.project_root)
+            project_legacy_views(session)
+            tab = window.image_tab
+            identity = session.selected_page_id
+            original = session.project.get_page(identity)
+            source = Path(window.project_root) / "slow-import.png"
+            Image.new("RGB", (24, 36), "blue").save(source)
+            started, release = threading.Event(), threading.Event()
+            stage_import = tab.artwork.stage_import
+            prepared = []
+
+            def slow_stage(path):
+                result = stage_import(path)
+                prepared.append(result)
+                started.set()
+                release.wait(10)
+                return result
+
+            with mock.patch.object(tab.artwork, "stage_import", side_effect=slow_stage):
+                try:
+                    self.assertTrue(tab.import_image(identity, str(source)))
+                    for _ in range(200):
+                        if started.is_set():
+                            break
+                        QtTest.QTest.qWait(10)
+                        time.sleep(0.005)
+                    self.assertTrue(started.is_set(), tab.status.text())
+                    self.assertFalse(window.shutdown())
+                    self.assertFalse(window._shutdown_complete)
+                    self.assertFalse(tab._shutdown)
+                    window.close()
+                    self.assertTrue(window.isVisible())
+                    self.assertTrue(tab._image_import_thread.isRunning())
+                    self.assertTrue(window._close_after_image_import)
+                finally:
+                    release.set()
+                    for _ in range(400):
+                        if window._shutdown_complete:
+                            break
+                        QtTest.QTest.qWait(10)
+                        time.sleep(0.005)
+                self.assertTrue(window._shutdown_complete)
+                self.assertFalse(window.isVisible())
+                self.assertEqual(session.project.get_page(identity), original)
+                self.assertTrue(prepared)
+                self.assertFalse(prepared[0]._directory.exists())
 
     def test_editor_formatting_remains_reachable_in_a_narrow_window(self) -> None:
         from Editor import Editor
