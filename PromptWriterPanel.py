@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 from page_controls import PageControls, page_controller
+from project_model import PAGE_TYPES
+from project_session import get_project_session
+from prompt_writer_project import PromptBatch, page_label
 from page_layout import DEFAULT_PAGES, PAGE_KEYS, PAGE_INDICES, page_labels, pages_payload
 
 import sys
@@ -1565,6 +1568,9 @@ def reset_prompt_writer_state_file(project_root: str | Path) -> bool:
 class PromptWriterPanel(QtWidgets.QWidget):
     dismissed = QtCore.Signal()
     project_changed = QtCore.Signal()
+    session_event = QtCore.Signal(object)
+    page_settings_requested = QtCore.Signal(str)
+    provider_requested = QtCore.Signal()
     prompts_generated = QtCore.Signal(dict, dict)  # prompts_map, debug_map
 
     def __init__(
@@ -1573,6 +1579,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         project_root: Optional[str] = None,
         *,
         language_service: Optional[object] = None,
+        page_id: Optional[str] = None,
     ):
         super().__init__(parent)
         self.setObjectName("PromptWriterPanel")
@@ -1631,14 +1638,17 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "format": default_format,
         }
 
+        self.session = get_project_session(self.project_root)
         self.page_controller = page_controller(self.project_root)
         self.page_controller.reload()
-        prototypes = {page.key: page for page in PAGE_SPECS}
-        self._all_page_specs = {
-            key: replace(prototypes.get(key, prototypes["letter"]), key=key, output_filename=f"{key}.png")
-            for key in PAGE_KEYS
-        }
-        self._page_specs = list(self._all_page_specs.values())
+        self._view_page_id = None
+        self._view_session_id = self.session.session_id
+        self._writing = False
+        self._active_batch = None
+        self._last_batch = None
+        self._view_spec = replace(PAGE_SPECS[0], key="current")
+        self._page_specs = [self._view_spec]
+        self._all_page_specs = {"current": self._view_spec}
         self._generated_prompts: Dict[str, str] = {}
         self._resolved_instructions: Dict[str, object] = {}
         self._generated_input_signature = ""
@@ -1665,46 +1675,266 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self.apply_theme_assets(theme_service)
         self.refresh_semantic_palette()
         self._connect_signals()
-        self.page_controller.changed.connect(self._page_layout_changed)
-        self.page_controller.selection_changed.connect(self._select_layout_page)
-        self._page_layout_changed()
-
+        self.session_event.connect(self._session_changed)
+        self.session.add_listener(self.session_event.emit)
+        listener = self.session_event.emit
+        session = self.session
+        self.destroyed.connect(lambda *_: session.remove_listener(listener))
         self._load_colors_into_combo()
         self._start_visionary_pulse()
+        if page_id is not None:
+            self.session.select_page(page_id)
         self.reload_project_state()
+
+    def select_page(self, page_id):
+        if self._state_persistence_suspended or page_id is None:
+            return
+        try:
+            self.session.select_page(page_id)
+            self.reload_project_state()
+        except KeyError:
+            self.reload_project_state()
+
+    @QtCore.Slot(object)
+    def _session_changed(self, event):
+        if self._writing or self._state_persistence_suspended or event.session_id != self.session.session_id:
+            return
+        if event.kind == "persisted":
+            return
+        self.reload_project_state()
+
+    def _can_edit_page(self):
+        return (not self._state_persistence_suspended and not self.session.is_restoring
+                and self._view_session_id == self.session.session_id
+                and self._view_page_id in {page["id"] for page in self.session.project.pages})
+
+    def _authored_change(self):
+        self._refresh_status()
+        self._schedule_persist_state()
+        self.project_changed.emit()
+
+    def _page_input_changed(self, *_args):
+        if not self._can_edit_page():
+            return
+        page_id = self._view_page_id
+        prompt = self.session.project.get_prompt(page_id)
+        sender = self.sender()
+        if sender is self._view_spec.detail_widget:
+            patch = {"directions": self._view_spec.detail_widget.toPlainText()}
+        else:
+            overrides = dict(prompt["overrides"])
+            if sender in (self.use_project_palette, self.page_palette):
+                if self.use_project_palette.isChecked():
+                    overrides.pop("color", None)
+                else:
+                    overrides["color"] = self.page_palette.currentText()
+                self.page_palette.setEnabled(not self.use_project_palette.isChecked())
+            elif sender in (self.use_project_style, self.page_style):
+                if self.use_project_style.isChecked():
+                    overrides.pop("type", None)
+                else:
+                    overrides["type"] = self.page_style.text()
+                self.page_style.setEnabled(not self.use_project_style.isChecked())
+            elif sender is self.page_subject:
+                if self.page_subject.text():
+                    overrides["subject"] = self.page_subject.text()
+                else:
+                    overrides.pop("subject", None)
+            patch = {"overrides": overrides}
+        self._writing = True
+        try:
+            self.session.project.update_prompt(page_id, patch)
+        finally:
+            self._writing = False
+        self._authored_change()
+
+    def _manual_prompt_changed(self):
+        if not self._can_edit_page():
+            return
+        self._writing = True
+        try:
+            self.session.project.update_prompt(self._view_page_id, {"text": self._view_spec.preview_widget.toPlainText()})
+        finally:
+            self._writing = False
+        self._authored_change()
+        self._highlight_saved_prompt(self._view_spec)
+
+    def _output_changed(self, *_args):
+        if self._state_persistence_suspended:
+            return
+        self._writing = True
+        try:
+            self.session.project.update_project_data("presentation", {"artwork_output": {
+                "width": self.output_width.value(), "height": self.output_height.value()}})
+        finally:
+            self._writing = False
+        self._authored_change()
+
+    def _refresh_status(self):
+        project = self.session.project
+        shared = project.to_dict()["prompt_settings"]
+        self.style_summary.setText(" · ".join(str(shared.get(key) or "Not selected") for key in ("subject", "type", "color")))
+        blockers = [QtCore.QSignalBlocker(self.page_palette), QtCore.QSignalBlocker(self.page_style)]
+        if self.use_project_palette.isChecked():
+            self.page_palette.setCurrentText(shared.get("color", ""))
+        if self.use_project_style.isChecked():
+            self.page_style.setText(shared.get("type", ""))
+        self.page_subject.setPlaceholderText(shared.get("subject") or "Use project subject")
+        del blockers
+        if self._view_page_id is not None:
+            page = project.get_page(self._view_page_id)
+            prompt = page["prompt"]
+            self._generated_prompts = {item["id"]: item["prompt"]["text"] for item in project.pages if item["prompt"]["text"] is not None}
+            self._generated_output_valid = prompt["text"] is not None and not prompt["stale"]
+            self.btn_generate.setText(f"Build Prompt for Page {project.prompt_context(page['id'])['position']}")
+            self.prompt_status.setText("Settings changed since this prompt was built." if prompt["stale"] and prompt["text"] is not None
+                                       else "Ready to build." if prompt["text"] is None else "Saved prompt — editable.")
+            self.btn_restore.setEnabled(isinstance(page["recovery"].get("previous_prompt", {}).get("text"), str))
+            try:
+                geometry = project.prompt_geometry(page["id"])
+                area = geometry["text_area"]
+                text = f"{PAGE_TYPES[page['type']].label} · {geometry['width']} × {geometry['height']} · {geometry['aspect_ratio']}"
+                if area is not None:
+                    if area.get("mode"):
+                        text += " · Text: responsive centered panel"
+                    else:
+                        scale, unit = (100, '%') if area['units'] == 'normalized' else (1, 'px')
+                        text += (f" · Text area: left {area['x'] * scale:g}{unit}, top {area['y'] * scale:g}{unit}, "
+                                 f"{area['width'] * scale:g}{unit} × {area['height'] * scale:g}{unit}")
+                self.layout_summary.setText(text)
+            except ValueError as error:
+                self.layout_summary.setText(str(error))
+        else:
+            self.btn_restore.setEnabled(False)
+            self.prompt_status.setText("Add a page in Images to begin.")
+            self.layout_summary.clear()
         self._sync_action_button_states()
 
+    def _restore_previous(self):
+        if self._can_edit_page():
+            self.session.project.restore_previous_prompt(self._view_page_id)
+            self._authored_change()
+
+    def _reroll_shared(self):
+        confirm = LetterSmithConfirmationDialog(self, title="Reroll shared wording",
+            question="Choose new shared wording for future builds? Existing prompts stay unchanged and become stale.",
+            primary_text="Reroll", secondary_text="Cancel")
+        if confirm.exec() == QtWidgets.QDialog.Accepted:
+            self.session.project.resolve_prompt_components(self._roll_shared_prompt_data, reroll=True)
+            self._authored_change()
+
+    def _guidance_phrases(self):
+        names = {id(widget): key for widget, key in self._checkbox_state_specs()}
+        return {names[id(widget)]: phrase for widget, phrase in self._guidance_checkbox_specs()}
+
+    def _choose_batch(self, all_pages=False):
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Build Prompts for Selected Pages")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        listing = QtWidgets.QListWidget()
+        for page in self.session.project.pages:
+            suffix = " — replace existing prompt" if page["prompt"]["text"] is not None else " — first build"
+            item = QtWidgets.QListWidgetItem(page_label(self.session.project, page["id"]) + suffix)
+            item.setData(Qt.UserRole, page["id"])
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if all_pages or page["id"] == self._view_page_id else Qt.Unchecked)
+            listing.addItem(item)
+        layout.addWidget(listing)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Build selected prompts")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(620, 340)
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            ids = [listing.item(i).data(Qt.UserRole) for i in range(listing.count()) if listing.item(i).checkState() == Qt.Checked]
+            if ids:
+                self._build_pages(ids)
+
+    def _confirm_replacement(self, batch):
+        if not any(item.replaces for item in batch.items):
+            return True
+        question = "\n".join(item.label + (" — replace existing prompt" if item.replaces else " — first build") for item in batch.items)
+        question += "\n\nPrevious prompts will remain available through Restore Previous Prompt."
+        dialog = LetterSmithConfirmationDialog(self, title="Build artwork prompts", question=question,
+            primary_text="Build", secondary_text="Cancel", click_outside_dismiss=False, width=620)
+        return dialog.exec() == QtWidgets.QDialog.Accepted
+
+    def _build_pages(self, page_ids, *, confirm=True):
+        if self._generation_in_progress:
+            return None
+        try:
+            batch = PromptBatch(self.session, page_ids, self._roll_shared_prompt_data, self._guidance_phrases())
+        except (KeyError, ValueError, RuntimeError) as error:
+            show_lettersmith_message(self, "Cannot build prompts", str(error))
+            return None
+        if confirm and not self._confirm_replacement(batch):
+            batch.cancel()
+            for item in batch.items:
+                batch.run_item(item)
+            self._last_batch = batch
+            self._show_batch_results(batch)
+            return batch
+        self._active_batch = batch
+        self._set_generation_busy(True)
+        progress = QtWidgets.QProgressDialog("Building artwork prompts…", "Cancel", 0, len(batch.items), self)
+        progress.setWindowModality(Qt.NonModal)
+        progress.setMinimumDuration(0)
+        progress.canceled.connect(batch.cancel)
+        self._batch_progress = progress
+        index = 0
+        def step():
+            nonlocal index
+            if self._shutdown:
+                batch.cancel()
+            if index < len(batch.items):
+                batch.run_item(batch.items[index])
+                index += 1
+                progress.setValue(index)
+                if index < len(batch.items):
+                    QtCore.QTimer.singleShot(0, step)
+                else:
+                    step()
+                return
+            progress.close()
+            self._active_batch = None
+            self._last_batch = batch
+            self._set_generation_busy(False)
+            self.reload_project_state()
+            self._show_batch_results(batch)
+            if batch.items and batch.items[0].target.session_id == self.session.session_id:
+                if not self._persist_state_now():
+                    self.batch_status.setText(self.batch_status.text() + "\nSave failed; prompts remain in the open project. Retry Save.")
+                self.project_changed.emit()
+                self.prompts_generated.emit({item.page_id: self.session.project.get_prompt(item.page_id)["text"]
+                                             for item in batch.items if item.status == "success" and item.page_id in {p['id'] for p in self.session.project.pages}}, {})
+        step()
+        return batch
+
+    def _show_batch_results(self, batch):
+        self.batch_status.setText("\n".join(f"{item.label}: {item.status} — {item.detail}" for item in batch.items))
+        self._batch_results_scroll.setVisible(bool(batch.items))
+        self._sync_action_button_states()
+
+    def _retry_batch(self):
+        batch = self._last_batch
+        if batch is None or not batch.items or batch.items[0].target.session_id != self.session.session_id:
+            return
+        ids = {page["id"] for page in self.session.project.pages}
+        failed = [item.page_id for item in batch.items if item.status in {"failed", "conflict"} and item.page_id in ids]
+        if failed:
+            self._build_pages(failed)
+
     def _page_layout_changed(self, persisted=False):
-        labels = page_labels(self.page_controller.pages)
-        prototypes = {page.key: page for page in PAGE_SPECS}
-        self._page_specs = []
-        for definition in self.page_controller.pages:
-            page = self._all_page_specs[definition.key]
-            prototype = prototypes[definition.kind]
-            page.display_label = labels[definition.key] + " Prompt"
-            page.color_key = definition.kind
-            page.baseline = prototype.baseline
-            page.detail_help = prototype.detail_help
-            page.detail_label.setText(labels[definition.key])
-            page.detail_widget.setPlaceholderText(f"Add details for {labels[definition.key]}.")
-            page.preview_title.setText(page.display_label)
-            self._page_specs.append(page)
-        self._select_layout_page(self.page_controller.selected)
-        self.refresh_semantic_palette()
-        if persisted:
-            if self._browser is not None and hasattr(self._browser, "set_approval_target"):
-                self._browser.set_approval_target("", "")
-            self._invalidate_generated_output()
-            self._schedule_persist_state()
-            self.project_changed.emit()
+        self.reload_project_state()
+
 
     def _select_layout_page(self, key):
-        active = {page.key for page in self._page_specs}
-        for page in self._all_page_specs.values():
-            visible = page.key == key and page.key in active
-            page.detail_widget.setVisible(visible)
-            page.detail_label.setVisible(visible)
-            page.preview_card.setVisible(visible)
+        from project_consumers import page_id_for_key
+        page_id = page_id_for_key(self.project_root, key)
+        if page_id is not None:
+            self.select_page(page_id)
+
 
     def _module_path(self, name: str) -> Path:
         return self._builtin_modules_dir() / name
@@ -1959,6 +2189,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._invalidate_generated_output()
         if key == "color":
             self._colors_path_used = self._resolve_managed_list_path("color")
+            if hasattr(self, "page_palette"):
+                self._populate_managed_combo(self.page_palette, entries, allow_none=False, normalized_match=True)
 
     def _clear_managed_list_cache(self, path: Path) -> None:
         _FILE_CACHE.pop(path, None)
@@ -1970,6 +2202,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         entries: List[ManagedListEntry],
         *,
         selected_text: Optional[str] = None,
+        target_combo=None,
     ) -> bool:
         if self._list_save_in_progress:
             LOGGER.warning("Prompt Writer list save ignored while another save is active: %s", key)
@@ -2002,7 +2235,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._clear_managed_list_cache(path)
             self._reload_managed_list(key)
             if selected_text is not None:
-                combo = self._managed_combo_for_key(key)
+                combo = target_combo if target_combo is not None else self._managed_combo_for_key(key)
                 index = self._find_combo_text(
                     combo, selected_text, normalized=key == "color"
                 )
@@ -2021,8 +2254,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
         finally:
             self._list_save_in_progress = False
 
-    def _open_list_manager(self, key: str) -> None:
+    def _open_list_manager(self, key: str, *, for_page=False) -> None:
         existing = self._list_manager_dialogs.get(key)
+        if existing is not None and getattr(existing, "_for_page", False) != for_page:
+            existing.close()
+            existing = None
         if existing is not None and existing.isVisible():
             existing.raise_()
             existing.activateWindow()
@@ -2030,7 +2266,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         config = self._managed_list_config(key)
         dialog = ListManagerDialog(
-            title=config["title"],
+            title=config["title"] + (" — This Page" if for_page else " — Project Style"),
             entries=self._read_managed_entries(key),
             allow_headers=bool(config["allow_headers"]),
             auto_user_header=config.get("auto_user_header"),
@@ -2038,9 +2274,13 @@ class PromptWriterPanel(QtWidgets.QWidget):
             app_font_family=self._app_font_family,
             parent=self,
         )
+        dialog._for_page = for_page
+        if for_page:
+            self.use_project_palette.setChecked(False)
         dialog._save_entries_callback = (
             lambda entries, selected_text, list_key=key: self._apply_managed_list_changes(
-                list_key, entries, selected_text=selected_text
+                list_key, entries, selected_text=selected_text,
+                target_combo=self.page_palette if for_page else None,
             )
         )
         dialog.finished.connect(lambda *_args, list_key=key: self._list_manager_dialogs.pop(list_key, None))
@@ -2064,28 +2304,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
             LOGGER.exception("Prompt Writer persistence scheduling failed: %s", error)
 
     def _persist_state_now(self) -> bool:
-        """Persist Prompt Writer selections + outputs.
-
-        Writes to prompt_writer_state.json so other tabs writing settings.json
-        cannot clobber Prompt Writer state.
-        """
-        try:
-            self._persist_timer.stop()
-            if self.page_controller.compatibility_error:
-                return False
-            if self._state_write_blocked:
-                LOGGER.error(
-                    "Prompt Writer state was written by a newer version and "
-                    "will not be overwritten: %s",
-                    self._state_path,
-                )
-                return False
-            state = self._capture_state()
-            safe_write_json(self._state_path, state)
-            return True
-        except (OSError, TypeError, ValueError) as error:
-            LOGGER.exception("Prompt Writer state persistence failed: %s (%s)", self._state_path, error)
+        self._persist_timer.stop()
+        if self._state_persistence_suspended or self.session.is_restoring:
             return False
+        try:
+            self.session.save()
+            return True
+        except (OSError, ValueError, RuntimeError, TypeError):
+            LOGGER.exception("Prompt Writer canonical save failed")
+            return False
+
 
     def persist_project_state(self) -> bool:
         """Flush the current project-owned Prompt Writer workspace to disk."""
@@ -2292,165 +2520,83 @@ class PromptWriterPanel(QtWidgets.QWidget):
         }
 
     def reload_project_state(self) -> bool:
-        """Replace the live workspace with the active project's saved state."""
-        self.page_controller.reload()
-        if self._browser is not None:
-            self._browser.set_approval_target("", "")
-        self._browser_targets.clear()
-        widgets: List[QtCore.QObject] = [
-            self.cmb_subject,
-            self.cmb_type,
-            self.cmb_color,
-            self.txt_global,
-            *(
-                page.detail_widget
-                for page in self._all_page_specs.values()
-                if page.detail_widget is not None
-            ),
-            *(checkbox for checkbox, _ in self._checkbox_state_specs()),
-        ]
-        blockers = [QtCore.QSignalBlocker(widget) for widget in widgets]
-        previous_suspension = self._state_persistence_suspended
-        self._persist_timer.stop()
+        if self.session.is_restoring:
+            return False
         self._state_persistence_suspended = True
         try:
-            self._invalidate_generated_output(discard=True)
-            return self._restore_persisted_state()
+            project = self.session.project
+            pages = project.pages
+            selected = self.session.selected_page_id
+            ids = [page["id"] for page in pages]
+            if selected not in ids:
+                selected = ids[0] if ids else None
+            if selected != self._view_page_id or self._view_session_id != self.session.session_id:
+                for dialog in tuple(self._list_manager_dialogs.values()):
+                    dialog.close()
+            if self._view_session_id != self.session.session_id:
+                self._persist_timer.stop()
+                self._browser_targets.clear()
+                self._last_batch = None
+                if self._active_batch is not None:
+                    self._active_batch.cancel()
+            self._view_page_id = selected
+            self._view_session_id = self.session.session_id
+            controls = [self.target_selector, self.cmb_subject, self.cmb_type, self.cmb_color,
+                        self.txt_global, self._view_spec.detail_widget, self._view_spec.preview_widget,
+                        self.page_palette, self.use_project_palette, self.page_subject,
+                        self.page_style, self.use_project_style, self.output_width, self.output_height,
+                        *(checkbox for checkbox, _ in self._checkbox_state_specs())]
+            blockers = [QtCore.QSignalBlocker(widget) for widget in controls]
+            self.target_selector.clear()
+            for page in pages:
+                self.target_selector.addItem(page_label(project, page["id"]), page["id"])
+            self.target_selector.setCurrentIndex(ids.index(selected) if selected else -1)
+            shared = project.to_dict()["prompt_settings"]
+            for combo, key, empty in ((self.cmb_subject, "subject", -1), (self.cmb_type, "type", 0), (self.cmb_color, "color", 0)):
+                self._restore_combo_value(combo, shared.get(key, ""), empty_index=empty, normalized_match=key == "color")
+            self.txt_global.setPlainText(shared.get("global", ""))
+            checks = _normalize_exclusive_check_states(shared.get("checks", {}))
+            for checkbox, key in self._checkbox_state_specs():
+                checkbox.setChecked(checks.get(key, False))
+            output = project.to_dict()["presentation"].get("artwork_output", {})
+            self.output_width.setValue(output.get("width", 2048))
+            self.output_height.setValue(output.get("height", 3072))
+            self._generated_prompts = {page["id"]: page["prompt"]["text"] for page in pages if page["prompt"]["text"] is not None}
+            self._resolved_instructions = shared.get("resolved_components", {})
+            page = project.get_page(selected) if selected else None
+            prompt = page["prompt"] if page else {"directions": "", "text": None, "overrides": {}, "stale": False}
+            self._view_spec.key = selected or "current"
+            self._view_spec.color_key = PAGE_TYPES[page["type"]].artwork_template if page else "cover"
+            self._view_spec.display_label = page_label(project, selected) if page else "No page selected"
+            self._view_spec.detail_label.setText("Page direction")
+            self._view_spec.detail_widget.setPlaceholderText("Describe the subjects, scene and composition for this page.")
+            _set_help(self._view_spec.detail_widget, "Directions for this page only. Message text is authored separately in Messages.")
+            self._view_spec.preview_title.setText("Generated Prompt")
+            self._view_spec.detail_widget.setPlainText(prompt["directions"])
+            self._view_spec.preview_widget.setPlainText(prompt["text"] or "")
+            overrides = prompt["overrides"]
+            self.use_project_palette.setChecked("color" not in overrides)
+            self.page_palette.setCurrentText(overrides.get("color", shared.get("color", "")))
+            self.page_palette.setEnabled("color" in overrides)
+            self.use_project_style.setChecked("type" not in overrides)
+            self.page_style.setText(overrides.get("type", shared.get("type", "")))
+            self.page_style.setEnabled("type" in overrides)
+            self.page_subject.setText(overrides.get("subject", ""))
+            self.page_subject.setPlaceholderText(shared.get("subject") or "Use project subject")
+            self.this_page_card.setEnabled(page is not None)
+            self._view_spec.preview_widget.setEnabled(page is not None)
+            self._generated_output_valid = bool(prompt["text"] is not None and not prompt["stale"])
+            del blockers
+            self._refresh_status()
+            self.refresh_semantic_palette()
+            return True
         finally:
-            for blocker in blockers:
-                blocker.unblock()
-            self._state_persistence_suspended = previous_suspension
+            self._state_persistence_suspended = False
+
 
     def _restore_persisted_state(self) -> bool:
-        """Load persisted Prompt Writer state.
+        return self.reload_project_state()
 
-        Source of truth:
-        1) prompt_writer_state.json
-        """
-        try:
-            state = None
-            self._state_write_blocked = False
-
-            try:
-                if self._state_path.exists():
-                    state = json.loads(self._state_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as error:
-                LOGGER.exception("Prompt Writer state could not be read: %s (%s)", self._state_path, error)
-                _backup_invalid_prompt_writer_state(self._state_path)
-                state = None
-
-            if state is not None and not isinstance(state, dict):
-                LOGGER.error(
-                    "Prompt Writer state root is invalid: %s",
-                    self._state_path,
-                )
-                _backup_invalid_prompt_writer_state(self._state_path)
-                state = None
-            if isinstance(state, dict):
-                raw_version = state.get("version", 0)
-                try:
-                    source_version = (
-                        -1
-                        if isinstance(raw_version, bool)
-                        else int(raw_version)
-                    )
-                except (TypeError, ValueError):
-                    source_version = -1
-                if source_version > PROMPT_WRITER_STATE_VERSION:
-                    self._state_write_blocked = True
-                    LOGGER.error(
-                        "Prompt Writer state schema %s is newer than supported "
-                        "schema %s: %s",
-                        source_version,
-                        PROMPT_WRITER_STATE_VERSION,
-                        self._state_path,
-                    )
-                    return False
-                if source_version < 0:
-                    LOGGER.error(
-                        "Prompt Writer state version is invalid: %s",
-                        self._state_path,
-                    )
-                    _backup_invalid_prompt_writer_state(self._state_path)
-                    state = None
-
-            state = self._normalize_persisted_state(state or empty_prompt_writer_state())
-            self._approved_pages = set(state.get("approved_images", []))
-
-            # Selects
-            try:
-                t = str(state.get("type", "")).strip()
-                self._restore_combo_value(self.cmb_type, t, empty_index=0)
-            except (RuntimeError, TypeError, ValueError) as error:
-                LOGGER.exception("Prompt Writer type selection restoration failed: %s", error)
-            try:
-                s = str(state.get("subject", "")).strip()
-                self._restore_combo_value(self.cmb_subject, s, empty_index=-1)
-            except (RuntimeError, TypeError, ValueError) as error:
-                LOGGER.exception("Prompt Writer subject selection restoration failed: %s", error)
-            try:
-                c = str(state.get("color", "")).strip()
-                self._restore_combo_value(
-                    self.cmb_color,
-                    c,
-                    empty_index=0,
-                    normalized_match=True,
-                )
-            except (RuntimeError, TypeError, ValueError) as error:
-                LOGGER.exception("Prompt Writer color selection restoration failed: %s", error)
-
-            # Text
-            try:
-                self.txt_global.setPlainText(str(state.get("global", "") or ""))
-                for page in self._all_page_specs.values():
-                    if page.detail_widget is not None:
-                        page.detail_widget.setPlainText(str(state.get(page.key, "") or ""))
-            except (RuntimeError, TypeError, ValueError) as error:
-                LOGGER.exception("Prompt Writer text restoration failed: %s", error)
-
-            # Checkboxes
-            checks = state.get("checks", {})
-            if isinstance(checks, dict):
-                for checkbox, state_key in self._checkbox_state_specs():
-                    try:
-                        checkbox.setChecked(bool(checks.get(state_key, False)))
-                    except (RuntimeError, TypeError, ValueError) as error:
-                        LOGGER.exception("Prompt Writer checkbox restoration failed for %s: %s", state_key, error)
-
-            # Generated previews
-            try:
-                generated_prompts = dict(state.get("generated_prompts", {}))
-                if generated_prompts:
-                    self._generated_prompts = generated_prompts
-                    self._resolved_instructions = dict(
-                        state.get("resolved_instructions", {})
-                    )
-                    # Exact saved prompts remain authoritative across prompt
-                    # language and library revisions. The current signature is
-                    # used only to invalidate them after a live control change.
-                    self._generated_input_signature = self._current_prompt_input_signature()
-                    for page in self._page_specs:
-                        txt = self._generated_prompts.get(page.key, "")
-                        if page.preview_widget is not None and txt.strip():
-                            self._set_colored_saved_preview(page, txt)
-                    self._set_generated_output_valid(
-                        not state.get("generated_output_stale", False)
-                    )
-                    # Validation controls whether these snapshots can be used;
-                    # it must never delete an authored or historical prompt.
-                    if self._generated_output_valid:
-                        self._validate_generated_prompt_set(generated_prompts)
-                else:
-                    self._invalidate_generated_output()
-            except (RuntimeError, TypeError, ValueError, UnicodeError) as error:
-                LOGGER.exception("Prompt Writer generated-output restoration failed: %s", error)
-                self._invalidate_generated_output()
-            self._refresh_approved_previews()
-
-        except (OSError, RuntimeError, TypeError, ValueError, UnicodeError) as error:
-            LOGGER.exception("Prompt Writer state restoration failed for %s: %s", self._state_path, error)
-            return False
-        return True
 
     # -----------------------
     # UI
@@ -2478,15 +2624,26 @@ class PromptWriterPanel(QtWidgets.QWidget):
         )
         cl.addWidget(self.title_bar)
 
+        target_row = QtWidgets.QHBoxLayout()
+        self.target_selector = QtWidgets.QComboBox()
+        self.target_selector.setAccessibleName("Target page")
+        self.target_selector.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.target_selector.setMinimumContentsLength(15)
+        self.btn_page_settings = QtWidgets.QPushButton("Page settings")
+        target_row.addWidget(QtWidgets.QLabel("Target page"))
+        target_row.addWidget(self.target_selector, 1)
+        target_row.addWidget(self.btn_page_settings)
+        cl.addLayout(target_row)
+
         action_bar = QtWidgets.QFrame()
         action_bar.setObjectName("actionBar")
         header = QtWidgets.QHBoxLayout(action_bar)
         header.setContentsMargins(10, 8, 10, 8)
         header.setSpacing(8)
 
-        self.btn_generate = QtWidgets.QPushButton("Create Prompt")
+        self.btn_generate = QtWidgets.QPushButton("Build Prompt")
         self.btn_generate.setObjectName("primaryButton")
-        self.btn_copy = QtWidgets.QPushButton("Copy All")
+        self.btn_copy = QtWidgets.QPushButton("Copy Prompt")
         self.btn_copy.setObjectName("secondaryButton")
         self.btn_copy.setEnabled(False)
         self.btn_erase = QtWidgets.QPushButton("Erase All")
@@ -2496,11 +2653,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
             b.setCursor(Qt.PointingHandCursor)
         set_control_help(
             self.btn_generate,
-            "Create coordinated prompts for the cover, letter, wall, and back images.",
+            "Build artwork instructions for the selected page. Existing text is retained for recovery.",
         )
         set_control_help(
             self.btn_copy,
-            "Copy all generated image prompts to the clipboard.",
+            "Copy the selected page's exact prompt text.",
         )
         set_control_help(
             self.btn_erase,
@@ -2563,9 +2720,23 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._left_scroll.setWidget(left_panel)
         main_h.addWidget(self._left_scroll, 10)
 
-        controls_title = QtWidgets.QLabel("Prompt Direction")
+        controls_title = QtWidgets.QLabel("Project Style")
         controls_title.setObjectName("columnTitle")
         left_v.addWidget(controls_title)
+        self.style_summary = QtWidgets.QLabel()
+        self.style_summary.setWordWrap(True)
+        left_v.addWidget(self.style_summary)
+        self.btn_style_editor = QtWidgets.QPushButton("Edit project style")
+        self.btn_style_editor.setCheckable(True)
+        left_v.addWidget(self.btn_style_editor)
+        self.style_editor = QtWidgets.QWidget()
+        left_v.addWidget(self.style_editor)
+        left_v.addStretch(1)
+        left_column = left_v
+        left_v = QtWidgets.QVBoxLayout(self.style_editor)
+        left_v.setContentsMargins(0, 0, 0, 0)
+        self.style_editor.hide()
+        self.btn_style_editor.toggled.connect(self.style_editor.setVisible)
         controls_hint = QtWidgets.QLabel(
             "Choose the shared direction, then add optional guidance and page-specific details."
         )
@@ -2623,14 +2794,14 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "Choose the main thing the images should be about. Double-click Subject to add, update, or remove subject entries.",
         )
         self.cmb_subject = QtWidgets.QComboBox()
-        self.cmb_subject.setEditable(False)
+        self.cmb_subject.setEditable(True)
         self.cmb_subject.setFixedSize(238, 34)
         self.cmb_subject.view().setMinimumWidth(320)
         self.cmb_subject.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
         self.cmb_subject.setItemDelegate(HeaderAwareItemDelegate(self.cmb_subject))
         _set_help(
             self.cmb_subject,
-            "Choose the main thing the images should be about. Typing is disabled to prevent accidental edits; double-click to manage the subject list.",
+            "Choose or type the project subject. Double-click the label to manage reusable subjects.",
         )
         self._populate_managed_combo(self.cmb_subject, self._read_managed_entries("subject"), allow_none=False)
         self._install_manage_trigger(self.lbl_subject, "subject")
@@ -2763,7 +2934,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.cb_wide_scene = GoldenCheckBox("Wide Scene")
         _set_help(
             self.cb_wide_scene,
-            "Wide Scene means showing more environment inside the same portrait 2048×3072 frame. It does not change the aspect ratio.",
+            "Show more environment inside the selected output dimensions.",
         )
         camera_layout.addWidget(self.cb_strong_focal_point, 0, 0)
         camera_layout.addWidget(self.cb_dynamic_angle, 1, 0)
@@ -2810,19 +2981,55 @@ class PromptWriterPanel(QtWidgets.QWidget):
         global_layout.addWidget(self.txt_global)
         left_v.addWidget(global_card)
 
+        output_form = QtWidgets.QFormLayout()
+        self.output_width = QtWidgets.QSpinBox()
+        self.output_height = QtWidgets.QSpinBox()
+        for spin in (self.output_width, self.output_height):
+            spin.setRange(1, 2147483647)
+        output_form.addRow("Artwork width (pixels)", self.output_width)
+        output_form.addRow("Artwork height (pixels)", self.output_height)
+        left_v.addLayout(output_form)
+        self.btn_reroll = QtWidgets.QPushButton("Reroll shared wording")
+        left_v.addWidget(self.btn_reroll)
+        self.btn_proofread_shared = QtWidgets.QPushButton("Proofread project direction")
+        self.btn_proofread_shared.clicked.connect(lambda: self._proofread_direction(shared=True))
+        left_v.addWidget(self.btn_proofread_shared)
+
         details_card = QtWidgets.QFrame()
         details_card.setObjectName("sectionCard")
         details_layout = QtWidgets.QVBoxLayout(details_card)
         details_layout.setContentsMargins(14, 12, 14, 14)
         details_layout.setSpacing(8)
 
-        per_lbl = QtWidgets.QLabel("Details for Each Image")
+        per_lbl = QtWidgets.QLabel("This Page")
         per_lbl.setObjectName("sectionTitle")
         _set_help(
             per_lbl,
             "Use these fields for details that should affect only one specific image, not the whole image set.",
         )
         details_layout.addWidget(per_lbl)
+        self.this_page_card = details_card
+        self.layout_summary = QtWidgets.QLabel()
+        self.layout_summary.setWordWrap(True)
+        details_layout.addWidget(self.layout_summary)
+        override_form = QtWidgets.QFormLayout()
+        self.page_subject = QtWidgets.QLineEdit()
+        override_form.addRow("Subject override", self.page_subject)
+        self.use_project_style = QtWidgets.QCheckBox("Use project visual style")
+        self.page_style = QtWidgets.QLineEdit()
+        override_form.addRow(self.use_project_style)
+        override_form.addRow("Page visual style", self.page_style)
+        self.use_project_palette = QtWidgets.QCheckBox("Use project palette")
+        self.page_palette = QtWidgets.QComboBox()
+        self.page_palette.setEditable(True)
+        override_form.addRow(self.use_project_palette)
+        palette_row = QtWidgets.QHBoxLayout()
+        palette_row.addWidget(self.page_palette, 1)
+        self.btn_page_palette = QtWidgets.QPushButton("Add palette")
+        palette_row.addWidget(self.btn_page_palette)
+        self.btn_page_palette.clicked.connect(lambda: self._open_list_manager("color", for_page=True))
+        override_form.addRow("Page palette", palette_row)
+        details_layout.addLayout(override_form)
 
         for page in self._page_specs:
             editor = QtWidgets.QPlainTextEdit()
@@ -2851,7 +3058,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
             page.detail_widget = editor
             page.detail_label = label
             setattr(self, f"txt_{page.key}", editor)
-        left_v.addWidget(details_card)
+        self.btn_proofread_page = QtWidgets.QPushButton("Proofread page direction")
+        self.btn_proofread_page.clicked.connect(self._proofread_direction)
+        details_layout.addWidget(self.btn_proofread_page)
         left_v.addStretch(1)
 
         output_panel = QtWidgets.QWidget()
@@ -2861,24 +3070,46 @@ class PromptWriterPanel(QtWidgets.QWidget):
         right_v.setSpacing(8)
         main_h.addWidget(output_panel, 11)
 
-        output_title = QtWidgets.QLabel("Generated Prompts")
+        left_column.insertWidget(left_column.count() - 1, details_card)
+        output_title = QtWidgets.QLabel("Generated Prompt")
         output_title.setObjectName("columnTitle")
         right_v.addWidget(output_title)
         output_hint = QtWidgets.QLabel(
-            "Create the coordinated set, then copy or generate each image."
+            "Build deliberately, edit freely, then copy the prompt to your image tool."
         )
         output_hint.setObjectName("columnHint")
         output_hint.setWordWrap(True)
         right_v.addWidget(output_hint)
-        self.page_controls = PageControls(self.page_controller)
-        right_v.addWidget(self.page_controls)
+        self.prompt_status = QtWidgets.QLabel()
+        self.prompt_status.setWordWrap(True)
+        right_v.addWidget(self.prompt_status)
+        batch_row = QtWidgets.QGridLayout()
+        self.btn_restore = QtWidgets.QPushButton("Restore Previous Prompt")
+        self.btn_batch = QtWidgets.QPushButton("Build selected pages…")
+        self.btn_all = QtWidgets.QPushButton("Build all pages…")
+        self.btn_retry = QtWidgets.QPushButton("Retry failed pages…")
+        for index, button in enumerate((self.btn_restore, self.btn_batch, self.btn_all, self.btn_retry)):
+            batch_row.addWidget(button, index // 2, index % 2)
+        right_v.addLayout(batch_row)
+        self.batch_status = QtWidgets.QLabel()
+        self.batch_status.setWordWrap(True)
+        self._batch_results_scroll = QtWidgets.QScrollArea()
+        self._batch_results_scroll.setWidgetResizable(True)
+        self._batch_results_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self._batch_results_scroll.setMaximumHeight(100)
+        self._batch_results_scroll.setWidget(self.batch_status)
+        self._batch_results_scroll.hide()
+        right_v.addWidget(self._batch_results_scroll)
 
         output_nav = QtWidgets.QHBoxLayout()
         self.btn_prompt_list = QtWidgets.QPushButton("Prompts")
         self.btn_conversation = QtWidgets.QPushButton("Conversation")
+        self.btn_provider = QtWidgets.QPushButton("Image service…")
+        self.btn_provider.clicked.connect(self.provider_requested.emit)
         self.btn_conversation.setVisible(False)
         output_nav.addWidget(self.btn_prompt_list)
         output_nav.addWidget(self.btn_conversation)
+        output_nav.addWidget(self.btn_provider)
         output_nav.addStretch()
         right_v.addLayout(output_nav)
         self._site_status = QtWidgets.QLabel("")
@@ -2934,11 +3165,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
             editor = FocusablePlainTextEdit()
             editor.setObjectName("promptOutput")
-            editor.setReadOnly(True)
-            editor.setAcceptRichText(True)
+            editor.setReadOnly(False)
+            editor.setAcceptRichText(False)
             editor.setPlaceholderText(f"Prompt for {page.display_label}")
             editor.setMinimumHeight(140)
-            editor.setMaximumHeight(260)
+            editor.setMaximumHeight(16777215)
             editor.document().setDocumentMargin(8)
             bl.addWidget(editor)
             image_label = QtWidgets.QLabel()
@@ -2947,7 +3178,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             image_label.setVisible(False)
             bl.addWidget(image_label, alignment=Qt.AlignHCenter)
 
-            self._preview_layout.addWidget(block)
+            self._preview_layout.addWidget(block, 1)
             page.preview_widget = editor
             page.copy_button = copy_btn
             page.generate_button = generate_btn
@@ -2955,13 +3186,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
             page.preview_title = header_label
             page.preview_card = block
 
-            copy_btn.clicked.connect(lambda _, page_key=page.key: self._copy_prompt(page_key))
+            copy_btn.clicked.connect(lambda _: self._copy_prompt(self._view_page_id))
             generate_btn.clicked.connect(
-                lambda _, page_key=page.key: self._generate_with_provider(page_key)
+                lambda _: self._generate_with_provider(self._view_page_id)
             )
             editor.focused.connect(lambda ed=editor: self._set_last_focused(ed))
 
-        self._preview_layout.addStretch(1)
         self._preview_scroll.setWidget(preview_container)
         self._output_stack = QtWidgets.QStackedWidget()
         self._output_stack.addWidget(self._preview_scroll)
@@ -3264,23 +3494,32 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def _connect_signals(self):
         self.btn_generate.clicked.connect(self._on_generate)
-        self.btn_copy.clicked.connect(self._copy_all_prompts)
+        self.btn_copy.clicked.connect(lambda: self._copy_prompt(self._view_page_id))
         self.btn_erase.clicked.connect(self._on_erase_all)
+        self.target_selector.currentIndexChanged.connect(lambda: self.select_page(self.target_selector.currentData()))
+        for combo in (self.cmb_type, self.cmb_subject, self.cmb_color):
+            combo.currentTextChanged.connect(self._on_prompt_input_changed)
+        self.txt_global.textChanged.connect(self._on_prompt_input_changed)
+        for group in self._exclusive_checkbox_groups():
+            self._wire_exclusive_group(group)
+        for checkbox, _ in self._checkbox_state_specs():
+            checkbox.stateChanged.connect(self._on_prompt_input_changed)
+        self._view_spec.detail_widget.textChanged.connect(self._page_input_changed)
+        self._view_spec.preview_widget.textChanged.connect(self._manual_prompt_changed)
+        self.use_project_palette.toggled.connect(self._page_input_changed)
+        self.page_palette.currentTextChanged.connect(self._page_input_changed)
+        self.use_project_style.toggled.connect(self._page_input_changed)
+        self.page_style.textChanged.connect(self._page_input_changed)
+        self.page_subject.textChanged.connect(self._page_input_changed)
+        self.output_width.valueChanged.connect(self._output_changed)
+        self.output_height.valueChanged.connect(self._output_changed)
+        self.btn_restore.clicked.connect(self._restore_previous)
+        self.btn_batch.clicked.connect(lambda: self._choose_batch(False))
+        self.btn_all.clicked.connect(lambda: self._choose_batch(True))
+        self.btn_retry.clicked.connect(self._retry_batch)
+        self.btn_reroll.clicked.connect(self._reroll_shared)
+        self.btn_page_settings.clicked.connect(lambda: self.page_settings_requested.emit(self._view_page_id or ""))
 
-        try:
-            self.cmb_type.currentTextChanged.connect(self._on_prompt_input_changed)
-            self.cmb_subject.currentTextChanged.connect(self._on_prompt_input_changed)
-            self.cmb_color.currentIndexChanged.connect(self._on_prompt_input_changed)
-            self.txt_global.textChanged.connect(self._on_prompt_input_changed)
-            for page in self._page_specs:
-                if page.detail_widget is not None:
-                    page.detail_widget.textChanged.connect(self._on_prompt_input_changed)
-            for group in self._exclusive_checkbox_groups():
-                self._wire_exclusive_group(group)
-            for checkbox, _ in self._checkbox_state_specs():
-                checkbox.stateChanged.connect(self._on_prompt_input_changed)
-        except (RuntimeError, TypeError, ValueError) as error:
-            LOGGER.exception("Prompt Writer signal wiring failed: %s", error)
 
     def attach_browser(self, browser: object, image_tab: object | None = None) -> None:
         """Display one live conversation for all generated prompts."""
@@ -3311,14 +3550,14 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._output_stack.setCurrentWidget(self._browser.view)
 
     def _generate_with_provider(self, page_key: str) -> None:
-        if not self._generated_output_valid or self._browser is None:
+        if self._browser is None or page_key is None:
             return
-        prompt = self._generated_prompts.get(page_key, "").strip()
+        prompt = self.session.project.get_prompt(page_key)["text"]
         if not prompt or self._site_request_in_progress:
             return
-        page = next(page for page in self._page_specs if page.key == page_key)
+        self._browser_targets[page_key] = self.session.capture_target(page_key)
         if hasattr(self._browser, "set_approval_target"):
-            self._browser.set_approval_target(page_key, page.display_label.removesuffix(" Prompt"))
+            self._browser.set_approval_target(page_key, page_label(self.session.project, page_key))
         self._site_request_in_progress = True
         self._site_status.setText(f"Sending {page_key} prompt to {self._browser.provider}...")
         self._site_status.setVisible(True)
@@ -3335,12 +3574,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._sync_action_button_states()
 
     def _on_browser_image_started(self, page_key: str) -> None:
-        from project_consumers import page_id_for_key, session_for
-        session = session_for(self.project_root)
-        page_id = page_id_for_key(self.project_root, page_key)
-        if session is not None and page_id is not None:
-            self._browser_targets[page_key] = session.capture_target(page_id)
-        self._site_status.setText(f"Saving the selected {page_key} image...")
+        self._site_status.setText("Saving the selected image to its original page...")
         self._site_status.setVisible(True)
 
     def _on_browser_image_failed(self, message: str) -> None:
@@ -3357,10 +3591,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         if self._image_tab is None or self._pending_approval_key:
             self._on_browser_image_failed("Finish the current image before choosing another.")
             return
-        index = next(
-            (PAGE_INDICES[page.key] for page in self._page_specs if page.key == page_key),
-            0,
-        )
+        index = self._page_image_index(page_key)
         if not index:
             self._on_browser_image_failed("The selected image has no matching page.")
             return
@@ -3376,10 +3607,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def _on_image_import_completed(self, index: int, path: str, error: str) -> None:
         page_key = self._pending_approval_key
-        if not page_key or index != next(
-            (PAGE_INDICES[page.key] for page in self._page_specs if page.key == page_key),
-            0,
-        ):
+        if not page_key or index != self._page_image_index(page_key):
             return
         self._pending_approval_key = ""
         if not path:
@@ -3393,37 +3621,22 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.project_changed.emit()
         self._persist_state_now()
 
-    def _refresh_approved_previews(self, *_args: object) -> None:
-        image_paths = getattr(self._image_tab, "image_paths", {})
-        for page in self._page_specs:
-            index = PAGE_INDICES[page.key]
-            label = page.image_widget
-            if label is None or page.preview_widget is None:
-                continue
-            path = image_paths.get(index) if page.key in self._approved_pages else None
-            pixmap = QtGui.QPixmap(str(path)) if path else QtGui.QPixmap()
-            if pixmap.isNull():
-                label.clear()
-                label.setVisible(False)
-                page.preview_widget.setVisible(True)
-            else:
-                label.setPixmap(pixmap.scaled(
-                    label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation,
-                ))
-                label.setVisible(True)
-                page.preview_widget.setVisible(False)
+    def _page_image_index(self, page_id):
+        try:
+            key = self.session.project.get_page(page_id)["recovery"].get("legacy_key")
+            return PAGE_INDICES.get(key, 0)
+        except KeyError:
+            return 0
+
+    def _refresh_approved_previews(self, *_args):
+        # Imported artwork never replaces the editable prompt document.
+        self._view_spec.image_widget.setVisible(False)
+
 
     def _set_generated_output_valid(self, valid: bool) -> None:
-        signature_matches = bool(
-            self._generated_input_signature
-            and self._generated_input_signature == self._current_prompt_input_signature()
-        )
-        all_pages_present = all(
-            bool(self._generated_prompts.get(page.key, "").strip())
-            for page in self._page_specs
-        )
-        self._generated_output_valid = bool(valid and signature_matches and all_pages_present)
+        self._generated_output_valid = bool(valid)
         self._sync_action_button_states()
+
 
     def _has_erasable_content(self) -> bool:
         state = self._capture_state()
@@ -3443,39 +3656,29 @@ class PromptWriterPanel(QtWidgets.QWidget):
         )
 
     def _sync_action_button_states(self) -> None:
+        selected = getattr(self, "_view_page_id", None)
         busy = self._generation_in_progress
-        set_control_invisible(
-            self.btn_generate,
-            busy,
-            available=bool(self.cmb_subject.currentText().strip()),
-        )
-        set_control_invisible(
-            self.btn_copy,
-            busy,
-            available=self._generated_output_valid,
-        )
-        set_control_invisible(
-            self.btn_erase,
-            busy,
-            available=self._has_erasable_content(),
-        )
-        for page in self._page_specs:
-            if page.copy_button is not None:
-                set_control_invisible(
-                    page.copy_button,
-                    busy,
-                    available=(
-                        self._generated_output_valid
-                        and bool(self._generated_prompts.get(page.key, "").strip())
-                    ),
-                )
-            if page.generate_button is not None:
-                page.generate_button.setVisible(
-                    self._browser is not None and self._generated_output_valid
-                )
-                page.generate_button.setEnabled(
-                    not busy and not self._site_request_in_progress
-                )
+        text = self.session.project.get_prompt(selected)["text"] if selected else None
+        choices = self.session.project.prompt_context(selected) if selected else None
+        subject = ({**choices["shared"], **choices["prompt"]["overrides"]}.get("subject") if choices else "")
+        for button, enabled in ((self.btn_generate, bool(selected and subject and str(subject).strip()) and not busy),
+                                (self.btn_copy, text is not None and not busy),
+                                (self.btn_erase, self._has_erasable_content() and not busy)):
+            button.setEnabled(enabled)
+            effect = button.graphicsEffect()
+            if not isinstance(effect, QtWidgets.QGraphicsOpacityEffect):
+                effect = QtWidgets.QGraphicsOpacityEffect(button)
+                button.setGraphicsEffect(effect)
+            effect.setOpacity(1.0 if enabled else 0.52)
+        self.btn_batch.setEnabled(bool(self.session.project.pages) and not busy)
+        self.btn_all.setEnabled(bool(self.session.project.pages) and not busy)
+        self.btn_retry.setEnabled(not busy and self._last_batch is not None and bool(self._last_batch.items)
+                                 and self._last_batch.items[0].target.session_id == self.session.session_id
+                                 and any(item.status in {"failed", "conflict"} for item in self._last_batch.items))
+        self._view_spec.copy_button.setEnabled(text is not None and not busy)
+        self._view_spec.generate_button.setVisible(self._browser is not None)
+        self._view_spec.generate_button.setEnabled(text is not None and not busy and not self._site_request_in_progress)
+
 
     def _invalidate_generated_output(self, *, discard: bool = False) -> None:
         if discard:
@@ -3488,26 +3691,26 @@ class PromptWriterPanel(QtWidgets.QWidget):
                     page.preview_widget.clear()
         self._set_generated_output_valid(False)
 
-    def _on_prompt_input_changed(self, *_args: object) -> None:
-        self._invalidate_generated_output()
-        self._schedule_persist_state()
-        self.project_changed.emit()
+    def _on_prompt_input_changed(self, *_args):
+        if self._state_persistence_suspended or self.session.is_restoring:
+            return
+        state = self._capture_state()
+        sender = self.sender()
+        mapping = {self.cmb_subject: "subject", self.cmb_type: "type", self.cmb_color: "color", self.txt_global: "global"}
+        keys = [mapping[sender]] if sender in mapping else ["checks"]
+        self._writing = True
+        try:
+            self.session.project.update_project_data("prompt_settings", {key: state[key] for key in keys})
+        finally:
+            self._writing = False
+        self._authored_change()
+
 
     def _build_copy_all_text(self) -> str:
-        if not self._generated_output_valid:
-            return ""
-        parts: List[str] = []
-        for page in self._page_specs:
-            text = self._generated_prompts.get(page.key, "").strip()
-            if not text:
-                if page.preview_widget is not None:
-                    text = page.preview_widget.toPlainText().strip()
-            parts.append(
-                f"--- {page.display_label} ---\n\n{text}"
-                if text
-                else f"--- {page.display_label} ---\n\n"
-            )
-        return "\n\n".join(parts).strip()
+        project = self.session.project
+        return "\n\n".join(f"--- {page_label(project, page['id'])} ---\n\n{page['prompt']['text']}"
+                            for page in project.pages if page["prompt"]["text"] is not None)
+
 
     def _copy_all_prompts_text(self) -> str:
         all_text = self._build_copy_all_text()
@@ -3557,7 +3760,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     @staticmethod
     def _color_preview_range(
-        document: QtGui.QTextDocument,
+        widget: QtWidgets.QTextEdit,
         start: int,
         length: int,
         color: str,
@@ -3566,23 +3769,31 @@ class PromptWriterPanel(QtWidgets.QWidget):
     ) -> None:
         if start < 0 or length <= 0:
             return
-        cursor = QtGui.QTextCursor(document)
-        cursor.setPosition(start)
-        cursor.setPosition(start + length, QtGui.QTextCursor.KeepAnchor)
+        # Qt positions use UTF-16 units; Python offsets use Unicode code points.
+        plain = widget.toPlainText()
+        cursor = QtGui.QTextCursor(widget.document())
+        cursor.setPosition(len(plain[:start].encode('utf-16-le')) // 2)
+        cursor.setPosition(len(plain[:start + length].encode('utf-16-le')) // 2, QtGui.QTextCursor.KeepAnchor)
         text_format = QtGui.QTextCharFormat()
         text_format.setForeground(QColor(color))
         if bold:
             text_format.setFontWeight(QtGui.QFont.Bold)
-        cursor.mergeCharFormat(text_format)
+        selection = QtWidgets.QTextEdit.ExtraSelection()
+        selection.cursor = cursor
+        selection.format = text_format
+        widget.setExtraSelections([*widget.extraSelections(), selection])
 
-    def _set_colored_saved_preview(self, page: PageSpec, text: str) -> None:
-        """Restore exact saved prompt text while reapplying its semantic colors."""
+    def _highlight_saved_prompt(self, page: PageSpec) -> None:
+        """Color the display without changing authored text, cursor or undo history."""
         widget = page.preview_widget
         if widget is None:
             return
-        widget.setPlainText(text)
+        widget.setExtraSelections([])
         plain = widget.toPlainText()
-        document = widget.document()
+        choices = {}
+        if self._view_page_id:
+            context = self.session.project.prompt_context(self._view_page_id)
+            choices = context['prompt']['resolved_components'].get('choices') or {**context['shared'], **context['prompt']['overrides']}
 
         def color_exact(
             prefix: str,
@@ -3598,7 +3809,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             match = plain.find(needle)
             if match >= 0:
                 self._color_preview_range(
-                    document,
+                    widget,
                     match + len(prefix),
                     len(value),
                     color,
@@ -3606,7 +3817,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 )
 
         subject = _without_terminal_punctuation(
-            self.cmb_subject.currentText(),
+            choices.get('subject', ''),
             max_length=300,
         )
 
@@ -3614,22 +3825,22 @@ class PromptWriterPanel(QtWidgets.QWidget):
         first_paragraph = plain if first_paragraph_end < 0 else plain[:first_paragraph_end]
         subject_start = first_paragraph.rfind(subject) if subject else -1
         self._color_preview_range(
-            document,
+            widget,
             subject_start,
             len(subject),
             self._display_prompt_color("subject"),
             bold=True,
         )
 
-        type_choice = self.cmb_type.currentText().strip()
+        type_choice = choices.get('type', '').strip()
         if type_choice == NONE_CHOICE_LABEL:
             type_choice = ""
         type_choice = _normalize_prompt_fragment(type_choice, max_length=300)
         color_choice = _normalize_prompt_fragment(
-            self._get_color_choice() or "",
+            choices.get('color') or "",
             max_length=300,
         )
-        global_extra = _normalize_prompt_fragment(self.txt_global.toPlainText())
+        global_extra = _normalize_prompt_fragment(choices.get('global', ''))
         image_extra = _normalize_prompt_fragment(
             page.detail_widget.toPlainText() if page.detail_widget is not None else ""
         )
@@ -3662,13 +3873,13 @@ class PromptWriterPanel(QtWidgets.QWidget):
             if guidance_end < 0:
                 guidance_end = len(plain)
             self._color_preview_range(
-                document,
+                widget,
                 guidance_start,
                 guidance_end - guidance_start,
                 self._display_prompt_color("helpful"),
             )
             self._color_preview_range(
-                document,
+                widget,
                 guidance_start,
                 len("Guidance:"),
                 self._display_prompt_color("helpful"),
@@ -3720,23 +3931,26 @@ class PromptWriterPanel(QtWidgets.QWidget):
         )
         for label, semantic_key in labels:
             if label is not None:
+                label.setProperty("themeIndependent", True)
                 label.setStyleSheet(
                     f"color:{self._display_prompt_color(semantic_key)};"
                 )
+                label.style().unpolish(label)
+                label.style().polish(label)
 
         for page in getattr(self, "_page_specs", ()):
             page_color = page.preview_color
             if page.detail_label is not None:
+                page.detail_label.setProperty("themeIndependent", True)
                 page.detail_label.setStyleSheet(f"color:{page_color};")
             if page.preview_title is not None:
+                page.preview_title.setProperty("themeIndependent", True)
                 page.preview_title.setStyleSheet(f"color:{page_color};")
             if page.preview_card is not None:
                 page.preview_card.setStyleSheet(
                     f"QFrame#promptCard {{ border-color:{page_color}; }}"
                 )
-            prompt_text = self._generated_prompts.get(page.key, "")
-            if page.preview_widget is not None and prompt_text.strip():
-                self._set_colored_saved_preview(page, prompt_text)
+            self._highlight_saved_prompt(page)
 
     def _set_generation_busy(self, busy: bool) -> None:
         self._generation_in_progress = bool(busy)
@@ -3779,57 +3993,26 @@ class PromptWriterPanel(QtWidgets.QWidget):
             return text
 
     def _proofread_visible_prompt_fields(self, lifecycle: str) -> bool:
-        """Proofread every free-text source before an open/close boundary."""
-        if self._generation_in_progress:
-            return False
-        try:
-            type_text = self.cmb_type.currentText().strip()
-            if type_text == NONE_CHOICE_LABEL:
-                type_text = ""
-            protected_terms = tuple(
-                value
-                for value in (
-                    self.cmb_subject.currentText().strip(),
-                    type_text,
-                    self._get_color_choice() or "",
-                )
-                if value
-            )
-        except (RuntimeError, TypeError, ValueError) as error:
-            LOGGER.exception(
-                "Prompt Writer %s proofreading context failed: %s",
-                lifecycle,
-                error,
-            )
-            protected_terms = ()
+        # Loading, selecting and closing preserve authored input exactly.
+        return False
 
-        fields: List[Tuple[str, QtWidgets.QPlainTextEdit]] = [
-            ("Apply to All", self.txt_global),
-            *(
-                (page.output_filename, page.detail_widget)
-                for page in self._page_specs
-                if page.detail_widget is not None
-            ),
-        ]
-        corrections = [
-            (
-                widget,
-                self._proofread_prompt_text(
-                    f"{field_name} during {lifecycle}",
-                    widget.toPlainText(),
-                    protected_terms=protected_terms,
-                ),
-            )
-            for field_name, widget in fields
-        ]
-        changed = any(widget.toPlainText() != corrected for widget, corrected in corrections)
-        if not changed:
-            return False
-        for widget, corrected in corrections:
-            self._replace_plain_text_as_one_edit(widget, corrected)
-        # Generated prompts cannot remain copyable after their source text changes.
-        self._invalidate_generated_output()
-        return True
+    def _proofread_direction(self, _checked=False, *, shared=False):
+        if not self._can_edit_page():
+            return
+        target = self.session.capture_target(self._view_page_id, fields=('prompt',))
+        widget = self.txt_global if shared else self._view_spec.detail_widget
+        original = widget.toPlainText()
+        corrected = self._proofread_prompt_text("Project direction" if shared else "Page direction", original)
+        if corrected == original:
+            return
+        def apply(model, page_id):
+            if shared:
+                model.update_project_data("prompt_settings", {"global": corrected})
+            else:
+                model.update_prompt(page_id, {"directions": corrected})
+        if self.session.apply_result(target, apply):
+            self._authored_change()
+
 
     @staticmethod
     def _replace_plain_text_as_one_edit(
@@ -3849,144 +4032,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
             blocker.unblock()
 
     def _on_generate(self):
-        if self.page_controller.compatibility_error:
-            show_lettersmith_message(self, "Prompt Writer", self.page_controller.compatibility_error)
-            return
-        from project_consumers import consumer_issue
-        issue = consumer_issue(self.project_root, "prompt_generation")
-        if issue:
-            show_lettersmith_message(self, "Prompt Writer", issue)
-            return
-        if self._generation_in_progress:
-            return
-        subject = self.cmb_subject.currentText().strip()
-        if not subject:
-            show_lettersmith_message(self, "Missing subject", "Please enter a Subject.")
-            return
+        if self._view_page_id is not None:
+            self._build_pages([self._view_page_id])
 
-        self._set_generation_busy(True)
-        try:
-            t = self.cmb_type.currentText()
-            if t == NONE_CHOICE_LABEL:
-                t = None
-            c = self._get_color_choice()
-            guidance = self._collect_guidance()
-            protected_terms = tuple(
-                value
-                for value in (subject, t or "", c or "")
-                if value
-            )
-            original_global = self.txt_global.toPlainText().strip()
-            original_per_extras = {
-                page.key: page.detail_widget.toPlainText().strip()
-                if page.detail_widget is not None
-                else ""
-                for page in self._page_specs
-            }
-            global_extra = self._proofread_prompt_text(
-                "Apply to All",
-                original_global,
-                protected_terms=protected_terms,
-            )
-            per_extras = {
-                page.key: self._proofread_prompt_text(
-                    page.output_filename,
-                    original_per_extras[page.key],
-                    protected_terms=protected_terms,
-                )
-                for page in self._page_specs
-            }
-
-            prompts: Dict[str, str] = {}
-            debug_map: Dict[str, dict] = {}
-            per_data_map: Dict[str, dict] = {}
-            shared_prompt_data = self._roll_shared_prompt_data()
-
-            for page in self._page_specs:
-                per_image_data = dict(shared_prompt_data)
-                per_data_map[page.key] = per_image_data
-                prompt, payload, dbg = assemble_prompt_for_image(
-                    subject,
-                    per_image_data,
-                    page,
-                    type_choice=t,
-                    color_choice=c,
-                    guidance=guidance,
-                    global_extra=global_extra,
-                    image_extra=per_extras.get(page.key, ""),
-                )
-                prompts[page.key] = prompt
-                per_data_map[page.key]["payload"] = payload
-                debug_map[page.key] = dbg
-
-            self._validate_generated_prompt_set(prompts)
-
-            self._replace_plain_text_as_one_edit(self.txt_global, global_extra)
-            for page in self._page_specs:
-                if page.detail_widget is not None:
-                    self._replace_plain_text_as_one_edit(
-                        page.detail_widget,
-                        per_extras[page.key],
-                    )
-
-            self._generated_prompts = dict(prompts)
-            self._approved_pages.clear()
-            self._refresh_approved_previews()
-            subject_lead_in = shared_prompt_data.get("order", [])
-            if isinstance(subject_lead_in, (list, tuple)):
-                subject_lead_in = list(subject_lead_in)
-            elif not isinstance(subject_lead_in, str):
-                subject_lead_in = ""
-            self._resolved_instructions = {
-                "role": str(shared_prompt_data.get("role", "")),
-                "subject_lead_in": subject_lead_in,
-                "effort": str(shared_prompt_data.get("effort", "")),
-                "format": str(shared_prompt_data.get("format", "")),
-            }
-            self._generated_input_signature = self._current_prompt_input_signature()
-            self._set_generated_output_valid(True)
-
-            for page in self._page_specs:
-                if page.preview_widget is None:
-                    continue
-                payload = per_data_map.get(page.key, {}).get("payload")
-                if not isinstance(payload, PromptPayload):
-                    continue
-                page.preview_widget.setHtml(
-                    render_prompt_html(
-                        payload,
-                        color_for=self._display_prompt_color,
-                    )
-                )
-
-            self.prompts_generated.emit(
-                {
-                    page.display_label: prompts[page.key]
-                    for page in self._page_specs
-                    if page.key in prompts
-                },
-                {
-                    page.display_label: debug_map[page.key]
-                    for page in self._page_specs
-                    if page.key in debug_map
-                },
-            )
-            self.project_changed.emit()
-            if not self._persist_state_now():
-                show_lettersmith_message(
-                    self,
-                    "Prompts generated",
-                    "The prompts were generated, but the latest Prompt Writer state could not be saved.",
-                )
-        except Exception:
-            LOGGER.exception("Prompt Writer generation failed")
-            show_lettersmith_message(
-                self,
-                "Generation failed",
-                "The prompts could not be generated. Your previous generated prompts were kept.",
-            )
-        finally:
-            self._set_generation_busy(False)
 
     def _roll_data_for_image(self) -> dict:
         return self._roll_shared_prompt_data()
@@ -4010,88 +4058,28 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def _copy_all_prompts(self):
         return self._copy_all_prompts_text()
 
-    def _copy_prompt(self, page_identifier: str) -> None:
-        if not self._generated_output_valid:
-            return
-        panel_page = next((item for item in self._page_specs if page_identifier in (item.key, item.display_label, item.output_filename)), None)
-        if panel_page is None:
-            return
-        text = self._generated_prompts.get(panel_page.key, "").strip()
-        if not text:
-            if panel_page.preview_widget is not None:
-                text = panel_page.preview_widget.toPlainText().strip()
-        if text:
-            try:
+    def _copy_prompt(self, page_identifier):
+        try:
+            text = self.session.project.get_prompt(page_identifier)["text"]
+            if text is not None:
                 QtWidgets.QApplication.clipboard().setText(text)
-            except (RuntimeError, OSError) as error:
-                LOGGER.exception("Prompt Writer copy failed for %s: %s", panel_page.key, error)
-                show_lettersmith_message(
-                    self,
-                    "Copy failed",
-                    "The prompt could not be copied to the clipboard.",
-                )
+        except (KeyError, RuntimeError, OSError) as error:
+            show_lettersmith_message(self, "Copy failed", str(error))
+
 
     def reset_prompt_writer_state(self) -> bool:
-        """Clear the live panel and persist one authoritative empty state."""
-        if getattr(self, "_reset_in_progress", False):
-            return False
-        self._reset_in_progress = True
-        signal_widgets: List[QtCore.QObject] = [
-            self.cmb_subject,
-            self.cmb_type,
-            self.cmb_color,
-            self.txt_global,
-            *(
-                page.detail_widget
-                for page in self._all_page_specs.values()
-                if page.detail_widget is not None
-            ),
-            *(checkbox for checkbox, _ in self._checkbox_state_specs()),
-        ]
-        signal_blockers = [QtCore.QSignalBlocker(widget) for widget in signal_widgets]
-        self._persist_timer.stop()
-        self._state_persistence_suspended = True
+        self._writing = True
         try:
-            for key in ("type", "subject", "color"):
-                self._reload_managed_list(key)
-
-            self.cmb_subject.setCurrentIndex(-1)
-            self.cmb_type.setCurrentIndex(0)
-            self.cmb_color.setCurrentIndex(0)
-            for checkbox, _ in self._checkbox_state_specs():
-                checkbox.setChecked(False)
-
-            self._last_focused_widget = None
-            self.txt_global.clear()
-            for page in self._all_page_specs.values():
-                if page.detail_widget is not None:
-                    page.detail_widget.clear()
-            self._invalidate_generated_output(discard=True)
-            self._approved_pages.clear()
-            self._refresh_approved_previews()
-            for dialog in tuple(self._list_manager_dialogs.values()):
-                try:
-                    dialog.entry_edit.clear()
-                    dialog.close()
-                except RuntimeError:
-                    pass
-            self._list_manager_dialogs.clear()
-            self._hide_timer.stop()
-            self._geom_anim.stop()
-            self._fade_anim.stop()
-            self._generation_in_progress = False
-            saved = self._persist_state_now()
-            if saved:
-                self.project_changed.emit()
-            return saved
-        except (OSError, RuntimeError, ValueError, TypeError) as error:
-            LOGGER.exception("Prompt Writer reset failed: %s", error)
-            return False
+            project = self.session.project
+            project.update_project_data("prompt_settings", {"type": "", "subject": "", "color": "", "global": "", "checks": {}, "resolved_components": {}})
+            for page in project.pages:
+                project.replace_prompt(page["id"], {"text": None, "directions": "", "overrides": {}, "resolved_components": {}, "stale": False})
         finally:
-            for blocker in signal_blockers:
-                blocker.unblock()
-            self._state_persistence_suspended = False
-            self._reset_in_progress = False
+            self._writing = False
+        self.reload_project_state()
+        self.project_changed.emit()
+        return self._persist_state_now()
+
 
     def _on_erase_all(self):
         if any(
@@ -4302,7 +4290,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
     def shutdown(self) -> None:
         if self._shutdown:
             return
-        self._proofread_visible_prompt_fields("shutdown")
+        self.session.remove_listener(self.session_event.emit)
+        if self._active_batch is not None:
+            self._active_batch.cancel()
         self._shutdown = True
 
         if self._browser is not None:

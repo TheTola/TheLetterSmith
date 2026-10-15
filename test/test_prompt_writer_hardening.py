@@ -60,10 +60,22 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.panel = None
 
     def tearDown(self):
+        self.doCleanups()
         if self.panel is not None:
+            self.panel.shutdown()
             self.panel.deleteLater()
-            self.app.processEvents()
+            QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        from project_session import release_project_session
+        release_project_session(self.project_root)
         self.temp_dir.cleanup()
+
+    def _saved_project(self):
+        from project_repository import active_project_repository
+        return active_project_repository(self.project_root).load().project
+
+    @staticmethod
+    def _preview_colors(widget):
+        return ' '.join(selection.format.foreground().color().name() for selection in widget.extraSelections())
 
     def test_hidden_defaults_are_generation_only_and_preview_matches(self):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
@@ -124,7 +136,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
 
         self.panel.cmb_subject.setCurrentIndex(-1)
         self.assertFalse(self.panel.btn_generate.isEnabled())
-        self.assertFalse(self.panel.btn_copy.isEnabled())
+        self.assertTrue(self.panel.btn_copy.isEnabled())
 
     def test_titlebar_uses_minimize_artwork_as_its_only_close_control(self):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
@@ -213,7 +225,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.assertFalse(self.panel._shutdown)
         self.assertFalse(self.panel._hide_timer.isActive())
         self.assertFalse(self.panel._visionary_timer.isActive())
-        saved = json.loads(self.panel._state_path.read_text(encoding="utf-8"))
+        saved = self._saved_project().to_dict()["prompt_settings"]
         self.assertEqual(saved["global"], "Keep this draft")
         self.panel.popup()
         QtTest.QTest.qWait(300)
@@ -244,242 +256,70 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.assertEqual(self.panel.txt_global.toPlainText(), "Keep this draft")
         owner.close()
 
-    def test_malformed_state_is_backed_up_before_repair(self):
+    def test_malformed_state_is_preserved_for_foundation_recovery(self):
+        from project_repository import ProjectRepositoryError
         state_path = self.project_root / "prompt_writer_state.json"
-        malformed = b"{not-json"
-        state_path.write_bytes(malformed)
-
-        self.panel = PromptWriterPanel(project_root=str(self.project_root))
-
-        backups = list(
-            self.project_root.glob("prompt_writer_state.invalid.*.json")
-        )
-        self.assertEqual(len(backups), 1)
-        self.assertEqual(backups[0].read_bytes(), malformed)
-        self.assertTrue(self.panel.persist_project_state())
+        state_path.write_bytes(b"{not-json")
+        with self.assertRaises(ProjectRepositoryError):
+            PromptWriterPanel(project_root=str(self.project_root))
+        self.assertEqual(state_path.read_bytes(), b"{not-json")
 
     def test_future_state_schema_is_not_overwritten(self):
+        from project_model import UnsupportedProjectError
         state_path = self.project_root / "prompt_writer_state.json"
-        state_path.write_text(
-            json.dumps({"version": 99, "subject": "Future subject"}),
-            encoding="utf-8",
-        )
-        original = state_path.read_bytes()
-
-        self.panel = PromptWriterPanel(project_root=str(self.project_root))
-
-        self.assertTrue(self.panel._state_write_blocked)
-        self.assertFalse(self.panel.persist_project_state())
+        original = json.dumps({"version": 99, "subject": "Future subject"}).encode()
+        state_path.write_bytes(original)
+        with self.assertRaises(UnsupportedProjectError):
+            PromptWriterPanel(project_root=str(self.project_root))
         self.assertEqual(state_path.read_bytes(), original)
 
-    def test_generate_proofreads_all_free_text_and_persists_exact_prompts(self):
-        raw_fields = {
-            "global": "make all image dark and dramatc",
-            "cover": "a women standing under blue treee",
-            "letter": "the same women hold a sword",
-            "wall": "old medival castel wall",
-            "back": "sun is setting behind her,she look away",
-        }
-        corrected_fields = {
-            "global": "Make all images dark and dramatic.",
-            "cover": "A woman standing under a blue tree.",
-            "letter": "The same woman holds a sword.",
-            "wall": "An old medieval castle wall.",
-            "back": "The sun is setting behind her; she looks away.",
-        }
-        service = _FakeLanguageService(
-            {
-                raw_fields[key]: corrected_fields[key]
-                for key in raw_fields
-            }
-        )
-        self.panel = PromptWriterPanel(
-            project_root=str(self.project_root),
-            language_service=service,
-        )
-        self.panel.cmb_type.setCurrentText("Illustration")
-        self.panel.cmb_subject.setCurrentText("Subject")
-        self.panel.cmb_color.setCurrentText("Ruby")
-        self.panel.cb_black.setChecked(True)
-        self.panel.cb_cinematic_framing.setChecked(True)
-        self.panel.txt_global.setPlainText(raw_fields["global"])
-        for page in self.panel._page_specs:
-            page.detail_widget.setPlainText(raw_fields[page.key])
-
-        selections_before = (
-            (self.panel.cmb_type.currentIndex(), self.panel.cmb_type.currentText()),
-            (self.panel.cmb_subject.currentIndex(), self.panel.cmb_subject.currentText()),
-            (self.panel.cmb_color.currentIndex(), self.panel.cmb_color.currentText()),
-            {
-                state_key: checkbox.isChecked()
-                for checkbox, state_key in self.panel._checkbox_state_specs()
-            },
-        )
-
-        self.panel._on_generate()
-
-        self.assertTrue(self.panel._generated_output_valid)
-        self.assertEqual(self.panel.txt_global.toPlainText(), corrected_fields["global"])
-        for page in self.panel._page_specs:
-            self.assertEqual(
-                page.detail_widget.toPlainText(),
-                corrected_fields[page.key],
-            )
-            prompt = self.panel._generated_prompts[page.key]
-            self.assertIn(corrected_fields["global"], prompt)
-            self.assertIn(corrected_fields[page.key], prompt)
-            for other_page in self.panel._page_specs:
-                if other_page.key != page.key:
-                    self.assertNotIn(corrected_fields[other_page.key], prompt)
-
-        self.assertEqual(
-            {text for text, context, _terms in service.calls if context == "prompt"},
-            set(raw_fields.values()),
-        )
-        self.assertEqual(
-            selections_before,
-            (
-                (self.panel.cmb_type.currentIndex(), self.panel.cmb_type.currentText()),
-                (self.panel.cmb_subject.currentIndex(), self.panel.cmb_subject.currentText()),
-                (self.panel.cmb_color.currentIndex(), self.panel.cmb_color.currentText()),
-                {
-                    state_key: checkbox.isChecked()
-                    for checkbox, state_key in self.panel._checkbox_state_specs()
-                },
-            ),
-        )
-
-        saved = json.loads(
-            (self.project_root / "prompt_writer_state.json").read_text(encoding="utf-8")
-        )
-        for key, corrected in corrected_fields.items():
-            self.assertEqual(saved[key], corrected)
-        self.assertEqual(saved["generated_prompts"], self.panel._generated_prompts)
-
-    def test_generate_uses_original_text_when_proofreading_fails(self):
-        service = _FakeLanguageService(error=RuntimeError("checker unavailable"))
-        self.panel = PromptWriterPanel(
-            project_root=str(self.project_root),
-            language_service=service,
-        )
-        self.panel.cmb_subject.setCurrentText("Subject")
+    def test_explicit_proofreading_updates_only_requested_direction(self):
+        service = _FakeLanguageService({'shared dramatc': 'Shared dramatic.', 'page treee': 'Page tree.'})
+        self.panel = PromptWriterPanel(project_root=str(self.project_root), language_service=service)
+        self.panel.cmb_subject.setCurrentText('Subject')
+        self.panel.txt_global.setPlainText('shared dramatc')
+        self.panel._view_spec.detail_widget.setPlainText('page treee')
         self.panel.cb_paint.setChecked(True)
-        original_fields = {
-            "global": "shared dramatc direction",
-            "cover": "cover treee direction",
-            "letter": "letter medival direction",
-            "wall": "wall castel direction",
-            "back": "back charcter direction",
-        }
-        self.panel.txt_global.setPlainText(original_fields["global"])
-        for page in self.panel._page_specs:
-            page.detail_widget.setPlainText(original_fields[page.key])
-
-        with self.assertLogs("PromptWriterPanel", level="ERROR") as logged:
-            self.panel._on_generate()
-
+        self.panel.btn_proofread_page.click()
+        self.assertEqual(self.panel.txt_global.toPlainText(), 'shared dramatc')
+        self.assertEqual(self.panel._view_spec.detail_widget.toPlainText(), 'Page tree.')
+        self.panel.btn_proofread_shared.click()
+        self.panel._on_generate()
         self.assertTrue(self.panel._generated_output_valid)
-        for field_name in (
-            "Apply to All",
-            "cover.png",
-            "letter.png",
-            "wall.png",
-            "back.png",
-        ):
-            self.assertTrue(any(field_name in message for message in logged.output))
         self.assertTrue(self.panel.cb_paint.isChecked())
-        self.assertEqual(self.panel.txt_global.toPlainText(), original_fields["global"])
-        for page in self.panel._page_specs:
-            self.assertEqual(page.detail_widget.toPlainText(), original_fields[page.key])
-            prompt = self.panel._generated_prompts[page.key]
-            self.assertIn(original_fields["global"], prompt)
-            self.assertIn(original_fields[page.key], prompt)
-        self.assertTrue(
-            set(original_fields.values()).issubset(
-                {call[0] for call in service.calls}
-            )
-        )
+        saved = self._saved_project()
+        page_id = self.panel._view_page_id
+        self.assertEqual(saved.to_dict()['prompt_settings']['global'], 'Shared dramatic.')
+        self.assertEqual(saved.get_prompt(page_id)['directions'], 'Page tree.')
+        self.assertIn('Page tree.', saved.get_prompt(page_id)['text'])
+        self.assertEqual(len(service.calls), 2)
 
-        saved = json.loads(
-            (self.project_root / "prompt_writer_state.json").read_text(encoding="utf-8")
-        )
-        for key, original in original_fields.items():
-            self.assertEqual(saved[key], original)
-        self.assertEqual(saved["generated_prompts"], self.panel._generated_prompts)
-
-    def test_open_and_close_proofread_all_free_text_and_persist_it(self):
-        raw_fields = {
-            "global": "make every image bright",
-            "cover": "cover needs punctuation",
-            "letter": "letter needs punctuation",
-            "wall": "wall needs punctuation",
-            "back": "back needs punctuation",
-        }
-        corrected_fields = {
-            key: value[:1].upper() + value[1:] + "."
-            for key, value in raw_fields.items()
-        }
-        service = _FakeLanguageService(
-            {
-                raw_fields[key]: corrected_fields[key]
-                for key in raw_fields
-            }
-        )
-        self.panel = PromptWriterPanel(
-            project_root=str(self.project_root),
-            language_service=service,
-        )
-        self.panel.cmb_subject.setCurrentText("Subject")
-        self.panel.txt_global.setPlainText(raw_fields["global"])
-        for page in self.panel._page_specs:
-            page.detail_widget.setPlainText(raw_fields[page.key])
-
-        self.panel._generated_prompts = {
-            page.key: f"Saved {page.key} prompt"
-            for page in self.panel._page_specs
-        }
-        self.panel._generated_input_signature = (
-            self.panel._current_prompt_input_signature()
-        )
-        self.panel._set_generated_output_valid(True)
+    def test_failed_explicit_proofreading_preserves_authored_text(self):
+        service = _FakeLanguageService(error=RuntimeError('checker unavailable'))
+        self.panel = PromptWriterPanel(project_root=str(self.project_root), language_service=service)
+        self.panel.cmb_subject.setCurrentText('Subject')
+        self.panel._view_spec.detail_widget.setPlainText('  page treee\n')
+        with self.assertLogs('PromptWriterPanel', level='ERROR'):
+            self.panel.btn_proofread_page.click()
+        self.assertEqual(self.panel._view_spec.detail_widget.toPlainText(), '  page treee\n')
+        self.panel._on_generate()
         self.assertTrue(self.panel._generated_output_valid)
+        self.assertEqual(self._saved_project().get_prompt(self.panel._view_page_id)['directions'], '  page treee\n')
+        self.assertEqual(len(service.calls), 1)
 
+    def test_open_close_and_build_never_automatically_proofread(self):
+        service = _FakeLanguageService({'draft': 'Unrequested correction.'})
+        self.panel = PromptWriterPanel(project_root=str(self.project_root), language_service=service)
+        self.panel.cmb_subject.setCurrentText('Subject')
+        self.panel.txt_global.setPlainText('draft')
+        self.panel._view_spec.detail_widget.setPlainText('draft')
         self.panel.popup()
-
-        self.assertEqual(
-            self.panel.txt_global.toPlainText(),
-            corrected_fields["global"],
-        )
-        for page in self.panel._page_specs:
-            self.assertEqual(
-                page.detail_widget.toPlainText(),
-                corrected_fields[page.key],
-            )
-        self.assertFalse(self.panel._generated_output_valid)
-        self.assertEqual(self.panel._generated_prompts, {
-            page.key: f"Saved {page.key} prompt" for page in self.panel._page_specs
-        })
-        saved = json.loads(
-            (self.project_root / "prompt_writer_state.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        for key, corrected in corrected_fields.items():
-            self.assertEqual(saved[key], corrected)
-
-        close_raw = "close also checks language"
-        close_corrected = "Close also checks language."
-        service.corrections[close_raw] = close_corrected
-        self.panel.txt_global.setPlainText(close_raw)
-        self.panel._on_close()
-
-        self.assertEqual(self.panel.txt_global.toPlainText(), close_corrected)
-        saved = json.loads(
-            (self.project_root / "prompt_writer_state.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(saved["global"], close_corrected)
+        self.panel._on_generate()
+        self.panel.close()
+        self.panel.popup()
+        self.assertEqual(service.calls, [])
+        self.assertEqual(self.panel.txt_global.toPlainText(), 'draft')
+        self.assertEqual(self._saved_project().get_prompt(self.panel._view_page_id)['directions'], 'draft')
 
     def test_source_labels_and_generated_segments_share_unique_colors(self):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
@@ -515,7 +355,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.panel._on_generate()
 
         for page in self.panel._page_specs:
-            html = page.preview_widget.toHtml().casefold()
+            html = self._preview_colors(page.preview_widget)
             for expected in (
                 PROMPT_COLORS["type"],
                 PROMPT_COLORS["subject"],
@@ -558,7 +398,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
             for page in self.panel._page_specs:
                 self.assertIn(
                     replacement.casefold(),
-                    page.preview_widget.toHtml().casefold(),
+                    self._preview_colors(page.preview_widget),
                 )
 
         for page in self.panel._page_specs:
@@ -570,7 +410,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
                     replacement.casefold(),
                 )
             self.assertIn(replacement.casefold(), page.preview_card.styleSheet().casefold())
-            self.assertIn(replacement.casefold(), page.preview_widget.toHtml().casefold())
+            self.assertIn(replacement.casefold(), self._preview_colors(page.preview_widget))
 
         self.assertEqual(self.panel._generated_prompts, before)
 
@@ -609,10 +449,12 @@ class PromptWriterHardeningTests(unittest.TestCase):
             light_text,
         )
         for page in self.panel._page_specs:
-            self.assertIn(light_text, page.preview_widget.toHtml().casefold())
+            self.assertIn(light_text, self._preview_colors(page.preview_widget))
 
         service.set_theme("dark", persist=False)
         self.panel.apply_theme_assets(service)
+        self.panel.lbl_global.ensurePolished()
+        self.app.processEvents()
         dark_text = self.panel._display_prompt_color("global").casefold()
         self.assertGreater(QtGui.QColor(dark_text).lightness(), 160)
         self.assertEqual(
@@ -623,7 +465,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
             dark_text,
         )
         for page in self.panel._page_specs:
-            self.assertIn(dark_text, page.preview_widget.toHtml().casefold())
+            self.assertIn(dark_text, self._preview_colors(page.preview_widget))
 
     def test_reset_clears_prompt_writer_but_preserves_user_options(self):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
@@ -644,7 +486,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
             "Legacy User Color",
             (self.project_root / "Prompter" / "modules" / "color.txt").read_text(encoding="utf-8"),
         )
-        saved = json.loads((self.project_root / "prompt_writer_state.json").read_text(encoding="utf-8"))
+        saved = self._saved_project().to_dict()["prompt_settings"]
         self.assertFalse(saved["checks"].get("real"))
         self.assertNotIn("neutral_style", saved["checks"])
         self.assertNotIn("unspecified_framing", saved["checks"])
@@ -851,13 +693,9 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.panel.cb_paint.setChecked(True)
         for page in self.panel._page_specs:
             page.detail_widget.setPlainText(f"  {page.key} direction 雪\n\n")
-        self.panel._generated_prompts = {
-            page.key: f"  Manual {page.key} café\r\n\n雪  "
-            for page in self.panel._page_specs
-        }
-        self.panel._resolved_instructions = {"role": "Chosen once"}
-        self.panel._generated_input_signature = self.panel._current_prompt_input_signature()
-        self.panel._set_generated_output_valid(True)
+        self.panel.session.project.update_project_data('prompt_settings', {'resolved_components': {'role': 'Chosen once'}})
+        for page in self.panel._page_specs:
+            self.panel.session.project.update_prompt(page.key, {'text': f"  Manual {page.key} café\r\n\n雪  ", 'stale': False})
         before = self.panel._capture_state()
         library_path = self.panel._resolve_managed_list_path("color")
         builtin_bytes = library_path.read_bytes()
@@ -1027,36 +865,30 @@ class PromptWriterHardeningTests(unittest.TestCase):
         )
         self.assertEqual({column for _row, column in positions.values()}, {0})
 
-    def test_malformed_persisted_generated_output_is_invalidated(self):
+    def test_saved_manual_placeholder_text_is_preserved_without_validation(self):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
-        self.panel.cmb_subject.setCurrentText("Subject")
-        self.panel._on_generate()
-        state_path = self.project_root / "prompt_writer_state.json"
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        state["generated_prompts"]["cover"] = "{{unresolved}}"
-        set_path_hidden(state_path, False)
-        state_path.write_text(json.dumps(state), encoding="utf-8")
-
-        self.panel.deleteLater()
-        self.app.processEvents()
-        self.panel = PromptWriterPanel(project_root=str(self.project_root))
-
-        self.assertFalse(self.panel._generated_output_valid)
-        self.assertEqual(self.panel._generated_prompts["cover"], "{{unresolved}}")
+        page_id = self.panel._view_page_id
+        self.panel._view_spec.preview_widget.setPlainText('  {{unresolved}}\n')
+        self.assertTrue(self.panel.persist_project_state())
+        self.panel.reload_project_state()
+        self.assertEqual(self.panel._view_spec.preview_widget.toPlainText(), '  {{unresolved}}\n')
+        self.assertEqual(self._saved_project().get_prompt(page_id)['text'], '  {{unresolved}}\n')
 
     def test_stale_partial_prompt_snapshots_round_trip_without_regeneration(self):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
+        page_id = self.panel._view_page_id
         exact = "  Edited café \r\n\n prompt  "
-        self.panel._generated_prompts = {"cover": exact}
-        self.panel._resolved_instructions = {"role": "Chosen once"}
-        self.panel.txt_global.setPlainText("Changed shared direction")
+        self.panel.session.project.update_project_data('prompt_settings', {'resolved_components': {'role': 'Chosen once'}})
+        self.panel.session.project.update_prompt(page_id, {'text': exact})
+        self.panel.txt_global.setPlainText('Changed shared direction')
         self.assertFalse(self.panel._generated_output_valid)
         self.assertTrue(self.panel.persist_project_state())
-        with mock.patch.object(self.panel, "_roll_shared_prompt_data", side_effect=AssertionError("load rerolled")):
+        with mock.patch.object(self.panel, '_roll_shared_prompt_data', side_effect=AssertionError('load rerolled')):
             self.assertTrue(self.panel.reload_project_state())
-        self.assertEqual(self.panel._generated_prompts, {"cover": exact})
-        self.assertEqual(self.panel._resolved_instructions, {"role": "Chosen once"})
+        self.assertEqual(self.panel._generated_prompts, {page_id: exact})
+        self.assertEqual(self.panel._resolved_instructions, {'role': 'Chosen once'})
         self.assertFalse(self.panel._generated_output_valid)
+        self.assertEqual(self._saved_project().get_prompt(page_id)['text'], exact)
 
     def test_complete_workspace_restores_historical_values_and_exact_prompts(self):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
@@ -1085,12 +917,13 @@ class PromptWriterHardeningTests(unittest.TestCase):
         ):
             self.panel._on_generate()
 
-        exact_cover = self.panel._generated_prompts["cover"] + "\r\nExact saved suffix."
-        self.panel._generated_prompts["cover"] = exact_cover
+        page_id = self.panel._view_page_id
+        exact_cover = self.panel._generated_prompts[page_id] + "\r\nExact saved suffix."
+        self.panel.session.project.update_prompt(page_id, {"text": exact_cover})
         expected_prompts = dict(self.panel._generated_prompts)
         expected_resolved = {
             "role": resolved["role"],
-            "subject_lead_in": resolved["order"],
+            "order": resolved["order"],
             "effort": resolved["effort"],
             "format": resolved["format"],
         }
@@ -1108,19 +941,19 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.assertEqual(self.panel.cmb_type.currentText(), "Retired Etching")
         self.assertEqual(self.panel.cmb_subject.currentText(), "GO and Genesis Prime")
         self.assertEqual(self.panel.cmb_color.currentText(), "Archived Copper Palette")
-        self.assertEqual(self.panel.txt_global.toPlainText(), "Shared visual direction.")
+        self.assertEqual(self.panel.txt_global.toPlainText(), "Shared visual direction")
         self.assertTrue(self.panel.cb_black.isChecked())
         self.assertTrue(self.panel.cb_cinematic_framing.isChecked())
         self.assertEqual(self.panel._resolved_instructions, expected_resolved)
         self.assertEqual(self.panel._generated_prompts, expected_prompts)
-        self.assertEqual(self.panel._generated_prompts["cover"], exact_cover)
+        self.assertEqual(self.panel._generated_prompts[page_id], exact_cover)
         self.assertTrue(self.panel._generated_output_valid)
-        cover_page = next(page for page in self.panel._page_specs if page.key == "cover")
+        cover_page = self.panel._view_spec
         self.assertEqual(
             cover_page.preview_widget.toPlainText(),
             exact_cover.replace("\r\n", "\n"),
         )
-        restored_html = cover_page.preview_widget.toHtml().casefold()
+        restored_html = self._preview_colors(cover_page.preview_widget)
         for expected in (
             PROMPT_COLORS["type"],
             PROMPT_COLORS["subject"],

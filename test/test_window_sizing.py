@@ -962,6 +962,28 @@ class WindowSizingTests(unittest.TestCase):
             self.assertIs(window._prompt_writer_win, replacement)
             self.assertEqual(len(window.findChildren(PromptWriterPanel)), 1)
 
+    def test_prompt_writer_images_launcher_targets_each_page_without_provider_sign_in(self) -> None:
+        from project_consumers import page_id_for_key
+        from project_model import create_project
+        from project_session import get_project_session
+        with self.window() as window:
+            session = get_project_session(window.project_root)
+            session.replace(create_project(['cover', 'letter', 'illustration', 'letter', 'end_page']))
+            window.image_tab.page_controller.reload()
+            window._prompt_writer_browser = None
+            window._prompt_writer_browser_ready = False
+            for page in window.image_tab.page_controller.pages:
+                panel = window._prompt_writer_win
+                if panel is not None and panel.is_open:
+                    panel.close()
+                window.image_tab.page_controller.select(page.key)
+                QtTest.QTest.mouseClick(window.image_tab.pwrite_fab, QtCore.Qt.LeftButton)
+                panel = window._prompt_writer_win
+                self.assertTrue(panel.is_open)
+                self.assertEqual(panel.target_selector.currentData(), page_id_for_key(window.project_root, page.key))
+                self.assertIsNone(window._prompt_writer_browser)
+                self.assertEqual(panel._view_spec.color_key, page.kind)
+
     def test_editor_formatting_remains_reachable_in_a_narrow_window(self) -> None:
         from Editor import Editor
 

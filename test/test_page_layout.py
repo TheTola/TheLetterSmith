@@ -115,37 +115,41 @@ class PageLayoutTests(unittest.TestCase):
             self.assertEqual(set(validate_runtime_image_manifest(root / "runtime")["slots"]), {page.key for page in pages})
 
     def test_editors_share_count_type_order_and_keep_drafts(self):
+        from project_consumers import page_id_for_key
+        from PySide6 import QtTest
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tab = ImageTab(root)
             panel = self._panel(root)
             try:
                 tab.page_controls.count.setValue(6)
-                self.assertEqual(len(panel._page_specs), 6)
-                panel._all_page_specs["page_1"].detail_widget.setPlainText("Blue garden")
-                panel.page_controller.select("page_1")
-                panel.page_controls.kind.setCurrentIndex(panel.page_controls.kind.findData("wall"))
-                panel.page_controls.move_left.click()
-                self.assertEqual(tab.page_controller.pages[2], LetterPage("page_1", "wall"))
-                self.assertEqual(tab.labels[5][0], "Letter 1 Image")
-                self.assertEqual(panel._page_specs[2].detail_widget.toPlainText(), "Blue garden")
+                self.assertEqual(panel.target_selector.count(), 6)
+                target = page_id_for_key(root, 'page_1')
+                panel.select_page(target)
+                panel._view_spec.detail_widget.setPlainText('Blue garden')
+                tab.page_controller.select('page_1')
+                tab.page_controls.kind.setCurrentIndex(tab.page_controls.kind.findData('wall'))
+                tab.page_controls.move_left.click()
+                self.assertEqual(tab.page_controller.pages[2], LetterPage('page_1', 'wall'))
+                self.assertEqual(panel.target_selector.currentData(), target)
+                self.assertEqual(panel._view_spec.detail_widget.toPlainText(), 'Blue garden')
                 panel._on_generate()
-                self.assertEqual(len(panel._generated_prompts), 6)
-                self.assertIn("The Wall Page", panel._generated_prompts["page_1"])
-                panel._copy_prompt("page_1")
-                self.assertEqual(self.app.clipboard().text(), panel._generated_prompts["page_1"])
-                panel.page_controls.count.setValue(2)
-                self.assertFalse(panel._generated_output_valid)
-                self.assertEqual(list(tab.cards), [1, 4])
-                panel.page_controls.count.setValue(10)
-                self.assertEqual(len(panel._page_specs), 10)
-                self.assertEqual(panel._all_page_specs["page_1"].detail_widget.toPlainText(), "Blue garden")
-                panel._on_generate()
-                self.assertTrue(panel._generated_output_valid)
+                prompt = panel.session.project.get_prompt(target)['text']
+                self.assertIn('readable area', prompt)
+                panel._copy_prompt(target)
+                self.assertEqual(self.app.clipboard().text(), prompt)
+                tab.page_controls.count.setValue(10)
+                self.assertEqual(panel.target_selector.count(), 10)
+                panel.select_page(target)
+                self.assertEqual(panel._view_spec.detail_widget.toPlainText(), 'Blue garden')
+                batch = panel._build_pages([page['id'] for page in panel.session.project.pages], confirm=False)
+                for _ in range(200):
+                    if not panel._generation_in_progress: break
+                    QtTest.QTest.qWait(5)
+                self.assertTrue(all(item.status == 'success' for item in batch.items))
                 self.assertEqual(len(panel._generated_prompts), 10)
-                panel.persist_project_state()
+                self.assertTrue(panel.persist_project_state())
                 panel.reload_project_state()
-                self.assertTrue(panel._generated_output_valid)
                 self.assertEqual(len(panel._generated_prompts), 10)
             finally:
                 panel.shutdown()
@@ -155,16 +159,20 @@ class PageLayoutTests(unittest.TestCase):
                 self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
 
     def test_image_approval_uses_stable_slot_after_reordering(self):
+        from project_consumers import page_id_for_key
         with tempfile.TemporaryDirectory() as directory:
             panel = self._panel(Path(directory))
             try:
-                pages = list(resized_pages(DEFAULT_PAGES, 5))
+                panel.page_controller.update_pages(tuple(resized_pages(DEFAULT_PAGES, 5)))
+                target = page_id_for_key(Path(directory), 'page_1')
+                panel._browser_targets[target] = panel.session.capture_target(target)
+                pages = list(panel.page_controller.pages)
                 pages[1], pages[3] = pages[3], pages[1]
                 panel.page_controller.update_pages(tuple(pages))
                 panel._image_tab = mock.Mock()
                 panel._image_tab.set_image_path.return_value = True
-                panel._on_browser_image_ready("page_1", "selected.png")
-                panel._image_tab.set_image_path.assert_called_once_with(PAGE_INDICES["page_1"], "selected.png")
+                panel._on_browser_image_ready(target, 'selected.png')
+                panel._image_tab.set_image_path.assert_called_once_with(PAGE_INDICES['page_1'], 'selected.png')
             finally:
                 panel.shutdown()
                 panel.deleteLater()

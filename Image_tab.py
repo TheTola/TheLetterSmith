@@ -3466,7 +3466,9 @@ class ImageTab(
             return
 
         try:
-            is_open = toggle()
+            from project_consumers import page_id_for_key
+            page_id = page_id_for_key(self.project_root, self.page_controller.selected)
+            is_open = toggle(page_id=page_id)
 
         except Exception as error:
             self._show_temporary_status(

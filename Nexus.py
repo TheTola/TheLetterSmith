@@ -5289,21 +5289,21 @@ class Nexus(QtWidgets.QMainWindow):
             self.status("Prompt Writer state could not be saved.")
             return False
 
-    def toggle_prompt_writer(self) -> bool:
+    def toggle_prompt_writer(self, page_id=None) -> bool:
         """Toggle the button's panel; shortcuts and tray actions remain show requests."""
         panel = self._prompt_writer_win
         if isinstance(panel, QtWidgets.QWidget):
             try:
-                if panel.is_open:
+                if panel.is_open and (page_id is None or page_id == panel._view_page_id):
                     panel.close_with_anim()
                     return False
             except RuntimeError:
                 self._prompt_writer_win = None
-        self.open_prompt_writer()
+        self.open_prompt_writer(page_id=page_id)
         panel = self._prompt_writer_win
         return isinstance(panel, QtWidgets.QWidget) and panel.is_open
 
-    def open_prompt_writer(self):
+    def open_prompt_writer(self, page_id=None):
         """
         Show or focus the cached Prompt Writer without toggling it closed.
         Ctrl+Alt+P and the tray action use this path.
@@ -5313,6 +5313,68 @@ class Nexus(QtWidgets.QMainWindow):
             self.recipient_page.focus_recipient()
             return
 
+        if isinstance(page_id, bool):
+            page_id = None
+        browser = self._prompt_writer_browser if self._prompt_writer_browser_ready else None
+        launcher = self.image_tab.pwrite_fab
+        if not launcher.isVisible():
+            launcher = self
+        w = getattr(self, "_prompt_writer_win", None)
+        if isinstance(w, QtWidgets.QWidget):
+            try:
+                if page_id is not None:
+                    w.select_page(page_id)
+                w.open_with_anim(launcher=launcher)
+                w.raise_()
+                w.activateWindow()
+                self.status("Prompt Writer focused.")
+                self.toast("Prompt Writer")
+                return
+            except RuntimeError:
+                self._prompt_writer_win = None
+
+        # In-process overlay panel
+        try:
+            from PromptWriterPanel import PromptWriterPanel  # local module in project root
+            w = PromptWriterPanel(
+                self,
+                project_root=self.project_root,
+                page_id=page_id,
+            )
+            self._prompt_writer_win = w
+            if browser is not None:
+                w.attach_browser(browser, self.image_tab)
+            w.provider_requested.connect(self._connect_prompt_writer_provider)
+            w.page_settings_requested.connect(self._show_prompt_page_settings)
+            self.theme_service.apply_semantic_styles(w)
+            w.project_changed.connect(
+                lambda: self.project_dirty.mark_changed("prompt-writer")
+            )
+            w.project_changed.connect(self._record_protected_edit)
+            w.destroyed.connect(lambda: self._on_prompt_writer_destroyed(w))
+            w.dismissed.connect(self._on_prompt_writer_dismissed)
+            w.open_with_anim(launcher=launcher)
+
+            self.status("Prompt Writer opened (inline).")
+            self.toast("Prompt Writer")
+            return
+
+        except Exception as ex:
+            print(f"[PromptWriter] In-process load failed: {ex}")
+        self.status("Prompt Writer could not be opened.")
+        self.toast("Prompt Writer unavailable")
+
+    def _show_prompt_page_settings(self, page_id):
+        from project_session import get_project_session
+        session = get_project_session(self.project_root)
+        if page_id:
+            session.select_page(page_id)
+        self.tabbar.setCurrentIndex(0)
+        self.image_tab.page_controls.setFocus()
+        if self._prompt_writer_win is not None:
+            self._prompt_writer_win.close_with_anim()
+
+    def _connect_prompt_writer_provider(self):
         browser = self._prompt_writer_browser
         if not self._prompt_writer_browser_ready:
             try:
@@ -5333,47 +5395,9 @@ class Nexus(QtWidgets.QMainWindow):
                 _LOGGER.exception("Prompt Writer provider sign-in failed: %s", error)
                 self.status("Prompt Writer provider could not be opened.")
                 return
-        launcher = self.image_tab.pwrite_fab
-        if not launcher.isVisible():
-            launcher = self
-        w = getattr(self, "_prompt_writer_win", None)
-        if isinstance(w, QtWidgets.QWidget):
-            try:
-                w.open_with_anim(launcher=launcher)
-                w.raise_()
-                w.activateWindow()
-                self.status("Prompt Writer focused.")
-                self.toast("Prompt Writer")
-                return
-            except RuntimeError:
-                self._prompt_writer_win = None
-
-        # In-process overlay panel
-        try:
-            from PromptWriterPanel import PromptWriterPanel  # local module in project root
-            w = PromptWriterPanel(
-                self,
-                project_root=self.project_root,
-            )
-            self._prompt_writer_win = w
-            w.attach_browser(browser, self.image_tab)
-            self.theme_service.apply_semantic_styles(w)
-            w.project_changed.connect(
-                lambda: self.project_dirty.mark_changed("prompt-writer")
-            )
-            w.project_changed.connect(self._record_protected_edit)
-            w.destroyed.connect(lambda: self._on_prompt_writer_destroyed(w))
-            w.dismissed.connect(self._on_prompt_writer_dismissed)
-            w.open_with_anim(launcher=launcher)
-
-            self.status("Prompt Writer opened (inline).")
-            self.toast("Prompt Writer")
-            return
-
-        except Exception as ex:
-            print(f"[PromptWriter] In-process load failed: {ex}")
-        self.status("Prompt Writer could not be opened.")
-        self.toast("Prompt Writer unavailable")
+        panel = self._prompt_writer_win
+        if panel is not None and panel._browser is not browser:
+            panel.attach_browser(browser, self.image_tab)
 
     def _on_prompt_writer_destroyed(self, panel: QtWidgets.QWidget) -> None:
         if self._prompt_writer_win is panel:
