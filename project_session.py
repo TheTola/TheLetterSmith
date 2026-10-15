@@ -159,6 +159,8 @@ class ProjectSession:
     def _target_signature(self, page_id: str, fields: tuple[str, ...], include_shared: bool) -> str:
         page = self.project.get_page(page_id)
         values = {key: _input_value(key, page.get(key)) for key in fields}
+        if '$order' in fields:
+            values['$order'] = [item['id'] for item in self.project.pages]
         if include_shared:
             payload = self.project.to_dict()
             values['$shared'] = {key: payload.get(key, {}) for key in ('shared_settings', 'prompt_settings', 'presentation')}
@@ -190,6 +192,20 @@ class ProjectSession:
                 return False
             return (target.input_versions == versions
                     and target.signature == self._target_signature(target.page_id, target.fields, target.include_shared))
+
+    def capture_prompt_batch(self, page_ids, factory):
+        """Coherent shared resolution, detached project and original-page tokens."""
+        with self._lock, self.project.mutation_scope():
+            ids = tuple(dict.fromkeys(page_ids))
+            if not ids:
+                raise ValueError('Select at least one page to build.')
+            for page_id in ids:
+                self.capture_target(page_id)
+            resolved = self.project.resolve_prompt_components(factory)
+            project = ProjectModel.from_dict(self.project.to_dict())
+            targets = tuple(self.capture_target(page_id, fields=('type', 'prompt', 'message', 'design_overrides', '$order'))
+                            for page_id in ids)
+            return project, resolved, targets
 
     def apply_result(self, target: WorkTarget, apply: Callable[[ProjectModel, str], None]) -> bool:
         """Apply to the captured page, or return False without invoking apply."""

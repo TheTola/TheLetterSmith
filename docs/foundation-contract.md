@@ -28,6 +28,13 @@ objects; old documents and exact prompt strings are not rewritten on load.
   those rectangles. Prompt Writer supports drafting artwork instructions for them.
 - Presentation changes invalidate prompt snapshots and shared WorkTarget versions,
   including edit-then-revert. They do not modify authored prompt strings.
+- `ProjectSession.capture_prompt_batch(page_ids, factory)` validates nonempty
+  targets, resolves shared wording once, and atomically returns a detached model,
+  shared resolution and page work tokens. Tokens include type, prompt, message,
+  page design, shared inputs and `$order`. The optional `$order` target field
+  guards the ordered page IDs and a mutation-time structure counter, including
+  reorder-then-revert. Ordinary page work without `$order` continues to survive
+  reordering. Batch tokens never include selection as an authored input.
 
 Foundation-owned: `project_model.py`, `project_migration.py`,
 `project_repository.py`, and `project_session.py`. Coordinate changes to these

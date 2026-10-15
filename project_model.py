@@ -257,12 +257,18 @@ class ProjectModel:
     def input_versions(self, page_id: str, fields: Iterable[str], *, include_shared: bool = True) -> tuple[int, ...]:
         """Read mutation-time counters; notifications are not the guard authority."""
         self._page(page_id)
+        fields = tuple(fields)
         keys = [(page_id, "*"), *((page_id, field) for field in fields)]
+        if '$order' in fields:
+            keys.append(('*', 'page_order'))
         if include_shared:
             keys.append(("*", "shared_settings"))
         return tuple(self._input_versions.get(key, 0) for key in keys)
 
     def _record_change(self, change: ModelChange) -> None:
+        if change.kind == 'structure':
+            key = ('*', 'page_order')
+            self._input_versions[key] = self._input_versions.get(key, 0) + 1
         for page_id, fields in change.changed_fields:
             for field in fields:
                 key = (page_id, field)
@@ -289,6 +295,8 @@ class ProjectModel:
                 changes.append((page_id, fields))
         if any(self._data[key] != candidate[key] for key in ("shared_settings", "prompt_settings", "presentation")):
             changes.append(("*", ("shared_settings",)))
+        if tuple(before) != tuple(after):
+            changes.append(('*', ('page_order',)))
         self._data = candidate
         self._record_change(ModelChange(kind, tuple(after), self.revision, tuple(changes)))
 
