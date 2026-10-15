@@ -200,6 +200,31 @@ class ForgeRenderTests(unittest.TestCase):
         self.assertEqual(len(assets), 1)
         self.assertEqual(assets[0].read_bytes(), (self.root / "attachments/active.png").read_bytes())
 
+    def test_shared_artwork_and_message_image_survives_save_and_portable_render(self):
+        page = self.project.pages[1]
+        reference = page["artwork"]["asset"]
+        original = (self.root / reference).read_bytes()
+        self.project.update_message(page["id"], {
+            **page["message"], "resources": [reference],
+            "html": f'<p>Message A</p><img src="{reference}">',
+        })
+        repository = ProjectRepository(self.root / "saved")
+        repository.save(self.project, asset_root=self.root)
+        restored = repository.load()
+        self.session.replace(restored.project, asset_root=restored.asset_root)
+        # The canonical repository must satisfy both owners without fallback
+        # to the original development workspace.
+        (self.root / reference).unlink()
+        output = self.build()
+        public = copy_display_output(output, self.root / "public")
+        manifest = json.loads((public / DISPLAY_MANIFEST).read_text())
+        artwork = next(item for item in manifest["pages"] if item["id"] == page["id"])
+        self.assertEqual((public / artwork["source"]).read_bytes(), original)
+        attachments = list((public / "gallery/message").rglob("*.png"))
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].read_bytes(), original)
+        self.assertEqual(generate.validate_play_bundle(public), public)
+
     def test_static_and_independent_real_gif_frames(self):
         frames = [Image.new("RGB", (20, 30), color) for color in ("red", "blue")]
         source = self.root / "moving.gif"
