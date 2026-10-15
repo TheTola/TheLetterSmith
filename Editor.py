@@ -47,6 +47,7 @@ import os
 import re
 import shutil
 import time
+import uuid
 from bisect import bisect_right
 from pathlib import Path
 from typing import Callable, Optional
@@ -113,6 +114,7 @@ from letter_page import (
     normalized_letter_page_settings,
 )
 from message_format import normalize_ultralinks_in_document
+from message_resources import load_message_image
 from project_save import ProjectNotReadyError, ProjectSaveService
 from project_state import ProjectStateController
 from project_paths import application_paths
@@ -494,22 +496,32 @@ class UltralinkDialog(QDialog):
 
 class RichTextEdit(QTextEdit):
     language_refresh_requested = QtCore.Signal()
+    document_edit_finished = QtCore.Signal()
 
     def __init__(
         self,
         project_root: Path,
         *args,
         language_service: Optional[object] = None,
+        resource_roots: tuple[Path, ...] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.project_root = Path(project_root)
+        self.resource_roots = resource_roots
         self._language_service = language_service
         self._language_issues: tuple[object, ...] = ()
         self._ignored_language_words: set[str] = set()
         self.setAcceptRichText(True)
         self.setAcceptDrops(True)
         self.viewport().setMouseTracking(True)
+
+    def loadResource(self, resource_type: int, name: QtCore.QUrl):
+        if self.resource_roots is None:
+            return super().loadResource(resource_type, name)
+        if resource_type == QTextDocument.ImageResource:
+            return load_message_image(name.toString(), self.resource_roots)
+        return QtCore.QByteArray()
 
     @property
     def language_issues(self) -> tuple[object, ...]:
@@ -743,7 +755,10 @@ class RichTextEdit(QTextEdit):
         assets_dir = self._assets_dir()
         _ensure_dir(assets_dir)
 
-        base = _safe_name(src_path.name)
+        base = (
+            f"{uuid.uuid4().hex}{src_path.suffix.lower()}"
+            if self.resource_roots is not None else _safe_name(src_path.name)
+        )
         dst = assets_dir / base
 
         if dst.exists():
@@ -789,10 +804,13 @@ class RichTextEdit(QTextEdit):
             super().dropEvent(event)
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
-        controller = getattr(self, "named_style_controller", None)
-        if controller is not None and controller.handle_key_press(event):
-            return
-        super().keyPressEvent(event)
+        try:
+            controller = getattr(self, "named_style_controller", None)
+            if controller is not None and controller.handle_key_press(event):
+                return
+            super().keyPressEvent(event)
+        finally:
+            self.document_edit_finished.emit()
 
     def insertFromMimeData(self, source: QMimeData) -> None:
         if source.hasImage():
@@ -800,9 +818,14 @@ class RichTextEdit(QTextEdit):
             if isinstance(img, QImage) and not img.isNull():
                 assets_dir = self._assets_dir()
                 _ensure_dir(assets_dir)
-                name = f"pasted_{int(time.time() * 1000)}.png"
+                name = (
+                    f"pasted_{uuid.uuid4().hex}.png"
+                    if self.resource_roots is not None
+                    else f"pasted_{int(time.time() * 1000)}.png"
+                )
                 out = assets_dir / name
-                img.save(str(out), "PNG")
+                if not img.save(str(out), "PNG"):
+                    return
                 rel = (Path(GALLERY_DIR) / ASSET_SUBDIR / name).as_posix()
                 self.insert_image_html(rel, 320)
                 return
@@ -823,6 +846,7 @@ class RichTextEdit(QTextEdit):
         finally:
             if controller is not None:
                 controller.after_paste(context)
+            self.document_edit_finished.emit()
 
 
 class FontSizeSpinBox(QSpinBox):
@@ -976,6 +1000,7 @@ class EditorSurface(QFrame):
 
 class Editor(QDialog):
     autosaved = QtCore.Signal(str)
+    bound_error = QtCore.Signal(str)
 
     def __init__(
         self,
@@ -985,8 +1010,20 @@ class Editor(QDialog):
         *,
         apply_defaults: bool = False,
         language_service: Optional[object] = None,
+        save_callback: Optional[Callable[[str], bool]] = None,
+        resource_roots: tuple[Path, ...] = (),
+        embedded: bool = False,
+        document_label: str = "",
+        display_settings: Optional[dict] = None,
     ) -> None:
         super().__init__(parent)
+        self._save_callback = save_callback
+        self._bound_document = save_callback is not None
+        self._embedded = bool(embedded)
+        self._document_label = str(document_label)
+        self._display_settings = dict(display_settings or {})
+        self._resource_roots = tuple(Path(root).resolve() for root in resource_roots)
+        self._bound_dirty = False
 
         # Resolve project root (authoritative)
         self.project_root = Path(getattr(parent, "project_root", os.getcwd()))
@@ -999,30 +1036,37 @@ class Editor(QDialog):
             self._language_service = None
 
         # Canonical message location (SOURCE OF TRUTH)
-        self.message_path = (self.project_root / MESSAGE_HTML_FILE).resolve()
-        self.message_path.parent.mkdir(parents=True, exist_ok=True)
-        self.settings_path = application_paths(
-            self.project_root
-        ).settings_file.resolve()
+        self.message_path = None
+        if not self._bound_document:
+            self.message_path = (self.project_root / MESSAGE_HTML_FILE).resolve()
+            self.message_path.parent.mkdir(parents=True, exist_ok=True)
+        paths = application_paths(self.project_root)
+        self.settings_path = paths.settings_file.resolve()
         self._style_slots = SavedStyleSetStore(SettingsStore(self.project_root))
         self.project_state = getattr(parent, "project_state", None)
-        if self.project_state is None:
+        if self.project_state is None and not self._bound_document:
             self.project_state = ProjectStateController(self.project_root)
             self.project_state.initialize()
         self.project_save_service = getattr(
             parent,
             "project_save_service",
             None,
-        ) or ProjectSaveService(
+        ) or (None if self._bound_document else ProjectSaveService(
             self.project_root,
             self.project_state,
-        )
+        ))
 
-        self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        if paths.profile_root is not None:
+            paths.settings_root.mkdir(parents=True, exist_ok=True)
+            self.settings = QSettings(
+                str(paths.settings_root / "editor.ini"), QSettings.IniFormat
+            )
+        else:
+            self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
         s = _read_json(self.settings_path)
         self.recipient_name = (
-            self.project_state.identity.recipient_display_name
+            getattr(getattr(self.project_state, "identity", None), "recipient_display_name", "")
             or str(s.get("recipient_name") or "").strip()
         )
 
@@ -1048,7 +1092,7 @@ class Editor(QDialog):
             self.message_html
         )
         self._restored_style_state = extract_lettersmith_style_state(self.message_html)
-        self._apply_message_defaults = bool(apply_defaults)
+        self._apply_message_defaults = bool(apply_defaults) and not self._bound_document
         self._initializing = True
         self._last_persisted_html = ""
         self._find_dialog: Optional[FindReplaceDialog] = None
@@ -1063,22 +1107,23 @@ class Editor(QDialog):
         )
 
         self._autosave_timer = QtCore.QTimer(self)
-        self._autosave_timer.setInterval(5 * 60 * 1000)
+        self._autosave_timer.setInterval(0 if self._bound_document else 5 * 60 * 1000)
+        self._autosave_timer.setSingleShot(self._bound_document)
         self._autosave_timer.timeout.connect(self._autosave_now)
         self._language_check_timer = QtCore.QTimer(self)
         self._language_check_timer.setSingleShot(True)
         self._language_check_timer.setInterval(550)
         self._language_check_timer.timeout.connect(self._refresh_language_issues)
 
-        self.setWindowTitle("Letter Editor")
+        self.setWindowTitle(self._document_label or "Letter Editor")
         self.setObjectName(EDITOR_WINDOW_OBJECT_NAME)
-        self.setWindowFlags(
+        self.setWindowFlags(Qt.Widget if self._embedded else (
             Qt.Dialog
             | Qt.FramelessWindowHint
             | Qt.WindowSystemMenuHint
             | Qt.WindowCloseButtonHint
-        )
-        self.setModal(True)
+        ))
+        self.setModal(not self._embedded)
         self.resize(1100, 720)
         self._wall_pixmap = (
             preview_pixmap
@@ -1087,12 +1132,13 @@ class Editor(QDialog):
         )
 
         self._apply_styles()
-        self._restore_geometry()
+        if not self._embedded:
+            self._restore_geometry()
         self._build_ui(self._wall_pixmap)
         theme_service = getattr(parent, "theme_service", None)
         if theme_service is None and isinstance(parent, QtWidgets.QWidget):
             theme_service = getattr(parent.window(), "theme_service", None)
-        if theme_service is not None:
+        if theme_service is not None and self.title_bar is not None:
             self.title_bar.apply_theme_assets(theme_service)
         self._settings_watcher = QtCore.QFileSystemWatcher(self)
         if self.settings_path.is_file():
@@ -1100,9 +1146,10 @@ class Editor(QDialog):
         self._settings_watcher.fileChanged.connect(self._settings_file_changed)
         try:
             self._last_persisted_html = (
-                self.message_path.read_text(encoding="utf-8")
-                if self.message_path.is_file()
-                else ""
+                self.message_html if self._bound_document else (
+                    self.message_path.read_text(encoding="utf-8")
+                    if self.message_path.is_file() else ""
+                )
             )
         except Exception as error:
             self._record_failure("load persisted message", error)
@@ -1111,11 +1158,15 @@ class Editor(QDialog):
             self._prepared_html() if not self._unsupported_style_state else self.message_html
         )
         self._initializing = False
+        if self._bound_document and self._unsupported_style_state:
+            self.editor.setReadOnly(True)
+            self.toolbar.setEnabled(False)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
         self._update_font_controls_height()
-        place_window_on_launcher(self, minimum=QSize(640, 420))
+        if not self._embedded:
+            place_window_on_launcher(self, minimum=QSize(640, 420))
 
     def _settings_file_changed(self, path: str) -> None:
         if self._closing:
@@ -1132,13 +1183,15 @@ class Editor(QDialog):
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(8)
 
-        self.title_bar = StandardTitleBar(
-            self,
-            "Letter Editor",
-            show_minimize=False,
-            on_close=self._request_close,
-        )
-        main_layout.addWidget(self.title_bar)
+        self.title_bar = None
+        if not self._embedded:
+            self.title_bar = StandardTitleBar(
+                self,
+                self._document_label or "Letter Editor",
+                show_minimize=False,
+                on_close=self._request_close,
+            )
+            main_layout.addWidget(self.title_bar)
 
         self.toolbar = QToolBar()
         self.toolbar.setIconSize(TOOLBAR_ICON_SIZE)
@@ -1148,6 +1201,7 @@ class Editor(QDialog):
         self.editor = RichTextEdit(
             self.project_root,
             language_service=self._language_service,
+            resource_roots=self._resource_roots if self._bound_document else None,
         )
         self.editor.setObjectName("EditorTextArea")
         self.editor.setProperty("themeFontRole", "letterContent")
@@ -1186,6 +1240,8 @@ class Editor(QDialog):
         self.editor.textChanged.connect(self._update_readability_indicator)
         self.editor.textChanged.connect(self._sync_named_style_selector)
         self.editor.language_refresh_requested.connect(self._schedule_language_check)
+        if self._bound_document:
+            self.editor.document_edit_finished.connect(self.flush_document)
         self.editor.currentCharFormatChanged.connect(self._sync_format)
         self.editor.currentCharFormatChanged.connect(self._update_readability_indicator)
 
@@ -1220,9 +1276,15 @@ class Editor(QDialog):
         btn_save_close.setDefault(False)
         btn_save_close.clicked.connect(self.save_and_close)
 
-        hb.addWidget(btn_save)
-        hb.addWidget(btn_close)
-        hb.addWidget(btn_save_close)
+        if self._embedded:
+            for button in (btn_save, btn_close, btn_save_close):
+                button.setParent(self)
+                button.hide()
+                button.setShortcut(QKeySequence())
+        else:
+            hb.addWidget(btn_save)
+            hb.addWidget(btn_close)
+            hb.addWidget(btn_save_close)
         main_layout.addLayout(hb)
 
         for control in (self.font_combo, self.font_size_spin):
@@ -1245,6 +1307,7 @@ class Editor(QDialog):
 
     def _editor_background_setting(self) -> tuple[str, int, str]:
         data = _read_json(self.settings_path)
+        data.update(self._display_settings)
         preset, opacity, _rgb, ink = normalized_letter_page_settings(data)
         return preset, opacity, ink
 
@@ -1277,6 +1340,10 @@ class Editor(QDialog):
     def refresh_background_from_settings(self) -> None:
         self._apply_editor_background()
         self._update_readability_indicator()
+
+    def set_display_settings(self, settings: dict) -> None:
+        self._display_settings = dict(settings)
+        self.refresh_background_from_settings()
 
     def _update_readability_indicator(self, *_args: object) -> None:
         if not hasattr(self, "readability_indicator") or self._closing:
@@ -1407,6 +1474,8 @@ class Editor(QDialog):
                         f"synchronize controls after: {label}",
                         error,
                     )
+                if self._bound_document:
+                    self.flush_document()
 
     def _record_failure(
         self,
@@ -2068,6 +2137,8 @@ class Editor(QDialog):
         self._request_close()
 
     def reject(self) -> None:
+        if self._embedded:
+            return
         self._request_close()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -2142,6 +2213,8 @@ class Editor(QDialog):
         return applied
 
     def get_edited_html(self) -> str:
+        if self._bound_document and not self._bound_dirty:
+            return self._last_persisted_html
         if self._discard_changes:
             return self._last_persisted_html or self.message_html
         content = self._prepared_html()
@@ -2162,12 +2235,23 @@ class Editor(QDialog):
         return sanitize_message_html(mark_lettersmith_message_html(content))
 
     def _sync_message_assets(self) -> None:
+        if self._bound_document:
+            return
         self.project_save_service.copy_workspace_tree(
             self.project_root / GALLERY_DIR / ASSET_SUBDIR,
             Path(GALLERY_DIR) / ASSET_SUBDIR,
         )
 
     def _schedule_autosave(self) -> None:
+        if self._bound_document:
+            if self._initializing or self._closing or self._save_in_progress:
+                return
+            self._bound_dirty = True
+            if self.named_styles._mutating:
+                self._autosave_timer.start()
+            else:
+                self.flush_document()
+            return
         if (
             self._initializing
             or self._save_in_progress
@@ -2179,6 +2263,9 @@ class Editor(QDialog):
             self._autosave_timer.start()
 
     def _autosave_now(self) -> None:
+        if self._bound_document:
+            self.flush_document()
+            return
         if (
             self._initializing
             or self._closing
@@ -2213,6 +2300,8 @@ class Editor(QDialog):
             return
 
     def _save_document(self) -> bool:
+        if self._bound_document:
+            return self.flush_document()
         if self._save_in_progress:
             return False
         if self._unsupported_style_state:
@@ -2285,6 +2374,10 @@ class Editor(QDialog):
     def _request_close(self) -> None:
         if self._closing:
             return
+        if self._bound_document:
+            if self.flush_document():
+                self._finish_close()
+            return
         if self._unsupported_style_state:
             confirmation = LetterSmithConfirmationDialog(
                 self,
@@ -2341,19 +2434,59 @@ class Editor(QDialog):
     def _finish_close(self) -> None:
         if self._closing:
             return
+        self.dispose_document()
+        if not self._embedded:
+            try:
+                self.settings.setValue(SETTINGS_KEY_GEOMETRY, self.saveGeometry())
+            except Exception as error:
+                self._record_failure("persist editor geometry", error)
+        super().accept()
+
+    def flush_document(self) -> bool:
+        """Commit the bound page synchronously without touching legacy message files."""
+        if not self._bound_document:
+            return self._save_document()
+        if self._initializing or self._closing or self._save_in_progress:
+            return not self._bound_dirty
+        if not self._bound_dirty:
+            return True
+        if self.named_styles._mutating:
+            self._autosave_timer.start()
+            return False
+        self._autosave_timer.stop()
+        self._save_in_progress = True
+        try:
+            content = self._prepared_html()
+            if content == self._persisted_document_html:
+                self._bound_dirty = False
+                return True
+            if not self._save_callback(content):
+                self.bound_error.emit(
+                    "The selected letter changed elsewhere. Your edits remain open."
+                )
+                return False
+            self._last_persisted_html = content
+            self._persisted_document_html = content
+            self._bound_dirty = False
+            self.autosaved.emit(content)
+            return True
+        except Exception as error:
+            self._record_failure("commit page letter", error)
+            self.bound_error.emit(f"Could not update this letter: {error}")
+            return False
+        finally:
+            self._save_in_progress = False
+
+    def dispose_document(self) -> None:
+        """Stop an editor that the workspace is replacing; never save or prompt."""
         self._closing = True
         self._autosave_timer.stop()
         self._language_check_timer.stop()
         if self._find_dialog is not None:
             self._find_dialog.hide()
         watcher = getattr(self, "_settings_watcher", None)
-        if watcher is not None:
+        if watcher is not None and watcher.files():
             watcher.removePaths(watcher.files())
-        try:
-            self.settings.setValue(SETTINGS_KEY_GEOMETRY, self.saveGeometry())
-        except Exception as error:
-            self._record_failure("persist editor geometry", error)
-        super().accept()
 
     def _inject_export_line_spacing_wrapper(self, html: str) -> str:
         if not html:

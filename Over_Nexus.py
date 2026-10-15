@@ -3,7 +3,8 @@
 #
 # Current behavior:
 # - No hidden Wall/Helper overlay buttons.
-# - The Message details area shows automatically on the Message tab.
+# - Canonical Messages keeps project details behind its explicit toggle.
+# - The legacy Message details area shows automatically on the Message tab.
 # - The Message details area hides automatically when leaving the Message tab.
 # - The wall/text-background image is handled from Image_tab.py.
 
@@ -56,6 +57,9 @@ class OverNexusController(QtCore.QObject):
 
         details = getattr(message_tab, "title_recipient_container", None)
         if isinstance(details, QtWidgets.QWidget):
+            toggle = getattr(message_tab, "project_details_toggle", None)
+            if isinstance(toggle, QtWidgets.QPushButton):
+                visible = visible and toggle.isChecked()
             details.setVisible(visible)
 
 

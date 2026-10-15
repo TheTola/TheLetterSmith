@@ -920,6 +920,7 @@ class IdentityFieldLockingTests(unittest.TestCase):
                 staged_path: Path,
                 _preset: str,
                 _overlay_opacity: int,
+                **_render_options: object,
             ) -> bool:
                 if html == "first":
                     first_started.set()
@@ -968,6 +969,7 @@ class IdentityFieldLockingTests(unittest.TestCase):
                 staged_path: Path,
                 _preset: str,
                 _overlay_opacity: int,
+                **_render_options: object,
             ) -> bool:
                 worker_started.set()
                 release_worker.wait(2.0)
