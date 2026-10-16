@@ -39,7 +39,8 @@ from image_button import (
 from project_paths import ProjectPathResolver, application_paths
 from project_save import ProjectSaveService
 from project_state import ProjectStateController
-from project_session import peek_project_session
+from project_session import get_project_session, peek_project_session
+from project_consumers import project_sound_snapshot, project_sound_views, update_project_sound
 from recent_media import recent_media, remember_media
 
 from sound_model import (
@@ -1400,7 +1401,13 @@ class ProjectSound(
 
         self.library = library
 
-        self.state = load_project_state(self.project_root)
+        self._saving = False
+        session = peek_project_session(self.project_root)
+        if session is not None:
+            project_sound_views(session)
+            self.library.replace_records(load_library(self.project_root))
+        self.state = (ProjectSoundState.from_dict(project_sound_snapshot(session))
+                      if session is not None else load_project_state(self.project_root))
         self._persisted_state = (
             self.state.to_dict()
             if project_sound_path(self.project_root).is_file()
@@ -1409,8 +1416,9 @@ class ProjectSound(
         self._normalize_available_tracks()
         self._missing_ids = tuple(self.missing_track_ids())
 
-        self._migrate_legacy_current_track()
-        self.save()
+        if session is None:
+            self._migrate_legacy_current_track()
+            self.save()
 
     def _referenced_track_ids(self) -> set[str]:
         return {
@@ -1493,11 +1501,19 @@ class ProjectSound(
 
     def persist_state(self) -> None:
         """Persist the current assignment and update the no-op write guard."""
-        save_project_state(
-            self.project_root,
-            self.state,
-        )
-        self._persisted_state = self.state.to_dict()
+        self._saving = True
+        try:
+            session = peek_project_session(self.project_root)
+            if session is None:
+                save_project_state(self.project_root, self.state)
+            else:
+                previous = self._persisted_state or {}
+                patch = {key: value for key, value in self.state.to_dict().items()
+                         if key not in previous or previous[key] != value}
+                self.state = ProjectSoundState.from_dict(update_project_sound(session, patch))
+            self._persisted_state = self.state.to_dict()
+        finally:
+            self._saving = False
 
     def reconcile_missing_files(
         self,
@@ -1517,7 +1533,12 @@ class ProjectSound(
 
     def reload_from_disk(self) -> bool:
         previous = self.state.to_dict()
-        loaded = load_project_state(self.project_root)
+        session = peek_project_session(self.project_root)
+        if session is not None:
+            project_sound_views(session)
+            self.library.replace_records(load_library(self.project_root))
+        loaded = (ProjectSoundState.from_dict(project_sound_snapshot(session))
+                  if session is not None else load_project_state(self.project_root))
         persisted = (
             loaded.to_dict()
             if project_sound_path(self.project_root).is_file()
@@ -4367,6 +4388,7 @@ class SoundTab(QtWidgets.QWidget):
     preview_widget = QtCore.Signal(QtWidgets.QWidget)
     _import_result_ready = QtCore.Signal(int, object)
     _import_error_ready = QtCore.Signal(int, str)
+    _session_changed = QtCore.Signal(object)
 
     # Nexus/Forge synchronization signals.
     volume_changed = QtCore.Signal(int)
@@ -4395,6 +4417,7 @@ class SoundTab(QtWidgets.QWidget):
             self.project_state,
             resolver=project_paths,
         )
+        self.session = get_project_session(self.project_root)
 
         self.library = SoundLibrary(
             self.project_root,
@@ -4480,9 +4503,53 @@ class SoundTab(QtWidgets.QWidget):
         self._sound_disk_revision = self._current_sound_disk_revision()
         self._active_sound_revision = self._current_active_sound_revision()
 
+        self._session_sound_signature = (self.session.session_id, project_sound_snapshot(self.session))
+        self._session_changed.connect(self._on_session_changed)
+        self._session_listener = self._session_changed.emit
+        self.session.add_listener(self._session_listener)
+        self._restore_sound_controls()
+
         self.preview_widget.emit(
             self._preview
         )
+
+    @QtCore.Slot(object)
+    def _on_session_changed(self, event) -> None:
+        if self._shutdown or event.session_id != self.session.session_id:
+            return
+        signature = (self.session.session_id, project_sound_snapshot(self.session))
+        previous = self._session_sound_signature
+        if signature == previous:
+            return
+        self._session_sound_signature = signature
+        if self.project_sound._saving:
+            return
+        if signature[0] != previous[0]:
+            self.prepare_for_project_restore()
+        assignment_keys = ("mode", "single_track_id", "playlist", "selected_track_id", "tracks")
+        assignment_changed = any(signature[1].get(key) != previous[1].get(key) for key in assignment_keys)
+        if signature[0] != previous[0] or assignment_changed:
+            self.reload_project_from_disk()
+        else:
+            self.project_sound.reload_from_disk()
+            self._restore_sound_controls()
+            self.sound_state_changed.emit("sound-state-reloaded")
+
+    def _restore_sound_controls(self) -> None:
+        snapshot = project_sound_snapshot(self.session)
+        with QtCore.QSignalBlocker(self.volume):
+            self.volume.setValue(snapshot["volume"])
+        self._last_saved_volume = self.volume.value()
+        self.volume_value.setText(str(self.volume.value()))
+        self.player.set_volume(self.volume.value())
+        self.player.set_muted(snapshot["muted"])
+        self._refresh_mute_control()
+
+    def _refresh_mute_control(self) -> None:
+        muted = self.player.is_muted()
+        self.mute_btn.setText("\U0001F507" if muted else "\U0001F50A")
+        self.mute_btn.setToolTip("Unmute project soundtrack" if muted else "Mute project soundtrack (saved)")
+        self.mute_btn.setAccessibleName(self.mute_btn.toolTip())
 
     def apply_theme_assets(
         self,
@@ -4861,9 +4928,9 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         self.mute_btn.setToolTip(
-            "Mute preview (temporary; saved soundtrack volume is unchanged)"
+            "Mute project soundtrack (saved)"
         )
-        self.mute_btn.setAccessibleName("Mute preview temporarily")
+        self.mute_btn.setAccessibleName("Mute project soundtrack")
 
         self.mute_btn.setFont(
             QtGui.QFont(
@@ -5478,6 +5545,9 @@ class SoundTab(QtWidgets.QWidget):
     def _load_volume(
         self,
     ) -> int:
+        session = peek_project_session(self.project_root)
+        if session is not None:
+            return project_sound_snapshot(session)["volume"]
         settings = _read_settings(
             self.project_root
         )
@@ -5513,20 +5583,17 @@ class SoundTab(QtWidgets.QWidget):
         value = self.volume.value()
         if value == getattr(self, "_last_saved_volume", None):
             return
-        settings = _read_settings(
-            self.project_root
-        )
-
-        settings["music_volume"] = value
-        settings["starting_volume"] = value
-
         try:
-            _write_settings(self.project_root, settings)
-        except OSError:
+            self.project_sound.state.volume = value
+            self.project_sound.persist_state()
+        except (OSError, ValueError):
             _LOGGER.exception("Could not save soundtrack volume")
+            self.project_sound.reload_from_disk()
+            self._restore_sound_controls()
             self._show_status("The soundtrack volume could not be saved. Please try again.", persistent=True)
             return
         self._last_saved_volume = value
+        self._restore_sound_controls()
 
     def _volume_changed(self, value: int) -> None:
         value = max(
@@ -5541,23 +5608,22 @@ class SoundTab(QtWidgets.QWidget):
         self._save_volume()
 
         # Notify Nexus so the Forge preview adopts the new volume.
-        self.volume_changed.emit(value)
+        self.volume_changed.emit(self.volume.value())
 
     def _toggle_mute(self) -> None:
-        muted = self.player.toggle_mute()
-
-        self.mute_btn.setText(
-            "\U0001F507"
-            if muted
-            else "\U0001F50A"
-        )
-
-        self.mute_btn.setToolTip(
-            "Unmute preview (temporary)"
-            if muted
-            else "Mute preview (temporary; saved soundtrack volume is unchanged)"
-        )
-        self.mute_btn.setAccessibleName(self.mute_btn.toolTip())
+        if self.session.is_restoring:
+            return
+        muted = not self.player.is_muted()
+        self.project_sound.state.muted = muted
+        try:
+            self.project_sound.persist_state()
+        except (OSError, ValueError):
+            _LOGGER.exception("Could not save soundtrack mute")
+            self.project_sound.reload_from_disk()
+            self._restore_sound_controls()
+            self._show_status("The soundtrack mute setting could not be saved. Please try again.", persistent=True)
+            return
+        self._restore_sound_controls()
 
         # Notify Nexus so the Forge preview adopts the mute state.
         self.sound_state_changed.emit(
@@ -5567,7 +5633,9 @@ class SoundTab(QtWidgets.QWidget):
         )
 
     def _project_state_changed(self) -> None:
+        self._session_sound_signature = (self.session.session_id, project_sound_snapshot(self.session))
         self._sync_project_sound_autosave()
+        self._restore_sound_controls()
         self._reload_player_queue()
         self._refresh_ui(refresh_playlist=False, refresh_track=False)
         self._sound_disk_revision = self._current_sound_disk_revision()
@@ -6056,6 +6124,7 @@ class SoundTab(QtWidgets.QWidget):
             return
 
         self._import_context = self._project_context()
+        self._import_target = self.session.capture_project_target(fields=("sound",))
         self._pending_import_mode = self.project_sound.state.mode
 
         self.player.stop(
@@ -6167,18 +6236,16 @@ class SoundTab(QtWidgets.QWidget):
             self._show_status("Imported into Music Archive. The project changed; no tracks were assigned.", persistent=True)
             return
 
-        if (
-            self._pending_import_mode
-            == "playlist"
-        ):
-            self.project_sound.add_to_playlist(
-                track_ids
-            )
-
-        elif track_ids:
-            self.project_sound.set_single(
-                track_ids[0]
-            )
+        target = getattr(self, "_import_target", None)
+        def assign(_model):
+            self.project_sound.reload_from_disk()
+            if self._pending_import_mode == "playlist":
+                self.project_sound.add_to_playlist(track_ids)
+            elif track_ids:
+                self.project_sound.set_single(track_ids[0])
+        if target is None or not self.session.apply_project_result(target, assign):
+            self._show_status("Imported into Music Archive. The project soundtrack changed; no tracks were assigned.", persistent=True)
+            return
 
         self._remember_tracks(track_ids)
 
@@ -6314,6 +6381,7 @@ class SoundTab(QtWidgets.QWidget):
 
     def _exec_music_popup(self, dialog: ArchiveDialog | StockMusicDialog) -> None:
         context = self._project_context()
+        target = self.session.capture_project_target(fields=("sound",))
         chosen: list[str] = []
         dialog.previewRequested.connect(self.player.pause_for_preview)
         dialog.tracksChosen.connect(chosen.extend)
@@ -6324,11 +6392,13 @@ class SoundTab(QtWidgets.QWidget):
             dialog._stop_preview()
             self.player.resume_after_preview(
                 resume=not self._shutdown and self._tab_active and context == self._project_context()
+                and self.session.project_target_is_current(target)
             )
             dialog.deleteLater()
         if chosen and not self._shutdown and context == self._project_context():
             # Applying a new letter selection retains its existing transport behavior.
-            self._archive_tracks_chosen(chosen)
+            if not self.session.apply_project_result(target, lambda _model: self._archive_tracks_chosen(chosen)):
+                self._show_status("The project soundtrack changed; no tracks were assigned.", persistent=True)
 
     def _project_context(self) -> tuple[str, int]:
         session = peek_project_session(self.project_root)
@@ -7255,17 +7325,10 @@ class SoundTab(QtWidgets.QWidget):
         )
         previous_active_revision = self._active_sound_revision
 
-        with QtCore.QSignalBlocker(self.volume):
-            self.volume.setValue(self._load_volume())
-        self._last_saved_volume = self.volume.value()
-        self.volume_value.setText(str(self.volume.value()))
-        self.player.set_muted(False)
-        self.mute_btn.setText("\U0001F50A")
-        self.mute_btn.setToolTip("Mute preview (temporary; saved soundtrack volume is unchanged)")
-
         self.library.replace_records(load_library(self.project_root))
 
         state_changed = self.project_sound.reload_from_disk()
+        self._restore_sound_controls()
 
         self._reload_player_queue()
         self._refresh_ui(refresh_playlist=True, refresh_track=True)
@@ -7283,6 +7346,8 @@ class SoundTab(QtWidgets.QWidget):
 
     def _persist_project_sound_state(self) -> None:
         self.project_sound.persist_state()
+        self._session_sound_signature = (self.session.session_id, project_sound_snapshot(self.session))
+        self._restore_sound_controls()
         self._sync_project_sound_autosave()
         self._sound_disk_revision = self._current_sound_disk_revision()
         self._active_sound_revision = self._current_active_sound_revision()
@@ -7415,6 +7480,7 @@ class SoundTab(QtWidgets.QWidget):
             )
             return False
         self._shutdown = True
+        self.session.remove_listener(self._session_listener)
 
         self._tab_active = False
         self._status_timer.stop()

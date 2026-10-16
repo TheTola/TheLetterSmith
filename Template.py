@@ -141,6 +141,7 @@ TEMPLATE_HTML = r"""
 
   <script nonce="{{CSP_NONCE}}">
     const INITIAL_VOLUME = {{INITIAL_VOLUME}};
+    const INITIAL_MUTED = {{INITIAL_MUTED}};
     const MUSIC_PLAYLIST = {{MUSIC_PLAYLIST_JSON}};
     const MUSIC_CROSSFADE_MS = {{MUSIC_CROSSFADE_MS}};
     const IMAGE_ANIMATIONS = {{IMAGE_ANIMATIONS_JSON}};
@@ -430,9 +431,15 @@ document.addEventListener('DOMContentLoaded', () => {
   let playlistTransitioning = false;
   let playlistTransitionTimer = null;
   const musicLoopDelayMs = 1200;
-  const muteStorageKey = 'lettersmith.viewerMuted';
-  let viewerMuted = loadViewerMuted();
+  let viewerMuted = typeof INITIAL_MUTED === 'boolean' && INITIAL_MUTED;
   let currentVolume = loadVolume0to100();
+  let playbackVisible = true;
+  let playbackRequested = false;
+  let playbackDisposed = false;
+  let playbackGeneration = 0;
+  const playbackTimers = new Set();
+  const playbackFrames = new Set();
+  const ownedAudio = new Set([music, musicStandby].filter(Boolean));
 
   const flipPool = Array.from({length: 10}, (_, i) => `gallery/sounds/flip${i+1}.mp3`);
   const glissSrc = 'gallery/sounds/glissando.mp3';
@@ -1158,12 +1165,13 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function playOneShot(src, volume01){
+    if (!playbackAllowed()) return;
     try{
-      const a = new Audio(src);
+      const a = ownTransientAudio(new Audio(src));
       a.preload = 'auto';
       a.volume = clamp(volume01, 0, 1);
-      a.muted = viewerMuted;
-      a.play().catch(()=>{});
+      a.muted = viewerMuted || currentVolume === 0;
+      playOwnedAudio(a);
     }catch(_){ }
   }
   function playFlip(){
@@ -1335,18 +1343,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const v0 = (typeof INITIAL_VOLUME === 'number') ? INITIAL_VOLUME : 50;
     return clamp(Math.round(v0), 0, 100);
   }
-  function loadViewerMuted(){
-    try{
-      return window.sessionStorage.getItem(muteStorageKey) === 'true';
-    }catch(_){
-      return false;
-    }
-  }
-  function saveViewerMuted(){
-    try{
-      window.sessionStorage.setItem(muteStorageKey, viewerMuted ? 'true' : 'false');
-    }catch(_){ }
-  }
   function setVolume0to100(v){
     const vv = clamp(Math.round(v), 0, 100);
     currentVolume = vv;
@@ -1355,8 +1351,8 @@ document.addEventListener('DOMContentLoaded', () => {
     [music, musicStandby].forEach((audio) => {
       if (!audio) return;
       audio.volume = vol01;
-      audio.muted = muted;
     });
+    ownedAudio.forEach(audio => { audio.muted = muted; });
     volIconImg.src = muted ? 'gallery/controls/voloff.png' : 'gallery/controls/volon.png';
     volIcon.setAttribute('aria-label', muted ? 'Audio muted. Toggle volume slider' : 'Toggle volume slider');
     if (slider) slider.value = String(vv);
@@ -1374,10 +1370,91 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function setViewerMuted(muted){
     viewerMuted = !!muted;
-    saveViewerMuted();
     setVolume0to100(currentVolume);
     syncMuteButton();
   }
+
+  function playbackAllowed(generation = playbackGeneration){
+    return !playbackDisposed && playbackVisible && !document.hidden && generation === playbackGeneration;
+  }
+  function schedulePlayback(callback, delay){
+    const generation = playbackGeneration;
+    const timer = setTimeout(() => {
+      playbackTimers.delete(timer);
+      if (playbackAllowed(generation)) callback();
+    }, delay);
+    playbackTimers.add(timer);
+    return timer;
+  }
+  function animatePlayback(callback){
+    const generation = playbackGeneration;
+    const frame = requestAnimationFrame(now => {
+      playbackFrames.delete(frame);
+      if (playbackAllowed(generation)) callback(now);
+    });
+    playbackFrames.add(frame);
+  }
+  function ownTransientAudio(audio){
+    ownedAudio.add(audio);
+    audio.addEventListener('ended', () => ownedAudio.delete(audio), {once:true});
+    return audio;
+  }
+  function playOwnedAudio(audio, onError){
+    const generation = playbackGeneration;
+    if (!playbackAllowed(generation)) return;
+    const failed = () => {
+      if (playbackAllowed(generation) && typeof onError === 'function') onError();
+    };
+    try{
+      Promise.resolve(audio.play()).then(() => {
+        if (!playbackAllowed(generation)) audio.pause();
+      }).catch(failed);
+    }catch(_){ failed(); }
+  }
+  function stopPlayback(dispose = false){
+    playbackGeneration += 1;
+    playbackRequested = false;
+    playbackDisposed = playbackDisposed || dispose;
+    playbackTimers.forEach(timer => clearTimeout(timer));
+    playbackFrames.forEach(frame => cancelAnimationFrame(frame));
+    playbackTimers.clear();
+    playbackFrames.clear();
+    playlistTransitionTimer = null;
+    playlistTransitioning = false;
+    ownedAudio.forEach(audio => {
+      try{
+        audio.pause();
+        if (dispose || (audio !== music && audio !== musicStandby)){
+          audio.removeAttribute('src');
+          audio.load();
+        }
+      }catch(_){ }
+      if (audio !== music && audio !== musicStandby) ownedAudio.delete(audio);
+    });
+    document.querySelectorAll('audio,video').forEach(media => {
+      try{ media.pause(); }catch(_){ }
+    });
+    if (started && introControlsLocked){
+      introControlsLocked = false;
+      overlay.remove();
+      syncButtons();
+    }
+    setVolume0to100(currentVolume);
+  }
+  window.letterSmithPlayback = Object.freeze({
+    setVisible(visible){
+      playbackVisible = !!visible;
+      if (!playbackVisible) stopPlayback();
+    },
+    shutdown(){
+      playbackVisible = false;
+      stopPlayback(true);
+    },
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) stopPlayback();
+  });
+  window.addEventListener('pagehide', () => window.letterSmithPlayback.shutdown());
 
   function musicSources(){
     return Array.isArray(MUSIC_PLAYLIST) ? MUSIC_PLAYLIST.filter((value) => typeof value === 'string' && value) : [];
@@ -1397,7 +1474,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function installPlaylistListeners(audio){
     if (!audio) return;
     audio.addEventListener('timeupdate', () => {
-      if (audio !== music || playlistTransitioning) return;
+      if (!playbackRequested || !playbackAllowed() || audio !== music || playlistTransitioning) return;
       const sources = musicSources();
       const crossfadeMs = Math.max(0, Number(MUSIC_CROSSFADE_MS) || 0);
       if (sources.length < 2 || crossfadeMs <= 0) return;
@@ -1406,13 +1483,13 @@ document.addEventListener('DOMContentLoaded', () => {
       if (remainingMs > 0 && remainingMs <= Math.max(120, crossfadeMs)) crossfadeToNextTrack();
     });
     audio.addEventListener('ended', () => {
-      if (audio !== music || playlistTransitioning) return;
+      if (!playbackRequested || !playbackAllowed() || audio !== music || playlistTransitioning) return;
       advanceMusicSequence();
     });
   }
   function advanceMusicSequence(){
     const sources = musicSources();
-    if (playlistTransitioning || !sources.length || !music) return;
+    if (!playbackRequested || !playbackAllowed() || playlistTransitioning || !sources.length || !music) return;
     if (sources.length > 1 && Number(MUSIC_CROSSFADE_MS) > 0){
       crossfadeToNextTrack();
       return;
@@ -1420,7 +1497,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const nextIndex = nextMusicIndex(sources);
     playlistTransitioning = true;
     if (playlistTransitionTimer !== null) clearTimeout(playlistTransitionTimer);
-    playlistTransitionTimer = setTimeout(() => {
+    playlistTransitionTimer = schedulePlayback(() => {
       playlistTransitionTimer = null;
       const currentSources = musicSources();
       if (!music || !currentSources.length){
@@ -1434,14 +1511,14 @@ document.addEventListener('DOMContentLoaded', () => {
         music.currentTime = 0;
         music.volume = clamp(currentVolume / 100, 0, 1);
         music.muted = viewerMuted || currentVolume === 0;
-        music.play().catch(()=>{});
+        playOwnedAudio(music);
       }catch(_){ }
       playlistTransitioning = false;
     }, musicLoopDelayMs);
   }
   function crossfadeToNextTrack(){
     const sources = musicSources();
-    if (playlistTransitioning || !sources.length || !music || !musicStandby) return;
+    if (!playbackRequested || !playbackAllowed() || playlistTransitioning || !sources.length || !music || !musicStandby) return;
     playlistTransitioning = true;
     const nextIndex = nextMusicIndex(sources);
     const target = clamp(currentVolume / 100, 0, 1);
@@ -1452,28 +1529,30 @@ document.addEventListener('DOMContentLoaded', () => {
     musicStandby.muted = muted;
     const duration = Math.max(120, Number(MUSIC_CROSSFADE_MS) || 1000);
     const startedAt = performance.now();
-    musicStandby.play().catch(() => {
+    playOwnedAudio(musicStandby, () => {
       playlistTransitioning = false;
     });
     function step(now){
       if (!playlistTransitioning) return;
       const t = clamp((now - startedAt) / duration, 0, 1);
-      music.volume = target * (1 - t);
-      musicStandby.volume = target * t;
-      if (t < 1){ requestAnimationFrame(step); return; }
+      const volume = clamp(currentVolume / 100, 0, 1);
+      const effectiveMuted = viewerMuted || volume === 0;
+      music.volume = volume * (1 - t);
+      musicStandby.volume = volume * t;
+      if (t < 1){ animatePlayback(step); return; }
       music.pause();
       music.currentTime = 0;
       const previous = music;
       music = musicStandby;
       musicStandby = previous;
       musicPlaylistIndex = nextIndex;
-      music.volume = target;
-      music.muted = muted;
-      musicStandby.volume = target;
-      musicStandby.muted = muted;
+      music.volume = volume;
+      music.muted = effectiveMuted;
+      musicStandby.volume = volume;
+      musicStandby.muted = effectiveMuted;
       playlistTransitioning = false;
     }
-    requestAnimationFrame(step);
+    animatePlayback(step);
   }
   installPlaylistListeners(music);
   installPlaylistListeners(musicStandby);
@@ -1550,7 +1629,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }, titleBannerFadeOutMs);
   }
   function openCurtain(){
-    if (started) return;
+    if (started || !playbackAllowed()) return;
+    const generation = playbackGeneration;
     started = true;
     introControlsLocked = true;
     syncButtons();
@@ -1572,35 +1652,35 @@ document.addEventListener('DOMContentLoaded', () => {
       syncButtons();
     }
     function startMusicAfterGliss(){
-      if (musicStarted) return;
+      if (musicStarted || !playbackAllowed(generation)) return;
       musicStarted = true;
       glissDone = true;
-      if (safetyTimer !== null){ clearTimeout(safetyTimer); safetyTimer = null; }
+      if (safetyTimer !== null){ clearTimeout(safetyTimer); playbackTimers.delete(safetyTimer); safetyTimer = null; }
       const v = currentVolume;
       setVolume0to100(v);
       if (!ensureInitialMusicSource()){
         tryUnlockIntroControls();
         return;
       }
+      playbackRequested = true;
       try{
         music.currentTime = 0;
         music.volume = 0;
         music.muted = viewerMuted || v === 0;
-        music.play().catch(()=>{});
+        playOwnedAudio(music);
       }catch(_){ }
-      const target = clamp(v / 100, 0, 1);
       const start = performance.now();
       function fadeStep(now){
         const t = clamp((now - start) / musicFadeMs, 0, 1);
         const e = t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t + 2, 2)/2;
-        music.volume = target * e;
-        if (t < 1) requestAnimationFrame(fadeStep);
+        music.volume = clamp(currentVolume / 100, 0, 1) * e;
+        if (t < 1) animatePlayback(fadeStep);
       }
-      requestAnimationFrame(fadeStep);
+      animatePlayback(fadeStep);
       tryUnlockIntroControls();
     }
     function beginGlissAndCurtain(g){
-      if (introMotionStarted) return;
+      if (introMotionStarted || !playbackAllowed(generation)) return;
       introMotionStarted = true;
       const openMs = runCurtainMotion(() => {
         curtainDone = true;
@@ -1608,24 +1688,24 @@ document.addEventListener('DOMContentLoaded', () => {
       });
       try{
         g.currentTime = 0;
-        g.play().catch(() => startMusicAfterGliss());
+        playOwnedAudio(g, startMusicAfterGliss);
       }catch(_){ startMusicAfterGliss(); }
       const glissWaitMs = Math.max(openMs, glissDurationMs(g));
-      safetyTimer = setTimeout(startMusicAfterGliss, glissWaitMs + glissSafetyPadMs);
+      safetyTimer = schedulePlayback(startMusicAfterGliss, glissWaitMs + glissSafetyPadMs);
     }
     try{
-      const g = new Audio(glissSrc);
+      const g = ownTransientAudio(new Audio(glissSrc));
       g.preload = 'auto';
       g.volume = 0.10;
-      g.muted = viewerMuted;
+      g.muted = viewerMuted || currentVolume === 0;
       g.addEventListener('ended', startMusicAfterGliss, { once: true });
       g.addEventListener('error', () => { beginGlissAndCurtain(g); startMusicAfterGliss(); }, { once: true });
       g.addEventListener('loadedmetadata', () => beginGlissAndCurtain(g), { once: true });
       g.load();
-      setTimeout(() => beginGlissAndCurtain(g), 250);
+      schedulePlayback(() => beginGlissAndCurtain(g), 250);
     }catch(_){
       const openMs = runCurtainMotion(() => { curtainDone = true; tryUnlockIntroControls(); });
-      setTimeout(startMusicAfterGliss, openMs);
+      schedulePlayback(startMusicAfterGliss, openMs);
     }
   }
 

@@ -122,14 +122,16 @@ class SoundArchivePreviewTests(unittest.TestCase):
                         original_file=target.name, processed_file=target.name,
                         duration_seconds=140.0,
                     )
+                save_library(directory, records)
                 tab.library.replace_records(records)
                 tab.library.changed.emit()
-                tab.player.set_muted(True)
                 tab.volume.setValue(23)
                 if state != "empty":
                     tab.project_sound.set_single("handoff-0")
                     if playlist:
                         tab.project_sound.add_to_playlist(["handoff-1"])
+                    if not tab.player.is_muted():
+                        tab.mute_btn.click()
                     self._wait_for(lambda: tab.player.player.duration() > 5000, "Song A did not load")
                     if state != "stopped":
                         tab.player.play()

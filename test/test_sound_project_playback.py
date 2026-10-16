@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import threading
 import unittest
 import wave
 from unittest import mock
@@ -82,7 +83,8 @@ class SoundProjectPlaybackTests(unittest.TestCase):
             self._playlist()
         tab = SoundTab(self.root)
         self.tabs.append(tab)
-        tab.player.set_muted(True)
+        if not tab.player.is_muted():
+            tab.mute_btn.click()
         return tab
 
     def _assert_sources_unchanged(self) -> None:
@@ -95,10 +97,11 @@ class SoundProjectPlaybackTests(unittest.TestCase):
         tab._save_volume()
         session = get_project_session(self.root)
         state = tab.project_sound.state.to_dict()
+        authored_sound = session.project.to_dict()["sound"]
         for count in (MIN_PAGES, 5, MAX_PAGES):
             with self.subTest(count=count):
                 project = five_page_project() if count == 5 else create_project(["letter"] * count)
-                project.update_project_data("sound", state)
+                project.update_project_data("sound", authored_sound)
                 project.update_shared_settings({"music_volume": 37, "starting_volume": 37})
                 session.replace(project, asset_root=self.root)
                 project = session.project
@@ -391,7 +394,7 @@ class SoundProjectPlaybackTests(unittest.TestCase):
             QtTest.QTest.keyClick(tab.playlist_list, QtCore.Qt.Key_Space)
             play.assert_called_once_with()
 
-    def test_keyboard_volume_persists_and_preview_mute_preserves_saved_level(self) -> None:
+    def test_keyboard_volume_and_project_mute_persist_without_changing_saved_level(self) -> None:
         tab = self._tab()
         self._show_tab(tab)
         tab.volume.setValue(25)
@@ -407,17 +410,24 @@ class SoundProjectPlaybackTests(unittest.TestCase):
         tab.player.set_muted(False)
         tab.mute_btn.click()
         self.assertTrue(tab.player.is_muted())
-        self.assertEqual(json.loads((self.root / "settings.json").read_text(encoding="utf-8")), settings)
+        self.assertEqual(json.loads((self.root / "settings.json").read_text(encoding="utf-8")),
+                         {**settings, "music_muted": True})
+        self.assertEqual(tab.session.project.to_dict()["sound"]["volume"], settings["music_volume"])
+        self.assertTrue(tab.session.project.to_dict()["sound"]["muted"])
         tab.shutdown()
-        reopened = self._tab(playlist=False)
+        reopened = SoundTab(self.root)
+        self.tabs.append(reopened)
         self.assertEqual(reopened.volume.value(), settings["music_volume"])
+        self.assertTrue(reopened.player.is_muted())
         self.assertFalse(reopened.player.is_playing())
 
     def test_reload_restores_volume_and_silence_without_edit_callbacks(self) -> None:
         tab = self._tab()
         tab.volume.setValue(23)
         settings_path = self.root / "settings.json"
-        SettingsStore(self.root).update_fields({"music_volume": 61, "starting_volume": 61})
+        replacement = create_project(["letter", "letter"])
+        replacement.update_project_data("sound", {"volume": 61, "muted": False})
+        tab.session.replace(replacement, asset_root=self.root)
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
         save_project_state(self.root, ProjectSoundState())
         changes = QtTest.QSignalSpy(tab.volume_changed)
@@ -430,6 +440,80 @@ class SoundProjectPlaybackTests(unittest.TestCase):
         self.assertFalse(tab.player.is_playing())
         self.assertFalse(tab.player.is_muted())
         self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8")), settings)
+
+    def test_audio_settings_preserve_pages_and_running_queue(self) -> None:
+        tab = self._tab()
+        before = tab.session.project.pages
+        with mock.patch.object(tab.player, "set_queue", wraps=tab.player.set_queue) as queue:
+            tab.volume.setValue(41)
+            tab.player.set_muted(False)
+            tab.mute_btn.click()
+            queue.assert_not_called()
+        self.assertEqual(tab.session.project.pages, before)
+        self.assertEqual(tab.session.project.to_dict()["sound"]["volume"], 41)
+        self.assertTrue(tab.session.project.to_dict()["sound"]["muted"])
+
+    def test_mute_adopts_queued_canonical_volume_before_event_delivery(self) -> None:
+        tab = self._tab()
+        tab.volume.setValue(20)
+        expected_muted = not tab.player.is_muted()
+        worker = threading.Thread(target=lambda: tab.session.project.update_project_data("sound", {"volume": 73}))
+        worker.start()
+        worker.join(2)
+        self.assertFalse(worker.is_alive(), "Canonical audio update deadlocked")
+        # The worker's Qt event is still queued when the user changes mute.
+        tab.mute_btn.click()
+        self.app.processEvents()
+        self.assertEqual(tab.session.project.to_dict()["sound"]["volume"], 73)
+        self.assertEqual(tab.volume.value(), 73)
+        self.assertAlmostEqual(tab.player._volume, 0.73)
+        self.assertEqual(tab.player.is_muted(), expected_muted)
+        self.assertEqual(tab.session.project.to_dict()["sound"]["muted"], expected_muted)
+
+    def test_late_import_after_sound_edit_then_revert_stays_in_archive(self) -> None:
+        tab = self._tab()
+        tab._import_context = tab._project_context()
+        tab._import_target = tab.session.capture_project_target(fields=("sound",))
+        tab._pending_import_mode = "playlist"
+        tab.project_sound.remove_from_playlist("synthetic-1")
+        tab.project_sound.add_to_playlist(["synthetic-1"])
+        before = tab.session.project.to_dict()["sound"]
+        with mock.patch.object(tab.project_sound, "add_to_playlist", wraps=tab.project_sound.add_to_playlist) as assign:
+            tab._accept_import_finished(tab._background_generation, [{"existing_track_id": "synthetic-0"}])
+            assign.assert_not_called()
+        self.assertEqual(tab.session.project.to_dict()["sound"], before)
+        self.assertIn("synthetic-0", tab.library.records)
+
+    def test_import_to_empty_canonical_draft_uses_project_target(self) -> None:
+        tab = self._tab(playlist=False)
+        tab.session.replace(create_project([]), asset_root=self.root)
+        tab._import_context = tab._project_context()
+        tab._import_target = tab.session.capture_project_target(fields=("sound",))
+        tab._pending_import_mode = "single"
+        tab._accept_import_finished(tab._background_generation, [{"existing_track_id": "synthetic-0"}])
+        self.assertEqual(tab.session.project.pages, [])
+        self.assertEqual(tab.session.project.to_dict()["sound"]["single_track_id"], "synthetic-0")
+        self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-0"])
+
+    def test_canonical_save_load_and_silent_project_reset_restore_audio(self) -> None:
+        from saved_letters import SavedLetterRestorer
+        tab = self._tab()
+        tab.volume.setValue(34)
+        tab.player.set_muted(False)
+        tab.mute_btn.click()
+        tab.project_sound.reorder_playlist(["synthetic-1", "synthetic-0"])
+        saved = tab.session.save(sync_workspace=False)
+        tab.session.replace(create_project(["letter", "letter"]), asset_root=self.root)
+        self.assertEqual(tab.project_sound.ordered_ids(), [])
+        self.assertFalse(tab.player.is_playing())
+        self.assertFalse(tab.player.is_muted())
+        SavedLetterRestorer(self.root).restore_canonical(saved)
+        tab.reload_project_from_disk()
+        self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-1", "synthetic-0"])
+        self.assertEqual(tab.volume.value(), 34)
+        self.assertTrue(tab.player.is_muted())
+        self.assertFalse(tab.player.is_playing())
+        self._assert_sources_unchanged()
 
     def test_unavailable_playlist_row_remains_visible_and_removable(self) -> None:
         tab = self._tab()

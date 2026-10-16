@@ -206,6 +206,65 @@ class ProjectModelTests(unittest.TestCase):
         project.update_artwork(page_id, {"asset": None})
         self.assertEqual([event.changed_fields for event in events], [((page_id, ("artwork",)),)] * 2)
 
+    def test_project_input_versions_track_only_changed_project_fields(self):
+        project = create_project()
+        fields = ('sound', 'presentation', 'shared_settings', 'prompt_settings')
+        self.assertEqual(project.project_input_versions(fields), (0, 0, 0, 0))
+        project.update_project_data('sound', {'volume': 40})
+        project.update_project_data('sound', {'volume': 40})
+        project.update_project_data('presentation', {'style': 'fade'})
+        project.update_shared_settings({'font': 'Serif'})
+        project.update_project_data('prompt_settings', {'style': 'Ink'})
+        self.assertEqual(project.project_input_versions(fields), (1, 1, 1, 1))
+        page_id = project.pages[0]['id']
+        self.assertEqual(project.input_versions(page_id, (), include_shared=True), (0, 2))
+        with self.assertRaises(ProjectModelError):
+            project.project_input_versions(('pages',))
+
+    def test_sound_mutation_preserves_pages_and_page_input_versions(self):
+        project = five_page_project()
+        pages = project.pages
+        versions = [project.input_versions(page['id'], ('artwork', 'prompt', 'message')) for page in pages]
+        revision = project.revision
+        events = []
+        project.add_listener(events.append)
+        project.update_project_data('sound', {'playlist': ['track-a'], 'volume': 20, 'muted': True})
+        self.assertEqual(project.pages, pages)
+        self.assertEqual([project.input_versions(page['id'], ('artwork', 'prompt', 'message')) for page in pages], versions)
+        self.assertEqual(project.revision, revision + 1)
+        self.assertEqual(events[0].page_ids, ())
+        self.assertEqual(events[0].source_model_id, id(project))
+
+    def test_compatibility_provenance_mutation_preserves_pages_and_sound_target(self):
+        project = five_page_project()
+        pages = project.pages
+        sound_versions = project.project_input_versions(('sound',))
+        project.update_project_data('extensions', {'legacy_authored_snapshot': {'sound': {'volume': 20}}})
+        self.assertEqual(project.pages, pages)
+        self.assertEqual(project.project_input_versions(('sound',)), sound_versions)
+        self.assertEqual(project.project_input_versions(('extensions',)), (1,))
+
+    def test_project_input_versions_survive_snapshot_edit_and_revert(self):
+        project = create_project([])
+        original = project.to_dict()
+        changed = deepcopy(original)
+        changed['sound'] = {'volume': 50}
+        project.adopt_snapshot(changed)
+        project.adopt_snapshot(original)
+        self.assertEqual(project.to_dict(), original)
+        self.assertEqual(project.project_input_versions(('sound', 'presentation')), (2, 0))
+        project.adopt_snapshot(original)
+        self.assertEqual(project.project_input_versions(('sound',)), (2,))
+
+    def test_project_recovery_counter_includes_page_delete_and_restore(self):
+        project = create_project()
+        page_id = project.pages[0]['id']
+        project.update_page_recovery(page_id, {'legacy_key': 'cover'})
+        self.assertEqual(project.project_input_versions(('recovery',)), (0,))
+        record = project.delete_page(page_id)
+        project.restore_page(record)
+        self.assertEqual(project.project_input_versions(('recovery', 'sound')), (2, 0))
+
     def test_invalid_mutation_does_not_modify_document(self):
         project = five_page_project()
         before = project.to_dict()

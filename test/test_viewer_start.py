@@ -68,7 +68,7 @@ class ViewerStartTests(unittest.TestCase):
                 "CSP_NONCE": "viewer-start-test", "TITLE": "Start interaction",
                 "MUSIC_PRELOAD_HTML": "", "TITLE_BANNER_TEXT_RGB": "255,255,255",
                 "MESSAGE_OVERLAY_STYLE": "", "MESSAGE_HTML": "<p>Test letter</p>",
-                "INITIAL_VOLUME": "40", "MUSIC_CROSSFADE_MS": "0",
+                "INITIAL_VOLUME": "40", "INITIAL_MUTED": "false", "MUSIC_CROSSFADE_MS": "0",
                 "MUSIC_PLAYLIST_JSON": '["gallery/sounds/music.mp3"]',
                 "IMAGE_ANIMATIONS_JSON": "{}", "HAS_MESSAGE_JSON": "true",
             }
@@ -195,6 +195,12 @@ class ViewerStartTests(unittest.TestCase):
                             self.assertTrue(state["clicks"][0]["active"])
                             self.assertEqual(state["clicks"][0]["target"], "curtain-overlay")
                         self.assertEqual(self.js("return String(getSelection());"), "")
+                        if action == "keyboard":
+                            before_hide = len(state["plays"])
+                            self.js("document.getElementById('bg-music').dispatchEvent(new Event('ended')); window.letterSmithPlayback.setVisible(false); return true;")
+                            QtTest.QTest.qWait(1400)
+                            self.assertEqual(len(self.js("return audit.plays;")), before_hide)
+                            self.assertTrue(self.js("return Array.from(document.querySelectorAll('audio')).every(audio => audio.paused);"))
             finally:
                 self.view.close()
                 self.view.deleteLater()

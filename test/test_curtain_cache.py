@@ -97,6 +97,25 @@ class CurtainCacheTests(unittest.TestCase):
         banner.save(root / APP_BANNER_PATH)
         return pages / "cover.png"
 
+    def test_project_audio_settings_reach_generated_viewer_and_invalidate_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_sources(root)
+            settings = SettingsStore(root)
+            settings.update_fields(
+                recipient_name="Audio fixture", music_volume=37, starting_volume=37,
+                music_muted=True,
+            )
+            muted_fingerprint = generate.build_source_fingerprint(root)
+            play = generate.generate_play_bundle(root, message_html="", seed_sfx=False)
+            html = (play / "index.html").read_text(encoding="utf-8")
+            self.assertIn("const INITIAL_VOLUME = 37;", html)
+            self.assertIn("const INITIAL_MUTED = true;", html)
+            settings.update_fields(music_muted=False)
+            self.assertNotEqual(generate.build_source_fingerprint(root), muted_fingerprint)
+            play = generate.generate_play_bundle(root, message_html="", seed_sfx=False)
+            self.assertIn("const INITIAL_MUTED = false;", (play / "index.html").read_text(encoding="utf-8"))
+
     def test_prepares_every_variant_and_invalidates_when_cover_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

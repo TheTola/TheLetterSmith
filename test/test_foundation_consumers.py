@@ -13,7 +13,9 @@ from PySide6 import QtWidgets
 
 from page_controls import page_controller
 from page_layout import load_pages
-from project_consumers import ConsumerCompatibilityError, consumer_issue, project_legacy_views, require_consumer
+from project_consumers import (ConsumerCompatibilityError, consumer_issue, project_legacy_views,
+                               project_sound_snapshot, project_sound_views, require_consumer,
+                               update_project_sound, prepare_consumer)
 from project_model import create_project
 from project_session import get_project_session, release_project_session
 
@@ -115,6 +117,210 @@ class FoundationConsumerTests(unittest.TestCase):
         project_legacy_views(self.session)
         self.session.project.update_project_data("sound", {"mode": "playlist", "playlist": ["new-track"]})
         self.assertIn("sound assignment changed", consumer_issue(self.root, "output"))
+
+    def test_sound_projection_keeps_other_content_and_session_identity(self):
+        from settings_store import SettingsStore
+        from sound_model import current_music_path, import_runtime_track, load_project_state
+        self.session.replace(create_project(), asset_root=self.root)
+        project_legacy_views(self.session)
+        page = self.session.project.pages[0]
+        self.session.project.update_prompt(page["id"], {"text": "keep this", "stale": False})
+        SettingsStore(self.root).update_fields({"ui_last_folder_music": "unchanged"})
+        source = self.root / "selected.mp3"
+        source.write_bytes(b"selected audio")
+        track = import_runtime_track(self.root, source)
+        before = self.session.project.to_dict()
+        identity = self.session.session_id
+        update_project_sound(self.session, {"single_track_id": track.track_id, "volume": 67, "muted": True})
+        after = self.session.project.to_dict()
+        self.assertEqual(after["pages"], before["pages"])
+        self.assertEqual(after["shared_settings"], before["shared_settings"])
+        self.assertEqual(after["prompt_settings"], before["prompt_settings"])
+        self.assertEqual(self.session.session_id, identity)
+        self.assertEqual(current_music_path(self.root).read_bytes(), source.read_bytes())
+        self.assertEqual(load_project_state(self.root).single_track_id, track.track_id)
+        self.assertEqual(SettingsStore(self.root).get("music_volume"), 67)
+        self.assertIs(SettingsStore(self.root).get("music_muted"), True)
+        self.assertEqual(SettingsStore(self.root).get("ui_last_folder_music"), "unchanged")
+        self.assertEqual(consumer_issue(self.root, "output"), "")
+        self.session.synchronize_workspace()
+        self.assertEqual(self.session.project.to_dict()["sound"], after["sound"])
+        self.assertEqual(self.session.project.to_dict()["shared_settings"], before["shared_settings"])
+
+    def test_direct_canonical_sound_edit_is_projected_before_output(self):
+        from sound_model import current_music_path, import_runtime_track
+        self.session.replace(create_project(), asset_root=self.root)
+        project_legacy_views(self.session)
+        source = self.root / "selected.mp3"
+        source.write_bytes(b"direct model edit")
+        track = import_runtime_track(self.root, source)
+        self.session.project.update_project_data("sound", {"single_track_id": track.track_id, "volume": 18})
+        self.assertIn("sound assignment changed", consumer_issue(self.root, "output"))
+        prepare_consumer(self.root, "output")
+        self.assertEqual(current_music_path(self.root).read_bytes(), source.read_bytes())
+        self.assertEqual(consumer_issue(self.root, "output"), "")
+
+    def test_missing_sound_order_and_metadata_survive_projection_and_save(self):
+        from sound_model import load_project_state
+        self.session.replace(create_project(), asset_root=self.root)
+        self.session.project.update_project_data("sound", {
+            "mode": "playlist", "playlist": ["missing-a", "missing-b"], "selected_track_id": "missing-b",
+            "tracks": [{"track_id": "missing-a", "asset": "audio/missing.mp3", "display_title": "Kept"},
+                       {"track_id": "missing-b", "missing": True}], "volume": 21, "muted": True,
+        })
+        project_sound_views(self.session)
+        update_project_sound(self.session, {"playlist": ["missing-b", "missing-a"], "volume": 22})
+        self.assertEqual(load_project_state(self.root).playlist, ["missing-b", "missing-a"])
+        stored = self.session.save()
+        sound = stored.project.to_dict()["sound"]
+        self.assertEqual(sound["playlist"], ["missing-b", "missing-a"])
+        self.assertEqual(sound["tracks"][1]["display_title"], "Kept")
+        self.assertEqual(sound["tracks"][1]["asset"], "audio/missing.mp3")
+        self.assertEqual(sound["volume"], 22)
+        self.assertTrue(sound["muted"])
+
+    def test_sound_projection_failure_rolls_back_views_and_model(self):
+        from sound_model import current_music_path, project_sound_path, import_runtime_track
+        from settings_store import SettingsStore
+        self.session.replace(create_project(), asset_root=self.root)
+        source = self.root / "selected.mp3"
+        source.write_bytes(b"current audio")
+        track = import_runtime_track(self.root, source)
+        update_project_sound(self.session, {"single_track_id": track.track_id, "volume": 29})
+        before = self.session.project.to_dict()
+        paths = (current_music_path(self.root), project_sound_path(self.root), SettingsStore(self.root).path)
+        files = {path: path.read_bytes() for path in paths}
+        with mock.patch.object(SettingsStore, "update_fields", side_effect=PermissionError("synthetic failure")):
+            with self.assertRaises(PermissionError):
+                update_project_sound(self.session, {"single_track_id": "missing", "volume": 87})
+        self.assertEqual(self.session.project.to_dict(), before)
+        self.assertEqual({path: path.read_bytes() for path in paths}, files)
+
+    def test_volume_edit_preserves_track_metadata_and_blank_draft_clears_audio(self):
+        from config import STARTING_VOLUME
+        from sound_model import current_music_path, import_runtime_track, load_project_state
+        self.session.replace(create_project(), asset_root=self.root)
+        source = self.root / "selected.mp3"
+        source.write_bytes(b"current audio")
+        track = import_runtime_track(self.root, source)
+        update_project_sound(self.session, {"single_track_id": track.track_id})
+        canonical = self.session.project.to_dict()["sound"]
+        canonical["tracks"][0]["custom_note"] = "preserved"
+        self.session.project.update_project_data("sound", canonical)
+        update_project_sound(self.session, {"volume": 0, "muted": True})
+        self.assertEqual(self.session.project.to_dict()["sound"]["tracks"][0]["custom_note"], "preserved")
+        with (mock.patch("sound_model.load_library", side_effect=AssertionError("volume must not scan the archive")),
+              mock.patch("saved_letters._SoundArchiveSnapshot.capture", side_effect=AssertionError("volume must not snapshot the archive"))):
+            update_project_sound(self.session, {"volume": 32})
+            project_sound_views(self.session)
+        self.session.replace(create_project([]), asset_root=self.root)
+        project_sound_views(self.session)
+        self.assertFalse(current_music_path(self.root).exists())
+        self.assertEqual(load_project_state(self.root).ordered_track_ids(), [])
+        self.assertEqual(project_sound_snapshot(self.session)["volume"], STARTING_VOLUME)
+        self.assertFalse(project_sound_snapshot(self.session)["muted"])
+
+    def test_portable_stock_alias_keeps_authored_identity_after_reload(self):
+        from sound_model import load_library, load_project_state, current_music_path
+        import json
+        stock = self.root / "resources/stock"
+        stock.mkdir(parents=True)
+        (stock / "music.mp3").write_bytes(b"stock audio")
+        (stock / "stock_manifest.json").write_text(json.dumps({"music": [{"filename": "music.mp3", "title": "Stock"}]}))
+        audio = self.root / "audio"
+        audio.mkdir()
+        (audio / "portable.mp3").write_bytes(b"stock audio")
+        self.session.replace(create_project([]), asset_root=self.root)
+        self.session.project.update_project_data("sound", {
+            "single_track_id": "authored-stock", "tracks": [{"track_id": "authored-stock", "asset": "audio/portable.mp3"}]})
+        project_sound_views(self.session)
+        self.assertIn("authored-stock", load_library(self.root))
+        self.assertEqual(load_project_state(self.root).single_track_id, "authored-stock")
+        update_project_sound(self.session, {"volume": 12})
+        self.assertEqual(project_sound_snapshot(self.session)["single_track_id"], "authored-stock")
+        self.assertEqual(current_music_path(self.root).read_bytes(), b"stock audio")
+
+    def test_sound_edits_reject_restoration_and_closed_session(self):
+        with self.session.restoring():
+            with self.assertRaisesRegex(RuntimeError, "restoration"):
+                update_project_sound(self.session, {"volume": 12})
+        self.session.close()
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            update_project_sound(self.session, {"volume": 12})
+
+    def test_portable_asset_replaces_cached_audio_for_the_same_authored_id(self):
+        import hashlib
+        from sound_model import current_music_path, load_library
+        self.session.replace(create_project([]), asset_root=self.root)
+        audio = self.root / "audio"
+        audio.mkdir()
+        (audio / "first.mp3").write_bytes(b"first project audio")
+        (audio / "second.mp3").write_bytes(b"second project audio")
+        self.session.project.update_project_data("sound", {
+            "single_track_id": "shared-authored-id",
+            "tracks": [{"track_id": "shared-authored-id", "asset": "audio/first.mp3"}]})
+        project_sound_views(self.session)
+        self.session.project.update_project_data("sound", {
+            "tracks": [{"track_id": "shared-authored-id", "asset": "audio/second.mp3"}]})
+        project_sound_views(self.session)
+        self.assertEqual(current_music_path(self.root).read_bytes(), b"second project audio")
+        records = load_library(self.root)
+        self.assertEqual(records["shared-authored-id"].content_hash, hashlib.sha256(b"second project audio").hexdigest())
+        self.assertIn(hashlib.sha256(b"first project audio").hexdigest()[:24], records)
+        self.session.project.update_project_data("sound", {
+            "tracks": [{"track_id": "shared-authored-id", "asset": "audio/unavailable.mp3", "sha256": "0" * 64}]})
+        project_sound_views(self.session)
+        self.assertFalse(current_music_path(self.root).exists())
+        self.assertEqual(project_sound_snapshot(self.session)["single_track_id"], "shared-authored-id")
+
+    def test_direct_canonical_assignment_save_contains_portable_audio(self):
+        from sound_model import import_runtime_track
+        source = self.root / "selected.mp3"
+        source.write_bytes(b"portable direct assignment")
+        record = import_runtime_track(self.root, source)
+        self.session.replace(create_project([]), asset_root=self.root)
+        self.session.project.update_project_data("sound", {"single_track_id": record.track_id, "volume": 47, "muted": True})
+        stored = self.session.save(sync_workspace=False)
+        sound = stored.project.to_dict()["sound"]
+        self.assertEqual(sound["single_track_id"], record.track_id)
+        self.assertEqual((stored.asset_root / sound["tracks"][0]["asset"]).read_bytes(), source.read_bytes())
+        self.assertEqual(sound["volume"], 47)
+        self.assertTrue(sound["muted"])
+
+    def test_portable_audio_repair_rejects_all_stale_hash_aliases(self):
+        import hashlib
+        from settings_store import SettingsStore
+        from sound_model import current_music_path, load_library, processed_dir, resolve_track_path
+        self.session.replace(create_project([]), asset_root=self.root)
+        audio = self.root / "audio"
+        audio.mkdir()
+        expected = b"original portable audio"
+        replaced = b"different cached audio"
+        digest = hashlib.sha256(expected).hexdigest()
+        (audio / "portable.mp3").write_bytes(expected)
+        self.session.project.update_project_data("sound", {
+            "single_track_id": "authored-alias",
+            "tracks": [{"track_id": "authored-alias", "asset": "audio/portable.mp3", "sha256": digest}]})
+        project_sound_views(self.session)
+        records = load_library(self.root)
+        modified = resolve_track_path(self.root, records["authored-alias"])
+        self.assertEqual(modified, resolve_track_path(self.root, records[digest[:24]]))
+        modified.write_bytes(replaced)
+        existing_files = {path.name for path in processed_dir(self.root).iterdir()}
+        with mock.patch.object(SettingsStore, "update_fields", side_effect=PermissionError("synthetic failure")):
+            with self.assertRaises(PermissionError):
+                project_sound_views(self.session)
+        self.assertEqual(modified.read_bytes(), replaced)
+        self.assertEqual({path.name for path in processed_dir(self.root).iterdir()}, existing_files)
+        project_sound_views(self.session)
+        records = load_library(self.root)
+        recovered = resolve_track_path(self.root, records["authored-alias"])
+        self.assertNotEqual(recovered, modified)
+        self.assertEqual(recovered.read_bytes(), expected)
+        self.assertEqual(modified.read_bytes(), replaced)
+        self.assertEqual(current_music_path(self.root).read_bytes(), expected)
+        self.assertEqual(records[digest[:24]].content_hash, hashlib.sha256(replaced).hexdigest())
+        self.assertEqual(project_sound_snapshot(self.session)["single_track_id"], "authored-alias")
 
     def test_delayed_provider_image_rejects_a_to_b_to_a_project_switch(self):
         from PromptWriterPanel import PromptWriterPanel

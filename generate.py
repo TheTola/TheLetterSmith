@@ -128,6 +128,7 @@ _FINGERPRINT_SETTING_KEYS = (
     "recipient_title",
     "starting_volume",
     "music_volume",
+    "music_muted",
     "curtain_style",
     "message_overlay_preset",
     "message_overlay_opacity",
@@ -524,6 +525,7 @@ def _validate_template_placeholders() -> None:
         "{{MESSAGE_HTML}}",
         "{{HAS_MESSAGE_JSON}}",
         "{{INITIAL_VOLUME}}",
+        "{{INITIAL_MUTED}}",
         "{{MESSAGE_OVERLAY_STYLE}}",
         "{{MUSIC_PLAYLIST_JSON}}",
         "{{MUSIC_CROSSFADE_MS}}",
@@ -1197,6 +1199,7 @@ def build_play_bundle_to(
         )
         .replace("{{HAS_MESSAGE_JSON}}", _script_json(has_message))
         .replace("{{INITIAL_VOLUME}}", str(starting_vol))
+        .replace("{{INITIAL_MUTED}}", _script_json(settings.get("music_muted") is True))
         .replace(
             "{{MESSAGE_OVERLAY_STYLE}}",
             _message_overlay_style_from_settings(settings),

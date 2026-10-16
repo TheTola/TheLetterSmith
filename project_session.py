@@ -16,7 +16,7 @@ from types import MappingProxyType
 from typing import Callable, Iterator, Mapping
 import uuid
 
-from project_model import ProjectModel, create_project
+from project_model import ProjectModel, ProjectModelError, create_project
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -54,6 +54,16 @@ class WorkTarget:
     input_versions: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class ProjectWorkTarget:
+    session_id: str
+    project_id: str
+    fields: tuple[str, ...]
+    restoration_epoch: int
+    signature: str
+    input_versions: tuple[int, ...]
+
+
 class ProjectSession:
     """A model plus non-authored selection and a replacement-generation ID."""
 
@@ -66,6 +76,7 @@ class ProjectSession:
         self.asset_root = Path(asset_root).resolve() if asset_root is not None else self.project_root
         self._listeners: list[Callable[[SessionChange], None]] = []
         self._suspend_depth = 0
+        self._project_work_epoch = 0
         self._pending = False
         self.session_id = str(uuid.uuid4())
         self.project = project
@@ -113,6 +124,8 @@ class ProjectSession:
     def restoring(self) -> Iterator[None]:
         """Serialize restoration with saves/work and publish completed state once."""
         with self._lock:
+            if not self._suspend_depth:
+                self._project_work_epoch += 1
             self._suspend_depth += 1
             try:
                 yield
@@ -197,6 +210,43 @@ class ProjectSession:
             if not self.target_is_current(target):
                 return False
             apply(self.project, target.page_id)
+            return True
+
+    def _project_target_signature(self, fields: tuple[str, ...]) -> str:
+        payload = self.project.to_dict()
+        values = {field: payload[field] for field in fields}
+        return hashlib.sha256(json.dumps(values, ensure_ascii=False, sort_keys=True,
+                                         separators=(',', ':')).encode('utf-8')).hexdigest()
+
+    def capture_project_target(self, *, fields: tuple[str, ...] = ('sound',)) -> ProjectWorkTarget:
+        """Capture project-wide work without requiring a page or selection."""
+        with self._lock, self.project.mutation_scope():
+            if self._closed or self.is_restoring:
+                raise RuntimeError('Cannot capture work from a closed or restoring project session.')
+            fields = tuple(fields)
+            versions = self.project.project_input_versions(fields)
+            return ProjectWorkTarget(self.session_id, self.project.project_id, fields,
+                                     self._project_work_epoch, self._project_target_signature(fields), versions)
+
+    def project_target_is_current(self, target: ProjectWorkTarget) -> bool:
+        with self._lock, self.project.mutation_scope():
+            if (self._closed or self.is_restoring or target.session_id != self.session_id
+                    or target.project_id != self.project.project_id
+                    or target.restoration_epoch != self._project_work_epoch):
+                return False
+            try:
+                versions = self.project.project_input_versions(target.fields)
+            except ProjectModelError:
+                return False
+            return (target.input_versions == versions
+                    and target.signature == self._project_target_signature(target.fields))
+
+    def apply_project_result(self, target: ProjectWorkTarget, apply: Callable[[ProjectModel], None]) -> bool:
+        """Atomically apply to the captured project, or reject without invoking apply."""
+        with self._lock, self.project.mutation_scope():
+            if not self.project_target_is_current(target):
+                return False
+            apply(self.project)
             return True
 
     def save(self, *, sync_workspace: bool = True):
@@ -289,7 +339,10 @@ def get_project_session(project_root: str | Path) -> ProjectSession:
                         and not source.get('settings', {}).get('recipient_title')):
                     # A genuinely new editor starts from the classic template.
                     # Explicit empty projects and incomplete imports stay empty.
+                    migrated_data = project.to_dict()
                     project = create_project(project_id=source.get('settings', {}).get('project_id') or None)
+                    project.update_shared_settings(migrated_data['shared_settings'])
+                    project.update_project_data('sound', migrated_data['sound'])
                     project.update_project_data('extensions', {'legacy_workspace_snapshot': source})
                 report['locations']['destination'] = str(repository.directory)
                 stored = repository.save(project, asset_root=root, expected_revision=None,

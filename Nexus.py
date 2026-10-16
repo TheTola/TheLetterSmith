@@ -3850,6 +3850,12 @@ class Nexus(QtWidgets.QMainWindow):
     # =============================================================================================
     def _forge_preview_loaded(self, _ok: bool) -> None:
         self._update_forge_preview_zoom()
+        self._set_forge_preview_visible(
+            self.tabbar.currentIndex() == 3
+            and self.preview_stack.currentWidget() is self.html_preview
+            and not self._shutdown_in_progress
+            and not self._shutdown_complete
+        )
 
     def _update_forge_preview_zoom(self) -> None:
         """Fit the design viewport, down to WebEngine's minimum supported zoom."""
@@ -4130,6 +4136,7 @@ class Nexus(QtWidgets.QMainWindow):
         self.preview_caption.setVisible(True)
 
     def _show_forge_preview_pending(self) -> None:
+        self._set_forge_preview_visible(False)
         self._last_pixmap = None
         self._clear_preview()
         self.preview_stack.setCurrentIndex(0)
@@ -4172,6 +4179,7 @@ class Nexus(QtWidgets.QMainWindow):
         self._update_preview_geometry()
         self.preview_stack.setCurrentWidget(view)
         if same_build:
+            self._set_forge_preview_visible(True)
             self.status(
                 f"Interactive letter preview: "
                 f"{self._forge_preview_mode.replace('-', ' ')}"
@@ -4195,14 +4203,15 @@ class Nexus(QtWidgets.QMainWindow):
         )
 
     def _set_forge_preview_visible(self, visible: bool) -> None:
-        if visible:
-            return
         view = self.html_preview
         if view is None:
             return
         view.page().runJavaScript(
+            "if (window.letterSmithPlayback) {"
+            f"window.letterSmithPlayback.setVisible({str(bool(visible)).lower()});"
+            "} else if (" + str(not bool(visible)).lower() + ") {"
             "document.querySelectorAll('audio,video').forEach("
-            "media => { try { media.pause(); } catch (_) {} });"
+            "media => { try { media.pause(); } catch (_) {} }); }"
         )
 
     def _release_forge_preview_files(self) -> None:
@@ -4214,6 +4223,7 @@ class Nexus(QtWidgets.QMainWindow):
             self._restore_forge_preview_from_fullscreen()
         try:
             view.page().runJavaScript(
+                "if (window.letterSmithPlayback) { window.letterSmithPlayback.shutdown(); }"
                 "document.querySelectorAll('audio,video').forEach("
                 "media => { try { media.pause(); media.currentTime = 0; } catch (_) {} });"
             )

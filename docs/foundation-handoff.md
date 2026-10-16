@@ -7,7 +7,13 @@ commit containing this handoff and the five foundation modules as the shared
 baseline; record its exact hash when creating dependent worktrees. Unrelated
 publishing, release, settings, and startup diagnostics work was excluded.
 The verification report separates historical working-tree runs from the staged
-foundation snapshot checks. No dependent feature implementation is included.
+foundation snapshot checks. The completed shared baseline is `1612235`.
+This copy also documents the authorized Sound/foundation/Forge integration on
+`codex/sound-project-playback`, after feature commits `b6d7ced` and `684f2fe`.
+The primary checkout and its unrelated dirty work remain untouched; this branch
+has not been merged into it or into sibling feature branches. See
+[sound-project-playback-handoff.md](sound-project-playback-handoff.md) for current
+scope, provenance and acceptance limits.
 
 Read [foundation-contract.md](foundation-contract.md),
 [foundation-migration.md](foundation-migration.md), and
@@ -79,10 +85,37 @@ The existing viewer can render multiple Letter pages only while their complete
 message documents are equal. Distinct documents, unresolved migrated ownership,
 per-page placement/design and custom message layouts are visibly blocked by
 readiness and all Play-bundle generation entry points. Projects remain savable.
-Canonical shared-setting/sound changes whose current compatibility views differ
-must pass the complete canonical save/load path before legacy preview/export;
-the guard prevents output using previous settings or audio. Unsupported
-presentation settings remain blocked pending the Forge integration.
+Canonical shared-setting changes whose current compatibility views differ still
+require the supported activation path before legacy preview/export. Sound now
+has a separate incremental projection; it no longer requires a complete
+save/load cycle. Unsupported presentation settings and independent page-message
+rendering remain blocked pending their Forge work.
+
+Project-wide Sound uses `project_sound_snapshot(session)`,
+`update_project_sound(session, patch)` and `project_sound_views(session)` from
+`project_consumers.py`. Canonical `sound.volume` is integer 0–100 and
+`sound.muted` is boolean. Older projects fall back to shared `music_volume`,
+then `starting_volume`, then `STARTING_VOLUME`; absent canonical mute is false.
+The projection mirrors effective levels to `music_volume`, `starting_volume`
+and `music_muted` and refreshes existing playback files. It preserves unrelated
+pages/messages/prompts, shared settings, session identity and page work tokens.
+Sound-only and compatibility-provenance edits do not mark prompts stale.
+`prepare_consumer` projects canonical Sound before applying compatibility guards.
+Empty drafts can edit/project Sound even though page output remains count-blocked.
+
+Portable Sound assets retain authored IDs and missing-resource metadata. Cached
+records are checked against resource content hashes, including same-ID resources
+from different projects. Canonical saves collect assigned audio before a Sound
+widget is opened. Projection and saved restore use the existing file/archive
+rollback mechanisms, including audio settings after a failed final restore write.
+See the Sound handoff for changed-file groups and focused regression evidence.
+
+Forge reads the projected volume/mute when generating a presentation. Its viewer
+mute remains local across next/back navigation; full Restart reloads authored
+defaults. `window.letterSmithPlayback.setVisible(false)` cancels owned playback,
+playlist timers and transition frames; `shutdown()` also disposes media sources.
+Nexus invokes these hooks for hidden/pending previews, late loads and shutdown.
+Showing the same stopped preview does not automatically resume playback.
 
 Prompt Writer retains stale/partial saved prompts and resolved components without
 regeneration; explicit Erase clears them. Current controls still express shared
@@ -115,6 +148,15 @@ replaced/deleted/type-changed targets. Existing Message render revisions and
 Sound generation guards continue to cancel/drain work during restore. Do not
 replace these checks with "use whichever page is selected when finished."
 
+Project-wide work uses `capture_project_target(fields=('sound',))`,
+`project_target_is_current(target)` and `apply_project_result(target, callback)`.
+These APIs require no page, including in empty drafts. They atomically check
+session/project identity, restoration epoch and relevant field signatures/counters
+before calling `callback(model)`. Relevant edits, even edit-then-revert, restore,
+replacement and close invalidate work; unrelated page changes do not. Sound
+imports and popup assignment use this contract in addition to cancellation.
+`project_input_versions(fields)` keeps these counters independent of page work.
+
 ## Focused checks
 
 Run these from the checkout with its installed Python dependencies. `pytest` is
@@ -137,3 +179,11 @@ suites are `test_prompt_writer_hardening`, `test_message_security`,
 and baseline failures separately from introduced failures. Offscreen/model tests do not
 establish future multi-message interface completion, live provider behavior,
 packaged application acceptance or real publication.
+
+Recorded Sound integration checks: 56 model/session tests, 16 consumer tests,
+13 repository tests and 32 saved-sound restore tests passed. Seven focused
+QWebEngine/generator tests passed; the existing native-media viewer opening test
+passed all seven input scenarios with output muted. Final full Sound discovery
+and integrated native-shell acceptance are still being recorded in the Sound
+handoff. These results do not establish audible quality, packaged acceptance,
+primary-checkout integration or completion of sibling features.

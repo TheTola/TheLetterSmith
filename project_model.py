@@ -23,6 +23,8 @@ FORMAT = "lettersmith.project"
 SCHEMA_VERSION = 3
 MIN_PAGES = 2
 MAX_PAGES = 10
+_PROJECT_DATA_FIELDS = ("metadata", "shared_settings", "prompt_settings", "sound",
+                        "presentation", "publication", "recovery", "extensions")
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -211,8 +213,7 @@ class ProjectModel:
         pages = [_validate_page(page) for page in data["pages"]]
         if len({page["id"] for page in pages}) != len(pages):
             raise ProjectModelError("Page IDs must be unique")
-        for field in ("metadata", "shared_settings", "prompt_settings", "sound",
-                      "presentation", "publication", "recovery", "extensions"):
+        for field in _PROJECT_DATA_FIELDS:
             _object(data.get(field), field)
         _validate_project_recovery(data["recovery"])
         revision = data.get("revision", 0)
@@ -224,6 +225,7 @@ class ProjectModel:
         self._mutation_depth = 0
         self._pending_changes: list[ModelChange] = []
         self._input_versions: dict[tuple[str, str], int] = {}
+        self._project_input_versions: dict[str, int] = {}
         self._listeners: list[Callable[[ModelChange], None]] = []
 
     @contextmanager
@@ -261,6 +263,18 @@ class ProjectModel:
             keys.append(("*", "shared_settings"))
         return tuple(self._input_versions.get(key, 0) for key in keys)
 
+    @_reading
+    def project_input_versions(self, fields: Iterable[str]) -> tuple[int, ...]:
+        """Read independent mutation counters for authored project objects."""
+        fields = tuple(fields)
+        if any(field not in _PROJECT_DATA_FIELDS for field in fields):
+            raise ProjectModelError("Unsupported project data field")
+        return tuple(self._project_input_versions.get(field, 0) for field in fields)
+
+    def _project_data_changed(self, fields: Iterable[str]) -> None:
+        for field in fields:
+            self._project_input_versions[field] = self._project_input_versions.get(field, 0) + 1
+
     def _record_change(self, change: ModelChange) -> None:
         for page_id, fields in change.changed_fields:
             for field in fields:
@@ -288,6 +302,8 @@ class ProjectModel:
                 changes.append((page_id, fields))
         if any(self._data[key] != candidate[key] for key in ("shared_settings", "prompt_settings")):
             changes.append(("*", ("shared_settings",)))
+        self._project_data_changed(field for field in _PROJECT_DATA_FIELDS
+                                   if self._data[field] != candidate[field])
         self._data = candidate
         self._record_change(ModelChange(kind, tuple(after), self.revision, tuple(changes)))
 
@@ -414,6 +430,7 @@ class ProjectModel:
         record = DeletionRecord(self.project_id, deepcopy(page), index)
         self._data["pages"].pop(index)
         self._data["recovery"].setdefault("deleted_pages", []).append({"page": deepcopy(page), "index": index})
+        self._project_data_changed(("recovery",))
         self._invalidate_order_prompts()
         self._changed("structure", [page_id])
         return record
@@ -437,7 +454,10 @@ class ProjectModel:
         if isinstance(record.index, bool) or not isinstance(record.index, int) or record.index < 0:
             raise ProjectModelError("Deleted page index must be a nonnegative integer")
         deleted = self._data["recovery"].get("deleted_pages", [])
-        self._data["recovery"]["deleted_pages"] = [item for item in deleted if item["page"]["id"] != page["id"]]
+        retained = [item for item in deleted if item["page"]["id"] != page["id"]]
+        if "deleted_pages" not in self._data["recovery"] or retained != deleted:
+            self._project_data_changed(("recovery",))
+        self._data["recovery"]["deleted_pages"] = retained
         result = self._insert(page, min(record.index, len(self._data["pages"])))
         return result
 
@@ -524,7 +544,7 @@ class ProjectModel:
 
     @_mutating
     def update_project_data(self, field: str, patch: Mapping[str, Any]) -> None:
-        if field not in {"metadata", "shared_settings", "prompt_settings", "sound", "presentation", "publication", "extensions", "recovery"}:
+        if field not in _PROJECT_DATA_FIELDS:
             raise ProjectModelError("Unsupported project data field")
         value = _object(patch, field)
         merged = {**self._data[field], **value}
@@ -533,7 +553,8 @@ class ProjectModel:
         if merged == self._data[field]:
             return
         self._data[field] = merged
-        ids = [page["id"] for page in self._data["pages"]]
+        self._project_data_changed((field,))
+        ids = [] if field in {"sound", "extensions"} else [page["id"] for page in self._data["pages"]]
         if field in {"shared_settings", "prompt_settings"}:
             for page in self._data["pages"]:
                 page["prompt"]["stale"] = True

@@ -54,6 +54,97 @@ from transactional_io import atomic_write_json
 
 
 class SavedLetterSoundRestoreTests(unittest.TestCase):
+    def test_canonical_restore_keeps_missing_assignment_and_project_audio_levels(self) -> None:
+        from project_consumers import project_sound_snapshot
+        from project_model import create_project
+        from project_repository import ProjectRepository
+        from project_session import get_project_session, release_project_session
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            (source / "audio").mkdir(parents=True)
+            (source / "audio" / "available.mp3").write_bytes(b"portable audio")
+            project = create_project([])
+            project.update_project_data("sound", {
+                "mode": "playlist", "playlist": ["authored-present", "authored-missing"],
+                "selected_track_id": "authored-missing", "volume": 46, "muted": True,
+                "tracks": [{"track_id": "authored-present", "asset": "audio/available.mp3", "display_title": "Present"},
+                           {"track_id": "authored-missing", "asset": "audio/absent.mp3", "display_title": "Missing"}],
+            })
+            stored = ProjectRepository(source / ".lettersmith-project").save(project, asset_root=source)
+            SettingsStore(root).update_fields(music_volume=99, starting_volume=99, music_muted=False)
+            try:
+                SavedLetterRestorer(root).restore_canonical(stored)
+                state = load_project_state(root)
+                self.assertEqual(state.playlist, ["authored-present", "authored-missing"])
+                self.assertEqual(state.selected_track_id, "authored-missing")
+                self.assertFalse(current_music_path(root).exists())
+                self.assertIn("authored-present", load_library(root))
+                snapshot = project_sound_snapshot(get_project_session(root))
+                self.assertEqual(snapshot["playlist"], state.playlist)
+                self.assertEqual(snapshot["volume"], 46)
+                self.assertTrue(snapshot["muted"])
+                self.assertEqual(SettingsStore(root).get("music_volume"), 46)
+                self.assertIs(SettingsStore(root).get("music_muted"), True)
+                saved = get_project_session(root).save()
+                self.assertEqual(saved.project.to_dict()["sound"]["playlist"], state.playlist)
+                self.assertEqual(saved.project.to_dict()["sound"]["tracks"][1]["display_title"], "Missing")
+            finally:
+                release_project_session(root)
+
+    def test_canonical_empty_sound_does_not_inherit_previous_volume_or_mute(self) -> None:
+        from config import STARTING_VOLUME
+        from project_model import create_project
+        from project_repository import ProjectRepository
+        from project_session import release_project_session
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            stored = ProjectRepository(source / ".lettersmith-project").save(create_project([]), asset_root=source)
+            SettingsStore(root).update_fields(music_volume=98, starting_volume=98, music_muted=True)
+            try:
+                SavedLetterRestorer(root).restore_canonical(stored)
+                self.assertEqual(SettingsStore(root).get("music_volume"), STARTING_VOLUME)
+                self.assertIs(SettingsStore(root).get("music_muted"), False)
+                self.assertEqual(load_project_state(root).ordered_track_ids(), [])
+            finally:
+                release_project_session(root)
+
+    def test_canonical_restore_rolls_back_audio_settings_when_final_settings_write_fails(self) -> None:
+        from project_model import create_project
+        from project_repository import ProjectRepository
+        from project_session import get_project_session, release_project_session
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            project = create_project([])
+            project.update_project_data("sound", {"volume": 12, "muted": True})
+            stored = ProjectRepository(source / ".lettersmith-project").save(project, asset_root=source)
+            session = get_project_session(root)
+            settings = SettingsStore(root)
+            settings.update_fields(music_volume=81, starting_volume=81, music_muted=False)
+            before_settings = settings.snapshot()
+            before_project = session.project.to_dict()
+            restorer = SavedLetterRestorer(root)
+            replace_snapshot = restorer.settings.replace_snapshot
+            calls = 0
+            def fail_once(snapshot):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise PermissionError("synthetic final settings failure")
+                return replace_snapshot(snapshot)
+            try:
+                with mock.patch.object(restorer.settings, "replace_snapshot", side_effect=fail_once):
+                    with self.assertRaises(PermissionError):
+                        restorer.restore_canonical(stored)
+                self.assertEqual(settings.snapshot(), before_settings)
+                self.assertEqual(session.project.to_dict(), before_project)
+            finally:
+                release_project_session(root)
+
     def _bundle(self, root: Path, *, recipient: str = "Shariana Parker", title: str = "A Joyful Noise") -> Path:
         bundle = root / "output" / "Play" / recipient / title
         pages = bundle / "gallery" / "pages"
@@ -446,6 +537,7 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
 
     def test_silent_letter_clears_project_sound_without_deleting_archive(self) -> None:
+        from config import STARTING_VOLUME
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             existing = root / "existing.mp3"
@@ -454,6 +546,7 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             state = ProjectSoundState(mode="single", single_track_id=record.track_id, selected_track_id=record.track_id)
             save_project_state(root, state)
             sync_current_compatibility(root, state, load_library(root))
+            SettingsStore(root).update_fields(music_volume=94, starting_volume=94, music_muted=True)
             bundle = self._bundle(root)
 
             self._restore(root, bundle)
@@ -461,6 +554,23 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             self.assertFalse(load_project_state(root).ordered_track_ids())
             self.assertFalse(current_music_path(root).exists())
             self.assertIn(record.track_id, load_library(root))
+            self.assertEqual(SettingsStore(root).get("music_volume"), STARTING_VOLUME)
+            self.assertIs(SettingsStore(root).get("music_muted"), False)
+
+    def test_saved_manifest_restores_volume_and_mute(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = self._bundle(root)
+            path = bundle / "gallery/sounds/lettersmith-sound.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload.update(volume=23, muted=True)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self._restore(root, bundle)
+            state = load_project_state(root)
+            self.assertEqual(state.volume, 23)
+            self.assertTrue(state.muted)
+            self.assertEqual(SettingsStore(root).get("starting_volume"), 23)
+            self.assertIs(SettingsStore(root).get("music_muted"), True)
 
     def test_restore_commits_active_play_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

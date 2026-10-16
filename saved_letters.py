@@ -29,6 +29,7 @@ from config import (
     CONTROL_FILES,
     MESSAGE_ASSETS_DIR,
     PLAY_METADATA_FILE,
+    STARTING_VOLUME,
     USER_MESSAGE_DIR,
     USER_PAGES_DIR,
     USER_SOUNDS_DIR,
@@ -133,6 +134,7 @@ PROMPT_WRITER_SNAPSHOT_SCHEMA_VERSION = 1
 RESTORABLE_SETTING_KEYS = (
     "starting_volume",
     "music_volume",
+    "music_muted",
     "curtain_style",
     "message_overlay_preset",
     "message_overlay_opacity",
@@ -1435,7 +1437,7 @@ class SavedLetterRestorer:
         sound use the existing rollback mechanisms; the canonical pointer is
         committed only after those preparations succeed.
         """
-        from project_consumers import project_legacy_views
+        from project_consumers import project_legacy_views, project_sound_snapshot, project_sound_views
         from project_model import ProjectModel
         from project_repository import active_project_repository, legacy_workspace_payload, _safe_file
         from project_session import ProjectSession, get_project_session
@@ -1522,39 +1524,15 @@ class SavedLetterRestorer:
                     transaction.commit(replace=source.is_dir(), keep_backup=True)
                     committed.append(transaction)
                 atomic_copy_file(stage_root / PROMPT_WRITER_STATE_FILE, self.project_root / PROMPT_WRITER_STATE_FILE)
-                sound = payload["sound"]
-                records = load_library(self.project_root)
-                imported = []
-                original_ids = []
-                for track in sound.get("tracks", []):
-                    reference = track.get("asset") or ("gallery/sounds/" + track["filename"] if track.get("filename") else None)
-                    if reference is None:
-                        continue
-                    source = _safe_file(loaded.asset_root, reference)
-                    if not source.is_file():
-                        continue
-                    record = import_runtime_track(self.project_root, source,
-                                                  display_title=track.get("display_title", ""),
-                                                  original_name=track.get("original_name", source.name),
-                                                  content_hash="", duration_seconds=track.get("duration_seconds", 0),
-                                                  records=records, persist=False)
-                    imported.append(record.track_id)
-                    original_ids.append(track.get("track_id", ""))
-                if imported:
-                    save_library(self.project_root, records)
-                selected_index = sound.get("selected_track_index", 0)
-                if sound.get("selected_track_id") in original_ids:
-                    selected_index = original_ids.index(sound["selected_track_id"])
-                if not isinstance(selected_index, int) or not 0 <= selected_index < len(imported):
-                    selected_index = 0
-                playlist = sound.get("mode") == "playlist"
-                state = ProjectSoundState(mode="playlist" if playlist else "single",
-                                          single_track_id=imported[0] if imported and not playlist else "",
-                                          playlist=imported if playlist else [],
-                                          playlist_expanded=bool(sound.get("playlist_expanded", True)),
-                                          selected_track_id=imported[selected_index] if imported else "")
-                save_project_state(self.project_root, state)
-                sync_current_compatibility(self.project_root, state, records)
+                audio_session = ProjectSession(ProjectModel.from_dict(payload), project_root=self.project_root,
+                                               asset_root=loaded.asset_root)
+                sound = project_sound_snapshot(audio_session)
+                settings_changed = True
+                project_sound_views(audio_session)
+                if not preserve_commit:
+                    working.project.update_project_data("sound", sound)
+                restored.update(music_volume=sound["volume"], starting_volume=sound["volume"],
+                                music_muted=sound["muted"])
                 self.settings.replace_snapshot(restored)
                 settings_changed = True
                 if preserve_commit:
@@ -1828,7 +1806,12 @@ class SavedLetterRestorer:
                     if imported_ids
                     else ""
                 ),
+                volume=sound_payload.get("volume", restored_settings.get("music_volume", restored_settings.get("starting_volume", STARTING_VOLUME))),
+                muted=sound_payload.get("muted", False) is True,
             )
+            state.normalize()
+            restored_settings.update(music_volume=state.volume, starting_volume=state.volume,
+                                     music_muted=state.muted)
             save_project_state(self.project_root, state)
             sync_current_compatibility(
                 self.project_root,
@@ -1846,6 +1829,9 @@ class SavedLetterRestorer:
             from project_model import ProjectModel
             from project_repository import active_project_repository, legacy_workspace_payload
             canonical_data = canonical_project.to_dict()
+            canonical_data["sound"].update(state.to_dict())
+            for track, track_id in zip(canonical_data["sound"].get("tracks", []), imported_ids):
+                track["track_id"] = track_id
             canonical_data["project_id"] = restored_settings["project_id"]
             canonical_data["metadata"][PROJECT_CREATED_AT_KEY] = restored_settings.get(PROJECT_CREATED_AT_KEY, "")
             canonical_data["extensions"]["legacy_workspace_snapshot"] = legacy_workspace_payload(self.project_root)
@@ -2429,6 +2415,7 @@ class SavedLetterRestorer:
     ) -> dict[str, Any]:
         restored = dict(settings_before)
         restored["curtain_style"] = DEFAULT_CURTAIN_STYLE
+        restored.update(music_volume=STARTING_VOLUME, starting_volume=STARTING_VOLUME, music_muted=False)
         stored_settings = metadata.get("settings", {})
         if isinstance(stored_settings, dict):
             for key in RESTORABLE_SETTING_KEYS:
@@ -2438,6 +2425,8 @@ class SavedLetterRestorer:
                         if key == "curtain_style"
                         else stored_settings[key]
                     )
+            if "music_volume" not in stored_settings and "starting_volume" in stored_settings:
+                restored["music_volume"] = stored_settings["starting_volume"]
         recipient = str(metadata.get("recipient_name") or "").strip()
         if not recipient:
             recipient = str(entry.recipient or "").strip()
