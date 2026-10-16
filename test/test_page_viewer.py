@@ -37,10 +37,10 @@ class PageViewerTests(unittest.TestCase):
         self.assertTrue(result, "Browser script did not complete")
         return json.loads(result[0])
 
-    def wait_for(self, source):
+    def wait_for(self, source, timeout_ms=6000):
         timer = QtCore.QElapsedTimer()
         timer.start()
-        while timer.elapsed() < 6000:
+        while timer.elapsed() < timeout_ms:
             if self.js(source):
                 return
             QtTest.QTest.qWait(50)
@@ -72,39 +72,55 @@ class PageViewerTests(unittest.TestCase):
             (root / "index.html").write_text(template_for_project_pages(pages, template_html=shell), encoding="utf-8")
             (root / "styles.css").write_text(TEMPLATE_CSS, encoding="utf-8")
             (root / "script.js").write_text(TEMPLATE_JS, encoding="utf-8")
-            self.view = QWebEngineView()
-            self.view.resize(1000, 700)
-            script = QWebEngineScript()
-            script.setInjectionPoint(QWebEngineScript.DocumentCreation)
-            script.setWorldId(QWebEngineScript.MainWorld)
-            script.setSourceCode('''
-                window.viewerErrors = [];
-                window.addEventListener('error', event => viewerErrors.push(event.message));
-                const nativeMatch = window.matchMedia.bind(window);
-                window.matchMedia = query => query.includes('prefers-reduced-motion')
-                  ? {matches:true, addEventListener(){}, removeEventListener(){}}
-                  : nativeMatch(query);
-            ''')
-            self.view.page().scripts().insert(script)
-            self.view.show()
-            try:
-                loaded = []
-                loop = QtCore.QEventLoop()
-                self.view.loadFinished.connect(lambda ok: (loaded.append(ok), loop.quit()))
-                self.view.setUrl(QtCore.QUrl.fromLocalFile(str(root / "index.html")))
-                QtCore.QTimer.singleShot(5000, loop.quit)
-                loop.exec()
-                self.assertEqual(loaded, [True])
-                self.wait_for("return !!window.LetterSmithViewer;")
-                self.js("document.getElementById('curtain-overlay').click(); return true;")
-                self.wait_for("return !document.getElementById('next').disabled;")
-                self.wait_for("return Number(getComputedStyle(document.getElementById('slideshow')).opacity) > .99;")
+            with self.output_view(root / "index.html"):
                 yield root
-                self.assertEqual(self.js("return window.viewerErrors;"), [])
-            finally:
-                self.view.close()
-                self.view.deleteLater()
-                self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
+    @contextmanager
+    def output_view(self, entry, *, native_start=False):
+        self.view = QWebEngineView()
+        self.view.resize(1000, 700)
+        script = QWebEngineScript()
+        script.setInjectionPoint(QWebEngineScript.DocumentCreation)
+        script.setWorldId(QWebEngineScript.MainWorld)
+        script.setSourceCode('''
+            window.viewerErrors = [];
+            window.cspErrors = [];
+            window.viewerAudio = [];
+            window.Audio = new Proxy(window.Audio, {construct(target,args){
+                const audio=Reflect.construct(target,args); viewerAudio.push(audio); return audio;
+            }});
+            window.addEventListener('error', event => viewerErrors.push(event.message));
+            window.addEventListener('securitypolicyviolation', event => cspErrors.push(event.violatedDirective));
+            const nativeMatch = window.matchMedia.bind(window);
+            window.matchMedia = query => query.includes('prefers-reduced-motion')
+              ? {matches:true, addEventListener(){}, removeEventListener(){}}
+              : nativeMatch(query);
+        ''')
+        self.view.page().scripts().insert(script)
+        self.view.show()
+        try:
+            loaded = []
+            loop = QtCore.QEventLoop()
+            self.view.loadFinished.connect(lambda ok: (loaded.append(ok), loop.quit()))
+            self.view.setUrl(QtCore.QUrl.fromLocalFile(str(entry)))
+            QtCore.QTimer.singleShot(5000, loop.quit)
+            loop.exec()
+            self.assertEqual(loaded, [True])
+            self.wait_for("return !!window.LetterSmithViewer;")
+            if native_start:
+                self.wait_for("return Number(getComputedStyle(document.getElementById('curtain-overlay')).opacity) > .99;")
+                QtTest.QTest.mouseClick(self.view.focusProxy() or self.view, QtCore.Qt.LeftButton, pos=QtCore.QPoint(500, 350))
+            else:
+                self.js("document.getElementById('curtain-overlay').click(); return true;")
+            # Trusted input plays the bundled intro sound before unlocking navigation.
+            self.wait_for("return !document.getElementById('next').disabled;", 20000 if native_start else 6000)
+            self.wait_for("return Number(getComputedStyle(document.getElementById('slideshow')).opacity) > .99;")
+            yield
+            self.assertEqual(self.js("return window.viewerErrors;"), [])
+        finally:
+            self.view.close()
+            self.view.deleteLater()
+            self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
 
     def test_canonical_messages_keep_identity_formatting_and_navigation(self):
         pages = [
@@ -176,6 +192,116 @@ class PageViewerTests(unittest.TestCase):
             self.wait_for("return LetterSmithViewer.currentPageId() === 'last';")
             self.assertTrue(self.js("return document.getElementById('next').disabled;"))
             self.assertEqual(self.js("return document.getElementById('page-indicator').textContent;"), "Page 2 of 2 — Last")
+
+    def test_real_layouts_zip_and_single_html_work_without_source_project(self):
+        import wave
+        import zipfile
+        from test_forge_render import ForgeRenderTests
+        from test_project_model import canvas_layout
+        from forge_render import build_render_to, capture_render, copy_display_output, export_render
+
+        fixture = ForgeRenderTests('test_real_five_pages_order_messages_reorder_and_repository_reload')
+        fixture.setUp()
+        with tempfile.TemporaryDirectory(prefix="detached-display-") as directory:
+            detached = Path(directory)
+            try:
+                fixture.seed_app_sounds()
+                pages = fixture.project.pages
+                a, b = pages[1]["id"], pages[3]["id"]
+                for page, color in zip(pages, ('#204050', '#804040', '#405040', '#204060', '#302040')):
+                    Image.new('RGB', (400, 600), color).save(fixture.root / page['artwork']['asset'])
+                wide_artwork = Image.new('RGB', (1200, 600), '#204060')
+                wide_artwork.paste('#905010', (0, 0, 600, 600))
+                wide_artwork.save(fixture.root / pages[3]['artwork']['asset'])
+                frames = [Image.new('RGB', (400, 600), color) for color in ('#306080', '#803060')]
+                frames[0].save(fixture.root / 'cover.gif', save_all=True, append_images=frames[1:], duration=[100, 160], loop=0)
+                fixture.project.update_artwork(pages[0]['id'], {'asset': 'cover.gif'})
+                fixture.project.update_message(a, {**fixture.project.get_message(a), 'layout': canvas_layout(),
+                    'html': '<p style="font-size:24px"><b>Message A — red artwork</b></p>' + '<p>Readable overflowing message paragraph.</p>' * 18})
+                fixture.project.update_message(b, {**fixture.project.get_message(b),
+                    'layout': {**canvas_layout(), 'box': {'x': 80, 'y': 330, 'width': 280, 'height': 190}, 'text_align': 'right'},
+                    'html': '<p style="font-size:30px"><i>Message B — blue artwork</i></p>'})
+                fixture.project.update_artwork(b, {'placement': {'version': 1, 'fit': 'cover', 'position': {'x': .8, 'y': .3}}})
+                tracks = []
+                for index in range(2):
+                    audio_path = fixture.root / f'pcm-{index}.wav'
+                    with wave.open(str(audio_path), 'wb') as audio:
+                        audio.setnchannels(1)
+                        audio.setsampwidth(2)
+                        audio.setframerate(22050)
+                        audio.writeframes(b'\x00\x00' * 22050 * 6)
+                    tracks.append({'track_id': str(index), 'asset': audio_path.name})
+                fixture.project.update_project_data('sound', {'tracks': tracks, 'mode': 'playlist', 'playlist': ['0', '1'], 'volume': 23, 'muted': True, 'crossfade_ms': 300})
+                built = build_render_to(capture_render(fixture.session), fixture.root / 'display')
+                display = copy_display_output(built, detached / 'display')
+                archive_path = export_render(fixture.session, detached / 'letter.zip')
+                standalone = export_render(fixture.session, detached / 'letter.html', output_format='html')
+                with zipfile.ZipFile(archive_path) as archive:
+                    archive.extractall(detached / 'unpacked')
+            finally:
+                fixture.tearDown()
+
+            self.assertFalse(fixture.root.exists())
+            observations = []
+            for mode, entry in (('display', display / 'index.html'), ('zip', detached / 'unpacked/letter/index.html'), ('html', standalone)):
+                with self.subTest(mode=mode), self.output_view(entry, native_start=True):
+                    sources = set()
+                    for _ in range(8):
+                        sources.add(self.js("return document.querySelector('.slide.active > img').src;"))
+                        QtTest.QTest.qWait(70)
+                    self.assertGreater(len(sources), 1)
+                    self.wait_for("return Array.from(document.querySelectorAll('audio')).some(audio=>!audio.paused && audio.currentTime > .1);")
+                    before = self.js("const a=Array.from(document.querySelectorAll('audio')).find(a=>!a.paused); return {src:a.currentSrc,time:a.currentTime};")
+                    self.js('LetterSmithViewer.goToPage(' + json.dumps(a) + '); return true;')
+                    after = self.js("const a=Array.from(document.querySelectorAll('audio')).find(a=>!a.paused); return {src:a.currentSrc,time:a.currentTime};")
+                    self.assertEqual(before['src'], after['src'])
+                    self.assertGreaterEqual(after['time'], before['time'])
+                    if mode == 'html':
+                        self.assertTrue(after['src'].startswith('data:audio/'))
+                    self.wait_for("return !document.getElementById('next').disabled;")
+                    self.js("document.getElementById('next').click(); return true;")
+                    self.wait_for("return viewerAudio.length > 1 && viewerAudio[viewerAudio.length-1].readyState >= 2;")
+                    self.assertTrue(self.js("return viewerAudio.every(audio=>!audio.error);"))
+                    if mode == 'html':
+                        self.assertTrue(self.js("return viewerAudio.every(audio=>audio.src.startsWith('data:audio/'));"))
+                    for page_id, expected, x, y, font in ((a, 'Message A', 40, 130, '24px'), (b, 'Message B', 80, 330, '30px')):
+                        self.wait_for("return !document.getElementById('prev').disabled;")
+                        self.js('LetterSmithViewer.goToPage(' + json.dumps(page_id) + '); return true;')
+                        self.wait_for("return !!document.querySelector('.text-wall.is-open');")
+                        self.wait_for("return document.getElementById('title-banner').getAttribute('aria-hidden') === 'true';")
+                        self.wait_for("return Number(getComputedStyle(document.querySelector('.text-wall.is-open')).opacity) > .99;")
+                        for width, height, orientation in ((1000, 700, 'landscape'), (390, 844, 'portrait')):
+                            self.view.resize(width, height)
+                            self.wait_for(f"return innerWidth === {width} && innerHeight === {height};")
+                            QtTest.QTest.qWait(500)
+                            measure = self.js('''
+                                const wall=document.querySelector('.text-wall.is-open');
+                                const r=wall.getBoundingClientRect(), image=document.querySelector('.slide.active > img'), a=image.getBoundingClientRect();
+                                return {x:(r.left-a.left)/a.width,y:(r.top-a.top)/a.height,text:wall.querySelector('.text-wall-content').textContent,
+                                  font:getComputedStyle(wall.querySelector('.text-wall-content p')).fontSize,fit:getComputedStyle(image).objectFit,
+                                  position:getComputedStyle(image).objectPosition,naturalWidth:image.naturalWidth,
+                                  issues:LetterSmithViewer.layoutIssues()};
+                            ''')
+                            self.assertIn(expected, measure['text'])
+                            self.assertEqual(measure['font'], font)
+                            self.assertAlmostEqual(measure['x'], x / 400, delta=.003)
+                            self.assertAlmostEqual(measure['y'], y / 600, delta=.003)
+                            self.assertEqual(measure['fit'], 'cover' if page_id == b else 'contain')
+                            if page_id == b:
+                                self.assertEqual(measure['position'], '80% 30%')
+                                self.assertEqual(measure['naturalWidth'], 1200)
+                            self.assertTrue(any(issue['page_id'] == a and issue['code'] == 'message_overflow' for issue in measure['issues']))
+                            profile = os.environ.get('LETTER_SMITH_PROFILE_ROOT')
+                            if profile and mode != 'zip':
+                                screenshot = Path(profile) / f'layout-{mode}-{expected[-1].lower()}-{orientation}.png'
+                                self.assertTrue(self.view.grab().save(str(screenshot)))
+                            observations.append({'mode': mode, 'page_id': page_id, 'orientation': orientation, 'x': measure['x'], 'y': measure['y'], 'font': measure['font']})
+                        if page_id == a:
+                            self.assertTrue(self.js("const viewport=document.querySelector('.text-wall.is-open .text-wall-viewport'); viewport.scrollTop=viewport.scrollHeight; return viewport.scrollTop > 0;"))
+                    self.assertEqual(self.js('return cspErrors;'), [])
+            profile = os.environ.get('LETTER_SMITH_PROFILE_ROOT')
+            if profile:
+                (Path(profile) / 'layout-export-observations.json').write_text(json.dumps(observations, indent=2), encoding='utf-8')
 
     def test_canonical_muted_state_preserves_volume_and_user_toggle_on_restart(self):
         pages = [

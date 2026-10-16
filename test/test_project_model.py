@@ -7,7 +7,7 @@ import unittest
 
 from project_model import (
     CLASSIC_PAGE_TYPES, MAX_PAGES, PAGE_TYPES, PageLimitError, ProjectModel,
-    ProjectModelError, UnsupportedProjectError, create_project, empty_message,
+    ProjectModelError, ProjectLayoutError, UnsupportedProjectError, create_project, empty_message,
 )
 from project_migration import migrate_project
 
@@ -24,6 +24,13 @@ def five_page_project():
             project.update_message(page["id"], message)
             project.update_prompt(page["id"], {"text": f"  Prompt {label}\n雪\n ", "resolved_components": {"palette": [label]}, "stale": False})
     return project
+
+
+def canvas_layout():
+    return {"version": 1, "units": "css_px", "canvas": {"width": 400, "height": 600},
+            "box": {"x": 40, "y": 130, "width": 320, "height": 170},
+            "padding": {"top": 12, "right": 12, "bottom": 12, "left": 12},
+            "text_align": "left", "overflow": "scroll"}
 
 
 def legacy_fixture(*, count=4):
@@ -45,6 +52,53 @@ def legacy_fixture(*, count=4):
 
 
 class ProjectModelTests(unittest.TestCase):
+    def test_layout_resolves_inheritance_and_document_overrides_without_mutating(self):
+        project = create_project()
+        page_id = project.pages[2]["id"]
+        project.update_shared_settings({"message_layout": canvas_layout()})
+        project.update_message(page_id, {**project.get_message(page_id), "layout": {"box": {"y": 250}, "text_align": "right"}})
+        before = project.to_dict()
+        resolved = project.resolve_layout(page_id)
+        self.assertEqual(resolved["message"]["box"], {"x": 40, "y": 250, "width": 320, "height": 170})
+        self.assertEqual(resolved["artwork"]["canvas"], {"width": 400, "height": 600})
+        self.assertEqual(project.to_dict(), before)
+        resolved["message"]["box"]["x"] = 999
+        self.assertEqual(project.render_snapshot()["pages"][2]["resolved_layout"]["message"]["box"]["x"], 40)
+
+    def test_layout_empty_and_null_override_preserve_legacy_rendering(self):
+        project = create_project()
+        page_id = project.pages[2]["id"]
+        self.assertEqual(project.resolve_layout(page_id), {"message": None, "artwork": None})
+        project.update_shared_settings({"message_layout": canvas_layout()})
+        project.update_page_settings(page_id, {"message_layout": None})
+        self.assertIsNone(project.resolve_layout(page_id)["message"])
+        project.clear_page_override(page_id, "message_layout")
+        self.assertIsNotNone(project.resolve_layout(page_id)["message"])
+
+    def test_invalid_or_unknown_layout_stays_savable_but_blocks_output(self):
+        project = create_project()
+        page_id = project.pages[2]["id"]
+        for layout in ({"width": 100}, {**canvas_layout(), "box": {"x": 350, "y": 0, "width": 100, "height": 100}},
+                       {**canvas_layout(), "padding": {"left": 320}}, {**canvas_layout(), "overflow": "clip"},
+                       {**canvas_layout(), "canvas": {"width": True, "height": 600}},
+                       {**canvas_layout(), "canvas": {"width": 10 ** 400, "height": 600}}):
+            with self.subTest(layout=layout):
+                project.update_message(page_id, {**project.get_message(page_id), "layout": layout})
+                self.assertEqual(ProjectModel.from_dict(project.to_dict()).get_message(page_id)["layout"], layout)
+                with self.assertRaises(ProjectLayoutError):
+                    project.resolve_layout(page_id)
+                self.assertTrue(any(issue.code == "unsupported_layout" and issue.page_id == page_id for issue in project.validate()))
+
+    def test_artwork_placement_and_message_share_one_canvas(self):
+        project = create_project()
+        page_id = project.pages[2]["id"]
+        project.update_message(page_id, {**project.get_message(page_id), "layout": canvas_layout()})
+        project.update_artwork(page_id, {"placement": {"version": 1, "fit": "cover", "position": {"x": .25, "y": 1}}})
+        self.assertEqual(project.resolve_layout(page_id)["artwork"]["position"], {"x": .25, "y": 1})
+        project.update_artwork(page_id, {"placement": {"version": 1, "canvas": {"width": 300, "height": 600}}})
+        with self.assertRaises(ProjectLayoutError):
+            project.resolve_layout(page_id)
+
     def test_types_and_templates(self):
         self.assertEqual(tuple(PAGE_TYPES), CLASSIC_PAGE_TYPES)
         self.assertEqual([item.artwork_template for item in PAGE_TYPES.values()], ["cover", "letter", "wall", "back"])

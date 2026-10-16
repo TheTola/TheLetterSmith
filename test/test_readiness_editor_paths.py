@@ -737,6 +737,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 self.assertEqual(tab.preview_mode_value, "landscape")
                 blocked = tab._readiness_result
                 self.assertFalse(blocked.can_preview)
+                self.assertFalse(tab.export_btn.isEnabled())
                 self.assertEqual(tab.preview_mode.count(), 0)
                 self.assertEqual(tab.preview_mode.currentIndex(), -1)
                 self.assertFalse(tab.preview_mode.isEnabled())
@@ -748,6 +749,18 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 with mock.patch("Forge_Tab.evaluate_readiness", return_value=ready):
                     tab.refresh_readiness()
                 self.assertTrue(tab.preview_mode.isEnabled())
+                self.assertTrue(tab.export_btn.isEnabled())
+                menu_labels = []
+                def choose_html():
+                    menu = QtWidgets.QApplication.activePopupWidget()
+                    menu_labels.extend(action.text() for action in menu.actions())
+                    menu.actions()[1].trigger()
+                    menu.close()
+                with mock.patch.object(tab, "export_letter") as export_letter:
+                    QtCore.QTimer.singleShot(0, choose_html)
+                    tab.export_btn.click()
+                self.assertEqual(menu_labels, ["ZIP Package…", "Single HTML…", "Website ZIP…"])
+                export_letter.assert_called_once_with("html")
                 self.assertEqual(tab.preview_mode.count(), 3)
                 self.assertEqual(tab.preview_mode.currentData(), "landscape")
                 self.assertEqual(

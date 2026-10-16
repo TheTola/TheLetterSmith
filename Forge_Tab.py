@@ -1947,6 +1947,10 @@ class ForgeTab(QtWidgets.QWidget):
         )
         self.github_account_btn.clicked.connect(self.show_github_account)
         publishing_row.addWidget(self.github_account_btn)
+        self.export_btn = self._tier_button("Export", ButtonTier.SMALL, "BButton.png")
+        set_control_help(self.export_btn, "Save a portable ZIP or Single HTML presentation.")
+        self.export_btn.clicked.connect(self.show_export_menu)
+        publishing_row.addWidget(self.export_btn)
         self._main_layout.addLayout(publishing_row)
 
         actions = QtWidgets.QHBoxLayout()
@@ -2186,6 +2190,7 @@ class ForgeTab(QtWidgets.QWidget):
             self.load_saved_btn,
             self.load_stock_btn,
             self.github_account_btn,
+            self.export_btn,
             self.preview_btn,
             self.publish_btn,
             self.unpublish_btn,
@@ -3204,6 +3209,8 @@ class ForgeTab(QtWidgets.QWidget):
             broken=not publication_valid,
             invisible=self._busy,
         )
+        if hasattr(self, "export_btn"):
+            self.export_btn.setEnabled(not self._busy and not self._publication_operation and readiness.can_publish)
         publishing_active = bool(
             self._pending_publish_context is not None
             or self._busy_operation
@@ -4392,6 +4399,54 @@ class ForgeTab(QtWidgets.QWidget):
 
     def preview_letter(self) -> None:
         self._prepare_preview(open_in_browser=True)
+
+    def show_export_menu(self) -> None:
+        menu = QtWidgets.QMenu(self)
+        for label, output_format in (("ZIP Package…", "zip"), ("Single HTML…", "html"), ("Website ZIP…", "publish_zip")):
+            action = menu.addAction(label)
+            action.triggered.connect(lambda _checked=False, kind=output_format: self.export_letter(kind))
+        menu.exec(self.export_btn.mapToGlobal(self.export_btn.rect().bottomLeft()))
+        menu.deleteLater()
+
+    def export_letter(self, output_format: str = "zip") -> None:
+        if self._busy or self._publication_operation:
+            return
+        if not self._flush_prompt_writer_state() or self._required_gate(for_publish=True) is None:
+            return
+        from forge_render import capture_render, export_render
+        from project_session import get_project_session
+
+        session = get_project_session(self.project_root)
+        context = _forge_project_context(self.project_root)
+        render = capture_render(session, "display")
+        extension = ".html" if output_format == "html" else ".zip"
+        label = "Single HTML (*.html)" if output_format == "html" else "ZIP Package (*.zip)"
+        name = generate.play_bundle_directory(self.project_root).name
+        if output_format == "publish_zip":
+            name += "-website"
+        filename, _filter = QtWidgets.QFileDialog.getSaveFileName(self, "Export Letter", name + extension, label)
+        if not filename:
+            return
+        destination = Path(filename)
+        if destination.suffix.casefold() != extension:
+            self._set_status(f"Choose a filename ending in {extension}.", error=True)
+            return
+
+        def task():
+            _require_forge_context(self.project_root, context)
+            path = export_render(session, destination, output_format=output_format, render_input=render,
+                                 cancelled=lambda: QtCore.QThread.currentThread().isInterruptionRequested())
+            return path, context, render.source_fingerprint
+
+        self._start_operation("Exporting letter…", task, self._export_completed,
+                              "Export failed. Any previous export was preserved.")
+
+    def _export_completed(self, result: object) -> None:
+        path, context, fingerprint = result
+        if not _forge_context_is_current(self.project_root, context):
+            return
+        earlier = _forge_source_fingerprint(self.project_root) != fingerprint
+        self._set_status(f"Export saved{' for an earlier revision' if earlier else ''}: {path}", timeout_ms=0)
 
     def ensure_preview_current(self) -> None:
         """Build or refresh the embedded preview before it is displayed."""

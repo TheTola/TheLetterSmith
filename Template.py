@@ -263,6 +263,8 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .slide.asset-failed > img{opacity:0}
 .slide.asset-failed::after{content:attr(data-fallback-label);position:absolute;inset:50% auto auto 50%;transform:translate(-50%,-50%);width:min(520px,72%);padding:18px 22px;color:var(--text-main);text-align:center;font:700 20px/1.4 var(--font-ui);background:rgba(0,0,0,.58);border:1px solid var(--hud-border);border-radius:var(--page-radius);box-shadow:var(--shadow-page);z-index:6}
 .slide > img{max-width:calc(100% - (2 * var(--page-side-rail)));max-height:calc(100% - var(--control-rail) - var(--bottom-control-rail));position:absolute;inset:var(--control-rail) var(--page-side-rail) var(--bottom-control-rail);margin:auto;object-fit:contain;border-radius:var(--page-radius);box-shadow:inset 0 0 30px rgba(0,0,0,.20),var(--shadow-page)}
+.canvas-bounds{position:absolute;inset:var(--control-rail) var(--page-side-rail) var(--bottom-control-rail);pointer-events:none}
+.slide.has-canvas > img{inset:auto;left:var(--canvas-left);top:var(--canvas-top);width:var(--canvas-width);height:var(--canvas-height);max-width:none;max-height:none;margin:0;object-fit:var(--artwork-fit);object-position:var(--artwork-x) var(--artwork-y)}
 
 .nav-button,.hud-button{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--hud-border);background:linear-gradient(180deg,var(--hud-surface-top),var(--hud-surface-bottom));color:var(--text-main);box-shadow:var(--hud-shadow);backdrop-filter:blur(10px);cursor:pointer;transition:transform var(--motion-hover),background var(--motion-hover),border-color var(--motion-hover),box-shadow var(--motion-hover),opacity var(--motion-overlay),visibility 0s linear var(--duration-overlay)}
 .nav-button:hover,.hud-button:hover{background:linear-gradient(180deg,rgba(25,37,55,.88),rgba(10,14,24,.76));border-color:var(--hud-border-strong);box-shadow:var(--hud-shadow-strong)}
@@ -294,6 +296,13 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .text-wall-content > :last-child{margin-bottom:0 !important}
 .text-wall-content :where(p,div,blockquote,ul,ol,h1,h2,h3,h4,table){margin-left:0 !important;margin-right:0 !important}
 .text-wall-content :where(img,table){height:auto}
+.text-wall.canvas-message{inset:auto;left:var(--message-left);top:var(--message-top);width:var(--message-width);height:var(--message-height);max-height:none;margin:0;padding:0;border:0;overflow:visible;transform:scale(var(--canvas-scale));transform-origin:top left;transition:opacity var(--motion-overlay),visibility 0s linear var(--duration-overlay)}
+.text-wall.canvas-message.is-open{transform:scale(var(--canvas-scale));transition-delay:0s}
+.canvas-message .text-wall-viewport{position:absolute;inset:0;overflow:auto;overscroll-behavior:contain;border-radius:inherit;scrollbar-width:thin}
+.canvas-message .text-wall-content{box-sizing:border-box;width:100%;max-width:none;min-height:100%;margin:0;padding:var(--message-padding);text-align:var(--message-align);font-size:18px}
+.canvas-message .close-text{position:absolute;top:calc(-44px / var(--canvas-scale));right:0;width:calc(44px / var(--canvas-scale));height:calc(44px / var(--canvas-scale));margin:0;font-size:calc(24px / var(--canvas-scale))}
+.message-overflow-note{position:absolute;right:0;bottom:calc(-24px / var(--canvas-scale));padding:2px 5px;border-radius:4px;background:#15151b;color:#fff;font:500 calc(12px / var(--canvas-scale))/1.4 var(--font-ui);white-space:nowrap;pointer-events:none}
+.message-overflow-note[hidden]{display:none}
 .text-wall-content :is(a[href^="ultralink:"],a[href^="hypernote:"]){font-style:italic;text-decoration:none !important;cursor:help;outline-offset:3px}
 .text-wall-content :is(a[href^="ultralink:"],a[href^="hypernote:"]):focus-visible{outline:2px solid #00d0ff;border-radius:3px}
 .ultralink-tooltip{position:fixed;left:0;top:0;max-width:min(22rem,calc(100vw - 32px));padding:11px 14px;border:1px solid transparent;border-radius:9px;box-shadow:0 18px 42px rgba(0,0,0,.34);font:500 15px/1.45 Georgia,'Times New Roman',serif;white-space:pre-wrap;overflow-wrap:anywhere;z-index:220;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity var(--motion-overlay),transform var(--motion-overlay),visibility 0s linear var(--duration-overlay);pointer-events:none}
@@ -444,7 +453,13 @@ document.addEventListener('DOMContentLoaded', () => {
   let viewerMuted = loadViewerMuted();
   let currentVolume = loadVolume0to100();
 
-  const flipPool = Array.from({length: 10}, (_, i) => `gallery/sounds/flip${i+1}.mp3`);
+  const flipPool = [
+    'gallery/sounds/flip1.mp3', 'gallery/sounds/flip2.mp3',
+    'gallery/sounds/flip3.mp3', 'gallery/sounds/flip4.mp3',
+    'gallery/sounds/flip5.mp3', 'gallery/sounds/flip6.mp3',
+    'gallery/sounds/flip7.mp3', 'gallery/sounds/flip8.mp3',
+    'gallery/sounds/flip9.mp3', 'gallery/sounds/flip10.mp3',
+  ];
   const glissSrc = 'gallery/sounds/glissando.mp3';
   const deferredAssets = [
     ...slides.slice(1).map((slide) => ({ as: 'image', href: slide.querySelector('img').getAttribute('src') })),
@@ -1088,6 +1103,59 @@ document.addEventListener('DOMContentLoaded', () => {
     if (wall) openText.setAttribute('aria-controls', wall.id);
     else openText.removeAttribute('aria-controls');
   }
+  const canvasPages = slides.filter((slide) => slide.dataset.layout).map((slide) => ({
+    slide, layout:JSON.parse(slide.dataset.layout),
+    wall:messageWalls.find((item) => item.dataset.pageId === slide.dataset.pageId),
+  }));
+  let layoutIssues = [];
+  let layoutFrame = 0;
+  function updateCanvasLayouts(){
+    const issues = [];
+    for (const item of canvasPages){
+      const {slide, layout, wall:messageWall} = item;
+      const bounds = slide.querySelector('.canvas-bounds').getBoundingClientRect();
+      const stage = slide.getBoundingClientRect();
+      const canvas = layout.artwork.canvas;
+      const scale = Math.min(bounds.width / canvas.width, bounds.height / canvas.height);
+      if (!(scale > 0)) continue;
+      const left = bounds.left - stage.left + (bounds.width - canvas.width * scale) / 2;
+      const top = bounds.top - stage.top + (bounds.height - canvas.height * scale) / 2;
+      const properties = {
+        '--canvas-left':`${left}px`, '--canvas-top':`${top}px`,
+        '--canvas-width':`${canvas.width * scale}px`, '--canvas-height':`${canvas.height * scale}px`,
+        '--artwork-fit':layout.artwork.fit,
+        '--artwork-x':`${layout.artwork.position.x * 100}%`, '--artwork-y':`${layout.artwork.position.y * 100}%`,
+      };
+      for (const [key,value] of Object.entries(properties)) slide.style.setProperty(key,value);
+      if (!messageWall || !layout.message) continue;
+      const {box,padding,text_align} = layout.message;
+      const messageProperties = {
+        '--canvas-scale':String(scale), '--message-left':`${left + box.x * scale}px`,
+        '--message-top':`${top + box.y * scale}px`, '--message-width':`${box.width}px`,
+        '--message-height':`${box.height}px`, '--message-align':text_align,
+        '--message-padding':`${padding.top}px ${padding.right}px ${padding.bottom}px ${padding.left}px`,
+      };
+      for (const [key,value] of Object.entries(messageProperties)) messageWall.style.setProperty(key,value);
+      const viewport = messageWall.querySelector('.text-wall-viewport');
+      const overflow = viewport.scrollHeight > viewport.clientHeight + 1 || viewport.scrollWidth > viewport.clientWidth + 1;
+      messageWall.querySelector('.message-overflow-note').hidden = !overflow;
+      if (overflow) issues.push({code:'message_overflow',page_id:slide.dataset.pageId,
+        message:`Page ${Number(slide.dataset.index) + 1} — ${slide.dataset.pageName}: Message continues in the scrollable text area.`,
+        severity:'warning',feature:'messages',blocks_output:false,blocks_preview:false});
+    }
+    const changed = JSON.stringify(issues) !== JSON.stringify(layoutIssues);
+    layoutIssues = issues;
+    if (changed) window.dispatchEvent(new CustomEvent('lettersmith-layout', {detail:issues.map((item) => ({...item}))}));
+  }
+  function scheduleCanvasLayouts(){
+    if (layoutFrame) return;
+    layoutFrame = requestAnimationFrame(() => { layoutFrame = 0; updateCanvasLayouts(); });
+  }
+  window.addEventListener('resize', scheduleCanvasLayouts);
+  document.addEventListener('load', scheduleCanvasLayouts, true);
+  document.fonts?.ready.then(scheduleCanvasLayouts);
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(scheduleCanvasLayouts).observe(slideshowEl);
+  scheduleCanvasLayouts();
   function syncPageNavigation(){
     const slide = slides[idx];
     if (pageIndicator && slide){
@@ -1302,6 +1370,9 @@ document.addEventListener('DOMContentLoaded', () => {
     imgFront.src = goingNext
       ? slideImageSrc(currentSlide)
       : slideImageSrc(targetSlide);
+    const turningImageStyle = getComputedStyle(slideImageEl(goingNext ? currentSlide : targetSlide));
+    imgFront.style.objectFit = turningImageStyle.objectFit;
+    imgFront.style.objectPosition = turningImageStyle.objectPosition;
 
     if (goingNext){
       targetSlide.classList.add('peek');
@@ -1691,6 +1762,7 @@ document.addEventListener('DOMContentLoaded', () => {
       return true;
     },
     currentPageId(){ return slides[idx]?.dataset.pageId || null; },
+    layoutIssues(){ updateCanvasLayouts(); return layoutIssues.map((item) => ({...item})); },
   });
   if (restartBtn){
     restartBtn.addEventListener('click', () => {
@@ -1819,10 +1891,11 @@ def template_for_project_pages(pages, *, template_html=None):
     """
     import hashlib
     import html
+    import json
     from pathlib import PurePosixPath
     from urllib.parse import unquote, urlsplit
 
-    from project_model import PAGE_TYPES
+    from project_model import PAGE_TYPES, resolve_page_layout
 
     pages = tuple(pages)
     base = TEMPLATE_HTML if template_html is None else template_html
@@ -1851,12 +1924,30 @@ def template_for_project_pages(pages, *, template_html=None):
         escaped_name = html.escape(name, quote=True)
         active = " active" if index == 0 else ""
         priority = ' fetchpriority="high"' if index == 0 else ""
+        supplied_layout = page.get("layout") or {}
+        layout = resolve_page_layout({
+            "message": {"layout": supplied_layout.get("message") or {}} if kind == "letter" else None,
+            "artwork": {"placement": supplied_layout.get("artwork") or {}},
+        }, {})
+        canvas_data = ""
+        canvas_bounds = ""
+        if layout["artwork"] is not None:
+            canvas_data = ' data-layout="' + html.escape(json.dumps(layout, separators=(",", ":")), quote=True) + '"'
+            canvas_bounds = '      <div class="canvas-bounds" aria-hidden="true"></div>\n'
+            active += " has-canvas"
         overlay = ""
         if kind == "letter":
             content = str(page.get("message_html", ""))
             overlay_style = html.escape(str(page.get("overlay_style", "")), quote=True)
+            message_class = " canvas-message" if layout["message"] is not None else ""
+            content_html = f'        <div class="text-wall-content" id="{scope}-content">{content}</div>\n'
+            if message_class:
+                content_html = (f'<div class="text-wall-viewport" tabindex="0" role="region" '
+                                f'aria-label="Message text — {escaped_name}" aria-describedby="{scope}-overflow">'
+                                + content_html + '</div>\n'
+                                + f'<span class="message-overflow-note" id="{scope}-overflow" hidden>Scroll to read the full message</span>\n')
             overlay = (
-                f'      <div class="text-wall" id="{scope}-message" '
+                f'      <div class="text-wall{message_class}" id="{scope}-message" '
                 f'data-page-id="{html.escape(page_id, quote=True)}" '
                 f'data-has-message="{str(bool(content.strip())).lower()}" '
                 f'role="dialog" aria-modal="false" aria-label="Message — {escaped_name}" '
@@ -1864,7 +1955,7 @@ def template_for_project_pages(pages, *, template_html=None):
                 f'        <button id="{scope}-close" class="hud-button hud-button-close close-text" '
                 f'type="button" title="Close Text" aria-label="Close message" '
                 f'aria-controls="{scope}-message">&times;</button>\n'
-                f'        <div class="text-wall-content" id="{scope}-content">{content}</div>\n'
+                + content_html +
                 '      </div>\n'
             )
             overlays.append(overlay)
@@ -1872,7 +1963,8 @@ def template_for_project_pages(pages, *, template_html=None):
             f'    <section class="slide{active}" data-index="{index}" '
             f'data-canonical="true" data-page-type="{kind}" '
             f'data-page-id="{html.escape(page_id, quote=True)}" '
-            f'data-page-name="{escaped_name}" id="{scope}">\n'
+            f'data-page-name="{escaped_name}" id="{scope}"{canvas_data}>\n'
+            + canvas_bounds +
             f'      <img src="{html.escape(source, quote=True)}" alt="{escaped_name}" '
             f'decoding="async"{priority}>\n    </section>\n'
         )

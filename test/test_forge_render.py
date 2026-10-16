@@ -5,8 +5,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 import unittest
+import zipfile
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -17,11 +19,11 @@ from PySide6.QtWidgets import QApplication
 import generate
 from forge_render import (DISPLAY_MANIFEST, RenderValidationError, StaleRenderError,
                           build_render_to, capture_render, copy_display_output,
-                          generate_render, render_is_current, validate_render)
+                          generate_render, export_render, render_is_current, validate_render)
 from project_model import create_project, MAX_PAGES, ProjectModel
 from project_repository import ProjectRepository
 from project_session import ProjectSession, get_project_session, release_project_session
-from test_project_model import five_page_project
+from test_project_model import five_page_project, canvas_layout
 
 
 class ForgeRenderTests(unittest.TestCase):
@@ -58,6 +60,13 @@ class ForgeRenderTests(unittest.TestCase):
     def build(self, name="display", mode="display"):
         return build_render_to(capture_render(self.session, mode), self.root / name, seed_sfx=False)
 
+    def seed_app_sounds(self):
+        source = generate.application_paths(Path(__file__).resolve().parents[1]).app_resource_path(generate.APP_SOUNDS_DIR)
+        destination = self.root / "resources/app/sounds"
+        destination.mkdir(parents=True, exist_ok=True)
+        for name in generate._sfx_names():
+            shutil.copy2(source / name, destination / name)
+
     def test_real_five_pages_order_messages_reorder_and_repository_reload(self):
         output = self.build()
         content = (output / "index.html").read_text(encoding="utf-8")
@@ -88,6 +97,30 @@ class ForgeRenderTests(unittest.TestCase):
         self.assertEqual([page["id"] for page in manifest["pages"]], order)
         for page, original in zip(manifest["pages"], self.session.project.pages):
             self.assertEqual((second / page["source"]).read_bytes(), (restored.asset_root / original["artwork"]["asset"]).read_bytes())
+
+    def test_distinct_resolved_layouts_survive_reorder_save_and_public_copy(self):
+        from html import unescape
+        first, second = self.project.pages[1], self.project.pages[3]
+        self.project.update_shared_settings({"message_layout": canvas_layout()})
+        self.project.update_message(second["id"], {**second["message"], "layout": {"box": {"x": 80, "y": 330, "width": 280, "height": 190}, "text_align": "right"}})
+        self.project.update_artwork(second["id"], {"placement": {"version": 1, "fit": "cover", "position": {"x": .8}}})
+        fingerprint = capture_render(self.session).source_fingerprint
+        self.project.update_shared_settings({"message_layout": {**canvas_layout(), "padding": {"left": 20}}})
+        self.assertNotEqual(capture_render(self.session).source_fingerprint, fingerprint)
+        order = [page["id"] for page in self.project.pages]
+        order[1], order[3] = order[3], order[1]
+        self.project.reorder_pages(order)
+        repository = ProjectRepository(self.root / "saved")
+        repository.save(self.project, asset_root=self.root)
+        stored = repository.load()
+        self.session.replace(stored.project, asset_root=stored.asset_root)
+        public = copy_display_output(self.build(), self.root / "public")
+        content = (public / "index.html").read_text(encoding="utf-8")
+        layouts = [json.loads(unescape(value)) for value in re.findall(r'data-layout="([^"]+)"', content)]
+        self.assertEqual([layout["message"]["box"]["y"] for layout in layouts], [330, 130])
+        self.assertEqual(layouts[0]["artwork"]["fit"], "cover")
+        self.assertEqual(content.count('class="text-wall canvas-message"'), 2)
+        self.assertEqual(generate.validate_play_bundle(public), public)
 
     def test_classic_workspace_migrates_and_renders_actual_type_meanings(self):
         from image_animation import install_image_asset
@@ -224,6 +257,72 @@ class ForgeRenderTests(unittest.TestCase):
         self.assertEqual(len(attachments), 1)
         self.assertEqual(attachments[0].read_bytes(), original)
         self.assertEqual(generate.validate_play_bundle(public), public)
+
+    def test_portable_exports_allow_only_display_files_and_preserve_inline_nonce(self):
+        from portable_export import create_zip_package, create_publish_package, create_single_html
+        output = self.build()
+        (output / "private-draft.json").write_text('{"prompt":"PRIVATE_EXPORT_MARKER"}')
+        (output / "gallery/private-draft.png").write_bytes(b"PRIVATE_EXPORT_MARKER")
+        manifest = json.loads((output / DISPLAY_MANIFEST).read_text())
+        expected = {*manifest["files"], DISPLAY_MANIFEST}
+        for exporter, rooted in ((create_zip_package, True), (create_publish_package, False)):
+            archive_path = exporter(output, self.root / "exports")
+            with zipfile.ZipFile(archive_path) as archive:
+                prefix = output.name + "/" if rooted else ""
+                actual = {name.removeprefix(prefix) for name in archive.namelist()}
+                self.assertEqual(actual, expected if rooted else expected | {".nojekyll", "_headers"})
+                self.assertIn(b"Message A", archive.read(prefix + "index.html"))
+                self.assertIn(b"Message B", archive.read(prefix + "index.html"))
+        document = create_single_html(output, self.root / "exports").read_text(encoding="utf-8")
+        self.assertNotIn("PRIVATE_EXPORT_MARKER", document)
+        self.assertNotIn('src="script.js"', document)
+        self.assertNotIn('href="styles.css"', document)
+        nonce = re.search(r"script-src 'nonce-([^']+)'", document).group(1)
+        scripts = re.findall(r"<script\b([^>]*)>", document)
+        self.assertEqual(len(scripts), 2)
+        self.assertTrue(all(f'nonce="{nonce}"' in attrs for attrs in scripts))
+        self.assertIn("media-src 'self' data:", document)
+
+    def test_real_export_service_preserves_previous_file_on_edit_replace_and_cancel(self):
+        self.seed_app_sounds()
+        from portable_export import PortableExportError
+        destination = self.root / "exports/letter.zip"
+        destination.parent.mkdir()
+        destination.write_bytes(b"previous usable export")
+        real_build = build_render_to
+        for change in (lambda: self.project.rename_page(self.project.pages[1]["id"], "Edited"),
+                       lambda: self.session.replace(self.project, asset_root=self.root)):
+            def build_then_change(*args, **kwargs):
+                result = real_build(*args, **kwargs)
+                change()
+                return result
+            with mock.patch("forge_render.build_render_to", side_effect=build_then_change), self.assertRaises(StaleRenderError):
+                export_render(self.session, destination)
+            self.assertEqual(destination.read_bytes(), b"previous usable export")
+        with self.assertRaises((StaleRenderError, PortableExportError)):
+            export_render(self.session, destination, cancelled=lambda: True)
+        self.assertEqual(destination.read_bytes(), b"previous usable export")
+        export_render(self.session, destination)
+        with zipfile.ZipFile(destination) as archive:
+            self.assertIn("letter/index.html", archive.namelist())
+
+    def test_forge_export_action_runs_the_real_snapshot_export(self):
+        self.seed_app_sounds()
+        from types import SimpleNamespace
+        from Forge_Tab import ForgeTab
+        session = get_project_session(self.root)
+        session.replace(self.project, asset_root=self.root)
+        destination = self.root / "exports/from-forge.html"
+        completed = mock.Mock()
+        forge = SimpleNamespace(project_root=self.root, _busy=False, _publication_operation="",
+                                _flush_prompt_writer_state=lambda: True, _required_gate=lambda **kwargs: True,
+                                _export_completed=completed, _set_status=mock.Mock())
+        forge._start_operation = lambda _status, task, success, _error: success(task())
+        with mock.patch("Forge_Tab.QtWidgets.QFileDialog.getSaveFileName", return_value=(str(destination), "HTML")):
+            ForgeTab.export_letter(forge, "html")
+        self.assertIn("Message A", destination.read_text(encoding="utf-8"))
+        self.assertIn("Message B", destination.read_text(encoding="utf-8"))
+        self.assertEqual(completed.call_args.args[0][0], destination)
 
     def test_static_and_independent_real_gif_frames(self):
         frames = [Image.new("RGB", (20, 30), color) for color in ("red", "blue")]

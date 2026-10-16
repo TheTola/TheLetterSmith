@@ -12,6 +12,7 @@ import html
 import json
 from pathlib import Path
 import secrets
+import tempfile
 from threading import RLock
 from types import MappingProxyType
 from urllib.parse import unquote, urlsplit
@@ -171,7 +172,7 @@ def _active_signature(render):
             return "missing"
     for page in render.snapshot["pages"]:
         message = page.get("message")
-        active = {key: _plain(page.get(key)) for key in ("id", "type", "name", "design_overrides")}
+        active = {key: _plain(page.get(key)) for key in ("id", "type", "name", "design_overrides", "resolved_layout")}
         active["artwork"] = {key: _plain(value) for key, value in page["artwork"].items() if key != "asset"}
         active["readability"] = {key: page.get("resolved_settings", {}).get(key) for key in _READABILITY}
         if message is not None:
@@ -264,19 +265,20 @@ def validate_render(render: RenderInput) -> tuple[RenderIssue, ...]:
         issues.append(RenderIssue("unsupported_presentation", "Unsupported presentation settings: " + ", ".join(sorted(unknown_presentation))))
     for raw in render.snapshot.get("validation", ()):
         # Missing retained recovery resources are not dependencies of display.
-        if raw["code"] in ("missing_artwork", "empty_message", "missing_resource"):
+        if raw["code"] in ("missing_artwork", "empty_message", "missing_resource", "unsupported_layout", "unsupported_placement"):
             continue
         issues.append(RenderIssue(raw["code"], raw["message"], raw.get("page_id")))
     for index, page in enumerate(pages, 1):
         label = f"Page {index} — {page.get('name') or PAGE_TYPES[page['type']].label}: "
         def issue(code, message, feature, *, preview=True):
             issues.append(RenderIssue(code, label + message, page["id"], "error" if preview else "warning", feature, True, preview))
+        for raw in render.snapshot.get("validation", ()):
+            if raw.get("page_id") == page["id"] and raw["code"] in ("unsupported_layout", "unsupported_placement"):
+                issue(raw["code"], raw["message"], "messages" if raw["code"] == "unsupported_layout" else "images")
         artwork = page["artwork"]
-        unknown_design = set(page.get("design_overrides", {})) - set(_READABILITY)
+        unknown_design = set(page.get("design_overrides", {})) - {*_READABILITY, "message_layout", "artwork_placement"}
         if unknown_design:
             issue("unsupported_page_settings", "Unsupported page presentation settings: " + ", ".join(sorted(unknown_design)), "images")
-        if artwork.get("placement"):
-            issue("unsupported_placement", "Artwork placement requires a coordinated foundation layout contract.", "images")
         from image_animation import default_gif_settings, normalize_gif_settings
         animation = artwork.get("animation", {})
         normalized_animation = normalize_gif_settings(animation)
@@ -298,8 +300,6 @@ def validate_render(render: RenderInput) -> tuple[RenderIssue, ...]:
                 issue("invalid_artwork", f"Artwork cannot be rendered: {error}", "images")
         message = page.get("message")
         if message is not None:
-            if message.get("layout"):
-                issue("unsupported_layout", "Message layout requires a coordinated foundation layout contract.", "messages")
             unknown = set(message.get("settings", {})) - set(_READABILITY)
             if unknown:
                 issue("unsupported_message_settings", "Unsupported message settings: " + ", ".join(sorted(unknown)), "messages")
@@ -431,7 +431,8 @@ def build_render_to(render: RenderInput, destination, *, seed_sfx=True, reuse_pl
         page_settings = {**settings, **{key: value for key, value in page.get("resolved_settings", {}).items() if key in _READABILITY},
                          **_plain((page.get("message") or {}).get("settings", {}))}
         pages.append({"id": page["id"], "type": page["type"], "name": page.get("name", ""), "source": source,
-                      "message_html": message_html, "overlay_style": letter_page_style_from_settings(page_settings)})
+                      "message_html": message_html, "overlay_style": letter_page_style_from_settings(page_settings),
+                      "layout": _plain(page.get("resolved_layout"))})
     # One font pass across the complete document prevents alias collisions and
     # avoids one page's font export deleting another page's emitted font files.
     separator = "<!--forge-document-" + secrets.token_hex(24) + "-->"
@@ -539,6 +540,37 @@ def copy_display_output(source, destination) -> Path:
         transaction.abort()
         raise
     return target
+
+
+def export_render(session, destination, *, output_format="zip", render_input=None, cancelled=None) -> Path:
+    """Export one captured display revision without replacing the active preview."""
+    from portable_export import create_zip_package, create_publish_package, create_single_html
+    from project_paths import application_paths
+
+    exporters = {"zip": create_zip_package, "publish_zip": create_publish_package, "html": create_single_html}
+    if output_format not in exporters:
+        raise ValueError("Unsupported display export format.")
+    render = render_input or capture_render(session, "display")
+    if render.output_mode != "display":
+        raise ValueError("Export requires final display input.")
+    if not render_is_current(session, render):
+        raise StaleRenderError("The project changed before export preparation.")
+    target = Path(destination).resolve()
+    temporary_root = application_paths(render.project_root).temporary_root
+    temporary_root.mkdir(parents=True, exist_ok=True)
+
+    def commit_output(commit):
+        def guarded(_model, _page_id):
+            if (cancelled is not None and cancelled()) or not render_is_current(session, render):
+                raise StaleRenderError("The project changed or export was canceled; the previous export was preserved.")
+            commit()
+        if not session.apply_result(render.targets[0], guarded):
+            raise StaleRenderError("The project was replaced; the previous export was preserved.")
+
+    with tempfile.TemporaryDirectory(prefix="export-", dir=temporary_root) as directory:
+        display = build_render_to(render, Path(directory) / "letter", cancelled=cancelled)
+        return exporters[output_format](display, target.parent, destination=target,
+                                        cancelled=cancelled, commit_output=commit_output)
 
 
 def generate_render(session, *, render_input=None, output_mode="display", destination=None, seed_sfx=True, cancelled=None) -> Path:
