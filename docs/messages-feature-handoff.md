@@ -16,7 +16,9 @@ Messages blocker report was left untouched. This document describes this branch.
 Every validation process used fresh synthetic runtime data beneath an explicit
 `LETTER_SMITH_PROFILE_ROOT`, with profile-local Qt settings. No private letters,
 provider generation, credentials, publishing, release builds, remote pushes or
-sibling commits were used. A test/import startup added one empty provider setting
+sibling merges were used. The shared-preview checks described below consumed an
+immutable copy of three committed Forge files outside the repository; no unfinished
+sibling changes were copied. A test/import startup added one empty provider setting
 to this worktree's tracked `settings.json`; its exact sole difference was verified
 and restored. No runtime data or settings changes are included in the commit.
 
@@ -25,6 +27,7 @@ and restored. No runtime data or settings changes are included in the commit.
 | Path | Change |
 | --- | --- |
 | `messages_workspace.py` | Canonical page selector, one bound editor, guarded autosave/import lifecycle, readability inheritance, combined preview adapter and recovery states. |
+| `message_shared_preview.py` | Optional consumer of the committed Forge renderer, with guarded background builds, isolated local WebEngine, page-ID navigation, cancellation and file release. |
 | `Editor.py` | Optional bound/embedded mode retaining the existing rich editor, named styles, links, lists, fonts, paragraph controls, proofing and safe undo boundary. Legacy mode remains available. |
 | `message_resources.py` | Shared restricted raster loading for the bound editor and existing Qt renderer; no Qt file/network fallback. |
 | `message_document_import.py` | Sanitized resource staging around the existing converter, explicit resource commit and temporary cleanup. |
@@ -32,6 +35,7 @@ and restored. No runtime data or settings changes are included in the commit.
 | `Nexus.py` | Plural tab label, explicit page navigation, background routing, retained-draft save guards, and space for the inline preview. |
 | `Over_Nexus.py` | Respects the explicit project-details toggle in canonical Messages. |
 | `test/test_messages_workspace.py` | 19 production-widget/controller/persistence scenarios. |
+| `test/test_message_shared_preview.py` | Four real shared-renderer/browser integration cases, enabled when the Forge adapter is installed. |
 | `test/test_message_security.py` | Five staging/resource security and portability cases. |
 | `test/test_identity_field_locking.py` | Existing worker-test adapters accept the renderer's optional resource/diagnostic arguments; cancellation assertions unchanged. |
 | `docs/messages-feature-handoff.md` | This implementation and integration record. |
@@ -92,7 +96,7 @@ Use project default. Existing shared defaults and other overrides are preserved.
 restoration and `project_replaced`) refresh bindings through a Qt signal. Model
 operations invalidate dependent previews/prompts without regenerating prompt text.
 
-Preview consumes `ProjectModel.render_snapshot()` and the selected page's actual
+On the foundation-only branch, preview consumes `ProjectModel.render_snapshot()` and the selected page's actual
 `message`, `artwork` and `resolved_settings`, resolving resources through
 `session.project_root` and `session.asset_root`. It reuses the existing
 `Message_tab._MessageRenderTask` / `_render_message_png` composition path and
@@ -101,29 +105,56 @@ Switching clears the previous preview immediately. Zoom only scales the display.
 Missing backgrounds show a neutral writing-ready state. Source artwork is never
 modified or replaced by the composed PNG.
 
-The available renderer uses fixed logical dimensions and text margins. The
-foundation stores `message.layout`, `message.settings`, `artwork.placement` and
-`artwork.animation`, but does not define text-area coordinate units, bounds,
-padding or a page-aware composition API. This branch does **not** invent those
-controls. Nonempty custom layout/settings/crop produce an explicit unsupported
-preview state. GIF backgrounds are labeled still previews. Fixed-preview overflow
-is reported without truncating saved HTML or shrinking fonts; presentation-mode
-scrolling remains unverified. Full independent output is still guarded by
-`project_consumers.consumer_issue(..., 'output')` pending Forge integration.
+That legacy path uses fixed logical dimensions and text margins, labels GIFs as
+still previews, reports fixed-preview overflow, and rejects unsupported custom
+layout/settings/crop. It never truncates saved HTML or shrinks stored fonts.
+
+When the committed `forge_render` module is available, Messages instead uses its
+actual generated viewer. `create_shared_preview` imports that adapter; absence of
+the module retains the legacy path. Its public contract was verified at Forge
+commit `758c0db069c4c632349c6fd6f838f5b925c61b36`:
+
+- `capture_render(session, output_mode="preview")` freezes canonical render inputs.
+- `validate_render(render)` supplies warnings and `build_render_to(render,
+  destination, seed_sfx=False, cancelled=...)` validates and generates a private
+  preview. It never promotes output into the live Play directory.
+- `render_is_current(session, render, check_sources=...)` rejects stale generations;
+  a separate foundation `WorkTarget` protects the initiating page and session.
+- The generated `window.LetterSmithViewer.goToPage(page_id)` and `currentPageId()`
+  APIs select and identify the displayed page. Messages uses the viewer's existing
+  start action and leaves composition, fonts, animation and scrolling in Forge.
+
+The WebEngine profile is off the record, muted, and restricted to the owned
+generation cache plus data/blob URLs. Remote requests and navigation outside that
+cache are blocked. Page switches, collapsed previews and tab exit cancel builds
+and unload the viewer. Restore/shutdown wait for workers and confirmed browser
+unload before releasing generated files. Zoom and resizing change only the view.
+Navigation inside the shared viewer does not change the editor's selected page;
+the preview label identifies its actual page and states when selection differs.
+Missing selected backgrounds retain the neutral writing-ready state. Unsupported
+layout still reports the shared renderer's validation error without fake output.
+
+The foundation stores `message.layout`, `message.settings`, `artwork.placement` and
+`artwork.animation`, but the reviewed baseline does not define text-area coordinate
+units, bounds or padding. This branch does **not** invent those controls. On
+2026-10-16 the Forge worktree still had uncommitted geometry changes in
+`project_model.py`, `forge_render.py` and `Template.py`; they were not consumed.
+Full independent output remains guarded by
+`project_consumers.consumer_issue(..., 'output')` pending sequential integration.
 
 Required coordinated work:
 
 1. Foundation/layout owner defines validated text-area position, dimensions,
    padding, units/bounds and inheritance using the existing document fields.
-2. Forge supplies the page-aware composition adapter consuming canonical render
-   snapshots/resources, artwork crop/animation and presentation-mode overflow.
-   Wire this adapter into Messages and expose only its supported layout controls.
+2. Sequentially integrate the reviewed Forge adapter; Messages already consumes
+   its documented interface. Complete the shared geometry/placement contract, then
+   expose only its validated position, dimensions and padding through Messages.
 3. Sequentially integrate the narrow Nexus/Over_Nexus hooks with other owners.
    Compare Messages and Forge output for A/B with different geometry, crop,
    formatting and GIF backgrounds. Remove output guards only after Forge verifies
    independent documents, resources and presentation behavior.
 
-## Verification — 2026-10-13 through 2026-10-15
+## Verification — 2026-10-13 through 2026-10-16
 
 Python: existing original-checkout `.venv\Scripts\python.exe`, with isolated
 profiles and `QT_QPA_PLATFORM=offscreen`, `QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu`.
@@ -178,15 +209,46 @@ run each table row in a separate process with
 Local exact runner/logs: `%TEMP%\lsmchecks-1a7fb1a5\run_checks.py` and sibling
 `workspace.log`, `foundation.log`, `message.log`, `styles.log`, `shell.log`.
 
+### Shared-preview continuation — 2026-10-16
+
+- Re-ran `test_messages_workspace test_message_security test_message_overlay`
+  against this foundation-based branch: **57 passed**. These overlap the 171
+  previous checks and are not an additional 57 distinct cases.
+- Ran `test_message_shared_preview` using actual production WebEngine and an
+  immutable source overlay containing only `forge_render.py`, `Template.py` and
+  `generate.py` from Forge commit `758c0db`: **4 passed**. The cases cover independent
+  A/B text, changing GIF frames with unchanged source bytes, long-text scrolling,
+  view-only zoom/resize, stale/cancelled builds, project replacement, tab exit,
+  restoration/file release, missing artwork, and real layout validation. The
+  delayed-build case pauses the real renderer; it does not substitute fake output.
+  These tests explicitly skip when `forge_render` is absent.
+- Native Windows used the actual MessageTab and the same committed renderer
+  overlay. Down/Return selected B from A, its long document scrolled in the shared
+  viewer, maximizing from 1280×820 preserved the selected document/preview, and
+  normal close confirmed no active or retired generated directories remained.
+  The native fixture used five synthetic pages with distinct A/B backgrounds and
+  rich Unicode text. No external URLs or private projects were used.
+- Final `git diff --check` and changed-Python AST parsing passed. Original-checkout
+  hash preservation was checked again before committing this continuation.
+
+Exact local evidence is under `%TEMP%\lsm-shared-a1698c96`: `baseline.log`,
+`shared.log`, `check_shared.py`, `native_shared.py`, `native-shared-result.json`, and
+the immutable `forge-snapshot` directory. Run the four integration cases with the
+existing venv Python and `check_shared.py test_message_shared_preview`; the runner
+initializes a fresh profile and Qt settings before importing application modules.
+This verifies a specific committed adapter composition, not a merged application.
+Offscreen WebEngine emitted GPU-context warnings; native validation ran separately.
+
 ## Completion report
 
 - **Feature implementation: Partial.** Independent writing, formatting,
-  selection, imports, guarded persistence and existing static-preview integration
-  work. Required text-area geometry and full crop/GIF/presentation parity await
-  the coordinated contracts above.
+  selection, imports, guarded persistence and shared-preview consumption work.
+  The committed Forge adapter passed GIF/scrolling checks. Required text-area
+  geometry controls and full crop/layout parity await the coordinated contract.
 - **Ready for sequential integration: No for full Prompt 3 acceptance.** The
   isolated implementation can be reviewed, but integration must retain the Forge
   output guards and finish those layout/rendering dependencies.
-- **Cross-feature verification:** Actual Nexus navigation/lifecycle and foundation
-  consumers were verified. Sibling feature branches, merged Forge output, live
+- **Cross-feature verification:** Actual Nexus navigation/lifecycle, foundation
+  consumers and the committed Forge renderer in an isolated source overlay were
+  verified. The merged application, custom geometry/crop, sibling UIs, live
   providers, publishing and packaged platforms were not verified.

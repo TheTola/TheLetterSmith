@@ -1318,6 +1318,8 @@ class MessageTab(QtWidgets.QWidget):
         if not self._tab_active:
             return
         self.sync_to_disk()
+        if getattr(self, "messages_workspace", None) is not None:
+            self.messages_workspace.deactivate_preview()
         self._tab_active = False
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]

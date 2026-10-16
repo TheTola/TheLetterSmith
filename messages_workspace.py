@@ -172,6 +172,12 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.preview_label.setAlignment(QtCore.Qt.AlignCenter)
         self.preview_scroll.setWidget(self.preview_label)
         preview_layout.addWidget(self.preview_scroll, 1)
+        from message_shared_preview import create_shared_preview
+        self.shared_preview = create_shared_preview(self.preview_panel, session, cache / f"shared-{uuid4().hex}")
+        if self.shared_preview is not None:
+            self.shared_preview.status_changed.connect(self.preview_note.setText)
+            preview_layout.addWidget(self.shared_preview, 1)
+            self.shared_preview.hide()
         self.zoom = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.zoom.setRange(25, 200)
         self.zoom.setValue(100)
@@ -184,6 +190,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.splitter.setSizes([800, 260])
         layout.addWidget(self.splitter, 1)
         self.preview_toggle.toggled.connect(self.preview_panel.setVisible)
+        self.preview_toggle.toggled.connect(self._preview_visibility_changed)
         self.selector.currentIndexChanged.connect(self._select)
         self.session_changed.connect(self._changed)
         session.add_listener(self.session_changed.emit)
@@ -250,6 +257,8 @@ class MessagesWorkspace(QtWidgets.QWidget):
                 self._dispose_editor()
             if reload_editor:
                 self._render_gate.invalidate(accepting=True)
+                if self.shared_preview is not None:
+                    self.shared_preview.invalidate()
                 self._pixmap = QtGui.QPixmap()
                 self.preview_label.clear()
                 self.preview_label.setText("Updating selected page preview…")
@@ -276,6 +285,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
                 self._render_gate.invalidate(accepting=True)
                 self._pixmap = QtGui.QPixmap()
                 self.preview_page_id = None
+                self.deactivate_preview()
                 self.owner.current_html = ""
                 self._show_recovery_notice()
                 return
@@ -647,6 +657,8 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self._pixmap = QtGui.QPixmap()
         if not self.page_id or self._failed:
             return
+        if self.shared_preview is not None and not self.preview_panel.isVisible():
+            return
         snapshot = self.session.project.render_snapshot()
         page = next((p for p in snapshot["pages"] if p["id"] == self.page_id), None)
         if page is None or page["message"] is None:
@@ -657,9 +669,18 @@ class MessagesWorkspace(QtWidgets.QWidget):
         background = self._asset(self.preview_background)
         self.preview_label.clear()
         if background is None:
+            if self.shared_preview is not None:
+                self.shared_preview.invalidate()
+                self.shared_preview.hide()
+                self.preview_scroll.show()
             self.preview_label.setText("No background artwork — draft remains editable")
             self.preview_label.adjustSize()
             self.preview_note.setText("Choose background artwork in Images.")
+            return
+        if self.shared_preview is not None:
+            self.preview_scroll.hide()
+            self.shared_preview.show()
+            self.shared_preview.request(page["id"])
             return
         if page["message"].get("layout") or page["message"].get("settings") or page["artwork"].get("placement"):
             self.preview_label.setText("Saved layout requires the page-aware Forge renderer")
@@ -702,6 +723,8 @@ class MessagesWorkspace(QtWidgets.QWidget):
             self._fit_preview()
 
     def _fit_preview(self, *_):
+        if self.shared_preview is not None:
+            self.shared_preview.set_zoom(self.zoom.value())
         if self._pixmap.isNull():
             return
         viewport = self.preview_scroll.viewport().size()
@@ -715,6 +738,17 @@ class MessagesWorkspace(QtWidgets.QWidget):
         super().resizeEvent(event)
         self._fit_preview()
 
+    def _preview_visibility_changed(self, visible):
+        if visible:
+            self._preview_timer.start()
+        else:
+            self.deactivate_preview()
+
+    def deactivate_preview(self):
+        self._preview_timer.stop()
+        if self.shared_preview is not None:
+            self.shared_preview.invalidate()
+
     def prepare_for_restore(self):
         if not self.save():
             raise RuntimeError("Save or recover the retained message draft before changing projects.")
@@ -723,11 +757,15 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self._render_pool.clear()
         if not self._render_pool.waitForDone(5000):
             raise RuntimeError("Message preview is still running.")
+        if self.shared_preview is not None and not self.shared_preview.release():
+            raise RuntimeError("Shared Messages preview is still releasing its files.")
 
     def shutdown(self):
         if self._closed:
             return True
         if not self.save():
+            return False
+        if self.shared_preview is not None and not self.shared_preview.shutdown():
             return False
         self._save_timer.stop()
         self._preview_timer.stop()
