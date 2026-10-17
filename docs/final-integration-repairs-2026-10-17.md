@@ -81,3 +81,12 @@ experimental window-title change was reverted; no appearance behavior changed.
   snapshot comparison found no authored-content change. Remove that redundant
   launch-time reload: the panel already reads canonical pages and subscribes to
   their events. A new real-construction regression failed before the removal.
+
+- FIX-11: the long combined run stalled in Qt unpolish during a Sound import.
+  ThemeService treated nonvisual QThread/QTimer ChildAdded events as reasons to
+  restyle the entire window. A focused reproduction recorded two unnecessary
+  refresh requests for those two children. Observe ChildPolished for completed
+  widget children instead; retain StyleChange and owned-dialog Show handling.
+  The new event-count regression, all 53 theme tests and the native import test
+  passed. Repeated whole-window and final-candidate results are recorded in the
+  verification report; earlier stalled runs are retained as failures.

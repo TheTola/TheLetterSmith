@@ -1064,6 +1064,21 @@ class ThemeServiceTests(unittest.TestCase):
         QtWidgets.QApplication.processEvents()
         self.assertIn(BASIC_DARK_THEME.tokens.text, label.styleSheet())
 
+    def test_worker_and_timer_children_do_not_restyle_the_interface(self) -> None:
+        service = ThemeService(self.root)
+        root = QtWidgets.QWidget()
+        service.apply_semantic_styles(root)
+        QtWidgets.QApplication.processEvents()
+        self.addCleanup(root.deleteLater)
+        self.addCleanup(service.shutdown)
+        with mock.patch.object(service, "_queue_semantic_refresh") as refresh:
+            worker_thread = QtCore.QThread(root)
+            timer = QtCore.QTimer(root)
+            QtWidgets.QApplication.processEvents()
+            refresh.assert_not_called()
+        worker_thread.deleteLater()
+        timer.deleteLater()
+
     def test_artwork_button_reloads_theme_specific_cloud_asset(self) -> None:
         fallback = (
             self.root

@@ -2013,7 +2013,7 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
                     type(watched).__name__,
                 )
         if event.type() in (
-            QtCore.QEvent.Type.ChildAdded,
+            QtCore.QEvent.Type.ChildPolished,
             QtCore.QEvent.Type.StyleChange,
         ) and isinstance(watched, QtWidgets.QWidget):
             root = self._semantic_root_for(watched)
@@ -2021,7 +2021,7 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
                 current_style = watched.styleSheet()
                 previous_output = self._semantic_style_outputs.get(watched)
                 if (
-                    event.type() == QtCore.QEvent.Type.ChildAdded
+                    event.type() == QtCore.QEvent.Type.ChildPolished
                     or current_style != previous_output
                 ):
                     self._queue_semantic_refresh(root)
