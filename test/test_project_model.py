@@ -93,6 +93,8 @@ class ProjectModelTests(unittest.TestCase):
         self.assertEqual(resolved["message"]["box"], {"x": 40, "y": 250, "width": 320, "height": 170})
         self.assertEqual(resolved["artwork"]["canvas"], {"width": 400, "height": 600})
         self.assertEqual(project.to_dict(), before)
+        self.assertEqual(project.prompt_geometry(page_id)["text_area"],
+                         {"units": "normalized", "x": .1, "y": 250 / 600, "width": .8, "height": 170 / 600})
         resolved["message"]["box"]["x"] = 999
         self.assertEqual(project.render_snapshot()["pages"][2]["resolved_layout"]["message"]["box"]["x"], 40)
 
@@ -302,7 +304,7 @@ class ProjectModelTests(unittest.TestCase):
         project.update_project_data('prompt_settings', {'style': 'Ink'})
         self.assertEqual(project.project_input_versions(fields), (1, 1, 1, 1))
         page_id = project.pages[0]['id']
-        self.assertEqual(project.input_versions(page_id, (), include_shared=True), (0, 2))
+        self.assertEqual(project.input_versions(page_id, (), include_shared=True), (0, 3))
         with self.assertRaises(ProjectModelError):
             project.project_input_versions(('pages',))
 

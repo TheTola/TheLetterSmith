@@ -1,5 +1,14 @@
 # Flexible page foundation contract
 
+## Combined feature contract — 2026-10-16
+
+Prompt Writer reads version-1 CSS-pixel geometry through `resolve_layout` and
+normalizes the resolved text box for artwork instructions. Shared geometry and
+document overrides therefore agree with Forge without rewriting stored layouts.
+Presentation changes invalidate shared prompt inputs as well as render inputs.
+The canonical renderer supplies Sound's `INITIAL_MUTED` value; viewer mute
+preferences remain scoped to project and display-content fingerprint.
+
 ## Prompt Writer contract extension — 2026-10-13
 
 Authorized alongside Prompt 4. These are optional data within existing schema-3

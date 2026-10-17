@@ -1447,6 +1447,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const initialMuted = document.body.dataset.initialMuted === undefined
       ? (typeof INITIAL_MUTED === 'boolean' && INITIAL_MUTED)
       : document.body.dataset.initialMuted === 'true';
+    if (!playbackIdentity) return initialMuted;
     try{
       const saved = window.sessionStorage.getItem(muteStorageKey);
       return saved === null ? initialMuted : saved === 'true';
@@ -1455,6 +1456,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
   function saveViewerMuted(){
+    if (!playbackIdentity) return;
     try{
       window.sessionStorage.setItem(muteStorageKey, viewerMuted ? 'true' : 'false');
     }catch(_){ }
@@ -1486,6 +1488,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function setViewerMuted(muted){
     viewerMuted = !!muted;
+    saveViewerMuted();
     setVolume0to100(currentVolume);
     syncMuteButton();
   }

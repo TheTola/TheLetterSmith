@@ -736,7 +736,15 @@ class ProjectModel:
         message = self._page(page_id)["message"]
         if message is not None:
             area = deepcopy(message.get("layout", {}))
-            if not area or area == {"mode": "responsive_center"}:
+            settings = self.resolve_settings(page_id)
+            if area.get("units") == "css_px" or settings.get("message_layout"):
+                layout = self.resolve_layout(page_id)["message"]
+                if layout is None:
+                    area = {"mode": "responsive_center"}
+                else:
+                    area = {"units": "normalized", **{key: layout["box"][key] / layout["canvas"][
+                        "width" if key in ("x", "width") else "height"] for key in ("x", "y", "width", "height")}}
+            elif not area or area == {"mode": "responsive_center"}:
                 area = {"mode": "responsive_center"}
             else:
                 units = area.get("units")

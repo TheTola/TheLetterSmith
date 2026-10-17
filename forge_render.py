@@ -477,7 +477,8 @@ def build_render_to(render: RenderInput, destination, *, seed_sfx=True, reuse_pl
     replacements = {"CSP_NONCE": secrets.token_urlsafe(24), "TITLE": html.escape(title, quote=True),
                     "TITLE_BANNER_TEXT_RGB": legacy._rgb_css_value(display.foreground),
                     "HAS_MESSAGE_JSON": legacy._script_json(any(page["message_html"] for page in pages)),
-                    "INITIAL_VOLUME": str(volume), "MESSAGE_OVERLAY_STYLE": "", "MESSAGE_HTML": "",
+                    "INITIAL_VOLUME": str(volume), "INITIAL_MUTED": str(bool(sound.get("muted", False))).lower(),
+                    "MESSAGE_OVERLAY_STYLE": "", "MESSAGE_HTML": "",
                     "MUSIC_PLAYLIST_JSON": legacy._script_json(playlist), "MUSIC_CROSSFADE_MS": str(crossfade),
                     "MUSIC_PRELOAD_HTML": f'<link rel="preload" as="audio" href="{playlist[0]}">' if playlist else "",
                     "IMAGE_ANIMATIONS_JSON": legacy._script_json(animations)}

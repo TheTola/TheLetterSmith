@@ -65,7 +65,7 @@ class PageViewerTests(unittest.TestCase):
                 "CSP_NONCE": "canonical-page-test", "TITLE": "Independent pages",
                 "MUSIC_PRELOAD_HTML": "", "TITLE_BANNER_TEXT_RGB": "255,255,255",
                 "MESSAGE_OVERLAY_STYLE": "", "MESSAGE_HTML": "",
-                "INITIAL_VOLUME": str(initial_volume), "MUSIC_CROSSFADE_MS": "0",
+                "INITIAL_VOLUME": str(initial_volume), "INITIAL_MUTED": str(bool(initial_muted)).lower(), "MUSIC_CROSSFADE_MS": "0",
                 "MUSIC_PLAYLIST_JSON": "[]", "IMAGE_ANIMATIONS_JSON": "{}", "HAS_MESSAGE_JSON": "false",
             }.items():
                 shell = shell.replace("{{" + key + "}}", value)
