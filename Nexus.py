@@ -1100,14 +1100,13 @@ class TitleBar(QtWidgets.QWidget):
 
     def _render_title(self) -> None:
         title = "The Silver-Tongued Lettersmith"
+        if self._project_dirty:
+            title = f"Unsaved changes — {title}"
         if self._project_title:
             title = f"{title} — {self._project_title}"
-        if self._project_dirty:
-            title = f"{title} •"
         self.title_label.setText(title)
-        self.title_label.setToolTip(
-            "Unsaved project changes" if self._project_dirty else "Letter Smith"
-        )
+        self.title_label.setToolTip(title)
+        self.title_label.setAccessibleName(title)
 
     def _sync_curtain_menu(self) -> None:
         self.curtain_styles.sync_from_settings()
@@ -2037,7 +2036,7 @@ class Nexus(QtWidgets.QMainWindow):
             ("Sound", "Choose one song or arrange a playlist for this letter."),
             ("Messages", "Write, import, and format each Letter page's message."),
             ("Forge", "Review, preview, load, publish, and share the letter."),
-            ("Command", "Open the deliberate reset workspace. Click to activate."),
+            ("Command", "New Project, application preferences, and Exit Application."),
         )
         for name, help_text in tab_help:
             index = self.tabbar.addTab(name)
@@ -2162,7 +2161,7 @@ class Nexus(QtWidgets.QMainWindow):
             }
         """)
         self.help_icon.setCursor(Qt.WhatsThisCursor)
-        self.help_icon.setAccessibleName("Help ΓÇö instructions for this tab")
+        self.help_icon.setAccessibleName("Help — instructions for this tab")
         self.help_icon.setFixedSize(HELP_ICON_PX, HELP_ICON_PX)
         self.help_icon.setMouseTracking(True)
         self.help_icon.setAttribute(Qt.WA_Hover, True)
@@ -2629,42 +2628,23 @@ class Nexus(QtWidgets.QMainWindow):
         self.message_tab.published_page_url_changed.connect(
             self.forge_tab.set_saved_page_url
         )
-        self.image_tab.images_changed.connect(
-            lambda _reason: self.forge_tab.schedule_refresh()
-        )
         self.image_tab.cover_changed.connect(
             self._schedule_curtain_preparation
-        )
-        self.sound_tab.sound_state_changed.connect(
-            lambda _reason: self.forge_tab.schedule_refresh()
-        )
-        self.sound_tab.volume_changed.connect(
-            lambda _volume: self.forge_tab.schedule_refresh()
-        )
-        self.message_tab.project_changed.connect(
-            self.forge_tab.schedule_refresh
-        )
-        self.image_tab.images_changed.connect(
-            lambda _reason: self.project_dirty.mark_changed("images")
         )
         self.image_tab.images_changed.connect(
             lambda _reason: self._record_protected_edit()
         )
         self.image_tab.animation_settings_changed.connect(
-            lambda _index: self.project_dirty.mark_changed("image-animation")
-        )
-        self.image_tab.animation_settings_changed.connect(
             lambda _index: self._record_protected_edit()
-        )
-        self.sound_tab.project_sound.changed.connect(
-            lambda: self.project_dirty.mark_changed("sound")
         )
         self.sound_tab.project_sound.changed.connect(
             self._record_protected_edit
         )
-        self.message_tab.project_changed.connect(
-            lambda: self.project_dirty.mark_changed("message")
-        )
+        # Canonical owner events already reach both the shell dirty controller
+        # and Forge. Keep the legacy editor fallback without duplicate signals.
+        if self.message_tab.messages_workspace is None:
+            self.message_tab.project_changed.connect(lambda: self.project_dirty.mark_changed("message"))
+            self.message_tab.project_changed.connect(self.forge_tab.schedule_refresh)
         self.message_tab.project_changed.connect(
             self._record_protected_edit
         )
@@ -2806,11 +2786,11 @@ class Nexus(QtWidgets.QMainWindow):
             self.project_dirty.mark_changed("settings")
 
     def _on_foundation_changed(self, event) -> None:
+        if event.session_id != self.project_session.session_id:
+            return
         if event.kind in {"selection", "project_replaced", "persisted"}:
             return
         self.project_dirty.mark_changed(f"pages:{event.kind}")
-        if self._project_tabs_initialized:
-            self.forge_tab.schedule_refresh()
 
     def _update_project_save_indicator(self, dirty: bool) -> None:
         controller = getattr(getattr(self, "forge_tab", None), "saved_projects", None)
@@ -3170,6 +3150,11 @@ class Nexus(QtWidgets.QMainWindow):
         dialog.exec()
 
     def _route_forge_correction(self, tab: str, target: str) -> None:
+        if not self.flush_project_edits():
+            return
+        if tab in {"message", "messages"} and any(page["id"] == target for page in self.project_session.project.pages):
+            self.open_message_page(target)
+            return
         destinations = {
             "images": (0, self.image_tab.focus_asset_slot),
             "sound": (1, self.sound_tab.focus_music_editor),
@@ -3180,10 +3165,11 @@ class Nexus(QtWidgets.QMainWindow):
             return
         index, focus = destination
         self.tabbar.setCurrentIndex(index)
-        if tab == "sound":
-            QtCore.QTimer.singleShot(0, focus)
-        else:
-            QtCore.QTimer.singleShot(0, lambda: focus(target))
+        token = self.project_session.session_id
+        def focus_current():
+            if token == self.project_session.session_id and self.tabbar.currentIndex() == index:
+                focus() if tab == "sound" else focus(target)
+        QtCore.QTimer.singleShot(0, focus_current)
 
     # =============================================================================================
     # Message double-click ΓåÆ full dialog preview
@@ -3240,6 +3226,11 @@ class Nexus(QtWidgets.QMainWindow):
         # was already committed underneath the snapshots.
         self._cancel_command_fade()
         old_idx = self.page_stack.currentIndex()
+        if old_idx == 0 and idx != 0 and not self.image_tab.flush_pending_edits():
+            with QtCore.QSignalBlocker(self.tabbar):
+                self.tabbar.setCurrentIndex(old_idx)
+            self.status("The page name could not be saved. Retry in Images before leaving.")
+            return
 
         if old_idx != idx and (old_idx == 4 or idx == 4):
             self._run_command_transition(idx)
@@ -3331,6 +3322,11 @@ class Nexus(QtWidgets.QMainWindow):
         """Apply the complete settled UI state for one tab."""
         old_idx = self.page_stack.currentIndex()
         workspace = getattr(getattr(self, "message_tab", None), "messages_workspace", None)
+        if idx == 2 and old_idx != 2 and workspace is not None and not workspace.open_page(None):
+            with QtCore.QSignalBlocker(self.tabbar):
+                self.tabbar.setCurrentIndex(old_idx)
+            self.status("Recover the retained message draft before changing its target.")
+            return
         if old_idx == 2 and idx != 2 and workspace is not None and not workspace.save():
             with QtCore.QSignalBlocker(self.tabbar):
                 self.tabbar.setCurrentIndex(2)
@@ -3531,6 +3527,7 @@ class Nexus(QtWidgets.QMainWindow):
             revision,
             "tab-switch",
         )
+        task.session_id = self.project_session.session_id
         task.signals.completed.connect(self._project_autosave_completed)
         task.signals.failed.connect(self._project_autosave_failed)
         self._autosave_active_revision = int(revision)
@@ -3543,6 +3540,12 @@ class Nexus(QtWidgets.QMainWindow):
         revision: int,
         _destination: str,
     ) -> None:
+        task = self._autosave_tasks.get(int(revision))
+        if task is not None and getattr(task, "session_id", self.project_session.session_id) != self.project_session.session_id:
+            self._autosave_tasks.pop(int(revision), None)
+            if self._autosave_active_revision == int(revision):
+                self._autosave_active_revision = None
+            return
         if self._autosave_active_revision != int(revision):
             self._autosave_tasks.pop(int(revision), None)
             return
@@ -3576,6 +3579,12 @@ class Nexus(QtWidgets.QMainWindow):
 
     @QtCore.Slot(int, str)
     def _project_autosave_failed(self, revision: int, message: str) -> None:
+        task = self._autosave_tasks.get(int(revision))
+        if task is not None and getattr(task, "session_id", self.project_session.session_id) != self.project_session.session_id:
+            self._autosave_tasks.pop(int(revision), None)
+            if self._autosave_active_revision == int(revision):
+                self._autosave_active_revision = None
+            return
         if self._autosave_active_revision == int(revision):
             self._autosave_active_revision = None
         self._autosave_tasks.pop(int(revision), None)
@@ -3887,6 +3896,8 @@ class Nexus(QtWidgets.QMainWindow):
     # Preview rendering (image/html) + fade behavior
     # =============================================================================================
     def _forge_preview_loaded(self, _ok: bool) -> None:
+        if _ok and self.html_preview is not None and self.html_preview.url() == QUrl("about:blank"):
+            self._forge_preview_unload_pending = False
         self._update_forge_preview_zoom()
         self._set_forge_preview_visible(
             self.tabbar.currentIndex() == 3
@@ -4187,7 +4198,8 @@ class Nexus(QtWidgets.QMainWindow):
         self.preview_caption.setVisible(True)
 
     def _load_forge_preview(self, index_path: str, mode: str) -> None:
-        if self.tabbar.currentIndex() != 3:
+        if (self.tabbar.currentIndex() != 3 or getattr(self, "_forge_preview_releasing", False)
+                or getattr(self, "_forge_preview_unload_pending", False)):
             return
         index = Path(index_path)
         if not index.is_file():
@@ -4257,11 +4269,14 @@ class Nexus(QtWidgets.QMainWindow):
             "media => { try { media.pause(); } catch (_) {} }); }"
         )
 
-    def _release_forge_preview_files(self) -> None:
+    def _release_forge_preview_files(self, timeout_ms: int = 5000) -> bool:
         """Stop playback and release the generated viewer's file handles."""
         view = self.html_preview
         if view is None:
-            return
+            return True
+        if getattr(self, "_forge_preview_releasing", False):
+            self.forge_tab.report_project_file_release_failure("The previous preview is still releasing its files. Retry shortly.")
+            return False
         if self._forge_fullscreen_active:
             self._restore_forge_preview_from_fullscreen()
         try:
@@ -4280,11 +4295,11 @@ class Nexus(QtWidgets.QMainWindow):
         else:
             self.preview_caption.setVisible(False)
         previous_url = view.url()
-        view.stop()
         blank_url = QUrl("about:blank")
-        if not previous_url.isLocalFile():
+        pending = getattr(self, "_forge_preview_unload_pending", False)
+        if not previous_url.isLocalFile() and not pending:
             view.setUrl(blank_url)
-            return
+            return True
 
         unload_loop = QtCore.QEventLoop()
         unload_timeout = QtCore.QTimer()
@@ -4295,15 +4310,23 @@ class Nexus(QtWidgets.QMainWindow):
             nonlocal unloaded
             if ok and view.url() == blank_url:
                 unloaded = True
+                self._forge_preview_unload_pending = False
                 unload_loop.quit()
 
         view.loadFinished.connect(finish_unload)
         unload_timeout.timeout.connect(unload_loop.quit)
+        self._forge_preview_releasing = True
         try:
-            view.setUrl(blank_url)
-            unload_timeout.start(1500)
-            unload_loop.exec(QtCore.QEventLoop.ExcludeUserInputEvents)
+            if not pending:
+                self._forge_preview_unload_pending = True
+                # Navigation cancels the old load itself. A queued Stop can
+                # otherwise cancel this blank load while Chromium is starting.
+                view.setUrl(blank_url)
+            if not unloaded:
+                unload_timeout.start(max(0, int(timeout_ms)))
+                unload_loop.exec(QtCore.QEventLoop.ExcludeUserInputEvents)
         finally:
+            self._forge_preview_releasing = False
             unload_timeout.stop()
             try:
                 view.loadFinished.disconnect(finish_unload)
@@ -4314,6 +4337,10 @@ class Nexus(QtWidgets.QMainWindow):
                 "Timed out waiting for the embedded Forge preview to release %s",
                 previous_url.toLocalFile(),
             )
+            self.forge_tab.report_project_file_release_failure(
+                "The previous preview is still releasing its files. Retry when it has stopped."
+            )
+        return unloaded
 
     def _release_project_files_for_restore(self) -> bool:
         """Release project-owned media handles before an atomic restore."""
@@ -4353,7 +4380,8 @@ class Nexus(QtWidgets.QMainWindow):
             raise RuntimeError(
                 "Curtain preparation did not stop before New Project."
         )
-        self._release_forge_preview_files()
+        if not self._release_forge_preview_files():
+            raise RuntimeError("The preview is still releasing its files; retry the transition")
         if not self._release_project_files_for_restore():
             raise RuntimeError(
                 "Project media could not be stopped before New Project."
@@ -4886,6 +4914,7 @@ class Nexus(QtWidgets.QMainWindow):
             self.status("Image import is being canceled; shutdown is not complete.")
             return False
         self._shutdown_in_progress = True
+        self._window_controller.shutdown()
         cleanup_errors = []
         self._forge_viewport_timer.stop()
         self._preview_geometry_timer.stop()
@@ -5313,6 +5342,12 @@ class Nexus(QtWidgets.QMainWindow):
     def flush_project_edits(self) -> bool:
         """Commit all live editors before an editable save or project transition."""
         try:
+            modal = QtWidgets.QApplication.activeModalWidget()
+            if modal is not None:
+                self.status(f"Apply or cancel {modal.windowTitle() or 'the open dialog'} before saving. Its input is retained.")
+                modal.raise_()
+                modal.activateWindow()
+                return False
             focus = QtWidgets.QApplication.focusWidget()
             if isinstance(focus, QtWidgets.QLineEdit):
                 if not focus.hasAcceptableInput():
@@ -5376,6 +5411,10 @@ class Nexus(QtWidgets.QMainWindow):
 
         if isinstance(page_id, bool):
             page_id = None
+        workspace = getattr(self.message_tab, "messages_workspace", None)
+        if workspace is not None and not workspace.save():
+            self.status("Save or recover the retained message draft before opening Prompt Writer.")
+            return
         if page_id is not None:
             try:
                 self.project_session.project.get_page(page_id)
@@ -5390,7 +5429,9 @@ class Nexus(QtWidgets.QMainWindow):
         if isinstance(w, QtWidgets.QWidget):
             try:
                 if page_id is not None:
-                    w.select_page(page_id)
+                    if w.select_page(page_id) is False:
+                        self.status("Prompt Writer retained its draft. Retry saving before changing pages.")
+                        return
                 w.open_with_anim(launcher=launcher)
                 w.raise_()
                 w.activateWindow()
@@ -5414,9 +5455,6 @@ class Nexus(QtWidgets.QMainWindow):
             w.provider_requested.connect(self._connect_prompt_writer_provider)
             w.page_settings_requested.connect(self._show_prompt_page_settings)
             self.theme_service.apply_semantic_styles(w)
-            w.project_changed.connect(
-                lambda: self.project_dirty.mark_changed("prompt-writer")
-            )
             w.project_changed.connect(self._record_protected_edit)
             w.destroyed.connect(lambda: self._on_prompt_writer_destroyed(w))
             w.dismissed.connect(self._on_prompt_writer_dismissed)
@@ -5432,6 +5470,8 @@ class Nexus(QtWidgets.QMainWindow):
         self.toast("Prompt Writer unavailable")
 
     def _show_prompt_page_settings(self, page_id):
+        if not self.flush_project_edits():
+            return
         from project_session import get_project_session
         session = get_project_session(self.project_root)
         if page_id:

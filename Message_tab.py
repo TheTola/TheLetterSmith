@@ -1315,6 +1315,9 @@ class MessageTab(QtWidgets.QWidget):
     def activate_for_tab_change(self) -> None:
         if self._tab_active:
             return
+        workspace = getattr(self, "messages_workspace", None)
+        if workspace is not None and not workspace.open_page(None):
+            return
         self._tab_active = True
         self.sync_from_disk()
 

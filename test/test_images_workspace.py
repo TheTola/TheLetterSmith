@@ -385,6 +385,34 @@ class ImagesWorkspaceTests(unittest.TestCase):
             self.assertTrue(self.tab.header.isVisible())
             self.assertEqual(self.list_ids(), self.ids)
 
+    def test_same_path_replacement_refreshes_only_valid_media(self):
+        self.select(self.first)
+        path = self.tab.artwork.resolve_asset(self.first)
+        before = self.session.project.to_dict()
+        old_key = self.tab._preview_key
+        old_image = self.tab.card._source_pixmap.toImage()
+        path.write_bytes(b"partial image write")
+        self.tab.refresh_cards()
+        self.assertEqual(self.tab._preview_key, old_key)
+        self.assertEqual(self.tab.card._source_pixmap.toImage(), old_image)
+        self.assertIn("preview out of date", self.row_text(self.first))
+        Image.new("RGB", (120, 180), "yellow").save(path)
+        self.tab.refresh_cards()
+        self.assertNotEqual(self.tab._preview_key, old_key)
+        self.assertEqual(self.tab.card._source_pixmap.toImage().pixelColor(2, 2).name(), "#ffff00")
+        self.assertEqual(self.session.project.to_dict(), before)
+
+    def test_pending_name_save_failure_blocks_navigation(self):
+        self.select(self.first)
+        self.tab.name_edit.setText("Last name edit")
+        self.tab.name_edit.textEdited.emit("Last name edit")
+        with mock.patch.object(self.session, "save", side_effect=OSError("synthetic failure")):
+            self.tab.page_list.setCurrentRow(self.list_ids().index(self.second))
+        self.assertEqual(self.session.selected_page_id, self.first)
+        self.assertTrue(self.tab._name_dirty)
+        self.assertEqual(self.tab.name_edit.text(), "Last name edit")
+        self.assertTrue(self.tab.flush_pending_edits())
+
     def test_external_selection_preserves_pending_name_on_its_original_page(self):
         self.select(self.first)
         self.tab.name_edit.setText("Edited before external selection")

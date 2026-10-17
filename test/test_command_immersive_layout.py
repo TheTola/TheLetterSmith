@@ -67,6 +67,7 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
         harness.height.return_value = 1080
         harness.width.return_value = 1920
         harness.body = body
+        harness.body_layout = QtWidgets.QVBoxLayout(body)
         harness.tabbar.currentIndex.return_value = 1
         harness.preview_frame = preview_frame
 
@@ -85,34 +86,27 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
             state.initialize()
             state.establish_project("Preview Geometry", custom_capitalization=True)
             window = Nexus(temp_dir)
+            window.project_session.project.add_page("cover")
             try:
                 window.resize(1400, 900)
                 window.application_stack.setCurrentWidget(window.body)
                 window.show()
                 self.app.processEvents()
-                region_heights = set()
                 for width, height in ((600, 900), (900, 600), (700, 700)):
-                    source = QtGui.QPixmap(width, height)
-                    source.fill(QtGui.QColor("red"))
-                    window._show_image_for_tab(0, source)
+                    source = Path(temp_dir) / f"{width}-{height}.png"
+                    Image.new("RGB", (width, height), "red").save(source)
+                    page_id = window.project_session.project.pages[0]["id"]
+                    window.project_session.select_page(page_id)
+                    window.project_session.project.update_artwork(page_id, {"asset": source.name})
                     self.app.processEvents()
-                    frame = window.preview_frame
-                    content = window.preview_stack.geometry()
-                    region_heights.add(window.preview_region.height())
-                    self.assertEqual((content.x(), content.y()), (2, 2))
-                    self.assertEqual(content.width(), frame.width() - PREVIEW_FRAME_EXTRA)
-                    self.assertEqual(content.height(), frame.height() - PREVIEW_FRAME_EXTRA)
+                    frame = window.image_tab.card.thumbnail
+                    displayed = frame.pixmap()
+                    self.assertFalse(window.preview_region.isVisible())
+                    self.assertTrue(frame.isVisible())
+                    self.assertEqual(frame.size(), displayed.size() + QtCore.QSize(2, 2))
                     self.assertAlmostEqual(
-                        content.width() / content.height(), width / height,
+                        displayed.width() / displayed.height(), width / height,
                         delta=0.01,
-                    )
-                    displayed = window.image_preview.pixmap()
-                    ratio = displayed.devicePixelRatio()
-                    self.assertLessEqual(
-                        abs(displayed.width() / ratio - content.width()), 1,
-                    )
-                    self.assertLessEqual(
-                        abs(displayed.height() / ratio - content.height()), 1,
                     )
                     grabbed = frame.grab()
                     grab_ratio = grabbed.devicePixelRatio()
@@ -121,7 +115,6 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                         round(frame.height() * grab_ratio / 2),
                     )
                     self.assertEqual(middle.name(), "#ff0000")
-                self.assertEqual(len(region_heights), 1)
             finally:
                 window.shutdown()
                 window.close()
@@ -266,14 +259,15 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
             window = Nexus(temp_dir)
             try:
                 self.assertEqual(window.tabbar.currentIndex(), 0)
-                self.assertFalse(window.preview_region.isHidden())
+                self.assertTrue(window.preview_region.isHidden())
                 window.resize(1400, 900)
                 window.show()
                 self.app.processEvents()
                 self.assertIs(window.application_stack.currentWidget(), window.body)
-                self.assertTrue(window.preview_region.isVisible())
-                self.assertTrue(window.preview_frame.isVisible())
-                self.assertGreater(window.preview_region.height(), 0)
+                self.assertFalse(window.preview_region.isVisible())
+                self.assertTrue(window.image_tab.card.isVisible())
+                self.assertTrue(window.image_tab.page_list.isVisible())
+                self.assertGreater(window.image_tab.card.height(), 0)
             finally:
                 window.shutdown()
                 window.close()
@@ -706,14 +700,20 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
 
     def test_forge_fullscreen_keeps_web_preview_visible(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
+            state = ProjectStateController(temp_dir)
+            state.initialize()
+            state.establish_project("Fullscreen preview", custom_capitalization=True)
             window = Nexus(temp_dir)
             window._initialize_project_tabs()
-            preview_view = QtWidgets.QWidget()
-            window.preview_stack.addWidget(preview_view)
-            window.html_preview = preview_view
+            preview_view = window._ensure_forge_preview()
             try:
                 window.resize(1200, 820)
                 window.application_stack.setCurrentWidget(window.body)
+                with QtCore.QSignalBlocker(window.tabbar):
+                    window.tabbar.setCurrentIndex(3)
+                window.page_stack.setCurrentIndex(3)
+                window.preview_region.show()
+                window.preview_frame.show()
                 window.preview_stack.setCurrentWidget(preview_view)
                 window.show()
                 self.app.processEvents()
@@ -735,10 +735,6 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 self.assertTrue(preview_view.isVisible())
             finally:
                 window._restore_forge_preview_from_fullscreen()
-                window.preview_stack.removeWidget(preview_view)
-                preview_view.setParent(None)
-                preview_view.deleteLater()
-                window.html_preview = None
                 window.shutdown()
                 window.close()
                 self.app.processEvents()
@@ -764,9 +760,11 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 window.application_stack.setCurrentWidget(window.body)
                 window._initialize_project_tabs()
                 window.show()
-                with QtCore.QSignalBlocker(window.tabbar):
+                # Enter through the production route so Forge receives its
+                # actual size policy and control/preview ownership.
+                with mock.patch.object(window, "_show_forge_preview"), \
+                     mock.patch.object(window.forge_tab, "activate_for_tab_change"):
                     window.tabbar.setCurrentIndex(3)
-                window.page_stack.setCurrentIndex(3)
                 window.preview_frame.show()
                 window.preview_region.show()
                 window.forge_tab.preview_format_panel.show()
@@ -804,8 +802,25 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 window.setMinimumHeight(516)
                 for size in ((1400, 900), (1180, 820), (960, 516), (960, 780), (960, 840), (1920, 600), (1400, 900)):
                     window.resize(*size)
-                    QtTest.QTest.qWait(250)
-                    self.app.processEvents()
+                    # Wait for both Qt layout and Chromium's asynchronous zoom
+                    # acknowledgement, rather than sampling after a fixed sleep.
+                    settled = QtCore.QElapsedTimer()
+                    settled.start()
+                    stable = 0
+                    while settled.elapsed() < 5000:
+                        self.app.processEvents()
+                        content = window.preview_stack.size()
+                        measured = browser_viewport()
+                        if (not window._preview_geometry_timer.isActive()
+                                and not window._forge_viewport_timer.isActive()
+                                and content == window.preview_stack.size()
+                                and abs(measured["width"] - min(FORGE_WINDOW_VIEWPORT.width(), content.width() * 4)) <= 2
+                                and abs(measured["height"] - min(FORGE_WINDOW_VIEWPORT.height(), content.height() * 4)) <= 2):
+                            stable += 1
+                            if stable == 2:
+                                break
+                        else:
+                            stable = 0
                     content = window.preview_stack.size()
                     self.assertEqual(
                         window.preview_stack.pos(),
@@ -826,7 +841,6 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                         / FORGE_WINDOW_VIEWPORT.height(),
                         delta=0.02,
                     )
-                    measured = browser_viewport()
                     # WebEngine's 25% zoom floor must not force a side column
                     # or enlarge the main window on a small available screen.
                     expected_width = min(FORGE_WINDOW_VIEWPORT.width(), content.width() * 4)
@@ -947,7 +961,7 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 window.tabbar.setCurrentIndex(0)
                 self.assertEqual(
                     window.page_stack.sizePolicy().verticalPolicy(),
-                    window._page_stack_vertical_policy,
+                    QtWidgets.QSizePolicy.Expanding,
                 )
             finally:
                 window.shutdown()

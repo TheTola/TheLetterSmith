@@ -493,7 +493,9 @@ class PageViewerTests(unittest.TestCase):
         with self.playback_viewer(muted=True, crossfade_ms=500):
             self.start_playback()
             self.js("document.getElementById('bg-music').dispatchEvent(new Event('ended')); document.getElementById('mute-button').click(); const slider=document.getElementById('volume-slider'); slider.value='19'; slider.dispatchEvent(new Event('input')); return true;")
-            QtTest.QTest.qWait(650)
+            # Chromium's animation frames need not finish within a fixed wall
+            # time. Observe the real handoff before checking the settled volume.
+            self.wait_for("return audit.active.has(document.getElementById('bg-music-standby')) && !audit.active.has(document.getElementById('bg-music'));")
             state = self.js("return Array.from(document.querySelectorAll('audio')).map(audio => ({volume:audio.volume, muted:audio.muted}));")
             self.assertTrue(state)
             for audio in state:

@@ -193,6 +193,33 @@ class SharedMessagesPreviewTests(unittest.TestCase):
         self.open_preview(self.a)
         self.assertEqual(self.preview.viewed_page_id, self.a)
 
+    def test_unrelated_edits_do_not_build_and_external_failure_retains_preview(self):
+        self.open_preview(self.a)
+        original = self.preview._current
+        with mock.patch.object(self.preview._pool, "start", wraps=self.preview._pool.start) as builds:
+            for index in range(5):
+                self.session.project.update_prompt(self.a, {"text": f"Private {index} 雪\n "})
+                self.workspace.render_preview()
+            self.assertEqual(builds.call_count, 0)
+        self.assertIs(self.preview._current, original)
+        render = original[1]
+        from forge_render import _resolve
+        page = next(page for page in render.snapshot["pages"] if page["id"] == self.a)
+        path = _resolve(render, page["artwork"]["asset"])
+        before = self.session.project.to_dict()
+        path.write_bytes(b"incomplete external write")
+        self.preview.check_resources()
+        self.preview.check_resources()
+        self.wait_for(lambda: not self.preview._tasks, timeout=45)
+        self.assertIs(self.preview._current, original)
+        self.assertTrue(self.preview.view.isVisible())
+        self.assertIn("out of date", self.preview._warning)
+        Image.new("RGB", (100, 150), "gold").save(path)
+        self.preview.check_resources()
+        self.preview.check_resources()
+        self.wait_for(lambda: self.preview._current is not original and self.preview.viewed_page_id == self.a, timeout=45)
+        self.assertEqual(self.session.project.to_dict(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

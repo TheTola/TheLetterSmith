@@ -400,8 +400,22 @@ class ForgeRenderTests(unittest.TestCase):
             render.snapshot["pages"][0]["name"] = "mutated"
         self.project.update_prompt(self.project.pages[0]["id"], {"text": "private changed prompt"})
         self.assertEqual(capture_render(self.session).source_fingerprint, render.source_fingerprint)
+        self.assertTrue(render_is_current(self.session, render))
+        self.project.update_project_data("prompt_settings", {"global": "Private directions"})
+        self.assertTrue(render_is_current(self.session, render))
         self.write_image("assets/background-0.png", "yellow")
         self.assertNotEqual(capture_render(self.session).source_fingerprint, render.source_fingerprint)
+        self.assertFalse(render_is_current(self.session, render))
+
+    def test_render_rejects_reverted_presentation_and_order_changes(self):
+        render = capture_render(self.session)
+        self.project.update_project_data("sound", {"volume": 25})
+        self.assertFalse(render_is_current(self.session, render, check_sources=False))
+        render = capture_render(self.session)
+        ids = [page["id"] for page in self.project.pages]
+        self.project.reorder_pages(list(reversed(ids)))
+        self.project.reorder_pages(ids)
+        self.assertFalse(render_is_current(self.session, render, check_sources=False))
 
     def test_unchanged_saves_and_resource_normalization_keep_visible_fingerprint(self):
         self.write_image("attachments/active.png", "red")

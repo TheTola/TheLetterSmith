@@ -723,8 +723,10 @@ class ProjectModel:
         page = self._page(page_id)
         merged = {**page["design_overrides"], **value}
         if merged != page["design_overrides"]:
+            inputs = self._prompt_dependencies(page_id)
             page["design_overrides"] = merged
-            page["prompt"]["stale"] = True
+            if self._prompt_dependencies(page_id) != inputs:
+                page["prompt"]["stale"] = True
             self._changed("page_design", [page_id])
 
     @_mutating
@@ -736,8 +738,10 @@ class ProjectModel:
     def clear_page_override(self, page_id: str, key: str) -> None:
         page = self._page(page_id)
         if key in page["design_overrides"]:
+            inputs = self._prompt_dependencies(page_id)
             del page["design_overrides"][key]
-            page["prompt"]["stale"] = True
+            if self._prompt_dependencies(page_id) != inputs:
+                page["prompt"]["stale"] = True
             self._changed("page_design", [page_id])
 
     @_mutating
@@ -754,17 +758,32 @@ class ProjectModel:
             _validate_project_recovery(merged)
         if merged == self._data[field]:
             return
+        dependencies = {page["id"]: self._prompt_dependencies(page["id"])
+                        for page in self._data["pages"]} if field in {"shared_settings", "prompt_settings", "presentation"} else {}
         self._data[field] = merged
         self._project_data_changed((field,))
         ids = [] if field in {"sound", "extensions"} else [page["id"] for page in self._data["pages"]]
         if field in {"shared_settings", "prompt_settings", "presentation"}:
             for page in self._data["pages"]:
-                page["prompt"]["stale"] = True
+                if dependencies[page["id"]] != self._prompt_dependencies(page["id"]):
+                    page["prompt"]["stale"] = True
         self._changed("shared_design" if field in {"shared_settings", "prompt_settings", "presentation"} else "project_data", ids)
 
     @_reading
     def resolve_settings(self, page_id: str) -> dict[str, Any]:
         return {**deepcopy(self._data["shared_settings"]), **deepcopy(self._page(page_id)["design_overrides"])}
+
+    def _prompt_dependencies(self, page_id: str):
+        """Inputs consumed by the artwork composer; rendered readability is separate."""
+        page = self._page(page_id)
+        choices = {**deepcopy(self._data["prompt_settings"]), **deepcopy(page["prompt"]["overrides"])}
+        try:
+            geometry = self.prompt_geometry(page_id)
+        except ProjectModelError:
+            geometry = (deepcopy(self._data["presentation"].get("artwork_output")),
+                        deepcopy(page["message"].get("layout")) if page["message"] else None,
+                        {key: self.resolve_settings(page_id).get(key) for key in ("message_layout", "artwork_placement")})
+        return choices, geometry
 
     @_reading
     def resolve_layout(self, page_id: str) -> dict[str, Any]:

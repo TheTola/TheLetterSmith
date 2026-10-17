@@ -23,7 +23,7 @@ from project_state import ProjectStateController
 from settings_store import SettingsStore
 from ui_theme import THEMES, install_button_text_guard
 from window_chrome import (
-    bounded_window_geometry, fit_window_to_screen, install_window_placement_guard,
+    FramelessWindowController, bounded_window_geometry, fit_window_to_screen, install_window_placement_guard,
     place_window_on_launcher, restored_window_geometry, screen_for_launcher,
 )
 
@@ -37,6 +37,24 @@ class WindowSizingTests(unittest.TestCase):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         install_button_text_guard(cls.app)
         install_window_placement_guard(cls.app)
+
+    def test_window_controller_only_observes_live_widgets_and_disposes_repeatedly(self):
+        for _ in range(20):
+            window = QtWidgets.QWidget()
+            controller = FramelessWindowController(window)
+            child = QtWidgets.QLabel("Child", window)
+            window.show()
+            self.app.processEvents()
+            self.assertTrue(child.hasMouseTracking())
+            with mock.patch.object(child, "window", side_effect=AssertionError("inspected a dying widget")):
+                self.assertFalse(controller.eventFilter(child, QtCore.QEvent(QtCore.QEvent.DeferredDelete)))
+            child.deleteLater()
+            self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+            controller.shutdown()
+            controller.shutdown()
+            window.deleteLater()
+            self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+            self.app.processEvents()
 
     @contextmanager
     def window(self, *, settings=None, populated=True):

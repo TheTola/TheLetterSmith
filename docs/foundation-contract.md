@@ -1,5 +1,97 @@
 # Flexible page foundation contract
 
+## UI & Synchronization contract extension — 2026-10-17
+
+The combined shell uses one `ProjectSession`. Authoring selection is
+`session.selected_page_id`; page numbers, names and type labels never identify a
+destination. Images, Messages and the reusable detached Prompt Writer show
+`Page N of total — name · type` (unnamed Prompt Writer rows use the type once).
+Ordinary Messages entry reconciles selected Letter, last valid Letter in this
+session, then first Letter through `select_page`. Hidden Messages refreshes may
+remember a valid Letter but never move global selection. No Letter pages means
+an empty workspace with the existing canonical Add Letter Page action.
+
+Images' prompt/text buttons, Messages' background button, Prompt Writer's Page
+Settings and Forge's readiness corrections route stable IDs through Nexus.
+Forge no longer translates a correction into a legacy slot or generic message
+key. The shell commits pending edits before routing, and queued focus callbacks
+verify the originating session. Presentation navigation stays inside the viewer;
+it does not change authoring selection. Messages and Prompt Writer retain an
+uncommittable draft instead of rebinding it. A failed Images name commit blocks
+selection/tab departure. Renaming/reordering updates Prompt Writer labels without
+resetting its unchanged document, cursor or undo history. A new binding/session
+gets a fresh document history.
+
+`Nexus.flush_project_edits()` remains the common save/transition preparation:
+validate the focused field, commit Images names, flush Messages, flush detached
+Prompt Writer, then synchronize canonical compatibility views. Forge output
+preparation now uses this same hook, with the existing Prompt Writer-only hook
+as a standalone compatibility fallback. Save/Open/New/Exit continue to use the
+Saved Letters controller, `ProjectSaveService` and `ProjectLifecycle`; the shell
+adds no save format or decision dialog. Autosave completion carries session
+generation as well as dirty revision, so a result from the first A in A→B→A
+cannot mark the reopened A saved or finalize its metadata.
+Modal crop/layout/library/settings editors keep their existing Apply/Cancel
+contract: common save/output preparation and lifecycle entry refuse to proceed
+while a modal dialog is open, focus it, and retain its unapplied or invalid input.
+They do not scrape or silently accept dialog widgets.
+
+Canonical events are the shell's authored dirty source and Forge's currency
+source. Duplicate Images/Sound/Messages/Prompt Writer dirty/Forge-refresh signal
+connections were removed; legacy Messages without a canonical workspace retains
+its fallback. Selection and persisted notifications are not content edits.
+Private prompt edits do not refresh Forge or Messages composition. Old-session
+notifications are ignored. The title bar spells out Unsaved changes before the
+project title so a long title cannot hide the state; its tooltip/accessibility
+name retains the complete title.
+
+Prompt staleness follows effective composer choices and `prompt_geometry`,
+including page overrides. Shared palette changes do not stale a page whose
+palette override shields it; shared Letter geometry affects Letters only.
+Curtain/readability changes do not stale image prompts. Exact strings are never
+rewritten by these invalidations. Structure/order and type changes retain their
+existing context-sensitive staleness rules. Document text alone does not rebuild
+artwork prompts.
+
+Forge owns `render_content_key(snapshot)` and `referenced_resource_stamp(render)`.
+The former is a cheap derived view key excluding private prompts; the latter
+checks only artwork, active message resources and selected soundtrack references.
+`RenderInput` captures page render dependencies/order and project render fields
+with mutation counters. `render_is_current` checks those plus session identity
+and source evidence, rather than rejecting a render solely because an unrelated
+private prompt changed. Reverted relevant edits still invalidate work.
+
+Shared Messages previews coalesce equal requests, retain the last usable output
+while replacing it, and reject late jobs. While visible, a one-second resource
+check requires two equal changed stamps before validating/rebuilding external
+bytes. Invalid/incomplete replacements retain the old preview with an out-of-date
+warning. Images' active-tab check uses file change tokens, decode validation and
+before/after evidence; a failed replacement retains the cached thumbnail and
+warning. Both caches are scoped to stable page/session IDs. No library-wide file
+watcher is introduced. Final output still performs Forge's hash/resource checks.
+
+Sound's owner hooks stop audition when leaving Sound. Messages remains muted;
+Forge uses its existing visibility/shutdown gate and single soundtrack. Ordinary
+viewer navigation does not restart sound or redirect editors. Shared preview
+release cancels work and unloads owned files before deletion; original resources
+and explicit saves are never cleaned up by a view operation.
+
+Embedded Forge release observes a successful blank navigation with a bounded
+five-second wait. A timeout cancels New/Open/Exit and output replacement before
+editor subscriptions or owned files are disposed. Retrying waits for the same
+pending navigation; a blank URL alone is not proof of release. Late preview-load
+callbacks cannot reclaim the view while release is pending. Navigation cancels
+the previous load; no queued Stop is issued ahead of the blank navigation, which
+could otherwise cancel that unload on a starting renderer. The window frame
+controller ignores construction/destruction events and removes its application
+event filter only after shutdown preflight succeeds.
+
+Authoritative integration coverage: `test_ui_synchronization`, owner tests in
+`test_messages_workspace`, `test_images_workspace`, `test_prompt_writer_pages`,
+`test_message_shared_preview`, `test_forge_render`, `test_forge_session_output`,
+`test_project_model`, and actual shell geometry tests. See the dated UI handoff
+for exact runs and native evidence; this contract does not assert release QA.
+
 ## Command & Settings contract extension — 2026-10-16
 
 `ProjectLifecycle` in `project_lifecycle.py` owns the shell's one in-flight
@@ -166,7 +258,8 @@ restyling a root after library/status updates.
 Prompt Writer reads version-1 CSS-pixel geometry through `resolve_layout` and
 normalizes the resolved text box for artwork instructions. Shared geometry and
 document overrides therefore agree with Forge without rewriting stored layouts.
-Presentation changes invalidate shared prompt inputs as well as render inputs.
+Presentation changes invalidate affected render inputs; only changes to effective
+composer geometry/settings stale image prompts (see the October 17 extension).
 The canonical renderer supplies Sound's `INITIAL_MUTED` value; viewer mute
 preferences remain scoped to project and display-content fingerprint.
 
@@ -281,7 +374,7 @@ detached deep copies. `project_id -> str` and `revision -> int` are read-only.
 | `update_artwork(page_id, patch)` | None; top-level artwork merge; nested placement/animation values supplied in patch replace their corresponding objects. |
 | `update_message(page_id, document)` | None; replaces complete rich document; rejects non-Letter; a changed text area marks prompt stale. |
 | `update_prompt(page_id, patch)` | None; top-level merge without string normalization; directions/overrides/options changes mark stale unless explicitly supplied. |
-| `update_page_settings(page_id, patch)` | None; top-level override merge; marks prompt/preview stale. |
+| `update_page_settings(page_id, patch)` | None; top-level override merge; marks preview stale and prompt stale only when effective composer inputs change. |
 | `clear_page_override(page_id, key)` | None; removes override so it inherits again. |
 | `update_page_recovery(page_id, patch)` | None; adapter/recovery provenance merge through the same event boundary. |
 | `update_shared_settings(patch)` | None; merge shared defaults; preserve authored artwork/message/prompt; mark derived output stale. |
@@ -309,7 +402,8 @@ model instance. Kinds are `structure`,
 `name`, `artwork`, `message`, `prompt`, `page_design`, `shared_design`,
 `project_data`. Callbacks see completed state. Structure changes invalidate
 order/count-dependent prompt snapshots. No operation regenerates prompt text.
-Rename alone does not stale a preview. Shared visual/prompt changes stale derived
+Rename preserves composition and prompt strings; renderers refresh labels that
+display the name. Effective shared visual/prompt changes stale their dependent
 output; authored strings/documents/assets remain unchanged. Public reads and
 mutations use one model lock for coherent snapshots during autosave. Callbacks
 run after that lock is released, avoiding inversion with the session lock.

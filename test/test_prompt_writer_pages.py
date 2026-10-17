@@ -92,6 +92,25 @@ class PromptWriterPageTests(unittest.TestCase):
                 self.assertIn('The End', text)
                 self.assertIsNone(self.session.project.get_message(page_id))
 
+    def test_refresh_preserves_cursor_undo_and_failed_target_switch(self):
+        editor = self.panel._view_spec.preview_widget
+        editor.moveCursor(QtGui.QTextCursor.End)
+        editor.insertPlainText(" LAST 雪\n  ")
+        exact = self.session.project.get_prompt(self.ids[1])["text"]
+        cursor = editor.textCursor().position()
+        self.session.project.rename_page(self.ids[1], "Renamed")
+        self.session.project.update_project_data("sound", {"volume": 33})
+        self.assertEqual(editor.textCursor().position(), cursor)
+        self.assertTrue(editor.document().isUndoAvailable())
+        self.assertEqual(self.session.project.get_prompt(self.ids[1])["text"], exact)
+        with mock.patch.object(self.session, "save", side_effect=OSError("synthetic conflict")):
+            self.assertFalse(self.panel.select_page(self.ids[3]))
+            self.assertFalse(self.panel.select_page(self.ids[3]))
+        self.assertEqual(self.panel._view_page_id, self.ids[1])
+        self.assertEqual(self.panel.target_selector.currentData(), self.ids[1])
+        self.assertTrue(self.panel.select_page(self.ids[3]))
+        self.assertFalse(editor.document().isUndoAvailable())
+
     def test_independent_controls_exact_text_reorder_rename_save_reload(self):
         a, b = self.ids[1], self.ids[3]
         self.panel.select_page(a)

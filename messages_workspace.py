@@ -207,9 +207,8 @@ class MessagesWorkspace(QtWidgets.QWidget):
         return [(index, page) for index, page in enumerate(self.session.project.pages, 1)
                 if page["type"] == "letter"]
 
-    @staticmethod
-    def _label(index, page):
-        return f"Page {index} — {page['name'] or 'Letter'}"
+    def _label(self, index, page):
+        return f"Page {index} of {len(self.session.project.pages)} — {page['name'] or 'Letter'} · Letter"
 
     def _error(self, message):
         self._failed = True
@@ -217,7 +216,10 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.recover_button.show()
 
     def _changed(self, event):
-        if self._closed or self._committing or self._refreshing:
+        if (self._closed or self._committing or self._refreshing
+                or event.session_id != self.session.session_id):
+            return
+        if event.kind == "prompt":
             return
         if (self._dirty and self.binding is not None
                 and self.binding.target.session_id == self.session.session_id):
@@ -260,7 +262,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
                 self._dispose_editor()
             if reload_editor:
                 self._render_gate.invalidate(accepting=True)
-                if self.shared_preview is not None:
+                if self.shared_preview is not None and not same:
                     self.shared_preview.invalidate()
                 self._pixmap = QtGui.QPixmap()
                 self.preview_label.clear()
@@ -431,12 +433,17 @@ class MessagesWorkspace(QtWidgets.QWidget):
     def open_page(self, page_id):
         if not self.save():
             return False
+        ids = [page["id"] for _, page in self._letters()]
+        preferred = page_id if page_id is not None else self.session.selected_page_id
+        page_id = preferred if preferred in ids else self._last_letter if self._last_letter in ids else next(iter(ids), None)
+        # Only explicit entry reconciles a filtered fallback. Hidden Messages
+        # refreshes must not hijack the artwork/Prompt Writer editing target.
         if page_id is not None:
             self.session.select_page(page_id)
         self.refresh(page_id)
         if self.editor:
             self.editor.editor.setFocus()
-        return True
+        return not self._failed
 
     def _dispose_editor(self):
         if self.editor is None:

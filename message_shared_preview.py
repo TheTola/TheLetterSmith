@@ -29,11 +29,12 @@ class _BuildSignals(QtCore.QObject):
 
 
 class _Build(QtCore.QRunnable):
-    def __init__(self, revision, session, target, adapter, cache):
+    def __init__(self, revision, session, target, adapter, cache, *, external=False):
         super().__init__()
         self.revision, self.session, self.target = revision, session, target
         self.adapter, self.cache = adapter, cache
         self.cancelled = Event()
+        self.external = external
         self.signals = _BuildSignals()
 
     def run(self):
@@ -44,7 +45,10 @@ class _Build(QtCore.QRunnable):
             if self.cancelled.is_set() or not self.session.target_is_current(self.target):
                 return
             render = self.adapter.capture_render(self.session, output_mode="preview")
-            warnings = tuple(issue.message for issue in self.adapter.validate_render(render)
+            issues = self.adapter.validate_render(render)
+            if self.external and any(issue.code in {"missing_artwork", "invalid_artwork", "message_resource", "missing_sound"} for issue in issues):
+                raise ValueError("A changed resource is missing or incomplete. Repair it or relink it in its editor.")
+            warnings = tuple(issue.message for issue in issues
                              if not issue.blocks_preview)
             temporary = tempfile.TemporaryDirectory(prefix="generation-", dir=self.cache)
             self.adapter.build_render_to(render, temporary.name, seed_sfx=False,
@@ -125,22 +129,41 @@ class SharedMessagePreview(QtWidgets.QWidget):
         self._retired = []
         self._view_released = True
         self._closed = False
+        self._request_key = None
+        self._resource_stamp = None
+        self._pending_resource_stamp = None
+        self._warning = ""
         self.viewed_page_id = None
         self._poll = QtCore.QTimer(self)
         self._poll.setInterval(400)
         self._poll.timeout.connect(self._inspect_page)
+        self._resource_timer = QtCore.QTimer(self)
+        self._resource_timer.setInterval(1000)
+        self._resource_timer.timeout.connect(self.check_resources)
         self._cleanup_timer = QtCore.QTimer(self)
         self._cleanup_timer.setSingleShot(True)
         self._cleanup_timer.setInterval(250)
         self._cleanup_timer.timeout.connect(self._cleanup_retired)
 
-    def request(self, page_id):
+    def request(self, page_id, *, force=False, external=False):
         if self._closed:
             return
-        self.invalidate()
+        key = (self.session.session_id, page_id, self.adapter.render_content_key(self.session.project.render_snapshot()))
+        if not force and key == self._request_key:
+            return
+        keep = (self._current is not None and self._page_id == page_id
+                and self._current[1].session_id == self.session.session_id)
+        if keep:
+            self._revision += 1
+            for task in self._tasks.values():
+                task.cancelled.set()
+            self._warning = "Preview out of date — updating."
+        else:
+            self.invalidate()
+        self._request_key = key
         self._page_id = page_id
-        target = self.session.capture_target(page_id, fields=("type", "message", "artwork", "design_overrides"))
-        task = _Build(self._revision, self.session, target, self.adapter, self.cache)
+        target = self.session.capture_target(page_id, fields=("type", "message", "artwork", "design_overrides"), include_shared=False)
+        task = _Build(self._revision, self.session, target, self.adapter, self.cache, external=external)
         self._tasks[self._revision] = task
         task.signals.finished.connect(self._finished)
         self.status_changed.emit("Updating shared preview…")
@@ -149,6 +172,10 @@ class SharedMessagePreview(QtWidgets.QWidget):
     def invalidate(self):
         self._revision += 1
         self._poll.stop()
+        self._resource_timer.stop()
+        self._request_key = None
+        self._resource_stamp = self._pending_resource_stamp = None
+        self._warning = ""
         self.viewed_page_id = None
         self._page_id = None
         for task in self._tasks.values():
@@ -158,7 +185,6 @@ class SharedMessagePreview(QtWidgets.QWidget):
             self._current = None
         self._view_released = False
         self.view.hide()
-        self.view.stop()
         self.view.setUrl(QtCore.QUrl("about:blank"))
 
     def _finished(self, revision, result):
@@ -173,9 +199,15 @@ class SharedMessagePreview(QtWidgets.QWidget):
                 self._retired.append(temporary)
                 self._cleanup_retired()
             if current and error:
-                self.status_changed.emit("Preview unavailable: " + error)
+                self._warning = ("Preview out of date: " if self._current else "Preview unavailable: ") + error
+                self.status_changed.emit(self._warning)
+                self._request_key = None
             return
+        if self._current is not None:
+            self._retired.append(self._current[0])
         self._current = (temporary, render, warnings)
+        self._warning = ""
+        self._resource_stamp = self.adapter.referenced_resource_stamp(render)
         self._view_released = False
         self.view.setUrl(QtCore.QUrl.fromLocalFile(str(Path(temporary.name) / "index.html")))
 
@@ -209,6 +241,7 @@ class SharedMessagePreview(QtWidgets.QWidget):
                 return
             self.view.show()
             self._poll.start()
+            self._resource_timer.start()
             self._inspect_page()
 
         # Sound's shared playback gate rejects hidden documents. Show the view
@@ -248,6 +281,8 @@ class SharedMessagePreview(QtWidgets.QWidget):
                     note += " Editor selection is unchanged."
                 if warnings:
                     note += " " + " ".join(warnings)
+                if self._warning:
+                    note += " " + self._warning
                 for issue in state.get("issues", []):
                     if isinstance(issue, dict) and issue.get("page_id") == page_id and isinstance(issue.get("message"), str):
                         note += " " + issue["message"]
@@ -257,6 +292,27 @@ class SharedMessagePreview(QtWidgets.QWidget):
             "JSON.stringify({page_id: window.LetterSmithViewer?.currentPageId() || null, "
             "issues: window.LetterSmithViewer?.layoutIssues?.() || []})", inspected,
         )
+
+    def check_resources(self):
+        if self._closed or self._current is None or self._tasks or not self.isVisible():
+            return
+        if self._current[1].session_id != self.session.session_id:
+            self._resource_timer.stop()
+            self._poll.stop()
+            return
+        stamp = self.adapter.referenced_resource_stamp(self._current[1])
+        if stamp == self._resource_stamp:
+            self._pending_resource_stamp = None
+            return
+        # Two stable observations avoid importing a file halfway through a write.
+        if stamp != self._pending_resource_stamp:
+            self._pending_resource_stamp = stamp
+            self._warning = "Preview out of date — checking changed resources."
+            self.status_changed.emit(self._warning)
+            return
+        self._resource_stamp = stamp
+        self._pending_resource_stamp = None
+        self.request(self._page_id, force=True, external=True)
 
     def set_zoom(self, value):
         self.view.setZoomFactor(max(0.25, min(2.0, value / 100)))

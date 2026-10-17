@@ -157,6 +157,25 @@ class ForgeSessionOutputTests(unittest.TestCase):
         page = self.session.project.pages[2]
         self.session.project.update_page_recovery(page["id"], {"legacy_key": "page_2"})
         forge = SimpleNamespace(project_root=self.root, dismiss_readiness=mock.Mock(), correction_requested=mock.Mock())
+        selected = self.session.selected_page_id
         ForgeTab._handle_readiness_correction(forge, "images", page["id"])
-        self.assertEqual(self.session.selected_page_id, page["id"])
-        forge.correction_requested.emit.assert_called_once_with("images", "page_2")
+        self.assertEqual(self.session.selected_page_id, selected)
+        forge.correction_requested.emit.assert_called_once_with("images", page["id"])
+
+    def test_output_preparation_uses_all_editors_and_stops_on_flush_failure(self):
+        shell = SimpleNamespace(flush_project_edits=mock.Mock(return_value=False),
+                                flush_prompt_writer_state=mock.Mock(return_value=True))
+        forge = SimpleNamespace(window=lambda: shell, _set_status=mock.Mock())
+        self.assertFalse(ForgeTab._flush_prompt_writer_state(forge))
+        shell.flush_project_edits.assert_called_once_with()
+        shell.flush_prompt_writer_state.assert_not_called()
+        forge._set_status.assert_called_once()
+
+    def test_preview_release_failure_is_reported_and_can_retry(self):
+        forge = SimpleNamespace(_project_release_error="", _set_status=mock.Mock(),
+                                preview_files_release_requested=mock.Mock())
+        forge.preview_files_release_requested.emit.side_effect = lambda: ForgeTab.report_project_file_release_failure(forge, "Preview still releasing")
+        self.assertFalse(ForgeTab._release_preview_files(forge))
+        forge._set_status.assert_called_once_with("Preview still releasing", error=True, timeout_ms=0)
+        forge.preview_files_release_requested.emit.side_effect = None
+        self.assertTrue(ForgeTab._release_preview_files(forge))

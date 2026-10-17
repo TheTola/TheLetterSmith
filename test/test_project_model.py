@@ -213,7 +213,26 @@ class ProjectModelTests(unittest.TestCase):
         self.assertEqual(after["message"], before["message"])
         self.assertEqual(after["artwork"], before["artwork"])
         self.assertEqual(after["prompt"]["text"], before["prompt"]["text"])
-        self.assertTrue(after["prompt"]["stale"])
+        self.assertFalse(after["prompt"]["stale"])
+
+    def test_prompt_staleness_follows_effective_choices_and_geometry(self):
+        project = create_project(("letter", "letter", "illustration"))
+        a, b, art = [page["id"] for page in project.pages]
+        project.update_prompt(a, {"overrides": {"color": "Fixed"}})
+        for page_id in (a, b, art):
+            project.update_prompt(page_id, {"text": "Exact old Wall\n 雪 ", "stale": False})
+        project.update_project_data("prompt_settings", {"color": "Changed shared"})
+        self.assertFalse(project.get_prompt(a)["stale"])
+        self.assertTrue(project.get_prompt(b)["stale"])
+        for page_id in (a, b, art):
+            project.update_prompt(page_id, {"stale": False})
+        project.update_shared_settings({"message_overlay_opacity": 40, "curtain_style": "normal_dark"})
+        self.assertTrue(all(not project.get_prompt(page_id)["stale"] for page_id in (a, b, art)))
+        project.update_shared_settings({"message_layout": canvas_layout()})
+        self.assertTrue(project.get_prompt(a)["stale"])
+        self.assertTrue(project.get_prompt(b)["stale"])
+        self.assertFalse(project.get_prompt(art)["stale"])
+        self.assertTrue(all(project.get_prompt(page_id)["text"] == "Exact old Wall\n 雪 " for page_id in (a, b, art)))
 
     def test_events_reflect_complete_state(self):
         project = five_page_project()

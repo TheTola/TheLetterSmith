@@ -154,17 +154,17 @@ class MessagesWorkspaceTests(unittest.TestCase):
 
     def test_selector_uses_actual_positions_and_ids_after_reorder_and_duplicate_names(self) -> None:
         self.assertEqual([self.workspace.selector.itemText(i) for i in range(2)],
-                         ["Page 2 — Letter", "Page 4 — Letter"])
+                         ["Page 2 of 5 — Letter · Letter", "Page 4 of 5 — Letter · Letter"])
         self.session.project.rename_page(self.letter_a, "Same title")
         self.session.project.rename_page(self.letter_b, "Same title")
         order = list(self.ids)
         order[1], order[3] = order[3], order[1]
         self.session.project.reorder_pages(order)
         self.assertEqual([self.workspace.selector.itemText(i) for i in range(2)],
-                         ["Page 2 — Same title", "Page 4 — Same title"])
+                         ["Page 2 of 5 — Same title · Letter", "Page 4 of 5 — Same title · Letter"])
         self.workspace.selector.setCurrentIndex(0)
         self.assertEqual(self.workspace.page_id, self.letter_b)
-        self.assertEqual(self.workspace.heading.text(), "Page 2 — Same title")
+        self.assertEqual(self.workspace.heading.text(), "Page 2 of 5 — Same title · Letter")
         self.assertIn("Message B", self.workspace.editor.editor.toPlainText())
         self.assertEqual(self.workspace.selector.itemData(1), self.letter_a)
 

@@ -2908,7 +2908,9 @@ class ForgeTab(QtWidgets.QWidget):
 
     @QtCore.Slot(object)
     def _on_project_session_changed(self, event: object) -> None:
-        if self._shutdown or getattr(event, "kind", "") == "selection":
+        if (self._shutdown or getattr(event, "kind", "") in {"selection", "prompt"}
+                or self._render_session is None
+                or getattr(event, "session_id", None) != self._render_session.session_id):
             return
         if getattr(event, "kind", "") == "project_replaced":
             self._pending_metadata_update = None
@@ -2987,17 +2989,6 @@ class ForgeTab(QtWidgets.QWidget):
 
     def _handle_readiness_correction(self, tab: str, target: str) -> None:
         self.dismiss_readiness()
-        from project_session import peek_project_session
-        session = peek_project_session(self.project_root)
-        if session is not None:
-            try:
-                page = session.project.get_page(target)
-            except KeyError:
-                pass
-            else:
-                session.select_page(page["id"])
-                # Adapt only at the existing shell boundary; ownership stays by ID.
-                target = page["recovery"].get("legacy_key", target) if tab == "images" else "message"
         self.correction_requested.emit(tab, target)
 
     def set_readiness_context_visible(self, visible: bool) -> None:
@@ -4114,6 +4105,14 @@ class ForgeTab(QtWidgets.QWidget):
     def report_project_file_release_failure(self, message: str) -> None:
         self._project_release_error = str(message or "").strip()
 
+    def _release_preview_files(self) -> bool:
+        self._project_release_error = ""
+        self.preview_files_release_requested.emit()
+        if self._project_release_error:
+            self._set_status(self._project_release_error, error=True, timeout_ms=0)
+            return False
+        return True
+
     def _release_project_files_for_restore(self) -> bool:
         """Release live viewers and media before replacing project folders."""
         self._project_release_error = ""
@@ -4133,7 +4132,8 @@ class ForgeTab(QtWidgets.QWidget):
             if callable(stop_catalog_tasks)
             else True
         )
-        self.preview_files_release_requested.emit()
+        if not self._release_preview_files():
+            return False
         self.project_files_release_requested.emit()
         if (
             (not covers_released or not catalog_released)
@@ -4407,17 +4407,20 @@ class ForgeTab(QtWidgets.QWidget):
         return None
 
     def _flush_prompt_writer_state(self) -> bool:
-        hook = getattr(self.window(), "flush_prompt_writer_state", None)
+        shell = self.window()
+        hook = getattr(shell, "flush_project_edits", None)
+        if not callable(hook):
+            hook = getattr(shell, "flush_prompt_writer_state", None)
         if not callable(hook):
             return True
         try:
             saved = bool(hook())
         except Exception:
-            _LOGGER.exception("Prompt Writer state could not be flushed before saving.")
+            _LOGGER.exception("Project edits could not be committed before output preparation.")
             saved = False
         if not saved:
             self._set_status(
-                "Prompt Writer state could not be saved. The letter was not updated.",
+                "Project edits could not be saved. Repair the retained edit before continuing.",
                 error=True,
             )
         return saved
@@ -4553,7 +4556,8 @@ class ForgeTab(QtWidgets.QWidget):
             )
 
         self._preview_refresh_pending = True
-        self.preview_files_release_requested.emit()
+        if not self._release_preview_files():
+            return
         self._start_operation(
             "Preparing preview…",
             task,
@@ -4753,7 +4757,8 @@ class ForgeTab(QtWidgets.QWidget):
                 prepared_output,
             )
 
-        self.preview_files_release_requested.emit()
+        if not self._release_preview_files():
+            return
         self._begin_publication_activity(
             "publish",
             "Preparing the finished letter…",

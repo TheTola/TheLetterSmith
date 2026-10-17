@@ -309,6 +309,7 @@ class FramelessWindowController(QtCore.QObject):
         self._cursor_target: Optional[QtWidgets.QWidget] = None
         self._cursor_was_explicit = False
         self._cursor_before_resize = QtGui.QCursor()
+        self._disposed = False
 
         application = QtWidgets.QApplication.instance()
         if application is not None:
@@ -319,6 +320,16 @@ class FramelessWindowController(QtCore.QObject):
         widget.setMouseTracking(True)
         for child in widget.findChildren(QtWidgets.QWidget):
             child.setMouseTracking(True)
+
+    def shutdown(self) -> None:
+        """Stop observing application widgets once this window is disposed."""
+        if self._disposed:
+            return
+        self._disposed = True
+        self._restore_cursor()
+        application = QtWidgets.QApplication.instance()
+        if application is not None:
+            application.removeEventFilter(self)
 
     def _enable_native_resize_style(self) -> None:
         if (
@@ -434,12 +445,22 @@ class FramelessWindowController(QtCore.QObject):
         )
 
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if self._disposed:
+            return False
+        kind = event.type()
+        # Application filters also see partially constructed/destructed widgets.
+        # Inspect only live interaction events, and children after polishing.
+        if kind not in (QtCore.QEvent.Show, QtCore.QEvent.WinIdChange,
+                        QtCore.QEvent.ChildPolished, QtCore.QEvent.MouseMove,
+                        QtCore.QEvent.MouseButtonPress, QtCore.QEvent.Hide,
+                        QtCore.QEvent.WindowStateChange):
+            return False
         if watched is self._window and event.type() in (
             QtCore.QEvent.Show, QtCore.QEvent.WinIdChange,
         ):
             self._enable_native_resize_style()
         if isinstance(watched, QtWidgets.QWidget):
-            if event.type() == QtCore.QEvent.ChildAdded:
+            if event.type() == QtCore.QEvent.ChildPolished:
                 child = event.child()
                 if (
                     isinstance(child, QtWidgets.QWidget)

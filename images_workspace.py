@@ -146,6 +146,7 @@ class ImageTab(QtWidgets.QWidget):
         self._name_target = None
         self._undo = []
         self._thumbnail_cache = {}
+        self._asset_warnings = {}
         self._preview_key = None
         self._image_import_thread = None
         self._image_import_worker = None
@@ -154,6 +155,9 @@ class ImageTab(QtWidgets.QWidget):
         self._pending_target = None
         self._pending_index = 0
         self._tab_active = False
+        self._resource_timer = QtCore.QTimer(self)
+        self._resource_timer.setInterval(1000)
+        self._resource_timer.timeout.connect(self.refresh_cards)
         self.image_paths = {}
         self.labels = {}
         root = QtWidgets.QVBoxLayout(self)
@@ -304,7 +308,9 @@ class ImageTab(QtWidgets.QWidget):
         if self._restoring_ui:
             return
         identity = current.data(QtCore.Qt.UserRole) if current else None
-        self._run(self.flush_pending_edits)
+        if self._run(self.flush_pending_edits) is False:
+            self.refresh_cards()
+            return
         self.session.select_page(identity)
 
     def _edit_name(self, text):
@@ -342,18 +348,23 @@ class ImageTab(QtWidgets.QWidget):
         if path is None:
             return None, False, None
         stat = path.stat()
-        key = (self.session.session_id, page["id"], page["artwork"].get("asset"), stat.st_size, stat.st_mtime_ns)
+        from transactional_io import file_change_token
+        key = (self.session.session_id, page["id"], page["artwork"].get("asset"), stat.st_size, stat.st_mtime_ns, file_change_token(path, stat_result=stat))
         cached = self._thumbnail_cache.get(page["id"])
         if cached is None or cached[0] != key:
             with Image.open(path) as media:
                 animated = media.format == "GIF" and getattr(media, "n_frames", 1) > 1
+                media.verify()
             reader = QtGui.QImageReader(str(path))
             reader.setAutoTransform(True)
             size = reader.size()
             if size.isValid():
                 reader.setScaledSize(size.scaled(64, 80, QtCore.Qt.KeepAspectRatio))
             pixmap = QtGui.QPixmap.fromImage(reader.read())
-            cached = (key, animated, QtGui.QIcon(pixmap))
+            after = path.stat()
+            if pixmap.isNull() or (after.st_size, after.st_mtime_ns, file_change_token(path, stat_result=after)) != key[3:]:
+                raise ValueError("Artwork is still being written or cannot be decoded")
+            cached = (key, animated, QtGui.QIcon(pixmap), path)
             self._thumbnail_cache[page["id"]] = cached
         return path, cached[1], cached[2]
 
@@ -374,14 +385,24 @@ class ImageTab(QtWidgets.QWidget):
         self.labels.clear()
         active_ids = {page["id"] for page in pages}
         self._thumbnail_cache = {identity: value for identity, value in self._thumbnail_cache.items() if identity in active_ids}
+        self._asset_warnings = {identity: value for identity, value in self._asset_warnings.items() if identity in active_ids}
         selected_page = None
         selected_media = (None, False, None)
         for number, page in enumerate(pages, 1):
             try:
                 media = self._asset_info(page)
+                if media[0] is None and page["artwork"].get("asset"):
+                    raise ValueError("Referenced artwork is missing")
+                self._asset_warnings.pop(page["id"], None)
             except (OSError, ValueError, KeyError):
                 media = (None, False, None)
+                cached = self._thumbnail_cache.get(page["id"])
+                if cached and cached[0][:3] == (self.session.session_id, page["id"], page["artwork"].get("asset")):
+                    media = (cached[3], cached[1], cached[2])
+                self._asset_warnings[page["id"]] = "Artwork unavailable — preview out of date"
             status = []
+            if page["id"] in self._asset_warnings:
+                status.append(self._asset_warnings[page["id"]])
             if media[0] is None:
                 status.append("Image missing")
             if any(issue.page_id == page["id"] and issue.code == "empty_message" for issue in issues):
@@ -452,7 +473,8 @@ class ImageTab(QtWidgets.QWidget):
             self.type_combo.setCurrentIndex(self.type_combo.findData(selected_page["type"]))
             settings = normalize_gif_settings(selected_page["artwork"].get("animation"))
             self.animation_mode.setCurrentIndex(self.animation_mode.findData(settings["playback_mode"]))
-            preview_key = (self.session.session_id, selected, repr(selected_page["artwork"]), str(path))
+            cached = self._thumbnail_cache.get(selected)
+            preview_key = (self.session.session_id, selected, repr(selected_page["artwork"]), str(path), cached[0] if cached else None)
             if preview_key != self._preview_key:
                 self.card.release_asset_handle()
                 if path is None:
@@ -478,8 +500,10 @@ class ImageTab(QtWidgets.QWidget):
                 project_legacy_views(self.session)
             self.session.save(sync_workspace=False)
             self.status.setText("")
+            return True
         except (OSError, ValueError, RuntimeError) as error:
             self.status.setText(f"Change retained in this session; saving needs attention: {error}")
+            return False
         finally:
             self._committing = False
             self.refresh_cards()
@@ -491,14 +515,16 @@ class ImageTab(QtWidgets.QWidget):
             return True
         text, target = self.name_edit.text(), self._name_target
         if self.session.apply_result(target, lambda model, identity: model.rename_page(identity, text)):
-            self._commit("page_name")
+            if not self._commit("page_name"):
+                return False
             self._name_dirty = False
             return True
         self.status.setText("The original page changed; its pending name was not applied.")
         return False
 
     def _prepare_page_operation(self):
-        self.flush_pending_edits()
+        if not self.flush_pending_edits():
+            raise RuntimeError("Save or repair the pending page name before changing pages.")
         # Legacy editors may have completed writes since the last projection.
         # Merge before a duplicate/delete/type operation captures its content.
         self.session.synchronize_workspace()
@@ -757,12 +783,14 @@ class ImageTab(QtWidgets.QWidget):
         self.refresh_cards()
 
     def request_prompt(self):
-        self.flush_pending_edits()
+        if not self.flush_pending_edits():
+            return
         if self.session.selected_page_id is not None:
             self.prompt_requested.emit(self.session.selected_page_id)
 
     def request_message(self):
-        self.flush_pending_edits()
+        if not self.flush_pending_edits():
+            return
         identity = self.session.selected_page_id
         if identity and self.session.project.get_page(identity)["type"] == "letter":
             self.message_requested.emit(identity)
@@ -806,11 +834,13 @@ class ImageTab(QtWidgets.QWidget):
         self._tab_active = True
         self.refresh_from_disk()
         self.card.set_playback_active(True)
+        self._resource_timer.start()
 
     def deactivate_for_tab_change(self):
         self.flush_pending_edits()
         self._tab_active = False
         self.card.set_playback_active(False)
+        self._resource_timer.stop()
 
     def set_compact_layout(self, compact):
         self.splitter.setOrientation(QtCore.Qt.Vertical if compact and self.width() < 560 else QtCore.Qt.Horizontal)
@@ -825,6 +855,7 @@ class ImageTab(QtWidgets.QWidget):
         self.card.apply_theme_assets(theme_service)
 
     def prepare_for_project_restore(self, timeout_ms=5000):
+        self._resource_timer.stop()
         self.flush_pending_edits()
         if not self._stop_import(timeout_ms):
             raise RuntimeError("Wait for the image import to finish before replacing the project.")
@@ -848,6 +879,7 @@ class ImageTab(QtWidgets.QWidget):
         if not self._stop_import(timeout_ms):
             return False
         self._shutdown = True
+        self._resource_timer.stop()
         self.session.remove_listener(self.session_event.emit)
         self.card.release_asset_handle()
         self._thumbnail_cache.clear()

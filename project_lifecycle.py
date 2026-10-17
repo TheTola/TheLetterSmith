@@ -114,6 +114,12 @@ class ProjectLifecycle(QtCore.QObject):
         window = self.window
         if self.busy or window._shutdown_complete or window._shutdown_in_progress:
             return False
+        modal = QtWidgets.QApplication.activeModalWidget()
+        if modal is not None:
+            window.status(f"Apply or cancel {modal.windowTitle() or 'the open dialog'} before changing projects or exiting.")
+            modal.raise_()
+            modal.activateWindow()
+            return False
         forge = getattr(window, "forge_tab", None)
         if (forge is not None and forge.operation_in_progress) or window._autosave_active_revision is not None:
             window.status("Finish the current project operation, then retry.")

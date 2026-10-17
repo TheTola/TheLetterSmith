@@ -12,7 +12,7 @@ def page_label(project, page_id):
     page = project.get_page(page_id)
     position = project.prompt_context(page_id)["position"]
     name = f"{page['name']} · " if page["name"] else ""
-    return f"Page {position} — {name}{PAGE_TYPES[page['type']].label}"
+    return f"Page {position} of {len(project.pages)} — {name}{PAGE_TYPES[page['type']].label}"
 
 
 def compose_page(project, page_id, resolved, guidance_phrases):

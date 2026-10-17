@@ -80,6 +80,7 @@ class RenderInput:
     source_fingerprint: str = ""
     targets: tuple = ()
     presentation_root: Path | None = None
+    project_target: object = None
 
 
 class StaleRenderError(RuntimeError):
@@ -251,10 +252,12 @@ def capture_render(session, output_mode="display", *, presentation_root=None) ->
     model = session.project
     with model.mutation_scope():
         snapshot = model.render_snapshot()
-    targets = tuple(session.capture_target(page["id"], fields=("type", "artwork", "message", "design_overrides"), include_shared=False) for page in snapshot["pages"])
+    targets = tuple(session.capture_target(page["id"], fields=("type", "name", "artwork", "message", "design_overrides", "$order"), include_shared=False) for page in snapshot["pages"])
+    project_target = session.capture_project_target(fields=("metadata", "shared_settings", "presentation", "sound", "recovery"))
     render = RenderInput(_freeze(snapshot), session.project_root, session.asset_root or session.project_root,
                          identity, snapshot["project_id"], snapshot["revision"], output_mode, targets=targets,
-                         presentation_root=Path(presentation_root).resolve() if presentation_root is not None else None)
+                         presentation_root=Path(presentation_root).resolve() if presentation_root is not None else None,
+                         project_target=project_target)
     if session.session_id != identity or session.project is not model or model.revision != render.revision:
         raise StaleRenderError("The project changed while its preview was captured.")
     return replace(render, source_fingerprint=_active_signature(render))
@@ -262,10 +265,44 @@ def capture_render(session, output_mode="display", *, presentation_root=None) ->
 
 def render_is_current(session, render: RenderInput, *, check_sources=True) -> bool:
     if (session.session_id != render.session_id or session.project.project_id != render.project_id
-            or session.project.revision != render.revision or not render.targets
+            or not render.targets
+            or (render.project_target is not None and not session.project_target_is_current(render.project_target))
+            or (render.project_target is None and session.project.revision != render.revision)
             or not all(session.target_is_current(target) for target in render.targets)):
         return False
     return not check_sources or _active_signature(render) == render.source_fingerprint
+
+
+def render_content_key(snapshot) -> str:
+    """Cheap view dependency key; no filesystem reads or private prompt data."""
+    pages = [{key: _plain(page.get(key)) for key in
+              ("id", "type", "name", "artwork", "message", "design_overrides", "resolved_layout")}
+             for page in snapshot["pages"]]
+    state = {key: _plain(snapshot.get(key)) for key in
+             ("project_id", "metadata", "shared_settings", "presentation", "sound", "validation")}
+    state["pages"] = pages
+    return json.dumps(state, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def referenced_resource_stamp(render) -> tuple:
+    """Bounded change evidence for this snapshot's authored resource graph."""
+    from generate import _file_signature
+    references = set()
+    for page in render.snapshot["pages"]:
+        if page["artwork"].get("asset"):
+            references.add(page["artwork"]["asset"])
+        message = page.get("message")
+        if message is not None:
+            references.update(message.get("resources", ()))
+    references.update(reference for track in _selected_tracks(render)
+                      if (reference := _track_reference(track)))
+    result = []
+    for reference in sorted(references):
+        try:
+            result.append((reference, _file_signature(_resolve(render, reference))))
+        except (OSError, ValueError, ProjectRepositoryError):
+            result.append((reference, None))
+    return tuple(result)
 
 
 def validate_render(render: RenderInput) -> tuple[RenderIssue, ...]:
@@ -553,6 +590,8 @@ class SavedProjectPreviewAdapter:
     validate_render = staticmethod(validate_render)
     build_render_to = staticmethod(build_render_to)
     render_is_current = staticmethod(render_is_current)
+    render_content_key = staticmethod(render_content_key)
+    referenced_resource_stamp = staticmethod(referenced_resource_stamp)
     StaleRenderError = StaleRenderError
 
 

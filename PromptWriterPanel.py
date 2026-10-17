@@ -1604,6 +1604,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._persist_timer.setSingleShot(True)
         self._persist_timer.timeout.connect(self._persist_state_now)
         self._state_persistence_suspended = False
+        self._persistence_failed = False
         self._state_write_blocked = False
         self._shutdown = False
 
@@ -1688,12 +1689,18 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
     def select_page(self, page_id):
         if self._state_persistence_suspended or page_id is None:
-            return
+            return False
+        if (self._persist_timer.isActive() or self._persistence_failed) and not self.persist_project_state():
+            with QtCore.QSignalBlocker(self.target_selector):
+                self.target_selector.setCurrentIndex(self.target_selector.findData(self._view_page_id))
+            self.prompt_status.setText("Prompt draft could not be saved. Retry before changing pages.")
+            return False
         try:
             self.session.select_page(page_id)
             self.reload_project_state()
+            return True
         except KeyError:
-            self.reload_project_state()
+            return False
 
     @QtCore.Slot(object)
     def _session_changed(self, event):
@@ -2309,8 +2316,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
             return False
         try:
             self.session.save()
+            self._persistence_failed = False
             return True
         except (OSError, ValueError, RuntimeError, TypeError):
+            self._persistence_failed = True
+            self.prompt_status.setText("Prompt draft could not be saved. Retry Save before continuing.")
             LOGGER.exception("Prompt Writer canonical save failed")
             return False
 
@@ -2530,7 +2540,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
             ids = [page["id"] for page in pages]
             if selected not in ids:
                 selected = ids[0] if ids else None
-            if selected != self._view_page_id or self._view_session_id != self.session.session_id:
+            new_session = self._view_session_id != self.session.session_id
+            new_binding = selected != self._view_page_id or new_session
+            if new_binding:
                 for dialog in tuple(self._list_manager_dialogs.values()):
                     dialog.close()
             if self._view_session_id != self.session.session_id:
@@ -2554,7 +2566,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
             shared = project.to_dict()["prompt_settings"]
             for combo, key, empty in ((self.cmb_subject, "subject", -1), (self.cmb_type, "type", 0), (self.cmb_color, "color", 0)):
                 self._restore_combo_value(combo, shared.get(key, ""), empty_index=empty, normalized_match=key == "color")
-            self.txt_global.setPlainText(shared.get("global", ""))
+            self._restore_text(self.txt_global, shared.get("global", ""), new_session)
             checks = _normalize_exclusive_check_states(shared.get("checks", {}))
             for checkbox, key in self._checkbox_state_specs():
                 checkbox.setChecked(checks.get(key, False))
@@ -2572,8 +2584,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._view_spec.detail_widget.setPlaceholderText("Describe the subjects, scene and composition for this page.")
             _set_help(self._view_spec.detail_widget, "Directions for this page only. Message text is authored separately in Messages.")
             self._view_spec.preview_title.setText("Generated Prompt")
-            self._view_spec.detail_widget.setPlainText(prompt["directions"])
-            self._view_spec.preview_widget.setPlainText(prompt["text"] or "")
+            self._restore_text(self._view_spec.detail_widget, prompt["directions"], new_binding)
+            self._restore_text(self._view_spec.preview_widget, prompt["text"] or "", new_binding)
             overrides = prompt["overrides"]
             self.use_project_palette.setChecked("color" not in overrides)
             self.page_palette.setCurrentText(overrides.get("color", shared.get("color", "")))
@@ -2592,6 +2604,14 @@ class PromptWriterPanel(QtWidgets.QWidget):
             return True
         finally:
             self._state_persistence_suspended = False
+
+    @staticmethod
+    def _restore_text(widget, text, new_binding=False):
+        # Qt normalizes displayed line endings. Identical refreshes must retain
+        # the cursor, selection and undo history, including historical CRLF.
+        displayed = text.replace("\r\n", "\n").replace("\r", "\n")
+        if new_binding or widget.toPlainText() != displayed:
+            widget.setPlainText(text)
 
 
     def _restore_persisted_state(self) -> bool:
