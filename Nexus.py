@@ -4915,6 +4915,7 @@ class Nexus(QtWidgets.QMainWindow):
             return False
         self._shutdown_in_progress = True
         self._window_controller.shutdown()
+        self.theme_service.shutdown()
         cleanup_errors = []
         self._forge_viewport_timer.stop()
         self._preview_geometry_timer.stop()

@@ -66,17 +66,10 @@ class SoundPlaybackLifecycleTests(unittest.TestCase):
                 self.app.processEvents()
 
     def test_transport_follows_actual_backend_play_pause_stop(self) -> None:
-        with self.player_fixture() as player:
-            observed = []
-            player.transportStateChanged.connect(observed.append)
-            player.play()
-            self.wait_for(lambda: player.transport_state == "playing", "Playback did not start")
-            player.pause()
-            self.wait_for(lambda: player.transport_state == "paused", "Playback did not pause")
-            player.stop()
-            self.assertEqual(player.transport_state, "stopped")
-            self.assertFalse(player.is_playing())
-            self.assertEqual(observed[-3:], ["playing", "paused", "stopped"])
+        result = self._native_transport_result("controls")
+        self.assertEqual(result["transport"][-4:], ["playing", "paused", "stopped", "unavailable"])
+        self.assertEqual(result["state"], "stopped")
+        self.assertTrue(result["shutdown_quiet"])
 
     def test_play_request_does_not_report_playing_before_backend(self) -> None:
         with self.player_fixture() as player:
@@ -302,9 +295,23 @@ def _run_native_transport(scenario: str) -> None:
     expected_count = 2 if scenario == "single" else 4
     monitor = QtCore.QTimer()
     monitor.setInterval(20)
-    monitor.timeout.connect(
-        lambda: app.quit() if errors or len(result["tracks"]) >= expected_count else None
-    )
+    if scenario == "controls":
+        result["transport"] = []
+        player.transportStateChanged.connect(result["transport"].append)
+        def advance_controls():
+            if errors:
+                app.quit()
+            elif player.transport_state == "playing":
+                player.pause()
+            elif player.transport_state == "paused":
+                player.stop()
+            elif "playing" in result["transport"] and player.transport_state == "stopped":
+                app.quit()
+        monitor.timeout.connect(advance_controls)
+    else:
+        monitor.timeout.connect(
+            lambda: app.quit() if errors or len(result["tracks"]) >= expected_count else None
+        )
     deadline = QtCore.QTimer()
     deadline.setSingleShot(True)
     deadline.timeout.connect(app.quit)
@@ -317,8 +324,12 @@ def _run_native_transport(scenario: str) -> None:
         result["durations"] = list(player._durations)
         result["state"] = player.transport_state
         assert not errors, errors
-        assert len(result["tracks"]) == expected_count, result
-        assert player.is_playing(), result
+        if scenario == "controls":
+            assert result["transport"][-3:] == ["playing", "paused", "stopped"], result
+            assert not player.is_playing(), result
+        else:
+            assert len(result["tracks"]) == expected_count, result
+            assert player.is_playing(), result
     finally:
         monitor.stop()
         deadline.stop()

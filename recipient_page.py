@@ -193,9 +193,10 @@ class RecipientPage(QtWidgets.QWidget):
     def focus_recipient(self) -> None:
         QtCore.QTimer.singleShot(
             0,
+            self.recipient_input,
             lambda: self.recipient_input.setFocus(
                 QtCore.Qt.OtherFocusReason
-            ),
+            ) if self.isVisible() else None,
         )
 
     def _clear_error(self) -> None:

@@ -1341,6 +1341,7 @@ class ThemeService(QtCore.QObject):
         ] = WeakKeyDictionary()
         self._reported_missing_assets: set[tuple[str, str]] = set()
         self._reported_asset_fallbacks: set[tuple[str, str, str]] = set()
+        self._disposed = False
 
         application = QtWidgets.QApplication.instance()
         if application is not None:
@@ -1996,6 +1997,8 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
 
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
         """Keep ordinary dialogs and runtime-created controls on the active theme."""
+        if self._disposed:
+            return False
         if (
             event.type() == QtCore.QEvent.Type.Show
             and isinstance(watched, QtWidgets.QDialog)
@@ -2036,7 +2039,7 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
         return None
 
     def _queue_semantic_refresh(self, root: QtWidgets.QWidget) -> None:
-        if self._semantic_refresh_pending.get(root, False):
+        if self._disposed or self._semantic_refresh_pending.get(root, False):
             return
         self._semantic_refresh_pending[root] = True
         QtCore.QTimer.singleShot(
@@ -2046,7 +2049,8 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
 
     def _refresh_semantic_root(self, root: QtWidgets.QWidget) -> None:
         try:
-            self.apply_semantic_styles(root)
+            if not self._disposed:
+                self.apply_semantic_styles(root)
         except RuntimeError:
             self._semantic_roots.pop(root, None)
         finally:
@@ -2057,10 +2061,18 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
     def _belongs_to_theme_host(self, widget: QtWidgets.QWidget) -> bool:
         current: QtWidgets.QWidget | None = widget
         while current is not None:
-            if str(current.property("letterSmithTheme") or ""):
+            if current in self._bindings or current in self._semantic_roots:
                 return True
             current = current.parentWidget()
         return False
+
+    def shutdown(self) -> None:
+        """Detach this host after confirmed shutdown; queued refreshes are inert."""
+        self._disposed = True
+        application = QtWidgets.QApplication.instance()
+        if application is not None:
+            application.removeEventFilter(self)
+        self._semantic_refresh_pending.clear()
 
     def apply(
         self,

@@ -2368,7 +2368,9 @@ class PlaylistPlayer(
             def deliver(*args) -> None:
                 if not self._shutdown and generation == self._source_generations[slot]:
                     callback(*args)
-            signal.connect(deliver)
+            # Native backend notifications must not re-enter transport teardown.
+            # The generation guard also rejects deliveries queued before Stop.
+            signal.connect(deliver, Qt.QueuedConnection)
             self._player_connections[slot].append((signal, deliver))
 
         connect(player.positionChanged, lambda value: self._on_position(slot, value))
@@ -4388,6 +4390,8 @@ class SoundTab(QtWidgets.QWidget):
     preview_widget = QtCore.Signal(QtWidgets.QWidget)
     _import_result_ready = QtCore.Signal(int, object)
     _import_error_ready = QtCore.Signal(int, str)
+    _repair_result_ready = QtCore.Signal(int, int, object)
+    _repair_error_ready = QtCore.Signal(int, str)
     _session_changed = QtCore.Signal(object)
 
     # Nexus/Forge synchronization signals.
@@ -4465,6 +4469,12 @@ class SoundTab(QtWidgets.QWidget):
         )
         self._import_error_ready.connect(
             self._accept_import_failed, QtCore.Qt.QueuedConnection,
+        )
+        self._repair_result_ready.connect(
+            self._accept_repair_finished, QtCore.Qt.QueuedConnection,
+        )
+        self._repair_error_ready.connect(
+            self._accept_repair_failed, QtCore.Qt.QueuedConnection,
         )
 
         self._preview = SoundPreviewWidget(
@@ -6168,29 +6178,11 @@ class SoundTab(QtWidgets.QWidget):
                 self._import_error_ready.emit(value, message)
         )
 
-        worker.finished.connect(
-            thread.quit
-        )
-
-        worker.failed.connect(
-            thread.quit
-        )
-
-        worker.finished.connect(
-            worker.deleteLater
-        )
-
-        worker.failed.connect(
-            worker.deleteLater
-        )
-
-        thread.finished.connect(
-            thread.deleteLater
-        )
-
-        thread.finished.connect(
-            self._clear_import_handles
-        )
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.DirectConnection)
+        thread.finished.connect(self._clear_import_handles, Qt.QueuedConnection)
 
         self._import_thread = thread
         self._import_worker = worker
@@ -6283,11 +6275,18 @@ class SoundTab(QtWidgets.QWidget):
             play_ui_sound(UiSound.ERROR)
             show_lettersmith_message(self, "Audio Import Error", detail)
 
+    @QtCore.Slot()
     def _clear_import_handles(
         self,
     ) -> None:
-        self._import_thread = None
+        thread = self._import_thread
+        if thread is not None and not thread.wait(0):
+            QtCore.QTimer.singleShot(10, self, self._clear_import_handles)
+            return
         self._import_worker = None
+        self._import_thread = None
+        if thread is not None:
+            thread.deleteLater()
 
         self._set_busy(
             False
@@ -6585,37 +6584,19 @@ class SoundTab(QtWidgets.QWidget):
         generation = self._background_generation
         worker.finished.connect(
             lambda repaired, issues, value=generation:
-                self._accept_repair_finished(value, repaired, issues)
+                self._repair_result_ready.emit(value, repaired, issues)
         )
 
         worker.failed.connect(
             lambda message, value=generation:
-                self._accept_repair_failed(value, message)
+                self._repair_error_ready.emit(value, message)
         )
 
-        worker.finished.connect(
-            thread.quit
-        )
-
-        worker.failed.connect(
-            thread.quit
-        )
-
-        worker.finished.connect(
-            worker.deleteLater
-        )
-
-        worker.failed.connect(
-            worker.deleteLater
-        )
-
-        thread.finished.connect(
-            thread.deleteLater
-        )
-
-        thread.finished.connect(
-            self._clear_repair_handles
-        )
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.DirectConnection)
+        thread.finished.connect(self._clear_repair_handles, Qt.QueuedConnection)
 
         self._repair_thread = thread
         self._repair_worker = worker
@@ -6628,6 +6609,7 @@ class SoundTab(QtWidgets.QWidget):
 
         thread.start()
 
+    @QtCore.Slot(int, int, object)
     def _accept_repair_finished(
         self,
         generation: int,
@@ -6637,6 +6619,7 @@ class SoundTab(QtWidgets.QWidget):
         if generation == self._background_generation and not self._shutdown:
             self._repair_finished(repaired, issues)
 
+    @QtCore.Slot(int, str)
     def _accept_repair_failed(self, generation: int, message: str) -> None:
         if generation == self._background_generation and not self._shutdown:
             self._repair_failed(message)
@@ -6681,11 +6664,18 @@ class SoundTab(QtWidgets.QWidget):
         )
         play_ui_sound(UiSound.ERROR)
 
+    @QtCore.Slot()
     def _clear_repair_handles(
         self,
     ) -> None:
-        self._repair_thread = None
+        thread = self._repair_thread
+        if thread is not None and not thread.wait(0):
+            QtCore.QTimer.singleShot(10, self, self._clear_repair_handles)
+            return
         self._repair_worker = None
+        self._repair_thread = None
+        if thread is not None:
+            thread.deleteLater()
         self._set_repair_action_enabled(True)
 
         self._set_busy(

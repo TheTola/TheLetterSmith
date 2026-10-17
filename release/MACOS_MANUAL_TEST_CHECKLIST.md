@@ -1,4 +1,4 @@
-# macOS 13+ native release acceptance
+# macOS 15+ native release acceptance
 
 Record the Mac model, OS version, CPU architecture, Python version, FFmpeg
 source/version/checksums, artifact checksum, signing Team ID, notary submission
@@ -6,7 +6,7 @@ ID, and tester for each run. Do not record credentials or private user data.
 
 ## Required environments
 
-- Clean macOS 13 user/profile on Apple Silicon.
+- Clean macOS 15 user/profile on Apple Silicon.
 - Native Apple Silicon smoke test of the packaged application.
 - Native Intel macOS smoke test of the x86_64 package.
 - Current light and dark appearance, Retina and external display coverage.

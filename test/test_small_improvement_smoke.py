@@ -248,97 +248,44 @@ class SmallImprovementSmokeTests(unittest.TestCase):
             saved = service.save_workspace_snapshot(reason="smoke-test")
             self.assertTrue((saved / "message" / "message.html").is_file())
 
-            play_dir, rebuilt = generate.ensure_play_bundle(
-                root,
-                seed_sfx=False,
-                force=True,
-            )
-            self.assertTrue(rebuilt)
-            self.assertTrue(
-                (play_dir / config.PLAY_METADATA_FILE).is_file()
-            )
-            self.assertTrue((play_dir / "prompt_writer_state.json").is_file())
-            prompt_state = {
-                "version": 6,
-                "subject": "Cached Prompt Writer state",
-                "generated_prompts": {
-                    "cover": "Exact cover prompt",
-                    "letter": "Exact letter prompt",
-                    "wall": "Exact wall prompt",
-                    "back": "Exact back prompt",
-                },
-            }
-            atomic_write_json(
-                root / "prompt_writer_state.json",
-                prompt_state,
-            )
-            cached_play_dir, cached_rebuilt = generate.ensure_play_bundle(
-                root,
-                seed_sfx=False,
-            )
-            self.assertEqual(cached_play_dir, play_dir)
-            self.assertFalse(cached_rebuilt)
-            cached_metadata = json.loads(
-                (play_dir / config.PLAY_METADATA_FILE).read_text(
-                    encoding="utf-8"
-                )
-            )
-            self.assertEqual(
-                cached_metadata["prompt_writer"]["state"],
-                prompt_state,
-            )
-            entry = SavedLetterCatalog(root).list_entries()[0]
+            from project_session import get_project_session, release_project_session
+            from forge_render import DISPLAY_MANIFEST
+            session = get_project_session(root)
+            self.addCleanup(release_project_session, root)
+            letter = next(page for page in session.project.pages if page["type"] == "letter")
+            prompt = "  Exact Wall / four-page prompt — 雪\n  "
+            session.project.update_prompt(letter["id"], {"text": prompt})
+            destination, stored = service.save_editable()
+            entry = SavedLetterCatalog(root)._entry(destination)
+            self.assertEqual((entry.page_count, entry.letter_count), (4, 1))
             self.assertIsNotNone(entry.cover_path)
-            self.assertEqual(entry.cover_path.name, "cover.thumbnail.png")
-            with Image.open(entry.cover_path) as thumbnail:
-                self.assertLessEqual(thumbnail.width, 336)
-                self.assertLessEqual(thumbnail.height, 184)
-            metadata = json.loads(
-                (play_dir / config.PLAY_METADATA_FILE).read_text(
-                    encoding="utf-8"
-                )
-            )
-            self.assertEqual(
-                metadata["cover_thumbnail_source_signature"]["version"],
-                1,
-            )
-            entry.cover_path.write_bytes(b"broken thumbnail")
-            update_saved_metadata(play_dir, root, evaluate_readiness(root))
-            with Image.open(entry.cover_path) as repaired_thumbnail:
-                repaired_thumbnail.verify()
-            thumbnail_stat = entry.cover_path.stat()
-            with Image.open(entry.cover_path) as repaired_thumbnail:
-                thumbnail_size = repaired_thumbnail.size
-            Image.new("RGB", thumbnail_size, (255, 0, 0)).save(
-                entry.cover_path,
-                format="PNG",
-            )
-            os.utime(
-                entry.cover_path,
-                ns=(thumbnail_stat.st_atime_ns, thumbnail_stat.st_mtime_ns),
-            )
-            update_saved_metadata(play_dir, root, evaluate_readiness(root))
-            with Image.open(entry.cover_path) as repaired_thumbnail:
-                self.assertNotEqual(
-                    repaired_thumbnail.getpixel((0, 0)),
-                    (255, 0, 0),
-                )
+            with Image.open(entry.cover_path) as cover:
+                cover.verify()
+            self.assertEqual(stored.project.get_prompt(letter["id"])["text"], prompt)
 
-            message.write_text("<p>Unsaved replacement.</p>", encoding="utf-8")
-            restored = SavedLetterRestorer(root).restore(entry)
-            self.assertEqual(restored.title, "Smoke Letter")
-            self.assertEqual(
-                message.read_text(encoding="utf-8"),
-                "<p>Round-trip smoke message.</p>",
-            )
+            play_dir, rebuilt = generate.ensure_play_bundle(root, seed_sfx=False, force=True)
+            self.assertTrue(rebuilt)
+            self.assertTrue((play_dir / DISPLAY_MANIFEST).is_file())
+            self.assertIn("Round-trip smoke message.", (play_dir / "index.html").read_text(encoding="utf-8"))
+            self.assertFalse((play_dir / "prompt_writer_state.json").exists())
+            self.assertFalse((play_dir / config.PLAY_METADATA_FILE).exists())
+            for path in play_dir.rglob("*"):
+                if path.is_file():
+                    self.assertNotIn(prompt.encode("utf-8"), path.read_bytes())
+            cached, rebuilt = generate.ensure_play_bundle(root, seed_sfx=False)
+            self.assertEqual(cached, play_dir)
+            self.assertFalse(rebuilt)
 
-            regenerated, was_rebuilt = generate.ensure_play_bundle(
-                root,
-                seed_sfx=False,
-                force=True,
-            )
-            self.assertTrue(was_rebuilt)
-            self.assertTrue((regenerated / "index.html").is_file())
+            changed = session.project.get_page(letter["id"])["message"]
+            changed["html"] = "<p>Unsaved replacement.</p>"
+            session.project.update_message(letter["id"], changed)
+            service.open_saved_project(entry)
+            self.assertEqual(session.project.get_page(letter["id"])["message"]["html"],
+                             "<p>Round-trip smoke message.</p>")
+            self.assertEqual(session.project.get_prompt(letter["id"])["text"], prompt)
+            regenerated, rebuilt = generate.ensure_play_bundle(root, seed_sfx=False, force=True)
+            self.assertTrue(rebuilt)
+            self.assertIn("Round-trip smoke message.", (regenerated / "index.html").read_text(encoding="utf-8"))
 
     def test_active_play_path_avoids_historical_bundle_scan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

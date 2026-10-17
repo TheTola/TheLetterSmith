@@ -74,7 +74,24 @@ Set `LETTER_SMITH_SIGNTOOL` only when SignTool is outside the Windows SDK paths;
 set `LETTER_SMITH_WINDOWS_TIMESTAMP_URL` only to override the default timestamp
 service. Certificate files and passwords are never stored in the repository.
 
-## macOS 13+
+## Isolated source verification
+
+Run all discovered `test/test_*.py` modules serially, each in a fresh process and
+runtime profile, without packaging or external network access:
+
+```powershell
+python release/verify_tests.py --output C:\Temp\lettersmith-verification
+```
+
+Use a new, short output path for each run. It retains per-module logs, profiles
+and `results.json`, including failures, skips, timeouts and the source revision.
+`--module test_ui_synchronization` selects a focused suite. The production release
+gate uses the same runner; isolated module processes prevent Qt singleton and
+renderer state from leaking between independent fixtures. No test module is
+excluded. Integrated multi-feature journeys still run together within their suite.
+Check out Git LFS assets (`git lfs checkout`) before resource validation.
+
+## macOS 15+
 
 The macOS application is a direct-download Developer ID distribution, not a Mac
 App Store package. Native build, signing, notarization, Gatekeeper, and clean-user
@@ -138,5 +155,5 @@ signatures, the Cocoa plugin, WebEngine helper/resources, resource sanitation,
 DMG integrity/mounting, and—when requested—notary acceptance, stapling, and
 Gatekeeper assessment. Complete the packaged-app and clean-profile checks in
 `release/MACOS_MANUAL_TEST_CHECKLIST.md` on both Apple Silicon and Intel. A real
-macOS 13 system is required to prove the stated minimum OS; newer CI runners do
+macOS 15 system is required to prove the stated minimum OS; newer CI runners do
 not substitute for that test.

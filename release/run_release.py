@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -96,27 +97,22 @@ def _preflight_release(platform_name: str) -> None:
 
 
 def _run_test_suite() -> None:
-    environment = dict(os.environ)
-    environment.setdefault("QT_QPA_PLATFORM", "offscreen")
-    environment.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+    evidence = Path(tempfile.mkdtemp(prefix="lsv-")) / "checks"
+    print(f"Isolated test evidence: {evidence}", flush=True)
     result = subprocess.run(
         [
             sys.executable,
-            "-m",
-            "unittest",
-            "discover",
-            "-s",
-            "test",
-            "-p",
-            "test_*.py",
+            str(PROJECT_ROOT / "release" / "verify_tests.py"),
+            "--output",
+            str(evidence),
         ],
         cwd=PROJECT_ROOT,
-        env=environment,
         check=False,
     )
     if result.returncode != 0:
         raise ReleasePipelineError(
-            f"The complete test suite failed with exit code {result.returncode}."
+            f"The complete test suite failed with exit code {result.returncode}. "
+            f"Evidence: {evidence}"
         )
 
 

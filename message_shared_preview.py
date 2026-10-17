@@ -128,6 +128,7 @@ class SharedMessagePreview(QtWidgets.QWidget):
         self._current = None
         self._retired = []
         self._view_released = True
+        self._unload_pending = False
         self._closed = False
         self._request_key = None
         self._resource_stamp = None
@@ -183,8 +184,14 @@ class SharedMessagePreview(QtWidgets.QWidget):
         if self._current is not None:
             self._retired.append(self._current[0])
             self._current = None
-        self._view_released = False
         self.view.hide()
+        if self._unload_pending:
+            return
+        if self._view_released and self.view.url().toString() in ("", "about:blank"):
+            self._cleanup_retired()
+            return
+        self._view_released = False
+        self._unload_pending = True
         self.view.setUrl(QtCore.QUrl("about:blank"))
 
     def _finished(self, revision, result):
@@ -209,12 +216,14 @@ class SharedMessagePreview(QtWidgets.QWidget):
         self._warning = ""
         self._resource_stamp = self.adapter.referenced_resource_stamp(render)
         self._view_released = False
+        self._unload_pending = False
         self.view.setUrl(QtCore.QUrl.fromLocalFile(str(Path(temporary.name) / "index.html")))
 
     def _loaded(self, ok):
         if self.view.url().toString() == "about:blank":
             if ok:
                 self._view_released = True
+                self._unload_pending = False
                 self._cleanup_retired()
             return
         if self._closed or self._current is None:
@@ -353,6 +362,7 @@ class SharedMessagePreview(QtWidgets.QWidget):
             self.invalidate()
             if not self._pool.waitForDone(timeout_ms):
                 return False
+            unloaded = self._view_released and not self._unload_pending
             remaining = max(0, timeout_ms - elapsed.elapsed())
             if not unloaded and remaining:
                 timer.start(remaining)

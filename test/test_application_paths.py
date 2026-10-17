@@ -616,6 +616,19 @@ TeamIdentifier=ABCDE12345
         self.assertEqual(result, 2)
         pipeline.assert_not_called()
 
+    def test_release_verification_isolates_runtime_and_retains_evidence(self) -> None:
+        from release.verify_tests import test_environment
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "profile"
+            with mock.patch.dict(os.environ, {"LETTER_SMITH_PROFILE_ROOT": "unrelated-profile"}):
+                environment = test_environment(profile)
+            self.assertEqual(environment["LETTER_SMITH_PROFILE_ROOT"], str(profile.resolve()))
+            self.assertEqual(environment["TEMP"], str(profile.resolve()))
+            self.assertEqual(environment["TMP"], str(profile.resolve()))
+            self.assertEqual(environment["QT_QPA_PLATFORM"], "offscreen")
+            self.assertIn("~NOTFOUND", environment["QTWEBENGINE_CHROMIUM_FLAGS"])
+            self.assertFalse(profile.exists())
+
     def test_frozen_runtime_uses_bundle_only_for_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

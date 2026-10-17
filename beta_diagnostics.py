@@ -28,6 +28,14 @@ MAX_REPORT_FILES = 20
 MAX_REPORT_BYTES = 25 * 1024 * 1024
 ACTION_SETTLE_MS = 1500
 
+# Resolve Qt enum aliases before installing a native event filter. Building
+# them during widget construction can trigger Python GC inside Qt destruction.
+_INSTRUMENT_EVENTS = frozenset((
+    QtCore.QEvent.Type.Polish, QtCore.QEvent.Type.Show,
+    QtCore.QEvent.Type.FocusIn, QtCore.QEvent.Type.KeyPress,
+    QtCore.QEvent.Type.MouseButtonPress, QtCore.QEvent.Type.Wheel,
+))
+
 _SAFE_OBJECT_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,80}")
 _PROTECTED_FIELD_NAME = re.compile(
     r"(?:password|passwd|secret|token|credential|authorization|device.?code)",
@@ -347,17 +355,11 @@ class BetaDiagnosticsController(QtCore.QObject):
                 continue
 
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if self._closed:
+            return False
         if (
-            isinstance(watched, QtWidgets.QWidget)
-            and event.type()
-            in {
-                QtCore.QEvent.Polish,
-                QtCore.QEvent.Show,
-                QtCore.QEvent.FocusIn,
-                QtCore.QEvent.KeyPress,
-                QtCore.QEvent.MouseButtonPress,
-                QtCore.QEvent.Wheel,
-            }
+            event.type() in _INSTRUMENT_EVENTS
+            and isinstance(watched, QtWidgets.QWidget)
         ):
             self._instrument_widget(watched)
         return False

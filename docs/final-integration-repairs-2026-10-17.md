@@ -1,0 +1,43 @@
+# Final integration repair record
+
+Baseline: `637da7f86475b243314579bf3242aa1ef8d12690`, clean integrated
+`codex/ui-synchronization`; work continues on `codex/final-integration`.
+No feature branch integration was necessary. All nine owner implementations are
+already ancestors of this candidate. The separate primary checkout and its dirty
+changes are excluded.
+
+| ID | Reproduction / observed defect | Authoritative repair | Regression evidence |
+|---|---|---|---|
+| FIX-01 | Cold/repeated Messages preview release navigated to blank repeatedly, restarting pending unloads and sometimes refusing shutdown. | `message_shared_preview.py` distinguishes released, unloading and loaded views. | `test_message_shared_preview` cold/repeated release regression; seven focused tests passed. |
+| FIX-02 | An old ThemeService styled another service's dialog; full single-process baseline entered repeated global restyling. | `ui_theme.py` limits ownership to its registered roots, makes queued callbacks inert on shutdown; Nexus disposes after preflight. | New foreign-host/disposal test failed before repair; 52 focused theme tests passed afterward. |
+| FIX-03 | A deferred recipient focus lambda accessed a deleted QLineEdit during later window transitions. | Qt context-bound timer in `recipient_page.py`. | `test_window_sizing.test_recipient_focus_callback_is_canceled_with_its_widget`; Command lifecycle 16 tests passed. |
+| FIX-04 | Diagnostics event filtering crashed during widget construction/GC while allocating Qt enum aliases on every event. | Cache typed event constants and ignore closed controllers in `beta_diagnostics.py`. | Two diagnostic native-abort reproductions; six focused privacy/diagnostic tests passed after repair. |
+| FIX-05 | Opening the rich-text style submenu used an invalid QAction wrapper; Update Style failed after collection. | Explicit QAction construction/parent ownership in `Editor.py`. | Existing real mouse/submenu test now includes GC; all 25 editor style tests passed. |
+| FIX-06 | Native Sound stop could stall; import completion intermittently aborted while releasing worker references. Repair callbacks also directly invoked UI consumers from worker lambdas. | Queue player notifications and repair results, use QObject slots for completion; retain native worker handles until nonblocking join confirms completion. | Native transport suite and real import callback reproduction; final combined results recorded separately. |
+
+## Verification infrastructure and justified expectation updates
+
+`release/verify_tests.py` runs all 55 discovered modules serially in isolated
+processes/profiles, records counts, skips, crashes and timeouts, denies Python
+writes outside the evidence root and external connections, and retains logs.
+The release test gate now uses it. Early runner errors concerning Windows extended
+paths and NUL were harness defects, corrected before candidate verification.
+
+Existing tests referenced removed four-card Images controls, an automatic close
+retry predating Save/Discard/Cancel, obsolete button dimensions/headings, collapsed
+playlist duplicates and private prompts in display packages. They now exercise
+the actual selected-page controls, explicit exit retry, content-sized labels,
+repeated playlist occurrences and separate editable/display persistence. The
+publication-control fixture supplies a real active Letter message before asserting
+final-output readiness. No persistence/renderer implementation is mocked to obtain
+these results. Native transport controls use the real application event loop,
+instead of the nested QTest wait that stalled inside the installed backend.
+
+The resource-input gate initially found a Git LFS pointer for `com.gif`. Local
+`git lfs checkout` restored the existing object. Existing local FFmpeg binaries
+were copied only after matching the repository's pinned hashes. No dependency
+upgrade or external media download was needed. macOS documentation now matches
+the manifest's 15.0 minimum; no macOS run is implied.
+
+Final verification, graphical evidence, unresolved cases and delivery status are
+recorded in the final verification report and requirements matrix.

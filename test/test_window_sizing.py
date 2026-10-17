@@ -38,6 +38,15 @@ class WindowSizingTests(unittest.TestCase):
         install_button_text_guard(cls.app)
         install_window_placement_guard(cls.app)
 
+    def test_recipient_focus_callback_is_canceled_with_its_widget(self):
+        from recipient_page import RecipientPage
+        page = RecipientPage()
+        page.show()
+        page.focus_recipient()
+        page.deleteLater()
+        self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        self.app.processEvents()
+
     def test_window_controller_only_observes_live_widgets_and_disposes_repeatedly(self):
         for _ in range(20):
             window = QtWidgets.QWidget()
@@ -717,11 +726,19 @@ class WindowSizingTests(unittest.TestCase):
         with self.window() as window:
             tab = window.sound_tab
             callbacks = []
+            busy_threads = []
+            set_busy = tab._set_busy
+            def checked_busy(*args, **kwargs):
+                busy_threads.append(QtCore.QThread.currentThread())
+                self.assertEqual(QtCore.QThread.currentThread(), self.app.thread())
+                return set_busy(*args, **kwargs)
             with mock.patch.object(tab, "_import_finished", side_effect=lambda payload: callbacks.append(
                 ("success", QtCore.QThread.currentThread()),
             )), mock.patch.object(tab, "_import_failed", side_effect=lambda message: callbacks.append(
                 ("failure", QtCore.QThread.currentThread()),
-            )):
+            )), mock.patch.object(tab, "_set_busy", side_effect=checked_busy), \
+                 mock.patch.object(tab, "_repair_finished", side_effect=lambda *_: callbacks.append(
+                     ("repair", QtCore.QThread.currentThread()))):
                 for path in (
                     ROOT / "resources/stock/music/stock song Background Music.mp3",
                     Path(window.project_root) / "missing.mp3",
@@ -733,13 +750,21 @@ class WindowSizingTests(unittest.TestCase):
                         QtTest.QTest.qWait(10)
                     self.assertIsNone(tab._import_thread)
                 self.assertEqual([kind for kind, thread in callbacks], ["success", "failure"])
+                tab.repair_music_archive()
+                elapsed.restart()
+                while tab._repair_thread is not None and elapsed.elapsed() < 5000:
+                    QtTest.QTest.qWait(10)
+                self.assertIsNone(tab._repair_thread)
+                self.assertEqual(callbacks[-1][0], "repair")
+                self.assertTrue(busy_threads)
                 self.assertTrue(all(thread == self.app.thread() for kind, thread in callbacks))
                 previous_generation = tab._background_generation
                 tab._background_generation += 1
                 tab._import_result_ready.emit(previous_generation, [])
                 tab._import_error_ready.emit(previous_generation, "stale result")
+                tab._repair_result_ready.emit(previous_generation, 0, [])
                 self.app.processEvents()
-                self.assertEqual(len(callbacks), 2)
+                self.assertEqual(len(callbacks), 3)
 
     def test_window_geometry_invalid_saved_value_keeps_other_settings(self) -> None:
         with self.window(settings={
@@ -1018,6 +1043,7 @@ class WindowSizingTests(unittest.TestCase):
             Image.new("RGB", (24, 36), "blue").save(source)
             started, release = threading.Event(), threading.Event()
             stage_import = tab.artwork.stage_import
+            stop_import = tab._stop_import
             prepared = []
 
             def slow_stage(path):
@@ -1027,7 +1053,8 @@ class WindowSizingTests(unittest.TestCase):
                 release.wait(10)
                 return result
 
-            with mock.patch.object(tab.artwork, "stage_import", side_effect=slow_stage):
+            with mock.patch.object(tab.artwork, "stage_import", side_effect=slow_stage), \
+                 mock.patch.object(tab, "_stop_import", side_effect=lambda _timeout: stop_import(0)):
                 try:
                     self.assertTrue(tab.import_image(identity, str(source)))
                     for _ in range(200):
@@ -1039,22 +1066,30 @@ class WindowSizingTests(unittest.TestCase):
                     self.assertFalse(window.shutdown())
                     self.assertFalse(window._shutdown_complete)
                     self.assertFalse(tab._shutdown)
-                    window.close()
+                    with mock.patch("project_lifecycle.QtWidgets.QMessageBox.question",
+                                    return_value=QtWidgets.QMessageBox.Discard):
+                        window.close()
                     self.assertTrue(window.isVisible())
                     self.assertTrue(tab._image_import_thread.isRunning())
-                    self.assertTrue(window._close_after_image_import)
+                    self.assertFalse(window.project_lifecycle.busy)
                 finally:
                     release.set()
                     for _ in range(400):
-                        if window._shutdown_complete:
+                        if tab._image_import_thread is None:
                             break
                         QtTest.QTest.qWait(10)
                         time.sleep(0.005)
-                self.assertTrue(window._shutdown_complete)
-                self.assertFalse(window.isVisible())
+                self.assertFalse(window._shutdown_complete)
+                self.assertTrue(window.isVisible())
                 self.assertEqual(session.project.get_page(identity), original)
                 self.assertTrue(prepared)
                 self.assertFalse(prepared[0]._directory.exists())
+                with mock.patch("project_lifecycle.QtWidgets.QMessageBox.question",
+                                return_value=QtWidgets.QMessageBox.Discard):
+                    window.close()
+                    self.app.processEvents()
+                self.assertTrue(window._shutdown_complete)
+                self.assertFalse(window.isVisible())
     def test_prompt_writer_images_launcher_targets_each_page_without_provider_sign_in(self) -> None:
         from project_model import create_project
         from project_session import get_project_session

@@ -748,7 +748,7 @@ class SoundArchivePreviewTests(unittest.TestCase):
             self.assertEqual(records[canonical_id].source_kind, "stock")
             self.assertEqual(
                 state.playlist,
-                [canonical_id, user_record.track_id],
+                [canonical_id, user_record.track_id, canonical_id],
             )
             self.assertEqual(state.selected_track_id, canonical_id)
 

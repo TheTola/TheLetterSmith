@@ -81,6 +81,30 @@ class ThemeServiceTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 
+    def test_dialog_theme_events_belong_to_their_host(self) -> None:
+        host, other_host = QtWidgets.QWidget(), QtWidgets.QWidget()
+        service = ThemeService(self.root, parent=host)
+        other = ThemeService(self.root, parent=other_host)
+        service.apply(host)
+        other.apply(other_host)
+        dialog = QtWidgets.QDialog(other_host)
+        try:
+            with mock.patch.object(service, "apply_semantic_styles", wraps=service.apply_semantic_styles) as apply:
+                dialog.show()
+                self.app.processEvents()
+                apply.assert_not_called()
+            service.shutdown()
+            with mock.patch.object(service, "apply_semantic_styles") as apply:
+                service._queue_semantic_refresh(host)
+                service._refresh_semantic_root(host)
+                self.app.processEvents()
+                apply.assert_not_called()
+        finally:
+            dialog.close()
+            host.deleteLater()
+            other_host.deleteLater()
+            self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
     def test_semantic_refresh_coalesces_style_events_from_its_own_pass(self) -> None:
         service = ThemeService(self.root)
         root = QtWidgets.QWidget()

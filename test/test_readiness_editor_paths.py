@@ -311,6 +311,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             "_project_release_error",
             "sound worker is still active",
         )
+        forge._release_preview_files = lambda: ForgeTab._release_preview_files(forge)
 
         released = ForgeTab._release_project_files_for_restore(forge)
 
@@ -858,10 +859,9 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 )
 
                 service.apply_semantic_styles(tab)
-                self.assertEqual(
-                    tab.unpublish_btn.size(),
-                    tab.github_account_btn.size(),
-                )
+                self.assertEqual(tab.unpublish_btn.height(), tab.github_account_btn.height())
+                for button in (tab.unpublish_btn, tab.github_account_btn):
+                    self.assertGreaterEqual(button.width(), button.sizeHint().width())
                 theme_backgrounds = set()
                 for action, button in buttons.items():
                     background = str(button.property("forgeActionBackground"))
@@ -2553,8 +2553,8 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             labels = {button.text() for button in dialog.findChildren(QtWidgets.QPushButton)}
             self.assertEqual(labels & {"Preview", "Show Original", "Repair Archive", "Close"}, set())
             self.assertIn("Rename Title", labels)
-            self.assertIn("Delete", labels)
-            self.assertIn("Use Selected", labels)
+            self.assertIn("Delete from Archive", labels)
+            self.assertIn("Use Track", labels)
             self.assertFalse(dialog.rename_btn.isEnabled())
             dialog.table.selectRow(0)
             self.app.processEvents()

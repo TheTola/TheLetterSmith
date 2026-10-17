@@ -580,3 +580,14 @@ with TemporaryDirectory() as temporary:
 Synthetic fixtures are `test/test_project_model.py:five_page_project` and
 `legacy_fixture`. They exercise real APIs without private content. The future
 multi-message editor UI is not implied by model or storage support.
+
+## Final integration lifecycle clarification
+
+Native Sound notifications and import/repair results enter the UI through queued,
+generation-checked slots. A worker's `finished` notification is not permission to
+destroy its Python/native handles before `QThread.wait(0)` confirms completion.
+Cleanup retries through the owning widget's timer, retaining the busy state and
+the existing bounded shutdown/cancel policy. No other application's workers are
+terminated. `ThemeService.shutdown()` detaches its application event filter only
+after shutdown preflight succeeds; canceled transitions retain it. An unloaded
+Messages preview releases without creating a browser or restarting an unload.

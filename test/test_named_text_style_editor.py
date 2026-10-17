@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import gc
 import tempfile
 import unittest
 from dataclasses import replace
@@ -433,6 +434,7 @@ class NamedTextStyleEditorTests(unittest.TestCase):
         self._select(editor, 0, len(editor.editor.toPlainText()))
         menu = editor.named_style_menu
         title_action = menu.actions()[STYLE_KEYS.index("title")]
+        gc.collect()
         menu.popup(editor.btn_named_style.mapToGlobal(QtCore.QPoint(0, 34)))
         self.app.processEvents()
         rect = menu.actionGeometry(title_action)

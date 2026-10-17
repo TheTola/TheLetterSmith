@@ -193,6 +193,22 @@ class SharedMessagesPreviewTests(unittest.TestCase):
         self.open_preview(self.a)
         self.assertEqual(self.preview.viewed_page_id, self.a)
 
+    def test_empty_release_does_not_start_a_browser_or_restart_pending_unload(self):
+        self.assertTrue(self.preview.release())
+        with mock.patch.object(self.preview.view, "setUrl", wraps=self.preview.view.setUrl) as navigate:
+            for _ in range(5):
+                self.preview.invalidate()
+                self.assertTrue(self.preview.release())
+            navigate.assert_not_called()
+        self.open_preview(self.a)
+        with mock.patch.object(self.preview.view, "setUrl", wraps=self.preview.view.setUrl) as navigate:
+            self.preview.invalidate()
+            self.preview.invalidate()
+            self.assertTrue(self.preview.release())
+            self.assertEqual(navigate.call_count, 1)
+        self.open_preview(self.b)
+        self.assertEqual(self.preview.viewed_page_id, self.b)
+
     def test_unrelated_edits_do_not_build_and_external_failure_retains_preview(self):
         self.open_preview(self.a)
         original = self.preview._current

@@ -1952,7 +1952,8 @@ class Editor(QDialog):
                     lambda key=key: self._apply_named_style(key),
                 )
             )
-            update_action = submenu.addAction(f"Update {label} to match")
+            update_action = QAction(f"Update {label} to match", submenu)
+            submenu.addAction(update_action)
             update_action.triggered.connect(
                 self._guarded_action(
                     f"Update {label}",

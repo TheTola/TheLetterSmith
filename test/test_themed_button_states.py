@@ -431,35 +431,15 @@ class ThemedButtonStateTests(unittest.TestCase):
         self.addCleanup(lambda: forge.shutdown(timeout_ms=1000))
         self.addCleanup(lambda: message.shutdown(timeout_ms=1000))
 
-        self.assertEqual(image.reset_btn._artwork_filename, "CButton.png")
-        self.assertEqual(image.open_btn._artwork_filename, "CButton.png")
-        self.assertFalse(image.reset_btn.isEnabled())
-        self.assertFalse(image.open_btn.isEnabled())
-        self.assertEqual(
-            image.reset_btn.semantic_state,
-            ButtonSemanticState.BROKEN,
-        )
-        self.assertEqual(
-            image.reset_btn.visual_semantic_state,
-            ButtonSemanticState.BROKEN,
-        )
-        self.assertEqual(
-            image.open_btn.semantic_state,
-            ButtonSemanticState.BROKEN,
-        )
-        clear_spy = QtTest.QSignalSpy(image.cards[1].clear_requested)
-        image.cards[1].clear_btn.click()
-        self.assertEqual(clear_spy.count(), 0)
-        with mock.patch("Image_tab.clear_slot_asset") as clear_slot:
-            image.clear_image(1)
-        clear_slot.assert_not_called()
-        for card in image.cards.values():
-            self.assertEqual(card.clear_btn._artwork_filename, "AButton.png")
-            self.assertFalse(card.clear_btn.isEnabled())
-            self.assertEqual(
-                card.clear_btn.semantic_state,
-                ButtonSemanticState.BROKEN,
-            )
+        self.assertFalse(image.clear_action.isEnabled())
+        self.assertFalse(image.crop_button.isEnabled())
+        self.assertTrue(image.import_button.isEnabled())
+        self.assertTrue(image.stock_button.isEnabled())
+        self.assertTrue(image.card.clear_btn.isHidden())
+        self.assertTrue(image.card.settings_btn.isHidden())
+        before = image.session.project.to_dict()
+        image.clear_action.trigger()
+        self.assertEqual(image.session.project.to_dict(), before)
 
         self.assertEqual(sound.single_action_btn._artwork_filename, "BButton.png")
         self.assertEqual(sound.create_playlist_btn._artwork_filename, "BButton.png")
@@ -549,15 +529,15 @@ class ThemedButtonStateTests(unittest.TestCase):
 
         self.assertEqual(message.btn._artwork_filename, "FButton.png")
         self.assertEqual(message.edit_btn._artwork_filename, "GButton.png")
-        self.assertEqual(message.edit_btn.text(), "Write Letter")
+        self.assertEqual(message.edit_btn.text(), "Edit")
         self.assertEqual(message.revisions_btn._artwork_filename, "HButton.png")
         for button in (message.btn, message.edit_btn, message.revisions_btn):
             self.assertTrue(button.isEnabled())
             self.assertEqual(button.semantic_state, ButtonSemanticState.NORMAL)
 
         expected_headings = (
-            (image.heading, "Select images for your letter"),
-            (sound.heading, "Select music for your letter"),
+            (image.heading, "Pages"),
+            (sound.heading, "Available Music"),
             (message.heading, "Write your letter’s message"),
             (forge.heading_title, "Review and forge your letter"),
         )
@@ -632,69 +612,31 @@ class ThemedButtonStateTests(unittest.TestCase):
         self.addCleanup(image.deleteLater)
         pages = self.root / USER_PAGES_DIR
         pages.mkdir(parents=True, exist_ok=True)
-        cover = pages / "cover.png"
+        cover = self.root / "selected.png"
         self.assertTrue(
             QtGui.QImage(12, 12, QtGui.QImage.Format_ARGB32).save(str(cover))
         )
 
+        identity = image.session.selected_page_id
+        target = image.artwork.capture_target(identity)
+        self.assertTrue(image.artwork.apply_import(target, image.artwork.stage_import(cover)))
         image.refresh_cards()
         self.assertTrue(image.has_meaningful_images())
-        self.assertTrue(image.cards[1].clear_btn.isEnabled())
-        self.assertTrue(image.reset_btn.isEnabled())
-        self.assertTrue(image.open_btn.isEnabled())
-
-        image._image_import_thread = object()
-        image._image_import_index = 2
-        image._sync_image_action_state()
-        self.assertEqual(
-            image.cards[1].clear_btn.semantic_state,
-            ButtonSemanticState.NORMAL,
-        )
-        self.assertEqual(
-            image.cards[2].clear_btn.semantic_state,
-            ButtonSemanticState.BROKEN,
-        )
-        self.assertEqual(
-            image.cards[3].clear_btn.semantic_state,
-            ButtonSemanticState.BROKEN,
-        )
-        self.assertEqual(
-            image.reset_btn.semantic_state,
-            ButtonSemanticState.NORMAL,
-        )
-        self.assertTrue(image.cards[1].clear_btn.is_invisible)
-        self.assertTrue(image.cards[2].clear_btn.is_invisible)
-        self.assertTrue(image.cards[3].clear_btn.is_invisible)
-        self.assertTrue(image.reset_btn.is_invisible)
-        self.assertEqual(
-            image.open_btn.semantic_state,
-            ButtonSemanticState.NORMAL,
-        )
-        self.assertTrue(image.open_btn.is_invisible)
-        for card in image.cards.values():
-            self.assertFalse(card.thumbnail.isEnabled())
-            effect = card.thumbnail.graphicsEffect()
-            self.assertIsInstance(effect, QtWidgets.QGraphicsOpacityEffect)
-            self.assertAlmostEqual(effect.opacity(), 0.52)
-        self.assertFalse(image.reset_btn.isEnabled())
-        image._image_import_thread = None
-        image._image_import_index = None
-        image._sync_image_action_state()
-
-        cover.unlink()
-        (pages / "lettersmith-images.json").write_text(
-            '{"schema_version": 1, "slots": {}}',
-            encoding="utf-8",
-        )
+        self.assertTrue(image.clear_action.isEnabled())
+        self.assertTrue(image.crop_button.isEnabled())
+        second = image.session.project.pages[1]["id"]
+        image.session.select_page(second)
         image.refresh_cards()
+        self.assertFalse(image.clear_action.isEnabled())
+        self.assertTrue(image.import_button.isEnabled())
+        image.session.select_page(identity)
+        image.refresh_cards()
+        self.assertTrue(image.clear_action.isEnabled())
+        image.clear_page_image(identity)
         self.assertFalse(image.has_meaningful_images())
-        self.assertFalse(image.cards[1].clear_btn.isEnabled())
-        self.assertFalse(image.reset_btn.isEnabled())
-        self.assertFalse(image.open_btn.isEnabled())
-        self.assertEqual(
-            image.open_btn.semantic_state,
-            ButtonSemanticState.BROKEN,
-        )
+        self.assertFalse(image.clear_action.isEnabled())
+        self.assertFalse(image.crop_button.isEnabled())
+        self.assertTrue(cover.is_file())
 
     def test_review_uses_theme_artwork_without_becoming_invisible(self) -> None:
         forge = ForgeTab(self.root)
@@ -850,7 +792,7 @@ class ThemedButtonStateTests(unittest.TestCase):
             (margins.left(), margins.top(), margins.right(), margins.bottom()),
             (28, 22, 28, 24),
         )
-        self.assertEqual(sound.layout().spacing(), 18)
+        self.assertEqual(sound.layout().spacing(), 8)
         self.assertGreaterEqual(sound.single_panel.layout().spacing(), 16)
         self.assertGreaterEqual(sound.playlist_panel.layout().spacing(), 14)
 
@@ -894,52 +836,22 @@ class ThemedButtonStateTests(unittest.TestCase):
         image = ImageTab(self.root)
         self.addCleanup(image.deleteLater)
         image.show()
-        settings_button = image.cards[1].settings_btn
-        settings_button.setVisible(True)
         repository = Path(__file__).resolve().parents[1]
-        service = ThemeService(
-            repository,
-            settings=SettingsStore(self.root),
-        )
-
-        for theme_id in (
-            "cyber_forge",
-            "obsidian_forge",
-            "velvet_rose",
-            "celestial_rose",
-        ):
+        service = ThemeService(repository, settings=SettingsStore(self.root))
+        self.addCleanup(service.shutdown)
+        for theme_id in ("cyber_forge", "obsidian_forge", "velvet_rose", "celestial_rose", "dark", "light"):
             service.set_theme(theme_id, persist=False)
             image.apply_theme_assets(service)
             service.apply_semantic_styles(image)
             self.app.processEvents()
             with self.subTest(theme_id=theme_id):
-                self.assertEqual(settings_button.size(), QtCore.QSize(44, 44))
-                self.assertEqual(
-                    image.reset_btn.size(),
-                    BUTTON_TIER_STYLES[ButtonTier.LARGE].size,
-                )
-                self.assertEqual(image.open_btn.size(), image.reset_btn.size())
-                self.assertAlmostEqual(
-                    image.reset_btn.font().pointSizeF(),
-                    BUTTON_TIER_STYLES[ButtonTier.LARGE].font_point_size,
-                )
-
-        for theme_id in ("dark", "light"):
-            service.set_theme(theme_id, persist=False)
-            image.apply_theme_assets(service)
-            service.apply_semantic_styles(image)
-            self.app.processEvents()
-            with self.subTest(theme_id=theme_id):
-                self.assertEqual(settings_button.size(), QtCore.QSize(44, 44))
-                self.assertEqual(
-                    image.reset_btn.size(),
-                    BASIC_BUTTON_TIER_STYLES[ButtonTier.LARGE].size,
-                )
-                self.assertEqual(image.open_btn.size(), image.reset_btn.size())
-                self.assertAlmostEqual(
-                    image.reset_btn.font().pointSizeF(),
-                    BUTTON_TIER_STYLES[ButtonTier.LARGE].font_point_size,
-                )
+                for button in (image.import_button, image.stock_button, image.crop_button, image.pwrite_fab):
+                    self.assertTrue(button.text())
+                    self.assertTrue(button.accessibleName())
+                    self.assertGreaterEqual(button.width(), button.minimumSizeHint().width())
+                    self.assertGreaterEqual(button.height(), button.minimumSizeHint().height())
+                self.assertTrue(image.card.settings_btn.isHidden())
+                self.assertTrue(image.animation_button.isHidden())
 
     def test_forge_long_action_typography_tracks_all_six_themes(self) -> None:
         forge = ForgeTab(self.root)
@@ -1392,6 +1304,12 @@ class ThemedButtonStateTests(unittest.TestCase):
         forge = ForgeTab(self.root)
         self.addCleanup(forge.deleteLater)
         self.addCleanup(lambda: forge.shutdown(timeout_ms=1000))
+        from project_session import get_project_session
+        session = get_project_session(self.root)
+        letter = next(page for page in session.project.pages if page["type"] == "letter")
+        document = session.project.get_message(letter["id"])
+        document["html"] = "<p>Synthetic publishable message.</p>"
+        session.project.update_message(letter["id"], document)
         forge._project_fingerprint = "published-fingerprint"
 
         forge._update_letter_action_button_states(evaluate_readiness(self.root))
@@ -1404,7 +1322,7 @@ class ThemedButtonStateTests(unittest.TestCase):
 
         (self.root / USER_PAGES_DIR / "cover.png").unlink()
         forge._update_letter_action_button_states(evaluate_readiness(self.root))
-        self.assertEqual(forge.preview_btn.semantic_state, ButtonSemanticState.BROKEN)
+        self.assertEqual(forge.preview_btn.semantic_state, ButtonSemanticState.NORMAL)
         self.assertEqual(forge.publish_btn.semantic_state, ButtonSemanticState.NORMAL)
         self.assertTrue(forge.publish_btn.is_invisible)
         self.assertFalse(forge.publish_btn.isEnabled())
@@ -1434,10 +1352,12 @@ class ThemedButtonStateTests(unittest.TestCase):
             }
         )
         SettingsStore(self.root).update_fields(clear_publication_state())
+        from project_session import get_project_session
+        get_project_session(self.root).synchronize_workspace()
         restored = evaluate_readiness(self.root)
         forge._update_letter_action_button_states(restored)
         self.assertEqual(forge.preview_btn.semantic_state, ButtonSemanticState.NORMAL)
-        self.assertEqual(forge.publish_btn.semantic_state, ButtonSemanticState.NORMAL)
+        self.assertEqual(forge.publish_btn.semantic_state, ButtonSemanticState.NORMAL, str(restored))
         self.assertEqual(
             forge.open_published_btn.semantic_state,
             ButtonSemanticState.BROKEN,
@@ -1616,14 +1536,13 @@ class ThemedButtonStateTests(unittest.TestCase):
 
         image = ImageTab(self.root)
         self.addCleanup(image.deleteLater)
-        self.assertIsNone(image.image_paths[3])
-        self.assertFalse(image.cards[3].clear_btn.isEnabled())
-        self.assertEqual(
-            image.cards[3].clear_btn.semantic_state,
-            ButtonSemanticState.BROKEN,
-        )
-        self.assertFalse(image.reset_btn.isEnabled())
-        self.assertFalse(image.open_btn.isEnabled())
+        letter = next(page for page in image.session.project.pages if page["type"] == "letter")
+        image.session.select_page(letter["id"])
+        image.refresh_cards()
+        self.assertIsNone(image.artwork.resolve_asset(letter["id"]))
+        self.assertFalse(image.clear_action.isEnabled())
+        self.assertFalse(image.crop_button.isEnabled())
+        self.assertFalse(image.has_meaningful_images())
 
         for name in ("cover.png", "letter.png", "back.png"):
             self.assertTrue(

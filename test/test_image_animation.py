@@ -1061,7 +1061,11 @@ class ImageAnimationTests(unittest.TestCase):
                     )
 
         card.clear_pixmap()
-        self.assertEqual(card.thumbnail.size(), QtCore.QSize(150, 165))
+        self.assertEqual(card.thumbnail.text(), "Click to select image")
+        self.assertTrue(card.thumbnail.pixmap().isNull())
+        self.assertTrue(card.contentsRect().contains(card.thumbnail.geometry()))
+        self.assertLessEqual(card.thumbnail.width(), 170)
+        self.assertLessEqual(card.thumbnail.height(), 157)
 
     def test_animated_gif_thumbnail_frame_follows_movie(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
