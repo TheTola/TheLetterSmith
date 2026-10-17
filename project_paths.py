@@ -443,6 +443,14 @@ def application_paths(project_root: str | Path | None = None) -> ApplicationPath
         root = _resolved(project_root)
         if root in {configured.workspace_root, configured.resource_root}:
             return configured
+    elif os.environ.get("LETTER_SMITH_PROFILE_ROOT", "").strip():
+        # Imports such as config can read settings before Main configures paths.
+        # Honor the isolation override at that boundary as well as after startup.
+        runtime = ApplicationPaths.for_runtime()
+        if project_root is None or _resolved(project_root) in {
+            runtime.workspace_root, runtime.resource_root,
+        }:
+            return runtime
     if project_root is None:
         return ApplicationPaths.for_project(Path(__file__).resolve().parent)
     return ApplicationPaths.for_project(project_root)

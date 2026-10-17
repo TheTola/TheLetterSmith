@@ -47,6 +47,14 @@ class WindowSizingTests(unittest.TestCase):
         self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
         self.app.processEvents()
 
+    def test_button_guard_does_not_read_text_during_destruction(self):
+        button = QtWidgets.QPushButton("Live")
+        guard = self.app._lettersmith_button_text_fit_guard
+        with mock.patch.object(button, "text", side_effect=AssertionError("read dying widget")):
+            self.assertFalse(guard.eventFilter(button, QtCore.QEvent(QtCore.QEvent.DeferredDelete)))
+        button.deleteLater()
+        self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
     def test_window_controller_only_observes_live_widgets_and_disposes_repeatedly(self):
         for _ in range(20):
             window = QtWidgets.QWidget()
@@ -297,18 +305,26 @@ class WindowSizingTests(unittest.TestCase):
                             self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
                             self.assertEqual(window.size(), QtCore.QSize(*size))
                             self.assertEqual(window.body_layout.direction(), QtWidgets.QBoxLayout.TopToBottom)
-                            preview_bottom = window.preview_frame.mapTo(
-                                window.body, QtCore.QPoint(0, window.preview_frame.height()),
-                            ).y()
-                            self.assertLessEqual(preview_bottom, window.page_stack.y())
-                            self.assertGreaterEqual(window.preview_frame.height(), 40)
+                            if index == 1:
+                                preview_bottom = window.preview_frame.mapTo(
+                                    window.body, QtCore.QPoint(0, window.preview_frame.height()),
+                                ).y()
+                                self.assertLessEqual(preview_bottom, window.page_stack.y())
+                                self.assertGreaterEqual(window.preview_frame.height(), 40)
+                            else:
+                                self.assertFalse(window.preview_frame.isVisibleTo(window))
+                                workspace = window.message_tab.messages_workspace
+                                self.assertTrue(workspace.isVisibleTo(window))
                             controls = ((sound.stock_btn, sound.archive_btn, sound.clear_btn,
                                          sound.play_btn, sound.volume, sound.status,
                                          sound.single_action_btn if mode == 0 else sound.add_track_btn)
                                         if index == 1 else
-                                        (window.message_tab.title_input, window.message_tab.url_input,
-                                         window.message_tab.overlay_opacity_slider, window.message_tab.btn,
-                                         window.message_tab.edit_btn, window.message_tab.revisions_btn))
+                                        (workspace.selector, workspace.background_button,
+                                         workspace.preview_toggle, workspace.heading,
+                                         workspace.add_button) if workspace.empty.isVisibleTo(window) else
+                                        (workspace.selector, workspace.background_button,
+                                         workspace.import_button, workspace.clear_button,
+                                         workspace.save_button, workspace.layout_button))
                             for control in controls:
                                 rect = QtCore.QRect(control.mapTo(scroll.viewport(), QtCore.QPoint()), control.size())
                                 self.assertTrue(scroll.viewport().rect().contains(rect), (control, rect))

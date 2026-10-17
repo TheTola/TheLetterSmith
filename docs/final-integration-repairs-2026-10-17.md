@@ -41,3 +41,31 @@ the manifest's 15.0 minimum; no macOS run is implied.
 
 Final verification, graphical evidence, unresolved cases and delivery status are
 recorded in the final verification report and requirements matrix.
+
+## Additional combined-run findings
+
+- FIX-07: importing configuration before Main configured paths normalized the
+  verification checkout's `settings.json` despite an explicit profile override.
+  `application_paths()` now resolves that override before bootstrap for runtime
+  resource/workspace roots while retaining explicit synthetic project roots.
+  `test_profile_applies_before_bootstrap_without_mutating_resource_settings`
+  exercises real SettingsStore writes and checks master bytes. 25 path tests passed.
+- FIX-08: the application-wide text-fit filter read button text during unrelated
+  destruction events; frame/placement filters also allocated event collections
+  and inspected unrelated objects. Gate by event type before accessing widgets and
+  cache frame/launcher event sets. The new destruction regression passed; the
+  repeated window-sizing module completed 35 tests with three native-only skips.
+  Earlier native abort traces are retained; a bounded passing run is not a claim
+  about every Qt backend or sustained stress load.
+- Legacy curtain tests now create independent synthetic legacy packages without
+  a canonical snapshot and explicitly refresh the derived catalog. Editing a
+  presentation sidecar cannot override a current editable snapshot. Eleven tests
+  passed. Identity/shutdown tests now use the Messages-owned combined preview and
+  real Nexus shutdown; 31 tests passed. Resizing checks target the actual current
+  Messages controls. The synthetic external folder-move scenario uses the existing
+  bounded Windows sharing retry; its injected delete failure remains asserted.
+
+The optional startup appearance popup could not be targeted by the native
+inspection tool. Its event loop was confirmed waiting, not a startup crash.
+Packaged smoke checks use an existing synthetic appearance preference. The
+experimental window-title change was reverted; no appearance behavior changed.

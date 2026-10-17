@@ -267,7 +267,8 @@ class SavedProjectTests(unittest.TestCase):
         self.assertEqual(self.service.read_saved_project(latest).project.project_id, stored.project.project_id)
         self.catalog.list_entries(force_refresh=True)
         moved = entry.path.with_name(entry.path.name + "-external")
-        entry.path.rename(moved)
+        from transactional_io import _with_transient_retry
+        _with_transient_retry(lambda: entry.path.rename(moved))
         with self.assertRaisesRegex(ProjectSaveError, "location is missing"):
             self.service.read_saved_project(latest)
         missing = next(item for item in self.catalog.list_entries(force_refresh=True) if item.path == entry.path)

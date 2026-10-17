@@ -233,7 +233,7 @@ class IdentityFieldLockingTests(unittest.TestCase):
             self.assertEqual(len(palettes), 6)
             root.deleteLater()
 
-    def test_message_preview_reserves_the_message_tabs_minimum_height(self) -> None:
+    def test_message_workspace_owns_its_combined_preview(self) -> None:
         preview_frame = QtWidgets.QWidget()
         body = QtWidgets.QWidget()
         body.resize(1400, 728)
@@ -244,7 +244,8 @@ class IdentityFieldLockingTests(unittest.TestCase):
             body=body,
             tabbar=types.SimpleNamespace(currentIndex=lambda: 2),
             message_tab=types.SimpleNamespace(
-                minimumSizeHint=lambda: QtCore.QSize(534, 340)
+                minimumSizeHint=lambda: QtCore.QSize(534, 340),
+                messages_workspace=object(),
             ),
             help_icon=types.SimpleNamespace(
                 height=lambda: 125,
@@ -254,11 +255,10 @@ class IdentityFieldLockingTests(unittest.TestCase):
             preview_frame=preview_frame,
         )
 
+        preview_frame.show()
         Nexus._update_preview_geometry(harness)
 
-        available_height = body.height() - 24
-        reserved_height = preview_frame.height() + 340 + 125 + 20
-        self.assertLessEqual(reserved_height, available_height)
+        self.assertTrue(preview_frame.isHidden())
         preview_frame.deleteLater()
         body.deleteLater()
 
@@ -626,11 +626,12 @@ class IdentityFieldLockingTests(unittest.TestCase):
         first_revision = dirty.revision
         dirty.mark_changed("newer")
         latest_revision = dirty.revision
-        task = types.SimpleNamespace(error="", destination="saved")
+        task = types.SimpleNamespace(error="", destination="saved", session_id="current")
         harness = types.SimpleNamespace(
             _autosave_active_revision=first_revision,
             _autosave_pending_revision=None,
             _autosave_tasks={first_revision: task},
+            project_session=types.SimpleNamespace(session_id="current"),
             _shutdown_in_progress=False,
             _shutdown_complete=False,
             project_dirty=dirty,
@@ -701,71 +702,34 @@ class IdentityFieldLockingTests(unittest.TestCase):
             self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
 
     def test_shutdown_flushes_draft_before_project_state_closes(self) -> None:
-        events: list[str] = []
+        from contextlib import ExitStack
+        from test_window_sizing import WindowSizingTests
 
-        class ProjectState:
-            def remove_listener(self, _listener: object) -> None:
-                events.append("listener")
+        events = []
+        fixture = WindowSizingTests()
+        fixture.app = self.app
+        with fixture.window() as window, ExitStack() as stack:
+            def track(owner, name, label):
+                original = getattr(owner, name)
+                def call(*args, **kwargs):
+                    events.append(label)
+                    return original(*args, **kwargs)
+                stack.enter_context(mock.patch.object(owner, name, side_effect=call))
 
-            def shutdown(self) -> None:
-                events.append("project")
-
-        class Tab:
-            def shutdown(self, timeout_ms: int | None = None) -> bool:
-                self.timeout_ms = timeout_ms
-                events.append("forge-operation")
-                return True
-
-            def deactivate_for_tab_change(self) -> None:
-                events.append("tab")
-
-            def set_readiness_context_visible(self, _visible: bool) -> None:
-                return None
-
-            readiness_window = types.SimpleNamespace(shutdown=lambda: None)
-
-        harness = types.SimpleNamespace(
-            _shutdown_complete=False,
-            _shutdown_in_progress=False,
-            _forge_viewport_timer=types.SimpleNamespace(stop=lambda: events.append("viewport-timer")),
-            _preview_geometry_timer=types.SimpleNamespace(stop=lambda: events.append("geometry-timer")),
-            _project_tabs_initialized=True,
-            _stop_curtain_preparation=lambda timeout_ms=None: (
-                events.append("curtain") or True
-            ),
-            _on_project_state_transition=object(),
-            _prompt_writer_win=None,
-            _tray_icon=None,
-            project_state=ProjectState(),
-            flush_prompt_writer_state=lambda: events.append("prompt") or True,
-            _release_forge_preview_files=lambda: None,
-            _dispose_forge_preview=lambda: None,
-            _finish_project_autosave_for_shutdown=lambda _timeout: (
-                events.append("autosave") or True
-            ),
-            forge_tab=Tab(),
-            sound_tab=types.SimpleNamespace(
-                shutdown=lambda timeout_ms=None: events.append("sound") or True,
-            ),
-            message_tab=types.SimpleNamespace(
-                shutdown=lambda: events.append("message")
-            ),
-            image_tab=types.SimpleNamespace(
-                shutdown=lambda: events.append("image")
-            ),
-        )
-
-        Nexus.shutdown(harness)
-
-        self.assertLess(events.index("viewport-timer"), events.index("project"))
-        self.assertLess(events.index("geometry-timer"), events.index("project"))
-        self.assertLess(events.index("curtain"), events.index("project"))
-        self.assertLess(events.index("prompt"), events.index("autosave"))
-        self.assertLess(events.index("forge-operation"), events.index("project"))
-        self.assertLess(events.index("prompt"), events.index("project"))
-        self.assertLess(events.index("sound"), events.index("project"))
-        self.assertLess(events.index("message"), events.index("project"))
-        self.assertLess(events.index("image"), events.index("project"))
+            track(window, "flush_project_edits", "edits")
+            track(window, "flush_prompt_writer_state", "prompt")
+            track(window, "_finish_project_autosave_for_shutdown", "autosave")
+            track(window.forge_tab, "shutdown_operations", "forge-operations")
+            track(window.sound_tab, "shutdown", "sound")
+            track(window.message_tab, "shutdown", "message")
+            track(window.image_tab, "shutdown", "image")
+            track(window.project_state, "shutdown", "project")
+            self.assertTrue(window.shutdown())
+            self.assertTrue(window._shutdown_complete)
+            for label in ("edits", "prompt", "autosave", "forge-operations",
+                          "sound", "message", "image"):
+                self.assertLess(events.index(label), events.index("project"), events)
+            self.assertLess(events.index("edits"), events.index("autosave"))
 
     def test_shutdown_autosave_drains_the_latest_dirty_revision(self) -> None:
         dirty = ProjectDirtyController()

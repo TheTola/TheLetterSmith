@@ -18,6 +18,15 @@ TITLE_BAR_CONTROL_PX = 40
 TITLE_BAR_ICON_PX = 36
 FRAME_RESIZE_MARGIN_PX = 8
 
+_LAUNCH_EVENTS = frozenset((QtCore.QEvent.Type.MouseButtonPress,
+                          QtCore.QEvent.Type.MouseButtonRelease,
+                          QtCore.QEvent.Type.KeyPress, QtCore.QEvent.Type.ContextMenu,
+                          QtCore.QEvent.Type.ToolTip))
+_FRAME_EVENTS = frozenset((QtCore.QEvent.Type.Show, QtCore.QEvent.Type.WinIdChange,
+                         QtCore.QEvent.Type.ChildPolished, QtCore.QEvent.Type.MouseMove,
+                         QtCore.QEvent.Type.MouseButtonPress, QtCore.QEvent.Type.Hide,
+                         QtCore.QEvent.Type.WindowStateChange))
+
 
 def bounded_window_geometry(
     geometry: QtCore.QRect,
@@ -163,12 +172,12 @@ class _WindowPlacementGuard(QtCore.QObject):
         self._launcher = None
 
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        kind = event.type()
+        if kind not in _LAUNCH_EVENTS and kind != QtCore.QEvent.Type.Show:
+            return False
         if not isinstance(watched, QtWidgets.QWidget):
             return False
-        if event.type() in (
-            QtCore.QEvent.MouseButtonPress, QtCore.QEvent.MouseButtonRelease,
-            QtCore.QEvent.KeyPress, QtCore.QEvent.ContextMenu, QtCore.QEvent.ToolTip,
-        ):
+        if kind in _LAUNCH_EVENTS:
             launch_ref = ref(watched)
             self._launcher = launch_ref
 
@@ -450,10 +459,7 @@ class FramelessWindowController(QtCore.QObject):
         kind = event.type()
         # Application filters also see partially constructed/destructed widgets.
         # Inspect only live interaction events, and children after polishing.
-        if kind not in (QtCore.QEvent.Show, QtCore.QEvent.WinIdChange,
-                        QtCore.QEvent.ChildPolished, QtCore.QEvent.MouseMove,
-                        QtCore.QEvent.MouseButtonPress, QtCore.QEvent.Hide,
-                        QtCore.QEvent.WindowStateChange):
+        if kind not in _FRAME_EVENTS:
             return False
         if watched is self._window and event.type() in (
             QtCore.QEvent.Show, QtCore.QEvent.WinIdChange,

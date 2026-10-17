@@ -581,9 +581,9 @@ class _ButtonTextFitGuard(QtCore.QObject):
         event: QtCore.QEvent,
     ) -> bool:
         if (
-            isinstance(watched, QtWidgets.QAbstractButton)
+            event.type() in self._EVENT_TYPES
+            and isinstance(watched, QtWidgets.QAbstractButton)
             and watched.text()
-            and event.type() in self._EVENT_TYPES
             and watched not in self._fitting
         ):
             signature = self._signature(watched)
@@ -2012,10 +2012,10 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
                     "Theme styles could not be applied to %s.",
                     type(watched).__name__,
                 )
-        if isinstance(watched, QtWidgets.QWidget) and event.type() in (
+        if event.type() in (
             QtCore.QEvent.Type.ChildAdded,
             QtCore.QEvent.Type.StyleChange,
-        ):
+        ) and isinstance(watched, QtWidgets.QWidget):
             root = self._semantic_root_for(watched)
             if root is not None:
                 current_style = watched.styleSheet()

@@ -591,3 +591,9 @@ the existing bounded shutdown/cancel policy. No other application's workers are
 terminated. `ThemeService.shutdown()` detaches its application event filter only
 after shutdown preflight succeeds; canceled transitions retain it. An unloaded
 Messages preview releases without creating a browser or restarting an unload.
+
+The isolated profile also applies to runtime-root settings/configuration imports
+before Main calls `configure_application_paths`. Explicit other project roots
+remain self-contained. Global event filters must reject irrelevant/destruction
+notifications before accessing widget content; native worker ownership ends only
+after a completed join, not merely receipt of a queued finished signal.

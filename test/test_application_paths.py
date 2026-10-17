@@ -14,6 +14,30 @@ from transactional_io import set_path_hidden
 
 
 class ApplicationPathsTests(unittest.TestCase):
+    def test_profile_applies_before_bootstrap_without_mutating_resource_settings(self):
+        import project_paths
+        from settings_store import SettingsStore
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            resources = base / "bundle"
+            resources.mkdir()
+            master = resources / "settings.json"
+            master.write_text('{"recipient_title":"Read-only master"}', encoding="utf-8")
+            original = master.read_bytes()
+            profile = base / "isolated"
+            with mock.patch.object(project_paths, "_APPLICATION_PATHS", None), \
+                 mock.patch.object(project_paths.sys, "_MEIPASS", str(resources), create=True), \
+                 mock.patch.dict(os.environ, {"LETTER_SMITH_PROFILE_ROOT": str(profile)}):
+                paths = application_paths()
+                self.assertEqual(paths.profile_root, profile.resolve())
+                self.assertEqual(application_paths(resources), paths)
+                self.assertEqual(application_paths(paths.workspace_root), paths)
+                SettingsStore(resources).update_fields(recipient_title="Isolated draft")
+                self.assertTrue(paths.settings_file.is_file())
+                self.assertEqual(master.read_bytes(), original)
+                other = base / "explicit-project"
+                self.assertEqual(application_paths(other), ApplicationPaths.for_project(other))
+
     def test_runtime_layout_separates_resources_app_data_and_documents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

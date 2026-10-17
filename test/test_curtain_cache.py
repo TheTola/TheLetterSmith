@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from uuid import uuid4
 
 from PIL import Image
 
@@ -459,8 +461,14 @@ class CurtainCacheTests(unittest.TestCase):
                 ),
             )
 
-            for stored_style, expected_style in cases:
+            for index, (stored_style, expected_style) in enumerate(cases):
+                # Exercise the legacy loader, not a current editable snapshot
+                # whose authoritative settings correctly supersede this sidecar.
+                legacy = saved.with_name(f"{saved.name}-legacy-{index}")
+                shutil.copytree(saved, legacy, ignore=shutil.ignore_patterns(".lettersmith-project"))
+                metadata_path = legacy / PLAY_METADATA_FILE
                 metadata = json.loads(json.dumps(base_metadata))
+                metadata["project_id"] = str(uuid4())
                 if stored_style is None:
                     metadata["settings"].pop("curtain_style", None)
                 else:
@@ -473,8 +481,8 @@ class CurtainCacheTests(unittest.TestCase):
                 settings.update_fields(curtain_style=CURTAIN_STYLE_WHITE)
                 entry = next(
                     item
-                    for item in SavedLetterCatalog(root).list_entries()
-                    if item.path == saved.resolve()
+                    for item in SavedLetterCatalog(root).list_entries(force_refresh=True)
+                    if item.path == legacy.resolve()
                 )
                 SavedLetterRestorer(root).restore(entry)
                 self.assertEqual(
