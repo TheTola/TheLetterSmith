@@ -935,8 +935,17 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 for size in ((1920, 1032), (1400, 900), (1180, 820), (960, 516), (1920, 600), (1400, 900)):
                     window.resize(*size)
                     window._update_preview_geometry()
-                    QtTest.QTest.qWait(100)
-                    self.app.processEvents()
+                    # Compact controls and their themed geometry settle through
+                    # queued layout events. Wait for that observable condition,
+                    # rather than assuming a loaded machine finishes in 100 ms.
+                    deadline = QtCore.QDeadlineTimer(3000)
+                    while not deadline.hasExpired():
+                        self.app.processEvents()
+                        if (not window._preview_geometry_timer.isActive()
+                                and not window.forge_tab._action_geometry_timer.isActive()
+                                and window.forge_controls_scroll.verticalScrollBar().maximum() == 0):
+                            break
+                        QtTest.QTest.qWait(10)
                     frame_bottom = window.preview_frame.mapTo(
                         window.body,
                         QtCore.QPoint(0, window.preview_frame.height()),
@@ -951,7 +960,7 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                         window.forge_tab.height(),
                         window.forge_tab.minimumSizeHint().height(),
                     )
-                    self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
+                    self.assertEqual(scroll.verticalScrollBar().maximum(), 0, f"Unsettled Forge layout at {size}")
                     self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
                     self.assertGreater(scroll.viewport().height(), 100)
                 self.assertEqual(

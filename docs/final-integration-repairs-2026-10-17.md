@@ -101,3 +101,11 @@ experimental window-title change was reverted; no appearance behavior changed.
   operations still use their established pre-operation merge. The real animated
   import regression now asserts project identity as well as exact prompt/source
   bytes, and passed together with the 23 Images and 13 Prompt Writer tests.
+
+- FIX-13 (test synchronization): the full candidate run observed a 36-pixel
+  intermediate scroll range after a fixed 100 ms Forge resize wait. The isolated
+  case and the entire 20-test layout module both passed unchanged on rerun.
+  Replace that timing assumption with a bounded wait for the existing geometry
+  timers and zero scroll range. All size, placement and accessibility assertions
+  remain intact; a failure now reports the requested size. No production layout
+  or supported minimum size changed.
