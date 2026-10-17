@@ -18,6 +18,7 @@ from PySide6 import QtGui, QtTest, QtWidgets
 import generate
 import message_import
 import message_html
+import message_document_import
 import transactional_io
 from Message_tab import MessageTab
 from config import CONTROL_FILES, REQUIRED_SLIDES
@@ -220,6 +221,110 @@ class MessageHTMLSecurityTests(unittest.TestCase):
             restored = restore_revision(message, revision)
             self.assertEqual(restored, "<p>Hello</p>")
             self.assertEqual(message.read_text(encoding="utf-8"), "<p>Hello</p>")
+
+
+class MessageDocumentImportTests(unittest.TestCase):
+    @staticmethod
+    def _image_bytes(color: str = "red") -> bytes:
+        import io
+        from PIL import Image
+
+        stream = io.BytesIO()
+        Image.new("RGB", (4, 4), color).save(stream, "PNG")
+        return stream.getvalue()
+
+    def test_import_stages_rich_html_and_assets_without_mutating_project(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "input" / "letter.html"
+            source.parent.mkdir()
+            (source.parent / "image.png").write_bytes(self._image_bytes())
+            state = {"schema_version": 1, "definitions": {}, "blocks": []}
+            raw = message_html.embed_lettersmith_style_state(
+                '<p style="font-weight:700">Hello</p><img src="image.png">', state
+            )
+            with message_document_import.stage_import_html(
+                raw, source_path=source, project_root=root / "project"
+            ) as staged:
+                self.assertFalse((root / "project" / "gallery").exists())
+                self.assertEqual(message_html.extract_lettersmith_style_state(staged.html), state)
+                self.assertIn("font-weight:700", staged.html)
+                self.assertEqual(len(staged.resources), 1)
+                self.assertEqual(message_document_import.message_resources(staged.html), staged.resources)
+                self.assertEqual(staged.commit_resources(), staged.resources)
+                asset = root / "project" / staged.resources[0]
+                self.assertEqual(asset.read_bytes(), self._image_bytes())
+                self.assertEqual(staged.commit_resources(), staged.resources)
+                temporary = Path(staged._temporary.name)
+            self.assertFalse(temporary.exists())
+            self.assertTrue(asset.exists())
+
+    def test_embedded_images_are_deduplicated_and_missing_images_keep_editable_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            encoded = base64.b64encode(self._image_bytes()).decode("ascii")
+            raw = (
+                '<p>Keep this letter</p>'
+                f'<img src="data:image/png;base64,{encoded}">' * 2
+                + '<img src="missing.png" alt="Missing photograph">'
+                + '<img src="../private.png"><img src="%43%3A/private.png">'
+                + '<script>run()</script>'
+            )
+            with message_document_import.stage_import_html(
+                raw, source_path=root / "letter.html", project_root=root / "project"
+            ) as staged:
+                self.assertEqual(len(staged.resources), 1)
+                self.assertIn("Keep this letter", staged.html)
+                self.assertIn("Missing photograph", staged.html)
+                self.assertNotIn("data:", staged.html)
+                self.assertNotIn("private.png", staged.html)
+                self.assertNotIn("<script", staged.html)
+                self.assertTrue(any("file missing" in notice for notice in staged.notices))
+                self.assertTrue(any("unsafe" in notice or "unsupported" in notice for notice in staged.notices))
+            self.assertFalse((root / "project" / "gallery").exists())
+
+    def test_commit_failure_preserves_existing_assets_and_rolls_back_own_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            encoded = base64.b64encode(self._image_bytes()).decode("ascii")
+            second = base64.b64encode(self._image_bytes("blue")).decode("ascii")
+            with message_document_import.stage_import_html(
+                f'<img src="data:image/png;base64,{encoded}">'
+                f'<img src="data:image/png;base64,{second}">',
+                source_path=root / "letter.html", project_root=root / "project",
+            ) as staged:
+                created = root / "project" / staged.resources[0]
+                collision = root / "project" / staged.resources[1]
+                collision.parent.mkdir(parents=True)
+                collision.write_bytes(b"Existing asset")
+                with self.assertRaises(message_import.MessageImportError):
+                    staged.commit_resources()
+                self.assertFalse(created.exists())
+                self.assertEqual(collision.read_bytes(), b"Existing asset")
+
+    def test_image_limit_fails_before_creating_runtime_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "image.png").write_bytes(self._image_bytes())
+            with mock.patch.object(message_document_import, "MAX_IMPORT_IMAGE_BYTES", 1):
+                with self.assertRaises(message_import.MessageImportError):
+                    message_document_import.stage_import_html(
+                        '<p>Hello</p><img src="image.png">',
+                        source_path=root / "letter.html", project_root=root / "project",
+                    )
+            self.assertFalse((root / "project").exists())
+
+    def test_resource_paths_are_local_canonical_and_unique(self) -> None:
+        self.assertEqual(
+            message_document_import.message_resources(
+                '<img src="gallery/message_assets/my%20photo.png">'
+                '<img src="gallery/message_assets/my photo.png">'
+                '<img src="https://example.com/image.png">'
+                '<img src="%43%3A/private.png"><img src="../private.png">'
+                '<img src="gallery/message_assets/../private.png">'
+            ),
+            ["gallery/message_assets/my photo.png"],
+        )
 
 
 class MessageImportSecurityTests(unittest.TestCase):

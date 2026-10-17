@@ -393,6 +393,9 @@ def _render_message_png(
     staged_path: Path,
     preset: str,
     overlay_opacity: int,
+    *,
+    resource_roots: tuple[Path, ...] = (),
+    diagnostics: dict | None = None,
 ) -> bool:
     """Render one full-resolution Message image outside the GUI thread."""
     full_width, full_height = MESSAGE_RENDER_WIDTH, MESSAGE_RENDER_HEIGHT
@@ -437,7 +440,11 @@ def _render_message_png(
         painter.fillRect(canvas.rect(), gradient)
     painter.end()
 
-    document = QTextDocument()
+    if resource_roots:
+        from message_resources import MessageTextDocument
+        document = MessageTextDocument(resource_roots)
+    else:
+        document = QTextDocument()
     document.setDefaultFont(
         QFont(MESSAGE_RENDER_FONT_FAMILY, MESSAGE_RENDER_FONT_SIZE)
     )
@@ -452,6 +459,8 @@ def _render_message_png(
     normalize_ultralinks_in_document(document)
     document.setTextWidth(text_width)
     document.setPageSize(QSizeF(text_width, text_height))
+    if diagnostics is not None:
+        diagnostics["overflow"] = document.pageCount() > 1
     _apply_adaptive_micro_contrast(
         document,
         canvas,
@@ -541,6 +550,7 @@ class _MessageRenderTask(QtCore.QRunnable):
         staged_path: Path,
         preset: str,
         overlay_opacity: int,
+        resource_roots: tuple[Path, ...] = (),
     ) -> None:
         super().__init__()
         self.revision = revision
@@ -551,6 +561,8 @@ class _MessageRenderTask(QtCore.QRunnable):
         self.staged_path = staged_path
         self.preset = preset
         self.overlay_opacity = overlay_opacity
+        self.resource_roots = resource_roots
+        self.diagnostics: dict = {}
         self.signals = _MessageRenderSignals()
 
     @QtCore.Slot()
@@ -566,6 +578,8 @@ class _MessageRenderTask(QtCore.QRunnable):
                 self.staged_path,
                 self.preset,
                 self.overlay_opacity,
+                resource_roots=self.resource_roots,
+                diagnostics=self.diagnostics,
             ):
                 raise RuntimeError("Failed to encode message.png")
             committed, error_text = self.gate.commit_if_current(
@@ -820,6 +834,8 @@ class MessageTab(QtWidgets.QWidget):
     wall_preview = Signal(QPixmap)
     published_page_url_changed = Signal(str)
     project_changed = Signal()
+    background_requested = Signal(str)
+    images_requested = Signal()
 
     def __init__(
         self,
@@ -1040,12 +1056,33 @@ class MessageTab(QtWidgets.QWidget):
         layout.addWidget(self.message_content_shell, 0, Qt.AlignHCenter | Qt.AlignTop)
         layout.addStretch(1)
 
-        # Ensure fallback assets and load the current message immediately.
-        self._check_existing()
-        self._update_message_summary()
+        from project_consumers import session_for
+        self.messages_workspace = None
+        session = session_for(self.project_root)
+        if session is not None:
+            from messages_workspace import MessagesWorkspace
+            self.message_content_shell.hide()
+            self.project_details_toggle = QtWidgets.QPushButton("Project title and recipient")
+            self.project_details_toggle.setCheckable(True)
+            self.project_details_toggle.toggled.connect(self.title_recipient_container.setVisible)
+            layout.insertWidget(0, self.project_details_toggle, 0, Qt.AlignLeft)
+            layout.insertWidget(1, self.title_recipient_container)
+            self.title_recipient_container.hide()
+            spacer = layout.takeAt(layout.count() - 1)
+            del spacer
+            self.messages_workspace = MessagesWorkspace(self, session)
+            self.messages_workspace.background_requested.connect(self.background_requested.emit)
+            self.messages_workspace.images_requested.connect(self.images_requested.emit)
+            layout.addWidget(self.messages_workspace, 1)
+        else:
+            self._check_existing()
+            self._update_message_summary()
 
     def set_compact_layout(self, compact: bool) -> None:
         """Reduce control geometry without moving controls above the preview."""
+        if getattr(self, "messages_workspace", None) is not None:
+            self.layout().setContentsMargins(8, 0, 8, 0)
+            return
         if self._compact_layout == compact:
             return
         self._compact_layout = compact
@@ -1125,6 +1162,21 @@ class MessageTab(QtWidgets.QWidget):
         lock_loaded_identity: bool = False,
     ) -> bool:
         """Reconcile Message content, metadata, rendering, and direct disk edits."""
+        workspace = getattr(self, "messages_workspace", None)
+        if workspace is not None:
+            self._load_settings()
+            for field, key in ((self.title_input, "recipient_title"), (self.name_input, "recipient_name"),
+                               (self.url_input, PUBLISHED_PAGE_URL_KEY)):
+                with QtCore.QSignalBlocker(field):
+                    field.setText(str(self.settings.get(key, "")))
+            if lock_loaded_identity:
+                self._apply_loaded_identity_locks(persist=True)
+            else:
+                self._sync_identity_field_lock(self.title_input, "title")
+                self._sync_identity_field_lock(self.name_input, "recipient")
+                self._sync_identity_field_lock(self.url_input, "published_url")
+            workspace.refresh()
+            return False
         before = dict(getattr(self, "_sync_state", {}))
         after = self._capture_sync_state()
         changed_keys = {key for key, value in after.items() if force or before.get(key) != value}
@@ -1172,6 +1224,8 @@ class MessageTab(QtWidgets.QWidget):
 
     def sync_to_disk(self) -> bool:
         """Persist Message metadata and finish render state before tab exit."""
+        if getattr(self, "messages_workspace", None) is not None:
+            return self.messages_workspace.save()
         from project_consumers import consumer_issue
         if consumer_issue(self.project_root, "message"):
             self._save_settings()
@@ -1264,6 +1318,8 @@ class MessageTab(QtWidgets.QWidget):
         if not self._tab_active:
             return
         self.sync_to_disk()
+        if getattr(self, "messages_workspace", None) is not None:
+            self.messages_workspace.deactivate_preview()
         self._tab_active = False
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # type: ignore[override]
@@ -1289,6 +1345,11 @@ class MessageTab(QtWidgets.QWidget):
 
     def focus_field(self, target: str) -> None:
         """Focus the Message correction requested by Project Readiness."""
+        if getattr(self, "messages_workspace", None) is not None:
+            if target == "message":
+                self.open_editor()
+                return
+            self.project_details_toggle.setChecked(True)
         widget = {
             "recipient": self.name_input,
             "title": self.title_input,
@@ -1478,6 +1539,9 @@ class MessageTab(QtWidgets.QWidget):
         RevisionHistoryDialog(self).exec()
 
     def restore_message_revision(self, revision_path: Path) -> bool:
+        if getattr(self, "messages_workspace", None) is not None:
+            self.messages_workspace.notice.setText("Legacy global revisions cannot be assigned to a page implicitly. Import a chosen revision into the selected Letter.")
+            return False
         if not self._message_consumer_available():
             return False
         try:
@@ -1980,6 +2044,9 @@ class MessageTab(QtWidgets.QWidget):
         - If message.png exists, show it.
         - Else show the selected wall.png when available.
         """
+        if getattr(self, "messages_workspace", None) is not None:
+            self.messages_workspace.render_preview()
+            return
         png_path = self._png_path()
         if png_path.is_file():
             full_pix = QPixmap(str(png_path))
@@ -2004,7 +2071,9 @@ class MessageTab(QtWidgets.QWidget):
     def select_file(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
-            "Select Message File",
+            (f"Import Text into {self.messages_workspace.binding.label}"
+             if getattr(self, "messages_workspace", None) is not None and self.messages_workspace.binding
+             else "Select Message File"),
             _downloads_directory(),
             "Messages (*.txt *.docx *.pdf *.odt *.html *.htm)",
         )
@@ -2019,6 +2088,9 @@ class MessageTab(QtWidgets.QWidget):
     # Editor
     # ──────────────────────────────────────────────────────────────────
     def open_editor(self) -> None:
+        if getattr(self, "messages_workspace", None) is not None:
+            self.messages_workspace.open_page(None)
+            return
         if not self._message_consumer_available():
             return
         self._editor_page_target = self._capture_message_target(fields=("type",))
@@ -2127,7 +2199,14 @@ class MessageTab(QtWidgets.QWidget):
         if process is not None:
             self.status.setText("A message is already being imported.")
             return
-        self._message_import_target = self._capture_message_target(fields=("type", "message"))
+        workspace = getattr(self, "messages_workspace", None)
+        if workspace is not None:
+            self._message_import_target = workspace.capture_import(path)
+            if self._message_import_target is None:
+                return
+            workspace.import_button.setEnabled(False)
+        else:
+            self._message_import_target = self._capture_message_target(fields=("type", "message"))
 
         result_path: Path | None = None
         try:
@@ -2138,6 +2217,9 @@ class MessageTab(QtWidgets.QWidget):
             if result_path is not None:
                 remove_result_path(result_path, attempts=3)
             self.status.setText("That file could not be imported.")
+            if workspace is not None:
+                workspace.import_button.setEnabled(True)
+                workspace.notice.setText("That file could not be imported.")
             return
         process = QtCore.QProcess(self)
         process.setStandardOutputFile(QtCore.QProcess.nullDevice())
@@ -2202,6 +2284,13 @@ class MessageTab(QtWidgets.QWidget):
             except MessageImportError as error:
                 error_message = str(error)
         self._release_message_import()
+        workspace = getattr(self, "messages_workspace", None)
+        if workspace is not None:
+            if error_message:
+                workspace.notice.setText(error_message)
+            elif source is not None:
+                workspace.finish_import(str(source), imported_html, target)
+            return
         if not self._message_target_current(target):
             return
         if error_message:
@@ -2228,6 +2317,8 @@ class MessageTab(QtWidgets.QWidget):
         )
         self._release_message_import()
         self.status.setText(error_message)
+        if getattr(self, "messages_workspace", None) is not None:
+            self.messages_workspace.notice.setText(error_message)
 
     def _release_message_import(self) -> None:
         self._message_import_timer.stop()
@@ -2240,6 +2331,8 @@ class MessageTab(QtWidgets.QWidget):
         self._message_import_target = None
         if hasattr(self, "btn"):
             self.btn.setEnabled(True)
+        if getattr(self, "messages_workspace", None) is not None:
+            self.messages_workspace.import_button.setEnabled(True)
         if process is not None:
             if process.state() != QtCore.QProcess.ProcessState.NotRunning:
                 process.kill()
@@ -2392,6 +2485,8 @@ class MessageTab(QtWidgets.QWidget):
 
     def prepare_for_project_restore(self, timeout_ms: int = 5000) -> None:
         """Release render work before project directories are replaced."""
+        if getattr(self, "messages_workspace", None) is not None:
+            self.messages_workspace.prepare_for_restore()
         self._overlay_render_timer.stop()
         self._flush_overlay_settings()
         if not self._stop_message_import(timeout_ms):
@@ -2403,6 +2498,8 @@ class MessageTab(QtWidgets.QWidget):
             raise RuntimeError("Message rendering did not stop before restore")
 
     def _message_consumer_available(self) -> bool:
+        if getattr(self, "messages_workspace", None) is not None:
+            return self.messages_workspace.page_id is not None
         from project_consumers import prepare_consumer
         try:
             prepare_consumer(self.project_root, "message")
@@ -2431,6 +2528,9 @@ class MessageTab(QtWidgets.QWidget):
 
     def reset_project_message(self) -> None:
         """Clear the live Message workspace after New Project commits."""
+        if getattr(self, "messages_workspace", None) is not None:
+            self.messages_workspace.refresh()
+            return
         self._overlay_render_timer.stop()
         self._overlay_update_pending = False
         if not self._stop_message_import(5000):
@@ -2462,6 +2562,8 @@ class MessageTab(QtWidgets.QWidget):
         self.status.setText("No message selected.")
 
     def shutdown(self, timeout_ms: int = 5000) -> bool:
+        if getattr(self, "messages_workspace", None) is not None:
+            return self.messages_workspace.shutdown() and self._stop_message_import(timeout_ms)
         self._overlay_render_timer.stop()
         self._flush_overlay_settings()
         import_stopped = self._stop_message_import(timeout_ms)

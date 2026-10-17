@@ -7,11 +7,12 @@ or pull requests were used.
 
 ## Baseline and scope
 
-Starting/current Git HEAD: `6d015d2e1d93d4773dc99df6ac2a2eca31bf52c1`, branch
-`main`. The foundation remains uncommitted. This revision alone does not include
-the foundation; there is no clean committed foundation baseline yet. Existing
-dirty work was preserved. Establish one reviewed foundation commit before
-creating dependent worktrees, as described in [foundation-handoff.md](foundation-handoff.md).
+Starting Git HEAD: `6d015d2e1d93d4773dc99df6ac2a2eca31bf52c1`, branch
+`main`. This revision alone does not include the foundation. The historical
+verification below was performed with preserved unrelated working-tree changes.
+The later commit review and staged-snapshot checks are recorded separately below.
+Use the commit containing this report as the shared foundation baseline, as
+described in [foundation-handoff.md](foundation-handoff.md).
 
 The authoritative existing paths were inspected: configurable `page_layout.py`
 version 1 (2–10 pages), `PageLayoutController`, image manifests and GIF source
@@ -179,6 +180,34 @@ automatic garbage collection is not implemented.
 
 All four foundation phases are complete. The six reproduced baseline UI failures
 and future consumer work above remain separate from this foundation acceptance.
-An isolated reviewed commit is still required before branching dependent worktrees.
+The user subsequently requested the isolated foundation commit; see the review
+record below before branching dependent worktrees.
 
 Foundation status: Ready for dependent feature tasks.
+
+## Foundation commit review — 2026-10-13
+
+Reviewed the documented foundation paths and staged only those changes.
+`Main.py` contributes only removal of the bulk-upgrade call and its two replacement
+comments. Its diagnostics additions, all publishing/release changes, user settings,
+unrelated dependencies/tests, runtime files, and feature handoffs were excluded.
+The original working-tree bytes outside the two review fixes and these foundation
+documents were preserved.
+
+Review found a resource-alias defect: an image used both as artwork and as an
+embedded message resource was renamed for artwork without retaining the message's
+original path. `ProjectRepository.save()` now retains every still-referenced alias.
+The added regression in the existing repository suite verifies immediate reload,
+exact message HTML/resources, source bytes, and a second portable save.
+
+The staged source was exported to a clean temporary directory, excluding private
+runtime/user directories and settings. Tests used the installed repository Python,
+separate isolated runtime profiles, offscreen Qt, and disabled bytecode writes.
+No excluded untracked diagnostics/HTTPS modules were available in the export.
+The 63-test foundation selection and 33-test message security/overlay selection
+passed. Logs are under `%TEMP%\lsbase-eb4721a4`; these checks exercise the staged
+foundation source rather than relying on mixed working-tree imports. The separate
+69-test persistence/restore/page-layout selection and 36-test Prompt Writer
+hardening suite also passed. Counts overlap (the repository suite is in two
+selections); they are not a unique-test total. Synthetic corrupt/missing fixture
+diagnostics were logged as expected; all four processes returned success.

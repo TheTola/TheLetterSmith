@@ -1,4 +1,4 @@
-﻿# ===============================
+# ===============================
 # File: Nexus.py
 # ===============================
 """
@@ -2005,7 +2005,7 @@ class Nexus(QtWidgets.QMainWindow):
         tab_help = (
             ("Images", "Select and prepare 2–10 pages for this letter."),
             ("Sound", "Choose one song or arrange a playlist for this letter."),
-            ("Message", "Write, import, and format the letter's message."),
+            ("Messages", "Write, import, and format each Letter page's message."),
             ("Forge", "Review, preview, load, publish, and share the letter."),
             ("Command", "Open the deliberate reset workspace. Click to activate."),
         )
@@ -2495,6 +2495,8 @@ class Nexus(QtWidgets.QMainWindow):
             project_state=self.project_state,
             project_paths=self.project_paths,
         )
+        self.message_tab.background_requested.connect(self._edit_message_background)
+        self.message_tab.images_requested.connect(lambda: self.tabbar.setCurrentIndex(0))
         self.forge_tab = ForgeTab(
             self.project_root,
             project_state=self.project_state,
@@ -3255,9 +3257,34 @@ class Nexus(QtWidgets.QMainWindow):
         self.tabbar.show()
         self.tabbar.raise_()
 
+    def open_message_page(self, page_id: str) -> bool:
+        """Navigate to Messages using canonical identity, including from Images."""
+        try:
+            if self.project_session.project.get_page(page_id)["type"] != "letter":
+                self.status("Only Letter pages have an editable message.")
+                return False
+        except (KeyError, ValueError, RuntimeError):
+            self.status("The selected page is no longer available.")
+            return False
+        workspace = getattr(self.message_tab, "messages_workspace", None)
+        if workspace is None or not workspace.open_page(page_id):
+            return False
+        self.tabbar.setCurrentIndex(2)
+        return True
+
+    def _edit_message_background(self, page_id: str) -> None:
+        self.project_session.select_page(page_id)
+        self.tabbar.setCurrentIndex(0)
+
     def _apply_tab_state(self, idx: int, *, animate_page: bool) -> None:
         """Apply the complete settled UI state for one tab."""
         old_idx = self.page_stack.currentIndex()
+        workspace = getattr(getattr(self, "message_tab", None), "messages_workspace", None)
+        if old_idx == 2 and idx != 2 and workspace is not None and not workspace.save():
+            with QtCore.QSignalBlocker(self.tabbar):
+                self.tabbar.setCurrentIndex(2)
+            self.status("Save or recover the retained message draft before leaving Messages.")
+            return
         if old_idx != idx:
             play_ui_sound(UiSound.TAB_SWITCHED)
         autosave_note = ""
@@ -3312,14 +3339,15 @@ class Nexus(QtWidgets.QMainWindow):
         else:
             self.preview_stack.setCurrentIndex(0)
         self.preview_caption.setVisible(False)
-        self.preview_frame.setVisible(idx not in {0, 4})
+        inline_messages = idx == 2 and workspace is not None
+        self.preview_frame.setVisible(idx not in {0, 4} and not inline_messages)
         if idx != 3:
             self._set_forge_compact_layout(False)
-        self.preview_region.setVisible(idx not in {0, 4})
+        self.preview_region.setVisible(idx not in {0, 4} and not inline_messages)
         self.forge_tab.preview_format_panel.setVisible(idx == 3)
         stack_policy = self.page_stack.sizePolicy()
         stack_policy.setVerticalPolicy(
-            QtWidgets.QSizePolicy.Expanding if idx == 0
+            QtWidgets.QSizePolicy.Expanding if idx == 0 or inline_messages
             else QtWidgets.QSizePolicy.Ignored if idx in {1, 2, 3}
             else self._page_stack_vertical_policy
         )
@@ -3402,6 +3430,9 @@ class Nexus(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self._position_help_icon)
 
     def _autosave_project_on_tab_switch(self) -> str:
+        workspace = getattr(getattr(self, "message_tab", None), "messages_workspace", None)
+        if workspace is not None and not workspace.save():
+            return "Project not saved: recover the retained message draft first."
         dirty = getattr(self, "project_dirty", None)
         if dirty is not None and not dirty.is_dirty:
             return ""
@@ -4564,6 +4595,11 @@ class Nexus(QtWidgets.QMainWindow):
             current_tab = -1
         max_width = max(1, body_width - PREVIEW_FRAME_EXTRA)
         region = getattr(self, "preview_region", None)
+        if current_tab == 2 and getattr(getattr(self, "message_tab", None), "messages_workspace", None) is not None:
+            self.preview_frame.hide()
+            if isinstance(region, QtWidgets.QWidget):
+                region.hide()
+            return
         if hasattr(self, "forge_tab"):
             compact = current_tab in {0, 1, 2, 3} and body_height < 600
             if current_tab != 4:
@@ -5195,6 +5231,11 @@ class Nexus(QtWidgets.QMainWindow):
         self.close()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        workspace = getattr(getattr(self, "message_tab", None), "messages_workspace", None)
+        if workspace is not None and not workspace.save():
+            self.status("Save or recover the retained message draft before closing.")
+            event.ignore()
+            return
         image_tab = getattr(self, "image_tab", None)
         if (
             self._project_tabs_initialized
@@ -5302,54 +5343,8 @@ class Nexus(QtWidgets.QMainWindow):
         panel = self._prompt_writer_win
         return isinstance(panel, QtWidgets.QWidget) and panel.is_open
 
-    def open_page_message(self, page_id: str) -> None:
-        """Route a page to Messages without choosing a different Letter page."""
-        session = self.project_session
-        try:
-            page = session.project.get_page(page_id)
-            if page["type"] != "letter":
-                self.status("Only Letter pages have an editable message.")
-                return
-            target = session.capture_target(
-                page_id, fields=("type",), include_shared=False,
-            )
-            session.select_page(page_id)
-        except (KeyError, ValueError, RuntimeError):
-            self.status("The selected page is no longer available.")
-            return
-
-        page_editor = getattr(self.message_tab, "open_page_message", None)
-        if not callable(page_editor):
-            letter_ids = [
-                item["id"] for item in session.project.pages
-                if item["type"] == "letter"
-            ]
-            if letter_ids != [page_id]:
-                self.status(
-                    "This project has multiple Letter pages. Opening this message "
-                    "requires the page-aware Messages integration."
-                )
-                return
-
-        self.tabbar.setCurrentIndex(2)
-        if not session.apply_result(
-            target, lambda _model, original_id: session.select_page(original_id),
-        ):
-            self.status("The selected page changed before Messages could open.")
-            return
-        if callable(page_editor):
-            page_editor(page_id)
-        else:
-            if [
-                item["id"] for item in session.project.pages
-                if item["type"] == "letter"
-            ] != [page_id]:
-                self.status(
-                    "This project has multiple Letter pages. Opening this message "
-                    "requires the page-aware Messages integration."
-                )
-                return
-            self.message_tab.open_message_editor()
+    def open_page_message(self, page_id: str) -> bool:
+        return self.open_message_page(page_id)
 
     def _prepare_prompt_writer_page(self, page_id: str):
         from page_controls import page_controller
