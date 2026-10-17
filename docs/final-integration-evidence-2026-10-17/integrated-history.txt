@@ -1,0 +1,38 @@
+5daa5e3b29bf1b6ca3019f56f1bb9c0d2aca6954 Snapshot existing flexible-page foundation for isolated Sound work
+7b988f735394213cd01dfadddd60e5e8afeed246 Snapshot verified page foundation for isolated Prompt Writer work
+490a688541c2b984c473719b111c00176067ea8d Fix Prompt Writer palette typing and saved selection
+1612235e5f5bf0c02e84cead87fc84242d30cac5 Establish canonical page foundation and isolated runtime profiles
+51565601b5edbe655c2bd9f063b1d27be862ffb8 Define prompt recovery shared resolution and artwork geometry contracts
+5e1d02163f80ed41d20accad5ce7f9913ff7cdd7 Add canonical Forge rendering and guarded display output
+b6d7cede9ce4dcbdd43a16fbf23bebdb6bec0531 Clean up Sound workspace and guard local playback
+516365041c1955ffa0a56255612a2ec7066adf7e Expose coherent prompt batches with order revision guards
+0e6e7edc86488168f921ac285098338821384b5c Merge verified foundation resource preservation into Forge branch
+b87bc005f32b996bd1a8e1081962baf680ec4be5 Bind Messages editing and imports to independent canonical Letter pages
+f9739b9d22c43d0793504e00e402d0eb435e4841 Build and preserve artwork prompts for canonical page targets
+758c0db069c4c632349c6fd6f838f5b925c61b36 Verify shared artwork resources and clarify Forge integration blockers
+684f2fef54ecebb17eb9e53461994eedab1cc933 Preserve repeat crossfades and verify native audio lifecycle
+0a73a0efd55ace83bfc7bddaa3ffd16b6dca09ee Build selected-page Images workspace with guarded artwork editing
+ea6c1f0a4457a4dff1691cb33b1599ac893120f7 Connect Messages to the shared Forge preview adapter
+7a8386f3b6806377ea8c7f79682abcdeb0d3a17c Integrate canonical project sound and Forge playback lifecycle
+681a85e5a5eb2c52e1ee33d157b3d8bf671d5083 Complete shared Forge geometry and portable exports
+d22cf41fe3e8862ac450263f3bbdc4b6a37e1ab5 Merge completed Forge geometry into Messages
+d9a434812a65a40b8239b7774fccbcd46597e92e Integrate verified Messages editor with selected-page Images
+7c9d698795258fbecabe35d7ec572371686d80b0 Add page-specific text geometry controls and merged preview diagnostics
+c5cfd7d1759eb90451068e52ac61e2ae80af115a Integrate canonical Prompt Writer routes and verify Images receiver workflows
+4dc65844ffb7a442e52bd4d07a0bd1f2334547c9 Merge commit '7c9d698' into codex/saved-letters-complete-projects
+9e304a7b256c2befcd618efbe42b7d3e73bbb442 Merge commit '7a8386f' into codex/saved-letters-complete-projects
+53ec7cfbef76e41ea7cbe7410df45aee4a0fe1b2 Verify combined feature baseline and reconcile shared renderer contracts
+32ce089b6b12c015dade887e1d7236ac8ca3fb27 Implement complete editable Saved Letters workflows
+83fb721552aa3c7e75bfabbc91694857817b9d24 Document Saved Letters implementation and integration evidence
+7835055b6d3b5092baafc155f629e58be60b77c2 Implement safe Command and Settings project lifecycle
+f2a0a3307b6f568226e09e86a48bfd110f92f8ec Document Command and Settings implementation and verification
+ed5b7258f6c4bf9ca859cef284b7f7bea9754bf5 Integrate canonical UI routes and lifecycle synchronization
+637da7f86475b243314579bf3242aa1ef8d12690 Document UI synchronization verification and remaining acceptance checks
+5da197528f02dbe8630edb9d298892c0cf23abc6 Repair integrated editor and media lifecycle; isolate full verification
+c13539b134cdbc1e9a2c18103726e80575e57022 Protect early profile initialization and Qt teardown event handling
+8e42e4a68bf87bde82e5bc57dec8a020f25d9d83 Keep Prompt Writer help tied to its canonical page target
+93dad0809bd68a59ff9fd52f6e8e657657b566ce Keep Prompt Writer launch from mutating saved project caches
+9ff030fc81bbb789f057ccc88f5e918dd04844f7 Avoid restyling windows when nonvisual workers are created
+30b00ae5287e798f6c077246a56002601b6acf5d Preserve captured artwork ownership through canonical saves
+87f598c5c93247fdc6959f77d46a85135b4046c5 test: wait for queued Forge resize geometry to settle
+20d0be7abc48eac95c1fbc00e4b6161b8b5baeda Retry transient locks when moving managed display bundles

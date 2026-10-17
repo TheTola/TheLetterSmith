@@ -1,0 +1,86 @@
+{
+  "platform": "Windows 11 AMD64, build 26300",
+  "python": "3.13.13",
+  "pyside6": "6.11.1",
+  "pillow": "12.3.0",
+  "pyinstaller": "6.22.3",
+  "tested_source_revision": "20d0be7abc48eac95c1fbc00e4b6161b8b5baeda",
+  "package_source_revision": "20d0be7abc48eac95c1fbc00e4b6161b8b5baeda",
+  "source_equivalence": "The source verification and rebuilt Windows package use the same production revision.",
+  "source_root": "C:\\Users\\Oluwatola Ayedun\\.codex\\worktrees\\saved-letters-complete-projects\\SmithLetter",
+  "delivery_root": "C:\\Users\\Oluwatola Ayedun\\Desktop\\LetterSmith-final-2026-10-17\\Verified-20d0be7",
+  "build_commands": [
+    "python release/build_release.py --build --confirm-package",
+    "python release/build_installer.py --build --confirm-package",
+    "python release/build_macos.py --configuration-only"
+  ],
+  "build_environment": {
+    "LETTER_SMITH_PROFILE_ROOT": "C:/Temp/ls10/build-profile",
+    "PYTHONPATH": "C:/Temp/ls10/build-deps",
+    "note": "Same PyInstaller version installed into isolated build-deps to supply its missing Windows bootloader. No dependency upgrade."
+  },
+  "build_input_counts": {
+    "source_files": 98,
+    "payload_files": 481,
+    "stock_images": 12,
+    "stock_music": 3,
+    "stock_letters": 3,
+    "example_letters": 1
+  },
+  "distribution": {
+    "files": 3578,
+    "bytes": 1810703608.0,
+    "manifest_hash": "0DD9118B9D5C60A838DFF58B1F9A520BC87E8D36331598E33DE007CADA33A697"
+  },
+  "artifacts": [
+    {
+      "path": "C:\\Users\\Oluwatola Ayedun\\Desktop\\LetterSmith-final-2026-10-17\\Verified-20d0be7\\LetterSmith\\LetterSmith.exe",
+      "bytes": 9622207,
+      "sha256": "4a81b10ef1b2797598150c6cf0f30417013afbfadf4baaebf0b90c50e4b75d88"
+    },
+    {
+      "path": "C:\\Users\\Oluwatola Ayedun\\Desktop\\LetterSmith-final-2026-10-17\\Verified-20d0be7\\LetterSmith-Beta-Setup-1.0.0.exe",
+      "bytes": 1102643951,
+      "sha256": "817abc631c82932a08362014a5c9a77ec2ee75a4f97da20d62b673132832f354"
+    },
+    {
+      "path": "C:\\Users\\Oluwatola Ayedun\\Desktop\\LetterSmith-final-2026-10-17\\Verified-20d0be7\\Portable presentation 雪.zip",
+      "bytes": 15612475,
+      "sha256": "3b6adf844abee62c5a806fdcc8bdad4d1516d92810a06ad19b2175b4c24d9546"
+    },
+    {
+      "path": "C:\\Users\\Oluwatola Ayedun\\Desktop\\LetterSmith-final-2026-10-17\\Verified-20d0be7\\Packaged UI export 雪.zip",
+      "bytes": 15612475,
+      "sha256": "17ae1a5238987c6ed4f480d3b64652a28265210303da53342d0a9ec8713a5430"
+    },
+    {
+      "path": "C:\\Users\\Oluwatola Ayedun\\Desktop\\LetterSmith-final-2026-10-17\\Verified-20d0be7\\distribution-files.sha256.json",
+      "bytes": 741399,
+      "sha256": "0dd9118b9d5c60a838dff58b1f9a520bc87e8d36331598e33de007cada33a697"
+    }
+  ],
+  "packaged_smoke": {
+    "tested_directory": "C:/Temp/ls10/delivery-20d0",
+    "profile": "C:/Temp/ls10/packaged-profile",
+    "outcomes": [
+      "launch",
+      "account sign-in canceled",
+      "five-page session restored",
+      "embedded Forge preview",
+      "native Export ZIP to Unicode path",
+      "40 exported resources and semantic HTML verified",
+      "ZIP opened in local browser",
+      "clean normal shutdown"
+    ],
+    "earlier_native_checks": "Messages B and Writer exact prompt/no false dirty state were inspected in 30b00ae; Cancel/New/Discard in 9ff030f. Final production widget suites reran those paths.",
+    "delivery_copy": "byte-identical executable/installer; all distribution files hashed"
+  },
+  "not_performed": [
+    "installer installation/upgrade/uninstall",
+    "clean-machine verification",
+    "code signing",
+    "macOS native build/run",
+    "notarization",
+    "live publication"
+  ]
+}

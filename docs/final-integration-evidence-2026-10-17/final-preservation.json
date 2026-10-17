@@ -1,0 +1,11 @@
+{
+  "package_source_revision": "30b00ae5287e798f6c077246a56002601b6acf5d",
+  "saved_generation": "7aa7a4193ddb4525",
+  "checks": [
+    "original saved generation unchanged after native New Project, Discard, restart and Open",
+    "all five identities, names and types retained",
+    "both messages independent",
+    "all exact prompts including final newline and two spaces retained",
+    "all synthetic source hashes unchanged"
+  ]
+}

@@ -1,0 +1,40 @@
+[
+  {
+    "module": "test_window_sizing.WindowSizingTests.test_closing_editor_does_not_create_native_main_content",
+    "tests": 1,
+    "seconds": 5.082,
+    "failures": [],
+    "errors": [],
+    "skipped": [],
+    "expected_failures": [],
+    "unexpected_successes": [],
+    "passed": true
+  },
+  {
+    "module": "test_window_sizing.WindowSizingTests.test_maximized_launch_button_restores_windows_state_and_bounds",
+    "tests": 1,
+    "seconds": 5.207,
+    "failures": [],
+    "errors": [],
+    "skipped": [],
+    "expected_failures": [],
+    "unexpected_successes": [],
+    "passed": true
+  },
+  {
+    "module": "test_window_sizing.WindowSizingTests.test_native_tool_placement_across_connected_screens",
+    "tests": 1,
+    "seconds": 0.023,
+    "failures": [],
+    "errors": [],
+    "skipped": [
+      [
+        "test_window_sizing.WindowSizingTests.test_native_tool_placement_across_connected_screens",
+        "Requires the native Windows platform and multiple screens"
+      ]
+    ],
+    "expected_failures": [],
+    "unexpected_successes": [],
+    "passed": true
+  }
+]

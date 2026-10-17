@@ -1,0 +1,437 @@
+{
+  "source_revision": "5da197528f02dbe8630edb9d298892c0cf23abc6",
+  "method": "Native packaged Messages and detached Prompt Writer edits, Ctrl+S, real repository reload",
+  "stored_revision": "55ef6a8e14774f53",
+  "project_id": "ace78981-eb53-4db1-92c7-5f1b073d019e",
+  "checks": [
+    "Letter A message unchanged",
+    "Letter B final Unicode message retained",
+    "all prompts exact including B appended newline and two spaces",
+    "source resource hashes unchanged"
+  ],
+  "canonical_after": {
+    "format": "lettersmith.project",
+    "schema_version": 3,
+    "project_id": "ace78981-eb53-4db1-92c7-5f1b073d019e",
+    "revision": 29,
+    "pages": [
+      {
+        "id": "1db0d979-4366-4c4a-a455-b347906b28ce",
+        "type": "cover",
+        "name": "Opening",
+        "artwork": {
+          "asset": "a/58c5a45c73e0c310f2a5e1a98a725def.png",
+          "media_type": null,
+          "placement": {},
+          "animation": {}
+        },
+        "prompt": {
+          "directions": "",
+          "overrides": {},
+          "template_id": "cover",
+          "resolved_components": {},
+          "text": "  PRIVATE-PROMPT-Opening — Wall / four-page\n雪\n  ",
+          "options": {},
+          "stale": false
+        },
+        "message": null,
+        "design_overrides": {},
+        "recovery": {
+          "legacy_key": "cover"
+        },
+        "revision": 5,
+        "preview_stale": true
+      },
+      {
+        "id": "22212fde-4ede-4f46-82d4-48f77b0535b0",
+        "type": "letter",
+        "name": "Letter A",
+        "artwork": {
+          "asset": "a/96093b7db17a2cac7c60b596e85d2731.png",
+          "media_type": null,
+          "placement": {},
+          "animation": {}
+        },
+        "prompt": {
+          "directions": "",
+          "overrides": {},
+          "template_id": "wall",
+          "resolved_components": {},
+          "text": "  PRIVATE-PROMPT-Letter A — Wall / four-page\n雪\n  ",
+          "options": {},
+          "stale": true
+        },
+        "message": {
+          "format": "html",
+          "html": "<p style=\"color:#ffffff;font-family:Arial;font-size:22px\"><b>MESSAGE A</b></p><p style=\"color:#ffffff\">Independent rich text — café.</p>",
+          "resources": [],
+          "layout": {
+            "version": 1,
+            "units": "css_px",
+            "canvas": {
+              "width": 400,
+              "height": 600
+            },
+            "box": {
+              "x": 40,
+              "y": 100,
+              "width": 320,
+              "height": 170
+            },
+            "padding": {
+              "top": 12,
+              "right": 12,
+              "bottom": 12,
+              "left": 12
+            },
+            "text_align": "left",
+            "overflow": "scroll"
+          },
+          "settings": {}
+        },
+        "design_overrides": {},
+        "recovery": {
+          "legacy_key": "letter"
+        },
+        "revision": 6,
+        "preview_stale": true
+      },
+      {
+        "id": "db04a5b1-5811-4bfc-995b-d5fb18b16394",
+        "type": "illustration",
+        "name": "Animated illustration",
+        "artwork": {
+          "asset": "a/4812693c5036214ebd83a4efc8498b84.gif",
+          "media_type": null,
+          "placement": {},
+          "animation": {
+            "playback_mode": "ping_pong",
+            "speed_percent": 100,
+            "play_count": 2
+          }
+        },
+        "prompt": {
+          "directions": "",
+          "overrides": {},
+          "template_id": "letter",
+          "resolved_components": {},
+          "text": "  PRIVATE-PROMPT-Animated illustration — Wall / four-page\n雪\n  ",
+          "options": {},
+          "stale": false
+        },
+        "message": null,
+        "design_overrides": {},
+        "recovery": {
+          "legacy_key": "wall"
+        },
+        "revision": 5,
+        "preview_stale": true
+      },
+      {
+        "id": "aed60509-4784-4824-b2e2-2b0c662c900a",
+        "type": "letter",
+        "name": "Letter B",
+        "artwork": {
+          "asset": "a/8c105a21b422ed1b9cb85ddb97521bc6.png",
+          "media_type": null,
+          "placement": {},
+          "animation": {}
+        },
+        "prompt": {
+          "directions": "",
+          "overrides": {},
+          "template_id": "wall",
+          "resolved_components": {},
+          "text": "  PRIVATE-PROMPT-Letter B — Wall / four-page\n雪\n   PACKAGED PROMPT FINAL café 雪\n  ",
+          "options": {},
+          "stale": true
+        },
+        "message": {
+          "format": "html",
+          "html": "<style type=\"text/css\">.lettersmith-defaults p,.lettersmith-defaults li{white-space:pre-wrap}.lettersmith-defaults hr{height:1px;border-width:0}.lettersmith-defaults li.unchecked::marker{content:\"\\2610\"}.lettersmith-defaults li.checked::marker{content:\"\\2612\"}</style><div class=\"lettersmith-defaults\"><!-- lettersmith-style-state:v2:eyJibG9ja3MiOlt7Im92ZXJyaWRlcyI6W10sInN0eWxlIjpudWxsfSx7Im92ZXJyaWRlcyI6W10sInN0eWxlIjpudWxsfV0sImRlZmluaXRpb25zIjp7InN0eWxlcyI6eyJoZWFkaW5nXzEiOnsiZm9udF9jb2xvciI6IiMyYjFjMTIiLCJmb250X2ZhbWlseSI6IlBhcHlydXMiLCJmb250X3NpemUiOjI0LjAsImZvbnRfd2VpZ2h0Ijo3MDAsIml0YWxpYyI6ZmFsc2UsInBhcmFncmFwaCI6bnVsbCwic3RyaWtldGhyb3VnaCI6ZmFsc2UsInVuZGVybGluZSI6ZmFsc2V9LCJoZWFkaW5nXzIiOnsiZm9udF9jb2xvciI6IiMyYjFjMTIiLCJmb250X2ZhbWlseSI6IlBhcHlydXMiLCJmb250X3NpemUiOjIwLjAsImZvbnRfd2VpZ2h0Ijo3MDAsIml0YWxpYyI6ZmFsc2UsInBhcmFncmFwaCI6bnVsbCwic3RyaWtldGhyb3VnaCI6ZmFsc2UsInVuZGVybGluZSI6ZmFsc2V9LCJoZWFkaW5nXzMiOnsiZm9udF9jb2xvciI6IiMyYjFjMTIiLCJmb250X2ZhbWlseSI6IlBhcHlydXMiLCJmb250X3NpemUiOjE4LjAsImZvbnRfd2VpZ2h0Ijo3MDAsIml0YWxpYyI6ZmFsc2UsInBhcmFncmFwaCI6bnVsbCwic3RyaWtldGhyb3VnaCI6ZmFsc2UsInVuZGVybGluZSI6ZmFsc2V9LCJub3JtYWxfdGV4dCI6eyJmb250X2NvbG9yIjoiIzJiMWMxMiIsImZvbnRfZmFtaWx5IjoiUGFweXJ1cyIsImZvbnRfc2l6ZSI6MTYuMCwiZm9udF93ZWlnaHQiOjQwMCwiaXRhbGljIjpmYWxzZSwicGFyYWdyYXBoIjpudWxsLCJzdHJpa2V0aHJvdWdoIjpmYWxzZSwidW5kZXJsaW5lIjpmYWxzZX0sInN1YnRpdGxlIjp7ImZvbnRfY29sb3IiOiIjMmIxYzEyIiwiZm9udF9mYW1pbHkiOiJQYXB5cnVzIiwiZm9udF9zaXplIjoyMC4wLCJmb250X3dlaWdodCI6NDAwLCJpdGFsaWMiOnRydWUsInBhcmFncmFwaCI6bnVsbCwic3RyaWtldGhyb3VnaCI6ZmFsc2UsInVuZGVybGluZSI6ZmFsc2V9LCJ0aXRsZSI6eyJmb250X2NvbG9yIjoiIzJiMWMxMiIsImZvbnRfZmFtaWx5IjoiUGFweXJ1cyIsImZvbnRfc2l6ZSI6MjguMCwiZm9udF93ZWlnaHQiOjcwMCwiaXRhbGljIjpmYWxzZSwicGFyYWdyYXBoIjpudWxsLCJzdHJpa2V0aHJvdWdoIjpmYWxzZSwidW5kZXJsaW5lIjpmYWxzZX19LCJ2ZXJzaW9uIjoyfSwic2NoZW1hX3ZlcnNpb24iOjJ9 -->\n\n<!-- lettersmith-message:v2 -->\n\n<p style=\"margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px\"><span style=\"font-family:'Arial'; font-size:22px; font-weight:700; color:#ffffff\">MESSAGE B</span></p>\n<p style=\"margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px\"><span style=\"color:#ffffff\">Independent rich text — café. PACKAGE B FINAL — 雪</span></p></div>",
+          "resources": [],
+          "layout": {
+            "version": 1,
+            "units": "css_px",
+            "canvas": {
+              "width": 400,
+              "height": 600
+            },
+            "box": {
+              "x": 40,
+              "y": 280,
+              "width": 320,
+              "height": 170
+            },
+            "padding": {
+              "top": 12,
+              "right": 12,
+              "bottom": 12,
+              "left": 12
+            },
+            "text_align": "right",
+            "overflow": "scroll"
+          },
+          "settings": {}
+        },
+        "design_overrides": {},
+        "recovery": {
+          "legacy_key": "back"
+        },
+        "revision": 8,
+        "preview_stale": true
+      },
+      {
+        "id": "61880940-f647-4ada-bf9f-219f6d80720f",
+        "type": "end_page",
+        "name": "Ending",
+        "artwork": {
+          "asset": "a/c7075d54baed3c6ef5ea0a6bacc805cb.png",
+          "media_type": null,
+          "placement": {},
+          "animation": {}
+        },
+        "prompt": {
+          "directions": "",
+          "overrides": {},
+          "template_id": "back",
+          "resolved_components": {},
+          "text": "  PRIVATE-PROMPT-Ending — Wall / four-page\n雪\n  ",
+          "options": {},
+          "stale": false
+        },
+        "message": null,
+        "design_overrides": {},
+        "recovery": {
+          "legacy_key": "page_1"
+        },
+        "revision": 5,
+        "preview_stale": true
+      }
+    ],
+    "metadata": {
+      "title": "Synthetic journey — five independent pages",
+      "recipient_title": "Synthetic journey — five independent pages",
+      "recipient_name": "Synthetic Recipient",
+      "project_id": "ace78981-eb53-4db1-92c7-5f1b073d019e",
+      "recipient_id": "6a080324-34c8-4c15-8200-a4c2d5bf2013",
+      "project_created_at": "2026-10-17T21:32:17+00:00",
+      "saved_at": "2026-10-17T21:49:24.926631+00:00"
+    },
+    "shared_settings": {
+      "project_created_at": "2026-10-17T21:32:17+00:00",
+      "project_id": "ace78981-eb53-4db1-92c7-5f1b073d019e",
+      "recipient_id": "6a080324-34c8-4c15-8200-a4c2d5bf2013",
+      "recipient_name": "Synthetic Recipient",
+      "recipient_title": "Synthetic journey — five independent pages"
+    },
+    "prompt_settings": {},
+    "sound": {
+      "mode": "playlist",
+      "playlist": [
+        "synthetic",
+        "synthetic"
+      ],
+      "volume": 20,
+      "muted": true,
+      "tracks": [
+        {
+          "track_id": "synthetic",
+          "display_title": "Synthetic silence",
+          "asset": "tone.wav"
+        },
+        {
+          "track_id": "synthetic",
+          "display_title": "Synthetic silence",
+          "asset": "tone.wav"
+        }
+      ]
+    },
+    "presentation": {},
+    "publication": {},
+    "recovery": {},
+    "extensions": {
+      "legacy_workspace_snapshot": {
+        "metadata": {
+          "project_id": "ace78981-eb53-4db1-92c7-5f1b073d019e",
+          "recipient_id": "6a080324-34c8-4c15-8200-a4c2d5bf2013",
+          "recipient_name": "Synthetic Recipient",
+          "recipient_title": "Synthetic journey — five independent pages",
+          "project_created_at": "2026-10-17T21:32:17+00:00"
+        },
+        "settings": {
+          "starting_volume": 20,
+          "required_features": [],
+          "published_page_url": "",
+          "project_created_at": "2026-10-17T21:32:17+00:00",
+          "project_published_at": "",
+          "published_public_path": "",
+          "published_at": "",
+          "published_expires_at": "",
+          "publication_provider": "",
+          "published_source_fingerprint": "",
+          "published_github_owner": "",
+          "published_github_repository": "",
+          "publication_verified": false,
+          "curtain_style": "average_color",
+          "project_id": "ace78981-eb53-4db1-92c7-5f1b073d019e",
+          "recipient_id": "6a080324-34c8-4c15-8200-a4c2d5bf2013",
+          "recipient_name": "Synthetic Recipient",
+          "recipient_title": "Synthetic journey — five independent pages",
+          "music_volume": 20,
+          "music_muted": true
+        },
+        "page_layout": [
+          {
+            "key": "cover",
+            "kind": "cover"
+          },
+          {
+            "key": "letter",
+            "kind": "wall"
+          },
+          {
+            "key": "wall",
+            "kind": "letter"
+          },
+          {
+            "key": "back",
+            "kind": "wall"
+          },
+          {
+            "key": "page_1",
+            "kind": "back"
+          }
+        ],
+        "page_layout_version": 1,
+        "images": {
+          "cover": {
+            "asset_type": "static",
+            "is_animated_gif": false,
+            "source_file": "cover.png",
+            "preview_file": "cover.png"
+          },
+          "letter": {
+            "asset_type": "static",
+            "is_animated_gif": false,
+            "source_file": "letter.png",
+            "preview_file": "letter.png"
+          },
+          "wall": {
+            "asset_type": "static",
+            "is_animated_gif": false,
+            "source_file": "wall.png",
+            "preview_file": "wall.png"
+          },
+          "back": {
+            "asset_type": "static",
+            "is_animated_gif": false,
+            "source_file": "back.png",
+            "preview_file": "back.png"
+          },
+          "page_1": {
+            "asset_type": "static",
+            "is_animated_gif": false,
+            "source_file": "page_1.png",
+            "preview_file": "page_1.png"
+          }
+        },
+        "asset_prefix": "gallery/user/pages",
+        "message_html": null,
+        "message_resources": [],
+        "resources": [
+          "audio/78f82cd49af869013e8ec414a15d71f5.mp3",
+          "audio/78f82cd49af869013e8ec414a15d71f5.mp3"
+        ],
+        "asset_signatures": {
+          "cover": "58c5a45c73e0c310f2a5e1a98a725defcb471399df23278a0c2f3b2f2b1e90cf",
+          "letter": "96093b7db17a2cac7c60b596e85d27310c5876d90dbddd0341eeafcc6bfbc8d4",
+          "wall": "4812693c5036214ebd83a4efc8498b84edb78847f13d22b91fabad9d65c5106d",
+          "back": "8c105a21b422ed1b9cb85ddb97521bc66f2bd108c0ec65dec3ac4133fe9637ab",
+          "page_1": "c7075d54baed3c6ef5ea0a6bacc805cb34c341317bef61b32f20f5412e2f33cd"
+        },
+        "prompt_writer_state": {
+          "version": 6,
+          "generated_prompts": {
+            "cover": "  PRIVATE-PROMPT-Opening — Wall / four-page\n雪\n  ",
+            "letter": "  PRIVATE-PROMPT-Letter A — Wall / four-page\n雪\n  ",
+            "wall": "  PRIVATE-PROMPT-Animated illustration — Wall / four-page\n雪\n  ",
+            "back": "  PRIVATE-PROMPT-Letter B — Wall / four-page\n雪\n  ",
+            "page_1": "  PRIVATE-PROMPT-Ending — Wall / four-page\n雪\n  "
+          },
+          "resolved_instructions": {},
+          "generated_output_stale": true,
+          "cover": "",
+          "letter": "",
+          "wall": "",
+          "back": "",
+          "page_1": ""
+        },
+        "sound": {
+          "version": 2,
+          "mode": "playlist",
+          "single_track_id": "",
+          "playlist": [
+            "synthetic",
+            "synthetic"
+          ],
+          "playlist_expanded": true,
+          "selected_track_id": "synthetic",
+          "volume": 20,
+          "muted": true,
+          "tracks": [
+            {
+              "track_id": "synthetic",
+              "asset": "audio/78f82cd49af869013e8ec414a15d71f5.mp3",
+              "sha256": "78f82cd49af869013e8ec414a15d71f5f4f2ec8d006b6a0c50527c91eaa7a85f",
+              "display_title": "Synthetic silence",
+              "original_name": "tone.wav",
+              "duration_seconds": 0.0
+            },
+            {
+              "track_id": "synthetic",
+              "asset": "audio/78f82cd49af869013e8ec414a15d71f5.mp3",
+              "sha256": "78f82cd49af869013e8ec414a15d71f5f4f2ec8d006b6a0c50527c91eaa7a85f",
+              "display_title": "Synthetic silence",
+              "original_name": "tone.wav",
+              "duration_seconds": 0.0
+            }
+          ]
+        }
+      },
+      "legacy_authored_snapshot": {
+        "sound": {
+          "mode": "playlist",
+          "playlist": [
+            "synthetic",
+            "synthetic"
+          ],
+          "volume": 20,
+          "muted": true,
+          "tracks": [
+            {
+              "track_id": "synthetic",
+              "display_title": "Synthetic silence",
+              "asset": "tone.wav"
+            },
+            {
+              "track_id": "synthetic",
+              "display_title": "Synthetic silence",
+              "asset": "tone.wav"
+            }
+          ]
+        },
+        "shared_settings": {
+          "project_created_at": "2026-10-17T21:32:17+00:00",
+          "project_id": "ace78981-eb53-4db1-92c7-5f1b073d019e",
+          "recipient_id": "6a080324-34c8-4c15-8200-a4c2d5bf2013",
+          "recipient_name": "Synthetic Recipient",
+          "recipient_title": "Synthetic journey — five independent pages"
+        }
+      },
+      "resource_files": [
+        "audio/78f82cd49af869013e8ec414a15d71f5.mp3"
+      ]
+    }
+  }
+}

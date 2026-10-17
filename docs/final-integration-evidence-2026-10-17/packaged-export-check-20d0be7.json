@@ -1,0 +1,14 @@
+{
+  "source_revision": "20d0be7abc48eac95c1fbc00e4b6161b8b5baeda",
+  "method": "Native packaged Forge Export > ZIP Package > save to Unicode path",
+  "path": "C:\\Temp\\ls10\\delivery-20d0\\Packaged UI export \u96ea.zip",
+  "sha256": "17ae1a5238987c6ed4f480d3b64652a28265210303da53342d0a9ec8713a5430",
+  "file_count": 40,
+  "checks": [
+    "all resource bytes and semantic HTML match the production-service export; only fresh CSP nonce and its HTML digest differ",
+    "every display-manifest file digest verified",
+    "private prompt sentinels absent",
+    "editable repository absent",
+    "contained extraction"
+  ]
+}

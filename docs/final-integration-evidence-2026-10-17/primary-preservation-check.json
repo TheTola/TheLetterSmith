@@ -1,0 +1,54 @@
+[
+  {
+    "Path": "Main.py",
+    "Match": true
+  },
+  {
+    "Path": "publishing/github_auth.py",
+    "Match": true
+  },
+  {
+    "Path": "publishing/github_pages.py",
+    "Match": true
+  },
+  {
+    "Path": "release/LetterSmith.spec",
+    "Match": true
+  },
+  {
+    "Path": "release/MACOS_MANUAL_TEST_CHECKLIST.md",
+    "Match": true
+  },
+  {
+    "Path": "release/README.md",
+    "Match": true
+  },
+  {
+    "Path": "release/build_macos.py",
+    "Match": true
+  },
+  {
+    "Path": "release/build_release.py",
+    "Match": true
+  },
+  {
+    "Path": "release/release_manifest.json",
+    "Match": true
+  },
+  {
+    "Path": "requirements.txt",
+    "Match": true
+  },
+  {
+    "Path": "settings.json",
+    "Match": true
+  },
+  {
+    "Path": "test/test_application_paths.py",
+    "Match": true
+  },
+  {
+    "Path": "test/test_github_publishing.py",
+    "Match": true
+  }
+]
