@@ -97,6 +97,18 @@ class PromptWriterPageTests(unittest.TestCase):
                 self.assertIn('The End', text)
                 self.assertIsNone(self.session.project.get_message(page_id))
 
+    def test_open_after_canonical_save_does_not_reproject_or_dirty_authored_state(self):
+        self.session.project.update_prompt(self.ids[3], {'text': '  Saved final café 雪\n  '})
+        self.session.save(sync_workspace=False)
+        before = self.session.project.to_dict()
+        panel = PromptWriterPanel(project_root=str(self.root), page_id=self.ids[3])
+        try:
+            self.assertEqual(panel._view_spec.preview_widget.toPlainText(), '  Saved final café 雪\n  ')
+            self.assertEqual(self.session.project.to_dict(), before)
+        finally:
+            panel.shutdown()
+            panel.deleteLater()
+
     def test_refresh_preserves_cursor_undo_and_failed_target_switch(self):
         editor = self.panel._view_spec.preview_widget
         editor.moveCursor(QtGui.QTextCursor.End)

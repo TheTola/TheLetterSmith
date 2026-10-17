@@ -597,3 +597,8 @@ before Main calls `configure_application_paths`. Explicit other project roots
 remain self-contained. Global event filters must reject irrelevant/destruction
 notifications before accessing widget content; native worker ownership ends only
 after a completed join, not merely receipt of a queued finished signal.
+
+Opening the canonical Prompt Writer is a read-only binding operation. It does not
+refresh legacy page projections; canonical pages, their labels and exact prompts
+already supply the view. Compatibility projection maintenance must not be added
+to a launcher as an incidental authored revision.

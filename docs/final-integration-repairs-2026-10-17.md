@@ -74,3 +74,10 @@ experimental window-title change was reverted; no appearance behavior changed.
   Letter B. Refresh the existing single-card help and empty-prompt placeholder
   from its actual canonical page label. The four-model launcher test now checks
   those descriptions for every target. Prompt content is untouched.
+
+- FIX-10: opening Prompt Writer after a canonical-only save refreshed the old
+  page-controller projection, incrementing the project revision solely for its
+  compatibility cache. Native inspection showed a false Unsaved changes title;
+  snapshot comparison found no authored-content change. Remove that redundant
+  launch-time reload: the panel already reads canonical pages and subscribes to
+  their events. A new real-construction regression failed before the removal.

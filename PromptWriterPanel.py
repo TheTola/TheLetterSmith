@@ -1641,7 +1641,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         self.session = get_project_session(self.project_root)
         self.page_controller = page_controller(self.project_root)
-        self.page_controller.reload()
         self._view_page_id = None
         self._view_session_id = self.session.session_id
         self._writing = False
