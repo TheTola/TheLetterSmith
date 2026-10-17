@@ -234,6 +234,7 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                 start_preparation.assert_called_once_with()
                 self.assertFalse(window._curtain_preparation_timer.isActive())
             finally:
+                window.shutdown()
                 window.close()
 
     def test_startup_always_selects_images_tab(self) -> None:
@@ -562,6 +563,7 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
             )
             self.assertTrue(window.protected_new_project_btn.isVisible())
             self.assertTrue(window.title_bar.settings_button.isVisible())
+            window.shutdown()
             window.close()
 
     def test_forge_preview_is_unloaded_before_directory_replacement(self) -> None:

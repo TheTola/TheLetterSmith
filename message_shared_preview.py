@@ -276,9 +276,8 @@ class SharedMessagePreview(QtWidgets.QWidget):
 
     def release(self, timeout_ms=5000):
         """Cancel builds and confirm browser unload before project restoration."""
-        self.invalidate()
-        if not self._pool.waitForDone(timeout_ms):
-            return False
+        elapsed = QtCore.QElapsedTimer()
+        elapsed.start()
         loop = QtCore.QEventLoop()
         timer = QtCore.QTimer()
         timer.setSingleShot(True)
@@ -293,9 +292,15 @@ class SharedMessagePreview(QtWidgets.QWidget):
         self.view.loadFinished.connect(blank_loaded)
         timer.timeout.connect(loop.quit)
         try:
-            self.view.setUrl(QtCore.QUrl("about:blank"))
-            timer.start(min(timeout_ms, 1500))
-            loop.exec(QtCore.QEventLoop.ExcludeUserInputEvents)
+            # Observe invalidate's one navigation. A second about:blank load
+            # cancels the first and can lose its completion on a cold renderer.
+            self.invalidate()
+            if not self._pool.waitForDone(timeout_ms):
+                return False
+            remaining = max(0, timeout_ms - elapsed.elapsed())
+            if not unloaded and remaining:
+                timer.start(remaining)
+                loop.exec(QtCore.QEventLoop.ExcludeUserInputEvents)
         finally:
             timer.stop()
             self.view.loadFinished.disconnect(blank_loaded)

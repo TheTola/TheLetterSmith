@@ -18,7 +18,7 @@ class SavedProjectsController(QtCore.QObject):
     def __init__(self, forge):
         super().__init__(forge)
         self.forge = forge
-        self.service = getattr(forge.window(), "project_save_service", None) or ProjectSaveService(forge.project_root, forge.project_state)
+        self.service = getattr(forge, "project_save_service", None) or getattr(forge.window(), "project_save_service", None) or ProjectSaveService(forge.project_root, forge.project_state)
         self.previews = []
         layout = forge.saved_panel.layout()
         self.details = QtWidgets.QLabel("Select a project to see its saved version.")
@@ -56,6 +56,9 @@ class SavedProjectsController(QtCore.QObject):
         forge.saved_actions_layout.insertWidget(2, self.save_button)
         self.shortcut = QtGui.QShortcut(QtGui.QKeySequence.Save, forge.window())
         self.shortcut.activated.connect(self.save)
+        # A hidden Forge widget cannot own the application's global shortcut.
+        # Nexus supplies its shared QAction; standalone Forge keeps this shortcut.
+        self.shortcut.setEnabled(getattr(forge, "project_save_service", None) is None)
         self.changed.connect(self.selected_changed)
         self._observed_session = self.session
         self._session_listener = lambda _event: self.changed.emit()
@@ -80,7 +83,7 @@ class SavedProjectsController(QtCore.QObject):
             return bool(hook())
         return self.forge._flush_prompt_writer_state()
 
-    def _run(self, activity, task, success):
+    def _run(self, activity, task, success, *, failed=None):
         if self.forge._busy:
             self._status("Wait for the current operation to finish.")
             return False
@@ -95,13 +98,20 @@ class SavedProjectsController(QtCore.QObject):
             value, error = result
             if error:
                 self._status(f"{activity.rstrip('…')} failed: {error}. Your open edits are retained. Retry, reload the saved version, or Save a Copy.", error=True)
+                if failed is not None:
+                    failed(False)
                 return
-            success(value)
+            try:
+                success(value)
+            except Exception as error:
+                self._status(f"{activity.rstrip('…')} could not finish: {error}. Your edits remain open.", error=True)
+                if failed is not None:
+                    failed(False)
 
         self.forge._start_operation(activity, work, finished, "The project operation failed; your edits remain open.")
         return True
 
-    def save(self, _checked=False, *, copy=False, after=None):
+    def save(self, _checked=False, *, copy=False, after=None, finished=None):
         if self.forge._busy or not self._flush():
             return False
         try:
@@ -130,8 +140,10 @@ class SavedProjectsController(QtCore.QObject):
             self.selected_changed()
             if after is not None and current:
                 self.forge._defer_until_idle(after)
+            if finished is not None:
+                finished(current)
 
-        return self._run("Saving project…", lambda: self.service.commit_editable_save(capture), saved)
+        return self._run("Saving project…", lambda: self.service.commit_editable_save(capture), saved, failed=finished)
 
     def selected_changed(self):
         if self.session.is_restoring:
@@ -172,6 +184,9 @@ class SavedProjectsController(QtCore.QObject):
         entry = self.forge._selected_saved_letter
         if not isinstance(entry, SavedLetter) or not entry.valid or self.forge._busy:
             return False
+        lifecycle = getattr(self.forge.window(), "project_lifecycle", None)
+        if lifecycle is not None:
+            return lifecycle.open_saved(entry)
         if not self._flush():
             return False
         if self.service.has_unsaved_editable_changes():
@@ -185,18 +200,20 @@ class SavedProjectsController(QtCore.QObject):
                 return self.save(after=lambda: self._read_and_open(entry))
         return self._read_and_open(entry)
 
-    def _read_and_open(self, entry):
+    def _read_and_open(self, entry, *, finished=None):
         origin, revision = self.session.session_id, self.session.project.revision
 
         def loaded(candidate):
-            if (origin, revision) != (self.session.session_id, self.session.project.revision):
+            if not self._flush() or (origin, revision) != (self.session.session_id, self.session.project.revision):
                 self._status("The open project changed while loading. Its edits were kept; open the saved project again.", error=True)
+                if finished is not None:
+                    finished(False)
                 return
             self.forge._begin_restore_activity("Opening project…")
             try:
                 if not self.forge._release_project_files_for_restore():
                     return
-                if (origin, revision) != (self.session.session_id, self.session.project.revision):
+                if not self._flush() or (origin, revision) != (self.session.session_id, self.session.project.revision):
                     raise RuntimeError("New edits arrived during the transition; retry opening")
                 stored = self.service.open_saved_project(entry, loaded=candidate)
                 self.forge._last_play_dir = None
@@ -205,14 +222,22 @@ class SavedProjectsController(QtCore.QObject):
                 self.forge.letter_loaded.emit(payload)
                 self.forge.saved_panel.hide()
                 self.selected_changed()
+                view_errors = getattr(self.forge.window(), "_project_view_restore_errors", ())
+                if view_errors:
+                    self._status("Project activated and retained, but these views need reopening: " + ", ".join(view_errors), error=True)
+                    return
                 self._status("Project opened." + (" Legacy/example content is an editable copy; its original is unchanged." if not candidate.revision or entry.example else "") +
                              (" " + entry.warning if entry.warning else ""))
             except Exception as error:
-                self._status(f"Open failed: {error}. The previous project is retained.", error=True)
+                retained = ("The previous project is retained." if origin == self.session.session_id else
+                            "The activated project is recoverable; reopen the application to restore its views.")
+                self._status(f"Open failed: {error}. {retained}", error=True)
             finally:
                 self.forge._finish_restore_activity()
+                if finished is not None:
+                    finished()
 
-        return self._run("Reading saved project…", lambda: self.service.read_saved_project(entry), loaded)
+        return self._run("Reading saved project…", lambda: self.service.read_saved_project(entry), loaded, failed=finished)
 
     def duplicate_selected(self):
         entry = self.forge._selected_saved_letter
@@ -382,8 +407,10 @@ class SavedProjectsController(QtCore.QObject):
         except Exception as error:
             self._status(str(error), error=True)
 
+    def prepare_for_shutdown(self):
+        return all(preview.release() for _dialog, preview, _session, _temporary in tuple(self.previews))
+
     def shutdown(self):
-        self._observed_session.remove_listener(self._session_listener)
         for dialog, preview, session, temporary in tuple(self.previews):
             if not preview.shutdown():
                 return False
@@ -391,4 +418,5 @@ class SavedProjectsController(QtCore.QObject):
             dialog.close()
             temporary.cleanup()
         self.previews.clear()
+        self._observed_session.remove_listener(self._session_listener)
         return True

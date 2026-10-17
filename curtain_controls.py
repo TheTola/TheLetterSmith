@@ -811,6 +811,10 @@ class CurtainStyleController(QtCore.QObject):
         )
         snapshot = self.settings.update_fields(curtain_style=normalized)
         stored = normalize_curtain_style(snapshot.get("curtain_style"))
+        from project_session import peek_project_session
+        session = peek_project_session(self.settings.project_root)
+        if session is not None and not session.is_restoring:
+            session.project.update_shared_settings({"curtain_style": stored})
         self._apply_style(stored)
         if stored != before:
             self.styleCommitted.emit(stored)

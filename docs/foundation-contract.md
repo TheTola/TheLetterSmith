@@ -1,5 +1,71 @@
 # Flexible page foundation contract
 
+## Command & Settings contract extension — 2026-10-16
+
+`ProjectLifecycle` in `project_lifecycle.py` owns the shell's one in-flight
+New/Open/Exit decision. It consumes `Nexus.flush_project_edits()` and the same
+`ProjectSaveService` instance injected into Forge/Saved Letters by Nexus.
+`SavedProjectsController.save(finished=callback)` reports whether the originating
+revision is still current, including failure. After the worker becomes idle,
+the lifecycle flushes again and checks session generation plus content revision;
+new edits cancel replacement. An explicit save never authorizes discarding a
+later revision. Standalone Forge retains its existing service fallback.
+
+`ProjectSaveService.prepare_new_project(page_types)` validates the configured
+`MIN_PAGES`/`MAX_PAGES` and returns an empty `StoredProject` from `create_project`.
+Preparation does not mutate active content. `activate_new_project(candidate)`
+uses `SavedLetterRestorer.restore_canonical`, its activation journal, resource
+staging, expected-revision check and rollback. It binds a fresh UUID destination
+as unsaved, with no publication authority. The existing recipient entry workflow
+remains; starter pages already exist and are retained when the recipient is set.
+
+`prepare_discard_project()` reads the last explicit save, or prepares a fresh
+classic draft when there is no explicit save. `discard_active_changes(prepared)`
+uses the same canonical activation and binding. Exit/Discard therefore restarts
+from that explicit version, not the abandoned active draft. Older canonical
+working generations remain recoverable; no library or saved generation is
+collected. New/Open discard by replacing only active state. Cancel performs no
+replacement, worker disposal or media stop. A preparation/flush/save/conflict
+failure keeps the session open. Shutdown waits are bounded by the existing owner
+hooks; busy owners report a retry path before subscriptions are disconnected.
+
+Command buttons, menus, Ctrl+N, Open, Save, Quit and window close share shell
+routes. Native application Quit is intercepted before `aboutToQuit`; confirmed
+close is queued because Qt suppresses recursive `close()` inside `closeEvent`.
+Saved preview release is part of shutdown preparation. Prompt Writer reload runs
+after the restoration scope, using its own blocked editing signals.
+The standalone `command.py` launcher calls `Main.main(open_new_project=True)`;
+it no longer invokes the old filesystem reset dialog. Failed view restoration
+is reported separately from a committed canonical activation; the committed
+project remains recoverable and no successful-open status hides that failure.
+
+`SharedMessagePreview.release(timeout_ms)` observes the single blank navigation
+issued by invalidation, with the remaining owner timeout after build cancellation.
+It does not start a second navigation that can cancel unload confirmation. Failure
+retains the owner and stops replacement; repeated release remains usable. This
+narrow shared-view repair is covered in `test_message_shared_preview` and the real
+Saved Letters save/open/preview path.
+Forge keeps its operation busy until the UI completion callback returns, including
+nested browser-release event loops. A worker's thread-finished signal is deferred
+while activation is completing; it cannot unlock controls or finish the restore
+overlay early. `test_saved_projects` asserts this in its real save/open path.
+
+Curtain selection commits only `shared_settings.curtain_style` and its existing
+settings mirror. It preserves page overrides, exact prompts and documents.
+Application theme/family and picker/window preferences do not dirty authored
+content. The former developer reset now resets only `application_theme` and
+`theme_family`, through `SettingsStore`; it neither saves/deletes a project nor
+reads/clears credentials. Restoration clears obsolete project view locks, prompt
+dumps and output/audio path fields instead of inheriting another project's state.
+
+With `LETTER_SMITH_PROFILE_ROOT` set, the default `GitHubCredentialStore` returns
+no stored account, refuses credential writes and ignores clear. Explicitly
+injected test stores remain supported. Normal production profiles continue using
+the existing secure keyring. No profile-specific plaintext credential store exists.
+
+Authoritative coverage: `test_command_settings`, `test_command_interaction`,
+`test_developer_mode`, plus existing repository/session/Saved Letters/media suites.
+
 ## Saved Projects contract extension — 2026-10-16
 
 The existing `ProjectSaveService` owns explicit editable saves as well as its

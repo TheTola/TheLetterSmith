@@ -584,19 +584,35 @@ def connect_shutdown_handler(
 
     completed = False
 
+    class QuitGuard(QtCore.QObject):
+        def eventFilter(self, watched, event):
+            if event.type() == QtCore.QEvent.Quit and not getattr(window, "_shutdown_complete", False):
+                if hasattr(window, "project_lifecycle"):
+                    window.close()
+                    return True
+            return False
+
+    # Native Quit / Ctrl+C must resolve edits before Qt emits aboutToQuit.
+    quit_guard = QuitGuard(application)
+    application.installEventFilter(quit_guard)
+    window._application_quit_guard = quit_guard
+
     def run_shutdown() -> None:
         nonlocal completed
         if completed:
             return
-        completed = True
         logging.info("[Shutdown] Cleanup started.")
         try:
-            shutdown()
+            result = shutdown()
 
         except Exception:
             logging.exception("[Shutdown] Cleanup failed.")
         else:
-            logging.info("[Shutdown] Cleanup completed.")
+            completed = result is not False
+            if completed:
+                logging.info("[Shutdown] Cleanup completed.")
+            else:
+                logging.error("[Shutdown] Cleanup incomplete; recovery state retained.")
 
     application.aboutToQuit.connect(
         run_shutdown
@@ -644,7 +660,7 @@ def _upgrade_saved_letters_at_startup(project_root: Path) -> None:
         )
 
 
-def main() -> None:
+def main(*, open_new_project: bool = False) -> None:
     """
     Launch Letter Smith.
     """
@@ -817,6 +833,8 @@ def main() -> None:
         application,
         window,
     )
+    if open_new_project:
+        QtCore.QTimer.singleShot(0, window.start_new_project)
 
     logging.info(
         "[Boot] "

@@ -1685,7 +1685,7 @@ class _CommandEntryNotice(
         layout.setSpacing(18)
 
         self.completion_message = QtWidgets.QLabel(
-            "WHEN YOU ARE COMPLETELY DONE",
+            "PROJECT COMMANDS",
             self.panel,
         )
         self.completion_message.setObjectName(
@@ -1711,13 +1711,11 @@ class _CommandEntryNotice(
         )
 
         self.message = QtWidgets.QLabel(
-            "Hold Go for 3 seconds to save this finished letter and clear "
-            "the workspace for your next project.\n\n"
-            "The saved letter remains available in Command Bar. You can "
-            "preview it, open its published letter, and copy its published "
-            "link.\n\n"
-            "Only do this when you are ready to send the letter and begin "
-            "your next project.\n\n"
+            "New Project lets you choose starter pages before deciding "
+            "whether to save your current changes.\n\n"
+            "Saved projects, recovery copies, libraries and application "
+            "preferences are kept. Use the labeled actions below or hold Go "
+            "to open New Project.\n\n"
             "Click anywhere to dismiss.",
             self.panel,
         )
@@ -2159,8 +2157,8 @@ class CommandTab(
         )
         set_control_help(
             self.go_btn,
-            "Hold Go for three seconds to finish this letter and clear the workspace for a new project.",
-            accessible_name="Finish letter and start new project",
+            "Hold Go for three seconds to choose a new project. You can save, discard changes, or cancel.",
+            accessible_name="New Project",
         )
 
         self._interaction_state = "idle"
@@ -2174,6 +2172,15 @@ class CommandTab(
         self._entry_notice = _CommandEntryNotice(
             self
         )
+
+        self.project_actions = QtWidgets.QWidget(self)
+        actions = QtWidgets.QHBoxLayout(self.project_actions)
+        actions.setContentsMargins(8, 8, 8, 8)
+        for label, route in (("New Project", "start_new_project"), ("Save Project", "save_project"),
+                             ("Open Saved Project", "_show_saved_letters_from_recipient_page"), ("Exit Application", "close")):
+            button = QtWidgets.QPushButton(label, self.project_actions)
+            button.clicked.connect(lambda _checked=False, name=route: self._route_project_action(name))
+            actions.addWidget(button)
 
         self._relayout()
 
@@ -2204,6 +2211,9 @@ class CommandTab(
     def _do_reset(
         self,
     ) -> None:
+        if callable(getattr(self.window(), "start_new_project", None)):
+            self._route_project_action("start_new_project")
+            return
         if self._interaction_state != "idle":
             return
 
@@ -2341,8 +2351,8 @@ class CommandTab(
         self.go_btn.setEnabled(True)
         set_control_help(
             self.go_btn,
-            "Hold Go for three seconds to finish this letter and clear the workspace for a new project.",
-            accessible_name="Finish letter and start new project",
+            "Hold Go for three seconds to choose a new project. You can save, discard changes, or cancel.",
+            accessible_name="New Project",
         )
         self._interaction_state = "idle"
 
@@ -2376,6 +2386,9 @@ class CommandTab(
             height,
         )
 
+        if hasattr(self, "project_actions"):
+            self.project_actions.setGeometry(12, max(0, height - 70), max(1, width - 24), 58)
+            self.project_actions.raise_()
         if self._bg_pix.isNull() or self._go_pix.isNull():
             self.bg_label.clear()
             self.go_btn.set_base(
@@ -2411,31 +2424,25 @@ class CommandTab(
         )
 
         self.go_btn.raise_()
+        if hasattr(self, "project_actions"):
+            self.project_actions.raise_()
         if self._entry_notice.isVisible():
             self._entry_notice.setGeometry(
                 self.rect()
             )
             self._entry_notice.raise_()
 
+    def _route_project_action(self, name):
+        action = getattr(self.window(), name, None)
+        if callable(action):
+            self._entry_notice.dismiss()
+            action()
+
 
 def main() -> None:
-    application = (
-        QtWidgets.QApplication.instance()
-        or QtWidgets.QApplication(
-            sys.argv
-        )
-    )
-
-    confirm_and_reset(
-        None
-    )
-
-    QtCore.QTimer.singleShot(
-        0,
-        application.quit,
-    )
-
-    application.exec()
+    # Standalone launch uses the same recovery, pending edits and decision flow.
+    from Main import main as launch_application
+    launch_application(open_new_project=True)
 
 
 if __name__ == "__main__":

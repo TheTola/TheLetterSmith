@@ -182,6 +182,17 @@ class SharedMessagesPreviewTests(unittest.TestCase):
         self.assertIsNone(self.preview._current)
         self.assertEqual(self.session.project.get_message(self.b), document)
 
+    def test_repeated_release_unloads_and_keeps_preview_usable(self):
+        self.open_preview(self.b)
+        previous = Path(self.preview._current[0].name)
+        self.assertTrue(self.preview.release())
+        self.assertTrue(self.preview.release())
+        self.assertEqual(self.preview.view.url().toString(), "about:blank")
+        self.assertFalse(previous.exists())
+        self.assertFalse(self.preview._closed)
+        self.open_preview(self.a)
+        self.assertEqual(self.preview.viewed_page_id, self.a)
+
 
 if __name__ == "__main__":
     unittest.main()

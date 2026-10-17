@@ -1563,6 +1563,11 @@ class SavedLetterRestorer:
         if entry is not None and (entry.example or entry.stock):
             payload["project_id"] = str(uuid.uuid4())
         restored = dict(settings_before)
+        # Legacy view/session fields must not retain the previous project's locks,
+        # prompt dump or output/audio paths. Authored values come from the candidate.
+        restored.update(recipient_title_locked=False, recipient_name_locked=False,
+                        published_page_url_locked=False, prompt_writer_state={},
+                        last_sealed_path="", music_required=False, music_file="", last_audio="none")
         for key in (*RESTORABLE_SETTING_KEYS, *PUBLICATION_METADATA_KEYS,
                     PROJECT_CREATED_AT_KEY, "recipient_name", "recipient_title", "recipient_id",
                     "recipient_display_name", "recipient_normalized_key", ACTIVE_PLAY_DIR_KEY,

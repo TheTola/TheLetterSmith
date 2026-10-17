@@ -266,6 +266,52 @@ class ProjectSaveService:
     def save_eligibility(self) -> ProjectSaveEligibility:
         return evaluate_project_save_eligibility(self.project_root)
 
+    def prepare_new_project(self, page_types):
+        """Validate an empty starter without changing the active session."""
+        from project_model import MIN_PAGES, MAX_PAGES, create_project
+        from project_repository import StoredProject
+        kinds = tuple(page_types)
+        if not MIN_PAGES <= len(kinds) <= MAX_PAGES:
+            raise ProjectSaveError(f"Choose between {MIN_PAGES} and {MAX_PAGES} pages")
+        project = create_project(kinds, metadata={
+            PROJECT_CREATED_AT_KEY: datetime.now(timezone.utc).isoformat(),
+        })
+        # There are no source references in a fresh factory document.
+        return StoredProject(project, "", self.project_root, {})
+
+    def activate_new_project(self, candidate):
+        """Use the same transactional replacement as Open; retain prior generations."""
+        from project_session import get_project_session
+        from saved_letters import SavedLetterRestorer
+        stored = SavedLetterRestorer(self.project_root).restore_canonical(candidate)
+        session = get_project_session(self.project_root)
+        self._bind(session, self.editable_root / session.project.project_id, None, -1)
+        self.project_state.initialize()
+        return stored
+
+    def prepare_discard_project(self):
+        """Exit restores the explicit save, or a fresh draft, without deleting recovery."""
+        from project_model import CLASSIC_PAGE_TYPES
+        from project_repository import ProjectRepository
+        from project_session import get_project_session
+        binding = self._binding(get_project_session(self.project_root))
+        if binding and binding.get("revision"):
+            directory = Path(binding["directory"])
+            self._validate_editable_directory(directory)
+            return ProjectRepository(directory / ".lettersmith-project").load(allow_missing=True), directory
+        return self.prepare_new_project(CLASSIC_PAGE_TYPES), None
+
+    def discard_active_changes(self, prepared):
+        from project_session import get_project_session
+        from saved_letters import SavedLetterRestorer
+        candidate, directory = prepared
+        stored = SavedLetterRestorer(self.project_root).restore_canonical(candidate)
+        session = get_project_session(self.project_root)
+        self._bind(session, directory or self.editable_root / session.project.project_id,
+                   candidate.revision if directory else None, session.project.revision if directory else -1)
+        self.project_state.initialize()
+        return stored
+
     def can_save(self) -> bool:
         return self.save_eligibility().can_save
 

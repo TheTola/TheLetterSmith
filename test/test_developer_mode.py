@@ -28,7 +28,7 @@ if "keyring" not in sys.modules:
 from developermode import (
     DEVELOPER_MODE_SHORTCUT,
     DeveloperModeDialog,
-    _save_current_letter_if_ready,
+    run_developer_mode,
     perform_developer_reset,
 )
 from project_state import ApplicationState, ProjectStateController
@@ -61,24 +61,14 @@ class DeveloperModeTests(unittest.TestCase):
             sys.argv
         )
 
-    def test_dialog_uses_supplied_developer_artwork(self) -> None:
-        repository = Path(__file__).resolve().parents[1]
-        dialog = DeveloperModeDialog(repository)
-
+    def test_dialog_names_the_exact_preference_scope(self) -> None:
+        dialog = DeveloperModeDialog(Path(self.temp_dir.name) if hasattr(self, "temp_dir") else Path.cwd())
         self.assertEqual(DEVELOPER_MODE_SHORTCUT, "Ctrl+Alt+Shift+D")
-        self.assertEqual(
-            dialog.developer_button.accessibleName(),
-            "Developer Mode",
-        )
-        self.assertEqual(dialog.developer_button.text(), "")
-        self.assertFalse(dialog.developer_button.icon().isNull())
-        self.assertEqual(
-            dialog.developer_button.iconSize(),
-            QtCore.QSize(840, 473),
-        )
+        self.assertEqual(dialog.windowTitle(), "Reset Appearance Preferences")
+        self.assertEqual(dialog.developer_button.text(), "Reset Appearance Preferences")
         dialog.deleteLater()
 
-    def test_reset_clears_active_project_github_and_theme_choice(self) -> None:
+    def test_reset_only_changes_appearance_and_keeps_projects_and_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             active_page = root / "gallery" / "user" / "pages" / "cover.png"
@@ -112,86 +102,36 @@ class DeveloperModeTests(unittest.TestCase):
                 save_current=save_current,
             )
 
-            self.assertEqual(result.saved_letter, saved.parent)
-            save_current.assert_called_once_with(root.resolve(), None)
-            self.assertEqual(credentials.clear_count, 1)
-            self.assertIsNone(credentials.stored)
-            self.assertFalse(active_page.exists())
+            self.assertIsNone(result.saved_letter)
+            save_current.assert_not_called()
+            self.assertEqual(credentials.clear_count, 0)
+            self.assertIs(credentials.stored, stored)
+            self.assertTrue(active_page.exists())
             self.assertTrue(saved.is_file())
             current = settings.snapshot()
             self.assertEqual(current.get("application_theme"), "")
             self.assertEqual(current.get("theme_family"), "")
-            self.assertEqual(current.get("curtain_style"), "average_color")
+            self.assertEqual(current.get("curtain_style"), "pure_white")
             self.assertTrue(
                 startup_theme_prompt_required(settings, force_prompt=False)
             )
-            self.assertEqual(controller.state, ApplicationState.RECIPIENT_REQUIRED)
+            self.assertEqual(controller.state, ApplicationState.PROJECT_READY)
 
-    def test_ready_letter_is_built_and_recorded_before_reset(self) -> None:
+    def test_cancel_and_write_failure_change_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            message = root / "gallery" / "user" / "message" / "message.html"
-            message.parent.mkdir(parents=True)
-            message.write_text("<p>Ready</p>", encoding="utf-8")
-            play_dir = root / "output" / "Play" / "Recipient" / "Letter"
-            play_dir.mkdir(parents=True)
-            readiness = types.SimpleNamespace(
-                can_preview=True,
-                missing_items=(),
-            )
-            window = types.SimpleNamespace(
-                flush_prompt_writer_state=mock.Mock(return_value=True),
-                _release_forge_preview_files=mock.Mock(),
-            )
-
-            with (
-                mock.patch(
-                    "developermode.evaluate_readiness",
-                    return_value=readiness,
-                ),
-                mock.patch(
-                    "developermode.generate.ensure_play_bundle",
-                    return_value=(play_dir, True),
-                ) as build,
-                mock.patch("developermode.update_saved_metadata") as metadata,
-                mock.patch(
-                    "developermode.record_saved_letter_activity"
-                ) as activity,
-            ):
-                saved, reason = _save_current_letter_if_ready(root, window)
-
-            self.assertEqual(saved, play_dir.resolve())
-            self.assertEqual(reason, "")
-            window.flush_prompt_writer_state.assert_called_once_with()
-            window._release_forge_preview_files.assert_called_once_with()
-            build.assert_called_once_with(
-                root,
-                message_html="<p>Ready</p>",
-                force=True,
-            )
-            metadata.assert_called_once_with(play_dir, root, readiness)
-            activity.assert_called_once_with(play_dir)
-
-    def test_failed_reset_restores_github_credential(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            stored = types.SimpleNamespace(account=object(), token=object())
-            credentials = _CredentialStore(stored)
-
-            with mock.patch(
-                "command.start_developer_reset",
-                side_effect=RuntimeError("reset failed"),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "reset failed"):
-                    perform_developer_reset(
-                        root,
-                        credential_store=credentials,
-                        save_current=lambda _root, _window: (None, "not ready"),
-                    )
-
-            self.assertEqual(credentials.clear_count, 1)
-            self.assertEqual(credentials.saved, [stored])
-            self.assertIs(credentials.stored, stored)
+            store = SettingsStore(root)
+            before = store.snapshot()
+            credentials = _CredentialStore(object())
+            with mock.patch.object(DeveloperModeDialog, "exec", return_value=QtWidgets.QDialog.Rejected):
+                self.assertFalse(run_developer_mode(project_root=root, credential_store=credentials))
+            self.assertEqual(store.snapshot(), before)
+            with mock.patch.object(SettingsStore, "update_fields", side_effect=OSError("read only")):
+                with self.assertRaises(OSError):
+                    perform_developer_reset(root, credential_store=credentials)
+            self.assertEqual(credentials.clear_count, 0)
+            self.assertEqual(credentials.saved, [])
+            self.assertEqual(store.snapshot(), before)
 
 
 if __name__ == "__main__":

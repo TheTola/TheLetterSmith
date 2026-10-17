@@ -46,6 +46,12 @@ class CommandInteractionTests(unittest.TestCase):
                 50,
             )
 
+    def test_standalone_command_uses_application_lifecycle(self) -> None:
+        with mock.patch("Main.main") as launch, mock.patch.object(command, "confirm_and_reset") as legacy:
+            command.main()
+        launch.assert_called_once_with(open_new_project=True)
+        legacy.assert_not_called()
+
     def test_rapid_activation_runs_once_and_restores_idle(self) -> None:
         calls = []
 
@@ -630,6 +636,12 @@ class CommandInteractionTests(unittest.TestCase):
             def delete_project(self) -> None:
                 self.delete_project_calls += 1
 
+            def save_project(self) -> None:
+                pass
+
+            def _show_saved_letters_from_recipient_page(self) -> None:
+                pass
+
             def status(self, _message: str) -> None:
                 pass
 
@@ -654,26 +666,20 @@ class CommandInteractionTests(unittest.TestCase):
         target_settings = Path(host.project_root) / "gallery/app/settings"
         shutil.copytree(source_settings, target_settings)
         title_bar = TitleBar(host)
-        actions = {action.text(): action for action in title_bar.settings_menu.actions()}
-
-        self.assertIn("App Theme", actions)
-        self.assertIn("New Project", actions)
-        self.assertIn("Delete Project", actions)
-        self.assertIn("About Letter Smith…", actions)
-        self.assertIn("Exit", actions)
-        project_actions = [
-            action.text()
-            for action in title_bar.settings_menu.actions()
-            if not action.isSeparator()
-        ]
-        self.assertEqual(
-            project_actions[project_actions.index("New Project") + 1],
-            "Delete Project",
-        )
-        self.assertEqual(
-            project_actions[project_actions.index("Delete Project") + 1],
-            "About Letter Smith…",
-        )
+        def menu_actions(menu):
+            result = {}
+            for action in menu.actions():
+                result[action.text()] = action
+                if action.menu() is not None:
+                    result.update(menu_actions(action.menu()))
+            return result
+        actions = menu_actions(title_bar.settings_menu)
+        for label in ("Project", "Application Preferences", "Help & Diagnostics", "App Theme",
+                      "New Project", "Save Project", "Open Saved Project…", "Manage Saved Projects…",
+                      "About Letter Smith…", "Exit Application"):
+            self.assertIn(label, actions)
+        self.assertNotIn("Delete Project", actions)
+        self.assertEqual(title_bar.new_project_action.shortcut(), QtGui.QKeySequence(QtGui.QKeySequence.New))
         theme_entries = [
             None if action.isSeparator() else action.text()
             for action in title_bar.themes_menu.actions()
@@ -1140,10 +1146,10 @@ class CommandInteractionTests(unittest.TestCase):
 
         actions["New Project"].trigger()
         self.assertEqual(host.new_project_calls, 1)
-        actions["Delete Project"].trigger()
+        actions["Manage Saved Projects…"].trigger()
         self.assertEqual(host.delete_project_calls, 1)
         host.show()
-        actions["Exit"].trigger()
+        actions["Exit Application"].trigger()
         self.app.processEvents()
         self.assertEqual(host.close_events, 1)
 

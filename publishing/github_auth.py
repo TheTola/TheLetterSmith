@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import socket
 import ssl
@@ -454,8 +455,13 @@ class GitHubCredentialStore:
 
     def __init__(self, *, keyring_module=keyring) -> None:
         self.keyring = keyring_module
+        # Development profiles must never restore or change the user's account.
+        # Injected test stores remain usable; no plaintext credential store is added.
+        self._isolated = keyring_module is keyring and bool(os.environ.get("LETTER_SMITH_PROFILE_ROOT", "").strip())
 
     def load(self) -> StoredGitHubCredential | None:
+        if self._isolated:
+            return None
         try:
             raw = self.keyring.get_password(self.SERVICE_NAME, self.ACCOUNT_NAME)
         except KeyringError as error:
@@ -527,6 +533,8 @@ class GitHubCredentialStore:
             return None
 
     def save(self, session: GitHubSession) -> None:
+        if self._isolated:
+            raise GitHubOperationError("credential_store", "Account storage is disabled in an isolated development profile.")
         payload = json.dumps(
             {
                 "access_token": session.token.access_token,
@@ -563,6 +571,8 @@ class GitHubCredentialStore:
         )
 
     def clear(self) -> None:
+        if self._isolated:
+            return
         try:
             self.keyring.delete_password(self.SERVICE_NAME, self.ACCOUNT_NAME)
         except PasswordDeleteError:

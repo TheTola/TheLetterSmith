@@ -1336,8 +1336,10 @@ class ForgeTab(QtWidgets.QWidget):
         project_paths: ProjectPathResolver | None = None,
         curtain_styles: CurtainStyleController | None = None,
         github_service: GitHubConnectionService | None = None,
+        project_save_service=None,
     ) -> None:
         super().__init__()
+        self.project_save_service = project_save_service
         self.project_root = Path(project_root).resolve()
         self.settings = SettingsStore(self.project_root)
         self._owns_curtain_styles = curtain_styles is None
@@ -5530,6 +5532,7 @@ class ForgeTab(QtWidgets.QWidget):
             if self._publication_operation:
                 self._abort_publication_activity(self._publication_operation)
             return
+        self._operation_completing = True
         try:
             callback(result)
         except Exception:
@@ -5541,6 +5544,11 @@ class ForgeTab(QtWidgets.QWidget):
             )
             if self._publication_operation:
                 self._abort_publication_activity(self._publication_operation)
+        finally:
+            self._operation_completing = False
+            if getattr(self, "_operation_finish_pending", False):
+                self._operation_finish_pending = False
+                QtCore.QTimer.singleShot(0, self._operation_finished)
 
     @QtCore.Slot(str, str, bool)
     def _operation_failed_on_ui(
@@ -5592,6 +5600,11 @@ class ForgeTab(QtWidgets.QWidget):
 
     def _operation_finished(self) -> None:
         if self._shutdown:
+            return
+        # Browser/media release can pump a nested event loop inside completion.
+        # A finished worker does not mean its UI activation has finished.
+        if getattr(self, "_operation_completing", False):
+            self._operation_finish_pending = True
             return
         thread = self._worker_thread
         self._worker = None

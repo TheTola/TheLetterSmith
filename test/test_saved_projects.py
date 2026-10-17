@@ -486,10 +486,17 @@ class SavedProjectUiTests(unittest.TestCase):
         self.wait(lambda: not self.forge._busy)
         copied = self.forge._selected_saved_letter
         self.assertNotEqual(copied.project_id, entry.project_id)
-        with mock.patch.object(QtWidgets.QMessageBox, "question", return_value=QtWidgets.QMessageBox.Discard):
+        preview = self.window.message_tab.messages_workspace.shared_preview
+        release = preview.release
+        def release_during_open(*args, **kwargs):
+            result = release(*args, **kwargs)
+            self.assertTrue(self.forge._busy, "Worker completion must not unlock an unfinished activation")
+            return result
+        with mock.patch.object(QtWidgets.QMessageBox, "question", return_value=QtWidgets.QMessageBox.Discard), \
+             mock.patch.object(preview, "release", side_effect=release_during_open):
             self.assertTrue(self.ui.open_selected())
             self.wait(lambda: not self.forge._busy, seconds=180)
-        self.assertEqual(self.session.project.project_id, copied.project_id)
+        self.assertEqual(self.session.project.project_id, copied.project_id, self.window._status.currentMessage())
         self.forge._select_saved_letter(entry)
         before = self.session.project.to_dict()
         self.ui.preview_selected()

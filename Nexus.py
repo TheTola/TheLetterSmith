@@ -919,7 +919,7 @@ class TitleBar(QtWidgets.QWidget):
         )
         set_action_help(
             self.new_project_action,
-            "Clear the active workspace and begin a letter for another recipient.",
+            "Choose empty starter pages, then save or discard the current draft.",
         )
         self.new_project_action.triggered.connect(
             self._nexus.start_new_project
@@ -950,6 +950,38 @@ class TitleBar(QtWidgets.QWidget):
             "Close Letter Smith safely.",
         )
         self.exit_action.triggered.connect(self._nexus.close)
+        # Reuse the actual actions, grouped by ownership rather than another settings store.
+        for action in self.settings_menu.actions():
+            self.settings_menu.removeAction(action)
+        project_menu = self.settings_menu.addMenu("Project")
+        project_menu.addAction(self.new_project_action)
+        self.new_project_action.setShortcut(QtGui.QKeySequence.New)
+        self._nexus.addAction(self.new_project_action)
+        self.save_project_action = project_menu.addAction("Save Project", self._nexus.save_project)
+        self.save_project_action.setShortcut(QtGui.QKeySequence.Save)
+        self._nexus.addAction(self.save_project_action)
+        self.open_project_action = project_menu.addAction("Open Saved Project…", self._nexus._show_saved_letters_from_recipient_page)
+        self.open_project_action.setShortcut(QtGui.QKeySequence.Open)
+        self._nexus.addAction(self.open_project_action)
+        project_menu.addMenu(self.curtain_menu)
+        self.curtain_menu.setTitle("Current Project Curtains")
+        self.delete_project_action.setText("Manage Saved Projects…")
+        set_action_help(self.delete_project_action, "Open Saved Letters to rename, duplicate or delete a selected save with recovery.")
+        project_menu.addAction(self.delete_project_action)
+        preferences = self.settings_menu.addMenu("Application Preferences")
+        preferences.addMenu(self.themes_menu)
+        preferences.addAction(self.visionary_location_action)
+        preferences.addAction(self.github_account_action)
+        self.save_settings_action.setText("Save Appearance Preferences")
+        preferences.addAction(self.save_settings_action)
+        diagnostics = self.settings_menu.addMenu("Help & Diagnostics")
+        diagnostics.addAction(self.repair_music_action)
+        diagnostics.addAction(self.about_action)
+        self.settings_menu.addSeparator()
+        self.exit_action.setText("Exit Application")
+        self.exit_action.setShortcut(QtGui.QKeySequence.Quit)
+        self._nexus.addAction(self.exit_action)
+        self.settings_menu.addAction(self.exit_action)
         self.settings_menu.aboutToShow.connect(
             self._sync_curtain_menu
         )
@@ -1086,11 +1118,7 @@ class TitleBar(QtWidgets.QWidget):
             action.setChecked(theme_id == current)
 
     def _sync_project_actions(self) -> None:
-        settings = SettingsStore(self._nexus.project_root).snapshot()
-        self.delete_project_action.setEnabled(
-            bool(str(settings.get("project_id", "")).strip())
-            and not is_protected_project(settings)
-        )
+        self.delete_project_action.setEnabled(True)
 
     def _set_theme(self, theme_id: str) -> None:
         try:
@@ -1927,6 +1955,8 @@ class Nexus(QtWidgets.QMainWindow):
         from project_session import get_project_session
 
         self.project_session = get_project_session(self.project_root)
+        from project_lifecycle import ProjectLifecycle
+        self.project_lifecycle = ProjectLifecycle(self)
         # Recovery may have restored settings from the committed generation.
         initial_project_state = self.project_state.initialize()
         self.foundation_changed.connect(self._on_foundation_changed)
@@ -2502,6 +2532,7 @@ class Nexus(QtWidgets.QMainWindow):
             project_state=self.project_state,
             project_paths=self.project_paths,
             curtain_styles=self.curtain_styles,
+            project_save_service=self.project_save_service,
         )
         for tab in (self.sound_tab, self.message_tab, self.forge_tab):
             tab.installEventFilter(self)
@@ -2770,7 +2801,8 @@ class Nexus(QtWidgets.QMainWindow):
             "visionary_url",
             PROMPT_WRITER_PROVIDER_KEY,
         }
-        if any(not key.startswith("ui_") and key not in ignored for key in keys):
+        ignored.update({"application_theme", "theme_family", "theme_mode"})
+        if any(not key.startswith("ui_") and not key.startswith("last_") and key not in ignored for key in keys):
             self.project_dirty.mark_changed("settings")
 
     def _on_foundation_changed(self, event) -> None:
@@ -3018,22 +3050,33 @@ class Nexus(QtWidgets.QMainWindow):
         """Coordinate public refresh contracts after an atomic restore."""
         with self.project_session.restoring():
             self._refresh_restored_project(_payload)
+        self._refresh_prompt_writer_after_restore()
         # Rendering captures work tokens and must start after rehydration ends.
         self._schedule_curtain_preparation(immediate=True)
         self.forge_tab.refresh_project_state()
         self.forge_tab.refresh_saved_letters()
+        if self._project_view_restore_errors:
+            self.status("Project restored, but some views need reopening: " + "; ".join(self._project_view_restore_errors))
+            return
         self._show_forge_preview()
 
-    def _refresh_restored_project(self, _payload: Optional[dict] = None) -> None:
-        self._protected_change_tracking_suspended = True
+    def _refresh_prompt_writer_after_restore(self) -> None:
         panel = getattr(self, "_prompt_writer_win", None)
         if isinstance(panel, QtWidgets.QWidget):
             try:
                 if not panel.reload_project_state():
+                    self._project_view_restore_errors.append("Prompt Writer")
                     self.status("Prompt Writer could not refresh the loaded project.")
             except Exception as error:
                 _LOGGER.exception("Prompt Writer could not refresh after restore: %s", error)
+                self._project_view_restore_errors.append("Prompt Writer")
                 self.status("Prompt Writer could not refresh the loaded project.")
+
+    def _refresh_restored_project(self, _payload: Optional[dict] = None) -> None:
+        self._protected_change_tracking_suspended = True
+        self._project_view_restore_errors = []
+        metadata = self.project_session.project.to_dict()["metadata"]
+        self.title_bar.set_project_title(metadata.get("recipient_title") or metadata.get("title") or "")
         refreshers = (
             ("Images", self.image_tab.refresh_from_disk),
             ("Message", self.message_tab.refresh_from_disk),
@@ -3043,6 +3086,8 @@ class Nexus(QtWidgets.QMainWindow):
             try:
                 refresh()
             except Exception as error:
+                self._project_view_restore_errors.append(owner)
+                _LOGGER.exception("%s view could not refresh after restore.", owner)
                 self.status(f"{owner} could not refresh: {error}")
         self.project_dirty.mark_saved()
         self._protected_change_count = 0
@@ -4052,6 +4097,7 @@ class Nexus(QtWidgets.QMainWindow):
                 _LOGGER.exception("Message could not refresh after New Project.")
             try:
                 self.forge_tab.reset_after_project_wipe()
+                self.forge_tab.preview_format_panel.hide()
             except Exception:
                 _LOGGER.exception("Forge could not refresh after New Project.")
         try:
@@ -4303,7 +4349,7 @@ class Nexus(QtWidgets.QMainWindow):
 
     def prepare_for_project_reset(self) -> None:
         """Stop project-owned workers and media before New Project commits."""
-        if not self._stop_curtain_preparation():
+        if not self._stop_curtain_preparation(timeout_ms=5000):
             raise RuntimeError(
                 "Curtain preparation did not stop before New Project."
         )
@@ -4812,6 +4858,25 @@ class Nexus(QtWidgets.QMainWindow):
             return True
         if self._shutdown_in_progress:
             return False
+        # Preflight every owner before disconnecting any editor or subscription.
+        try:
+            if not self.flush_project_edits():
+                return False
+            if not self._finish_project_autosave_for_shutdown(5000):
+                raise RuntimeError("Workspace recovery is still saving; retry Exit")
+            if self._project_tabs_initialized:
+                self.prepare_for_project_reset()
+                if not self.forge_tab.shutdown_operations(timeout_ms=5000):
+                    raise RuntimeError("Forge work is still finishing; retry Exit")
+                if not self.forge_tab.saved_projects.prepare_for_shutdown():
+                    raise RuntimeError("A saved preview is still finishing; retry Exit")
+            lifecycle = getattr(self, "project_lifecycle", None)
+            if lifecycle is not None and lifecycle._exit_token is not None and not lifecycle.exit_is_authorized():
+                raise RuntimeError("New edits arrived after the exit decision; retry Exit")
+        except Exception as error:
+            _LOGGER.exception("Shutdown preparation failed.")
+            self.status(f"Exit stopped: {error}. The project remains open.")
+            return False
         image_tab = getattr(self, "image_tab", None)
         if (
             self._project_tabs_initialized
@@ -4821,6 +4886,7 @@ class Nexus(QtWidgets.QMainWindow):
             self.status("Image import is being canceled; shutdown is not complete.")
             return False
         self._shutdown_in_progress = True
+        cleanup_errors = []
         self._forge_viewport_timer.stop()
         self._preview_geometry_timer.stop()
         _LOGGER.info("Application resource shutdown started.")
@@ -4834,6 +4900,7 @@ class Nexus(QtWidgets.QMainWindow):
                 if callable(stop_tab_animation):
                     stop_tab_animation()
             except Exception:
+                cleanup_errors.append("Resource cleanup failed; see diagnostics.")
                 _LOGGER.exception("Tab transition shutdown failed.")
             try:
                 if not self._stop_curtain_preparation(timeout_ms=5000):
@@ -4841,6 +4908,7 @@ class Nexus(QtWidgets.QMainWindow):
                         "Curtain preparation did not stop before shutdown."
                     )
             except Exception:
+                cleanup_errors.append("Resource cleanup failed; see diagnostics.")
                 _LOGGER.exception("Curtain preparation shutdown failed.")
             autosave_deadline = monotonic() + 5.0
             try:
@@ -4849,6 +4917,7 @@ class Nexus(QtWidgets.QMainWindow):
                         "Prompt Writer state could not be flushed during shutdown."
                     )
             except Exception:
+                cleanup_errors.append("Resource cleanup failed; see diagnostics.")
                 _LOGGER.exception("Prompt Writer shutdown flush failed.")
             try:
                 autosave_remaining_ms = max(
@@ -4862,14 +4931,15 @@ class Nexus(QtWidgets.QMainWindow):
                         "Project autosave did not finish cleanly before shutdown."
                     )
             except Exception:
+                cleanup_errors.append("Resource cleanup failed; see diagnostics.")
                 _LOGGER.exception("Project autosave shutdown failed.")
             if self._project_tabs_initialized:
                 try:
                     if not self.forge_tab.shutdown(timeout_ms=5000):
-                        _LOGGER.warning(
-                            "Forge resources did not stop before shutdown."
-                        )
+                        cleanup_errors.append("Forge resources did not stop before shutdown.")
+                        _LOGGER.warning(cleanup_errors[-1])
                 except Exception:
+                    cleanup_errors.append("Resource cleanup failed; see diagnostics.")
                     _LOGGER.exception("Forge resource shutdown failed.")
             save_preferences = getattr(self, "_save_window_preferences", None)
             if callable(save_preferences):
@@ -4933,6 +5003,7 @@ class Nexus(QtWidgets.QMainWindow):
                 try:
                     prompt_writer_shutdown()
                 except Exception:
+                    cleanup_errors.append("Resource cleanup failed; see diagnostics.")
                     _LOGGER.exception(
                         "Prompt Writer shutdown cleanup failed."
                     )
@@ -4940,24 +5011,31 @@ class Nexus(QtWidgets.QMainWindow):
                 try:
                     self._release_forge_preview_files()
                 except Exception:
+                    cleanup_errors.append("Resource cleanup failed; see diagnostics.")
                     _LOGGER.exception("Forge preview file release failed.")
                 try:
                     if not self.sound_tab.shutdown(timeout_ms=5000):
-                        _LOGGER.warning("Sound workers did not stop during shutdown.")
+                        cleanup_errors.append("Sound workers did not stop during shutdown.")
+                        _LOGGER.warning(cleanup_errors[-1])
                 except Exception:
+                    cleanup_errors.append("Resource cleanup failed; see diagnostics.")
                     _LOGGER.exception("Sound shutdown failed.")
                 try:
-                    self.message_tab.shutdown()
+                    if not self.message_tab.shutdown():
+                        cleanup_errors.append("Messages resources did not stop during shutdown.")
                 except Exception:
+                    cleanup_errors.append("Resource cleanup failed; see diagnostics.")
                     _LOGGER.exception("Message shutdown failed.")
             try:
                 self._dispose_forge_preview()
             except Exception:
+                cleanup_errors.append("Resource cleanup failed; see diagnostics.")
                 _LOGGER.exception("Forge WebEngine disposal failed.")
         finally:
             try:
                 self.project_state.shutdown()
             except Exception:
+                cleanup_errors.append("Resource cleanup failed; see diagnostics.")
                 _LOGGER.exception("Project state shutdown failed.")
             from project_session import release_project_session
 
@@ -4968,8 +5046,13 @@ class Nexus(QtWidgets.QMainWindow):
                 self._tray_icon.hide()
             self._shutdown_complete = True
             self._shutdown_in_progress = False
-            _LOGGER.info("Application resource shutdown completed.")
+            if cleanup_errors:
+                _LOGGER.error("Application cleanup reported %s errors.", len(cleanup_errors))
+                show_lettersmith_message(self, "Exit Application", "Some resources could not be released cleanly. Saved projects and recovery are retained. See application diagnostics.")
+            else:
+                _LOGGER.info("Application resource shutdown completed.")
         return True
+
 
     def _dispose_forge_preview(self) -> None:
         """Close the fullscreen host and the view-owned WebEngine page."""
@@ -5010,119 +5093,43 @@ class Nexus(QtWidgets.QMainWindow):
         self.html_preview = None
 
     def start_new_project(self) -> None:
-        """Confirm and clear only the currently active editable project."""
-        if self._shutdown_complete or self._shutdown_in_progress:
-            return
-        forge_tab = getattr(self, "forge_tab", None)
-        if forge_tab is not None and forge_tab.operation_in_progress:
-            self.status("Finish the current Forge operation before starting a new project.")
-            return
-        protected = bool(
-            forge_tab is not None and forge_tab.is_protected_project()
-        )
-        if self.project_state.is_project_ready and not protected:
-            confirmation = LetterSmithConfirmationDialog(
-                self,
-                title="Start New Project",
-                question=(
-                    "Discard the current active project and start a new one? "
-                    "Saved letters, backups, Prompt Writer libraries, palettes, "
-                    "and application preferences will be kept."
-                ),
-                primary_text="Yes",
-                secondary_text="No",
-                destructive_primary=True,
-                click_outside_dismiss=False,
-                width=560,
-            )
-            if confirmation.exec() != QtWidgets.QDialog.Accepted:
-                self.status("New project canceled.")
-                return
-        try:
-            from command import start_new_project
+        self.project_lifecycle.new_project()
 
-            completed = start_new_project(
-                self,
-                project_root=self.project_root,
-                project_state=self.project_state,
-            )
-        except Exception as error:
-            _LOGGER.exception("New Project failed: %s", error)
-            show_lettersmith_message(
-                self,
-                "New Project",
-                f"The active project could not be cleared: {error}",
-            )
-            return
-        if completed:
-            self._on_command_wiped()
-            self._protected_change_count = 0
-            self._protected_warning_shown = False
-            self._sync_protected_project_ui()
-            self.status("New project ready. Enter a recipient to begin.")
+    def save_project(self) -> None:
+        self._initialize_project_tabs()
+        self.forge_tab.saved_projects.save()
+
+    def _show_new_project(self) -> None:
+        """Rehydrate empty canonical views without invoking field-reset handlers."""
+        self.title_bar.set_project_title("")
+        self._last_pixmap = None
+        self._clear_preview()
+        self._set_command_immersive(False)
+        if self._project_tabs_initialized:
+            with self.project_session.restoring():
+                self._refresh_restored_project()
+            self._refresh_prompt_writer_after_restore()
+            if self._project_view_restore_errors:
+                raise RuntimeError("Views could not refresh: " + ", ".join(self._project_view_restore_errors))
+            self.forge_tab._last_play_dir = None
+            self.forge_tab.preview_format_panel.hide()
+            self.forge_tab.refresh_project_state()
+            self.forge_tab.refresh_saved_letters()
+            blocker = QtCore.QSignalBlocker(self.tabbar)
+            self.tabbar.setCurrentIndex(0)
+            del blocker
+            self.page_stack.setCurrentIndex(0)
+        self.preview_caption.clear()
+        self.preview_stack.setCurrentIndex(0)
+        self.project_dirty.mark_changed("new-project")
+        self.curtain_styles.sync_from_settings()
+        self.curtain_styles.set_preview_colors({})
+        self.status("New project ready. Enter a recipient to begin.")
 
     def delete_project(self) -> None:
-        """Confirm and permanently remove the active editable project."""
-        if self._shutdown_complete or self._shutdown_in_progress:
-            return
-        forge_tab = getattr(self, "forge_tab", None)
-        if forge_tab is not None and forge_tab.operation_in_progress:
-            self.status("Finish the current Forge operation before deleting the project.")
-            return
-        if not self.project_state.is_project_ready:
-            self.status("There is no active project to delete.")
-            return
-        if forge_tab is not None and forge_tab.is_protected_project():
-            self.status("Stock and Example Letters cannot be deleted.")
-            return
-
-        settings = SettingsStore(self.project_root).snapshot()
-        recipient = str(settings.get("recipient_name", "")).strip()
-        title = str(settings.get("recipient_title", "")).strip()
-        project_name = title or "Untitled Letter"
-        owner = f" for {recipient}" if recipient else ""
-        confirmation = LetterSmithConfirmationDialog(
-            self,
-            title="Delete Project",
-            question=(
-                f'Permanently delete "{project_name}"{owner}?\n\n'
-                "The active draft, saved letter, and recovery copies will be "
-                "removed from this device. Shared Prompt Writer libraries, "
-                "palettes, music, application preferences, and published "
-                "copies will be kept.\n\nThis cannot be undone."
-            ),
-            primary_text="Yes",
-            secondary_text="No",
-            destructive_primary=True,
-            click_outside_dismiss=False,
-            width=620,
-        )
-        if confirmation.exec() != QtWidgets.QDialog.Accepted:
-            self.status("Project deletion canceled.")
-            return
-
-        try:
-            from command import delete_project
-
-            completed = delete_project(
-                self,
-                project_root=self.project_root,
-                project_state=self.project_state,
-            )
-        except Exception as error:
-            _LOGGER.exception("Delete Project failed: %s", error)
-            show_lettersmith_message(
-                self,
-                "Delete Project",
-                f"The active project could not be deleted: {error}",
-            )
-            return
-        if completed:
-            self._on_command_wiped()
-            self._protected_change_count = 0
-            self._protected_warning_shown = False
-            self._sync_protected_project_ui()
-            self.status("Project deleted. Enter a recipient to begin.")
+        """Library deletion belongs to Saved Letters and retains a recovery copy."""
+        self._show_saved_letters_from_recipient_page()
+        self.status("Select the saved project, then Project Actions → Delete Saved Project. A recovery copy is kept.")
 
     def open_command_bar_and_close_editor(self, data: object) -> bool:
         """Transfer the completed-letter snapshot to the post-reset controller."""
@@ -5247,49 +5254,23 @@ class Nexus(QtWidgets.QMainWindow):
         self.close()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        workspace = getattr(getattr(self, "message_tab", None), "messages_workspace", None)
-        if workspace is not None and not workspace.save():
-            self.status("Save or recover the retained message draft before closing.")
-            event.ignore()
+        if self._shutdown_complete:
+            super().closeEvent(event)
             return
-        image_tab = getattr(self, "image_tab", None)
-        if (
-            self._project_tabs_initialized
-            and image_tab is not None
-            and not image_tab._stop_import(0)
-        ):
-            if not getattr(self, "_close_after_image_import", False):
-                self._close_after_image_import = True
-                thread = image_tab._image_import_thread
-                thread.finished.connect(
-                    self._resume_close_after_image_import, QtCore.Qt.QueuedConnection,
-                )
-                if thread.isFinished():
-                    QtCore.QTimer.singleShot(0, self._resume_close_after_image_import)
-            self.status("Canceling image import before closing…")
+        if not self.project_lifecycle.exit_is_authorized():
             event.ignore()
+            if self.project_lifecycle._exit_token is not None:
+                self.project_lifecycle.exit_failed()
+                self.status("New edits arrived before closing. They remain open; retry Exit.")
+                return
+            self.project_lifecycle.request_exit()
             return
-        forge_tab = getattr(self, "forge_tab", None)
-        if (
-            self._project_tabs_initialized
-            and forge_tab is not None
-            and not forge_tab.shutdown_operations(timeout_ms=5000)
-        ):
-            self.status("Finish the current Forge operation before closing.")
-            event.ignore()
-            return
-        sound_tab = getattr(self, "sound_tab", None)
-        if (
-            self._project_tabs_initialized
-            and sound_tab is not None
-            and not sound_tab.shutdown(timeout_ms=5000)
-        ):
-            self.status("Finish the current Sound operation before closing.")
-            event.ignore()
-            return
+        # The decision is complete before any player, callback or worker is stopped.
         if not self.shutdown():
+            self.project_lifecycle.exit_failed()
             event.ignore()
             return
+        self.project_lifecycle.finish()
         super().closeEvent(event)
 
     def _resume_close_after_image_import(self) -> None:
@@ -5301,17 +5282,13 @@ class Nexus(QtWidgets.QMainWindow):
     # Prompt Writer opener (used by Image_tab FAB and Ctrl+Alt+P shortcut)
     # =============================================================================================
     def open_developer_mode(self) -> None:
-        """Open the guarded developer reset dialog."""
-        if getattr(self, "_developer_mode_active", False):
+        """Reset only the explicitly named appearance preferences."""
+        if getattr(self, "_developer_mode_active", False) or self.project_lifecycle.busy:
             return
         self._developer_mode_active = True
         try:
             from developermode import run_developer_mode
-
-            run_developer_mode(
-                project_root=self.project_root,
-                parent=self,
-            )
+            run_developer_mode(project_root=self.project_root, parent=self)
         finally:
             self._developer_mode_active = False
 
