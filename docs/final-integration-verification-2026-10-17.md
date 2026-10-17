@@ -56,8 +56,8 @@ its normalized blob remained `05fe2919b52bc236d73f174ad74c1dee934cc080`.
 Only the completed integrated ancestry and this task's focused repairs/evidence
 are eligible for the separately authorized GitHub update. No force push, history
 rewrite, unrelated working-tree capture, live hosting change or account change
-is part of this delivery. The final GitHub delivery record identifies the actual
-remote revision after the push.
+is part of this delivery. The [GitHub delivery receipt](final-integration-github-delivery-2026-10-17.md)
+records the verified fast-forward source/evidence push.
 
 ## Environment and isolation
 

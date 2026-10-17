@@ -42,6 +42,7 @@ docs/final-integration-evidence-2026-10-17/portable-export-30b00ae.json
 docs/final-integration-evidence-2026-10-17/primary-preservation-check.json
 docs/final-integration-evidence-2026-10-17/synthetic-seed-expectations.json
 docs/final-integration-evidence-2026-10-17/verification-logs.zip
+docs/final-integration-github-delivery-2026-10-17.md
 docs/final-integration-repairs-2026-10-17.md
 docs/final-integration-requirements-2026-10-17.md
 docs/final-integration-verification-2026-10-17.md
