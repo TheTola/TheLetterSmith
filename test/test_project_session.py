@@ -6,7 +6,7 @@ import threading
 import unittest
 from unittest import mock
 
-from project_model import create_project
+from project_model import ProjectModel, ProjectModelError, create_project
 from project_session import ProjectSession
 
 
@@ -61,6 +61,109 @@ class ProjectSessionTests(unittest.TestCase):
         session.project.update_message(page_id, {**original, 'html': '<b>Changed</b>'})
         session.project.update_message(page_id, original)
         self.assertFalse(session.apply_result(target, lambda *_: self.fail('stale result applied')))
+
+    def test_project_target_captures_and_applies_without_pages(self):
+        session = ProjectSession(create_project([]))
+        target = session.capture_project_target()
+        self.assertTrue(session.project_target_is_current(target))
+        self.assertTrue(session.apply_project_result(target, lambda model: model.update_project_data(
+            'sound', {'playlist': ['track-a'], 'volume': 35, 'muted': False})))
+        self.assertEqual(session.project.to_dict()['sound']['playlist'], ['track-a'])
+        self.assertEqual(session.project.pages, [])
+        self.assertFalse(session.project_target_is_current(target))
+        with self.assertRaises(ProjectModelError):
+            session.capture_project_target(fields=('pages',))
+
+    def test_project_target_ignores_selection_pages_and_unrelated_project_fields(self):
+        session = self.session
+        target = session.capture_project_target()
+        session.select_page(self.ids[1])
+        session.project.reorder_pages(reversed(self.ids))
+        session.project.update_prompt(self.ids[1], {'text': 'Independent text'})
+        session.project.update_shared_settings({'font': 'Serif'})
+        session.project.update_project_data('presentation', {'style': 'fade'})
+        session.project.update_project_data('sound', {})
+        session.adopt(ProjectModel.from_dict(session.project.to_dict()))
+        self.assertTrue(session.project_target_is_current(target))
+        combined = session.capture_project_target(fields=('sound', 'presentation'))
+        session.project.update_project_data('presentation', {'style': 'slide'})
+        self.assertFalse(session.project_target_is_current(combined))
+        self.assertTrue(session.project_target_is_current(target))
+
+    def test_project_edit_then_revert_invalidates_without_notifications(self):
+        session = self.session
+        session.project.update_project_data('sound', {'volume': 40})
+        target = session.capture_project_target()
+        session.project.remove_listener(session._on_model_change)
+        try:
+            session.project.update_project_data('sound', {'volume': 70})
+            session.project.update_project_data('sound', {'volume': 40})
+            self.assertFalse(session.apply_project_result(target, lambda *_: self.fail('Stale project work applied')))
+        finally:
+            session.project.add_listener(session._on_model_change)
+
+    def test_project_snapshot_edit_then_revert_does_not_revive_target(self):
+        session = self.session
+        original = session.project.to_dict()
+        target = session.capture_project_target()
+        changed = ProjectModel.from_dict(original)
+        changed.update_project_data('sound', {'volume': 70})
+        session.adopt(changed)
+        session.adopt(ProjectModel.from_dict(original))
+        self.assertEqual(session.project.to_dict(), original)
+        self.assertFalse(session.project_target_is_current(target))
+
+    def test_project_target_rejected_during_and_after_unchanged_restoration(self):
+        session = self.session
+        target = session.capture_project_target()
+        with session.restoring():
+            with session.restoring():
+                self.assertFalse(session.project_target_is_current(target))
+                self.assertFalse(session.apply_project_result(target, lambda *_: self.fail('Restoration accepted work')))
+                with self.assertRaises(RuntimeError):
+                    session.capture_project_target()
+        self.assertFalse(session.project_target_is_current(target))
+        self.assertTrue(session.project_target_is_current(session.capture_project_target()))
+
+    def test_project_target_rejected_after_replacement_and_close(self):
+        session = self.session
+        original = session.project
+        target = session.capture_project_target()
+        session.replace(create_project([]))
+        session.replace(original)
+        self.assertFalse(session.apply_project_result(target, lambda *_: self.fail('Replaced project accepted work')))
+        target = session.capture_project_target()
+        session.close()
+        self.assertFalse(session.apply_project_result(target, lambda *_: self.fail('Closed project accepted work')))
+        with self.assertRaises(RuntimeError):
+            session.capture_project_target()
+
+    def test_concurrent_project_edit_cannot_slip_between_guard_and_apply(self):
+        session = self.session
+        model = session.project
+        target = session.capture_project_target()
+        edited = threading.Event()
+        workers = []
+        model.remove_listener(session._on_model_change)
+        model.add_listener(lambda event: edited.set())
+        model.add_listener(session._on_model_change)
+        original_signature = session._project_target_signature
+        def signature_with_concurrent_edit(fields):
+            signature = original_signature(fields)
+            if not workers:
+                worker = threading.Thread(target=lambda: model.update_project_data('sound', {'volume': 75}))
+                workers.append(worker)
+                worker.start()
+                edited.wait(0.1)
+            return signature
+        try:
+            with mock.patch.object(session, '_project_target_signature', side_effect=signature_with_concurrent_edit):
+                session.apply_project_result(target, lambda current: current.update_project_data('sound', {'volume': 20}))
+        finally:
+            for worker in workers:
+                worker.join(2)
+        self.assertTrue(all(not worker.is_alive() for worker in workers), 'Project guard deadlocked')
+        self.assertEqual(model.to_dict()['sound']['volume'], 75)
 
     def test_concurrent_relevant_edit_cannot_slip_between_guard_and_apply(self):
         session = self.session
@@ -223,6 +326,31 @@ class ProjectSessionTests(unittest.TestCase):
             self.assertEqual(session.project.project_id, identity)
             self.assertEqual(SettingsStore(directory).snapshot()['project_id'], identity)
             release_project_session(directory)
+
+    def test_fresh_template_preserves_existing_audio_and_settings(self):
+        from project_session import get_project_session, release_project_session
+        from settings_store import SettingsStore
+        from sound_model import project_sound_path
+        from transactional_io import atomic_write_json
+        for state in ({}, {'mode': 'single', 'single_track_id': 'missing-track'},
+                      {'mode': 'playlist', 'playlist': ['missing-track'], 'selected_track_id': 'missing-track'}):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                SettingsStore(directory).update_fields({'music_volume': 37})
+                atomic_write_json(project_sound_path(directory), state)
+                session = get_project_session(directory)
+                try:
+                    payload = session.project.to_dict()
+                    self.assertEqual(len(payload['pages']), 4)
+                    self.assertEqual(payload['shared_settings']['music_volume'], 37)
+                    for key, value in state.items():
+                        self.assertEqual(payload['sound'][key], value)
+                finally:
+                    release_project_session(directory)
+                reopened = get_project_session(directory)
+                try:
+                    self.assertEqual(reopened.project.to_dict(), payload)
+                finally:
+                    release_project_session(directory)
 
     def test_reset_pointer_failure_preserves_session_then_success_reopens_empty(self):
         from project_repository import active_project_repository

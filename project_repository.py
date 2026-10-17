@@ -162,11 +162,13 @@ def _resource_references(payload: dict) -> set[str]:
     return references
 
 
-def _active_audio_sources(root: Path) -> tuple[list[dict], dict[str, Path]]:
+def _active_audio_sources(root: Path, *, state: dict | None = None) -> tuple[list[dict], dict[str, Path]]:
     """Resolve only this project's selected archive/stock tracks, read-only."""
     from project_paths import application_paths
+    from sound_model import hash_file
     paths = application_paths(root)
-    state = _json(paths.project_sound_state_file, optional=True)
+    state = state if state is not None else _json(paths.project_sound_state_file, optional=True)
+    previous = {item.get("track_id"): item for item in state.get("tracks", []) if isinstance(item, dict)}
     ids = list(state.get("playlist", [])) if state.get("mode") == "playlist" else [state.get("single_track_id")]
     ids = [item for item in ids if isinstance(item, str) and item]
     if not ids:
@@ -196,13 +198,13 @@ def _active_audio_sources(root: Path) -> tuple[list[dict], dict[str, Path]]:
                 if not isinstance(candidate, dict) or not candidate.get("filename"):
                     continue
                 path = _safe_file(paths.stock_root, candidate["filename"])
-                if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest()[:24] == track_id.removeprefix("stock:"):
+                if path.is_file() and hash_file(path)[:24] == track_id.removeprefix("stock:"):
                     source, record = path, candidate
                     break
         if source is None or not source.is_file():
-            records.append({"track_id": track_id, "missing": True})
+            records.append({**deepcopy(previous.get(track_id, {})), "track_id": track_id, "missing": True})
             continue
-        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        digest = hash_file(source)
         relative = f"audio/{digest[:32]}{source.suffix.lower()}"
         sources[relative] = source
         records.append({"track_id": track_id, "asset": relative, "sha256": digest,
@@ -276,7 +278,29 @@ class ProjectRepository:
         source_roots = [Path(asset_root).resolve()]
         if fallback_asset_root is not None:
             source_roots.append(Path(fallback_asset_root).resolve())
-        external_audio = _active_audio_sources(source_roots[0])[1] if payload.get("sound", {}).get("tracks") else {}
+        sound = payload.get("sound", {})
+        assigned = sound.get("playlist", []) if sound.get("mode") == "playlist" else [sound.get("single_track_id")]
+        external_audio = {}
+        if any(isinstance(track_id, str) and track_id for track_id in assigned):
+            resolved, external_audio = _active_audio_sources(source_roots[0], state=sound)
+            previous = {track.get("track_id"): track for track in sound.get("tracks", []) if isinstance(track, dict)}
+            # Direct canonical assignment APIs may not have visited Sound yet.
+            # Add portable metadata, retaining authored references even when
+            # their assets are missing or differ from a cached archive alias.
+            portable = []
+            for track in resolved:
+                before = previous.get(track["track_id"], {})
+                if before.get("asset") or before.get("filename"):
+                    portable.append(deepcopy(before))
+                else:
+                    item = {**deepcopy(before), **track}
+                    if not track.get("missing"):
+                        item.pop("missing", None)
+                    portable.append(item)
+            resolved_ids = {track["track_id"] for track in resolved}
+            portable.extend(deepcopy(track) for track in sound.get("tracks", [])
+                            if isinstance(track, dict) and track.get("track_id") not in resolved_ids)
+            sound["tracks"] = portable
         with _writer_lock(self.directory):
             head = self._head()
             if (head.get("revision") or None) != expected_revision:

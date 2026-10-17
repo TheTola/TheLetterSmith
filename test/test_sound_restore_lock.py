@@ -173,6 +173,10 @@ class SoundRestoreLockTests(unittest.TestCase):
     def test_persist_updates_sound_revisions_after_self_write(self) -> None:
         sound_tab = SimpleNamespace(
             project_sound=mock.Mock(),
+            session=SimpleNamespace(session_id="current", project=mock.Mock(to_dict=lambda: {
+                "sound": {}, "shared_settings": {},
+            })),
+            _restore_sound_controls=mock.Mock(),
             _sync_project_sound_autosave=mock.Mock(),
             _current_sound_disk_revision=mock.Mock(return_value=((2, 2, 2),)),
             _current_active_sound_revision=mock.Mock(return_value=("active",)),

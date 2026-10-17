@@ -122,14 +122,16 @@ class SoundArchivePreviewTests(unittest.TestCase):
                         original_file=target.name, processed_file=target.name,
                         duration_seconds=140.0,
                     )
+                save_library(directory, records)
                 tab.library.replace_records(records)
                 tab.library.changed.emit()
-                tab.player.set_muted(True)
                 tab.volume.setValue(23)
                 if state != "empty":
                     tab.project_sound.set_single("handoff-0")
                     if playlist:
                         tab.project_sound.add_to_playlist(["handoff-1"])
+                    if not tab.player.is_muted():
+                        tab.mute_btn.click()
                     self._wait_for(lambda: tab.player.player.duration() > 5000, "Song A did not load")
                     if state != "stopped":
                         tab.player.play()
@@ -424,7 +426,7 @@ class SoundArchivePreviewTests(unittest.TestCase):
             finally:
                 tab.close()
 
-    def test_playlist_tracks_wrap_before_vertical_scrolling(self) -> None:
+    def test_playlist_tracks_use_full_width_ordered_rows_with_accessible_actions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             tab = SoundTab(Path(directory))
             try:
@@ -440,14 +442,16 @@ class SoundArchivePreviewTests(unittest.TestCase):
 
                 view = tab.playlist_list
                 rects = [view.visualItemRect(view.item(index)) for index in range(10)]
-                self.assertTrue(
-                    any(rect.y() == rects[0].y() and rect.x() > rects[0].x()
-                        for rect in rects[1:])
-                )
-                self.assertTrue(any(rect.y() > rects[0].y() for rect in rects[1:]))
-                self.assertGreaterEqual(view.viewport().height(), 2 * view.gridSize().height())
+                self.assertTrue(all(rect.x() == rects[0].x() for rect in rects))
+                self.assertTrue(all(previous.bottom() < current.top() for previous, current in zip(rects, rects[1:])))
+                self.assertTrue(all(rect.width() >= view.viewport().width() - 2 * view.spacing() for rect in rects))
+                self.assertGreaterEqual(view.viewport().height(), 2 * rects[0].height())
                 self.assertGreater(view.verticalScrollBar().maximum(), 0)
                 self.assertEqual(view.horizontalScrollBarPolicy(), QtCore.Qt.ScrollBarAlwaysOff)
+                for button in (tab.playlist_preview_btn, tab.move_up_btn, tab.move_down_btn, tab.remove_track_btn):
+                    self.assertTrue(button.isVisible())
+                    self.assertNotEqual(button.focusPolicy(), QtCore.Qt.NoFocus)
+                    self.assertTrue(tab.rect().contains(button.mapTo(tab, button.rect().bottomRight())))
             finally:
                 tab.close()
 

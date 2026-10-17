@@ -250,7 +250,13 @@ class WindowSizingTests(unittest.TestCase):
                 for index, mode in ((1, 0), (1, 1), (2, None)):
                     window.tabbar.setCurrentIndex(index)
                     if mode is not None:
-                        sound.mode_stack.setCurrentIndex(mode)
+                        if mode == 1:
+                            sound.project_sound.create_playlist()
+                        else:
+                            sound.project_sound.convert_to_single()
+                        sound.single_title.setText("A long track title with spaces " * 3)
+                        sound.single_detail.setText("4:30 • " + "a-long-imported-audio-filename-" * 3 + ".mp3")
+                        sound.now_playing.setText("Stopped: " + sound.single_title.text())
                     QtTest.QTest.qWait(300)
                     for size in ((1400, 900), (900, 480), (960, 600),
                                  (960, 516), (1024, 540), (1920, 600),

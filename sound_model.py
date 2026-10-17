@@ -292,8 +292,16 @@ class ProjectSoundState:
     playlist: list[str] = field(default_factory=list)
     playlist_expanded: bool = True
     selected_track_id: str = ""
+    volume: Optional[int] = None
+    muted: bool = False
 
     def normalize(self, valid_ids: Optional[set[str]] = None) -> "ProjectSoundState":
+        if self.volume is not None:
+            try:
+                self.volume = max(0, min(100, int(self.volume)))
+            except (TypeError, ValueError):
+                self.volume = None
+        self.muted = self.muted is True
         self.mode = "playlist" if self.mode == "playlist" else "single"
         self.single_track_id = str(self.single_track_id or "").strip()
         clean: list[str] = []
@@ -333,6 +341,8 @@ class ProjectSoundState:
                 else True
             ),
             selected_track_id=str(payload.get("selected_track_id", "")),
+            volume=payload.get("volume"),
+            muted=payload.get("muted") is True,
         )
 
     def to_dict(self) -> dict:
@@ -343,6 +353,8 @@ class ProjectSoundState:
             "playlist": list(self.playlist),
             "playlist_expanded": bool(self.playlist_expanded),
             "selected_track_id": self.selected_track_id,
+            **({"volume": self.volume, "muted": self.muted} if self.volume is not None
+               else {"muted": True} if self.muted else {}),
         }
 
     def ordered_track_ids(self) -> list[str]:
@@ -477,6 +489,11 @@ def _stock_track_aliases(
             continue
         track_id = str(value.get("track_id", "")).strip() or str(key)
         content_hash = str(value.get("content_hash", "")).strip()
+        if value.get("source_kind") == "stock" and value.get("resource_file") and track_id != content_hash[:24]:
+            # A current canonical project may retain a portable resource alias.
+            # Keep that authored reference; only implicit legacy aliases migrate.
+            aliases.pop(track_id, None)
+            continue
         canonical_id = canonical_by_hash.get(content_hash, "")
         if canonical_id:
             aliases[track_id] = canonical_id
@@ -547,7 +564,10 @@ def load_library(project_root: str | Path) -> dict[str, TrackRecord]:
     records = {
         track_id: record
         for track_id, record in records.items()
-        if record.content_hash not in stock_hashes
+        if record.content_hash not in stock_hashes or (
+            record.source_kind == "stock" and record.resource_file
+            and track_id != record.content_hash[:24]
+        )
     }
     records.update(stock_records)
     return records
@@ -557,7 +577,9 @@ def save_library(project_root: str | Path, records: dict[str, TrackRecord]) -> N
     user_records = {
         key: record
         for key, record in records.items()
-        if record.source_kind != "stock"
+        if record.source_kind != "stock" or (
+            record.resource_file and record.track_id != record.content_hash[:24]
+        )
     }
     atomic_write_json(
         library_path(project_root),
@@ -651,6 +673,8 @@ def build_sound_manifest(state: ProjectSoundState, tracks: Iterable[TrackRecord]
         "playlist_expanded": bool(state.playlist_expanded),
         "selected_track_index": selected_track_index,
         "crossfade_ms": 1000 if state.mode == "playlist" and len(track_list) > 1 else 0,
+        **({"volume": state.volume, "muted": state.muted} if state.volume is not None
+           else {"muted": True} if state.muted else {}),
         "tracks": [
             {
                 "filename": filename,
@@ -743,7 +767,9 @@ def sync_current_compatibility(
     state: ProjectSoundState,
     records: dict[str, TrackRecord],
 ) -> bool:
-    state.normalize(set(records))
+    # A missing library entry is still an authored assignment. Compatibility
+    # media may disappear until it is repaired, but the saved choice must not.
+    state.normalize()
     selected = state.selected_track_id
     ordered = state.ordered_track_ids()
     if selected not in ordered:

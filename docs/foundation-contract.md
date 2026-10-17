@@ -147,6 +147,12 @@ run after that lock is released, avoiding inversion with the session lock.
 and defers notifications until the outer scope exits. It provides synchronization,
 not rollback. `input_versions(page_id, fields, *, include_shared=True)` returns
 mutation-time counters; consumers normally use the session target API instead.
+`project_input_versions(fields)` provides independent counters for project
+objects (`metadata`, `shared_settings`, `prompt_settings`, `sound`,
+`presentation`, `publication`, `recovery`, `extensions`). These counters survive
+same-project adoption and do not alter the existing page/shared input counters.
+Sound and extension-provenance edits increment the project revision without
+changing pages or prompts.
 Foundation adapters use `adopt_snapshot(payload, *, kind="workspace")` for
 validated same-project updates while preserving the active model object and
 its mutation counters. Project replacement belongs to the session.
@@ -187,6 +193,18 @@ the operation. Selection/rename do not redirect output; deletion/recreation,
 relevant edits (even edit then revert), and project replacement invalidate it.
 Order-sensitive work should explicitly incorporate order in its own input
 contract; ordinary page-targeted image work must not follow the selected page.
+
+For project-wide work, use `capture_project_target(*, fields=('sound',)) ->
+ProjectWorkTarget`, `project_target_is_current(target) -> bool`, and
+`apply_project_result(target, callback) -> bool`. The frozen target captures the
+session/project identity, relevant project-object signatures and mutation
+counters; no page or selection is required, including in an empty draft.
+`callback(model)` runs inside the same atomic guard/mutation scope. Unrelated
+page, selection, or project-field edits leave it current; relevant edits (even
+edit then revert), replacement, close, and entering a restoration scope invalidate
+it. Project targets remain invalid after an unchanged restoration; existing page
+target restoration behavior is unchanged. Choose the relevant project fields;
+an empty `fields` tuple guards only the session and restoration boundary.
 
 `SessionChange(kind,page_ids,revision,session_id)` adds session identity to model
 events. `session.synchronize_workspace()` applies only changed legacy fields;
