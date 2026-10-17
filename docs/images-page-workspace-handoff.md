@@ -1,4 +1,4 @@
-# Images page workspace handoff — 2026-10-15
+# Images page workspace handoff — 2026-10-16
 
 ## Provenance and isolation
 
@@ -8,8 +8,8 @@ Starting foundation commit: `5daa5e3b29bf1b6ca3019f56f1bb9c0d2aca6954`.
 Its tree is `965ba54e71dc8ea8318d9c3e3cb9fb178e1d65bb`, identical to the
 Prompt Writer foundation snapshot `7b988f735394213cd01dfadddd60e5e8afeed246`.
 The earlier foundation documents describe an uncommitted state; these later
-snapshots resolve that starting-revision blocker. No sibling feature commits
-were copied. Foundation contract, migration, verification and handoff documents
+snapshots resolve that starting-revision blocker. The initial Images implementation
+did not copy sibling feature commits. Foundation contract, migration, verification and handoff documents
 were read, and the real model/session/repository APIs were verified.
 
 Worktree: `C:\Users\Oluwatola Ayedun\.codex\worktrees\images-page-workspace\SmithLetter`.
@@ -43,8 +43,9 @@ private fixtures, external generation, publication or remote push were used.
 | `docs/images-page-workspace-handoff.md` | This handoff. |
 | `docs/images-workspace-evidence/{populated,empty}-{1.25,1.5}.png` | Four actual shell renders using synthetic artwork. |
 
-No foundation schema, serializer, registry, message store, Forge renderer,
-Messages editor, Prompt Writer internals or dependencies were changed.
+The initial Images implementation did not change foundation contracts, sibling
+editors, Forge or dependencies. The authorized integration below consumes the
+completed Messages and Prompt Writer commits and their foundation extensions.
 
 ## Model, operations and lifecycle
 
@@ -103,27 +104,26 @@ existing native playback path.
 exact selected page ID. Edit Letter Text is visible/enabled only for Letter.
 
 `Nexus.open_prompt_writer(page_id=None)` retains existing no-argument callers.
-For page routes it checks `consumer_issue(root, 'prompts')`, projects supported
-views, verifies `page_id_for_key`, then uses the existing shared
-`PageLayoutController.reload()/select(key)` interface. The target is checked
-again after provider/sign-in modal work. The shell retains that shared controller
-to avoid dangling session listeners. Imported counts above the adapter limit
-receive a clear compatibility message before provider UI; they are not truncated.
-Prompt Writer's own type controls and broader page-aware behavior remain owned
-by its feature branch.
+It validates the requested canonical ID and calls `PromptWriterPanel(page_id=...)`
+or `panel.select_page(page_id)` for the cached panel. There is no legacy slot/count
+gate or sign-in requirement for writing prompts. Page settings returns the exact
+ID to Images and focuses its Name control. Page types remain owned by Images.
+The optional image service opens only through its explicit action.
 
-`Nexus.open_page_message(page_id)` validates Letter ownership before opening.
-The baseline Messages editor supports only a sole active Letter, so it uses
-`open_message_editor()` only when that sole ID matches. Multiple Letters receive
-an explicit integration message rather than opening the wrong document.
-The required Messages integration entry point is
-`MessageTab.open_page_message(page_id: str)`: flush the previous document, select
-that ID through the same session, bind its independent message and open/focus
-the existing editor. The shell consumes this hook if present. It is **not**
-implemented by the baseline or fabricated as a working feature here.
+`Nexus.open_page_message(page_id)` delegates to the completed Messages hook
+`Nexus.open_message_page(page_id)`. That hook validates Letter ownership and calls
+`MessageTab.messages_workspace.open_page(page_id)`, which flushes the previous
+document and binds the requested independent message. Repeated Letters work.
+`MessageTab.background_requested(str)` returns to Images with the same ID.
+
+Prompt Writer artwork approval uses `ImageTab.import_image(page_id, path,
+target=captured_target)` and `artwork_import_completed(page_id, path, error)`.
+The initiating session/revision token survives staging; selection cannot redirect
+the import. The legacy indexed adapter remains available for older consumers.
+Imported projects above the creation limit use the canonical route successfully.
 
 Shared `Nexus.py` edits also connect the two signals; hide the former external
-preview only for Images; allow its workspace to expand; apply the same rule on
+preview for Images and embedded Messages; allow their workspaces to expand; apply the same rule on
 reset and resize; anchor its help icon to the workspace; replace obsolete help;
 and move the protected New Project action into the existing help/tool row so it
 does not cover the selected artwork. Its global/tray Prompt Writer action still
@@ -134,7 +134,7 @@ No Forge rendering hook is consumed. The selected preview is artwork only.
 The foundation's output guard still blocks distinct Letter documents and other
 unsupported renderer features. No combined message renderer was introduced.
 
-## Verification and evidence
+## Initial Images verification and evidence — 2026-10-15
 
 Before this implementation: foundation 62/62 and page layout 8/8 passed.
 The original image suite ran 48 tests with two pre-existing failures: utility
@@ -224,27 +224,111 @@ isolated. These are after-change renders; no before screenshot is claimed.
 - [Populated, 150%](images-workspace-evidence/populated-1.5.png)
 - [Empty, 150%](images-workspace-evidence/empty-1.5.png)
 
-## Remaining integration requirements
+## Completed receiver integration — 2026-10-16
 
-1. Integrate the Messages page-ID entry point and verify independent Letter A/B
-   editing end to end. The enabled Images route currently explains this valid
-   baseline limitation for multiple Letters.
-2. Integrate Prompt Writer's canonical page interface, including imported counts
-   outside its legacy adapter limits and removal of its independent type assignment.
-   Current supported-count routing is checked against the baseline's real API.
-3. Verify the merged Forge, Messages and Prompt Writer branches using the same
-   five-page fixture; current Forge output correctly refuses distinct messages.
-4. Packaged application, real provider sign-in/generation, publication and other
-   operating systems were not tested. No release acceptance is claimed.
+Started clean at Images commit `0a73a0efd55ace83bfc7bddaa3ffd16b6dca09ee`.
+Merged the verified Messages editor/preview consumer commit
+`ea6c1f0a4457a4dff1691cb33b1599ac893120f7` in `d9a4348`. This also includes the
+reviewed foundation resource-preservation fix from `1612235`. Integrated Prompt
+Writer `f9739b9d22c43d0793504e00e402d0eb435e4841`, including its authorized
+foundation contracts `5156560` and `5163650`. These are actual local Git merges;
+no sibling working-tree files were copied. The newer Forge/geometry work remains
+separate from this Images integration.
 
-- **Feature implementation: Partial.** Page/artwork operations and selected-page
-  UI are implemented; multi-Letter text navigation and unrestricted Prompt Writer
-  navigation require the receiving feature integrations described above.
-- **Ready for sequential integration: Yes, with conditions.** Apply only this
-  isolated feature commit onto the matching foundation, reconcile the listed
-  shell hunks, then integrate and verify those receiving interfaces before final
-  feature acceptance. Do not release this as fully integrated.
-- **Cross-feature verification:** Foundation, baseline page adapter, selected
-  Prompt Writer routing, safe Messages gating and shell geometry were exercised.
-  Independent Messages editing, sibling prompt behavior and full Forge output
-  remain integration work.
+Additional changed paths relative to `0a73a0e`:
+
+- Shell/bridges: `Nexus.py`, `Over_Nexus.py`, `PromptWriterPanel.py`.
+- Committed Messages implementation: `Editor.py`, `Message_tab.py`,
+  `messages_workspace.py`, `message_document_import.py`, `message_resources.py`,
+  `message_shared_preview.py`.
+- Committed Prompt Writer composer: `prompt_writer_project.py`.
+- Completed foundation changes: `project_model.py`, `project_session.py`,
+  `project_repository.py`.
+- Tests: `test/test_foundation_consumers.py`, `test/test_identity_field_locking.py`,
+  `test/test_message_security.py`, `test/test_message_shared_preview.py`,
+  `test/test_messages_workspace.py`, `test/test_page_layout.py`,
+  `test/test_project_model.py`, `test/test_project_repository.py`,
+  `test/test_project_session.py`, `test/test_prompt_writer_hardening.py`,
+  `test/test_prompt_writer_pages.py`, `test/test_window_sizing.py`.
+- Documentation: this file, `docs/foundation-contract.md`,
+  `docs/foundation-handoff.md`, `docs/foundation-verification.md`,
+  `docs/messages-feature-handoff.md`, `docs/prompt-writer-page-targets-handoff.md`.
+
+Conflict resolution retained the selected-page Images implementation, Messages'
+retained-draft guards, asynchronous Images close handling, current repository
+resource preservation, and the completed Prompt Writer contracts. The integration
+changes outside those incoming commits are the narrow shell and artwork approval
+bridges, updated regression fixtures, two production integration checks in the
+existing sizing test file, and this report. No new storage system or dependency.
+
+### Integration verification
+
+The original 21 Images checks passed before merging. **173 distinct selected
+checks passed on the integrated source**, across the core and focused reruns:
+
+- Core selection: 168 checks covering model/repository/session/consumers, Images,
+  Messages, Prompt Writer, page layout, launcher caching and import-time close.
+- Two additional actual Nexus cases verify independent A/B editing and exact
+  prompts after reorder/save/reload; and canonical GIF approval on page 12,
+  unchanged source bytes, harmless selection changes and stale-target rejection.
+- Three additional shell cases cover all themes and independent window dimensions,
+  protected New Project placement, and resizing during transitions.
+
+The first core run passed 167/168: one legacy provider fixture still supplied a
+slot key rather than the new public canonical ID. It now supplies a real target
+token and retains assertions for the legacy fallback. The first all-theme run
+expected the removed external Messages preview; the updated check verifies its
+absence and the visible embedded workspace. Its final rerun passed in 44.241 s.
+The new reorder fixture explicitly selects the page before exercising Move Up.
+No production behavior was bypassed to resolve these fixture assumptions.
+
+Use the isolated wrapper documented above. Core modules were:
+`test_project_model test_project_repository test_project_session
+ test_foundation_consumers test_images_workspace test_messages_workspace
+ test_prompt_writer_pages test_prompt_writer_hardening
+ test_prompt_writer_legacy_removal test_page_layout`, plus the three existing
+launcher/import-close cases. Focused cases in `WindowSizingTests` were:
+
+- `test_images_messages_and_prompts_keep_independent_letters_after_reorder_and_save`
+- `test_prompt_writer_imports_by_id_beyond_legacy_page_limits_and_rejects_stale_target`
+- `test_shell_layout_all_themes_and_independent_dimensions`
+- `test_protected_new_project_stays_clear_on_main_tabs`
+- `test_shell_layout_resize_during_transitions_settles_in_viewport`
+
+Local logs: `%TEMP%\lsi-integration-core.log`, `%TEMP%\lsi-final-routes.log`,
+`%TEMP%\lsi-layout-final.log`. The latter two supersede their documented earlier
+fixture failures. Changed Python AST parsing and `git diff --check` passed.
+Offscreen WebEngine emitted GPU-context warnings; those runs do not establish
+GPU or Forge/browser rendering acceptance.
+
+Native Windows used the actual Nexus and the five-page synthetic fixture at
+1200 x 850, then maximized to 1920 x 1032. Actual UI input opened Prompt Writer
+on Letter B without a provider, returned through Page settings to B, opened B's
+message from Images, typed `Native B verification`, returned to B artwork, and
+opened A's unchanged message. GIF artwork visibly changed frames in Images.
+Normal close flushed the draft. The saved result confirmed B alone contained the
+native edit, both exact prompt markers survived, no provider was opened, and
+shutdown completed. Native helper contention initially delayed input; only the
+subsequent observed successful actions are claimed. Evidence harness/result:
+`%TEMP%\lsi-native-integration.py` and
+`%TEMP%\lsi-native-5ce2028e\native-result.json`.
+
+The primary checkout remained on `1612235`; all 13 originally dirty tracked
+files retained their recorded SHA-256 hashes. Unrelated untracked content and
+other feature worktrees were not modified. No push, publication or release build.
+
+## Remaining application verification
+
+1. Sequential Forge/geometry integration remains separate. Its output guards are
+   retained. Messages currently labels its fallback preview as static, including
+   GIF backgrounds; Images continues animated artwork playback.
+2. Packaged application, real provider sign-in/generation, publishing and other
+   operating systems were not tested. No whole-application release claim.
+
+- **Feature implementation: Complete.** Selected-page Images operations and both
+  required exact-ID receiving interfaces are usable and verified on this branch.
+- **Ready for sequential integration: Yes.** Merge this branch with its recorded
+  receiver/foundation ancestry; reconcile shared shell hunks when adding Forge.
+- **Cross-feature verification:** Integrated Images, Messages, Prompt Writer,
+  canonical persistence, GIF approval, stale results, navigation, close lifecycle
+  and shell sizing were exercised. Full Forge and packaged acceptance remain.

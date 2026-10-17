@@ -126,7 +126,7 @@ class WindowSizingTests(unittest.TestCase):
                             self.assertEqual(page.geometry(), window.page_stack.contentsRect())
                             if index != 4:
                                 self.assertTrue(window.body.rect().contains(window.page_stack.geometry()))
-                                if index != 0:
+                                if index not in {0, 2}:
                                     preview = QtCore.QRect(
                                         window.preview_frame.mapTo(window.body, QtCore.QPoint()),
                                         window.preview_frame.size(),
@@ -163,6 +163,9 @@ class WindowSizingTests(unittest.TestCase):
                                 self.assertLess(tab.now_playing.geometry().bottom(), play_y)
                                 self.assertGreaterEqual(tab.height(), tab.minimumSizeHint().height())
                             elif index == 2:
+                                self.assertFalse(window.preview_frame.isVisibleTo(window))
+                                self.assertFalse(window.preview_region.isVisibleTo(window))
+                                self.assertTrue(window.message_tab.messages_workspace.isVisibleTo(window))
                                 self.assertGreaterEqual(
                                     window.message_tab.height(), window.message_tab.minimumSizeHint().height(),
                                 )
@@ -1028,6 +1031,138 @@ class WindowSizingTests(unittest.TestCase):
                 self.assertEqual(session.project.get_page(identity), original)
                 self.assertTrue(prepared)
                 self.assertFalse(prepared[0]._directory.exists())
+    def test_prompt_writer_images_launcher_targets_each_page_without_provider_sign_in(self) -> None:
+        from project_model import create_project
+        from project_session import get_project_session
+        with self.window() as window:
+            session = get_project_session(window.project_root)
+            session.replace(create_project(['cover', 'letter', 'illustration', 'letter', 'end_page']))
+            window._prompt_writer_browser = None
+            window._prompt_writer_browser_ready = False
+            for page in session.project.pages:
+                panel = window._prompt_writer_win
+                if panel is not None and panel.is_open:
+                    panel.close()
+                session.select_page(page["id"])
+                QtTest.QTest.mouseClick(window.image_tab.pwrite_fab, QtCore.Qt.LeftButton)
+                panel = window._prompt_writer_win
+                self.assertTrue(panel.is_open)
+                self.assertEqual(panel.target_selector.currentData(), page["id"])
+                self.assertIsNone(window._prompt_writer_browser)
+                from project_model import PAGE_TYPES
+                self.assertEqual(panel._view_spec.color_key, PAGE_TYPES[page["type"]].artwork_template)
+                QtTest.QTest.mouseClick(panel.btn_page_settings, QtCore.Qt.LeftButton)
+                self.assertEqual(window.tabbar.currentIndex(), 0)
+                self.assertEqual(session.selected_page_id, page["id"])
+                self.assertFalse(panel.is_open)
+
+    def test_images_messages_and_prompts_keep_independent_letters_after_reorder_and_save(self) -> None:
+        from PIL import Image
+        from project_repository import active_project_repository
+        from test_project_model import five_page_project
+
+        with self.window() as window:
+            session = window.project_session
+            project = five_page_project()
+            root = Path(window.project_root)
+            (root / "assets").mkdir(exist_ok=True)
+            for index, page in enumerate(project.pages):
+                Image.new("RGB", (60, 90), (index * 40, 60, 120)).save(root / page["artwork"]["asset"])
+                if page["type"] == "letter":
+                    document = page["message"]
+                    document["layout"] = {}
+                    project.update_message(page["id"], document)
+            session.replace(project, asset_root=root)
+            ids = [page["id"] for page in session.project.pages]
+            first, second = ids[1], ids[3]
+            images = window.image_tab
+            workspace = window.message_tab.messages_workspace
+            expected_prompts = {identity: session.project.get_prompt(identity)["text"] for identity in (first, second)}
+            for identity, marker in ((second, " B-only edit"), (first, " A-only edit")):
+                session.select_page(identity)
+                QtTest.QTest.mouseClick(images.message_button, QtCore.Qt.LeftButton)
+                self.assertEqual(window.tabbar.currentIndex(), 2)
+                self.assertEqual(workspace.page_id, identity)
+                self.assertFalse(window.preview_region.isVisible())
+                editor = workspace.editor.editor
+                editor.moveCursor(QtGui.QTextCursor.End)
+                QtTest.QTest.keyClicks(editor, marker)
+                QtTest.QTest.mouseClick(workspace.background_button, QtCore.Qt.LeftButton)
+                self.assertEqual(window.tabbar.currentIndex(), 0)
+                self.assertEqual(session.selected_page_id, identity)
+                QtTest.QTest.mouseClick(images.pwrite_fab, QtCore.Qt.LeftButton)
+                panel = window._prompt_writer_win
+                self.assertEqual(panel.target_selector.currentData(), identity)
+                self.assertEqual(panel._view_spec.preview_widget.toPlainText(), expected_prompts[identity])
+                expected_prompts[identity] += marker
+                panel._view_spec.preview_widget.setPlainText(expected_prompts[identity])
+                QtTest.QTest.mouseClick(panel.btn_page_settings, QtCore.Qt.LeftButton)
+            session.select_page(second)
+            images.move_page(second, -2)
+            self.assertEqual(session.selected_page_id, second)
+            self.assertTrue(window.open_message_page(second))
+            self.assertIn("B-only edit", workspace.editor.editor.toPlainText())
+            self.assertNotIn("A-only edit", workspace.editor.editor.toPlainText())
+            self.assertFalse(window.open_message_page(ids[2]))
+            self.assertEqual(workspace.page_id, second)
+            self.assertTrue(workspace.save())
+            self.assertTrue(window.flush_prompt_writer_state())
+            session.save(sync_workspace=False)
+            loaded = active_project_repository(root).load().project
+            for identity, marker, other in ((first, "A-only edit", "B-only edit"), (second, "B-only edit", "A-only edit")):
+                self.assertIn(marker, loaded.get_message(identity)["html"])
+                self.assertNotIn(other, loaded.get_message(identity)["html"])
+                self.assertEqual(loaded.get_prompt(identity)["text"], expected_prompts[identity])
+                self.assertTrue(loaded.get_page(identity)["artwork"]["asset"])
+
+    def test_prompt_writer_imports_by_id_beyond_legacy_page_limits_and_rejects_stale_target(self) -> None:
+        from copy import deepcopy
+        from uuid import uuid4
+        import time
+        from PIL import Image
+        from project_model import MAX_PAGES, ProjectModel, create_project
+
+        with self.window() as window:
+            session = window.project_session
+            payload = create_project(("illustration",) * MAX_PAGES).to_dict()
+            for _ in range(2):
+                page = deepcopy(payload["pages"][0])
+                page["id"] = str(uuid4())
+                payload["pages"].append(page)
+            session.replace(ProjectModel.from_dict(payload), asset_root=window.project_root)
+            target_id = session.project.pages[-1]["id"]
+            other_id = session.project.pages[0]["id"]
+            session.select_page(target_id)
+            QtTest.QTest.mouseClick(window.image_tab.pwrite_fab, QtCore.Qt.LeftButton)
+            panel = window._prompt_writer_win
+            self.assertEqual(panel.target_selector.count(), MAX_PAGES + 2)
+            self.assertEqual(panel.target_selector.currentData(), target_id)
+            self.assertEqual(panel._page_image_index(target_id), 0)
+            panel._view_spec.preview_widget.setPlainText("Exact imported-page prompt\n雪")
+            source = Path(window.project_root) / "approval.gif"
+            frames = [Image.new("RGB", (24, 36), color) for color in ("red", "blue")]
+            frames[0].save(source, save_all=True, append_images=frames[1:], duration=90, loop=0)
+            original_bytes = source.read_bytes()
+            panel._browser_targets[target_id] = session.capture_target(target_id)
+            session.select_page(other_id)
+            other = session.project.get_page(other_id)
+            panel._on_browser_image_ready(target_id, str(source))
+            deadline = time.monotonic() + 8
+            while window.image_tab._image_import_thread is not None and time.monotonic() < deadline:
+                QtTest.QTest.qWait(10)
+                time.sleep(0.005)
+            self.assertIsNone(window.image_tab._image_import_thread)
+            self.assertEqual(panel._pending_approval_key, "")
+            self.assertIn(target_id, panel._approved_pages)
+            self.assertEqual(session.project.get_page(other_id), other)
+            self.assertEqual(session.project.get_prompt(target_id)["text"], "Exact imported-page prompt\n雪")
+            self.assertEqual(window.image_tab.artwork.resolve_asset(target_id).read_bytes(), original_bytes)
+            panel._browser_targets[target_id] = session.capture_target(target_id)
+            session.project.delete_page(target_id)
+            before = session.project.to_dict()
+            panel._on_browser_image_ready(target_id, str(source))
+            self.assertEqual(session.project.to_dict(), before)
+            self.assertIn("original page changed", panel._site_status.text())
 
     def test_editor_formatting_remains_reachable_in_a_narrow_window(self) -> None:
         from Editor import Editor

@@ -123,9 +123,10 @@ class FoundationConsumerTests(unittest.TestCase):
         original = self.session.project.to_dict()
         panel = PromptWriterPanel(project_root=str(self.root))
         try:
-            panel._image_tab = mock.Mock()
+            panel._image_tab = mock.Mock(spec=["set_image_path"])
             page = self.session.project.pages[0]
-            key = page["recovery"]["legacy_key"]
+            key = page["id"]
+            panel._browser_targets[key] = self.session.capture_target(key)
             panel._on_browser_image_started(key)
             self.session.replace(create_project(), asset_root=self.root)
             from project_model import ProjectModel
@@ -144,13 +145,15 @@ class FoundationConsumerTests(unittest.TestCase):
         project_legacy_views(self.session)
         panel = PromptWriterPanel(project_root=str(self.root))
         try:
-            panel._image_tab = mock.Mock()
+            panel._image_tab = mock.Mock(spec=["set_image_path"])
             panel._image_tab.set_image_path.return_value = True
             page = self.session.project.pages[0]
             key = page["recovery"]["legacy_key"]
-            panel._on_browser_image_started(key)
+            page_id = page["id"]
+            panel._browser_targets[page_id] = self.session.capture_target(page_id)
+            panel._on_browser_image_started(page_id)
             self.session.project.reorder_pages([item["id"] for item in reversed(self.session.project.pages)])
-            panel._on_browser_image_ready(key, "selected.png")
+            panel._on_browser_image_ready(page_id, "selected.png")
             panel._image_tab.set_image_path.assert_called_once_with(PAGE_INDICES[key], "selected.png")
         finally:
             panel.shutdown()

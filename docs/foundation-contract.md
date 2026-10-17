@@ -1,5 +1,41 @@
 # Flexible page foundation contract
 
+## Prompt Writer contract extension — 2026-10-13
+
+Authorized alongside Prompt 4. These are optional data within existing schema-3
+objects; old documents and exact prompt strings are not rewritten on load.
+
+- `replace_prompt(page_id, patch)` validates a build result, retains the previous
+  complete prompt in `page.recovery.previous_prompt`, then applies the patch.
+  `restore_previous_prompt(page_id)` swaps exact text/resolved output snapshots,
+  leaves current directions/options/overrides intact, and marks the output stale.
+  Recovery uses the normal portable project repository, with no separate store.
+- `resolve_prompt_components(factory, reroll=False)` records one shared resolution
+  in `prompt_settings.resolved_components`. An existing common historical page
+  resolution is reused; otherwise the first explicit build calls the factory.
+  Only an explicit reroll calls it again. Changing selections never rerolls text.
+- `presentation.artwork_output` contains positive integer pixel `width`/`height`.
+  Absent dimensions retain the previous 2048 x 3072 default. `prompt_geometry(id)`
+  derives orientation and reduced aspect ratio and returns geometry without HTML.
+- Empty `message.layout` retains the existing responsive centered viewer panel
+  (`mode: responsive_center`), whose height depends on content and viewport and
+  whose maximum width is 960 CSS pixels. No fixed artwork rectangle is implied.
+  Explicit rectangles have `units: normalized` (0..1 image coordinates) or
+  `units: pixels` (artwork pixels), plus finite `x`, `y`, `width`, `height`, measured
+  from the top left and fitting inside the artwork. Unknown layouts are retained
+  exactly; fresh composition rejects ambiguous geometry instead of guessing.
+  Existing viewer readiness guards for custom layouts remain until Forge supports
+  those rectangles. Prompt Writer supports drafting artwork instructions for them.
+- Presentation changes invalidate prompt snapshots and shared WorkTarget versions,
+  including edit-then-revert. They do not modify authored prompt strings.
+- `ProjectSession.capture_prompt_batch(page_ids, factory)` validates nonempty
+  targets, resolves shared wording once, and atomically returns a detached model,
+  shared resolution and page work tokens. Tokens include type, prompt, message,
+  page design, shared inputs and `$order`. The optional `$order` target field
+  guards the ordered page IDs and a mutation-time structure counter, including
+  reorder-then-revert. Ordinary page work without `$order` continues to survive
+  reordering. Batch tokens never include selection as an authored input.
+
 Foundation-owned: `project_model.py`, `project_migration.py`,
 `project_repository.py`, and `project_session.py`. Coordinate changes to these
 files; feature branches must consume their public operations rather than invent

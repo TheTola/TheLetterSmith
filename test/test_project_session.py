@@ -11,6 +11,28 @@ from project_session import ProjectSession
 
 
 class ProjectSessionTests(unittest.TestCase):
+    def test_prompt_batch_captures_once_and_reverted_order_invalidates(self):
+        factory = mock.Mock(return_value={'role': 'Resolved once'})
+        snapshot, resolved, targets = self.session.capture_prompt_batch(self.ids, factory)
+        self.assertEqual(resolved, {'role': 'Resolved once'})
+        factory.assert_called_once_with()
+        self.session.select_page(self.ids[-1])
+        self.assertTrue(all(self.session.target_is_current(target) for target in targets))
+        self.session.project.reorder_pages(list(reversed(self.ids)))
+        self.session.project.reorder_pages(self.ids)
+        self.assertTrue(all(not self.session.target_is_current(target) for target in targets))
+        self.assertEqual([page['id'] for page in snapshot.pages], self.ids)
+        self.session.capture_prompt_batch(self.ids, factory)
+        factory.assert_called_once_with()
+
+    def test_presentation_changes_invalidate_prompt_work_even_when_reverted(self):
+        session = self.session
+        token = session.capture_target(self.ids[0], fields=("prompt",))
+        session.project.update_project_data("presentation", {"artwork_output": {"width": 900, "height": 1600}})
+        session.project.update_project_data("presentation", {"artwork_output": {}})
+        self.assertFalse(session.target_is_current(token))
+        self.assertTrue(session.project.get_prompt(self.ids[0])["stale"])
+
     def setUp(self):
         self.session = ProjectSession(create_project(('cover', 'letter', 'illustration', 'letter', 'end_page')))
         self.ids = [page['id'] for page in self.session.project.pages]

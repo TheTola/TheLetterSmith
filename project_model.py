@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from functools import wraps
 import json
 import logging
+import math
 from types import MappingProxyType
 from threading import RLock
 from typing import Any, Callable, Iterable, Mapping
@@ -256,12 +257,18 @@ class ProjectModel:
     def input_versions(self, page_id: str, fields: Iterable[str], *, include_shared: bool = True) -> tuple[int, ...]:
         """Read mutation-time counters; notifications are not the guard authority."""
         self._page(page_id)
+        fields = tuple(fields)
         keys = [(page_id, "*"), *((page_id, field) for field in fields)]
+        if '$order' in fields:
+            keys.append(('*', 'page_order'))
         if include_shared:
             keys.append(("*", "shared_settings"))
         return tuple(self._input_versions.get(key, 0) for key in keys)
 
     def _record_change(self, change: ModelChange) -> None:
+        if change.kind == 'structure':
+            key = ('*', 'page_order')
+            self._input_versions[key] = self._input_versions.get(key, 0) + 1
         for page_id, fields in change.changed_fields:
             for field in fields:
                 key = (page_id, field)
@@ -286,8 +293,10 @@ class ProjectModel:
                 fields = tuple(field for field in before[page_id].keys() | after[page_id].keys()
                                if before[page_id].get(field) != after[page_id].get(field))
                 changes.append((page_id, fields))
-        if any(self._data[key] != candidate[key] for key in ("shared_settings", "prompt_settings")):
+        if any(self._data[key] != candidate[key] for key in ("shared_settings", "prompt_settings", "presentation")):
             changes.append(("*", ("shared_settings",)))
+        if tuple(before) != tuple(after):
+            changes.append(('*', ('page_order',)))
         self._data = candidate
         self._record_change(ModelChange(kind, tuple(after), self.revision, tuple(changes)))
 
@@ -496,6 +505,43 @@ class ProjectModel:
         self._update_field(page_id, "prompt", value, "prompt")
 
     @_mutating
+    def replace_prompt(self, page_id: str, patch: Mapping[str, Any]) -> None:
+        """Explicit build: retain one exact previous snapshot in page recovery."""
+        page = self.get_page(page_id)
+        previous = deepcopy(page["prompt"])
+        page["prompt"].update(_object(patch, "prompt"))
+        _validate_page(page)
+        if previous.get("text") is not None:
+            self.update_page_recovery(page_id, {"previous_prompt": previous})
+        self.update_prompt(page_id, patch)
+
+    @_mutating
+    def restore_previous_prompt(self, page_id: str) -> bool:
+        """Swap output snapshots only; current directions/overrides stay authored."""
+        page = self.get_page(page_id)
+        previous = page["recovery"].get("previous_prompt")
+        if not isinstance(previous, dict) or not isinstance(previous.get("text"), str):
+            return False
+        self.update_prompt(page_id, {"text": previous["text"],
+                                    "resolved_components": previous.get("resolved_components", {}),
+                                    "stale": True})
+        self.update_page_recovery(page_id, {"previous_prompt": page["prompt"]})
+        return True
+
+    @_mutating
+    def resolve_prompt_components(self, factory: Callable[[], Mapping], *, reroll: bool = False) -> dict:
+        """One project resolution, changed only on first build or explicit reroll."""
+        resolved = self._data["prompt_settings"].get("resolved_components")
+        if not reroll and isinstance(resolved, dict) and resolved:
+            return deepcopy(resolved)
+        legacy = [page["prompt"]["resolved_components"] for page in self._data["pages"]
+                  if page["prompt"]["resolved_components"]]
+        value = legacy[0] if not reroll and legacy and all(item == legacy[0] for item in legacy) else factory()
+        value = _object(value, "resolved_components")
+        self.update_project_data("prompt_settings", {"resolved_components": value})
+        return deepcopy(value)
+
+    @_mutating
     def update_page_settings(self, page_id: str, patch: Mapping[str, Any]) -> None:
         value = _object(patch, "design_overrides")
         page = self._page(page_id)
@@ -534,10 +580,10 @@ class ProjectModel:
             return
         self._data[field] = merged
         ids = [page["id"] for page in self._data["pages"]]
-        if field in {"shared_settings", "prompt_settings"}:
+        if field in {"shared_settings", "prompt_settings", "presentation"}:
             for page in self._data["pages"]:
                 page["prompt"]["stale"] = True
-        self._changed("shared_design" if field in {"shared_settings", "prompt_settings"} else "project_data", ids)
+        self._changed("shared_design" if field in {"shared_settings", "prompt_settings", "presentation"} else "project_data", ids)
 
     @_reading
     def resolve_settings(self, page_id: str) -> dict[str, Any]:
@@ -552,6 +598,42 @@ class ProjectModel:
                 "position": next(i + 1 for i, item in enumerate(self._data["pages"]) if item["id"] == page_id),
                 "text_area": deepcopy(page["message"].get("layout", {})) if page["message"] is not None else None,
                 "shared": deepcopy(self._data["prompt_settings"]), "prompt": page["prompt"]}
+
+    @_reading
+    def prompt_geometry(self, page_id: str) -> dict[str, Any]:
+        """Artwork pixels plus message geometry; never includes message text.
+
+        Empty legacy layouts use the existing responsive, centered viewer panel.
+        Explicit rectangles use normalized image coordinates or artwork pixels.
+        Unknown historical layout conventions remain stored, but cannot be built.
+        """
+        output = self._data["presentation"].get("artwork_output", {})
+        width, height = output.get("width", 2048), output.get("height", 3072)
+        if any(isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in (width, height)):
+            raise ProjectModelError("Artwork dimensions must be positive whole pixels")
+        divisor = math.gcd(width, height)
+        result = {"width": width, "height": height, "aspect_ratio": f"{width // divisor}:{height // divisor}",
+                  "orientation": "landscape" if width > height else "portrait" if height > width else "square",
+                  "text_area": None}
+        message = self._page(page_id)["message"]
+        if message is not None:
+            area = deepcopy(message.get("layout", {}))
+            if not area or area == {"mode": "responsive_center"}:
+                area = {"mode": "responsive_center"}
+            else:
+                units = area.get("units")
+                if units not in {"normalized", "pixels"}:
+                    raise ProjectModelError("The Letter text area needs explicit normalized or pixels units")
+                values = [area.get(key) for key in ("x", "y", "width", "height")]
+                if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in values):
+                    raise ProjectModelError("The Letter text area needs finite x, y, width and height")
+                x, y, w, h = values
+                limit_x, limit_y = (1, 1) if units == "normalized" else (width, height)
+                if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > limit_x or y + h > limit_y:
+                    raise ProjectModelError("The Letter text area must fit inside the artwork")
+                area = {key: area[key] for key in ("units", "x", "y", "width", "height")}
+            result["text_area"] = area
+        return result
 
     @_reading
     def validate(self) -> tuple[ValidationIssue, ...]:
