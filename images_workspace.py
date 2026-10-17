@@ -492,9 +492,7 @@ class ImageTab(QtWidgets.QWidget):
     def _commit(self, reason):
         self._committing = True
         try:
-            # Merge only changed legacy fields before refreshing disposable views.
             from project_consumers import project_legacy_views
-            self.session.synchronize_workspace()
             count = len(self.session.project.pages)
             if MIN_PAGES <= count <= MAX_PAGES:
                 project_legacy_views(self.session)
@@ -618,8 +616,11 @@ class ImageTab(QtWidgets.QWidget):
     def import_image(self, page_id, source_path, target=None):
         if self._shutdown or self._image_import_thread is not None or not source_path:
             return False
-        self._prepare_page_operation()
-        target = target or self.artwork.capture_target(page_id)
+        if target is None:
+            self._prepare_page_operation()
+            target = self.artwork.capture_target(page_id)
+        elif not self.flush_pending_edits():
+            raise RuntimeError("Save or repair the pending page name before importing artwork.")
         if target.page_id != page_id or not self.session.target_is_current(target):
             return False
         self._pending_target = target

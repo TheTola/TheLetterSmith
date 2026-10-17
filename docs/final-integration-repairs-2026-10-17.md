@@ -90,3 +90,14 @@ experimental window-title change was reverted; no appearance behavior changed.
   The new event-count regression, all 53 theme tests and the native import test
   passed. Repeated whole-window and final-candidate results are recorded in the
   verification report; earlier stalled runs are retained as failures.
+
+- FIX-12: removing the writer's incidental legacy refresh exposed a dependency in
+  the over-limit imported-page workflow. Images re-read stale compatibility
+  settings after a result's target was captured, replacing the active identity;
+  its commit and the writer's completion save repeated that read. Captured imports
+  now flush pending page names and validate their original token, then commit the
+  canonical result without a second legacy merge. Prompt Writer persists its
+  already-canonical state with `sync_workspace=False`. Normal uncaptured image
+  operations still use their established pre-operation merge. The real animated
+  import regression now asserts project identity as well as exact prompt/source
+  bytes, and passed together with the 23 Images and 13 Prompt Writer tests.

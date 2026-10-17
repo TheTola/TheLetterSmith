@@ -602,3 +602,8 @@ Opening the canonical Prompt Writer is a read-only binding operation. It does no
 refresh legacy page projections; canonical pages, their labels and exact prompts
 already supply the view. Compatibility projection maintenance must not be added
 to a launcher as an incidental authored revision.
+
+A captured artwork result validates its original session/page token after pending
+names are flushed. It does not import disposable workspace settings at commit.
+Images and Prompt Writer persist already-canonical edits without a second legacy
+merge; explicit compatibility ingestion remains at the established input boundary.

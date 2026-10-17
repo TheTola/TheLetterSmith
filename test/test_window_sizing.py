@@ -1221,6 +1221,7 @@ class WindowSizingTests(unittest.TestCase):
             panel._browser_targets[target_id] = session.capture_target(target_id)
             session.select_page(other_id)
             other = session.project.get_page(other_id)
+            project_id = session.project.project_id
             panel._on_browser_image_ready(target_id, str(source))
             deadline = time.monotonic() + 8
             while window.image_tab._image_import_thread is not None and time.monotonic() < deadline:
@@ -1228,7 +1229,8 @@ class WindowSizingTests(unittest.TestCase):
                 time.sleep(0.005)
             self.assertIsNone(window.image_tab._image_import_thread)
             self.assertEqual(panel._pending_approval_key, "")
-            self.assertIn(target_id, panel._approved_pages)
+            self.assertIn(target_id, panel._approved_pages, panel._site_status.text())
+            self.assertEqual(session.project.project_id, project_id)
             self.assertEqual(session.project.get_page(other_id), other)
             self.assertEqual(session.project.get_prompt(target_id)["text"], "Exact imported-page prompt\n雪")
             self.assertEqual(window.image_tab.artwork.resolve_asset(target_id).read_bytes(), original_bytes)

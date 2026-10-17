@@ -2314,7 +2314,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         if self._state_persistence_suspended or self.session.is_restoring:
             return False
         try:
-            self.session.save()
+            self.session.save(sync_workspace=False)
             self._persistence_failed = False
             return True
         except (OSError, ValueError, RuntimeError, TypeError):
