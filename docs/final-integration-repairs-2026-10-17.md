@@ -69,3 +69,8 @@ The optional startup appearance popup could not be targeted by the native
 inspection tool. Its event loop was confirmed waiting, not a startup crash.
 Packaged smoke checks use an existing synthetic appearance preference. The
 experimental window-title change was reverted; no appearance behavior changed.
+
+- FIX-09: native packaged inspection found Cover-specific direction/copy help on
+  Letter B. Refresh the existing single-card help and empty-prompt placeholder
+  from its actual canonical page label. The four-model launcher test now checks
+  those descriptions for every target. Prompt content is untouched.

@@ -2581,9 +2581,13 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._view_spec.color_key = PAGE_TYPES[page["type"]].artwork_template if page else "cover"
             self._view_spec.display_label = page_label(project, selected) if page else "No page selected"
             self._view_spec.detail_label.setText("Page direction")
+            _set_help(self._view_spec.detail_label, "Directions for this page only. Message text is authored separately in Messages.")
             self._view_spec.detail_widget.setPlaceholderText("Describe the subjects, scene and composition for this page.")
             _set_help(self._view_spec.detail_widget, "Directions for this page only. Message text is authored separately in Messages.")
             self._view_spec.preview_title.setText("Generated Prompt")
+            _set_help(self._view_spec.copy_button, f"Copy the exact prompt for {self._view_spec.display_label} to the clipboard.")
+            _set_help(self._view_spec.generate_button, f"Send the complete prompt for {self._view_spec.display_label} to the selected image service.")
+            self._view_spec.preview_widget.setPlaceholderText(f"Prompt for {self._view_spec.display_label}")
             self._restore_text(self._view_spec.detail_widget, prompt["directions"], new_binding)
             self._restore_text(self._view_spec.preview_widget, prompt["text"] or "", new_binding)
             overrides = prompt["overrides"]

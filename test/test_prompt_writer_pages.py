@@ -73,6 +73,11 @@ class PromptWriterPageTests(unittest.TestCase):
             page = self.session.project.get_page(page_id)
             self.assertEqual(self.panel.target_selector.currentData(), page_id)
             self.assertEqual(self.panel._view_spec.color_key, PAGE_TYPES[page['type']].artwork_template)
+            label = self.panel.target_selector.currentText()
+            self.assertIn(label, self.panel._view_spec.copy_button.toolTip())
+            self.assertIn(label, self.panel._view_spec.generate_button.toolTip())
+            self.assertIn(label, self.panel._view_spec.preview_widget.placeholderText())
+            self.assertNotIn('cover.png', self.panel._view_spec.detail_label.toolTip())
             batch = self.build([page_id])
             self.assertEqual(batch.items[0].status, 'success')
             text = self.session.project.get_prompt(page_id)['text']
