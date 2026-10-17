@@ -578,8 +578,9 @@ with TemporaryDirectory() as temporary:
 ```
 
 Synthetic fixtures are `test/test_project_model.py:five_page_project` and
-`legacy_fixture`. They exercise real APIs without private content. The future
-multi-message editor UI is not implied by model or storage support.
+`legacy_fixture`. They exercise real APIs without private content. This model
+example alone does not verify editor wiring; the integrated Messages and shell
+checks are recorded in the final integration requirements matrix.
 
 ## Final integration lifecycle clarification
 
@@ -607,3 +608,8 @@ A captured artwork result validates its original session/page token after pendin
 names are flushed. It does not import disposable workspace settings at commit.
 Images and Prompt Writer persist already-canonical edits without a second legacy
 merge; explicit compatibility ingestion remains at the established input boundary.
+
+Managed display-bundle relocation and case-only rename use the same bounded
+transient-lock retry primitive as generation commits. A persistent failure still
+raises; it is not a successful save, migration or rename. Existing path and
+identity validation precedes the move.

@@ -25,7 +25,7 @@ from html import unescape
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from transactional_io import atomic_write_json
+from transactional_io import atomic_write_json, _replace_directory_path
 from project_paths import application_paths
 from protected_projects import (
     demo_preview_directory,
@@ -399,12 +399,12 @@ def _rename_component_case(path: Path, requested_name: str) -> Path:
         temporary = path.with_name(
             f".lettersmith-case-{uuid.uuid4().hex}"
         )
-    os.replace(path, temporary)
+    _replace_directory_path(path, temporary)
     try:
-        os.replace(temporary, requested)
+        _replace_directory_path(temporary, requested)
     except OSError:
         if temporary.exists() and not path.exists():
-            os.replace(temporary, path)
+            _replace_directory_path(temporary, path)
         raise
     return requested.resolve(strict=True)
 
@@ -690,7 +690,7 @@ def migrate_play_bundle(
                 return PlayBundleMigration(source_path, destination, stable_id)
             raise FileExistsError(f"Saved-letter destination exists: {destination}")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(source_path, destination)
+        _replace_directory_path(source_path, destination)
     destination = _case_normalized_bundle_path(
         destination,
         play_root,
@@ -756,7 +756,7 @@ def _relocate_managed_bundle(
                 f"Saved-letter destination exists: {destination}"
             )
         destination.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(source, destination)
+        _replace_directory_path(source, destination)
 
     if target_root == stock_root:
         destination = _rename_component_case(

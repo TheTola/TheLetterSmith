@@ -47,6 +47,43 @@ from transactional_io import (
 
 
 class PersistenceHardeningTests(unittest.TestCase):
+    def test_managed_bundle_move_retries_transient_lock_and_preserves_persistent_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = config.canonical_play_root(root) / "Recipient" / "Original"
+            source.mkdir(parents=True)
+            for name in ("index.html", "styles.css", "script.js"):
+                (source / name).write_text("synthetic resource", encoding="utf-8")
+            identity = "76ebc1b3-9ad7-44bb-9bad-2c16652d6284"
+            atomic_write_json(source / config.PLAY_METADATA_FILE, {"project_id": identity})
+            original_replace = os.replace
+            attempts = []
+
+            def briefly_locked(old, new):
+                if Path(old) == source:
+                    attempts.append((old, new))
+                    if len(attempts) == 1:
+                        raise PermissionError("Synthetic temporary viewer lock")
+                return original_replace(old, new)
+
+            with mock.patch("config.os.replace", side_effect=briefly_locked), \
+                 mock.patch("transactional_io.time.sleep"):
+                moved = config.migrate_play_bundle(
+                    root, source, recipient="Recipient", title="Renamed", project_id=identity,
+                ).destination
+            self.assertEqual(len(attempts), 2)
+            self.assertFalse(source.exists())
+            self.assertEqual((moved / "index.html").read_text(), "synthetic resource")
+            before = {p.name: p.read_bytes() for p in moved.iterdir() if p.is_file()}
+            with mock.patch("config.os.replace", side_effect=PermissionError("Persistent lock")), \
+                 mock.patch("transactional_io.time.sleep"):
+                with self.assertRaises(PermissionError):
+                    config.migrate_play_bundle(
+                        root, moved, recipient="Recipient", title="Blocked", project_id=identity,
+                    )
+            self.assertEqual({p.name: p.read_bytes() for p in moved.iterdir() if p.is_file()}, before)
+            self.assertFalse((moved.parent / "Blocked").exists())
+
     def test_atomic_copy_uses_short_sibling_on_long_windows_path(self) -> None:
         if os.name != "nt":
             self.skipTest("Windows path-length behavior is platform-specific.")

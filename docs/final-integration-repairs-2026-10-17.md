@@ -109,3 +109,13 @@ experimental window-title change was reverted; no appearance behavior changed.
   timers and zero scroll range. All size, placement and accessibility assertions
   remain intact; a failure now reports the requested size. No production layout
   or supported minimum size changed.
+
+- FIX-14: an earlier seven-curtain round-trip run hit Windows error 5 when the
+  managed display directory was renamed. That path used a single `os.replace`
+  although canonical generation commits already use bounded transient-lock
+  retries. Managed bundle moves and case-only rename/rollback now reuse
+  `transactional_io._replace_directory_path`, preserving existing containment and
+  collision checks. An injected first-attempt lock reproduced the failure before
+  the repair; the regression also checks that a persistent lock raises and leaves
+  every prior bundle byte intact. This repairs the observed production operation,
+  rather than retrying the entire test or reporting a failed move as success.
