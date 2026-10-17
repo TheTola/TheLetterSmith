@@ -15,7 +15,7 @@ from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 import project_paths
 from project_model import create_project
 from project_session import get_project_session, release_project_session, reset_project_session
-from test_project_model import five_page_project
+from test_project_model import canvas_layout, five_page_project
 
 
 class MessagesWorkspaceTests(unittest.TestCase):
@@ -32,8 +32,8 @@ class MessagesWorkspaceTests(unittest.TestCase):
             environ={"LETTER_SMITH_PROFILE_ROOT": str(self.profile)},
         )
         project_paths.configure_application_paths(self.paths)
+        self.paths.initialize()
         self.root = self.paths.workspace_root
-        self.root.mkdir(parents=True)
         self.previous_settings_format = QtCore.QSettings.defaultFormat()
         probe = QtCore.QSettings(QtCore.QSettings.IniFormat, QtCore.QSettings.UserScope,
                                  "LetterSmithPathProbe", "Probe")
@@ -90,6 +90,27 @@ class MessagesWorkspaceTests(unittest.TestCase):
         else:
             editor.moveCursor(QtGui.QTextCursor.End)
         QtTest.QTest.keyClicks(editor, text)
+
+    def _wait_for(self, condition, timeout=15):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            self.app.processEvents()
+            if condition():
+                return
+            time.sleep(0.02)
+        self.fail(self.workspace.preview_note.text())
+
+    def _layout_dialog(self):
+        from message_layout_dialog import MessageLayoutDialog
+        self.assertTrue(self.workspace.save())
+        identity = self.workspace.page_id
+        target = self.session.capture_target(identity, fields=("type", "message", "artwork", "design_overrides"))
+        dialog = MessageLayoutDialog(
+            self.workspace, self.session.project.get_page(identity), self.session.project.resolve_settings(identity),
+            self.session.project.to_dict()["shared_settings"], self.workspace.binding.label,
+            lambda geometry, **options: self.workspace.apply_layout(target, geometry, **options),
+        )
+        return dialog
 
     def _plain(self, page_id: str) -> str:
         document = QtGui.QTextDocument()
@@ -343,12 +364,8 @@ class MessagesWorkspaceTests(unittest.TestCase):
         reference_b = self._background(self.letter_b, "blue")
         self.workspace.open_page(self.letter_b)
         self.workspace.render_preview()
-        timer = QtCore.QElapsedTimer()
-        timer.start()
-        while self.workspace.preview_label.pixmap().isNull() and timer.elapsed() < 10_000:
-            self.app.processEvents()
-            QtTest.QTest.qWait(20)
-        self.assertFalse(self.workspace.preview_label.pixmap().isNull(), self.workspace.preview_note.text())
+        self._wait_for(lambda: self.workspace.shared_preview.viewed_page_id == self.letter_b)
+        self.assertTrue(self.workspace.shared_preview.view.isVisible())
         self.assertEqual(self.workspace.preview_page_id, self.letter_b)
         self.assertEqual(self.workspace.preview_background, reference_b)
         self.assertNotEqual(self.workspace.preview_background, reference_a)
@@ -373,11 +390,12 @@ class MessagesWorkspaceTests(unittest.TestCase):
         self.assertTrue(self.workspace.open_page(self.letter_b))
         self.assertEqual(self._plain(self.letter_a), "Keep this unsaved draft")
 
-    def test_long_unicode_letter_reports_fixed_preview_overflow_without_truncation(self) -> None:
+    def test_long_unicode_letter_reports_scrollable_overflow_without_truncation(self) -> None:
         from project_repository import active_project_repository
 
         self._background(self.letter_a, "white")
         self.workspace.open_page(self.letter_a)
+        self.workspace.apply_layout(self.session.capture_target(self.letter_a), canvas_layout())
         text = "\n".join(
             f"{index}: Unicode 雪 café e\u0301 😀 — preserved ending."
             for index in range(50)
@@ -390,15 +408,8 @@ class MessagesWorkspaceTests(unittest.TestCase):
         self.assertTrue(self.workspace.save())
         original = self.session.project.get_message(self.letter_a)
         self.workspace.render_preview()
-        timer = QtCore.QElapsedTimer()
-        timer.start()
-        while ("Text exceeds this fixed preview" not in self.workspace.preview_note.text()
-               and timer.elapsed() < 15_000):
-            self.app.processEvents()
-            # The Python renderer needs the GIL while the GUI remains idle.
-            time.sleep(0.02)
-        self.assertIn("Text exceeds this fixed preview", self.workspace.preview_note.text())
-        self.assertFalse(self.workspace.preview_label.pixmap().isNull())
+        self._wait_for(lambda: "scrollable text area" in self.workspace.preview_note.text())
+        self.assertTrue(self.workspace.shared_preview.view.isVisible())
         self.assertEqual(self._plain(self.letter_a), text)
         self.workspace.zoom.setValue(175)
         self.assertEqual(self.session.project.get_message(self.letter_a), original)
@@ -414,10 +425,126 @@ class MessagesWorkspaceTests(unittest.TestCase):
         document["resources"] = [missing]
         self.session.project.update_message(self.letter_a, document)
         self.workspace.render_preview()
-        self.assertIn("Missing embedded resource", self.workspace.preview_note.text())
+        self._wait_for(lambda: "Message resource is missing" in self.workspace.preview_note.text())
         self.assertIn(missing, self.workspace.preview_note.text())
         self.assertEqual(self.session.project.get_message(self.letter_a), document)
         self.assertIn("Keep the missing image reference.", self.workspace.editor.editor.toPlainText())
+
+    def test_layout_controls_preserve_partial_inheritance_and_other_pages(self):
+        self.session.project.update_shared_settings({"message_layout": canvas_layout()})
+        self.workspace.open_page(self.letter_a)
+        original = self.session.project.get_page(self.letter_a)
+        other = self.session.project.get_page(self.letter_b)
+        dialog = self._layout_dialog()
+        self.assertEqual(dialog.scope.text(), "Using project text layout")
+        dialog.custom.setChecked(True)
+        dialog.values[("box", "x")].setValue(60)
+        dialog.values[("box", "width")].setValue(280)
+        dialog.values[("padding", "left")].setValue(18)
+        dialog.alignment.setCurrentIndex(dialog.alignment.findData("right"))
+        dialog.apply_button.click()
+        self.assertEqual(dialog.result(), QtWidgets.QDialog.Accepted, dialog.error.text())
+        authored = self.session.project.get_message(self.letter_a)
+        self.assertEqual(authored["layout"], {"box": {"x": 60, "width": 280}, "padding": {"left": 18}, "text_align": "right"})
+        self.assertEqual(authored["html"], original["message"]["html"])
+        self.assertEqual(self.session.project.get_page(self.letter_b), other)
+        self.assertEqual(self.session.project.get_page(self.letter_a)["artwork"], original["artwork"])
+        self.assertEqual(self.session.project.get_page(self.letter_a)["prompt"]["text"], original["prompt"]["text"])
+        defaults = canvas_layout()
+        defaults["box"]["y"] = 200
+        self.session.project.update_shared_settings({"message_layout": defaults})
+        resolved = self.session.project.resolve_layout(self.letter_a)["message"]
+        self.assertEqual((resolved["box"]["x"], resolved["box"]["y"]), (60, 200))
+        self.assertEqual(self.session.project.get_message(self.letter_a), authored)
+
+    def test_layout_default_reset_clears_only_text_layout_overrides(self):
+        self.session.project.update_shared_settings({"message_layout": canvas_layout()})
+        self.workspace.open_page(self.letter_a)
+        self.session.project.update_page_settings(self.letter_a, {"message_layout": None, "message_overlay_opacity": 31})
+        self.workspace.apply_layout(self.session.capture_target(self.letter_a), canvas_layout())
+        dialog = self._layout_dialog()
+        dialog.default_button.click()
+        dialog.apply_button.click()
+        self.assertEqual(dialog.result(), QtWidgets.QDialog.Accepted, dialog.error.text())
+        page = self.session.project.get_page(self.letter_a)
+        self.assertEqual(page["message"]["layout"], {})
+        self.assertNotIn("message_layout", page["design_overrides"])
+        self.assertEqual(page["design_overrides"]["message_overlay_opacity"], 31)
+        self.assertEqual(self.session.project.resolve_layout(self.letter_a)["message"], canvas_layout())
+
+    def test_layout_dialog_rejects_bounds_and_padding_without_replacing_document(self):
+        self.workspace.open_page(self.letter_a)
+        original = self.session.project.to_dict()
+        dialog = self._layout_dialog()
+        dialog.custom.setChecked(True)
+        dialog.values[("box", "x")].setValue(100)
+        dialog.apply_button.click()
+        self.assertIn("fit inside", dialog.error.text())
+        self.assertEqual(self.session.project.to_dict(), original)
+        dialog.values[("box", "x")].setValue(0)
+        dialog.values[("padding", "left")].setValue(400)
+        dialog.apply_button.click()
+        self.assertIn("positive space", dialog.error.text())
+        self.assertEqual(self.session.project.to_dict(), original)
+
+    def test_layout_dialog_rejects_changed_inputs_and_replaced_session(self):
+        self.workspace.open_page(self.letter_a)
+        dialog = self._layout_dialog()
+        dialog.custom.setChecked(True)
+        self._type("Newer document")
+        changed = self.session.project.to_dict()
+        dialog.apply_button.click()
+        self.assertIn("changed while Text Layout", dialog.error.text())
+        self.assertEqual(self.session.project.to_dict(), changed)
+        self.assertTrue(self.workspace.save())
+        dialog = self._layout_dialog()
+        dialog.custom.setChecked(True)
+        replacement = type(self.session.project).from_dict(self.session.project.to_dict())
+        self.session.replace(replacement)
+        changed = self.session.project.to_dict()
+        dialog.apply_button.click()
+        self.assertIn("changed while Text Layout", dialog.error.text())
+        self.assertEqual(self.session.project.to_dict(), changed)
+
+    def test_layout_survives_retype_duplicate_reorder_and_repository_reload(self):
+        from project_repository import active_project_repository
+        self.workspace.open_page(self.letter_a)
+        self.workspace.apply_layout(self.session.capture_target(self.letter_a), canvas_layout())
+        original = self.session.project.get_message(self.letter_a)
+        duplicate = self.session.project.duplicate_page(self.letter_a)
+        self.workspace.open_page(duplicate)
+        dialog = self._layout_dialog()
+        dialog.values[("box", "x")].setValue(20)
+        dialog.apply_button.click()
+        self.assertEqual(dialog.result(), QtWidgets.QDialog.Accepted, dialog.error.text())
+        self.assertEqual(self.session.project.get_message(self.letter_a), original)
+        self.session.project.change_page_type(self.letter_a, "illustration")
+        self.session.project.change_page_type(self.letter_a, "letter")
+        self.session.project.reorder_pages(list(reversed([p["id"] for p in self.session.project.pages])))
+        self.workspace.open_page(self.letter_a)
+        self._type("Text after geometry", replace=False)
+        self.assertTrue(self.workspace.save())
+        stored = active_project_repository(self.root).load()
+        self.assertEqual(stored.project.get_message(self.letter_a)["layout"], original["layout"])
+        self.assertIn("Text after geometry", stored.project.get_message(self.letter_a)["html"])
+        self.assertEqual(stored.project.resolve_layout(duplicate)["message"]["box"]["x"], 20)
+
+    def test_layout_open_cancel_preserves_unknown_data_and_readiness_targets_letter(self):
+        from message_layout_dialog import MessageLayoutDialog
+        self.tab.focus_field(self.letter_b)
+        self.assertEqual(self.workspace.page_id, self.letter_b)
+        document = self.session.project.get_message(self.letter_b)
+        document["layout"] = {"historical": 17}
+        self.session.project.update_message(self.letter_b, document)
+        original = self.session.project.to_dict()
+        inspected = []
+        def cancel(dialog):
+            inspected.append(dialog.error.text())
+            return QtWidgets.QDialog.Rejected
+        with mock.patch.object(MessageLayoutDialog, "exec", cancel):
+            self.workspace.layout_button.click()
+        self.assertIn("Saved layout cannot be rendered", inspected[0])
+        self.assertEqual(self.session.project.to_dict(), original)
 
     def test_dirty_replaced_session_retains_draft_and_blocks_style_changes(self) -> None:
         self.workspace.open_page(self.letter_a)

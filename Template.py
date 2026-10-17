@@ -260,9 +260,11 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .slide.active{opacity:1;pointer-events:auto}
 .slide.peek{opacity:1;pointer-events:none;z-index:4}
 .slide.ghost{opacity:0;pointer-events:none}
-.slide.asset-failed img{opacity:0}
+.slide.asset-failed > img{opacity:0}
 .slide.asset-failed::after{content:attr(data-fallback-label);position:absolute;inset:50% auto auto 50%;transform:translate(-50%,-50%);width:min(520px,72%);padding:18px 22px;color:var(--text-main);text-align:center;font:700 20px/1.4 var(--font-ui);background:rgba(0,0,0,.58);border:1px solid var(--hud-border);border-radius:var(--page-radius);box-shadow:var(--shadow-page);z-index:6}
-.slide img{max-width:calc(100% - (2 * var(--page-side-rail)));max-height:calc(100% - var(--control-rail) - var(--bottom-control-rail));position:absolute;inset:var(--control-rail) var(--page-side-rail) var(--bottom-control-rail);margin:auto;object-fit:contain;border-radius:var(--page-radius);box-shadow:inset 0 0 30px rgba(0,0,0,.20),var(--shadow-page)}
+.slide > img{max-width:calc(100% - (2 * var(--page-side-rail)));max-height:calc(100% - var(--control-rail) - var(--bottom-control-rail));position:absolute;inset:var(--control-rail) var(--page-side-rail) var(--bottom-control-rail);margin:auto;object-fit:contain;border-radius:var(--page-radius);box-shadow:inset 0 0 30px rgba(0,0,0,.20),var(--shadow-page)}
+.canvas-bounds{position:absolute;inset:var(--control-rail) var(--page-side-rail) var(--bottom-control-rail);pointer-events:none}
+.slide.has-canvas > img{inset:auto;left:var(--canvas-left);top:var(--canvas-top);width:var(--canvas-width);height:var(--canvas-height);max-width:none;max-height:none;margin:0;object-fit:var(--artwork-fit);object-position:var(--artwork-x) var(--artwork-y)}
 
 .nav-button,.hud-button{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--hud-border);background:linear-gradient(180deg,var(--hud-surface-top),var(--hud-surface-bottom));color:var(--text-main);box-shadow:var(--hud-shadow);backdrop-filter:blur(10px);cursor:pointer;transition:transform var(--motion-hover),background var(--motion-hover),border-color var(--motion-hover),box-shadow var(--motion-hover),opacity var(--motion-overlay),visibility 0s linear var(--duration-overlay)}
 .nav-button:hover,.hud-button:hover{background:linear-gradient(180deg,rgba(25,37,55,.88),rgba(10,14,24,.76));border-color:var(--hud-border-strong);box-shadow:var(--hud-shadow-strong)}
@@ -294,6 +296,13 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .text-wall-content > :last-child{margin-bottom:0 !important}
 .text-wall-content :where(p,div,blockquote,ul,ol,h1,h2,h3,h4,table){margin-left:0 !important;margin-right:0 !important}
 .text-wall-content :where(img,table){height:auto}
+.text-wall.canvas-message{inset:auto;left:var(--message-left);top:var(--message-top);width:var(--message-width);height:var(--message-height);max-height:none;margin:0;padding:0;border:0;overflow:visible;transform:scale(var(--canvas-scale));transform-origin:top left;transition:opacity var(--motion-overlay),visibility 0s linear var(--duration-overlay)}
+.text-wall.canvas-message.is-open{transform:scale(var(--canvas-scale));transition-delay:0s}
+.canvas-message .text-wall-viewport{position:absolute;inset:0;overflow:auto;overscroll-behavior:contain;border-radius:inherit;scrollbar-width:thin}
+.canvas-message .text-wall-content{box-sizing:border-box;width:100%;max-width:none;min-height:100%;margin:0;padding:var(--message-padding);text-align:var(--message-align);font-size:18px}
+.canvas-message .close-text{position:absolute;top:calc(-44px / var(--canvas-scale));right:0;width:calc(44px / var(--canvas-scale));height:calc(44px / var(--canvas-scale));margin:0;font-size:calc(24px / var(--canvas-scale))}
+.message-overflow-note{position:absolute;right:0;bottom:calc(-24px / var(--canvas-scale));padding:2px 5px;border-radius:4px;background:#15151b;color:#fff;font:500 calc(12px / var(--canvas-scale))/1.4 var(--font-ui);white-space:nowrap;pointer-events:none}
+.message-overflow-note[hidden]{display:none}
 .text-wall-content :is(a[href^="ultralink:"],a[href^="hypernote:"]){font-style:italic;text-decoration:none !important;cursor:help;outline-offset:3px}
 .text-wall-content :is(a[href^="ultralink:"],a[href^="hypernote:"]):focus-visible{outline:2px solid #00d0ff;border-radius:3px}
 .ultralink-tooltip{position:fixed;left:0;top:0;max-width:min(22rem,calc(100vw - 32px));padding:11px 14px;border:1px solid transparent;border-radius:9px;box-shadow:0 18px 42px rgba(0,0,0,.34);font:500 15px/1.45 Georgia,'Times New Roman',serif;white-space:pre-wrap;overflow-wrap:anywhere;z-index:220;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity var(--motion-overlay),transform var(--motion-overlay),visibility 0s linear var(--duration-overlay);pointer-events:none}
@@ -306,14 +315,18 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .text-wall::-webkit-scrollbar-thumb{background:rgba(92,67,40,.52);border-radius:999px}
 
 .hud-button{width:calc(var(--icon-size) + 10px);height:calc(var(--icon-size) + 10px);padding:5px;border-radius:var(--pill-radius)}
-#open-text,#close-text{opacity:0;visibility:hidden;pointer-events:none}
-#open-text.is-visible,#close-text.is-visible{opacity:1;visibility:visible;pointer-events:auto;transition-delay:0s}
+#open-text,#close-text,.close-text{opacity:0;visibility:hidden;pointer-events:none}
+#open-text.is-visible,#close-text.is-visible,.close-text.is-visible{opacity:1;visibility:visible;pointer-events:auto;transition-delay:0s}
 #open-text{position:absolute;left:var(--corner-offset);bottom:var(--corner-offset);z-index:101;transform:translateY(8px) scale(.96)}
 #open-text.is-visible{transform:translateY(0) scale(1)}
 #open-text img{width:var(--icon-size);height:var(--icon-size);padding:6px}
 #open-text:hover{transform:translateY(0) scale(1.05)}
-#close-text{position:sticky;top:0;left:auto;bottom:auto;display:flex;margin:0 0 0 auto;width:var(--close-size);height:var(--close-size);border-radius:14px;font-size:clamp(24px,2.8vw,28px);line-height:1;z-index:3;transform:scale(.96)}
-#close-text.is-visible{transform:scale(1)}
+.close-text,#close-text{position:sticky;top:0;left:auto;bottom:auto;display:flex;margin:0 0 0 auto;width:var(--close-size);height:var(--close-size);border-radius:14px;font-size:clamp(24px,2.8vw,28px);line-height:1;z-index:3;transform:scale(.96)}
+#close-text.is-visible,.close-text.is-visible{transform:scale(1)}
+#page-navigation{position:absolute;left:50%;bottom:var(--corner-offset);transform:translateX(-50%);display:flex;align-items:center;gap:8px;max-width:calc(100% - 220px);padding:6px 10px;border-radius:var(--panel-radius);background:rgba(14,14,18,.85);color:#fff;font:500 12px/1.4 var(--font-ui);z-index:106}
+#page-indicator{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#page-selector{max-width:130px;color:#fff;background:#25252b;border:1px solid #777;border-radius:4px;padding:4px}
+@media(max-width:520px){#page-navigation{bottom:calc(var(--bottom-control-rail) + 4px);max-width:calc(100% - 24px)}#page-selector{max-width:100px}}
 
 #volume-control{position:absolute;right:var(--corner-offset);bottom:var(--corner-offset);display:flex;align-items:center;gap:10px;padding:6px;border:1px solid rgba(255,255,255,.08);border-radius:var(--pill-radius);background:rgba(42,46,54,.72);box-shadow:var(--hud-shadow);backdrop-filter:blur(10px);z-index:102;opacity:0;visibility:hidden;pointer-events:none;transform:translateY(0);transition:opacity var(--motion-overlay),transform var(--motion-major),visibility 0s linear var(--duration-overlay)}
 body.stage-ready #volume-control{opacity:1;visibility:visible;pointer-events:auto;transition-delay:0s}
@@ -361,9 +374,13 @@ document.addEventListener('DOMContentLoaded', () => {
   const sheetFront = document.getElementById('sheetFront');
   const imgFront = document.getElementById('turnFrontImg');
 
-  const wall       = document.getElementById('textWall');
-  const closeText  = document.getElementById('close-text');
+  const legacyWall = document.getElementById('textWall');
+  const messageWalls = Array.from(document.querySelectorAll('.text-wall'));
+  let wall         = legacyWall;
+  let closeText    = document.getElementById('close-text');
   const openText   = document.getElementById('open-text');
+  const pageIndicator = document.getElementById('page-indicator');
+  const pageSelector = document.getElementById('page-selector');
 
   const slideshowEl = document.getElementById('slideshow');
   const volumeControl = document.getElementById('volume-control');
@@ -427,14 +444,22 @@ document.addEventListener('DOMContentLoaded', () => {
   let deferredWarmStarted = false;
   let flipping = false;
   let musicPlaylistIndex = 0;
+  let requestedPageId = null;
   let playlistTransitioning = false;
   let playlistTransitionTimer = null;
   const musicLoopDelayMs = 1200;
-  const muteStorageKey = 'lettersmith.viewerMuted';
+  const playbackIdentity = document.body.dataset.playbackId;
+  const muteStorageKey = 'lettersmith.viewerMuted' + (playbackIdentity ? ':' + playbackIdentity : '');
   let viewerMuted = loadViewerMuted();
   let currentVolume = loadVolume0to100();
 
-  const flipPool = Array.from({length: 10}, (_, i) => `gallery/sounds/flip${i+1}.mp3`);
+  const flipPool = [
+    'gallery/sounds/flip1.mp3', 'gallery/sounds/flip2.mp3',
+    'gallery/sounds/flip3.mp3', 'gallery/sounds/flip4.mp3',
+    'gallery/sounds/flip5.mp3', 'gallery/sounds/flip6.mp3',
+    'gallery/sounds/flip7.mp3', 'gallery/sounds/flip8.mp3',
+    'gallery/sounds/flip9.mp3', 'gallery/sounds/flip10.mp3',
+  ];
   const glissSrc = 'gallery/sounds/glissando.mp3';
   const deferredAssets = [
     ...slides.slice(1).map((slide) => ({ as: 'image', href: slide.querySelector('img').getAttribute('src') })),
@@ -467,9 +492,10 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  function installAdaptiveMicroContrast(){
-    const content = document.getElementById('textWallContent');
-    let wallImage = document.querySelector('[data-page-type="wall"] > img');
+  function installAdaptiveMicroContrast(wall){
+    const content = wall.querySelector('.text-wall-content');
+    const ownerSlide = wall.closest('.slide') || slides.find((slide) => wall.dataset.pageId && slide.dataset.pageId === wall.dataset.pageId);
+    let wallImage = ownerSlide?.querySelector('img') || document.querySelector('[data-page-type="wall"] > img');
     if (!content || !wallImage){
       return { schedule(){} };
     }
@@ -513,7 +539,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     content.dataset.adaptiveContrastMode=supportsHighlights?'highlights':'glyph-spans';
     const style = document.createElement('style');
-    style.id = 'lettersmith-adaptive-micro-contrast';
+    style.id = `lettersmith-adaptive-micro-contrast-${wall.id}`;
     document.head.appendChild(style);
     let highlightNames = [];
     let imageSample = null;
@@ -598,7 +624,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function run(){
       frame=0;
       if (!wall.classList.contains('is-open')) return;
-      wallImage = slides[idx].querySelector('img');
+      wallImage = (ownerSlide || slides[idx]).querySelector('img');
       const sampleImage=prepareImage();
       if (!sampleImage) return;
       const imageRect=wallImage.getBoundingClientRect(), wallRect=wall.getBoundingClientRect();
@@ -690,10 +716,10 @@ document.addEventListener('DOMContentLoaded', () => {
       const rules=[];
       let index=0;
       for(const [color,ranges] of groups){
-        const name=`lettersmith-amc-${index++}`;
+        const name=`lettersmith-amc-${wall.id}-${index++}`;
         CSS.highlights.set(name,new Highlight(...ranges));
         highlightNames.push(name);
-        rules.push(`.text-wall-content::highlight(${name}){color:${color}}`);
+        rules.push(`#${content.id}::highlight(${name}){color:${color}}`);
       }
       style.textContent=rules.join('\n');
     }
@@ -707,10 +733,11 @@ document.addEventListener('DOMContentLoaded', () => {
     return {schedule};
   }
 
-  const adaptiveMicroContrast = installAdaptiveMicroContrast();
+  const contrastControllers = new Map(messageWalls.map((item) => [item, installAdaptiveMicroContrast(item)]));
+  const adaptiveMicroContrast = {schedule(){ contrastControllers.get(wall)?.schedule(); }};
 
-  function installUltralinks(){
-    const content = document.getElementById('textWallContent');
+  function installUltralinks(wall){
+    const content = wall.querySelector('.text-wall-content');
     if (!content) return;
     const links = Array.from(
       content.querySelectorAll('a[href^="ultralink:"],a[href^="hypernote:"]')
@@ -718,7 +745,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!links.length) return;
 
     const tooltip = document.createElement('div');
-    tooltip.id = 'ultralink-tooltip';
+    tooltip.id = legacyWall === wall ? 'ultralink-tooltip' : `ultralink-tooltip-${wall.id}`;
     tooltip.className = 'ultralink-tooltip';
     tooltip.setAttribute('role', 'tooltip');
     document.body.appendChild(tooltip);
@@ -1047,7 +1074,8 @@ document.addEventListener('DOMContentLoaded', () => {
     setHiddenState(slideshowEl, false);
     setHiddenState(volumeControl, false);
     document.body.classList.add('stage-ready');
-    setActiveIndex(0, { playSound: false });
+    const requestedIndex = slides.findIndex((slide) => slide.dataset.pageId === requestedPageId);
+    setActiveIndex(Math.max(0, requestedIndex), { playSound: false });
   }
 
   function startCurtainIntro(){
@@ -1064,7 +1092,78 @@ document.addEventListener('DOMContentLoaded', () => {
     requestAnimationFrame(() => overlay.classList.add('is-visible'));
   }
 
-  function isWallPage(){ return slides[idx].dataset.pageType === "wall"; }
+  function isWallPage(){
+    const slide = slides[idx];
+    return !!slide && (slide.dataset.pageType === "wall" ||
+      (slide.dataset.canonical === 'true' && slide.dataset.pageType === "letter"));
+  }
+  function selectMessageWall(){
+    wall = messageWalls.find((item) => item.dataset.pageId && item.dataset.pageId === slides[idx]?.dataset.pageId) || legacyWall;
+    closeText = wall?.querySelector('.hud-button-close') || null;
+    if (wall) openText.setAttribute('aria-controls', wall.id);
+    else openText.removeAttribute('aria-controls');
+  }
+  const canvasPages = slides.filter((slide) => slide.dataset.layout).map((slide) => ({
+    slide, layout:JSON.parse(slide.dataset.layout),
+    wall:messageWalls.find((item) => item.dataset.pageId === slide.dataset.pageId),
+  }));
+  let layoutIssues = [];
+  let layoutFrame = 0;
+  function updateCanvasLayouts(){
+    const issues = [];
+    for (const item of canvasPages){
+      const {slide, layout, wall:messageWall} = item;
+      const bounds = slide.querySelector('.canvas-bounds').getBoundingClientRect();
+      const stage = slide.getBoundingClientRect();
+      const canvas = layout.artwork.canvas;
+      const scale = Math.min(bounds.width / canvas.width, bounds.height / canvas.height);
+      if (!(scale > 0)) continue;
+      const left = bounds.left - stage.left + (bounds.width - canvas.width * scale) / 2;
+      const top = bounds.top - stage.top + (bounds.height - canvas.height * scale) / 2;
+      const properties = {
+        '--canvas-left':`${left}px`, '--canvas-top':`${top}px`,
+        '--canvas-width':`${canvas.width * scale}px`, '--canvas-height':`${canvas.height * scale}px`,
+        '--artwork-fit':layout.artwork.fit,
+        '--artwork-x':`${layout.artwork.position.x * 100}%`, '--artwork-y':`${layout.artwork.position.y * 100}%`,
+      };
+      for (const [key,value] of Object.entries(properties)) slide.style.setProperty(key,value);
+      if (!messageWall || !layout.message) continue;
+      const {box,padding,text_align} = layout.message;
+      const messageProperties = {
+        '--canvas-scale':String(scale), '--message-left':`${left + box.x * scale}px`,
+        '--message-top':`${top + box.y * scale}px`, '--message-width':`${box.width}px`,
+        '--message-height':`${box.height}px`, '--message-align':text_align,
+        '--message-padding':`${padding.top}px ${padding.right}px ${padding.bottom}px ${padding.left}px`,
+      };
+      for (const [key,value] of Object.entries(messageProperties)) messageWall.style.setProperty(key,value);
+      const viewport = messageWall.querySelector('.text-wall-viewport');
+      const overflow = viewport.scrollHeight > viewport.clientHeight + 1 || viewport.scrollWidth > viewport.clientWidth + 1;
+      messageWall.querySelector('.message-overflow-note').hidden = !overflow;
+      if (overflow) issues.push({code:'message_overflow',page_id:slide.dataset.pageId,
+        message:`Page ${Number(slide.dataset.index) + 1} — ${slide.dataset.pageName}: Message continues in the scrollable text area.`,
+        severity:'warning',feature:'messages',blocks_output:false,blocks_preview:false});
+    }
+    const changed = JSON.stringify(issues) !== JSON.stringify(layoutIssues);
+    layoutIssues = issues;
+    if (changed) window.dispatchEvent(new CustomEvent('lettersmith-layout', {detail:issues.map((item) => ({...item}))}));
+  }
+  function scheduleCanvasLayouts(){
+    if (layoutFrame) return;
+    layoutFrame = requestAnimationFrame(() => { layoutFrame = 0; updateCanvasLayouts(); });
+  }
+  window.addEventListener('resize', scheduleCanvasLayouts);
+  document.addEventListener('load', scheduleCanvasLayouts, true);
+  document.fonts?.ready.then(scheduleCanvasLayouts);
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(scheduleCanvasLayouts).observe(slideshowEl);
+  scheduleCanvasLayouts();
+  function syncPageNavigation(){
+    const slide = slides[idx];
+    if (pageIndicator && slide){
+      const name = slide.dataset.pageName || slide.querySelector('img')?.alt || '';
+      pageIndicator.textContent = `Page ${idx + 1} of ${TOTAL}${name ? ' — ' + name : ''}`;
+    }
+    if (pageSelector) pageSelector.value = String(idx);
+  }
   function setDisabled(btn, disabled){
     btn.disabled = !!disabled;
     btn.setAttribute('aria-disabled', disabled ? 'true' : 'false');
@@ -1073,6 +1172,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const locked = !started || introControlsLocked || wallRevealLocked || flipping;
     setDisabled(prevBtn, locked || idx === 0);
     setDisabled(nextBtn, locked || idx === TOTAL - 1);
+    if (pageSelector) setDisabled(pageSelector, locked);
   }
 
   function clearWallRevealTimers(){
@@ -1080,6 +1180,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (wallRevealUnlockTimer !== null){ clearTimeout(wallRevealUnlockTimer); wallRevealUnlockTimer = null; }
   }
   function setWallOpen(open){
+    if (!wall) return;
     wall.classList.toggle('is-open', open);
     setHiddenState(wall, !open);
     openText.classList.toggle('is-visible', !open);
@@ -1093,6 +1194,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
   function hideWallDuringRevealDelay(){
+    if (!wall) return;
     wall.classList.remove('is-open');
     openText.classList.remove('is-visible');
     closeText.classList.remove('is-visible');
@@ -1121,25 +1223,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }, wallRevealDelayMs);
   }
   function syncWallUI(){
-    if (!HAS_MESSAGE){
+    const hasMessage = wall && (wall.dataset.hasMessage === undefined ? HAS_MESSAGE : wall.dataset.hasMessage === 'true');
+    if (!hasMessage || !isWallPage()){
       clearWallRevealTimers();
       wallRevealLocked = false;
-      wall.classList.remove('is-open');
+      wall?.classList.remove('is-open');
       openText.classList.remove('is-visible');
-      closeText.classList.remove('is-visible');
-      setHiddenState(wall, true);
-      setHiddenState(openText, true);
-      setHiddenState(closeText, true);
-      setExpandedState(openText, false);
-      syncButtons();
-      return;
-    }
-    if (!isWallPage()){
-      clearWallRevealTimers();
-      wallRevealLocked = false;
-      wall.classList.remove('is-open');
-      openText.classList.remove('is-visible');
-      closeText.classList.remove('is-visible');
+      closeText?.classList.remove('is-visible');
       setHiddenState(wall, true);
       setHiddenState(openText, true);
       setHiddenState(closeText, true);
@@ -1175,15 +1265,21 @@ document.addEventListener('DOMContentLoaded', () => {
   function setActiveIndex(newIdx, opts = {}){
     const target = clamp(newIdx, 0, TOTAL - 1);
     if (target === idx && opts.force !== true){
+      selectMessageWall();
+      syncPageNavigation();
       syncButtons();
       syncWallUI();
       return;
     }
     clearWallRevealTimers();
     wallRevealLocked = false;
+    hideWallDuringRevealDelay();
+    document.querySelectorAll('.ultralink-tooltip.is-visible').forEach((item) => item.classList.remove('is-visible'));
     cancelImageAnimation(idx);
     prepareImageAnimation(target);
     idx = target;
+    selectMessageWall();
+    syncPageNavigation();
     slides.forEach((s, i) => {
       s.classList.toggle('active', i === idx);
       s.classList.remove('peek');
@@ -1274,6 +1370,9 @@ document.addEventListener('DOMContentLoaded', () => {
     imgFront.src = goingNext
       ? slideImageSrc(currentSlide)
       : slideImageSrc(targetSlide);
+    const turningImageStyle = getComputedStyle(slideImageEl(goingNext ? currentSlide : targetSlide));
+    imgFront.style.objectFit = turningImageStyle.objectFit;
+    imgFront.style.objectPosition = turningImageStyle.objectPosition;
 
     if (goingNext){
       targetSlide.classList.add('peek');
@@ -1336,10 +1435,12 @@ document.addEventListener('DOMContentLoaded', () => {
     return clamp(Math.round(v0), 0, 100);
   }
   function loadViewerMuted(){
+    const initialMuted = document.body.dataset.initialMuted === 'true';
     try{
-      return window.sessionStorage.getItem(muteStorageKey) === 'true';
+      const saved = window.sessionStorage.getItem(muteStorageKey);
+      return saved === null ? initialMuted : saved === 'true';
     }catch(_){
-      return false;
+      return initialMuted;
     }
   }
   function saveViewerMuted(){
@@ -1642,6 +1743,27 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   prevBtn.addEventListener('click', () => go(-1));
   nextBtn.addEventListener('click', () => go(1));
+  if (pageSelector){
+    pageSelector.addEventListener('change', () => {
+      const target = Number(pageSelector.value);
+      if (Number.isInteger(target) && target >= 0 && target < TOTAL){
+        dismissTitleBanner();
+        setActiveIndex(target);
+      }
+    });
+  }
+  window.LetterSmithViewer = Object.freeze({
+    goToPage(pageId){
+      const target = slides.findIndex((slide) => slide.dataset.pageId === String(pageId));
+      if (target < 0 || flipping) return false;
+      requestedPageId = String(pageId);
+      if (started) dismissTitleBanner();
+      setActiveIndex(target, {playSound:false});
+      return true;
+    },
+    currentPageId(){ return slides[idx]?.dataset.pageId || null; },
+    layoutIssues(){ updateCanvasLayouts(); return layoutIssues.map((item) => ({...item})); },
+  });
   if (restartBtn){
     restartBtn.addEventListener('click', () => {
       window.location.reload();
@@ -1688,14 +1810,17 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     }
   });
-  closeText.addEventListener('click', () => {
-    if (!isWallPage()) return;
-    clearWallRevealTimers();
-    wallRevealLocked = false;
-    setWallOpen(false);
-    wallClosedByUser = true;
-    syncButtons();
-    openText.focus({preventScroll:true});
+  messageWalls.forEach((item) => {
+    const button = item.querySelector('.hud-button-close');
+    button?.addEventListener('click', () => {
+      if (!isWallPage() || item !== wall) return;
+      clearWallRevealTimers();
+      wallRevealLocked = false;
+      setWallOpen(false);
+      wallClosedByUser = true;
+      syncButtons();
+      openText.focus({preventScroll:true});
+    });
   });
   bindPress(openText, () => {
     if (!isWallPage()) return;
@@ -1704,7 +1829,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setWallOpen(true);
     wallClosedByUser = false;
     syncButtons();
-    closeText.focus({preventScroll:true});
+    closeText?.focus({preventScroll:true});
   });
   bindPress(volIcon, () => {
     const s = ensureSlider();
@@ -1717,12 +1842,15 @@ document.addEventListener('DOMContentLoaded', () => {
   setSliderOpen(false);
   syncMuteButton();
   setVolume0to100(loadVolume0to100());
-  setHiddenState(wall, true);
+  messageWalls.forEach((item) => {
+    setHiddenState(item, true);
+    setHiddenState(item.querySelector('.hud-button-close'), true);
+  });
   setHiddenState(openText, true);
   setHiddenState(closeText, true);
   setExpandedState(openText, false);
   try{
-    installUltralinks();
+    messageWalls.forEach(installUltralinks);
   }catch(error){
     console.error('Ultralink setup failed', error);
   }
@@ -1752,3 +1880,106 @@ def template_for_pages(pages):
             f'decoding="async"{priority}>\n    </section>\n'
         )
     return TEMPLATE_HTML[:start] + "\n".join(sections) + overlay + TEMPLATE_HTML[end:]
+
+
+def template_for_project_pages(pages, *, template_html=None):
+    """Compose canonical render DTOs without changing authored documents.
+
+    ``message_html`` must already be sanitized and its resources packaged.
+    Expand trusted shell placeholders before passing ``template_html`` so
+    authored text can never be interpreted as another shell placeholder.
+    """
+    import hashlib
+    import html
+    import json
+    from pathlib import PurePosixPath
+    from urllib.parse import unquote, urlsplit
+
+    from project_model import PAGE_TYPES, resolve_page_layout
+
+    pages = tuple(pages)
+    base = TEMPLATE_HTML if template_html is None else template_html
+    start = base.index('    <section class="slide active"')
+    end = base.index('    <button id="prev"', start)
+    seen = set()
+    sections = []
+    overlays = []
+    options = []
+    for index, page in enumerate(pages):
+        page_id = str(page["id"])
+        if not page_id or page_id in seen:
+            raise ValueError("Rendered pages require unique nonempty page IDs.")
+        seen.add(page_id)
+        kind = page["type"]
+        definition = PAGE_TYPES[kind]
+        name = str(page.get("name") or definition.label)
+        source = str(page["source"])
+        parsed = urlsplit(source)
+        relative = PurePosixPath(unquote(parsed.path))
+        if (parsed.scheme or parsed.netloc or relative.is_absolute()
+                or ".." in relative.parts or "\\" in source or ":" in source
+                or not relative.parts):
+            raise ValueError("Rendered artwork must use a safe packaged relative path.")
+        scope = "page-" + hashlib.sha256(page_id.encode("utf-8")).hexdigest()
+        escaped_name = html.escape(name, quote=True)
+        active = " active" if index == 0 else ""
+        priority = ' fetchpriority="high"' if index == 0 else ""
+        supplied_layout = page.get("layout") or {}
+        layout = resolve_page_layout({
+            "message": {"layout": supplied_layout.get("message") or {}} if kind == "letter" else None,
+            "artwork": {"placement": supplied_layout.get("artwork") or {}},
+        }, {})
+        canvas_data = ""
+        canvas_bounds = ""
+        if layout["artwork"] is not None:
+            canvas_data = ' data-layout="' + html.escape(json.dumps(layout, separators=(",", ":")), quote=True) + '"'
+            canvas_bounds = '      <div class="canvas-bounds" aria-hidden="true"></div>\n'
+            active += " has-canvas"
+        overlay = ""
+        if kind == "letter":
+            content = str(page.get("message_html", ""))
+            overlay_style = html.escape(str(page.get("overlay_style", "")), quote=True)
+            message_class = " canvas-message" if layout["message"] is not None else ""
+            content_html = f'        <div class="text-wall-content" id="{scope}-content">{content}</div>\n'
+            if message_class:
+                content_html = (f'<div class="text-wall-viewport" tabindex="0" role="region" '
+                                f'aria-label="Message text — {escaped_name}" aria-describedby="{scope}-overflow">'
+                                + content_html + '</div>\n'
+                                + f'<span class="message-overflow-note" id="{scope}-overflow" hidden>Scroll to read the full message</span>\n')
+            overlay = (
+                f'      <div class="text-wall{message_class}" id="{scope}-message" '
+                f'data-page-id="{html.escape(page_id, quote=True)}" '
+                f'data-has-message="{str(bool(content.strip())).lower()}" '
+                f'role="dialog" aria-modal="false" aria-label="Message — {escaped_name}" '
+                f'aria-hidden="true" tabindex="-1" style="{overlay_style}">\n'
+                f'        <button id="{scope}-close" class="hud-button hud-button-close close-text" '
+                f'type="button" title="Close Text" aria-label="Close message" '
+                f'aria-controls="{scope}-message">&times;</button>\n'
+                + content_html +
+                '      </div>\n'
+            )
+            overlays.append(overlay)
+        sections.append(
+            f'    <section class="slide{active}" data-index="{index}" '
+            f'data-canonical="true" data-page-type="{kind}" '
+            f'data-page-id="{html.escape(page_id, quote=True)}" '
+            f'data-page-name="{escaped_name}" id="{scope}"{canvas_data}>\n'
+            + canvas_bounds +
+            f'      <img src="{html.escape(source, quote=True)}" alt="{escaped_name}" '
+            f'decoding="async"{priority}>\n    </section>\n'
+        )
+        options.append(f'<option value="{index}">{index + 1} — {escaped_name}</option>')
+    navigation = (
+        '    <div id="page-navigation" aria-label="Page navigation">'
+        '<span id="page-indicator" role="status" aria-live="polite"></span>'
+        '<select id="page-selector" aria-label="Go to page" disabled>'
+        + "".join(options) + '</select></div>\n'
+    )
+    prefix = base[:start]
+    if pages:
+        prefix = prefix.replace('href="gallery/pages/cover.png"',
+                                f'href="{html.escape(str(pages[0]["source"]), quote=True)}"')
+    else:
+        prefix = prefix.replace('  <link rel="preload" as="image" href="gallery/pages/cover.png" fetchpriority="high">', "")
+    suffix = base[end:].replace('aria-controls="textWall"', '')
+    return prefix + "\n".join(sections) + "\n".join(overlays) + navigation + suffix

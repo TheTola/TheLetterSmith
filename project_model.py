@@ -60,6 +60,14 @@ class PageLimitError(ProjectModelError):
     pass
 
 
+class ProjectLayoutError(ProjectModelError):
+    """A preserved draft layout cannot be used for display output."""
+
+    def __init__(self, message: str, *, field: str = "message_layout") -> None:
+        super().__init__(message)
+        self.field = field
+
+
 @dataclass(frozen=True)
 class ModelChange:
     kind: str
@@ -179,6 +187,90 @@ def _validate_project_recovery(value: Mapping[str, Any]) -> None:
         if not isinstance(record, dict) or not isinstance(record.get("index"), int) or record["index"] < 0:
             raise ProjectModelError("Deleted page recovery record is malformed")
         _validate_page(record.get("page"))
+
+
+def resolve_page_layout(page: Mapping[str, Any], settings: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve version-1 logical CSS-pixel geometry without editing authored data.
+
+    Shared settings < page design overrides < explicit document/artwork fields.
+    The caller passes already resolved settings; nested geometry fields merge.
+    Empty objects inherit, while a null settings override clears its default.
+    Unknown historical objects remain savable but are never assigned guessed units.
+    """
+    field = "message_layout"
+
+    def fail(message):
+        raise ProjectLayoutError(message, field=field)
+
+    def obj(value, label, allowed):
+        if not isinstance(value, Mapping) or set(value) - set(allowed):
+            fail(f"{label} has unsupported fields or is not an object.")
+        return dict(value)
+
+    def number(value, label, low=0, high=100000):
+        if isinstance(value, bool) or not isinstance(value, (float, int)) or not low <= value <= high or not math.isfinite(value):
+            fail(f"{label} must be a finite number between {low} and {high}.")
+        return value
+
+    def merge(base, explicit):
+        if base is None:
+            base = {}
+        if not isinstance(base, Mapping) or not isinstance(explicit, Mapping):
+            fail(f"{field} must be an object or a null inherited default.")
+        result = deepcopy(dict(base))
+        for key, value in explicit.items():
+            if key in ("canvas", "box", "padding", "position") and isinstance(value, Mapping) and isinstance(result.get(key), Mapping):
+                result[key] = {**result[key], **deepcopy(dict(value))}
+            else:
+                result[key] = deepcopy(value)
+        return result
+
+    def canvas(value):
+        size = obj(value, "Canvas", ("width", "height"))
+        return {axis: number(size.get(axis), f"Canvas {axis}", 1, 16384) for axis in ("width", "height")}
+
+    message = None
+    document = page.get("message")
+    if document is not None:
+        raw = merge(settings.get("message_layout"), document.get("layout", {}))
+        if raw:
+            obj(raw, "Message layout", ("version", "units", "canvas", "box", "padding", "text_align", "overflow"))
+            if type(raw.get("version")) is not int or raw["version"] != 1 or raw.get("units") != "css_px":
+                fail("Message layout requires version 1 and explicit css_px units; older layout data is preserved.")
+            size = canvas(raw.get("canvas"))
+            box = obj(raw.get("box"), "Text box", ("x", "y", "width", "height"))
+            box = {key: number(box.get(key), f"Text box {key}", 1 if key in ("width", "height") else 0) for key in ("x", "y", "width", "height")}
+            if box["x"] + box["width"] > size["width"] or box["y"] + box["height"] > size["height"]:
+                fail("The text box must fit inside its logical canvas.")
+            padding = obj(raw.get("padding", {}), "Text padding", ("top", "right", "bottom", "left"))
+            padding = {side: number(padding.get(side, 0), f"Padding {side}") for side in ("top", "right", "bottom", "left")}
+            if padding["left"] + padding["right"] >= box["width"] or padding["top"] + padding["bottom"] >= box["height"]:
+                fail("Text padding must leave positive space for the message.")
+            alignment = raw.get("text_align", "inherit")
+            if alignment not in ("inherit", "left", "center", "right", "justify", "start", "end"):
+                fail("Text alignment is unsupported.")
+            if raw.get("overflow", "scroll") != "scroll":
+                fail("Message overflow must use scroll; clipping or automatic text shrinking is unsupported.")
+            message = {"version": 1, "units": "css_px", "canvas": size, "box": box,
+                       "padding": padding, "text_align": alignment, "overflow": "scroll"}
+
+    field = "artwork_placement"
+    raw = merge(settings.get("artwork_placement"), page.get("artwork", {}).get("placement", {}))
+    artwork = None
+    if raw or message is not None:
+        obj(raw, "Artwork placement", ("version", "canvas", "fit", "position"))
+        if raw and (type(raw.get("version")) is not int or raw["version"] != 1):
+            fail("Artwork placement requires version 1; older placement data is preserved.")
+        size = canvas(raw.get("canvas", message["canvas"] if message else None))
+        if message is not None and size != message["canvas"]:
+            fail("Artwork and message must use the same logical canvas.")
+        fit = raw.get("fit", "contain")
+        if fit not in ("contain", "cover"):
+            fail("Artwork fit must be contain or cover.")
+        position = obj(raw.get("position", {}), "Artwork position", ("x", "y"))
+        position = {axis: number(position.get(axis, .5), f"Artwork position {axis}", 0, 1) for axis in ("x", "y")}
+        artwork = {"version": 1, "canvas": size, "fit": fit, "position": position}
+    return {"message": message, "artwork": artwork}
 
 
 def _reading(method):
@@ -590,6 +682,11 @@ class ProjectModel:
         return {**deepcopy(self._data["shared_settings"]), **deepcopy(self._page(page_id)["design_overrides"])}
 
     @_reading
+    def resolve_layout(self, page_id: str) -> dict[str, Any]:
+        """Return resolved geometry, or raise ProjectLayoutError for an invalid draft."""
+        return resolve_page_layout(self._page(page_id), self.resolve_settings(page_id))
+
+    @_reading
     def prompt_context(self, page_id: str) -> dict[str, Any]:
         page = self.get_page(page_id)
         return {"page_id": page_id, "type": page["type"], "template_id": page["prompt"]["template_id"],
@@ -645,6 +742,10 @@ class ProjectModel:
         for resource in self._data["recovery"].get("missing_resources", []):
             issues.append(ValidationIssue("missing_resource", f"Project resource is missing: {resource}"))
         for page in self._data["pages"]:
+            try:
+                self.resolve_layout(page["id"])
+            except ProjectLayoutError as error:
+                issues.append(ValidationIssue("unsupported_layout" if error.field == "message_layout" else "unsupported_placement", str(error), page["id"]))
             if not page["artwork"].get("asset"):
                 issues.append(ValidationIssue("missing_artwork", "Page has no artwork", page["id"]))
             if page["message"] is not None and not page["message"]["html"].strip():
@@ -656,6 +757,10 @@ class ProjectModel:
         data = self.to_dict()
         for page in data["pages"]:
             page["resolved_settings"] = self.resolve_settings(page["id"])
+            try:
+                page["resolved_layout"] = self.resolve_layout(page["id"])
+            except ProjectLayoutError:
+                page["resolved_layout"] = None  # Preserved draft; validation explains the problem.
         data["validation"] = [issue.to_dict() for issue in self.validate()]
         data["ready"] = not data["validation"]
         return data

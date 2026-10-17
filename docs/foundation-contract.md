@@ -117,9 +117,10 @@ detached deep copies. `project_id -> str` and `revision -> int` are read-only.
 | `update_shared_settings(patch)` | None; merge shared defaults; preserve authored artwork/message/prompt; mark derived output stale. |
 | `update_project_data(field, patch)` | None; merge one of metadata/shared_settings/prompt_settings/sound/presentation/publication/extensions/recovery. |
 | `resolve_settings(page_id)` | Detached merged shared defaults and explicit page overrides. |
+| `resolve_layout(page_id)` | Detached normalized message/artwork geometry; raises `ProjectLayoutError` for an invalid draft layout. |
 | `prompt_context(page_id)` | Template, ID/type, actual order/count/one-based position, Letter text area, shared selections and exact page prompt. |
 | `validate()` | Tuple of `ValidationIssue(code,message,page_id,severity)`; these are output-readiness issues. Structural validation occurs on construction/mutation. |
-| `render_snapshot()` | Detached project with per-page resolved settings, validation and readiness. Resource availability is also checked by the repository/consumer. |
+| `render_snapshot()` | Detached project with per-page `resolved_settings`, `resolved_layout`, validation and readiness. Invalid geometry has null `resolved_layout` and a page-specific issue. Resource availability is also checked by the repository/consumer. |
 
 Errors: `UnknownPageError(KeyError)` for missing page; `PageLimitError` for
 interactive limits; `UnsupportedProjectError` for type/schema meaning;
@@ -196,6 +197,65 @@ consumers. Saving and compatibility synchronization serialize with activation
 across processes. An interrupted-activation marker blocks synchronization until
 `get_project_session` recovers committed views. Failed loading must not call
 `replace`.
+
+## Shared composition geometry (October 16 coordinated extension)
+
+The user authorized Foundation geometry and portable export integration on the
+Forge branch. Schema version 3 and the existing `message.layout`,
+`artwork.placement`, shared settings and page overrides remain the storage
+format. No migration rewrites older layout objects.
+
+`project_model.resolve_page_layout(page, resolved_settings)` is the pure shared
+resolver; `ProjectModel.resolve_layout(page_id)` supplies authoritative settings.
+It returns `{"message": normalized_or_null, "artwork": normalized_or_null}`.
+Both model snapshots and Forge's template adapter use this resolver. Messages
+must consume it and the Forge adapter rather than interpreting geometry itself.
+
+Inheritance uses the existing `resolve_settings`: a page's `message_layout` or
+`artwork_placement` setting replaces that shared setting as a whole. Explicit
+`message.layout` / `artwork.placement` fields then override the selected setting,
+merging nested `canvas`, `box`, `padding` and `position` fields. Empty explicit
+objects inherit; a null page setting clears that inherited default. Empty total
+geometry preserves the existing responsive artwork/message presentation.
+
+Nonempty message geometry requires:
+
+```json
+{
+  "version": 1,
+  "units": "css_px",
+  "canvas": {"width": 400, "height": 600},
+  "box": {"x": 40, "y": 130, "width": 320, "height": 170},
+  "padding": {"top": 12, "right": 12, "bottom": 12, "left": 12},
+  "text_align": "left",
+  "overflow": "scroll"
+}
+```
+
+Coordinates start at the logical canvas's top-left. Canvas dimensions are finite
+numbers from 1 through 16384; box dimensions are positive and its nonnegative
+coordinates must keep it within that canvas. Padding defaults to zero per edge
+and must leave positive content space. Alignment defaults to `inherit` and also
+supports `left`, `center`, `right`, `justify`, `start`, `end`. Overflow defaults to
+`scroll`; clipping and automatic text shrinking are rejected. The viewer scales
+the complete canvas uniformly into available space without editing authored
+fonts or text. A focusable text viewport and visible overflow notice keep the
+entire message accessible.
+
+Nonempty artwork placement requires `version: 1`, optional `fit` (`contain` by
+default, or `cover`), and optional normalized `position: {x, y}` (each 0–1,
+default 0.5). A `canvas` is required when no message geometry exists. Otherwise
+it inherits the message canvas and an explicit canvas must match. Message
+geometry alone supplies centered `contain` artwork placement on the same canvas.
+Unknown fields, units, versions and out-of-range values are errors, not guesses.
+
+Invalid/old opaque geometry remains savable. `ProjectLayoutError.field` identifies
+`message_layout` or `artwork_placement`; `validate()` reports `unsupported_layout`
+or `unsupported_placement` with the page ID, blocking preview/final rendering.
+Browser-measured overflow is a nonblocking `message_overflow` RenderIssue-shaped
+warning returned by `LetterSmithViewer.layoutIssues()` and emitted through the
+`lettersmith-layout` window event. Font metrics are measured by the viewer;
+Messages owns any editing controls and can use these page-specific diagnostics.
 
 ## Persistence and runnable example
 

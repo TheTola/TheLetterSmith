@@ -273,6 +273,7 @@ class GitHubPagesPublisher(Publisher):
         clock: Callable[[], float] = time.monotonic,
         cancelled: Callable[[], bool] = lambda: False,
         verification_timeout: int = 180,
+        persist_publication: bool = True,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         self.settings = SettingsStore(self.project_root)
@@ -286,6 +287,7 @@ class GitHubPagesPublisher(Publisher):
         self.clock = clock
         self.cancelled = cancelled
         self.verification_timeout = max(1, int(verification_timeout))
+        self.persist_publication = bool(persist_publication)
 
     def is_configured(self) -> bool:
         return self.configuration.configured
@@ -492,7 +494,8 @@ class GitHubPagesPublisher(Publisher):
                 PUBLISHED_GITHUB_OWNER_KEY: owner,
                 PUBLISHED_GITHUB_REPOSITORY_KEY: repository_name,
             }
-            self.settings.update_fields(publication)
+            if self.persist_publication:
+                self.settings.update_fields(publication)
             if self.auth_service is not None:
                 self.auth_service.record_operation_success(
                     self.session,

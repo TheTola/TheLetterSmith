@@ -192,6 +192,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
     def test_forge_builds_a_missing_preview_and_reuses_a_current_one(self) -> None:
         missing = SimpleNamespace(
             _busy=False,
+            _publication_operation="",
             _preview_refresh_pending=True,
             _preview_refresh_requested=False,
             _refresh_source_fingerprint=mock.Mock(),
@@ -208,6 +209,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
 
         current = SimpleNamespace(
             _busy=False,
+            _publication_operation="",
             _preview_refresh_pending=False,
             _preview_refresh_requested=False,
             _refresh_source_fingerprint=mock.Mock(),
@@ -735,6 +737,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 self.assertEqual(tab.preview_mode_value, "landscape")
                 blocked = tab._readiness_result
                 self.assertFalse(blocked.can_preview)
+                self.assertFalse(tab.export_btn.isEnabled())
                 self.assertEqual(tab.preview_mode.count(), 0)
                 self.assertEqual(tab.preview_mode.currentIndex(), -1)
                 self.assertFalse(tab.preview_mode.isEnabled())
@@ -746,6 +749,18 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 with mock.patch("Forge_Tab.evaluate_readiness", return_value=ready):
                     tab.refresh_readiness()
                 self.assertTrue(tab.preview_mode.isEnabled())
+                self.assertTrue(tab.export_btn.isEnabled())
+                menu_labels = []
+                def choose_html():
+                    menu = QtWidgets.QApplication.activePopupWidget()
+                    menu_labels.extend(action.text() for action in menu.actions())
+                    menu.actions()[1].trigger()
+                    menu.close()
+                with mock.patch.object(tab, "export_letter") as export_letter:
+                    QtCore.QTimer.singleShot(0, choose_html)
+                    tab.export_btn.click()
+                self.assertEqual(menu_labels, ["ZIP Package…", "Single HTML…", "Website ZIP…"])
+                export_letter.assert_called_once_with("html")
                 self.assertEqual(tab.preview_mode.count(), 3)
                 self.assertEqual(tab.preview_mode.currentData(), "landscape")
                 self.assertEqual(
@@ -870,6 +885,8 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             tab.close()
 
     def test_project_save_requires_two_completed_tabs(self) -> None:
+        from PIL import Image
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state = ProjectStateController(root)
@@ -883,7 +900,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             )
             pages = root / "gallery" / "user" / "pages"
             pages.mkdir(parents=True)
-            (pages / "cover.png").write_bytes(b"cover")
+            Image.new("RGB", (24, 36), "navy").save(pages / "cover.png")
 
             resolver = ProjectPathResolver(root)
             service = ProjectSaveService(
@@ -905,7 +922,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
 
             for name in REQUIRED_SLIDES:
                 if not (pages / name).exists():
-                    (pages / name).write_bytes(name.encode("ascii"))
+                    Image.new("RGB", (24, 36), "navy").save(pages / name)
             message_asset = root / MESSAGE_ASSETS_DIR / "inline.png"
             message_asset.parent.mkdir(parents=True)
             message_asset.write_bytes(b"inline asset")
@@ -917,11 +934,12 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.assertTrue(eligibility.can_save)
             readiness = evaluate_readiness(root)
             message_item = next(
-                item for item in readiness.items if item.key == "message"
+                item for item in readiness.items if item.key.endswith(":message")
             )
             self.assertFalse(message_item.ready)
-            self.assertFalse(message_item.required)
+            self.assertTrue(message_item.required)
             self.assertTrue(readiness.can_preview)
+            self.assertFalse(readiness.can_publish)
 
             saved = service.save_workspace_snapshot(reason="tab-switch")
 
@@ -2114,7 +2132,8 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             index = (play_dir / "index.html").read_text(encoding="utf-8")
             script = (play_dir / "script.js").read_text(encoding="utf-8")
             self.assertIn("const HAS_MESSAGE = false;", index)
-            self.assertIn("if (!HAS_MESSAGE){", script)
+            self.assertIn("wall.dataset.hasMessage", script)
+            self.assertIn("if (!hasMessage || !isWallPage()){", script)
             self.assertEqual(
                 (play_dir / "gallery/message/message.html").read_text(
                     encoding="utf-8"
@@ -2545,6 +2564,122 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
         finally:
             dialog.close()
             self.app.processEvents()
+
+
+class CanonicalReadinessTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def setUp(self) -> None:
+        from PIL import Image
+        from project_session import get_project_session
+        from test_project_model import five_page_project
+
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.session = get_project_session(self.root)
+        project = five_page_project()
+        project.update_project_data("metadata", {
+            "recipient_name": "Synthetic Recipient",
+            "recipient_title": "Synthetic Presentation",
+        })
+        for page in project.pages:
+            artwork = self.root / page["artwork"]["asset"]
+            artwork.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (24, 36), "navy").save(artwork)
+            if page["message"] is not None:
+                project.rename_page(page["id"], "Repeated Letter")
+                project.update_message(page["id"], {**page["message"], "layout": {}})
+        self.session.replace(project, asset_root=self.root)
+
+    def tearDown(self) -> None:
+        from project_session import release_project_session
+
+        release_project_session(self.root)
+        self.temporary.cleanup()
+
+    def test_distinct_messages_and_repeated_names_use_canonical_page_targets(self) -> None:
+        result = evaluate_readiness(self.root)
+        letters = [page for page in self.session.project.pages if page["message"]]
+        messages = [item for item in result.items if item.key.endswith(":message")]
+        self.assertTrue(result.can_preview)
+        self.assertTrue(result.can_publish)
+        self.assertEqual([item.correction_target for item in messages],
+                         [page["id"] for page in letters])
+        self.assertEqual([item.label for item in messages], [
+            "Page 2 — Repeated Letter: Message", "Page 4 — Repeated Letter: Message",
+        ])
+        self.assertFalse(any(item.key == "page_foundation" for item in result.items))
+        order = [page["id"] for page in self.session.project.pages]
+        order[1], order[3] = order[3], order[1]
+        self.session.project.reorder_pages(order)
+        messages = [item for item in evaluate_readiness(self.root).items
+                    if item.key.endswith(":message")]
+        self.assertEqual([item.correction_target for item in messages],
+                         [letters[1]["id"], letters[0]["id"]])
+
+    def test_empty_message_allows_preview_but_blocks_final_output(self) -> None:
+        page = self.session.project.pages[3]
+        self.session.project.update_message(page["id"], {**page["message"], "html": ""})
+        result = evaluate_readiness(self.root)
+        item = next(item for item in result.items if item.key == f"page:{page['id']}:message")
+        self.assertFalse(item.ready)
+        self.assertEqual(item.correction_target, page["id"])
+        self.assertTrue(result.can_preview)
+        self.assertFalse(result.can_publish)
+        self.assertIn("Preview Only", result.status)
+        self.assertEqual(self.session.project.get_message(page["id"])["html"], "")
+
+    def test_missing_artwork_has_page_specific_image_correction(self) -> None:
+        page = self.session.project.pages[3]
+        (self.root / page["artwork"]["asset"]).unlink()
+        result = evaluate_readiness(self.root)
+        item = next(item for item in result.items if item.key == f"page:{page['id']}:artwork")
+        self.assertFalse(item.ready)
+        self.assertEqual(item.correction_tab, "images")
+        self.assertEqual(item.correction_target, page["id"])
+        self.assertIn("Page 4", item.label)
+        self.assertFalse(result.can_publish)
+
+    def test_unknown_message_layout_is_blocked_on_its_own_page(self) -> None:
+        page = self.session.project.pages[3]
+        self.session.project.update_message(page["id"], {
+            **page["message"], "layout": {"width": 300},
+        })
+        result = evaluate_readiness(self.root)
+        problems = [item for item in result.missing_items
+                    if item.correction_target == page["id"]]
+        self.assertTrue(problems)
+        self.assertTrue(all(item.correction_tab == "message" for item in problems))
+        self.assertFalse(result.can_preview)
+        self.assertFalse(result.can_publish)
+
+    def test_artwork_only_project_has_no_phantom_message_requirement(self) -> None:
+        for page in self.session.project.pages:
+            if page["message"] is not None:
+                self.session.project.change_page_type(page["id"], "illustration")
+        result = evaluate_readiness(self.root)
+        self.assertTrue(result.can_publish)
+        self.assertFalse(any(item.key.endswith(":message") for item in result.items))
+        self.assertTrue(any(page["recovery"].get("inactive_message")
+                            for page in self.session.project.pages))
+
+    def test_music_requirement_uses_canonical_settings_and_silent_project(self) -> None:
+        self.assertTrue(evaluate_readiness(self.root).can_publish)
+        self.session.project.update_project_data("sound", {
+            "mode": "playlist", "playlist": [],
+            "tracks": [{"track_id": "unselected", "asset": "unused.mp3"}],
+        })
+        silent = evaluate_readiness(self.root)
+        self.assertTrue(silent.can_publish)
+        self.assertFalse(next(item for item in silent.items if item.key == "music").ready)
+        self.session.project.update_shared_settings({"required_features": {"music": True}})
+        result = evaluate_readiness(self.root)
+        music = next(item for item in result.items if item.key == "music")
+        self.assertTrue(music.required)
+        self.assertFalse(music.ready)
+        self.assertFalse(result.can_publish)
 
 
 if __name__ == "__main__":
