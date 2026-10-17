@@ -263,9 +263,9 @@ class MissingSoundAssignmentTests(unittest.TestCase):
             self.assertEqual(current_music_path(root).read_bytes(), source.read_bytes())
             self.assertEqual(project_sound_path(root).read_bytes(), saved_assignment)
 
-    def test_duplicate_disallowed_rule_is_unchanged(self) -> None:
+    def test_stored_playlist_occurrences_are_not_collapsed(self) -> None:
         state = ProjectSoundState(mode="playlist", playlist=["a", "b", "a"])
-        self.assertEqual(state.normalize().playlist, ["a", "b"])
+        self.assertEqual(state.normalize().playlist, ["a", "b", "a"])
 
 
 def _run_native_transport(scenario: str) -> None:

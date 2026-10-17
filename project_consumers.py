@@ -108,7 +108,7 @@ def _project_sound_views(session, sound: dict, *, update_sound: bool = False) ->
             expected_hash = hash_file(source) if source is not None else track.get("sha256", track.get("content_hash"))
             if current is not None and resolve_track_path(root, current).is_file():
                 current_hash = hash_file(resolve_track_path(root, current))
-                if not expected_hash or current_hash == expected_hash:
+                if current_hash == expected_hash or (not expected_hash and (not reference or track_id == current_hash[:24])):
                     continue
                 # The same authored ID may belong to another loaded project's
                 # portable resource. Keep its archive bytes under their own ID.
@@ -290,6 +290,8 @@ def page_id_for_key(root, key: str) -> str | None:
 
 
 def _asset(session, reference: str) -> Path:
+    if reference in session.project.to_dict()["recovery"].get("missing_resources", []):
+        raise FileNotFoundError(f"Project resource is missing: {reference}")
     relative = Path(reference)
     if relative.is_absolute() or ".." in relative.parts or ":" in reference:
         raise ConsumerCompatibilityError("A project resource has an unsafe path.")

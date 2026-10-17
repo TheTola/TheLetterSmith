@@ -696,7 +696,7 @@ class SavedLetterCard(QtWidgets.QFrame):
         self.setProperty("selected", False)
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.setFixedSize(184, 214)
+        self.setFixedSize(184, 238)
         self.setToolTip(
             f"{entry.title} — {entry.recipient}\n"
             f"{entry.path}\n"
@@ -766,6 +766,10 @@ class SavedLetterCard(QtWidgets.QFrame):
         self.status_label.setFixedHeight(20)
         self.status_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         layout.addWidget(self.status_label)
+        self.state_label = QtWidgets.QLabel()
+        self.state_label.setTextFormat(Qt.PlainText)
+        self.state_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        layout.addWidget(self.state_label)
 
         self.setStyleSheet(
             "QFrame#SavedLetterCard{background:#111b23;"
@@ -805,6 +809,7 @@ class SavedLetterCard(QtWidgets.QFrame):
             "font:600 8pt 'Segoe UI';}"
         )
         self._request_cover(entry.cover_path)
+        self.update_entry(entry)
 
     @staticmethod
     def _publication_presentation(entry: SavedLetter) -> tuple[str, str]:
@@ -812,6 +817,10 @@ class SavedLetterCard(QtWidgets.QFrame):
             return "Example", "ExampleStatus"
         if entry.stock:
             return "published", "StockStatus"
+        if not entry.valid:
+            return "Cannot open — see details", "ExpiredStatus"
+        if entry.canonical:
+            return ("Draft · See warnings" if entry.warning else "Saved draft"), "LocalStatus"
         if entry.published:
             return "Published", "PublishedStatus"
         if entry.expired:
@@ -854,7 +863,7 @@ class SavedLetterCard(QtWidgets.QFrame):
             self._cover_cache_key = None
             self.cover.clear()
             if not expected_path:
-                self.cover.setText("No cover")
+                self.cover.setText("No artwork thumbnail")
         if self._cover_requester is not None:
             self._cover_requester(
                 self,
@@ -898,7 +907,7 @@ class SavedLetterCard(QtWidgets.QFrame):
         self._cover_cache_key = key
         self.cover.clear()
         if pixmap.isNull():
-            self.cover.setText("No cover")
+            self.cover.setText("Thumbnail unavailable" if self.entry.cover_path else "No artwork thumbnail")
         else:
             self.cover.setPixmap(pixmap)
         return True
@@ -920,13 +929,14 @@ class SavedLetterCard(QtWidgets.QFrame):
             )
         )
         self._request_cover(entry.cover_path)
-        display_name = f"{entry.title} — {entry.recipient}"
+        display_name = entry.title
+        self.name_label.setTextFormat(Qt.PlainText)
         self.name_label.setText(display_name)
         self.name_label.setToolTip(display_name)
-        self.title_label.setText(f"Title: {self._shorten(entry.title, 25)}")
+        self.title_label.setText(entry.summary)
         self.title_label.setToolTip(entry.title)
         self.recipient_label.setText(
-            f"Recipient: {self._shorten(entry.recipient, 21)}"
+            entry.modified_at.astimezone().strftime("Saved %Y-%m-%d %H:%M")
         )
         self.recipient_label.setToolTip(entry.recipient)
         publication_label, status_name = self._publication_presentation(entry)
@@ -1466,6 +1476,8 @@ class ForgeTab(QtWidgets.QWidget):
             self._cancel_github_sign_in
         )
         self._init_ui()
+        from saved_projects_ui import SavedProjectsController
+        self.saved_projects = SavedProjectsController(self)
 
         self._card_layout_timer = QtCore.QTimer(self)
         self._card_layout_timer.setSingleShot(True)
@@ -1648,6 +1660,7 @@ class ForgeTab(QtWidgets.QWidget):
             alignment=Qt.AlignCenter,
         )
         saved_holder = QtWidgets.QHBoxLayout()
+        self.saved_actions_layout = saved_holder
         saved_holder.setSpacing(5)
         saved_holder.setContentsMargins(0, 0, 0, 0)
         saved_holder.addWidget(self._unpublish_balance)
@@ -3300,7 +3313,7 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_heading.setText(
             "Stock Letters" if stock_mode else "Saved Letters"
         )
-        self.saved_delete_toggle.setVisible(not stock_mode)
+        self.saved_delete_toggle.hide()
         self.refresh_saved_letters(
             force_reconcile=not stock_mode or self._catalog_dirty
         )
@@ -3471,6 +3484,8 @@ class ForgeTab(QtWidgets.QWidget):
         self._catalog_rendered = True
         self._pending_scroll_position = (horizontal, vertical)
         self._scroll_restore_timer.start(0)
+        if hasattr(self, "saved_projects"):
+            self.saved_projects.selected_changed()
 
     def _start_catalog_reconciliation(
         self,
@@ -3845,6 +3860,9 @@ class ForgeTab(QtWidgets.QWidget):
             self._delete_saved_letter(entry)
 
     def load_selected_letter(self) -> None:
+        if hasattr(self, "saved_projects"):
+            self.saved_projects.open_selected()
+            return
         entry = self._selected_saved_letter
         if not isinstance(entry, SavedLetter) or self._busy:
             return
@@ -3935,12 +3953,17 @@ class ForgeTab(QtWidgets.QWidget):
         selected_path = entry.path
         for card in self._saved_cards:
             card.set_selected(card.entry.path == selected_path)
+        if hasattr(self, "saved_projects"):
+            self.saved_projects.selected_changed()
 
     def _activate_saved_letter(self, entry: object) -> None:
         self._select_saved_letter(entry)
         self.load_selected_letter()
 
     def _delete_saved_letter(self, entry: object) -> None:
+        if hasattr(self, "saved_projects"):
+            self.saved_projects.delete_selected(entry=entry)
+            return
         if not isinstance(entry, SavedLetter) or self._busy:
             return
         if self._saved_panel_mode == "stock":
@@ -4015,7 +4038,7 @@ class ForgeTab(QtWidgets.QWidget):
             empty = QtWidgets.QLabel(
                 "No stock letters available."
                 if self._saved_panel_mode == "stock"
-                else "No saved letters yet. Preview a letter to create one."
+                else "No saved projects yet. Save Project keeps complete editable drafts."
             )
             empty.setObjectName("SavedLettersEmpty")
             empty.setAlignment(Qt.AlignCenter)
@@ -4028,7 +4051,7 @@ class ForgeTab(QtWidgets.QWidget):
         available = max(184, self.saved_scroll.viewport().width() - 8)
         columns = max(1, available // 192)
         rows = (len(self._saved_cards) + columns - 1) // columns
-        self.saved_cards_widget.setMinimumHeight((rows * 222) + 4)
+        self.saved_cards_widget.setMinimumHeight((rows * 246) + 4)
         for index, card in enumerate(self._saved_cards):
             self.saved_cards_layout.addWidget(
                 card,
@@ -5588,6 +5611,11 @@ class ForgeTab(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(0, self.ensure_preview_current)
 
     def _set_busy(self, busy: bool) -> None:
+        controller = getattr(self, "saved_projects", None)
+        if controller is not None:
+            controller.save_button.setEnabled(not busy)
+            controller.actions.setEnabled(not busy)
+            controller.open_button.setEnabled(not busy and bool(self._selected_saved_letter and self._selected_saved_letter.valid))
         for card in self._saved_cards:
             card.setEnabled(not busy)
         self.saved_archive_recipient.setEnabled(not busy)
@@ -5716,6 +5744,8 @@ class ForgeTab(QtWidgets.QWidget):
         if self._shutdown:
             return True
         if not self.shutdown_operations(timeout_ms=timeout_ms):
+            return False
+        if hasattr(self, "saved_projects") and not self.saved_projects.shutdown():
             return False
 
         self.deactivate_for_tab_change()

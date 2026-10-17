@@ -303,6 +303,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
                 self.editor = Editor(document["html"], parent=self, embedded=True,
                                      save_callback=lambda html: self._commit_html(binding, html),
                                      resource_roots=self._resource_roots(), document_label=label,
+                                     missing_resources=self._missing_resources(),
                                      display_settings=self.session.project.resolve_settings(selected))
                 self.editor.bound_error.connect(self._error)
                 self.editor_layout.addWidget(self.editor)
@@ -337,8 +338,13 @@ class MessagesWorkspace(QtWidgets.QWidget):
         return tuple(dict.fromkeys(Path(p).resolve() for p in
                                   (self.session.project_root, self.session.asset_root) if p))
 
+    def _missing_resources(self):
+        return self.session.project.to_dict()["recovery"].get("missing_resources", [])
+
     def _asset(self, reference):
         if not isinstance(reference, str) or not reference:
+            return None
+        if reference in self._missing_resources():
             return None
         path = Path(reference)
         if path.is_absolute() or ".." in path.parts or ":" in reference or "\\" in reference:
@@ -643,7 +649,8 @@ class MessagesWorkspace(QtWidgets.QWidget):
             merged["html"] = staged.html
             if mode == "append":
                 editor = Editor(original["html"], parent=self, embedded=True,
-                                save_callback=lambda _: True, resource_roots=self._resource_roots())
+                                save_callback=lambda _: True, resource_roots=self._resource_roots(),
+                                missing_resources=self._missing_resources())
                 cursor = editor.editor.textCursor()
                 cursor.movePosition(QtGui.QTextCursor.End)
                 cursor.insertBlock()
@@ -755,7 +762,8 @@ class MessagesWorkspace(QtWidgets.QWidget):
         task = _MessageRenderTask(revision=revision, gate=self._render_gate,
             html=page["message"]["html"], wall_path=background, output_path=self._preview_path,
             staged_path=self._preview_path.with_name(f"{self._preview_path.stem}-{revision}.png"),
-            preset=preset, overlay_opacity=opacity, resource_roots=self._resource_roots())
+            preset=preset, overlay_opacity=opacity, resource_roots=self._resource_roots(),
+            missing_resources=self._missing_resources())
         self._render_tasks[revision] = (task, target, note)
         task.signals.finished.connect(self._preview_finished)
         self._render_pool.start(task)

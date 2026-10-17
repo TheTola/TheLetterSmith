@@ -2045,11 +2045,14 @@ QWidget[ordinaryThemeRoot="true"] *[themeFontRole="userEntry"] {{
         )
 
     def _refresh_semantic_root(self, root: QtWidgets.QWidget) -> None:
-        self._semantic_refresh_pending.pop(root, None)
         try:
             self.apply_semantic_styles(root)
         except RuntimeError:
             self._semantic_roots.pop(root, None)
+        finally:
+            # Styling emits child StyleChange events. Coalesce those into this
+            # pass instead of scheduling an endless sequence of root refreshes.
+            self._semantic_refresh_pending.pop(root, None)
 
     def _belongs_to_theme_host(self, widget: QtWidgets.QWidget) -> bool:
         current: QtWidgets.QWidget | None = widget

@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import shutil
 import stat
+from dataclasses import dataclass, field
+from uuid import uuid4
 
 from config import (
     MESSAGE_ASSETS_DIR,
@@ -58,6 +60,19 @@ class ProjectNotReadyError(ProjectSaveError):
     pass
 
 
+@dataclass(frozen=True)
+class EditableSave:
+    project: object
+    session_id: str
+    content_revision: int
+    directory: Path
+    expected_revision: str | None
+    asset_root: Path
+    fallback_asset_root: Path | None
+    copy: bool = False
+    migration_report: dict = field(default_factory=dict)
+
+
 class ProjectSaveService:
     """State-gated persistence for recipient-owned project files."""
 
@@ -72,6 +87,181 @@ class ProjectSaveService:
         self.project_state = project_state
         self.resolver = resolver or ProjectPathResolver(self.project_root)
         self.settings = SettingsStore(self.project_root)
+        self._editable_binding = None
+
+    @property
+    def editable_root(self) -> Path:
+        from project_paths import application_paths
+        return application_paths(self.project_root).saved_letters_root / "Editable Projects"
+
+    @property
+    def _binding_path(self) -> Path:
+        return self.project_root / ".lettersmith-project" / "editable-save.json"
+
+    def _binding(self, session):
+        if self._editable_binding is None:
+            try:
+                value = json.loads(self._binding_path.read_text(encoding="utf-8"))
+                if value["project_id"] == session.project.project_id:
+                    value["session_id"] = session.session_id
+                    self._editable_binding = value
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        value = self._editable_binding
+        return value if value and value["session_id"] == session.session_id else None
+
+    def _bind(self, session, directory, revision, content_revision):
+        self._editable_binding = {"session_id": session.session_id, "project_id": session.project.project_id,
+                                  "directory": str(directory), "revision": revision, "content_revision": content_revision}
+        try:
+            atomic_write_json(self._binding_path, self._editable_binding)
+        except OSError:
+            _LOGGER.warning("Saved project committed; its session binding could not be cached", exc_info=True)
+
+    def has_unsaved_editable_changes(self) -> bool:
+        from project_session import get_project_session
+        session = get_project_session(self.project_root)
+        binding = self._binding(session)
+        return binding is None or binding["content_revision"] != session.project.revision
+
+    def capture_editable_save(self, *, copy: bool = False, title: str | None = None) -> EditableSave:
+        """Call on the GUI thread after all editors have committed pending fields."""
+        from project_model import ProjectModel
+        from project_repository import _json
+        from project_session import get_project_session
+        session = get_project_session(self.project_root)
+        session.synchronize_workspace()
+        with session._lock, session.project.mutation_scope():
+            if session.is_restoring or session._closed:
+                raise ProjectSaveError("Wait for the project transition before saving")
+            project = ProjectModel.from_dict(session.project.to_dict())
+            revision = project.revision
+            binding = self._binding(session)
+            if copy:
+                project = project.independent_copy(title=title)
+            elif title is not None:
+                project.update_project_data("metadata", {"title": title, "recipient_title": title})
+            directory = Path(binding["directory"]) if binding and not copy else self.editable_root / project.project_id
+            self._validate_editable_directory(directory)
+            return EditableSave(project, session.session_id, revision, directory,
+                                binding["revision"] if binding and not copy else None,
+                                self.project_root, session.asset_root, copy,
+                                _json((session.asset_root or self.project_root) / "migration.json", optional=True))
+
+    def commit_editable_save(self, capture: EditableSave):
+        """Worker-safe canonical commit. No editor or library index mutation."""
+        from project_model import ProjectModel
+        from project_repository import ProjectRepository, _writer_lock
+        self._validate_editable_directory(capture.directory)
+        payload = capture.project.to_dict()
+        payload["metadata"]["saved_at"] = datetime.now(timezone.utc).isoformat()
+        with _writer_lock(self.editable_root / ".library-lock"):
+            return ProjectRepository(capture.directory / ".lettersmith-project").save(
+                ProjectModel.from_dict(payload), asset_root=capture.asset_root,
+                fallback_asset_root=capture.fallback_asset_root, expected_revision=capture.expected_revision,
+                migration_report=capture.migration_report)
+
+    def complete_editable_save(self, capture: EditableSave, stored) -> bool:
+        """Bind only the originating live session; newer authored edits stay dirty."""
+        from project_session import get_project_session
+        session = get_project_session(self.project_root)
+        if capture.copy or session.session_id != capture.session_id or session.project.project_id != capture.project.project_id:
+            return False
+        self._bind(session, capture.directory, stored.revision, capture.content_revision)
+        return session.project.revision == capture.content_revision
+
+    def save_editable(self, *, copy: bool = False, title: str | None = None):
+        capture = self.capture_editable_save(copy=copy, title=title)
+        stored = self.commit_editable_save(capture)
+        self.complete_editable_save(capture, stored)
+        return capture.directory, stored
+
+    def _validate_editable_directory(self, directory: Path):
+        directory = Path(directory)
+        root = self.editable_root.resolve()
+        if directory.is_symlink() or directory.resolve().parent != root or directory.parent.is_symlink():
+            raise ProjectSaveError("Editable saves must remain in the managed project library")
+        try:
+            from uuid import UUID
+            UUID(directory.name)
+        except ValueError as error:
+            raise ProjectSaveError("Editable save destinations use project identities, not titles") from error
+
+    def read_saved_project(self, entry):
+        """Validate/migrate a candidate without activating it or changing its source."""
+        from project_repository import ProjectRepository, StoredProject, read_legacy_project
+        from saved_letters import SavedLetterRestorer
+        restorer = SavedLetterRestorer(self.project_root)
+        source = Path(entry.path)
+        if not source.is_dir():
+            raise ProjectSaveError("The selected saved location is missing; restore it before opening")
+        if source.is_symlink() or not any(source.resolve().is_relative_to(root.resolve()) and source.resolve() != root.resolve()
+                                         for root in restorer.allowed_roots):
+            raise ProjectSaveError("The selected project is outside the managed library")
+        repository = ProjectRepository(source / ".lettersmith-project")
+        if repository.directory.exists() or getattr(entry, "canonical", False):
+            loaded = repository.load(allow_missing=True)
+            if entry.storage_revision and loaded.revision != entry.storage_revision:
+                raise ProjectSaveError("The saved version changed; refresh the library before continuing")
+            return loaded
+        # The migration reader owns historical type interpretation and exact strings.
+        migrated = read_legacy_project(source, saved=True)
+        return StoredProject(migrated.project, "", source, migrated.report.to_dict())
+
+    def open_saved_project(self, entry, *, loaded=None):
+        from dataclasses import replace
+        from project_session import get_project_session
+        from saved_letters import SavedLetterRestorer
+        loaded = loaded or self.read_saved_project(entry)
+        independent = entry.example or entry.stock or entry.recovery or not loaded.revision
+        if independent:
+            loaded = replace(loaded, project=loaded.project.independent_copy())
+        stored = SavedLetterRestorer(self.project_root).restore_canonical(loaded)
+        session = get_project_session(self.project_root)
+        if not independent and Path(entry.path).resolve().parent == self.editable_root.resolve():
+            self._bind(session, entry.path, loaded.revision, session.project.revision)
+        else:
+            self._bind(session, self.editable_root / session.project.project_id, None, -1)
+        self.project_state.initialize()
+        return stored
+
+    def duplicate_saved_project(self, entry, *, title: str | None = None):
+        loaded = self.read_saved_project(entry)
+        project = loaded.project.independent_copy(title=title or entry.title + " — Copy")
+        capture = EditableSave(project, "", project.revision, self.editable_root / project.project_id,
+                               None, loaded.asset_root, None, True, loaded.migration_report)
+        return capture.directory, self.commit_editable_save(capture)
+
+    def rename_saved_project(self, entry, title: str):
+        from project_repository import ProjectRepository, _writer_lock
+        self._validate_editable_directory(entry.path)
+        if not title.strip():
+            raise ProjectSaveError("Enter a project title")
+        loaded = self.read_saved_project(entry)
+        if loaded.revision != entry.storage_revision:
+            raise ProjectSaveError("The saved version changed; refresh the library before renaming")
+        loaded.project.update_project_data("metadata", {"title": title, "recipient_title": title,
+                                                        "saved_at": datetime.now(timezone.utc).isoformat()})
+        with _writer_lock(self.editable_root / ".library-lock"):
+            return ProjectRepository(entry.path / ".lettersmith-project").save(
+                loaded.project, asset_root=loaded.asset_root, expected_revision=entry.storage_revision)
+
+    def trash_saved_project(self, entry) -> Path:
+        """Move only the selected owned save, retaining every generation for recovery."""
+        from project_paths import application_paths
+        from project_repository import ProjectRepository, _writer_lock
+        self._validate_editable_directory(entry.path)
+        repository = ProjectRepository(entry.path / ".lettersmith-project")
+        # The lock lives outside the moved tree, while the repository lock verifies
+        # the last observed generation. No shared source asset is removed.
+        with _writer_lock(self.editable_root / ".library-lock"):
+            with _writer_lock(repository.directory):
+                if repository._head().get("revision") != entry.storage_revision:
+                    raise ProjectSaveError("The saved version changed; refresh before deleting")
+            destination = application_paths(self.project_root).recovery_root / ("Deleted Project " + uuid4().hex)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(entry.path, destination)
+        return destination
 
     def save_eligibility(self) -> ProjectSaveEligibility:
         return evaluate_project_save_eligibility(self.project_root)
@@ -720,6 +910,8 @@ class ProjectSaveService:
                 "The generated letter could not follow the updated title: "
                 f"{error}"
             ) from error
+        if (play_directory / "lettersmith-display.json").is_file():
+            return
         if (play_directory / "index.html").is_file():
             settings = self.settings.snapshot()
             metadata_path = play_directory / PLAY_METADATA_FILE

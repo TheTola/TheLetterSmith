@@ -23,13 +23,14 @@ _MAX_IMAGE_PIXELS = 64 * 1024 * 1024
 class MessageTextDocument(QTextDocument):
     """Preview document using the same restricted images as the bound editor."""
 
-    def __init__(self, resource_roots: tuple[Path, ...], parent=None) -> None:
+    def __init__(self, resource_roots: tuple[Path, ...], parent=None, *, missing_resources=()) -> None:
         super().__init__(parent)
         self.resource_roots = tuple(Path(root).resolve() for root in resource_roots)
+        self.missing_resources = frozenset(missing_resources)
 
     def loadResource(self, resource_type: int, name: QUrl):
         if resource_type == QTextDocument.ImageResource:
-            return load_message_image(name.toString(), self.resource_roots)
+            return load_message_image(name.toString(), self.resource_roots, missing_resources=self.missing_resources)
         return QByteArray()
 
 
@@ -60,9 +61,11 @@ def resolve_message_resource(uri: str, resource_roots: tuple[Path, ...]) -> Path
     return None
 
 
-def load_message_image(uri: str, resource_roots: tuple[Path, ...]) -> QImage:
+def load_message_image(uri: str, resource_roots: tuple[Path, ...], *, missing_resources=()) -> QImage:
     """Load bounded raster data; never invoke Qt's file/network fallback."""
     try:
+        if unquote(str(uri)) in missing_resources:
+            return QImage()
         match = _DATA_IMAGE.fullmatch(str(uri))
         if match is not None:
             encoded = re.sub(r"\s+", "", match.group(1))

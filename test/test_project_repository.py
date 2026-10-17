@@ -13,6 +13,45 @@ from project_repository import ProjectRepository, ProjectConflictError, ProjectR
 
 
 class ProjectRepositoryTests(unittest.TestCase):
+    def test_generation_commit_retries_sharing_violation_and_preserves_failed_save(self):
+        import os
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = ProjectRepository(root / "saved")
+            project = create_project(())
+            original_replace = os.replace
+            attempts = []
+            def transient_replace(source, destination):
+                if Path(source).name.startswith(".s-"):
+                    attempts.append(source)
+                    if len(attempts) == 1:
+                        raise PermissionError("Synthetic temporary sharing violation")
+                return original_replace(source, destination)
+            with mock.patch("transactional_io.os.replace", side_effect=transient_replace):
+                saved = repository.save(project, asset_root=root)
+            self.assertEqual(len(attempts), 2)
+            project.update_project_data("metadata", {"title": "Not committed"})
+            with mock.patch("project_repository._replace_directory_path", side_effect=PermissionError("Still locked")):
+                with self.assertRaises(PermissionError):
+                    repository.save(project, asset_root=root, expected_revision=saved.revision)
+            self.assertEqual(repository.load().revision, saved.revision)
+            self.assertNotEqual(repository.load().project.to_dict(), project.to_dict())
+
+    def test_migration_report_follows_identity_or_explicit_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = ProjectRepository(root / "saved")
+            project = create_project(())
+            report = {"converted": True, "source_format": "legacy_active"}
+            first = repository.save(project, asset_root=root, migration_report=report)
+            same = repository.save(project, asset_root=root, expected_revision=first.revision)
+            self.assertTrue(same.migration_report["converted"])
+            fresh = repository.save(create_project(()), asset_root=root, expected_revision=same.revision)
+            self.assertEqual(fresh.migration_report, {})
+            copied = repository.save(project.independent_copy(), asset_root=root, expected_revision=fresh.revision,
+                                     migration_report=same.migration_report)
+            self.assertTrue(copied.migration_report["converted"])
+
     def test_activation_lock_reenters_for_listeners_but_excludes_other_processes(self):
         import subprocess
         import sys
@@ -156,6 +195,7 @@ class ProjectRepositoryTests(unittest.TestCase):
             self.assertEqual(manifest["missing"], ["missing.gif"])
             self.assertTrue(any(issue.code == "missing_resource" for issue in saved.project.validate()))
             project.update_artwork(page_id, {"asset": "../escape.gif"})
+            project.update_project_data("recovery", {"missing_resources": ["../escape.gif"]})
             with self.assertRaises(ProjectRepositoryError):
                 repository.save(project, asset_root=root, expected_revision=saved.revision)
             self.assertEqual(repository.load().revision, saved.revision)

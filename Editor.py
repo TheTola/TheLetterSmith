@@ -504,11 +504,13 @@ class RichTextEdit(QTextEdit):
         *args,
         language_service: Optional[object] = None,
         resource_roots: tuple[Path, ...] | None = None,
+        missing_resources=(),
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.project_root = Path(project_root)
         self.resource_roots = resource_roots
+        self.missing_resources = frozenset(missing_resources)
         self._language_service = language_service
         self._language_issues: tuple[object, ...] = ()
         self._ignored_language_words: set[str] = set()
@@ -520,7 +522,7 @@ class RichTextEdit(QTextEdit):
         if self.resource_roots is None:
             return super().loadResource(resource_type, name)
         if resource_type == QTextDocument.ImageResource:
-            return load_message_image(name.toString(), self.resource_roots)
+            return load_message_image(name.toString(), self.resource_roots, missing_resources=self.missing_resources)
         return QtCore.QByteArray()
 
     @property
@@ -1012,6 +1014,7 @@ class Editor(QDialog):
         language_service: Optional[object] = None,
         save_callback: Optional[Callable[[str], bool]] = None,
         resource_roots: tuple[Path, ...] = (),
+        missing_resources=(),
         embedded: bool = False,
         document_label: str = "",
         display_settings: Optional[dict] = None,
@@ -1023,6 +1026,7 @@ class Editor(QDialog):
         self._document_label = str(document_label)
         self._display_settings = dict(display_settings or {})
         self._resource_roots = tuple(Path(root).resolve() for root in resource_roots)
+        self._missing_resources = frozenset(missing_resources)
         self._bound_dirty = False
 
         # Resolve project root (authoritative)
@@ -1202,6 +1206,7 @@ class Editor(QDialog):
             self.project_root,
             language_service=self._language_service,
             resource_roots=self._resource_roots if self._bound_document else None,
+            missing_resources=self._missing_resources,
         )
         self.editor.setObjectName("EditorTextArea")
         self.editor.setProperty("themeFontRole", "letterContent")

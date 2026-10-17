@@ -167,6 +167,17 @@ propagate their original exception; they never report successful persistence.
 
 ## Verification and limits
 
+Saved Letters now opens legacy sources through `read_legacy_project(saved=True)`
+and activates an independent user-owned copy through the same canonical restore
+boundary. Listing, previewing and opening do not rewrite the source. Save Project
+commits that copy under its UUID, retaining the migration report and unresolved
+content. Recover Content in Open Project requires a destination and explicit
+replacement/copy decisions; originals and displaced resources remain retained
+after saving. Deleting an owned save moves its complete generations into Recovery.
+Opening a recovery copy creates another independent project and detaches publication
+authority. No bulk upgrade, permanent-resource deletion or garbage collection is
+part of this workflow. See the Saved Projects contract extension for exact APIs.
+
 `test/test_project_model.py` has reusable `legacy_fixture` and
 `five_page_project` builders. It verifies classic/configurable mappings, optional
 Wall absence, independent repeated messages, exact prompts, current idempotence,

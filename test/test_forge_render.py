@@ -67,6 +67,44 @@ class ForgeRenderTests(unittest.TestCase):
         for name in generate._sfx_names():
             shutil.copy2(source / name, destination / name)
 
+    def test_long_saved_title_staging_preserves_relative_display_resources(self):
+        from forge_render import validate_display_output
+        from transactional_io import _remove_path
+        destination = self.root / ("recipient-" + "r" * 80) / ("title-" + "t" * 85)
+        try:
+            output = generate_render(self.session, destination=destination, seed_sfx=False)
+            verified = validate_display_output(output)
+            manifest = json.loads((verified / DISPLAY_MANIFEST).read_text(encoding="utf-8"))
+            self.assertTrue(manifest["files"])
+            self.assertTrue(all(not Path(name).is_absolute() and ".." not in Path(name).parts for name in manifest["files"]))
+        finally:
+            self.assertTrue(destination.parent.resolve().is_relative_to(self.root.resolve()))
+            _remove_path(destination.parent)
+
+    def test_saved_preview_uses_app_controls_without_active_artwork_fallback(self):
+        from forge_render import SavedProjectPreviewAdapter
+        stored = ProjectRepository(self.root / "saved").save(self.project, asset_root=self.root)
+        isolated = ProjectSession(stored.project, project_root=stored.asset_root, asset_root=stored.asset_root)
+        adapter = SavedProjectPreviewAdapter(self.root)
+        try:
+            render = adapter.capture_render(isolated)
+            output = adapter.build_render_to(render, self.root / "saved-preview", seed_sfx=False)
+            self.assertTrue((output / "gallery/controls/npage.png").is_file())
+            self.assertNotEqual(isolated.session_id, self.session.session_id)
+            missing = stored.project.pages[0]["artwork"]["asset"]
+            (stored.asset_root / missing).unlink()
+            # An identically named file in the active workspace must not fill it.
+            active_file = self.root / missing
+            active_file.parent.mkdir(parents=True, exist_ok=True)
+            self.write_image(missing, "pink")
+            issues = adapter.validate_render(adapter.capture_render(isolated))
+            self.assertTrue(any(issue.code == "missing_artwork" and issue.page_id == stored.project.pages[0]["id"] for issue in issues))
+            preview = adapter.build_render_to(adapter.capture_render(isolated), self.root / "missing-preview", seed_sfx=False)
+            manifest = json.loads((preview / DISPLAY_MANIFEST).read_text(encoding="utf-8"))
+            self.assertNotEqual((preview / manifest["pages"][0]["source"]).read_bytes(), active_file.read_bytes())
+        finally:
+            isolated.close()
+
     def test_real_five_pages_order_messages_reorder_and_repository_reload(self):
         output = self.build()
         content = (output / "index.html").read_text(encoding="utf-8")

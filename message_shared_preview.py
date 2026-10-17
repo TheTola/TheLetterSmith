@@ -211,6 +211,9 @@ class SharedMessagePreview(QtWidgets.QWidget):
             self._poll.start()
             self._inspect_page()
 
+        # Sound's shared playback gate rejects hidden documents. Show the view
+        # before requesting its start action so GIFs also start in this preview.
+        self.view.show()
         # Use Forge's public page-ID API and the viewer's existing start action.
         # Composition, layout, animation and scrolling stay entirely in Forge.
         self.view.page().runJavaScript(

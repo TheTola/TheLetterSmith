@@ -416,6 +416,70 @@ class ProjectModel:
     def to_dict(self) -> dict[str, Any]:
         return deepcopy(self._data)
 
+    @_reading
+    def independent_copy(self, *, title: str | None = None) -> "ProjectModel":
+        """Copy authored state; page IDs are scoped to the new project identity."""
+        data = deepcopy(self._data)
+        data["project_id"] = str(uuid4())
+        data["revision"] = 0
+        data["publication"] = {}
+        for field in ("metadata", "shared_settings", "presentation"):
+            for key in list(data[field]):
+                if key.startswith(("published_", "publication_")) or key in (
+                        "project_published_at", "active_play_dir", "protected_project_kind", "protected_project_master_path"):
+                    data[field].pop(key)
+        data["metadata"]["project_id"] = data["project_id"]
+        if title is not None:
+            data["metadata"]["recipient_title"] = title
+            data["metadata"]["title"] = title
+        for key in ("legacy_workspace_snapshot", "legacy_authored_snapshot"):
+            data["extensions"].pop(key, None)
+        data["metadata"]["copy_provenance"] = {"source_project_id": self.project_id}
+        return ProjectModel.from_dict(data)
+
+    @_reading
+    def recoverable_items(self) -> tuple[dict, ...]:
+        recovery = self._data["recovery"]
+        items = []
+        if isinstance(recovery.get("unassigned_message"), dict):
+            items.append({"kind": "message", "key": "", "value": deepcopy(recovery["unassigned_message"])})
+        for field, kind in (("unassigned_messages", "message"), ("unassigned_prompts", "prompt")):
+            for key, value in recovery.get(field, {}).items():
+                items.append({"kind": kind, "key": key, "value": deepcopy(value)})
+        return tuple(items)
+
+    @_mutating
+    def assign_recovered(self, kind: str, key: str, page_id: str, *, replace: bool = False) -> None:
+        """Explicit assignment; originals and displaced content remain recoverable."""
+        item = next((item for item in self.recoverable_items() if item["kind"] == kind and item["key"] == key), None)
+        if item is None:
+            raise ProjectModelError("This recovery item no longer exists")
+        page = self._page(page_id)
+        if kind == "message" and page["type"] != "letter":
+            raise ProjectModelError("Recovered messages require a Letter page")
+        previous = deepcopy(page["message"] if kind == "message" else page["prompt"])
+        occupied = previous.get("html") if kind == "message" else previous.get("text")
+        if occupied and not replace:
+            raise ProjectModelError("The destination is occupied; choose Replace, Copy to a new page, or Cancel")
+        record = {**item, "page_id": page_id, "previous": previous}
+        if kind == "message":
+            self.update_message(page_id, item["value"])
+        else:
+            value = item["value"]
+            self.replace_prompt(page_id, value if isinstance(value, dict) else {"text": value, "stale": False})
+        recovery = deepcopy(self._data["recovery"])
+        recovery.setdefault("assigned_content", []).append(record)
+        assigned = {(record["kind"], record["key"]) for record in recovery["assigned_content"]}
+        pending = [item for item in self.recoverable_items() if (item["kind"], item["key"]) not in assigned]
+        unresolved = []
+        for issue in recovery.get("unresolved_associations", []):
+            content = issue.get("content")
+            remaining = [item for item in pending if item["kind"] == ("prompt" if content == "prompts" else "message")]
+            if content not in ("prompts", "message", "messages") or remaining:
+                unresolved.append(issue)
+        recovery["unresolved_associations"] = unresolved
+        self.update_project_data("recovery", recovery)
+
     @property
     @_reading
     def project_id(self) -> str:

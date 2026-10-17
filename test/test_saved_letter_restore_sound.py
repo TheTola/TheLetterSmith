@@ -54,6 +54,13 @@ from transactional_io import atomic_write_json
 
 
 class SavedLetterSoundRestoreTests(unittest.TestCase):
+    def assert_invalid_project_visible(self, root, bundle):
+        entries = SavedLetterCatalog(root).list_entries(force_refresh=True)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].path, bundle.resolve())
+        self.assertFalse(entries[0].valid)
+        self.assertTrue(entries[0].warning)
+
     def test_canonical_restore_keeps_missing_assignment_and_project_audio_levels(self) -> None:
         from project_consumers import project_sound_snapshot
         from project_model import create_project
@@ -485,7 +492,7 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
 
             self.assertFalse(sound_model.processed_dir(root).exists())
 
-    def test_manifestless_required_sound_bundle_is_not_listed(self) -> None:
+    def test_manifestless_required_sound_bundle_remains_identifiable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundle = self._bundle(root)
@@ -497,7 +504,7 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             (sounds / "lettersmith-sound.json").unlink()
             (sounds / "music.mp3").write_bytes(b"retired-format")
 
-            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+            self.assert_invalid_project_visible(root, bundle)
 
     def test_canonical_required_music_rejects_a_silent_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -508,9 +515,9 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             metadata["settings"] = {"required_features": ["music"]}
             metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
-            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+            self.assert_invalid_project_visible(root, bundle)
 
-    def test_manifestless_optional_music_bundle_is_not_listed(self) -> None:
+    def test_manifestless_optional_music_bundle_remains_identifiable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundle = self._bundle(root)
@@ -520,10 +527,10 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             (sounds / "music.mp3").write_bytes(b"manifestless music")
             manifest = sounds / "lettersmith-sound.json"
 
-            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+            self.assert_invalid_project_visible(root, bundle)
             self.assertFalse(manifest.exists())
 
-    def test_saved_bundle_user_workspace_layout_is_not_listed(self) -> None:
+    def test_incomplete_legacy_package_remains_identifiable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundle = self._bundle(root)
@@ -534,7 +541,11 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
             (gallery / "message").replace(user / "message")
             (gallery / "controls").replace(user / "card" / "controls")
 
-            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+            entries = SavedLetterCatalog(root).list_entries()
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].path, bundle)
+            self.assertFalse(entries[0].valid)
+            self.assertIn("incomplete", entries[0].warning)
 
     def test_silent_letter_clears_project_sound_without_deleting_archive(self) -> None:
         from config import STARTING_VOLUME
@@ -812,15 +823,15 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 {"Play", "Recovery"},
             )
 
-    def test_catalog_omits_bundle_that_restorer_cannot_load(self) -> None:
+    def test_catalog_identifies_bundle_that_restorer_cannot_load(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundle = self._bundle(root)
             (bundle / "gallery" / "pages" / "cover.png").unlink()
 
-            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+            self.assert_invalid_project_visible(root, bundle)
 
-    def test_catalog_omits_bundle_with_corrupt_metadata(self) -> None:
+    def test_catalog_identifies_bundle_with_corrupt_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundle = self._bundle(root)
@@ -829,7 +840,7 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+            self.assert_invalid_project_visible(root, bundle)
 
     def test_catalog_accepts_letter_with_empty_message(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -990,10 +1001,7 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 }
                 atomic_write_json(metadata_path, metadata)
 
-                self.assertEqual(
-                    SavedLetterCatalog(root).list_entries(force_refresh=True),
-                    (),
-                )
+                self.assert_invalid_project_visible(root, bundle)
                 with self.assertRaisesRegex(
                     SavedLetterRestoreError,
                     "Prompt Writer state is invalid",
@@ -1008,7 +1016,7 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 )
                 self.assertFalse((root / "gallery" / "user" / "pages").exists())
 
-    def test_letter_without_prompt_writer_state_is_not_listed(self) -> None:
+    def test_letter_without_prompt_writer_state_remains_identifiable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bundle = self._bundle(root)
@@ -1023,7 +1031,7 @@ class SavedLetterSoundRestoreTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            self.assertEqual(SavedLetterCatalog(root).list_entries(), ())
+            self.assert_invalid_project_visible(root, bundle)
             self.assertFalse((bundle / PROMPT_WRITER_STATE_FILE).exists())
             self.assertEqual(
                 json.loads(

@@ -1995,7 +1995,7 @@ class Nexus(QtWidgets.QMainWindow):
         self.title_bar.set_project_title(
             str(self.settings_store.get("recipient_title", ""))
         )
-        self.project_dirty.add_listener(self.title_bar.set_project_dirty)
+        self.project_dirty.add_listener(self._update_project_save_indicator)
         self.settings_store.changed.connect(self._on_project_settings_changed)
         main_layout.addWidget(self.title_bar)
 
@@ -2780,6 +2780,11 @@ class Nexus(QtWidgets.QMainWindow):
         if self._project_tabs_initialized:
             self.forge_tab.schedule_refresh()
 
+    def _update_project_save_indicator(self, dirty: bool) -> None:
+        controller = getattr(getattr(self, "forge_tab", None), "saved_projects", None)
+        unsaved = controller.service.has_unsaved_editable_changes() if controller is not None else False
+        self.title_bar.set_project_dirty(dirty or unsaved)
+
     def _on_project_state_transition(
         self,
         previous: ApplicationState,
@@ -3013,6 +3018,11 @@ class Nexus(QtWidgets.QMainWindow):
         """Coordinate public refresh contracts after an atomic restore."""
         with self.project_session.restoring():
             self._refresh_restored_project(_payload)
+        # Rendering captures work tokens and must start after rehydration ends.
+        self._schedule_curtain_preparation(immediate=True)
+        self.forge_tab.refresh_project_state()
+        self.forge_tab.refresh_saved_letters()
+        self._show_forge_preview()
 
     def _refresh_restored_project(self, _payload: Optional[dict] = None) -> None:
         self._protected_change_tracking_suspended = True
@@ -3034,10 +3044,6 @@ class Nexus(QtWidgets.QMainWindow):
                 refresh()
             except Exception as error:
                 self.status(f"{owner} could not refresh: {error}")
-        self._schedule_curtain_preparation(immediate=True)
-        self.forge_tab.refresh_project_state()
-        self.forge_tab.refresh_saved_letters()
-        self._show_forge_preview()
         self.project_dirty.mark_saved()
         self._protected_change_count = 0
         self._protected_warning_shown = False
@@ -4915,7 +4921,7 @@ class Nexus(QtWidgets.QMainWindow):
             if curtain_styles is not None:
                 curtain_styles.close()
             project_dirty = getattr(self, "project_dirty", None)
-            dirty_callback = getattr(title_bar, "set_project_dirty", None)
+            dirty_callback = self._update_project_save_indicator
             if project_dirty is not None and callable(dirty_callback):
                 project_dirty.remove_listener(dirty_callback)
             self.project_state.remove_listener(
@@ -5325,6 +5331,31 @@ class Nexus(QtWidgets.QMainWindow):
         except Exception as error:
             print(f"[PromptWriter] reset failed: {error}")
             self.status("Prompt Writer reset failed; command was not completed.")
+            return False
+
+    def flush_project_edits(self) -> bool:
+        """Commit all live editors before an editable save or project transition."""
+        try:
+            focus = QtWidgets.QApplication.focusWidget()
+            if isinstance(focus, QtWidgets.QLineEdit):
+                if not focus.hasAcceptableInput():
+                    self.status("Correct the highlighted field or cancel the operation; your edit is retained.")
+                    return False
+                focus.clearFocus()
+            images = getattr(self, "image_tab", None)
+            if images is not None and images.flush_pending_edits() is False:
+                self.status("The pending page name could not be committed. Repair it in Images before saving.")
+                return False
+            workspace = getattr(getattr(self, "message_tab", None), "messages_workspace", None)
+            if workspace is not None and not workspace.save():
+                self.status("The Messages draft could not be saved. Repair or recover it before continuing.")
+                return False
+            if not self.flush_prompt_writer_state():
+                return False
+            self.project_session.synchronize_workspace()
+            return True
+        except Exception as error:
+            self.status(f"Save stopped: {error}. Your edits remain open; repair the field or cancel.")
             return False
 
     def flush_prompt_writer_state(self) -> bool:

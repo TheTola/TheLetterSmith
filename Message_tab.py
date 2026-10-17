@@ -395,6 +395,7 @@ def _render_message_png(
     overlay_opacity: int,
     *,
     resource_roots: tuple[Path, ...] = (),
+    missing_resources=(),
     diagnostics: dict | None = None,
 ) -> bool:
     """Render one full-resolution Message image outside the GUI thread."""
@@ -442,7 +443,7 @@ def _render_message_png(
 
     if resource_roots:
         from message_resources import MessageTextDocument
-        document = MessageTextDocument(resource_roots)
+        document = MessageTextDocument(resource_roots, missing_resources=missing_resources)
     else:
         document = QTextDocument()
     document.setDefaultFont(
@@ -551,6 +552,7 @@ class _MessageRenderTask(QtCore.QRunnable):
         preset: str,
         overlay_opacity: int,
         resource_roots: tuple[Path, ...] = (),
+        missing_resources=(),
     ) -> None:
         super().__init__()
         self.revision = revision
@@ -562,6 +564,7 @@ class _MessageRenderTask(QtCore.QRunnable):
         self.preset = preset
         self.overlay_opacity = overlay_opacity
         self.resource_roots = resource_roots
+        self.missing_resources = tuple(missing_resources)
         self.diagnostics: dict = {}
         self.signals = _MessageRenderSignals()
 
@@ -579,6 +582,7 @@ class _MessageRenderTask(QtCore.QRunnable):
                 self.preset,
                 self.overlay_opacity,
                 resource_roots=self.resource_roots,
+                missing_resources=self.missing_resources,
                 diagnostics=self.diagnostics,
             ):
                 raise RuntimeError("Failed to encode message.png")

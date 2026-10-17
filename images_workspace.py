@@ -490,9 +490,9 @@ class ImageTab(QtWidgets.QWidget):
         if not self._name_dirty or self._name_target is None:
             return True
         text, target = self.name_edit.text(), self._name_target
-        self._name_dirty = False
         if self.session.apply_result(target, lambda model, identity: model.rename_page(identity, text)):
             self._commit("page_name")
+            self._name_dirty = False
             return True
         self.status.setText("The original page changed; its pending name was not applied.")
         return False

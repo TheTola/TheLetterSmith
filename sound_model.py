@@ -305,14 +305,12 @@ class ProjectSoundState:
         self.mode = "playlist" if self.mode == "playlist" else "single"
         self.single_track_id = str(self.single_track_id or "").strip()
         clean: list[str] = []
-        seen: set[str] = set()
         for value in self.playlist:
             track_id = str(value or "").strip()
-            if not track_id or track_id in seen:
+            if not track_id:
                 continue
             if valid_ids is not None and track_id not in valid_ids:
                 continue
-            seen.add(track_id)
             clean.append(track_id)
         self.playlist = clean
         if valid_ids is not None and self.single_track_id not in valid_ids:

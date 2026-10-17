@@ -161,6 +161,8 @@ class PageArtworkController:
         raw = self.session.project.get_page(page_id)["artwork"].get("asset")
         if not raw:
             return None
+        if raw in self.session.project.to_dict()["recovery"].get("missing_resources", []):
+            return None
         relative = Path(raw)
         windows_relative = PureWindowsPath(raw)
         if (relative.is_absolute() or windows_relative.drive or windows_relative.root

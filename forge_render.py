@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import html
 import json
+import os
 from pathlib import Path
 import secrets
 import tempfile
@@ -29,6 +30,15 @@ _READABILITY = ("message_overlay_preset", "message_overlay_opacity")
 _PRESENTATION = ("recipient_name", "recipient_title", "starting_volume", "music_volume", "curtain_style", *_READABILITY)
 _GENERATIONS = WeakKeyDictionary()
 _GENERATION_LOCK = RLock()
+
+
+def _io_path(path) -> Path:
+    """Use Win32 extended paths for nested staging under long display titles."""
+    resolved = Path(path).resolve()
+    text = str(resolved)
+    if os.name == "nt" and not text.startswith("\\\\?\\"):
+        return Path("\\\\?\\UNC\\" + text[2:] if text.startswith("\\\\") else "\\\\?\\" + text)
+    return resolved
 
 
 def _freeze(value):
@@ -69,6 +79,7 @@ class RenderInput:
     output_mode: str
     source_fingerprint: str = ""
     targets: tuple = ()
+    presentation_root: Path | None = None
 
 
 class StaleRenderError(RuntimeError):
@@ -82,6 +93,8 @@ class RenderValidationError(RuntimeError):
 
 
 def _resolve(render: RenderInput, reference: str) -> Path:
+    if reference in render.snapshot["recovery"].get("missing_resources", ()):
+        raise FileNotFoundError(f"Resource is missing: {reference}")
     # Match the foundation consumer's canonical-generation-first resolution.
     candidates = [_safe_file(root, reference) for root in dict.fromkeys((render.asset_root, render.project_root))]
     source = next((path for path in candidates if path.is_file()), None)
@@ -165,6 +178,7 @@ def _active_signature(render):
     pages = []
     dependencies = {}
     documents = []
+    presentation_root = render.presentation_root or render.project_root
     def content_digest(source):
         try:
             return legacy._file_content_digest(source).hex()
@@ -204,17 +218,17 @@ def _active_signature(render):
                 selected["content"] = "missing"
         tracks.append(selected)
     for family in extract_font_families("\n".join(documents)):
-        for face in inspect_font_family(render.project_root, family).faces:
+        for face in inspect_font_family(presentation_root, family).faces:
             dependencies[f"font:{family}:{face.weight}:{face.style}:{face.collection_index}"] = content_digest(face.source_path)
     for name in legacy.CONTROL_FILES:
-        source = render.project_root / legacy.USER_CONTROLS_DIR / name
+        source = presentation_root / legacy.USER_CONTROLS_DIR / name
         if source.is_file():
             dependencies["control:" + name] = content_digest(source)
-    paths = legacy.application_paths(render.project_root)
+    paths = legacy.application_paths(presentation_root)
     banner = paths.resource_path(legacy.APP_BANNER_PATH)
     if banner.is_file():
         dependencies["banner"] = content_digest(banner)
-    for name, source in legacy._resolve_sfx_sources(render.project_root).items():
+    for name, source in legacy._resolve_sfx_sources(presentation_root).items():
         dependencies["sfx:" + name] = content_digest(source)
     sound = render.snapshot.get("sound", {})
     visible = {"renderer": RENDERER_VERSION, "project": render.project_id, "mode": render.output_mode,
@@ -227,7 +241,7 @@ def _active_signature(render):
     return digest.hexdigest()
 
 
-def capture_render(session, output_mode="display") -> RenderInput:
+def capture_render(session, output_mode="display", *, presentation_root=None) -> RenderInput:
     """Capture the foundation render snapshot without projection or mutation."""
     if output_mode not in ("preview", "display"):
         raise ValueError("Output mode must be preview or display.")
@@ -239,7 +253,8 @@ def capture_render(session, output_mode="display") -> RenderInput:
         snapshot = model.render_snapshot()
     targets = tuple(session.capture_target(page["id"], fields=("type", "artwork", "message", "design_overrides"), include_shared=False) for page in snapshot["pages"])
     render = RenderInput(_freeze(snapshot), session.project_root, session.asset_root or session.project_root,
-                         identity, snapshot["project_id"], snapshot["revision"], output_mode, targets=targets)
+                         identity, snapshot["project_id"], snapshot["revision"], output_mode, targets=targets,
+                         presentation_root=Path(presentation_root).resolve() if presentation_root is not None else None)
     if session.session_id != identity or session.project is not model or model.revision != render.revision:
         raise StaleRenderError("The project changed while its preview was captured.")
     return replace(render, source_fingerprint=_active_signature(render))
@@ -308,7 +323,7 @@ def validate_render(render: RenderInput) -> tuple[RenderIssue, ...]:
                 if not message_plain_text(value).strip() and "<img" not in value:
                     issue("empty_message", "Letter message is empty.", "messages", preview=False)
                 missing_fonts = [family for family in extract_font_families(value)
-                                 if not inspect_font_family(render.project_root, family).faces]
+                                 if not inspect_font_family(render.presentation_root or render.project_root, family).faces]
                 if missing_fonts:
                     issue("missing_font", "Message font files are unavailable: " + ", ".join(missing_fonts), "messages")
             except (OSError, ValueError, ProjectRepositoryError) as error:
@@ -391,7 +406,8 @@ def build_render_to(render: RenderInput, destination, *, seed_sfx=True, reuse_pl
     from curtain_color import curtain_variant_rgbs, get_curtain_display_colors, write_recolored_banner_image
     from font_export import build_embedded_font_payload
     from letter_page import letter_page_style_from_settings
-    target = Path(destination).resolve()
+    presentation_root = render.presentation_root or render.project_root
+    target = _io_path(destination)
     if target.exists() and any(target.iterdir()):
         raise ValueError("Render destination must be an empty staging directory.")
     issues = validate_render(render)
@@ -436,7 +452,7 @@ def build_render_to(render: RenderInput, destination, *, seed_sfx=True, reuse_pl
     # One font pass across the complete document prevents alias collisions and
     # avoids one page's font export deleting another page's emitted font files.
     separator = "<!--forge-document-" + secrets.token_hex(24) + "-->"
-    fonts = build_embedded_font_payload(render.project_root, separator.join(page["message_html"] for page in pages), target / "gallery/fonts",
+    fonts = build_embedded_font_payload(presentation_root, separator.join(page["message_html"] for page in pages), target / "gallery/fonts",
                                         reuse_fonts_dir=Path(reuse_play_directory) / "gallery/fonts" if reuse_play_directory else None)
     for page, document in zip(pages, fonts.html.split(separator)):
         page["message_html"] = document
@@ -448,9 +464,9 @@ def build_render_to(render: RenderInput, destination, *, seed_sfx=True, reuse_pl
     colors = curtain_variant_rgbs(analysis)
     style = legacy.normalize_curtain_style(settings.get("curtain_style"))
     display = get_curtain_display_colors(style, colors)
-    controls = render.project_root / legacy.USER_CONTROLS_DIR
+    controls = presentation_root / legacy.USER_CONTROLS_DIR
     legacy._copy_control_files(controls, target / "gallery/controls", legacy.CONTROL_FILES, curtain_rgb=display.background, copy_file=copier.copy)
-    banner = legacy.application_paths(render.project_root).resource_path(legacy.APP_BANNER_PATH)
+    banner = legacy.application_paths(presentation_root).resource_path(legacy.APP_BANNER_PATH)
     write_recolored_banner_image(banner, target / "gallery/controls" / legacy.BANNER_FILE, display.background)
     playlist, sound_records = [], []
     for index, track in enumerate(_selected_tracks(render)):
@@ -462,7 +478,7 @@ def build_render_to(render: RenderInput, destination, *, seed_sfx=True, reuse_pl
     sound = render.snapshot.get("sound", {})
     crossfade = max(0, int(sound.get("crossfade_ms", 1000 if sound.get("mode") == "playlist" and len(playlist) > 1 else 0)))
     atomic_write_json(target / "gallery/sounds" / legacy.BUILD_SOUND_MANIFEST_NAME, {"version": 1, "tracks": sound_records, "crossfade_ms": crossfade, "mode": sound.get("mode", "single")})
-    legacy._seed_sfx_into_build(project_root=render.project_root, sounds_dst=target / "gallery/sounds", seed_sfx=seed_sfx, copy_file=copier.copy)
+    legacy._seed_sfx_into_build(project_root=presentation_root, sounds_dst=target / "gallery/sounds", seed_sfx=seed_sfx, copy_file=copier.copy)
     title = legacy._title_from_settings(settings, legacy._recipient_from_settings(settings))
     volume = sound.get("volume", legacy._starting_volume_from_settings(settings))
     try:
@@ -501,12 +517,14 @@ def build_render_to(render: RenderInput, destination, *, seed_sfx=True, reuse_pl
                       "animations": animations, "files": resources,
                       "warnings": [{"code": issue.code, "message": issue.message, "page_id": issue.page_id} for issue in issues]})
     check_cancelled()
-    return validate_display_output(target)
+    validate_display_output(target)
+    # Browser URLs and callers retain ordinary paths; extended syntax is I/O-only.
+    return Path(destination).resolve()
 
 
 def validate_display_output(directory) -> Path:
     import generate as legacy
-    root = Path(directory).resolve()
+    root = _io_path(directory)
     manifest = json.loads((root / DISPLAY_MANIFEST).read_text(encoding="utf-8"))
     if manifest.get("version") != RENDERER_VERSION or not isinstance(manifest.get("files"), dict):
         raise RuntimeError("Invalid display resource manifest.")
@@ -520,17 +538,32 @@ def validate_display_output(directory) -> Path:
     for filename in ("index.html", "styles.css"):
         for reference in legacy._runtime_asset_references((root / filename).read_text(encoding="utf-8")):
             legacy._validate_runtime_asset_reference(root, root, reference)
-    return root
+    return Path(directory).resolve()
+
+
+class SavedProjectPreviewAdapter:
+    """Read-only snapshots use app controls/fonts without active authored assets."""
+
+    def __init__(self, presentation_root):
+        self.presentation_root = Path(presentation_root).resolve()
+
+    def capture_render(self, session, output_mode="preview"):
+        return capture_render(session, output_mode, presentation_root=self.presentation_root)
+
+    validate_render = staticmethod(validate_render)
+    build_render_to = staticmethod(build_render_to)
+    render_is_current = staticmethod(render_is_current)
+    StaleRenderError = StaleRenderError
 
 
 def copy_display_output(source, destination) -> Path:
     """Copy the verified public allowlist, excluding private build diagnostics."""
-    root = validate_display_output(source)
+    root = _io_path(validate_display_output(source))
     manifest = json.loads((root / DISPLAY_MANIFEST).read_text(encoding="utf-8"))
     if manifest.get("output_mode") != "display" or manifest.get("warnings"):
         raise RuntimeError("Prepare validated final output before publication.")
     target = Path(destination).resolve()
-    transaction = PathTransaction(target, unique_staging=True)
+    transaction = PathTransaction(_io_path(target), unique_staging=True)
     try:
         stage = transaction.prepare()
         for relative in (*manifest["files"], DISPLAY_MANIFEST):
@@ -585,7 +618,7 @@ def generate_render(session, *, render_input=None, output_mode="display", destin
         raise StaleRenderError("The captured project changed; update the preview again.")
     target = Path(destination).resolve() if destination else legacy.play_bundle_directory(render.project_root)
     legacy._preserve_published_play_bundle(render.project_root, target)
-    transaction = PathTransaction(target, staging_suffix=".build-staging", backup_suffix=".build-backup", unique_staging=True)
+    transaction = PathTransaction(_io_path(target), staging_suffix=".build-staging", backup_suffix=".build-backup", unique_staging=True)
     try:
         stage = transaction.prepare()
         build_render_to(render, stage, seed_sfx=seed_sfx, reuse_play_directory=target if target.is_dir() else None, cancelled=cancelled)

@@ -81,6 +81,18 @@ class ThemeServiceTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 
+    def test_semantic_refresh_coalesces_style_events_from_its_own_pass(self) -> None:
+        service = ThemeService(self.root)
+        root = QtWidgets.QWidget()
+        self.addCleanup(root.deleteLater)
+        service._semantic_refresh_pending[root] = True
+        with mock.patch.object(service, "apply_semantic_styles", side_effect=lambda widget: service._queue_semantic_refresh(widget)) as apply:
+            with mock.patch.object(QtCore.QTimer, "singleShot") as schedule:
+                service._refresh_semantic_root(root)
+                apply.assert_called_once_with(root)
+                schedule.assert_not_called()
+        self.assertNotIn(root, service._semantic_refresh_pending)
+
     def test_complete_immutable_themes_are_available(self) -> None:
         self.assertEqual(
             {theme.theme_id for theme in THEMES.values()},

@@ -146,6 +146,12 @@ class SavedLetterActivityOrderTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
+    def setUp(self) -> None:
+        # Library tests must not restore machine-wide publishing credentials.
+        validation = mock.patch.object(ForgeTab, "_validate_github_account_async")
+        validation.start()
+        self.addCleanup(validation.stop)
+
     def _wait_for_catalog_refresh(
         self,
         tab: ForgeTab,

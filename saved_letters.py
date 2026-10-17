@@ -158,7 +158,7 @@ _COVER_THUMBNAIL_RELATIVE = Path("gallery/pages/cover.thumbnail.png")
 _COVER_THUMBNAIL_SOURCE_KEY = "cover_thumbnail_source_signature"
 _COVER_THUMBNAIL_CACHE_VERSION = 1
 _COVER_THUMBNAIL_SIZE = (336, 184)
-_SAVED_CATALOG_INDEX_SCHEMA_VERSION = 3
+_SAVED_CATALOG_INDEX_SCHEMA_VERSION = 4
 _SAVED_CATALOG_INDEX_RELATIVE = Path(
     "saved_letters",
     "catalog-v3.json",
@@ -417,6 +417,18 @@ class SavedLetter:
     recovery: bool = False
     example: bool = False
     stock: bool = False
+    canonical: bool = False
+    storage_revision: str = ""
+    content_revision: int = 0
+    page_count: int = 0
+    letter_count: int = 0
+    saved_publication_state: str = ""
+    warning: str = ""
+    valid: bool = True
+
+    @property
+    def summary(self) -> str:
+        return f"{self.page_count} pages · {self.letter_count} letter pages"
 
     @property
     def created_sort_date(self) -> date:
@@ -839,6 +851,7 @@ class SavedLetterCatalog:
                 self._entries = cached
                 return self._entries
         entries: list[SavedLetter] = []
+        previous_entries = self._entries or self._load_index() or ()
         seen: set[Path] = set()
         validator = SavedLetterRestorer(self.project_root)
         sources = (
@@ -853,6 +866,16 @@ class SavedLetterCatalog:
         for root, recovery, example, stock in sources:
             if not root.is_dir():
                 continue
+            # Editable snapshots need no generated HTML or complete presentation.
+            for repository in root.rglob(".lettersmith-project"):
+                path = repository.parent.resolve()
+                if (path / "lettersmith-display.json").is_file():
+                    continue
+                if path in seen or not path.is_relative_to(root.resolve()) or any(
+                        part.startswith((".s-", ".letter-load-")) or ".build-" in part for part in path.relative_to(root).parts):
+                    continue
+                seen.add(path)
+                entries.append(self._entry(path, recovery=recovery, example=example, stock=stock))
             for index in root.rglob("index.html"):
                 path = index.parent.resolve()
                 try:
@@ -868,8 +891,15 @@ class SavedLetterCatalog:
                     continue
                 if path in seen:
                     continue
+                # Forge's derived display output is not an editable saved project.
+                if (path / "lettersmith-display.json").is_file():
+                    continue
                 try:
                     if not self._is_valid_candidate(path):
+                        if (path / PLAY_METADATA_FILE).is_file():
+                            entries.append(replace(self._entry(path, recovery=recovery, example=example, stock=stock),
+                                                   valid=False, warning="The legacy package is incomplete; its source has been retained."))
+                            seen.add(path)
                         continue
                     validator._validated_saved_letter_content(path)
                     entry = self._entry(
@@ -878,15 +908,22 @@ class SavedLetterCatalog:
                         example=example,
                         stock=stock,
                     )
-                except Exception:
+                except Exception as error:
                     _LOGGER.warning(
-                        "Skipping unloadable saved-letter candidate: %s",
+                        "Unloadable saved-letter candidate: %s",
                         path,
                         exc_info=True,
                     )
+                    if (path / PLAY_METADATA_FILE).is_file():
+                        entries.append(replace(self._entry(path, recovery=recovery, example=example, stock=stock),
+                                               valid=False, warning=f"Cannot open this saved project: {error}"))
+                        seen.add(path)
                     continue
                 seen.add(path)
                 entries.append(entry)
+        for entry in previous_entries:
+            if entry.path not in seen and not entry.path.exists():
+                entries.append(replace(entry, valid=False, warning="Saved location is missing. Restore its folder to reopen this project."))
         if self.stock_only:
             entries.sort(
                 key=lambda entry: (
@@ -927,7 +964,8 @@ class SavedLetterCatalog:
                 break
 
         entries = [entry for entry in self._entries if entry.path != candidate]
-        if recovery is not None and self._is_valid_candidate(candidate):
+        if (recovery is not None and not (candidate / "lettersmith-display.json").is_file()
+                and ((candidate / ".lettersmith-project").is_dir() or self._is_valid_candidate(candidate))):
             entries.append(self._entry(candidate, recovery=recovery))
         entries.sort(key=self._saved_sort_key)
         self._entries = tuple(entries)
@@ -957,7 +995,7 @@ class SavedLetterCatalog:
     def _saved_sort_key(entry: SavedLetter) -> tuple[object, ...]:
         return (
             not entry.example,
-            -entry.saved_sort_date.toordinal(),
+            -(entry.modified_at.date().toordinal() if entry.canonical else entry.saved_sort_date.toordinal()),
             entry.title.casefold(),
             entry.recipient.casefold(),
             str(entry.path).casefold(),
@@ -991,13 +1029,20 @@ class SavedLetterCatalog:
             if relative.parts:
                 allowed_root = root
                 break
-        if allowed_root is None or not self._is_valid_candidate(target):
+        if allowed_root is None or (not entry.canonical and not self._is_valid_candidate(target)):
             raise SavedLetterDeleteError(
                 "The saved letter is outside the managed letter folders."
             )
 
         try:
-            shutil.rmtree(target)
+            if entry.canonical and target.parent == self.play_root / "Editable Projects":
+                from project_save import ProjectSaveService
+                from project_state import ProjectStateController
+                ProjectSaveService(self.project_root, ProjectStateController(self.project_root)).trash_saved_project(entry)
+            else:
+                destination = self.recovery_root / ("Deleted Project " + uuid.uuid4().hex)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(target, destination)
         except OSError as error:
             raise SavedLetterDeleteError(
                 "The saved letter could not be deleted."
@@ -1147,6 +1192,7 @@ class SavedLetterCatalog:
             ),
             "recipient_id": entry.recipient_id,
             "project_id": entry.project_id,
+            **{key: getattr(entry, key) for key in ("canonical", "storage_revision", "content_revision", "page_count", "letter_count", "warning", "valid", "saved_publication_state")},
         }
 
     def _deserialize_index_entry(
@@ -1227,6 +1273,7 @@ class SavedLetterCatalog:
             project_id=_valid_uuid(raw_entry.get("project_id")),
             recovery=recovery,
             example=example,
+            **{key: raw_entry[key] for key in ("canonical", "storage_revision", "content_revision", "page_count", "letter_count", "warning", "valid", "saved_publication_state") if key in raw_entry},
         )
 
     def _index_sources(
@@ -1304,6 +1351,63 @@ class SavedLetterCatalog:
         example: bool = False,
         stock: bool = False,
     ) -> SavedLetter:
+        from project_repository import ProjectRepository
+        repository = ProjectRepository(path / ".lettersmith-project")
+        if repository.directory.exists():
+            try:
+                stored = repository.load(allow_missing=True)
+                data = stored.project.to_dict()
+                metadata = data["metadata"]
+                publication = data["publication"]
+                publication_state = "Unpublished"
+                if publication.get(PUBLISHED_PAGE_URL_KEY):
+                    publication_state = "Publication status unknown / unverified"
+                    if publication.get(PUBLICATION_VERIFIED_KEY) is True:
+                        publication_state = "Last publication confirmed; saved revision unverified"
+                        if publication.get(PUBLISHED_SOURCE_FINGERPRINT_KEY) and not data["recovery"].get("missing_resources"):
+                            from forge_render import capture_render
+                            from project_session import ProjectSession
+                            preview_session = ProjectSession(stored.project, project_root=stored.asset_root, asset_root=stored.asset_root)
+                            try:
+                                fingerprint = capture_render(preview_session, "display", presentation_root=self.project_root).source_fingerprint
+                                publication_state = ("Last published version matches saved content" if fingerprint == publication[PUBLISHED_SOURCE_FINGERPRINT_KEY]
+                                                     else "Saved changes not published (last known publication)")
+                            except (ValueError, RuntimeError, OSError):
+                                pass
+                            finally:
+                                preview_session.close()
+                warnings = [issue.message for issue in stored.project.validate()]
+                if stored.migration_report:
+                    warnings.insert(0, "Migrated project; recovery details are retained.")
+                pages = data["pages"]
+                candidates = sorted(enumerate(pages), key=lambda item: (item[1]["type"] != "cover", item[0]))
+                cover = next((path / ".lettersmith-project" / "g" / stored.revision / page["artwork"]["asset"] for _, page in candidates
+                              if page["artwork"].get("asset") and (stored.asset_root / page["artwork"]["asset"]).is_file()), None)
+                saved_at = metadata.get("saved_at", "")
+                try:
+                    modified = datetime.fromisoformat(saved_at)
+                except (TypeError, ValueError):
+                    modified = datetime.fromtimestamp(repository.pointer.stat().st_mtime, timezone.utc)
+                return SavedLetter(path=path, title=str(metadata.get("title") or metadata.get("recipient_title") or "Untitled Project"),
+                    recipient=str(metadata.get("recipient_name") or ""), modified_at=modified,
+                    cover_path=cover, published_url=str(publication.get(PUBLISHED_PAGE_URL_KEY, "")),
+                    project_id=data["project_id"], recipient_id=str(metadata.get("recipient_id", "")),
+                    project_created_at=str(metadata.get(PROJECT_CREATED_AT_KEY, "")),
+                    canonical=True, storage_revision=stored.revision, content_revision=data["revision"],
+                    saved_publication_state=publication_state,
+                    page_count=len(pages), letter_count=sum(page["type"] == "letter" for page in pages),
+                    warning=" ".join(dict.fromkeys(warnings)), recovery=recovery, example=example, stock=stock,
+                    published_at=str(publication.get(PUBLISHED_AT_KEY, "")),
+                    published_public_path=str(publication.get(PUBLISHED_PUBLIC_PATH_KEY, "")),
+                    publication_provider=str(publication.get(PUBLICATION_PROVIDER_KEY, "")),
+                    published_github_owner=str(publication.get(PUBLISHED_GITHUB_OWNER_KEY, "")),
+                    published_github_repository=str(publication.get(PUBLISHED_GITHUB_REPOSITORY_KEY, "")),
+                    publication_verified=publication.get(PUBLICATION_VERIFIED_KEY) is True,
+                    published_source_fingerprint=str(publication.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")))
+            except Exception as error:
+                return SavedLetter(path=path, recipient="", title=path.name, modified_at=datetime.now(timezone.utc),
+                                   published_url="", cover_path=None, canonical=True, valid=False, warning=str(error),
+                                   recovery=recovery, example=example, stock=stock)
         metadata = _read_metadata(path)
         recipient = self._display_text(metadata.get("recipient_name"))
         title = self._display_text(metadata.get("recipient_title"))
@@ -1321,6 +1425,14 @@ class SavedLetterCatalog:
             metadata.get("cover_thumbnail_path"),
             "gallery/pages/cover.png",
         )
+        try:
+            from project_repository import read_legacy_project
+            legacy = read_legacy_project(path, saved=True)
+            legacy_pages = legacy.project.pages
+            warning = "Legacy project — opening creates an editable copy; the original is retained."
+            valid = True
+        except Exception as error:
+            legacy_pages, warning, valid = (), str(error), False
         return SavedLetter(
             path=path,
             recipient=recipient,
@@ -1330,6 +1442,8 @@ class SavedLetterCatalog:
                 metadata.get("published_page_url", "")
             ),
             cover_path=cover,
+            page_count=len(legacy_pages), letter_count=sum(page["type"] == "letter" for page in legacy_pages),
+            warning=warning, valid=valid,
             project_created_at=str(
                 metadata.get(PROJECT_CREATED_AT_KEY, "")
             ).strip(),
@@ -2538,6 +2652,19 @@ def update_saved_metadata(
     destination = Path(play_dir).resolve()
     if _is_bundled_letter_master(destination):
         return _read_metadata(destination)
+    # Canonical Forge output is derived presentation content. Its compatibility
+    # callbacks must never turn it into another editable save or dump prompts.
+    display_manifest = destination / "lettersmith-display.json"
+    if display_manifest.is_file():
+        display = json.loads(display_manifest.read_text(encoding="utf-8"))
+        settings = SettingsStore(root).snapshot()
+        return {
+            "project_id": display.get("project_id", ""),
+            "source_fingerprint": display.get("source_fingerprint", ""),
+            "recipient_name": settings.get("recipient_name", ""),
+            "recipient_title": settings.get("recipient_title", ""),
+            **_publication_metadata(settings),
+        }
     metadata_path = destination / PLAY_METADATA_FILE
     metadata = _read_metadata(
         destination,
@@ -2680,6 +2807,8 @@ def update_saved_publication_metadata(
         raise FileNotFoundError(f"Saved letter does not exist: {destination}")
     if _is_bundled_letter_master(destination):
         return _read_metadata(destination)
+    if (destination / "lettersmith-display.json").is_file():
+        return _publication_metadata(SettingsStore(project_root).snapshot())
     metadata_path = destination / PLAY_METADATA_FILE
     metadata = _read_metadata(destination, strict=True)
     metadata.update(
@@ -2753,7 +2882,7 @@ def record_saved_letter_activity(
     destination = Path(play_dir).resolve()
     if not destination.is_dir():
         raise FileNotFoundError(f"Saved letter does not exist: {destination}")
-    if _is_bundled_letter_master(destination):
+    if _is_bundled_letter_master(destination) or (destination / "lettersmith-display.json").is_file():
         return ""
     moment = when or datetime.now(timezone.utc)
     if moment.tzinfo is None:

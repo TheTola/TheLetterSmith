@@ -1,5 +1,100 @@
 # Flexible page foundation contract
 
+## Saved Projects contract extension — 2026-10-16
+
+The existing `ProjectSaveService` owns explicit editable saves as well as its
+existing workspace recovery snapshots. `save_project()` retains its previous
+workspace/repository meaning. Saved Letters uses `capture_editable_save()`,
+`commit_editable_save(capture)`, and `complete_editable_save(capture, stored)`.
+The synchronous equivalent is `save_editable(copy=False, title=None)`.
+
+- The shell calls `Nexus.flush_project_edits()` on the GUI thread first: commit
+  the focused valid field, pending Images name, Messages document, detached
+  Prompt Writer, then synchronize established compatibility views. A failure
+  prevents save/open/delete and keeps the editing session available for repair.
+- Capture returns one detached model with its content revision, session token,
+  destination and expected storage revision. Workers commit only that snapshot
+  through `ProjectRepository`. Completion can bind only the originating live
+  session. Saving R never marks a later revision saved. Workspace autosave and
+  explicit editable-save dirtiness are tracked separately.
+- Explicit saves live at `Saved Letters/Editable Projects/<project UUID>/` and
+  contain the normal `.lettersmith-project` generation repository. Display
+  titles never become editable-save paths. `editable-save.json` is a disposable
+  active-workspace binding, not a second authored document or exported resource.
+- `ProjectModel.independent_copy(title=None)` creates a new project UUID and
+  detached mutable graph. Page IDs are project-scoped and remain unchanged with
+  all internal references. The copy has an independent destination/resource
+  generation, clears `publication` and writable publication/active-output/protected
+  bindings in metadata/settings, and retains only inert source-ID provenance.
+  Historical extension data is preserved but is never publishing authority.
+- Save a Copy keeps the original session active. `duplicate_saved_project(entry)`
+  copies the selected committed version, including when the active editor has
+  newer unsaved edits. Neither operation includes another session's pending work.
+- `read_saved_project(entry)` validates without activation and rejects a stale
+  selected storage revision. `open_saved_project(entry, loaded=...)` uses
+  `SavedLetterRestorer.restore_canonical`. Legacy, Example, Stock and Recovery
+  sources open as independent user-owned copies. Ordinary editable saves keep
+  their identity and publication association. No source is upgraded by listing
+  or opening it.
+- `rename_saved_project(entry, title)` commits display metadata through the same
+  repository with expected-revision checking. `trash_saved_project(entry)` moves
+  the complete owned directory into Recovery under the shared library lock.
+  Other saves, original sources and permanent libraries are never collected.
+- `ProjectRepository.load(allow_missing=True)` tolerates absent resource bytes
+  while retaining references and recording warnings without incrementing the
+  authored revision. Corrupt bytes, unsafe paths and unsupported schemas remain
+  errors. Strict `load()` remains the default. Available source bytes, including
+  GIFs, are copied without conversion; migration reports and supported extension
+  data survive editable saves and copies.
+- Declared missing references remain unavailable through save and consumer
+  resolution even when an earlier workspace has a same-named file. Images,
+  Messages and Forge honor that canonical missing-resource set. Use explicit
+  image/message/audio replacement to relink content. A missing portable sound
+  alias cannot reuse an unrelated archive entry without matching content
+  identity; prior archive bytes remain under their content identity.
+- Generation-directory promotion uses the existing bounded sharing-violation
+  retry in `transactional_io`. Exhausted failures leave the old pointer intact.
+  Implicit migration-report reuse requires the same project identity; a new
+  project cannot inherit the previous session's report. Canonical copies and
+  restoration pass their retained report explicitly.
+- Stored sound playlists retain repeated occurrence IDs and their order. Sound's
+  existing interactive Add action may still prevent inserting a duplicate; it
+  must not collapse an already-authored playlist during save or restoration.
+- `recoverable_items()` exposes detached unresolved message/prompt descriptions.
+  `assign_recovered(kind, key, page_id, replace=False)` requires an actual stable
+  page ID; messages require Letter pages, prompts can target any page. Occupied
+  destinations require explicit replacement or a new page copy. The original
+  item and displaced complete document/prompt remain in recovery; their embedded
+  resource graph is included in subsequent canonical saves. Assignment clears
+  only corresponding resolved migration associations. No recovery GC is added.
+
+The catalog/index and thumbnails are disposable. Metadata is tagged with project,
+storage and content revisions. Thumbnail choice is the first usable Cover artwork
+in project order, then first usable artwork of any type, then a labeled placeholder.
+Decode generation/path guards reject stale results and canceled cards. A thumbnail
+failure cannot roll back a committed document. Invalid or missing entries remain
+identifiable. Publication labels use the last confirmed metadata and Forge's
+read-only display fingerprint; unavailable comparisons are explicitly unverified.
+No catalog operation probes a remote service.
+Forge folders marked by `lettersmith-display.json` are derived output and are
+excluded from the editable collection, including folders created by older mixed
+metadata callbacks. Those callbacks now return publication information without
+writing prompts, canonical saves or editable metadata into renderer output.
+Workspace autosave also leaves those derived folders unchanged. Existing legacy
+packages retain their documented metadata behavior; no existing files are deleted.
+
+Saved Version Preview creates a separate read-only session and uses Forge's
+`SavedProjectPreviewAdapter(presentation_root)` through `SharedMessagePreview`.
+The adapter supplies only controls, banner, fonts and UI sounds from the application;
+authored artwork/message/audio resolution stays inside the saved generation.
+It starts muted and never activates
+the snapshot in the editor. Forge uses extended Win32 paths internally for long
+title staging, while public build paths remain ordinary browser-compatible paths.
+The shared preview makes its view visible before invoking the viewer start
+action; Sound's hidden-document playback guard otherwise prevents GIF startup.
+The shared theme refresh coalesces its own StyleChange events to avoid repeatedly
+restyling a root after library/status updates.
+
 ## Combined feature contract — 2026-10-16
 
 Prompt Writer reads version-1 CSS-pixel geometry through `resolve_layout` and

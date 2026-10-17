@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 import threading
 import uuid
 
-from transactional_io import atomic_write_bytes, atomic_write_json, is_link_or_reparse_point
+from transactional_io import atomic_write_bytes, atomic_write_json, is_link_or_reparse_point, _replace_directory_path
 
 
 class ProjectRepositoryError(RuntimeError):
@@ -156,6 +156,8 @@ def _resource_references(payload: dict) -> set[str]:
     recovery = payload.get("recovery", {})
     messages = [recovery.get("unassigned_message")]
     messages.extend(recovery.get("unassigned_messages", {}).values())
+    messages.extend(record.get("previous") for record in recovery.get("assigned_content", [])
+                    if isinstance(record, dict) and record.get("kind") == "message")
     for message in messages:
         if isinstance(message, dict):
             resource(message.get("resources", []))
@@ -239,7 +241,7 @@ class ProjectRepository:
             raise ProjectRepositoryError("invalid_document", "Invalid project generation identity.", path=self.pointer)
         return head
 
-    def load(self) -> StoredProject:
+    def load(self, *, allow_missing: bool = False) -> StoredProject:
         from project_model import ProjectModel
         head = self._head()
         if not head:
@@ -258,14 +260,21 @@ class ProjectRepository:
             raise ProjectRepositoryError("unlisted_resource", "The project references resources outside its committed manifest.", path=generation)
         if set(manifest.get("missing", [])) != set(payload.get("recovery", {}).get("missing_resources", [])):
             raise ProjectRepositoryError("invalid_document", "Missing resource records disagree with the project document.", path=generation)
+        missing = list(payload.get("recovery", {}).get("missing_resources", []))
         for relative, digest in manifest.get("files", {}).items():
             candidate = _safe_file(generation, relative)
             try:
                 actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
             except OSError as error:
+                if allow_missing and isinstance(error, FileNotFoundError):
+                    missing.append(relative)
+                    continue
                 raise ProjectRepositoryError("missing_resource", f"Committed resource is missing: {relative}", path=candidate) from error
             if actual != digest:
                 raise ProjectRepositoryError("resource_changed", f"Committed resource changed: {relative}", path=candidate)
+        if missing:
+            payload["recovery"]["missing_resources"] = list(dict.fromkeys(missing))
+            project = ProjectModel.from_dict(payload)
         return StoredProject(project, head["revision"], generation, _json(generation / "migration.json", optional=True))
 
     def save(self, project, *, asset_root: str | Path,
@@ -311,15 +320,23 @@ class ProjectRepository:
             staging.mkdir(parents=True)
             report = deepcopy(migration_report)
             if report is None:
-                report = _json(self.directory / "g" / head["revision"] / "migration.json", optional=True) if head else {}
+                report = {}
+                if head:
+                    previous = self.directory / "g" / head["revision"]
+                    if _json(previous / "project.json").get("project_id") == payload["project_id"]:
+                        report = _json(previous / "migration.json", optional=True)
             if report:
                 report.setdefault("locations", {})["destination"] = str(self.directory)
             files = {}
             missing = []
+            known_missing = set(payload.get("recovery", {}).get("missing_resources", []))
             owned_pages = _owned_pages(payload)
             artwork_references = {page.get("artwork", {}).get("asset") for page in owned_pages}
             for relative in sorted(_resource_references(payload)):
                 candidates = [_safe_file(root, relative) for root in source_roots]
+                if relative in known_missing:
+                    missing.append(relative)
+                    continue
                 if relative in external_audio:
                     candidates.append(external_audio[relative])
                 source = next((item for item in candidates if item.is_file()), None)
@@ -361,7 +378,7 @@ class ProjectRepository:
             atomic_write_json(staging / "migration.json", report)
             # Reparse serialized bytes before the one visible commit operation.
             ProjectModel.from_dict(_json(staging / "project.json"))
-            os.replace(staging, generation)
+            _replace_directory_path(staging, generation)
             atomic_write_json(self.pointer, {"format": "lettersmith.project-head", "version": 1, "revision": revision})
             return StoredProject(ProjectModel.from_dict(payload), revision, generation, report)
 
