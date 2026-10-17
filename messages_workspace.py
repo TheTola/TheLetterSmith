@@ -112,6 +112,9 @@ class MessagesWorkspace(QtWidgets.QWidget):
                        self.recover_button):
             actions.addWidget(widget)
         actions.addStretch(1)
+        self.layout_button = QtWidgets.QPushButton("Text Layout")
+        self.layout_button.clicked.connect(self.edit_layout)
+        actions.addWidget(self.layout_button)
         self.style_toggle = QtWidgets.QPushButton("Readability")
         self.style_toggle.setCheckable(True)
         actions.addWidget(self.style_toggle)
@@ -495,6 +498,57 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.default_button.setEnabled(customized)
         if self.editor is not None:
             self.editor.set_display_settings(self.session.project.resolve_settings(self.page_id))
+
+    def edit_layout(self):
+        if not self.page_id or not self.save():
+            return
+        from message_layout_dialog import MessageLayoutDialog
+        page_id = self.page_id
+        target = self.session.capture_target(page_id, fields=("type", "message", "artwork", "design_overrides"))
+        dialog = MessageLayoutDialog(
+            self, self.session.project.get_page(page_id), self.session.project.resolve_settings(page_id),
+            self.session.project.to_dict()["shared_settings"], self.binding.label,
+            lambda geometry, **options: self.apply_layout(target, geometry, **options),
+        )
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
+
+    def apply_layout(self, target, geometry, *, use_default=False):
+        from copy import deepcopy
+        from project_model import resolve_page_layout
+
+        if self._failed or self.page_id != target.page_id:
+            raise RuntimeError("The edited page changed. Reopen Text Layout for the intended Letter.")
+
+        def apply(model, page_id):
+            page = model.get_page(page_id)
+            document = page["message"]
+            document["layout"] = {} if use_default else deepcopy(geometry)
+            settings = model.resolve_settings(page_id)
+            if use_default:
+                settings.pop("message_layout", None)
+                defaults = model.to_dict()["shared_settings"]
+                if "message_layout" in defaults:
+                    settings["message_layout"] = defaults["message_layout"]
+            resolve_page_layout(page, settings)
+            model.update_message(page_id, document)
+            if use_default:
+                model.clear_page_override(page_id, "message_layout")
+
+        self._committing = True
+        try:
+            if not self.session.apply_result(target, apply):
+                raise RuntimeError("The page or its defaults changed while Text Layout was open. Reopen it to review the current values.")
+            self.binding.document = self.session.project.get_message(self.page_id)
+            self.binding.target = self.session.capture_target(self.page_id, fields=("type", "message"), include_shared=False)
+            self._dirty = True
+            self.owner.project_changed.emit()
+        finally:
+            self._committing = False
+        self.refresh()
+        self.save()
 
     def customize_style(self, *_):
         if self.binding is None or self._refreshing or self._failed:

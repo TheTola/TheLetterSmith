@@ -1,12 +1,19 @@
 # Messages implementation handoff — Prompt 3
 
+Updated 2026-10-16: the completed Forge branch at `681a85e` is integrated in this
+worktree by merge commit `d22cf41`. Messages now authors the shared geometry
+contract and consumes live overflow diagnostics. Earlier partial results below
+are retained as history; the completion report describes the integrated branch.
+
 ## Baseline and isolation
 
 Started from reviewed foundation commit `1612235e5f5bf0c02e84cead87fc84242d30cac5`,
 on `codex/messages-independent-letters`. The managed worktree is
 `C:\Users\Oluwatola Ayedun\.codex\worktrees\messages-independent-letters\SmithLetter`.
 It started clean. Foundation contract, migration, verification and ownership
-documents were consumed; no foundation schema or Forge templates were changed.
+documents were consumed. Foundation schema and migration remain unchanged; the
+completed Forge implementation and its coordinated geometry extension were merged
+without editing its templates or resolver.
 
 The original checkout remains on the foundation commit with its unrelated work
 preserved. Hash comparison covered all 42 recorded original files; only the four
@@ -15,10 +22,10 @@ Messages blocker report was left untouched. This document describes this branch.
 
 Every validation process used fresh synthetic runtime data beneath an explicit
 `LETTER_SMITH_PROFILE_ROOT`, with profile-local Qt settings. No private letters,
-provider generation, credentials, publishing, release builds, remote pushes or
-sibling merges were used. The shared-preview checks described below consumed an
-immutable copy of three committed Forge files outside the repository; no unfinished
-sibling changes were copied. A test/import startup added one empty provider setting
+provider generation, credentials, publishing, release builds or remote pushes were
+used. Initial shared-preview checks consumed an immutable copy of three committed
+Forge files outside the repository. The final checks use the actual merged branch;
+no unfinished sibling changes were copied. A test/import startup added one empty provider setting
 to this worktree's tracked `settings.json`; its exact sole difference was verified
 and restored. No runtime data or settings changes are included in the commit.
 
@@ -28,13 +35,14 @@ and restored. No runtime data or settings changes are included in the commit.
 | --- | --- |
 | `messages_workspace.py` | Canonical page selector, one bound editor, guarded autosave/import lifecycle, readability inheritance, combined preview adapter and recovery states. |
 | `message_shared_preview.py` | Optional consumer of the committed Forge renderer, with guarded background builds, isolated local WebEngine, page-ID navigation, cancellation and file release. |
+| `message_layout_dialog.py` | Compact page-local canvas, text position/dimensions, padding and alignment controls; inherited defaults, shared validation and explicit Apply/Cancel. |
 | `Editor.py` | Optional bound/embedded mode retaining the existing rich editor, named styles, links, lists, fonts, paragraph controls, proofing and safe undo boundary. Legacy mode remains available. |
 | `message_resources.py` | Shared restricted raster loading for the bound editor and existing Qt renderer; no Qt file/network fallback. |
 | `message_document_import.py` | Sanitized resource staging around the existing converter, explicit resource commit and temporary cleanup. |
 | `Message_tab.py` | Existing feature entry point hosts the workspace, preserves identity fields/locks, routes existing conversion workers, delegates save/restore/shutdown and extends renderer resource/overflow inputs. |
 | `Nexus.py` | Plural tab label, explicit page navigation, background routing, retained-draft save guards, and space for the inline preview. |
 | `Over_Nexus.py` | Respects the explicit project-details toggle in canonical Messages. |
-| `test/test_messages_workspace.py` | 19 production-widget/controller/persistence scenarios. |
+| `test/test_messages_workspace.py` | 25 production-widget/controller/persistence scenarios, including geometry inheritance, validation, conflicts, retained historical data and restore. |
 | `test/test_message_shared_preview.py` | Four real shared-renderer/browser integration cases, enabled when the Forge adapter is installed. |
 | `test/test_message_security.py` | Five staging/resource security and portability cases. |
 | `test/test_identity_field_locking.py` | Existing worker-test adapters accept the renderer's optional resource/diagnostic arguments; cancellation assertions unchanged. |
@@ -134,25 +142,35 @@ the preview label identifies its actual page and states when selection differs.
 Missing selected backgrounds retain the neutral writing-ready state. Unsupported
 layout still reports the shared renderer's validation error without fake output.
 
-The foundation stores `message.layout`, `message.settings`, `artwork.placement` and
-`artwork.animation`, but the reviewed baseline does not define text-area coordinate
-units, bounds or padding. This branch does **not** invent those controls. On
-2026-10-16 the Forge worktree still had uncommitted geometry changes in
-`project_model.py`, `forge_render.py` and `Template.py`; they were not consumed.
-Full independent output remains guarded by
-`project_consumers.consumer_issue(..., 'output')` pending sequential integration.
+The coordinated extension is now committed and integrated. Its contract is in
+`docs/foundation-contract.md`, Shared composition geometry. The Text Layout dialog
+uses `resolve_page_layout` to validate version-1 `css_px` canvas size, text box,
+per-edge padding, alignment and supported scrolling. It obtains existing values
+through the same resolver used by `ProjectModel.resolve_layout` and Forge.
+Empty geometry retains responsive presentation until the user explicitly
+customizes it. A new custom canvas uses existing artwork canvas dimensions, or
+the documented 400×600 example when no canvas exists; no values are persisted on
+opening or cancelling the dialog.
 
-Required coordinated work:
+Only edited inherited fields become document overrides. Use project default
+clears `message.layout` and only the `message_layout` page override, preserving
+other settings, authored HTML/resources, artwork and prompt text. Existing opaque
+layout data remains intact on open/cancel and exposes the resolver's error.
+Invalid boxes/padding cannot be applied. The dialog keeps rejected values visible
+for correction. Supported long text scrolls; there is no clipping/shrink toggle.
 
-1. Foundation/layout owner defines validated text-area position, dimensions,
-   padding, units/bounds and inheritance using the existing document fields.
-2. Sequentially integrate the reviewed Forge adapter; Messages already consumes
-   its documented interface. Complete the shared geometry/placement contract, then
-   expose only its validated position, dimensions and padding through Messages.
-3. Sequentially integrate the narrow Nexus/Over_Nexus hooks with other owners.
-   Compare Messages and Forge output for A/B with different geometry, crop,
-   formatting and GIF backgrounds. Remove output guards only after Forge verifies
-   independent documents, resources and presentation behavior.
+`MessagesWorkspace.apply_layout(target, geometry, use_default=False)` uses
+`capture_target`/`apply_result` with type, message, artwork, page design and shared
+inputs. Changed inputs or project replacement reject the original dialog's
+commit. It preserves the current editor, updates its binding, and saves through
+the existing retained-draft lifecycle. `MessageTab.focus_field(page_id)` now
+opens the actual Letter targeted by Forge readiness. These are the only new
+entry-point changes in this continuation; Nexus/Over_Nexus need no further edits.
+
+The preview polls Forge's public `layoutIssues()` alongside `currentPageId()` and
+shows diagnostics for the displayed page. Messages/Forge composition uses the
+same renderer, including crop/GIF behavior. Canonical output now follows the
+merged Forge validation path; no manual compatibility guard removal was added.
 
 ## Verification — 2026-10-13 through 2026-10-16
 
@@ -239,16 +257,59 @@ initializes a fresh profile and Qt settings before importing application modules
 This verifies a specific committed adapter composition, not a merged application.
 Offscreen WebEngine emitted GPU-context warnings; native validation ran separately.
 
+### Completed geometry and merged verification — 2026-10-16
+
+- Reviewed and merged immutable Forge commit `681a85e` without conflicts. The
+  combined `test_project_model test_forge_render test_message_shared_preview`
+  baseline passed **52 tests** before adding controls.
+- Final `test_messages_workspace test_message_shared_preview test_message_security
+  test_message_overlay test_forge_session_output`: **78 passed**. Workspace tests
+  now exercise actual shared previews. Their fixture initializes bundled profile
+  assets, and dialog cleanup relies on Qt ownership. Browser diagnostics cross
+  the Qt bridge as JSON because direct JavaScript object results were not delivered
+  as a usable dictionary in this runtime.
+- `test_page_viewer.PageViewerTests.test_real_layouts_zip_and_single_html_work_without_source_project`:
+  **1 passed**, including portrait/landscape geometry, independent documents,
+  crop, GIFs and portable ZIP/HTML after source deletion. These selections total
+  **127 distinct tests**; four preview cases overlap the baseline and final groups.
+- An actual Nexus integration harness measured identical normalized text geometry
+  in Messages and Forge for A/B with different layouts and crop. It verified
+  leaving-tab edit flush, reordering, canonical save/reopen through
+  `SavedLetterRestorer`, and empty-project replacement with released preview files.
+  GitHub account restoration alone was disabled; all project/editor/render paths
+  were production code using synthetic content.
+- The same complete Nexus harness passed with the native Windows Qt platform
+  (`integrated_check.py --native-check`), including the rendered geometry
+  comparisons and save/restore/replacement lifecycle. Its log is
+  `integration-native.log`. This is automated native evidence, separate from the
+  manual desktop interaction below.
+- Native Messages displayed its actual canvas, scrolling notice and new Text
+  Layout button. Desktop automation stalled before opening the dialog; this is
+  not claimed as a completed manual native-control check. Automated control tests
+  above passed independently.
+
+Current runners and logs: `%TEMP%\lsm-geometry-20261016\run_checks.py`,
+`merged-baseline.log`, `messages-final.log`, `viewer.log`, `integrated_check.py`,
+`integration-short.log`, and `integrated-observations.json`. The shell harness
+uses a fresh `C:\Temp\lsm-*` profile: a longer initial profile exceeded Windows
+path limits in an existing generated-output temporary path. That path-length
+limitation was not changed. Restoration rejected premature Forge fingerprint
+captures while the session was suspended; subsequent refreshed output and the
+restored documents passed the assertions. The original checkout remains on
+`1612235`; final SHA-256 comparison of 42 recorded files found no unexpected
+changes. Final changed-Python AST parsing and `git diff --check` passed.
+No main-branch merge or push occurred.
+
 ## Completion report
 
-- **Feature implementation: Partial.** Independent writing, formatting,
-  selection, imports, guarded persistence and shared-preview consumption work.
-  The committed Forge adapter passed GIF/scrolling checks. Required text-area
-  geometry controls and full crop/layout parity await the coordinated contract.
-- **Ready for sequential integration: No for full Prompt 3 acceptance.** The
-  isolated implementation can be reviewed, but integration must retain the Forge
-  output guards and finish those layout/rendering dependencies.
-- **Cross-feature verification:** Actual Nexus navigation/lifecycle, foundation
-  consumers and the committed Forge renderer in an isolated source overlay were
-  verified. The merged application, custom geometry/crop, sibling UIs, live
-  providers, publishing and packaged platforms were not verified.
+- **Feature implementation: Complete on this branch.** Independent documents,
+  rich editing/imports, guarded persistence, inherited page geometry, real shared
+  composition and scrolling diagnostics are implemented and exercised.
+- **Ready for sequential integration: Yes.** Messages and completed Forge are
+  integrated here. Preserve unrelated primary-checkout work and reconcile any
+  overlapping shell changes when bringing in other feature branches.
+- **Cross-feature verification:** Combined Messages/Forge in actual Nexus,
+  geometry/crop parity, save/reopen and replacement lifecycle were verified with
+  synthetic data. Other sibling UIs, packaged platforms, audible playback, live
+  providers and publishing remain outside this acceptance. Manual native dialog
+  interaction was limited by the desktop automation failure described above.

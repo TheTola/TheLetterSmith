@@ -1346,6 +1346,10 @@ class MessageTab(QtWidgets.QWidget):
     def focus_field(self, target: str) -> None:
         """Focus the Message correction requested by Project Readiness."""
         if getattr(self, "messages_workspace", None) is not None:
+            if any(page["id"] == target and page["type"] == "letter"
+                   for page in self.messages_workspace.session.project.pages):
+                self.messages_workspace.open_page(target)
+                return
             if target == "message":
                 self.open_editor()
                 return

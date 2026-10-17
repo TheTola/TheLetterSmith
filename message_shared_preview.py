@@ -223,9 +223,16 @@ class SharedMessagePreview(QtWidgets.QWidget):
     def _inspect_page(self):
         revision = self._revision
 
-        def inspected(page_id):
+        def inspected(state):
             if self._closed or revision != self._revision or self._current is None:
                 return
+            try:
+                state = json.loads(state)
+            except (TypeError, ValueError):
+                return
+            if not isinstance(state, dict):
+                return
+            page_id = state.get("page_id")
             if not isinstance(page_id, str):
                 return
             self.viewed_page_id = page_id
@@ -238,9 +245,15 @@ class SharedMessagePreview(QtWidgets.QWidget):
                     note += " Editor selection is unchanged."
                 if warnings:
                     note += " " + " ".join(warnings)
+                for issue in state.get("issues", []):
+                    if isinstance(issue, dict) and issue.get("page_id") == page_id and isinstance(issue.get("message"), str):
+                        note += " " + issue["message"]
                 self.status_changed.emit(note)
 
-        self.view.page().runJavaScript("window.LetterSmithViewer?.currentPageId() || null", inspected)
+        self.view.page().runJavaScript(
+            "JSON.stringify({page_id: window.LetterSmithViewer?.currentPageId() || null, "
+            "issues: window.LetterSmithViewer?.layoutIssues?.() || []})", inspected,
+        )
 
     def set_zoom(self, value):
         self.view.setZoomFactor(max(0.25, min(2.0, value / 100)))
