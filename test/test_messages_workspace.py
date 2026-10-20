@@ -433,7 +433,13 @@ class MessagesWorkspaceTests(unittest.TestCase):
         self.assertTrue(workspace.opacity.isEnabled())
         self.assertLessEqual(workspace.selector.width(), 320)
         workspace.style_panel.zoom.setValue(125)
-        self.assertEqual(workspace.main_style_panel.summary.text(), "Warm Paper · 125%")
+        self.assertEqual(workspace.main_style_panel.zoom.value(), 125)
+        self.assertEqual(workspace.main_style_panel.preset.currentText(), "Warm Paper")
+        self.assertFalse(workspace.main_style_panel.color.isVisible())
+        self.assertFalse(workspace.style_panel.opacity.isVisible())
+        self.assertFalse(workspace.style_panel.contrast.isVisible())
+        self.assertEqual(workspace.style_panel.color.text(), "Normal Text Color")
+        self.assertFalse(hasattr(workspace, "background_button"))
 
     def test_new_blank_letter_remembers_paper_without_restyling_other_letters(self):
         self.workspace.open_page(self.letter_a)
@@ -719,8 +725,104 @@ class MessagesWorkspaceTests(unittest.TestCase):
         ):
             self.assertEqual(field.text(), expected)
             self.assertTrue(field.isReadOnly())
+            for mirror in field._identity_mirrors:
+                self.assertEqual(mirror.text(), expected)
+                self.assertTrue(mirror.isReadOnly())
         self.assertEqual(self.session.project.get_message(self.letter_a), original)
         self.assertEqual(self.workspace.editor.get_edited_html(), original["html"])
+
+    def test_footer_zoom_accepts_percentage_and_both_arrow_buttons(self):
+        workspace = self.workspace
+        workspace.open_page(self.letter_a)
+        workspace.open_editor()
+        for controls in (workspace.style_panel, workspace.main_style_panel):
+            with self.subTest(editor=controls is workspace.style_panel):
+                zoom = controls.zoom
+                zoom.setFocus()
+                zoom.selectAll()
+                QtTest.QTest.keyClicks(zoom, "125%")
+                workspace.readability_changed.emit()
+                self.assertEqual(zoom.cleanText(), "125")
+                QtTest.QTest.keyClick(zoom, QtCore.Qt.Key_Return)
+                self.assertEqual(zoom.value(), 125)
+                self.assertEqual(workspace.zoom.value(), 125)
+                for subcontrol, expected in (
+                    (QtWidgets.QStyle.SC_SpinBoxUp, 126),
+                    (QtWidgets.QStyle.SC_SpinBoxDown, 125),
+                ):
+                    option = QtWidgets.QStyleOptionSpinBox()
+                    zoom.initStyleOption(option)
+                    rect = zoom.style().subControlRect(
+                        QtWidgets.QStyle.CC_SpinBox, option, subcontrol, zoom)
+                    QtTest.QTest.mouseClick(zoom, QtCore.Qt.LeftButton, pos=rect.center())
+                    self.assertEqual(zoom.value(), expected)
+                    self.assertEqual(workspace.zoom.value(), expected)
+                    self.assertAlmostEqual(workspace.shared_preview.view.zoomFactor(), expected / 100)
+                self.assertEqual(workspace.style_panel.zoom.value(), workspace.main_style_panel.zoom.value())
+
+    def test_identity_views_edit_restore_and_reopen_without_stock_values(self):
+        from Message_tab import PUBLISHED_PAGE_URL_KEY
+        from project_repository import active_project_repository
+
+        workspace = self.workspace
+        workspace.open_page(self.letter_a)
+        self.session.project.rename_page(self.letter_a, "")
+        self.tab.project_state.establish_project("Synthetic recipient", custom_capitalization=True)
+        self.session.synchronize_workspace()
+        self.tab.settings_store.update_fields({
+            "recipient_title": "Synthetic older letter",
+            "recipient_name": "Synthetic recipient",
+            PUBLISHED_PAGE_URL_KEY: "https://example.com/older-letter",
+        })
+        self.tab.sync_from_disk(lock_loaded_identity=True)
+        workspace.open_editor()
+        self.app.processEvents()
+        self.assertEqual(workspace.editor_window.windowTitle(),
+                         "LetterSmith Editor · Synthetic older letter")
+        expected = {}
+        for source, key, text in (
+            (self.tab.title_input, "recipient_title", "Updated letter"),
+            (self.tab.name_input, "recipient_name", "Updated recipient"),
+            (self.tab.url_input, PUBLISHED_PAGE_URL_KEY, "https://example.com/updated"),
+        ):
+            mirror = source._identity_mirrors[0]
+            QtTest.QTest.mouseDClick(mirror, QtCore.Qt.LeftButton)
+            self.assertFalse(mirror.isReadOnly())
+            self.assertTrue(mirror.hasFocus())
+            mirror.selectAll()
+            QtTest.QTest.keyClicks(mirror, text)
+            QtTest.QTest.keyClick(mirror, QtCore.Qt.Key_Return)
+            self.assertEqual(source.text(), text)
+            self.assertEqual(self.tab.settings_store.snapshot()[key], text)
+            expected[key] = text
+        self.assertEqual(workspace.editor_window.windowTitle(), "LetterSmith Editor · Updated letter")
+        self.assertTrue(workspace.save())
+        self.session.synchronize_workspace()
+        self.session.save(sync_workspace=False)
+        saved = active_project_repository(self.root).load().project.to_dict()
+        self.assertEqual(saved["metadata"]["recipient_title"], expected["recipient_title"])
+        self.assertEqual(saved["metadata"]["recipient_name"], expected["recipient_name"])
+        self.assertEqual(saved["publication"][PUBLISHED_PAGE_URL_KEY], expected[PUBLISHED_PAGE_URL_KEY])
+        self.assertTrue(self.tab.shutdown())
+        self.tab.hide()
+        self.tab.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        release_project_session(self.root)
+        self.session = get_project_session(self.root)
+        self._open_tab()
+        for source, key in ((self.tab.title_input, "recipient_title"),
+                            (self.tab.name_input, "recipient_name"),
+                            (self.tab.url_input, PUBLISHED_PAGE_URL_KEY)):
+            self.assertEqual(source.text(), expected[key])
+            self.assertEqual(source._identity_mirrors[0].text(), expected[key])
+            source.setReadOnly(False)
+            source.setText("Changed in Messages")
+            self.assertEqual(source._identity_mirrors[0].text(), "Changed in Messages")
+        self.tab.settings_store.update_fields({key: "" for key in expected})
+        self.tab.sync_from_disk()
+        for field in (self.tab.title_input, self.tab.name_input, self.tab.url_input):
+            self.assertEqual(field.text(), "")
+            self.assertEqual(field._identity_mirrors[0].text(), "")
 
 
 if __name__ == "__main__":

@@ -103,6 +103,7 @@ class MessagesWorkspace(_MessagesWorkspace):
         super().__init__(owner, session)
         self.editor_window = _EditorWindow(self)
         self.editor_window.content.addWidget(owner.create_identity_panel(self.editor_window))
+        owner.title_input.textChanged.connect(self._refresh_editor_title)
         for widget in (self.notice, self.actions):
             self.editor_window.content.addWidget(widget)
         self.editor_window.content.addWidget(self.editor_host, 1)
@@ -125,9 +126,8 @@ class MessagesWorkspace(_MessagesWorkspace):
         page_caption.setBuddy(self.selector)
         header.insertWidget(0, page_caption)
         header.addWidget(self.open_editor_button)
-        for button in (self.background_button, self.open_editor_button):
-            button.setMinimumHeight(36)
-            button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.open_editor_button.setMinimumHeight(36)
+        self.open_editor_button.setCursor(QtCore.Qt.PointingHandCursor)
         self.selector.setMinimumHeight(36)
         self.layout().setSpacing(12)
         self.save_button.hide()
@@ -150,9 +150,6 @@ class MessagesWorkspace(_MessagesWorkspace):
             self.shared_preview.view.loadFinished.connect(self._quiet_preview)
             self.shared_preview.expand_requested.connect(self.expand_preview)
         self.refresh()
-
-    def attach_readability_footer(self, status_bar):
-        status_bar.addPermanentWidget(self.main_style_panel, 1)
 
     def expand_preview(self):
         if self.shared_preview is None or self.shared_preview._current is None:
@@ -222,10 +219,14 @@ class MessagesWorkspace(_MessagesWorkspace):
         name = self.binding.label if self.binding else "Letter"
         if self.page_id is not None and self.binding.target.session_id == self.session.session_id:
             try:
-                name = self.session.project.get_page(self.page_id).get("name") or "Letter"
+                name = (self.session.project.get_page(self.page_id).get("name")
+                        or self.owner.title_input.text().strip() or name)
             except KeyError:
                 pass  # A retained draft can outlive its deleted page.
         return "LetterSmith Editor · " + name
+
+    def _refresh_editor_title(self, *_):
+        self.editor_window.setWindowTitle(self._editor_title())
 
     def open_editor(self):
         if not self.open_page(None) or self.editor is None:

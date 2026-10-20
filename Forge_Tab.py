@@ -1930,12 +1930,18 @@ class ForgeTab(QtWidgets.QWidget):
         publishing_row = QtWidgets.QHBoxLayout()
         publishing_row.setContentsMargins(0, 0, 0, 0)
         publishing_row.setSpacing(8)
-        publishing_row.addWidget(self._muted_label("Online hosting"))
+        self.hosting_status = QtWidgets.QWidget()
+        self.hosting_status.setAccessibleName("Online hosting")
+        hosting_row = QtWidgets.QHBoxLayout(self.hosting_status)
+        hosting_row.setContentsMargins(4, 2, 4, 2)
+        hosting_row.setSpacing(8)
+        hosting_row.addWidget(self._muted_label("Online hosting ·"))
         self.publishing_provider_label = QtWidgets.QLabel("GitHub Pages")
         self.publishing_provider_label.setStyleSheet(
             "color:#e8f9ff;font:600 10pt 'Segoe UI';"
         )
-        publishing_row.addWidget(self.publishing_provider_label)
+        hosting_row.addWidget(self.publishing_provider_label)
+        hosting_row.addWidget(self._muted_label("·"))
         self.github_account_summary = QtWidgets.QLabel()
         self.github_account_summary.setObjectName(
             "ForgeGitHubAccountSummary"
@@ -1946,10 +1952,12 @@ class ForgeTab(QtWidgets.QWidget):
         self.github_account_summary.setSizePolicy(
             QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred,
         )
-        self.github_account_summary.setWordWrap(True)
+        self.github_account_summary.setWordWrap(False)
         self.github_account_summary.setMaximumHeight(46)
-        publishing_row.addWidget(self.github_account_summary, 1)
-        publishing_row.addStretch(0)
+        hosting_row.addWidget(self.github_account_summary)
+        hosting_row.addStretch(1)
+        publishing_row.addWidget(self.hosting_status, 1)
+        publishing_row.addStretch(1)
         self.github_account_btn = self._tier_button(
             "GitHub Account",
             ButtonTier.SMALL,

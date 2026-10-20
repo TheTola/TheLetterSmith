@@ -1106,7 +1106,8 @@ class MessageTab(QtWidgets.QWidget):
             source.textChanged.connect(field.setText)
             field.textChanged.connect(source.setText)
             field.double_clicked.connect(
-                lambda source=source, key=key: self._unlock_identity_field(source, key))
+                lambda source=source, key=key, field=field:
+                    self._unlock_identity_field(source, key, focus=field))
             field.returnPressed.connect(
                 lambda source=source, key=key: self._commit_identity_field(source, key))
             field.editingFinished.connect(self._save_settings)
@@ -1114,6 +1115,13 @@ class MessageTab(QtWidgets.QWidget):
             fields.append(field)
         self._layout_identity_fields(panel, fields)
         return panel
+
+    def _restore_identity_text(self, field, value):
+        # Restoration is not an edit. Signal-blocked source updates must also
+        # refresh every view; textChanged is reserved for subsequent user edits.
+        for view in (field, *getattr(field, "_identity_mirrors", ())):
+            with QtCore.QSignalBlocker(view):
+                view.setText(str(value or ""))
 
     def set_compact_layout(self, compact: bool) -> None:
         """Reduce control geometry without moving controls above the preview."""
@@ -1205,8 +1213,7 @@ class MessageTab(QtWidgets.QWidget):
             self._load_settings()
             for field, key in ((self.title_input, "recipient_title"), (self.name_input, "recipient_name"),
                                (self.url_input, PUBLISHED_PAGE_URL_KEY)):
-                with QtCore.QSignalBlocker(field):
-                    field.setText(str(self.settings.get(key, "")))
+                self._restore_identity_text(field, self.settings.get(key, ""))
             if lock_loaded_identity:
                 self._apply_loaded_identity_locks(persist=True)
             else:
@@ -1728,11 +1735,13 @@ class MessageTab(QtWidgets.QWidget):
         self,
         field: IdentityLineEdit,
         field_name: str,
+        *,
+        focus: IdentityLineEdit | None = None,
     ) -> None:
         field.setReadOnly(False)
         self.settings[IDENTITY_LOCK_KEYS[field_name]] = False
         self._style_identity_field(field)
-        field.setFocus(Qt.MouseFocusReason)
+        (focus if focus is not None else field).setFocus(Qt.MouseFocusReason)
 
     def _commit_identity_field(
         self,

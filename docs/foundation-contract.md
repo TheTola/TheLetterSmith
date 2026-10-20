@@ -18,8 +18,10 @@ session, then first Letter through `select_page`. Hidden Messages refreshes may
 remember a valid Letter but never move global selection. No Letter pages means
 an empty workspace with the existing canonical Add Letter Page action.
 
-Images' prompt/text buttons, Messages' background button, Prompt Writer's Page
+Images' prompt/text buttons, Messages' background route, Prompt Writer's Page
 Settings and Forge's readiness corrections route stable IDs through Nexus.
+Messages reaches background editing through the Images tab while retaining the
+selected page ID; the redundant Edit Background Artwork button is removed.
 Forge no longer translates a correction into a legacy slot or generic message
 key. The shell commits pending edits before routing, and queued focus callbacks
 verify the originating session. Presentation navigation stays inside the viewer;
@@ -28,6 +30,21 @@ uncommittable draft instead of rebinding it. A failed Images name commit blocks
 selection/tab departure. Renaming/reordering updates Prompt Writer labels without
 resetting its unchanged document, cursor or undo history. A new binding/session
 gets a fresh document history.
+
+The shared status-bar location is contextual, not a global Messages control
+surface. Images shows canonical page count; Sound shows the assigned track or
+ordered, horizontally scrollable playlist; Messages shows paper, opacity,
+contrast and preview zoom; Forge supplies its existing live hosting/account
+status widget. Command retains its immersive hidden status bar. Hidden footer
+views do not reserve height. These views introduce no persisted project state.
+
+The detached LetterSmith Editor has paper, preview zoom and Normal Text Color.
+Both zoom fields use the same transient 25–200% value; unrelated preview/style
+refreshes must preserve an unfinished percentage entry. The editor title uses
+the page name, then project title, then the derived Letter label. Title,
+recipient and publication URL are views of the existing MessageTab identity
+fields and canonical compatibility service. Guarded restoration updates all
+identity views explicitly; it must not depend on blocked textChanged signals.
 
 `Nexus.flush_project_edits()` remains the common save/transition preparation:
 validate the focused field, commit Images names, flush Messages, flush detached

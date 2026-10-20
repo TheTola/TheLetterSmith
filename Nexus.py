@@ -172,6 +172,23 @@ FORGE_PREVIEW_BACKGROUND = "#0b0c12"
 FORGE_WINDOW_VIEWPORT = QSize(1600, 760)
 
 
+class _ContextFooter(QtWidgets.QStackedWidget):
+    """Hidden tabs must not reserve height in the active tab's footer."""
+
+    def __init__(self):
+        super().__init__()
+        self.currentChanged.connect(self.updateGeometry)
+
+    def sizeHint(self):
+        widget = self.currentWidget()
+        if widget is None:
+            return QSize()
+        return widget.sizeHint().boundedTo(widget.maximumSize()).expandedTo(widget.minimumSize())
+
+    def minimumSizeHint(self):
+        return QSize(0, max(0, self.sizeHint().height()))
+
+
 def _fit_preview_content_size(source: QSize, width: int, height: int) -> QSize:
     """Fit a complete source into a logical-pixel content rectangle."""
     return source.scaled(
@@ -2528,8 +2545,6 @@ class Nexus(QtWidgets.QMainWindow):
         )
         self.message_tab.background_requested.connect(self._edit_message_background)
         self.message_tab.images_requested.connect(lambda: self.tabbar.setCurrentIndex(0))
-        if self.message_tab.messages_workspace is not None:
-            self.message_tab.messages_workspace.attach_readability_footer(self._status)
         self.forge_tab = ForgeTab(
             self.project_root,
             project_state=self.project_state,
@@ -2544,6 +2559,7 @@ class Nexus(QtWidgets.QMainWindow):
             project_state=self.project_state,
         )
         self.command_tab.setProperty("themeIndependent", True)
+        self._initialize_context_footer()
 
         self.preview_tools_layout.insertWidget(
             0,
@@ -2796,9 +2812,62 @@ class Nexus(QtWidgets.QMainWindow):
         if any(not key.startswith("ui_") and not key.startswith("last_") and key not in ignored for key in keys):
             self.project_dirty.mark_changed("settings")
 
+    def _initialize_context_footer(self) -> None:
+        """One physical footer, with views supplied by their feature owners."""
+        self.context_footer = _ContextFooter()
+        self.context_footer.setObjectName("ContextFooter")
+        self.context_footer.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.pages_footer = QtWidgets.QLabel()
+        self.pages_footer.setAccessibleName("Project page count")
+        self.pages_footer.setContentsMargins(4, 2, 4, 2)
+        self.context_footer.addWidget(self.pages_footer)
+        self.sound_footer = QtWidgets.QScrollArea()
+        self.sound_footer.setAccessibleName("Selected music")
+        self.sound_footer.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.sound_footer.setWidgetResizable(True)
+        self.sound_footer.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.sound_footer.setFixedHeight(38)
+        self.sound_footer_label = QtWidgets.QLabel()
+        self.sound_footer_label.setTextFormat(Qt.PlainText)
+        self.sound_footer_label.setContentsMargins(4, 0, 4, 0)
+        self.sound_footer_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Preferred)
+        self.sound_footer.setWidget(self.sound_footer_label)
+        self.context_footer.addWidget(self.sound_footer)
+        workspace = self.message_tab.messages_workspace
+        self.context_footer.addWidget(
+            workspace.main_style_panel if workspace is not None else QtWidgets.QWidget())
+        # Reparent the live account-status view. Forge retains ownership of
+        # its connection state and account checks; the shell does not probe it.
+        self.context_footer.addWidget(self.forge_tab.hosting_status)
+        self.context_footer.addWidget(QtWidgets.QWidget())
+        self._status.addPermanentWidget(self.context_footer, 1)
+        self.sound_tab.sound_state_changed.connect(self._refresh_sound_footer)
+        self.sound_tab.library.changed.connect(self._refresh_sound_footer)
+        self._refresh_pages_footer()
+        self._refresh_sound_footer()
+
+    def _refresh_pages_footer(self) -> None:
+        if not hasattr(self, "pages_footer"):
+            return
+        count = len(self.project_session.project.pages)
+        self.pages_footer.setText(f"{count} {'Page' if count == 1 else 'Pages'}")
+
+    def _refresh_sound_footer(self, *_args) -> None:
+        titles = []
+        for track_id in self.sound_tab.project_sound.ordered_ids():
+            record = self.sound_tab.library.get(track_id)
+            titles.append(record.display_title if record is not None else "Unavailable track")
+        text = " · ".join(titles) if titles else "No music selected."
+        self.sound_footer_label.setText(text)
+        self.sound_footer_label.setToolTip(text)
+
     def _on_foundation_changed(self, event) -> None:
         if event.session_id != self.project_session.session_id:
             return
+        if event.kind in {"structure", "project_replaced", "persisted"}:
+            self._refresh_pages_footer()
         if event.kind in {"selection", "project_replaced", "persisted"}:
             return
         self.project_dirty.mark_changed(f"pages:{event.kind}")
@@ -3080,6 +3149,8 @@ class Nexus(QtWidgets.QMainWindow):
                 self._project_view_restore_errors.append(owner)
                 _LOGGER.exception("%s view could not refresh after restore.", owner)
                 self.status(f"{owner} could not refresh: {error}")
+        self._refresh_pages_footer()
+        self._refresh_sound_footer()
         self.project_dirty.mark_saved()
         self._protected_change_count = 0
         self._protected_warning_shown = False
@@ -3487,6 +3558,7 @@ class Nexus(QtWidgets.QMainWindow):
         else:
             self.preview_stack.setCurrentIndex(0)
 
+        self.context_footer.setCurrentIndex(idx)
         self.help_icon.setVisible(idx != 4)
         self.help_anchor.setVisible(idx not in {0, 1, 3, 4})
         if idx == 4:

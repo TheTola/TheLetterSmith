@@ -13,13 +13,12 @@ from message_document_import import message_resources, stage_import_html
 from message_html import sanitize_message_html
 from project_paths import application_paths
 from ui_dialogs import LetterSmithConfirmationDialog
-from named_text_styles import STYLE_LABELS
 
 
 class ReadabilityControls(QtWidgets.QWidget):
     """Synchronized views of the selected page's existing styling controls."""
 
-    def __init__(self, workspace, parent=None):
+    def __init__(self, workspace, parent=None, *, editor=False):
         super().__init__(parent)
         self.workspace = workspace
         self.setObjectName("letterReadabilityControls")
@@ -27,49 +26,52 @@ class ReadabilityControls(QtWidgets.QWidget):
         self.setStyleSheet(
             "#letterReadabilityControls QComboBox, #letterReadabilityControls QSpinBox"
             "{min-height:24px;padding:1px 4px;font:9pt 'Segoe UI';}"
+            "#letterReadabilityControls QSpinBox{padding-right:22px;}"
+            "#letterReadabilityControls QSpinBox::up-button,"
+            "#letterReadabilityControls QSpinBox::down-button{width:20px;}"
             "#letterReadabilityControls QLabel{font:9pt 'Segoe UI';}"
         )
         row = QtWidgets.QHBoxLayout(self)
         row.setContentsMargins(4, 2, 4, 2)
         row.setSpacing(6)
-        self.preset = QtWidgets.QComboBox()
+        self.preset = QtWidgets.QComboBox(self)
         self.preset.setAccessibleName("Letter paper")
         self.preset.setToolTip("Paper for the selected letter")
         for key, label in LETTER_PAGE_PRESET_LABELS.items():
             self.preset.addItem(label, key)
         row.addWidget(self.preset)
-        self.opacity = QtWidgets.QSpinBox()
+        self.opacity = QtWidgets.QSpinBox(self)
         self.opacity.setRange(0, 100)
         self.opacity.setSuffix("%")
         self.opacity.setAccessibleName("Paper opacity")
         self.opacity.setToolTip("Paper opacity: 0% reveals the artwork")
-        row.addWidget(self.opacity)
-        self.category = QtWidgets.QComboBox()
-        self.category.setAccessibleName("Text color category")
-        for key, label in STYLE_LABELS.items():
-            self.category.addItem(label, key)
-        row.addWidget(self.category)
-        self.color = QtWidgets.QToolButton()
-        self.color.setText("Color")
-        self.color.setAccessibleName("Choose category text color")
+        self.opacity.setKeyboardTracking(False)
+        self.opacity.setVisible(not editor)
+        if not editor:
+            row.addWidget(self.opacity)
+        self.color = QtWidgets.QToolButton(self)
+        self.color.setText("Normal Text Color")
+        self.color.setAccessibleName("Normal Text Color")
         self.color.clicked.connect(self.choose_color)
-        row.addWidget(self.color)
-        self.contrast = QtWidgets.QLabel()
+        self.color.setVisible(editor)
+        self.contrast = QtWidgets.QLabel(self)
         self.contrast.setAccessibleName("Letter contrast")
-        row.addWidget(self.contrast)
+        self.contrast.setVisible(not editor)
+        if not editor:
+            row.addWidget(self.contrast)
         row.addStretch(1)
-        self.zoom = QtWidgets.QSpinBox()
+        self.zoom = QtWidgets.QSpinBox(self)
         self.zoom.setRange(25, 200)
         self.zoom.setSuffix("%")
+        self.zoom.setKeyboardTracking(False)
+        self.zoom.setMinimumWidth(90)
         self.zoom.setAccessibleName("Page preview zoom")
-        self.zoom.setToolTip("Preview zoom")
+        self.zoom.setToolTip("Preview zoom: type 25–200% or use the arrows")
         row.addWidget(self.zoom)
-        self.summary = QtWidgets.QLabel()
-        self.summary.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        row.addWidget(self.summary)
+        if editor:
+            row.addWidget(self.color)
         self.preset.currentIndexChanged.connect(self.apply)
         self.opacity.valueChanged.connect(self.apply)
-        self.category.currentIndexChanged.connect(self.sync)
         self.zoom.valueChanged.connect(workspace.zoom.setValue)
         workspace.readability_changed.connect(self.sync)
         self.sync()
@@ -92,10 +94,10 @@ class ReadabilityControls(QtWidgets.QWidget):
         if editor is None:
             return
         page_id = self.workspace.page_id
-        key = self.category.currentData()
+        key = "normal_text"
         color = QtWidgets.QColorDialog.getColor(
             QtGui.QColor(editor.named_styles.active_set.get(key).font_color), self,
-            f"{self.category.currentText()} · {self.preset.currentText()}")
+            f"Normal Text Color · {self.preset.currentText()}")
         if self.workspace.editor is editor and self.workspace.page_id == page_id:
             editor.set_paper_text_color(key, color)
             self.workspace.readability_changed.emit()
@@ -104,22 +106,25 @@ class ReadabilityControls(QtWidgets.QWidget):
         workspace = self.workspace
         self.setEnabled(workspace.page_id is not None and not workspace._failed)
         if workspace.page_id is None:
-            self.summary.clear()
+            self.contrast.clear()
             return
         preset, opacity, _, _ = normalized_letter_page_settings(
             workspace._display_settings())
         with QtCore.QSignalBlocker(self.preset), QtCore.QSignalBlocker(self.opacity), QtCore.QSignalBlocker(self.zoom):
             self.preset.setCurrentIndex(self.preset.findData(preset))
-            self.opacity.setValue(opacity)
+            if self.opacity.value() != opacity:
+                self.opacity.setValue(opacity)
             self.opacity.setEnabled(preset != "clear")
-            self.zoom.setValue(workspace.zoom.value())
-        self.summary.setText(f"{LETTER_PAGE_PRESET_LABELS[preset]} · {workspace.zoom.value()}%")
+            # setValue also replaces uncommitted spin-box text when its numeric
+            # value is unchanged. Preview/contrast refreshes must not erase typing.
+            if self.zoom.value() != workspace.zoom.value():
+                self.zoom.setValue(workspace.zoom.value())
         self.setToolTip(workspace.binding.label)
         if workspace.editor is not None:
             editor = workspace.editor
-            color = editor.named_styles.active_set.get(self.category.currentData()).font_color
+            color = editor.named_styles.active_set.get("normal_text").font_color
             self.color.setStyleSheet(f"QToolButton{{border-bottom:3px solid {color};padding:3px 6px;}}")
-            self.color.setToolTip(f"{self.category.currentText()} color: {color}")
+            self.color.setToolTip(f"Normal Text Color: {color}")
             self.contrast.setText(editor.readability_indicator.text())
             self.contrast.setToolTip(editor.readability_indicator.toolTip())
             if workspace._preview_contrast is not None:
@@ -195,9 +200,6 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.selector.setMaximumWidth(320)
         header.addWidget(self.selector)
         header.addStretch(1)
-        self.background_button = QtWidgets.QPushButton("Edit Background Artwork")
-        self.background_button.clicked.connect(self._edit_background)
-        header.addWidget(self.background_button)
         self.preview_toggle = QtWidgets.QPushButton("Preview")
         self.preview_toggle.setCheckable(True)
         self.preview_toggle.setChecked(True)
@@ -276,7 +278,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([800, 260])
         layout.addWidget(self.splitter, 1)
-        self.style_panel = ReadabilityControls(self, self)
+        self.style_panel = ReadabilityControls(self, self, editor=True)
         self.preset = self.style_panel.preset
         self.opacity = self.style_panel.opacity
         layout.addWidget(self.style_panel)
@@ -368,7 +370,6 @@ class MessagesWorkspace(QtWidgets.QWidget):
             self.empty.setVisible(not has_letter)
             self.splitter.setVisible(has_letter)
             self.actions.setVisible(has_letter)
-            self.background_button.setEnabled(has_letter)
             self.selector.setEnabled(has_letter)
             self.style_panel.setVisible(has_letter)
             from project_model import MAX_PAGES

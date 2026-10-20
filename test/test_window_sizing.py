@@ -47,6 +47,132 @@ class WindowSizingTests(unittest.TestCase):
         self.app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
         self.app.processEvents()
 
+    def test_context_footer_tracks_pages_music_and_actual_hosting_view(self):
+        import hashlib
+        import wave
+        from project_model import ProjectModel, create_project
+        from publishing.github_auth import (
+            GitHubAccount, GitHubConnectionSnapshot, GitHubConnectionState,
+            GitHubSession, GitHubToken,
+        )
+        from sound_model import TrackRecord, processed_dir, save_library
+
+        with self.window() as window:
+            window.project_session.replace(create_project(
+                ["cover", "letter", "illustration", "letter", "end_page"]))
+            footer = window.context_footer
+            workspace = window.message_tab.messages_workspace
+            for index, widget in (
+                (0, window.pages_footer), (1, window.sound_footer),
+                (2, workspace.main_style_panel), (3, window.forge_tab.hosting_status),
+            ):
+                window.tabbar.setCurrentIndex(index)
+                self.settle(window)
+                self.assertIs(footer.currentWidget(), widget)
+                self.assertTrue(widget.isVisibleTo(window))
+                self.assertEqual(workspace.main_style_panel.isVisibleTo(window), index == 2)
+            window.tabbar.setCurrentIndex(4)
+            self.assertFalse(window.statusBar().isVisible())
+            window.tabbar.setCurrentIndex(0)
+            project = window.project_session.project
+            count = len(project.pages)
+            self.assertEqual(window.pages_footer.text(), f"{count} Pages")
+            added = project.add_page("illustration")
+            self.assertEqual(window.pages_footer.text(), f"{count + 1} Pages")
+            project.delete_page(added)
+            self.assertEqual(window.pages_footer.text(), f"{count} Pages")
+            imported = create_project().to_dict()
+            imported["pages"] = imported["pages"][:1]
+            window.project_session.replace(ProjectModel.from_dict(imported))
+            self.assertEqual(window.pages_footer.text(), "1 Page")
+
+            window.tabbar.setCurrentIndex(1)
+            sound = window.sound_tab
+            self.assertEqual(window.sound_footer_label.text(), "No music selected.")
+            ids = []
+            for index in range(3):
+                identity = f"footer-track-{index}"
+                ids.append(identity)
+                path = processed_dir(window.project_root) / f"{identity}.wav"
+                with wave.open(str(path), "wb") as output:
+                    output.setnchannels(1)
+                    output.setsampwidth(2)
+                    output.setframerate(8000)
+                    output.writeframes(bytes(8000 + index * 2))
+                sound.library.records[identity] = TrackRecord(
+                    track_id=identity, content_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
+                    display_title=f"Song {index}: " + "long title " * 12,
+                    original_name=path.name, original_file=path.name, processed_file=path.name,
+                    duration_seconds=0.5, added_at="2026-10-20T00:00:00+00:00",
+                )
+            sound.library.invalidate_availability()
+            save_library(window.project_root, sound.library.records)
+            sound.project_sound.set_single(ids[0])
+            self.assertEqual(window.sound_footer_label.text(), sound.library.get(ids[0]).display_title)
+            sound.project_sound.add_to_playlist(ids[1:])
+            self.assertEqual(window.sound_footer_label.text(),
+                             " · ".join(sound.library.get(identity).display_title for identity in ids))
+            sound.project_sound.reorder_playlist(list(reversed(ids)))
+            self.assertTrue(window.sound_footer_label.text().startswith("Song 2:"))
+            self.settle(window)
+            self.assertGreater(window.sound_footer.horizontalScrollBar().maximum(), 0)
+            self.assertLessEqual(window.sound_footer.height(), 40)
+            sound.project_sound.remove_from_playlist(ids[1])
+            self.assertNotIn("Song 1:", window.sound_footer_label.text())
+            sound.library.rename_display_title(ids[2], "Renamed track")
+            self.assertTrue(window.sound_footer_label.text().startswith("Renamed track"))
+
+            window.tabbar.setCurrentIndex(3)
+            forge = window.forge_tab
+            forge._apply_github_state(GitHubConnectionSnapshot(
+                GitHubConnectionState.CONNECTED,
+                session=GitHubSession(GitHubAccount("synthetic-account", 123),
+                                      GitHubToken("synthetic-test-token")),
+            ))
+            self.assertTrue(footer.isAncestorOf(forge.github_account_summary))
+            self.assertEqual(forge.publishing_provider_label.text(), "GitHub Pages")
+            self.assertEqual(forge.github_account_summary.text(), "Connected as synthetic-account")
+            forge._apply_github_state(GitHubConnectionSnapshot(GitHubConnectionState.DISCONNECTED))
+            self.assertNotIn("synthetic-account", forge.github_account_summary.text())
+
+    def test_context_footer_zoom_arrows_and_entry_across_themes(self):
+        from project_model import create_project
+
+        with self.window() as window:
+            window.project_session.replace(create_project(["cover", "letter", "end_page"]))
+            window.tabbar.setCurrentIndex(2)
+            workspace = window.message_tab.messages_workspace
+            for theme in THEMES:
+                window.theme_service.set_theme(theme)
+                for controls in (workspace.main_style_panel, workspace.style_panel):
+                    with self.subTest(theme=theme, editor=controls is workspace.style_panel):
+                        if controls is workspace.style_panel:
+                            workspace.open_editor()
+                        self.settle(window)
+                        zoom = controls.zoom
+                        zoom.setFocus()
+                        zoom.selectAll()
+                        QtTest.QTest.keyClicks(zoom, "125%")
+                        QtTest.QTest.keyClick(zoom, QtCore.Qt.Key_Return)
+                        self.assertEqual(workspace.zoom.value(), 125)
+                        for subcontrol, expected in (
+                            (QtWidgets.QStyle.SC_SpinBoxUp, 126),
+                            (QtWidgets.QStyle.SC_SpinBoxDown, 125),
+                        ):
+                            option = QtWidgets.QStyleOptionSpinBox()
+                            zoom.initStyleOption(option)
+                            rect = zoom.style().subControlRect(
+                                QtWidgets.QStyle.CC_SpinBox, option, subcontrol, zoom)
+                            QtTest.QTest.mouseClick(zoom, QtCore.Qt.LeftButton, pos=rect.center())
+                            self.assertEqual(zoom.value(), expected)
+                            self.assertEqual(workspace.zoom.value(), expected)
+                            self.assertAlmostEqual(workspace.shared_preview.view.zoomFactor(), expected / 100)
+                        for boundary, key in ((25, QtCore.Qt.Key_Down), (200, QtCore.Qt.Key_Up)):
+                            zoom.setValue(boundary)
+                            QtTest.QTest.keyClick(zoom, key)
+                            self.assertEqual(zoom.value(), boundary)
+                        workspace.editor_window.close()
+
     def test_button_guard_does_not_read_text_during_destruction(self):
         button = QtWidgets.QPushButton("Live")
         guard = self.app._lettersmith_button_text_fit_guard
@@ -321,10 +447,10 @@ class WindowSizingTests(unittest.TestCase):
                                          sound.play_btn, sound.volume, sound.status,
                                          sound.single_action_btn if mode == 0 else sound.add_track_btn)
                                         if index == 1 else
-                                        (workspace.selector, workspace.background_button,
+                                        (workspace.selector,
                                          workspace.preview_toggle, workspace.heading,
                                          workspace.add_button) if workspace.empty.isVisibleTo(window) else
-                                        (workspace.selector, workspace.background_button,
+                                        (workspace.selector,
                                          workspace.import_button, workspace.clear_button,
                                          workspace.save_button, workspace.layout_button))
                             for control in controls:
@@ -1164,7 +1290,8 @@ class WindowSizingTests(unittest.TestCase):
                 editor = workspace.editor.editor
                 editor.moveCursor(QtGui.QTextCursor.End)
                 QtTest.QTest.keyClicks(editor, marker)
-                QtTest.QTest.mouseClick(workspace.background_button, QtCore.Qt.LeftButton)
+                QtTest.QTest.mouseClick(window.tabbar, QtCore.Qt.LeftButton,
+                                        pos=window.tabbar.tabRect(0).center())
                 self.assertEqual(window.tabbar.currentIndex(), 0)
                 self.assertEqual(session.selected_page_id, identity)
                 QtTest.QTest.mouseClick(images.pwrite_fab, QtCore.Qt.LeftButton)
