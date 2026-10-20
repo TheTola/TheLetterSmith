@@ -469,11 +469,15 @@ class SavedProjectUiTests(unittest.TestCase):
         QtTest.QTest.keyClicks(editor, " Final B")
         self.window.open_prompt_writer(page_id=self.ids[3])
         panel = self.window._prompt_writer_win
-        self.assertTrue(panel.isWindow())
+        # The restored Prompt Writer occupies the application workspace. Its
+        # pending edits must still join Save even though Messages is not visible.
+        self.assertIs(self.window.application_stack.currentWidget(), panel)
+        self.assertTrue(panel.isVisibleTo(self.window))
+        self.assertEqual(panel._view_page_id, self.ids[3])
         prompt = panel._view_spec.preview_widget
         prompt.moveCursor(QtGui.QTextCursor.End)
         QtTest.QTest.keyClicks(prompt, " Last prompt key")
-        exact = self.session.project.get_prompt(self.ids[3])["text"]
+        exact = prompt.toPlainText()
         self.assertTrue(self.ui.save())
         self.wait(lambda: not self.forge._busy)
         entry = self.forge._selected_saved_letter

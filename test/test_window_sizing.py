@@ -57,7 +57,12 @@ class WindowSizingTests(unittest.TestCase):
         )
         from sound_model import TrackRecord, processed_dir, save_library
 
-        with self.window() as window:
+        with self.window(populated=False) as window:
+            window._initialize_project_tabs()
+            self.assertFalse(window.context_footer.isVisibleTo(window))
+            window._accept_recipient("Footer validation", True)
+            self.app.processEvents()
+            self.assertTrue(window.context_footer.isVisibleTo(window))
             window.project_session.replace(create_project(
                 ["cover", "letter", "illustration", "letter", "end_page"]))
             footer = window.context_footer
@@ -66,7 +71,8 @@ class WindowSizingTests(unittest.TestCase):
                 (0, window.pages_footer), (1, window.sound_footer),
                 (2, workspace.main_style_panel), (3, window.forge_tab.hosting_status),
             ):
-                window.tabbar.setCurrentIndex(index)
+                QtTest.QTest.mouseClick(window.tabbar, QtCore.Qt.LeftButton,
+                                       pos=window.tabbar.tabRect(index).center())
                 self.settle(window)
                 self.assertIs(footer.currentWidget(), widget)
                 self.assertTrue(widget.isVisibleTo(window))
@@ -134,6 +140,13 @@ class WindowSizingTests(unittest.TestCase):
             self.assertEqual(forge.github_account_summary.text(), "Connected as synthetic-account")
             forge._apply_github_state(GitHubConnectionSnapshot(GitHubConnectionState.DISCONNECTED))
             self.assertNotIn("synthetic-account", forge.github_account_summary.text())
+            window.open_prompt_writer(page_id=window.project_session.project.pages[0]["id"])
+            self.assertIs(window.application_stack.currentWidget(), window._prompt_writer_win)
+            self.assertFalse(footer.isVisibleTo(window))
+            window._prompt_writer_win.back_button.click()
+            self.assertIs(window.application_stack.currentWidget(), window.body)
+            self.assertTrue(footer.isVisibleTo(window))
+            self.assertIs(footer.currentWidget(), forge.hosting_status)
 
     def test_context_footer_zoom_arrows_and_entry_across_themes(self):
         from project_model import create_project
@@ -321,9 +334,12 @@ class WindowSizingTests(unittest.TestCase):
                                                     (theme, (width, height), button.text(), rect))
                             elif index == 1:
                                 tab = window.sound_tab
-                                self.assertLess(tab.mode_stack.geometry().bottom(), tab.now_playing.y())
+                                # The status label now belongs to playback_panel.
+                                # Compare both controls in the tab's coordinates.
+                                now_playing_y = tab.now_playing.mapTo(tab, QtCore.QPoint()).y()
+                                self.assertLess(tab.mode_stack.geometry().bottom(), now_playing_y)
                                 play_y = tab.play_btn.mapTo(tab, QtCore.QPoint()).y()
-                                self.assertLess(tab.now_playing.geometry().bottom(), play_y)
+                                self.assertLess(now_playing_y + tab.now_playing.height(), play_y)
                                 self.assertGreaterEqual(tab.height(), tab.minimumSizeHint().height())
                             elif index == 2:
                                 self.assertFalse(window.preview_frame.isVisibleTo(window))
@@ -373,7 +389,7 @@ class WindowSizingTests(unittest.TestCase):
                             self.assertFalse(button_rect.intersects(page_rect), button_rect)
                             if index == 0:
                                 self.assertFalse(window.preview_frame.isVisibleTo(window))
-                                self.assertTrue(window.image_tab.card.isVisibleTo(window))
+                                self.assertTrue(window.image_tab.page_list.isVisibleTo(window))
                                 prompt = window.image_tab.pwrite_fab
                                 prompt_rect = QtCore.QRect(
                                     prompt.mapTo(window, QtCore.QPoint()), prompt.size(),
@@ -401,13 +417,29 @@ class WindowSizingTests(unittest.TestCase):
             modal.deleteLater()
 
     def test_sound_and_message_fit_without_panel_scrolling(self) -> None:
+        import hashlib
+        import wave
+        from sound_model import TrackRecord, processed_dir, save_library
+
         with self.window() as window:
             window.setMinimumSize(900, 480)
             sound = window.sound_tab
-            sound.single_title.setText("A long track title with spaces " * 3)
-            sound.single_detail.setText("4:30 • " + "a-long-imported-audio-filename-" * 3 + ".mp3")
-            sound.now_playing.setText("Now Playing: " + sound.single_title.text())
-            sound.create_playlist_btn.show()
+            path = processed_dir(window.project_root) / "resize-track.wav"
+            with wave.open(str(path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(8000)
+                output.writeframes(bytes(8000))
+            sound.library.records["resize-track"] = TrackRecord(
+                track_id="resize-track", content_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
+                display_title="A long track title with spaces " * 3,
+                original_name="a-long-imported-audio-filename-" * 3 + ".wav",
+                original_file=path.name, processed_file=path.name,
+                duration_seconds=0.5, added_at="2026-10-20T00:00:00+00:00",
+            )
+            sound.library.invalidate_availability()
+            save_library(window.project_root, sound.library.records)
+            sound.project_sound.set_single("resize-track")
             for theme in THEMES:
                 window.theme_service.set_theme(theme)
                 for index, mode in ((1, 0), (1, 1), (2, None)):
@@ -417,9 +449,6 @@ class WindowSizingTests(unittest.TestCase):
                             sound.project_sound.create_playlist()
                         else:
                             sound.project_sound.convert_to_single()
-                        sound.single_title.setText("A long track title with spaces " * 3)
-                        sound.single_detail.setText("4:30 • " + "a-long-imported-audio-filename-" * 3 + ".mp3")
-                        sound.now_playing.setText("Stopped: " + sound.single_title.text())
                     QtTest.QTest.qWait(300)
                     for size in ((1400, 900), (900, 480), (960, 600),
                                  (960, 516), (1024, 540), (1920, 600),
@@ -443,17 +472,16 @@ class WindowSizingTests(unittest.TestCase):
                                 self.assertFalse(window.preview_frame.isVisibleTo(window))
                                 workspace = window.message_tab.messages_workspace
                                 self.assertTrue(workspace.isVisibleTo(window))
-                            controls = ((sound.stock_btn, sound.archive_btn, sound.clear_btn,
+                            controls = ((sound.stock_btn, sound.archive_btn,
                                          sound.play_btn, sound.volume, sound.status,
-                                         sound.single_action_btn if mode == 0 else sound.add_track_btn)
+                                         *((sound.single_action_btn, sound.create_playlist_btn) if mode == 0
+                                           else (sound.add_track_btn, sound.clear_btn)))
                                         if index == 1 else
-                                        (workspace.selector,
-                                         workspace.preview_toggle, workspace.heading,
-                                         workspace.add_button) if workspace.empty.isVisibleTo(window) else
-                                        (workspace.selector,
-                                         workspace.import_button, workspace.clear_button,
-                                         workspace.save_button, workspace.layout_button))
+                                        (workspace.selector, workspace.open_editor_button,
+                                         workspace.add_button) if workspace.empty.isVisibleTo(window)
+                                        else (workspace.selector, workspace.open_editor_button))
                             for control in controls:
+                                self.assertTrue(control.isVisibleTo(window), control.accessibleName())
                                 rect = QtCore.QRect(control.mapTo(scroll.viewport(), QtCore.QPoint()), control.size())
                                 self.assertTrue(scroll.viewport().rect().contains(rect), (control, rect))
                             if index == 1:
@@ -523,6 +551,11 @@ class WindowSizingTests(unittest.TestCase):
                             self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
                             self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
                             self.assertEqual([button.font().toString() for button in buttons], fonts)
+                            for control in (tab.preview_format_label, tab.preview_mode,
+                                            tab.curtain_style_label, tab.curtain_style_selector):
+                                rect = QtCore.QRect(control.mapTo(tab.preview_format_panel, QtCore.QPoint()),
+                                                    control.size())
+                                self.assertTrue(tab.preview_format_panel.rect().contains(rect), rect)
                             for widget in (*buttons, tab.github_account_btn, tab.unpublish_btn):
                                 rect = QtCore.QRect(widget.mapTo(scroll.viewport(), QtCore.QPoint()), widget.size())
                                 self.assertTrue(scroll.viewport().rect().contains(rect), (widget.text(), rect))
@@ -551,6 +584,13 @@ class WindowSizingTests(unittest.TestCase):
             self.assertFalse(window._forge_compact_layout)
             self.assertEqual(window.body_layout.direction(), QtWidgets.QBoxLayout.TopToBottom)
             self.assertLessEqual(window.help_icon.width(), 64)
+            window.tabbar.setCurrentIndex(3)
+            tab._set_status("The preview could not be saved.", error=True, timeout_ms=0)
+            self.settle(window)
+            self.assertTrue(tab.status.isVisibleTo(window))
+            tab._set_status("Preview saved.")
+            tab._status_timer.timeout.emit()
+            self.assertFalse(tab.status.isVisibleTo(window))
 
     def test_shell_layout_hidden_pages_and_content_do_not_grow_window(self) -> None:
         with self.window() as window:
@@ -1145,7 +1185,8 @@ class WindowSizingTests(unittest.TestCase):
                                     pos=window.tabbar.tabRect(1).center())
             self.settle()
             self.assertEqual(window.tabbar.currentIndex(), 1)
-            self.assertTrue(panel.is_open)
+            self.assertFalse(panel.is_open)
+            self.assertIs(window.application_stack.currentWidget(), window.body)
             self.assertEqual(panel.txt_global.toPlainText(), "Keep this draft")
 
             panel.close()
@@ -1368,7 +1409,10 @@ class WindowSizingTests(unittest.TestCase):
             before = session.project.to_dict()
             panel._on_browser_image_ready(target_id, str(source))
             self.assertEqual(session.project.to_dict(), before)
-            self.assertIn("original page changed", panel._site_status.text())
+            self.assertEqual(
+                panel._site_status.text(),
+                "That image belongs to a page or project that has changed. Select its destination again.",
+            )
 
     def test_editor_formatting_remains_reachable_in_a_narrow_window(self) -> None:
         from Editor import Editor

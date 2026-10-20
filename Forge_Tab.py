@@ -1506,7 +1506,7 @@ class ForgeTab(QtWidgets.QWidget):
 
         self._status_timer = QtCore.QTimer(self)
         self._status_timer.setSingleShot(True)
-        self._status_timer.timeout.connect(self.status.clear)
+        self._status_timer.timeout.connect(lambda: self._set_status(""))
 
         self._github_reconnect_timer = QtCore.QTimer(self)
         self._github_reconnect_timer.setSingleShot(True)
@@ -1879,7 +1879,10 @@ class ForgeTab(QtWidgets.QWidget):
 
         self.preview_format_panel = QtWidgets.QFrame(self)
         self.preview_format_panel.setObjectName("ForgePreviewFormat")
-        self.preview_format_panel.setFixedWidth(488)
+        self.preview_format_panel.setMinimumWidth(488)
+        self.preview_format_panel.setSizePolicy(
+            QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Preferred,
+        )
         self.preview_format_panel.setStyleSheet(
             "QFrame#ForgePreviewFormat{background:rgba(13,31,40,.86);"
             "border:1px solid #315c69;border-radius:10px;}"
@@ -2060,6 +2063,7 @@ class ForgeTab(QtWidgets.QWidget):
         self.status.setStyleSheet(
             "QLabel#ForgeStatus{color:#a9c4cf;padding:3px 2px;}"
         )
+        self.status.hide()
         self._main_layout.addWidget(self.status)
         self._main_layout.addStretch(1)
         self._apply_forge_theme(CYBER_FORGE_THEME.tokens)
@@ -2093,7 +2097,10 @@ class ForgeTab(QtWidgets.QWidget):
         format_layout = self.preview_format_panel.layout()
         format_layout.setContentsMargins(11, 1 if compact else 6, 9, 1 if compact else 6)
         for index in range(format_layout.count()):
-            format_layout.itemAt(index).layout().setSpacing(0 if compact else 4)
+            controls = format_layout.itemAt(index).layout()
+            controls.setDirection(QtWidgets.QBoxLayout.LeftToRight if compact
+                                  else QtWidgets.QBoxLayout.TopToBottom)
+            controls.setSpacing(6 if compact else 4)
         self.readiness_summary.setMinimumWidth(220 if compact else 0)
         self.github_account_summary.setMinimumWidth(220 if compact else 0)
         self.github_account_summary.setMaximumWidth(max(
@@ -2108,6 +2115,7 @@ class ForgeTab(QtWidgets.QWidget):
             (self.load_stock_btn, ButtonTier.STANDARD),
             (self.unpublish_btn, ButtonTier.SMALL),
             (self.github_account_btn, ButtonTier.SMALL),
+            (self.export_btn, ButtonTier.SMALL),
         ):
             button.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, 0.65 if compact else FORGE_GEOMETRY_SCALE)
             button.apply_theme_assets()
@@ -5698,6 +5706,7 @@ class ForgeTab(QtWidgets.QWidget):
         timeout_ms: int = 4500,
     ) -> None:
         self.status.setText(message)
+        self.status.setVisible(bool(message))
         color = "#ff9a9a" if error else "#a9cbd6"
         self.status.setStyleSheet(
             f"QLabel#ForgeStatus{{color:{color};padding:3px 2px;}}"

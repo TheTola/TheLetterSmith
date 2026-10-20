@@ -37,6 +37,9 @@ ordered, horizontally scrollable playlist; Messages shows paper, opacity,
 contrast and preview zoom; Forge supplies its existing live hosting/account
 status widget. Command retains its immersive hidden status bar. Hidden footer
 views do not reserve height. These views introduce no persisted project state.
+`Nexus._sync_context_footer()` also follows the active workspace: the recipient
+screen and full-page Prompt Writer hide the authoring footer; returning to the
+main workspace restores the current tab's view.
 
 The detached LetterSmith Editor has paper, preview zoom and Normal Text Color.
 Both zoom fields use the same transient 25–200% value; unrelated preview/style

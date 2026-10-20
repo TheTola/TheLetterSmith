@@ -2843,10 +2843,23 @@ class Nexus(QtWidgets.QMainWindow):
         self.context_footer.addWidget(self.forge_tab.hosting_status)
         self.context_footer.addWidget(QtWidgets.QWidget())
         self._status.addPermanentWidget(self.context_footer, 1)
+        self.application_stack.currentChanged.connect(self._sync_context_footer)
         self.sound_tab.sound_state_changed.connect(self._refresh_sound_footer)
         self.sound_tab.library.changed.connect(self._refresh_sound_footer)
         self._refresh_pages_footer()
         self._refresh_sound_footer()
+        self._sync_context_footer()
+
+    def _sync_context_footer(self, *_args) -> None:
+        if not hasattr(self, "context_footer"):
+            return
+        index = self.tabbar.currentIndex()
+        self.context_footer.setCurrentIndex(index)
+        self.context_footer.setVisible(
+            self.project_state.is_project_ready
+            and self.application_stack.currentWidget() is self.body
+            and index != 4
+        )
 
     def _refresh_pages_footer(self) -> None:
         if not hasattr(self, "pages_footer"):
@@ -2900,6 +2913,7 @@ class Nexus(QtWidgets.QMainWindow):
             state is ApplicationState.PROJECT_READY
             and self.project_state.is_project_ready
         )
+        self._sync_context_footer()
         if not ready and self._command_immersive:
             self._set_command_immersive(False)
         self.tabbar.setVisible(ready)
@@ -3558,7 +3572,7 @@ class Nexus(QtWidgets.QMainWindow):
         else:
             self.preview_stack.setCurrentIndex(0)
 
-        self.context_footer.setCurrentIndex(idx)
+        self._sync_context_footer()
         self.help_icon.setVisible(idx != 4)
         self.help_anchor.setVisible(idx not in {0, 1, 3, 4})
         if idx == 4:
@@ -4874,7 +4888,11 @@ class Nexus(QtWidgets.QMainWindow):
                 controls_height = self.image_tab.heightForWidth(body_width)
             elif current_tab in {1, 2} and self._project_tabs_initialized:
                 tab = self.sound_tab if current_tab == 1 else self.message_tab
-                controls_height = max(tab.minimumSizeHint().height(), tab.heightForWidth(body_width)) + 4
+                scroll = self.sound_controls_scroll if current_tab == 1 else self.message_controls_scroll
+                # An existing scrollbar narrows wrapped labels during resize.
+                # Fit that actual width before reclaiming space for the preview.
+                controls_width = min(body_width, scroll.viewport().width())
+                controls_height = max(tab.minimumSizeHint().height(), tab.heightForWidth(controls_width)) + 4
             preview_budget = max(
                 1, body_height - tools_height - caption_height - gaps
                 - controls_height - PREVIEW_FRAME_EXTRA,
