@@ -241,10 +241,6 @@ class ImageTab(_ImagesWorkspace):
         actions = QtWidgets.QHBoxLayout()
         actions.addStretch()
         actions.addWidget(self.add_button)
-        self.page_actions_button = QtWidgets.QPushButton("Page actions")
-        self.page_actions_button.setAccessibleName("Actions for selected page")
-        self.page_actions_button.clicked.connect(self._show_selected_page_menu)
-        actions.addWidget(self.page_actions_button)
         actions.addStretch()
         identity_panel_layout.addLayout(actions)
         self._header_layout.addWidget(self._identity_panel, 0, 1, QtCore.Qt.AlignCenter)
@@ -310,11 +306,6 @@ class ImageTab(_ImagesWorkspace):
     def _choose_page(self, identity):
         if not self._shutdown and self.isVisible() and self._select_for_action(identity):
             self._run(self._stock_selected)
-
-    def _show_selected_page_menu(self):
-        menu = self._page_menu(self.session.selected_page_id)
-        menu.exec(self.page_actions_button.mapToGlobal(self.page_actions_button.rect().bottomLeft()))
-        menu.deleteLater()
 
     def _page_menu(self, identity):
         menu = QtWidgets.QMenu(self)

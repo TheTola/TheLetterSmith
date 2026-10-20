@@ -36,7 +36,7 @@ or validation.
   visible selection/focus, and themed thumbnail grids replace the older plain
   strip/popup presentation. The popup supports ten choices and keyboard activation.
   Stock labels use current type names rather than legacy stock filenames.
-- The visible Page actions menu retains import, crop, GIF settings, clear artwork,
+- The page context menu retains import, crop, GIF settings, clear artwork,
   prompt/message routes, move, add, delete, and undo; it also restores access to
   canonical Duplicate page and Open Artwork Folder operations.
 
@@ -134,3 +134,47 @@ ten-image picker with a single click and dismissing it with Escape. Screenshots:
 All verification used isolated profiles. The final review window remains open;
 its exit was canceled to preserve changes made during review. Unrelated
 application instances were not touched.
+
+## Minimalism and unique history refinement
+
+Baseline: `main` at `b3386138f9cf380a0a834bfa878225ac76394089`.
+Existing Prompt Writer changes were preserved. The shared Foundation contract
+now records “Minimalist wherever possible”: preserve capabilities and remove
+redundant controls. The Images Page actions button and its duplicate launcher
+were removed; the existing right-click menu and its operations remain.
+
+Recent images now compare decoded content, not filenames or encoded file bytes.
+Equivalent PNG compression/metadata and GIF comments cannot create duplicate
+choices. Each category independently keeps ten unique images, newest first;
+reusing one moves it to the front, while different images with the same filename
+remain separate. GIF comparison includes every frame, duration and loop count.
+Existing duplicate lists are filtered on read without rewriting their file.
+The bounded comparison cache uses file-change metadata to detect replacements.
+The shared history format, project artwork and source resources are unchanged.
+
+Production changes: `images_grid.py`, `recent_media.py`. Existing regression
+files updated: `test/test_images_strip.py`, `test/test_image_animation.py`,
+`test/test_images_launcher_layout.py`. Documentation: this handoff and
+`docs/foundation-contract.md`.
+
+Baseline Images strip/animation checks: 64 passed. Three new content-comparison
+regressions reproduced the old behavior before the fix and passed afterward.
+An intermediate combined run hit a native Qt access violation during
+`QListWidget.clear()` in the existing project-replacement regression; its isolated
+rerun passed. Logs are retained under
+`C:/Temp/lettersmith-minimalism-20261020/verified/`; that run is not a passing
+verification result.
+
+Final command after the implementation and layout expectations were updated:
+
+```powershell
+.venv/Scripts/python.exe release/verify_tests.py --output C:/Temp/lettersmith-minimalism-20261020/final --module test_images_strip --module test_images_workspace --module test_images_launcher_layout --module test_image_animation --module test_restored_workspaces.RestoredWriterTests.test_type_history_is_limited_and_independent_of_page_identity
+```
+
+**97 passed, zero failures/errors/skips** (19 + 27 + 2 + 48 + 1). The complete
+strip suite, including the replacement regression, passed on this final run.
+Tests exercise real service/import/widget routes in isolated offscreen processes,
+including all installed themes and window sizing. No new native desktop,
+packaged-app or macOS check was performed for this refinement. `git diff --check`
+passed. This refinement's delivery includes only the seven files listed above;
+concurrent Prompt Writer changes are excluded.

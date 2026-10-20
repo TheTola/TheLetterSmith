@@ -82,8 +82,7 @@ class ImagesLauncherLayoutTests(unittest.TestCase):
                         scroll = window.image_controls_scroll
                         self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
                         self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
-                        for control in (tab.pwrite_fab, tab.name_edit, tab.type_combo, tab.add_button,
-                                        tab.page_actions_button):
+                        for control in (tab.pwrite_fab, tab.name_edit, tab.type_combo, tab.add_button):
                             rect = QtCore.QRect(control.mapTo(scroll.viewport(), QtCore.QPoint()), control.size())
                             self.assertTrue(scroll.viewport().rect().contains(rect), (control.accessibleName(), rect))
                         self.assertEqual(tab.page_list.viewMode(), QtWidgets.QListView.IconMode)

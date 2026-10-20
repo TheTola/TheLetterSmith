@@ -1095,7 +1095,7 @@ class ImageAnimationTests(unittest.TestCase):
             tab.show()
             self.app.processEvents()
             artwork = QtCore.QRect(tab.page_list.mapTo(tab, QtCore.QPoint()), tab.page_list.size())
-            for button in (tab.add_button, tab.page_actions_button):
+            for button in (tab.add_button,):
                 bounds = QtCore.QRect(button.mapTo(tab, QtCore.QPoint()), button.size())
                 self.assertTrue(button.isVisibleTo(tab))
                 self.assertFalse(bounds.intersects(artwork))

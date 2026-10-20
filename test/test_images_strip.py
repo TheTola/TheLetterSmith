@@ -4,6 +4,7 @@ from unittest import mock
 from pathlib import Path
 
 from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
 from project_model import MAX_PAGES, PAGE_TYPES, create_project
@@ -70,6 +71,82 @@ class ImagesStripTests(unittest.TestCase):
         self.assertEqual(self.session.project.to_dict(), project)
         self.assertEqual(recent_media(self.root, self.session.project.project_id, "music"), (("track", "Track"),))
 
+    def test_recent_images_deduplicate_content_without_collapsing_same_filenames(self):
+        original = self.image("same.png", "gold")
+        renamed = self.root / "renamed.png"
+        renamed.write_bytes(original.read_bytes())
+        reencoded = self.root / "different-encoding.png"
+        metadata = PngInfo()
+        metadata.add_text("Description", "Same artwork, different metadata")
+        with Image.open(original) as image:
+            image.save(reencoded, compress_level=0, pnginfo=metadata)
+        self.assertNotEqual(original.read_bytes(), reencoded.read_bytes())
+        other_folder = self.root / "other"
+        other_folder.mkdir()
+        different = other_folder / original.name
+        Image.new("RGB", (160, 240), "navy").save(different)
+        expected = {}
+        for kind in PAGE_TYPES:
+            with self.subTest(kind=kind):
+                remember_type_image(self.root, kind, original, "First")
+                remember_type_image(self.root, kind, different, "Different artwork")
+                for source in (original, renamed, reencoded, renamed, original):
+                    remember_type_image(self.root, kind, source, "Used again")
+                    history = recent_type_images(self.root, kind)
+                    self.assertEqual([label for _, label in history], ["Used again", "Different artwork"])
+                    with Image.open(history[0][0]) as image:
+                        self.assertEqual(image.convert("RGB").getpixel((0, 0)), (255, 215, 0))
+                    with Image.open(history[1][0]) as image:
+                        self.assertEqual(image.convert("RGB").getpixel((0, 0)), (0, 0, 128))
+                expected[kind] = history
+                self.assertEqual({key: recent_type_images(self.root, key) for key in expected}, expected)
+        self.session.replace(create_project(), asset_root=self.root)
+        self.assertEqual({kind: recent_type_images(self.root, kind) for kind in PAGE_TYPES}, expected)
+        self.assertTrue(all(path.is_file() for path in (original, renamed, reencoded, different)))
+
+    def test_existing_duplicate_history_is_filtered_without_rewriting_or_deleting_files(self):
+        import json
+        from recent_media import _history_path, _TYPE_HISTORY_ID
+        original = self.image("original.png", "gold")
+        duplicate = self.image("duplicate.png", "gold")
+        older = self.image("older.png", "navy")
+        values = [{"value": str(path), "label": label} for path, label in
+                  ((duplicate, "Newest"), (original, "Repeated"), (older, "Older"))]
+        history_file = _history_path(self.root)
+        history_file.parent.mkdir(parents=True, exist_ok=True)
+        history_file.write_text(json.dumps({_TYPE_HISTORY_ID: {"image:cover": values}}), encoding="utf-8")
+        saved = history_file.read_bytes()
+        self.assertEqual(recent_type_images(self.root, "cover"),
+                         ((str(duplicate), "Newest"), (str(older), "Older")))
+        self.assertEqual(history_file.read_bytes(), saved)
+        self.assertTrue(all(path.is_file() for path in (original, duplicate, older)))
+        Image.new("RGB", (160, 240), "green").save(duplicate)
+        self.assertEqual(recent_type_images(self.root, "cover"),
+                         ((str(duplicate), "Newest"), (str(original), "Repeated"), (str(older), "Older")))
+        self.assertEqual(history_file.read_bytes(), saved)
+
+    def test_animation_deduplication_uses_every_frame_and_playback_timing(self):
+        red, blue, green = (Image.new("RGB", (24, 36), color) for color in ("red", "blue", "green"))
+        sources = []
+        for name, last, duration, loop in (("first.gif", blue, 90, 0),
+                                           ("different-frame.gif", green, 90, 0),
+                                           ("different-timing.gif", blue, 180, 0),
+                                           ("different-loop.gif", blue, 90, 2)):
+            path = self.root / name
+            red.save(path, save_all=True, append_images=[last], duration=duration, loop=loop)
+            sources.append(path)
+            remember_type_image(self.root, "illustration", path, name)
+        duplicate = self.root / "renamed.gif"
+        red.save(duplicate, save_all=True, append_images=[blue], duration=90, loop=0,
+                 comment=b"Same animation with different metadata")
+        self.assertNotEqual(duplicate.read_bytes(), sources[0].read_bytes())
+        remember_type_image(self.root, "illustration", duplicate, "Used again")
+        history = recent_type_images(self.root, "illustration")
+        self.assertEqual([label for _, label in history],
+                         ["Used again", "different-loop.gif", "different-timing.gif", "different-frame.gif"])
+        with Image.open(history[0][0]) as image:
+            self.assertEqual(image.n_frames, 2)
+
     def test_every_same_type_page_uses_shared_history_then_its_three_stock_images(self):
         from Image_tab import STOCK_IMAGE_FILES
         from page_layout import PAGE_INDICES
@@ -132,7 +209,8 @@ class ImagesStripTests(unittest.TestCase):
                                    pos=view.visualItemRect(view.item(1)).center())
             self.wait_for(lambda: bool(chosen) and self.tab._image_import_thread is None)
         self.assertEqual(chosen, [choices[9][0]])
-        self.assertEqual(recent_type_images(self.root, "letter")[0][1], "Choice 0")
+        self.assertEqual([label for _, label in recent_type_images(self.root, "letter")],
+                         ["Choice 0", *[f"Choice {i}" for i in reversed(range(1, 10))]])
         with Image.open(self.tab.artwork.resolve_asset(self.first)) as imported:
             self.assertEqual(imported.size, expected_size)
             self.assertEqual(imported.convert("RGB").tobytes(), expected_pixels)
@@ -223,7 +301,8 @@ class ImagesStripTests(unittest.TestCase):
         menu = self.tab._page_menu(self.first)
         actions = {action.text(): action for action in menu.actions()}
         for label in ("Import image…", "Stock & recent images…", "Crop image…",
-                      "Clear page artwork", "Delete page…", "Add page"):
+                      "Clear page artwork", "Delete page…", "Add page", "Prompt Writer",
+                      "Edit letter text", "Move left", "Move right"):
             self.assertIn(label, actions)
         self.assertIn("Duplicate page", actions)
         self.assertIn("Open Artwork Folder", actions)
@@ -271,6 +350,8 @@ class ImagesStripTests(unittest.TestCase):
             self.assertLess(rect.bottom(), strip_y)
         self.assertLess(self.tab.pwrite_fab.x(), self.tab.name_edit.x())
         self.assertTrue(self.tab.add_button.isVisibleTo(self.tab))
+        self.assertFalse(any(button.text() == "Page actions"
+                             for button in self.tab.findChildren(QtWidgets.QAbstractButton)))
         for button in (self.tab.import_button, self.tab.stock_button, self.tab.crop_button,
                        self.tab.duplicate_button, self.tab.delete_button, self.tab.more_button,
                        self.tab.undo_button):

@@ -1,5 +1,12 @@
 # Flexible page foundation contract
 
+## Core design principle
+
+Minimalist wherever possible. Preserve useful functionality while removing
+redundant entry points, unnecessary complexity and wasted space. Review duplicate
+controls before retaining both; keep secondary actions in their existing context
+menus and preserve keyboard access, visible focus and clear action scope.
+
 ## UI & Synchronization contract extension — 2026-10-17
 
 The combined shell uses one `ProjectSession`. Authoring selection is

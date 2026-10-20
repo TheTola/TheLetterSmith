@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import hashlib
+from functools import lru_cache
 from pathlib import Path
 from threading import RLock
 from uuid import UUID
+
+from PIL import Image, ImageOps
 
 from project_paths import application_paths
 from transactional_io import atomic_copy_file, atomic_write_json
@@ -63,7 +66,31 @@ def _load(path: Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _unique_entries(values: list, limit: int = _LIMIT) -> list[dict[str, str]]:
+@lru_cache(maxsize=128)
+def _image_content_key(path: str, size: int, modified: int, changed: int) -> str:
+    """Compare decoded artwork, retaining animation frames, timing and loops.
+
+    File stats invalidate the bounded cache after same-path replacement; PNG/GIF
+    comments and compression do not make otherwise identical artwork distinct.
+    """
+    digest = hashlib.sha256()
+    with Image.open(path) as image:
+        frames = getattr(image, "n_frames", 1)
+        digest.update(str(frames).encode("ascii") + b"\0")
+        if frames > 1:
+            digest.update(str(image.info.get("loop")).encode("ascii") + b"\0")
+        for index in range(frames):
+            image.seek(index)
+            pixels = ImageOps.exif_transpose(image).convert("RGBA")
+            digest.update(pixels.width.to_bytes(8, "big"))
+            digest.update(pixels.height.to_bytes(8, "big"))
+            digest.update(pixels.tobytes())
+            if frames > 1:
+                digest.update(str(image.info.get("duration", 0)).encode("ascii") + b"\0")
+    return digest.hexdigest()
+
+
+def _unique_entries(values: list, limit: int = _LIMIT, *, image_content: bool = False) -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
     seen: set[str] = set()
     for item in values:
@@ -73,9 +100,17 @@ def _unique_entries(values: list, limit: int = _LIMIT) -> list[dict[str, str]]:
         label = item.get("label")
         if not isinstance(value, str) or not value or not isinstance(label, str):
             continue
-        if value in seen:
+        key = value
+        if image_content:
+            try:
+                path = Path(value).resolve(strict=True)
+                stat = path.stat()
+                key = _image_content_key(str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+                continue
+        if key in seen:
             continue
-        seen.add(value)
+        seen.add(key)
         entries.append({"value": value, "label": label})
         if len(entries) == limit:
             break
@@ -97,7 +132,8 @@ def recent_media(
         return ()
     return tuple(
         (item["value"], item["label"])
-        for item in _unique_entries(values, _entry_limit(project_id, slot))
+        for item in _unique_entries(values, _entry_limit(project_id, slot),
+                                    image_content=project_id == _TYPE_HISTORY_ID and slot.startswith("image:"))
     )
 
 
@@ -121,7 +157,8 @@ def remember_media(
         if not isinstance(old, list):
             old = []
         project[slot] = _unique_entries(
-            [{"value": value, "label": label}, *old], _entry_limit(project_id, slot)
+            [{"value": value, "label": label}, *old], _entry_limit(project_id, slot),
+            image_content=project_id == _TYPE_HISTORY_ID and slot.startswith("image:")
         )
         payload[project_id] = project
         path.parent.mkdir(parents=True, exist_ok=True)
