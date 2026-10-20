@@ -979,12 +979,9 @@ class MessageTab(QtWidgets.QWidget):
                 font.setPointSizeF(font.pointSizeF() + 1.0)
                 control.setFont(font)
 
-        # Identity changes are committed with Enter, never just by tabbing away.
-        from url_reachability import UrlReachabilityChecker
-        self._url_checker = UrlReachabilityChecker(self)
-        self._url_checker.finished.connect(self._manual_url_checked)
-        self._pending_identity_commit = None
-        self._validated_manual_url = None
+        self.title_input.editingFinished.connect(self._save_settings)
+        self.name_input.editingFinished.connect(self._save_settings)
+        self.url_input.editingFinished.connect(self._save_settings)
         shell.addWidget(self.title_recipient_container)
 
         shell.addWidget(self._build_message_overlay_controls())
@@ -1069,9 +1066,12 @@ class MessageTab(QtWidgets.QWidget):
         if session is not None:
             from floating_messages import MessagesWorkspace
             self.message_content_shell.hide()
-            layout.insertWidget(0, self.title_recipient_container)
-            self.title_recipient_container.show()
-            layout.insertWidget(1, self.status)
+            self.project_details_toggle = QtWidgets.QPushButton("Project title and recipient")
+            self.project_details_toggle.setCheckable(True)
+            self.project_details_toggle.toggled.connect(self.title_recipient_container.setVisible)
+            layout.insertWidget(0, self.project_details_toggle, 0, Qt.AlignLeft)
+            layout.insertWidget(1, self.title_recipient_container)
+            self.title_recipient_container.hide()
             spacer = layout.takeAt(layout.count() - 1)
             del spacer
             self.messages_workspace = MessagesWorkspace(self, session)
@@ -1360,7 +1360,7 @@ class MessageTab(QtWidgets.QWidget):
             if target == "message":
                 self.open_editor()
                 return
-            self.title_recipient_container.show()
+            self.project_details_toggle.setChecked(True)
         widget = {
             "recipient": self.name_input,
             "title": self.title_input,
@@ -1374,7 +1374,7 @@ class MessageTab(QtWidgets.QWidget):
     # Nexus / Over_Nexus hooks
     # ──────────────────────────────────────────────────────────────────
     def toggle_title_recipient_area(self) -> None:
-        self.title_recipient_container.show()
+        self.title_recipient_container.setVisible(not self.title_recipient_container.isVisible())
 
     def open_message_editor(self) -> None:
         self.open_editor()
@@ -1715,50 +1715,12 @@ class MessageTab(QtWidgets.QWidget):
                 "Published Page URL must be a valid HTTP or HTTPS address."
             )
             return
-        url_field = getattr(self, "url_input", None)
-        if url_field is not None:
-            raw_url = url_field.text().strip()
-            url = _normalize_published_page_url(raw_url)
-            if raw_url and not url:
-                self.status.setText("Published Page URL must be a valid HTTP or HTTPS address.")
-                return
-            saved_url = normalize_published_page_url(self.settings_store.get(PUBLISHED_PAGE_URL_KEY, ""))
-            if url and url != saved_url and url != self._validated_manual_url:
-                values = (self.title_input.text(), self.name_input.text(), url_field.text())
-                self._pending_identity_commit = (url, field_name, values, self.project_state.identity.project_id)
-                self.status.setText("Checking the URL…")
-                self._url_checker.check(url)
-                return
         if not self._save_settings():
             return
-        for name, candidate in (("title", getattr(self, "title_input", None)),
-                                ("recipient", getattr(self, "name_input", None)),
-                                ("published_url", url_field)):
-            if candidate is not None:
-                locked = bool(candidate.text().strip())
-                candidate.setReadOnly(locked)
-                self.settings[IDENTITY_LOCK_KEYS[name]] = locked
-                self._style_identity_field(candidate)
         field.setReadOnly(True)
         self.settings[IDENTITY_LOCK_KEYS[field_name]] = True
         if self._persist_settings(announce=False):
             self._style_identity_field(field)
-
-    def _manual_url_checked(self, url: str, accepted: bool) -> None:
-        pending, self._pending_identity_commit = self._pending_identity_commit, None
-        if pending is None or pending[0] != url:
-            return
-        values = (self.title_input.text(), self.name_input.text(), self.url_input.text())
-        if values != pending[2] or self.project_state.identity.project_id != pending[3]:
-            self.status.setText("Details changed during the URL check. Press Enter to save them.")
-            return
-        if not accepted:
-            self.status.setText("The URL could not be reached. Check the address and your connection, then press Enter again. The saved URL is unchanged.")
-            return
-        self._validated_manual_url = url
-        field = {"title": self.title_input, "recipient": self.name_input,
-                 "published_url": self.url_input}[pending[1]]
-        self._commit_identity_field(field, pending[1])
 
     def reset_identity_locks(self) -> None:
         """Clear identity fields and leave all three controls editable."""
@@ -1843,15 +1805,6 @@ class MessageTab(QtWidgets.QWidget):
         return True
 
     def _save_settings(self) -> bool:
-        raw_url = self.url_input.text().strip()
-        candidate_url = _normalize_published_page_url(raw_url)
-        saved_url = normalize_published_page_url(self.settings.get(PUBLISHED_PAGE_URL_KEY, ""))
-        if raw_url and not candidate_url:
-            self.status.setText("Published Page URL must be a valid HTTP or HTTPS address.")
-            return False
-        if candidate_url and candidate_url != saved_url and candidate_url != getattr(self, "_validated_manual_url", None):
-            self.status.setText("Press Enter to check and save the URL.")
-            return False
         recipient = self.name_input.text().strip()
         title = self.title_input.text().strip()
         current_recipient = (
@@ -1974,18 +1927,6 @@ class MessageTab(QtWidgets.QWidget):
         else:
             self.settings = self.settings_store.snapshot()
             self.settings[PUBLISHED_PAGE_URL_KEY] = normalized_url
-        checker = getattr(self, "_url_checker", None)
-        if checker is not None:
-            checker.cancel()
-            self._pending_identity_commit = None
-            self._validated_manual_url = None
-        if hasattr(self, "url_input"):
-            self.url_input.setReadOnly(bool(normalized_url))
-            self.settings[IDENTITY_LOCK_KEYS["published_url"]] = bool(normalized_url)
-            MessageTab._style_identity_field(self.url_input)
-            store = getattr(self, "settings_store", None)
-            if store is not None:
-                store.update_fields({IDENTITY_LOCK_KEYS["published_url"]: bool(normalized_url)})
         self.published_page_url_changed.emit(normalized_url)
         return True
 
@@ -2632,8 +2573,6 @@ class MessageTab(QtWidgets.QWidget):
         self.status.setText("No message selected.")
 
     def shutdown(self, timeout_ms: int = 5000) -> bool:
-        self._url_checker.cancel()
-        self._pending_identity_commit = None
         if getattr(self, "messages_workspace", None) is not None:
             return self.messages_workspace.shutdown() and self._stop_message_import(timeout_ms)
         self._overlay_render_timer.stop()
