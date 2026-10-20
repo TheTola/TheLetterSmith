@@ -11,6 +11,7 @@ import hashlib
 import html
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import tempfile
@@ -357,8 +358,6 @@ def validate_render(render: RenderInput) -> tuple[RenderIssue, ...]:
                 issue("unsupported_message_settings", "Unsupported message settings: " + ", ".join(sorted(unknown)), "messages")
             try:
                 value, _ = _message_sources(render, page)
-                if not message_plain_text(value).strip() and "<img" not in value:
-                    issue("empty_message", "Letter message is empty.", "messages", preview=False)
                 missing_fonts = [family for family in extract_font_families(value)
                                  if not inspect_font_family(render.presentation_root or render.project_root, family).faces]
                 if missing_fonts:
@@ -472,6 +471,9 @@ def build_render_to(render: RenderInput, destination, *, seed_sfx=True, reuse_pl
         if animation:
             animations[str(index)] = animation
         message_html, sources = _message_sources(render, page) if page.get("message") is not None else ("", {})
+        from message_format import message_plain_text
+        if not message_plain_text(message_html).strip() and not re.search(r'<img\b', message_html, re.I):
+            message_html = ''
         resource_map = {}
         for reference, resource in sources.items():
             name = hashlib.sha256(resource.read_bytes()).hexdigest()[:24] + resource.suffix.lower()

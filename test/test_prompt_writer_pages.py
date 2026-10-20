@@ -151,7 +151,7 @@ class PromptWriterPageTests(unittest.TestCase):
         self.session.project.rename_page(b, 'Repeated name')
         self.session.project.reorder_pages(list(reversed(self.ids)))
         self.assertEqual(self.panel.target_selector.currentData(), a)
-        self.assertIn('Page 4', self.panel.target_selector.currentText())
+        self.assertEqual(self.panel.target_selector.currentText(), 'Repeated name')
         self.assertTrue(self.panel.persist_project_state())
         self.panel._on_close()
         self.panel.reload_project_state()

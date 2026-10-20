@@ -292,17 +292,73 @@ class StaticFab(QtWidgets.QToolButton):
         self._surface = surface
 
         self.setObjectName("PWriteFab")
+        self.setText("Prompt Writer")
+        self.setAccessibleName("Prompt Writer")
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setCursor(QtCore.Qt.PointingHandCursor)
         self.setAutoRaise(True)
         self.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
         self.setFixedSize(200, 200)
-        self.setStyleSheet(
-            "#PWriteFab {"
-            "background: transparent;"
-            "border: none;"
-            "padding: 0;"
-            "}"
+        self.setStyleSheet('#PWriteFab {background:transparent; border:none; padding:0;}')
+        self._press_scale = 1.0
+        self._press_animation = QtCore.QVariantAnimation(self)
+        self._press_animation.setDuration(110)
+        self._press_animation.valueChanged.connect(self._set_press_scale)
+        self.pressed.connect(lambda: self._animate_press(0.94))
+        self.released.connect(lambda: self._animate_press(1.0))
+
+    def _animate_press(self, value):
+        self._press_animation.stop()
+        self._press_animation.setStartValue(self._press_scale)
+        self._press_animation.setEndValue(value)
+        self._press_animation.start()
+
+    def _set_press_scale(self, value):
+        self._press_scale = float(value)
+        self.update()
+
+    def paintEvent(self, event):
+        if self.icon().isNull():
+            return super().paintEvent(event)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+        side = int(min(self.width(), self.height()) * self._press_scale)
+        rect = QtCore.QRect(0, 0, side, side)
+        rect.moveCenter(self.rect().center() + QtCore.QPoint(0, 2 if self.isDown() else 0))
+        self.icon().paint(painter, rect, QtCore.Qt.AlignCenter,
+                          QIcon.Normal if self.isEnabled() else QIcon.Disabled)
+        if self.hasFocus() and self.testAttribute(QtCore.Qt.WA_KeyboardFocusChange):
+            painter.setPen(QtGui.QPen(self.palette().highlight().color(), 2))
+            painter.drawLine(self.width()//3, self.height()-3, self.width()*2//3, self.height()-3)
+
+    def set_artwork_size(self, size: int) -> None:
+        self._artwork_size = size
+        self.setFixedSize(size, size)
+        self.setIconSize(QSize(size - 8, size - 8))
+
+    def apply_theme_assets(self, theme_service=None, project_root=None) -> None:
+        baseline = application_paths(project_root).app_resource_path(
+            "themes/cyber_forge/prompt_writer/Pwrite.png"
         )
+        path = baseline
+        resolver = getattr(theme_service, "resolve_asset", None)
+        if callable(resolver):
+            try:
+                path = Path(resolver("prompt_writer/Pwrite.png"))
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
+        pixmap = QtGui.QPixmap(str(path))
+        if pixmap.isNull() and path != baseline:
+            pixmap = QtGui.QPixmap(str(baseline))
+        # The shared text-fit guard also measures hidden icon-only text. Keep
+        # the accessible name, but supply a visible label only for the fallback.
+        self.setText("Prompt\nWriter" if pixmap.isNull() else "")
+        self.setIcon(QIcon(pixmap))
+        self.setToolButtonStyle(
+            QtCore.Qt.ToolButtonTextOnly if pixmap.isNull()
+            else QtCore.Qt.ToolButtonIconOnly
+        )
+        self.set_artwork_size(getattr(self, "_artwork_size", 152))
 
     def set_surface(self, surface: QtWidgets.QWidget) -> None:
         self._surface = surface
@@ -1832,4 +1888,4 @@ class ImageSettingsDialog(LetterSmithDialog):
 
 
 # Keep the established public entry point; media widgets above are shared.
-from images_workspace import ImageTab
+from images_grid import ImageTab

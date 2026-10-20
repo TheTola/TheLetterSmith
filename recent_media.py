@@ -14,6 +14,16 @@ from transactional_io import atomic_copy_file, atomic_write_json
 
 _LOCK = RLock()
 _LIMIT = 3
+_TYPE_HISTORY_ID = "a406f198-533b-4d72-8777-a79b7dd8b061"
+
+
+def recent_type_images(project_root, page_type):
+    """The last three images used for this artwork type, across projects."""
+    return recent_media(project_root, _TYPE_HISTORY_ID, f"image:{page_type}")
+
+
+def remember_type_image(project_root, page_type, source, label):
+    remember_image_copy(project_root, _TYPE_HISTORY_ID, page_type, source, label)
 
 
 def _history_path(project_root: str | Path) -> Path:

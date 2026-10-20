@@ -10,9 +10,11 @@ from project_model import PAGE_TYPES, ProjectModel
 
 def page_label(project, page_id):
     page = project.get_page(page_id)
-    position = project.prompt_context(page_id)["position"]
-    name = f"{page['name']} · " if page["name"] else ""
-    return f"Page {position} of {len(project.pages)} — {name}{PAGE_TYPES[page['type']].label}"
+    kind = PAGE_TYPES[page["type"]].label
+    if page["name"] and page["name"] != kind:
+        return page["name"]
+    peers = [item for item in project.pages if item["type"] == page["type"]]
+    return kind if len(peers) == 1 else f"{kind} {next(i for i, item in enumerate(peers, 1) if item['id'] == page_id)}"
 
 
 def compose_page(project, page_id, resolved, guidance_phrases):

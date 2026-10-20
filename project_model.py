@@ -860,8 +860,6 @@ class ProjectModel:
                 issues.append(ValidationIssue("unsupported_layout" if error.field == "message_layout" else "unsupported_placement", str(error), page["id"]))
             if not page["artwork"].get("asset"):
                 issues.append(ValidationIssue("missing_artwork", "Page has no artwork", page["id"]))
-            if page["message"] is not None and not page["message"]["html"].strip():
-                issues.append(ValidationIssue("empty_message", "Letter message is empty", page["id"]))
         return tuple(issues)
 
     @_reading

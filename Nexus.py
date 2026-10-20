@@ -3320,6 +3320,12 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _apply_tab_state(self, idx: int, *, animate_page: bool) -> None:
         """Apply the complete settled UI state for one tab."""
+        writer = getattr(self, '_prompt_writer_win', None)
+        if writer is not None and self.application_stack.currentWidget() is writer:
+            if writer.close_with_anim() is False:
+                with QtCore.QSignalBlocker(self.tabbar):
+                    self.tabbar.setCurrentIndex(self.page_stack.currentIndex())
+                return
         old_idx = self.page_stack.currentIndex()
         workspace = getattr(getattr(self, "message_tab", None), "messages_workspace", None)
         if idx == 2 and old_idx != 2 and workspace is not None and not workspace.open_page(None):
@@ -5444,7 +5450,7 @@ class Nexus(QtWidgets.QMainWindow):
 
         # In-process overlay panel
         try:
-            from PromptWriterPanel import PromptWriterPanel  # local module in project root
+            from prompt_writer_workspace import PromptWriterPanel
             w = PromptWriterPanel(
                 self,
                 project_root=self.project_root,
@@ -5506,6 +5512,8 @@ class Nexus(QtWidgets.QMainWindow):
         panel = self._prompt_writer_win
         if panel is not None and panel._browser is not browser:
             panel.attach_browser(browser, self.image_tab)
+        if panel is not None:
+            panel._show_conversation()
 
     def _on_prompt_writer_destroyed(self, panel: QtWidgets.QWidget) -> None:
         if self._prompt_writer_win is panel:

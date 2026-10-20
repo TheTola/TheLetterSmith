@@ -936,10 +936,11 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             message_item = next(
                 item for item in readiness.items if item.key.endswith(":message")
             )
-            self.assertFalse(message_item.ready)
+            # Empty letter text is valid: the page is artwork without an overlay.
+            self.assertTrue(message_item.ready)
             self.assertTrue(message_item.required)
             self.assertTrue(readiness.can_preview)
-            self.assertFalse(readiness.can_publish)
+            self.assertTrue(readiness.can_publish)
 
             saved = service.save_workspace_snapshot(reason="tab-switch")
 
@@ -2619,16 +2620,15 @@ class CanonicalReadinessTests(unittest.TestCase):
         self.assertEqual([item.correction_target for item in messages],
                          [letters[1]["id"], letters[0]["id"]])
 
-    def test_empty_message_allows_preview_but_blocks_final_output(self) -> None:
+    def test_empty_message_allows_artwork_only_final_output(self) -> None:
         page = self.session.project.pages[3]
         self.session.project.update_message(page["id"], {**page["message"], "html": ""})
         result = evaluate_readiness(self.root)
         item = next(item for item in result.items if item.key == f"page:{page['id']}:message")
-        self.assertFalse(item.ready)
+        self.assertTrue(item.ready)
         self.assertEqual(item.correction_target, page["id"])
         self.assertTrue(result.can_preview)
-        self.assertFalse(result.can_publish)
-        self.assertIn("Preview Only", result.status)
+        self.assertTrue(result.can_publish)
         self.assertEqual(self.session.project.get_message(page["id"])["html"], "")
 
     def test_missing_artwork_has_page_specific_image_correction(self) -> None:

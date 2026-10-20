@@ -107,6 +107,8 @@ class PromptWriterBrowser(QtCore.QObject):
         self._pending_prompt = ""
         self._pending_callback: Callable[[bool, str], None] | None = None
         self._submission_checks = 0
+        from browser_image_actions import ImageActions
+        self.image_actions = ImageActions(self)
 
     def select(self, provider: str) -> None:
         if provider not in PROVIDER_URLS:
@@ -124,21 +126,23 @@ class PromptWriterBrowser(QtCore.QObject):
     def set_approval_target(self, page_key: str, label: str) -> None:
         self._approval_target = page_key
         self.view.approval_label = label
+        self.image_actions.set_target(page_key, label)
         for popup in self._popups:
             for view in popup.findChildren(_ProviderView):
                 view.approval_label = label
 
-    def _approve_image_url(self, url: str, page: QWebEnginePage) -> None:
+    def _approve_image_url(self, url: str, page: QWebEnginePage, *, target: str | None = None) -> None:
         image_url = QUrl(url)
-        if not self._approval_target or image_url.scheme().lower() not in {"blob", "http", "https"}:
+        target = target or self._approval_target
+        if not target or image_url.scheme().lower() not in {"blob", "http", "https"}:
             self.imageFailed.emit("Choose a generated image in the conversation first.")
             return
         if self._pending_image is not None or self._active_image_download is not None:
             self.imageFailed.emit("Wait for the current image to finish saving.")
             return
-        pending = (self._approval_target, image_url.toString(), page)
+        pending = (target, image_url.toString(), page)
         self._pending_image = pending
-        self.imageApprovalStarted.emit(self._approval_target)
+        self.imageApprovalStarted.emit(target)
         try:
             page.download(image_url)
         except Exception as error:

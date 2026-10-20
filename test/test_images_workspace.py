@@ -95,7 +95,8 @@ class ImagesWorkspaceTests(unittest.TestCase):
                 for index in range(self.tab.page_list.count())]
 
     def row_text(self, page_id):
-        return self.tab.page_list.item(self.list_ids().index(page_id)).text()
+        item = self.tab.page_list.item(self.list_ids().index(page_id))
+        return item.text() + '\n' + (item.data(QtCore.Qt.UserRole+2) or '')
 
     def import_and_wait(self, page_id, path):
         self.assertTrue(self.tab.import_image(page_id, str(path)))
@@ -133,11 +134,80 @@ class ImagesWorkspaceTests(unittest.TestCase):
             self.assertEqual(self.page(page_id)["message"], empty_message() if kind == "letter" else None)
         self.assertEqual(len(self.list_ids()), 9)
 
+    def test_artwork_launcher_tracks_selection_reorder_rename_and_empty_project(self):
+        from Image_tab import StaticFab
+        from project_paths import application_paths
+        from types import SimpleNamespace
+
+        button = self.tab.pwrite_fab
+        button.apply_theme_assets(SimpleNamespace(
+            resolve_asset=lambda name: application_paths().app_resource_path("themes/cyber_forge/" + name)
+        ))
+        self.assertIsInstance(button, StaticFab)
+        self.assertFalse(button.icon().isNull())
+        requested = []
+        self.tab.prompt_requested.connect(requested.append)
+        self.select(self.second)
+        self.tab.rename_page(self.second, "Moonlit garden")
+        self.tab.reorder_pages(list(reversed(self.ids)))
+        self.pump()
+        self.assertIn("Moonlit garden", button.accessibleDescription())
+        self.assertIn("Page 2", self.tab.prompt_target.text())
+        QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
+        self.select(self.ids[2])
+        button.setFocus()
+        QtTest.QTest.keyClick(button, QtCore.Qt.Key_Space)
+        self.assertEqual(requested, [self.second, self.ids[2]])
+        self.session.select_page(None)
+        self.pump()
+        self.assertFalse(button.isEnabled())
+        self.assertEqual(self.tab.prompt_target.text(), "Select a page to begin")
+        QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
+        self.assertEqual(requested, [self.second, self.ids[2]])
+
+    def test_artwork_launcher_does_not_open_when_pending_edits_cannot_save(self):
+        requested = []
+        self.tab.prompt_requested.connect(requested.append)
+        with mock.patch.object(self.tab, "flush_pending_edits", return_value=False):
+            QtTest.QTest.mouseClick(self.tab.pwrite_fab, QtCore.Qt.LeftButton)
+        self.assertEqual(requested, [])
+
+    def test_creation_area_reflows_without_covering_the_preview(self):
+        for width, height in ((1200, 760), (960, 620), (800, 760), (560, 1000), (1200, 760)):
+            with self.subTest(width=width, height=height):
+                self.tab.resize(width, height)
+                self.pump()
+                rectangles = [QtCore.QRect(control.mapTo(self.tab, QtCore.QPoint()), control.size())
+                              for control in (self.tab.page_list, self.tab.pwrite_fab, self.tab.import_button,
+                                              self.tab.stock_button)]
+                for rect in rectangles:
+                    self.assertTrue(self.tab.rect().contains(rect), (self.tab.size(), rect))
+                for rect in rectangles[1:]:
+                    self.assertFalse(rect.intersects(rectangles[0]))
+                self.assertEqual(self.tab.page_list.viewMode(), QtWidgets.QListView.IconMode)
+
     def test_add_without_selection_appends(self):
         self.session.select_page(None)
         page_id = self.tab.add_page("illustration")
         self.assertEqual(self.session.project.pages[-1]["id"], page_id)
         self.assertEqual(self.session.selected_page_id, page_id)
+
+    def test_grid_drop_changes_canonical_order_without_changing_page_content(self):
+        navigator = self.tab.page_list
+        before = self.page(self.ids[0])
+        mime = QtCore.QMimeData()
+        mime.setData(navigator._PAGE_MIME, self.ids[0].encode('utf-8'))
+        event = mock.Mock()
+        event.source.return_value = navigator
+        event.mimeData.return_value = mime
+        event.position.return_value = QtCore.QPointF(navigator.visualItemRect(navigator.item(2)).center())
+        navigator.dropEvent(event)
+        self.assertEqual(self.list_ids()[:3], [self.ids[1], self.ids[2], self.ids[0]])
+        after = self.page(self.ids[0])
+        for field in ('id', 'type', 'artwork', 'message'):
+            self.assertEqual(after[field], before[field])
+        self.assertEqual(after['prompt']['text'], before['prompt']['text'])
+        event.accept.assert_called_once()
 
     def test_rename_reorder_and_explicit_move_preserve_page_owned_content(self):
         self.select(self.second)
@@ -313,8 +383,10 @@ class ImagesWorkspaceTests(unittest.TestCase):
     def test_page_limits_and_out_of_range_import_keep_all_pages_visible(self):
         self.session.replace(create_project(("illustration",) * MAX_PAGES), asset_root=self.root)
         self.pump()
-        self.assertFalse(self.tab.add_button.isEnabled())
-        self.assertIn(str(MAX_PAGES), self.tab.add_button.toolTip())
+        self.assertTrue(self.tab.add_button.isEnabled())
+        self.assertFalse(self.tab.limit_label.isVisible())
+        with self.assertRaisesRegex(ValueError, 'maximum of 10'):
+            self.tab.add_page('illustration')
         self.session.replace(create_project(("illustration",) * MIN_PAGES), asset_root=self.root)
         self.pump()
         self.assertFalse(self.tab.delete_button.isEnabled())
@@ -326,7 +398,7 @@ class ImagesWorkspaceTests(unittest.TestCase):
         self.session.replace(ProjectModel.from_dict(imported), asset_root=self.root)
         self.pump()
         self.assertEqual(self.tab.page_list.count(), MAX_PAGES + 2)
-        self.assertFalse(self.tab.add_button.isEnabled())
+        self.assertTrue(self.tab.add_button.isEnabled())
         self.select(imported["pages"][-1]["id"])
         self.assertEqual(self.tab.page_list.currentRow(), MAX_PAGES + 1)
 
@@ -337,7 +409,7 @@ class ImagesWorkspaceTests(unittest.TestCase):
         self.tab.clear_page_image(page_id)
         self.assertIn("Image missing", self.row_text(page_id))
         self.session.project.update_message(self.first, empty_message())
-        self.assertIn("Message empty", self.row_text(self.first))
+        self.assertIn("Ready", self.row_text(self.first))
         self.assertIn("Ready", self.row_text(self.second))
 
     def test_delete_undo_restores_identity_content_order_and_keeps_source_files(self):
@@ -374,7 +446,7 @@ class ImagesWorkspaceTests(unittest.TestCase):
     def test_keyboard_selection_and_small_window_retain_accessible_controls(self):
         self.select(self.ids[0])
         self.tab.page_list.setFocus()
-        QtTest.QTest.keyClick(self.tab.page_list, QtCore.Qt.Key_Down)
+        QtTest.QTest.keyClick(self.tab.page_list, QtCore.Qt.Key_Right)
         self.pump()
         self.assertEqual(self.session.selected_page_id, self.first)
         for width, height in ((700, 520), (1200, 800)):
@@ -382,7 +454,7 @@ class ImagesWorkspaceTests(unittest.TestCase):
             self.pump()
             self.assertTrue(self.tab.page_list.isVisible())
             self.assertGreater(self.tab.page_list.width(), 0)
-            self.assertTrue(self.tab.header.isVisible())
+            self.assertTrue(self.tab.name_edit.isVisible())
             self.assertEqual(self.list_ids(), self.ids)
 
     def test_same_path_replacement_refreshes_only_valid_media(self):

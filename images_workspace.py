@@ -27,6 +27,7 @@ TYPE_HELP = {
 
 class PageNavigator(QtWidgets.QListWidget):
     order_changed = QtCore.Signal(object)
+    _PAGE_MIME = 'application/x-lettersmith-page'
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -40,8 +41,50 @@ class PageNavigator(QtWidgets.QListWidget):
         self.setStyleSheet("QListWidget:focus { border: 2px solid palette(highlight); }")
 
     def dropEvent(self, event):
+        if self.viewMode() == QtWidgets.QListView.IconMode and event.source() is self:
+            identity = bytes(event.mimeData().data(self._PAGE_MIME)).decode('utf-8')
+            ids = [self.item(row).data(QtCore.Qt.UserRole) for row in range(self.count())]
+            if identity in ids:
+                destination = self.indexAt(event.position().toPoint()).row()
+                if destination < 0:
+                    destination = len(ids)-1
+                ids.remove(identity)
+                ids.insert(destination, identity)
+                self.order_changed.emit(ids)
+                event.setDropAction(QtCore.Qt.MoveAction)
+                event.accept()
+            return
         super().dropEvent(event)
         self.order_changed.emit([self.item(row).data(QtCore.Qt.UserRole) for row in range(self.count())])
+
+    def startDrag(self, actions):
+        if self.viewMode() != QtWidgets.QListView.IconMode:
+            return super().startDrag(actions)
+        if self.currentItem() is None:
+            return
+        mime = QtCore.QMimeData()
+        mime.setData(self._PAGE_MIME, self.currentItem().data(QtCore.Qt.UserRole).encode('utf-8'))
+        drag = QtGui.QDrag(self)
+        drag.setMimeData(mime)
+        drag.setPixmap(self.currentItem().icon().pixmap(80, 100))
+        drag.exec(QtCore.Qt.MoveAction)
+
+    def dragEnterEvent(self, event):
+        if event.source() is self and event.mimeData().hasFormat(self._PAGE_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.source() is self and event.mimeData().hasFormat(self._PAGE_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.currentItem() is not None:
+            self.scrollToItem(self.currentItem())
 
 
 class _ImportWorker(QtCore.QObject):
@@ -134,7 +177,7 @@ class ImageTab(QtWidgets.QWidget):
 
     def __init__(self, project_root=None, *, project_state=None, project_paths=None):
         super().__init__()
-        from Image_tab import ImageAssetCard
+        from Image_tab import ImageAssetCard, StaticFab
         self.project_root = Path(project_root or application_paths().workspace_root).resolve()
         self.project_state = project_state
         self.session = get_project_session(self.project_root)
@@ -160,9 +203,14 @@ class ImageTab(QtWidgets.QWidget):
         self._resource_timer.timeout.connect(self.refresh_cards)
         self.image_paths = {}
         self.labels = {}
+        self._workspace_mode = None
         root = QtWidgets.QVBoxLayout(self)
+        # Let resizeEvent choose the narrow layout before Qt enforces the
+        # previous horizontal layout's minimum width.
+        root.setSizeConstraint(QtWidgets.QLayout.SetNoConstraint)
         root.setContentsMargins(8, 8, 8, 8)
-        self.heading = QtWidgets.QLabel("Pages")
+        root.setSpacing(10)
+        self.heading = QtWidgets.QLabel("Images")
         apply_tab_heading_style(self.heading)
         root.addWidget(self.heading)
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -170,6 +218,10 @@ class ImageTab(QtWidgets.QWidget):
         navigation = QtWidgets.QWidget()
         nav = QtWidgets.QVBoxLayout(navigation)
         nav.setContentsMargins(0, 0, 4, 0)
+        nav.setSpacing(6)
+        pages_heading = QtWidgets.QLabel("Your pages")
+        pages_heading.setStyleSheet("font-weight: 600;")
+        nav.addWidget(pages_heading)
         self.add_button = QtWidgets.QToolButton()
         self.add_button.setText("Add Page")
         self.add_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
@@ -205,6 +257,7 @@ class ImageTab(QtWidgets.QWidget):
         workspace = QtWidgets.QWidget()
         main = QtWidgets.QVBoxLayout(workspace)
         main.setContentsMargins(4, 0, 0, 0)
+        main.setSpacing(8)
         self.header = QtWidgets.QLabel()
         self.header.setWordWrap(True)
         self.header.setTextFormat(QtCore.Qt.PlainText)
@@ -222,12 +275,18 @@ class ImageTab(QtWidgets.QWidget):
         self.type_combo.setToolTip("Changing a Letter to another type hides its message and retains it for restoration. Artwork and exact prompt text are preserved.")
         identity.addRow("Type", self.type_combo)
         main.addLayout(identity)
+        self.artwork_layout = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.LeftToRight)
+        self.artwork_layout.setSpacing(12)
+        main.addLayout(self.artwork_layout, 1)
+        preview = QtWidgets.QWidget()
+        preview_layout = QtWidgets.QVBoxLayout(preview)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(6)
+        self.artwork_layout.addWidget(preview, 1)
         tools = QtWidgets.QHBoxLayout()
         self.import_button = self._button("Import Image", self._browse_selected)
         self.stock_button = self._button("Stock Images", self._stock_selected)
         self.crop_button = self._button("Crop / Position", self._crop_selected)
-        tools.addWidget(self.import_button)
-        tools.addWidget(self.stock_button)
         tools.addWidget(self.crop_button)
         self.more_button = QtWidgets.QToolButton()
         self.more_button.setText("More")
@@ -237,10 +296,9 @@ class ImageTab(QtWidgets.QWidget):
         more.addAction("Open Artwork Folder", self.open_gallery_folder)
         self.more_button.setMenu(more)
         tools.addWidget(self.more_button)
-        main.addLayout(tools)
-        self.empty_label = QtWidgets.QLabel("Import an image or choose stock artwork for this page.")
+        self.empty_label = QtWidgets.QLabel("Start with a prompt, import an image, or choose stock artwork.")
         self.empty_label.setWordWrap(True)
-        main.addWidget(self.empty_label)
+        preview_layout.addWidget(self.empty_label)
         self.card = ImageAssetCard(0, "", self.project_root, self)
         self.card.setProperty("workspacePreview", True)
         self.card.title_label.hide()
@@ -250,7 +308,7 @@ class ImageTab(QtWidgets.QWidget):
         self.card.setMaximumSize(16777215, 16777215)
         self.card.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.card.set_playback_active(False)
-        main.addWidget(self.card, 1)
+        preview_layout.addWidget(self.card, 1)
         self.card.select_requested.connect(self._browse_selected)
         self.card.file_dropped.connect(lambda _index, path: self._run(lambda: self.import_image(self.session.selected_page_id, path)))
         animation = QtWidgets.QHBoxLayout()
@@ -262,18 +320,52 @@ class ImageTab(QtWidgets.QWidget):
         animation.addWidget(self.animation_mode)
         animation.addWidget(self.animation_button)
         animation.addStretch()
-        main.addLayout(animation)
-        routes = QtWidgets.QHBoxLayout()
-        self.pwrite_fab = self._button("Write Image Prompt", self.request_prompt)
+        preview_layout.addLayout(animation)
         self.message_button = self._button("Edit Letter Text", self.request_message)
-        routes.addWidget(self.pwrite_fab)
-        routes.addWidget(self.message_button)
-        routes.addStretch()
-        main.addLayout(routes)
+        tools.addWidget(self.message_button)
+        tools.addStretch()
+        preview_layout.addLayout(tools)
+
+        # Give the original artwork launcher its own space, clear of the preview.
+        self.creation_panel = QtWidgets.QFrame()
+        self.creation_panel.setObjectName("ArtworkCreationPanel")
+        self.creation_panel.setStyleSheet(
+            "QFrame#ArtworkCreationPanel { border: 1px solid palette(mid); border-radius: 12px; }"
+        )
+        self.creation_layout = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.TopToBottom, self.creation_panel)
+        self.creation_layout.setContentsMargins(12, 12, 12, 12)
+        self.creation_layout.setSpacing(10)
+        self.pwrite_fab = StaticFab(self.creation_panel, self.creation_panel)
+        self.pwrite_fab.set_artwork_size(152)
+        self.pwrite_fab.clicked.connect(lambda: self._run(self.request_prompt))
+        self.creation_layout.addWidget(self.pwrite_fab, 0, QtCore.Qt.AlignHCenter)
+        self.prompt_copy = QtWidgets.QWidget()
+        copy_layout = QtWidgets.QVBoxLayout(self.prompt_copy)
+        copy_layout.setContentsMargins(0, 0, 0, 0)
+        copy_layout.setSpacing(4)
+        self.prompt_title = QtWidgets.QLabel("Prompt Writer")
+        self.prompt_title.setStyleSheet("font-weight: 600;")
+        self.prompt_target = QtWidgets.QLabel()
+        self.prompt_target.setTextFormat(QtCore.Qt.PlainText)
+        self.prompt_target.setWordWrap(True)
+        self.prompt_target.setMaximumHeight(self.prompt_target.fontMetrics().lineSpacing() * 3)
+        self.prompt_hint = QtWidgets.QLabel("Write a prompt for this page’s artwork.")
+        self.prompt_hint.setWordWrap(True)
+        for label in (self.prompt_title, self.prompt_target, self.prompt_hint):
+            copy_layout.addWidget(label)
+        self.creation_layout.addWidget(self.prompt_copy)
+        self.source_actions = QtWidgets.QWidget()
+        sources = QtWidgets.QVBoxLayout(self.source_actions)
+        sources.setContentsMargins(0, 0, 0, 0)
+        sources.setSpacing(6)
+        sources.addWidget(self.import_button)
+        sources.addWidget(self.stock_button)
+        self.creation_layout.addWidget(self.source_actions)
+        self.artwork_layout.addWidget(self.creation_panel, 0, QtCore.Qt.AlignTop)
         self.splitter.addWidget(workspace)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
-        self.splitter.setSizes([240, 680])
+        self.splitter.setSizes([220, 720])
         self.splitter.setChildrenCollapsible(False)
         self.status = QtWidgets.QLabel()
         self.status.setWordWrap(True)
@@ -290,6 +382,8 @@ class ImageTab(QtWidgets.QWidget):
         if self.session.selected_page_id is None and self.session.project.pages:
             self.session.select_page(self.session.project.pages[0]["id"])
         self.refresh_cards()
+        self.apply_theme_assets()
+        self._update_workspace_layout()
 
     def _button(self, text, callback):
         button = QtWidgets.QPushButton(text)
@@ -359,7 +453,7 @@ class ImageTab(QtWidgets.QWidget):
             reader.setAutoTransform(True)
             size = reader.size()
             if size.isValid():
-                reader.setScaledSize(size.scaled(64, 80, QtCore.Qt.KeepAspectRatio))
+                reader.setScaledSize(size.scaled(400, 440, QtCore.Qt.KeepAspectRatio))
             pixmap = QtGui.QPixmap.fromImage(reader.read())
             after = path.stat()
             if pixmap.isNull() or (after.st_size, after.st_mtime_ns, file_change_token(path, stat_result=after)) != key[3:]:
@@ -459,6 +553,9 @@ class ImageTab(QtWidgets.QWidget):
         self.import_button.setAccessibleName(self.import_button.text())
         if selected_page is None:
             self.header.setText("No page selected — use Add Page to begin.")
+            self.prompt_target.setText("Select a page to begin")
+            self.pwrite_fab.setToolTip("Select a page, then open Prompt Writer.")
+            self.pwrite_fab.setAccessibleDescription("Select a page to enable Prompt Writer.")
             self.name_edit.clear()
             self._name_target = None
             self.card.clear_pixmap()
@@ -466,6 +563,10 @@ class ImageTab(QtWidgets.QWidget):
         else:
             name = selected_page["name"] or PAGE_TYPES[selected_page["type"]].label
             self.header.setText(f"Page {row+1} of {count} — {name} · {PAGE_TYPES[selected_page['type']].label}")
+            target = f"Page {row+1} · {name}"
+            self.prompt_target.setText(target)
+            self.pwrite_fab.setToolTip(f"Open Prompt Writer for {target}\nShortcut: Ctrl+Alt+P")
+            self.pwrite_fab.setAccessibleDescription(f"Write an artwork prompt for {target}")
             if not self._name_dirty or self._name_target is None or self._name_target.page_id != selected:
                 self.name_edit.setText(selected_page["name"])
                 self._name_target = self.session.capture_target(selected, fields=("name",), include_shared=False)
@@ -486,6 +587,7 @@ class ImageTab(QtWidgets.QWidget):
                 self._preview_key = preview_key
         self.card.clear_btn.hide()
         self.card.settings_btn.hide()
+        self.prompt_target.setToolTip(self.prompt_target.text())
         self._restoring_ui = False
         return True
 
@@ -660,6 +762,8 @@ class ImageTab(QtWidgets.QWidget):
             path = str(self.artwork.resolve_asset(target.page_id))
             try:
                 remember_image_copy(self.project_root, target.project_id, target.page_id, path, result.source_path.name)
+                from recent_media import remember_type_image
+                remember_type_image(self.project_root, self.session.project.get_page(target.page_id)["type"], path, result.source_path.name)
             except (OSError, ValueError):
                 # History is a convenience cache; a failure cannot roll back a
                 # successfully validated canonical artwork change.
@@ -715,11 +819,14 @@ class ImageTab(QtWidgets.QWidget):
         slot = PAGE_TYPES[page["type"]].artwork_template
         directory = application_paths(self.project_root).stock_images_root / slot
         files = tuple(path for name in STOCK_IMAGE_FILES[PAGE_INDICES[slot]] if (path := directory / name).is_file())
-        history = recent_media(self.project_root, self.session.project.project_id, f"image:{identity}")
+        from recent_media import recent_type_images
+        history = recent_type_images(self.project_root, page["type"])
+        if not history:
+            history = recent_media(self.project_root, self.session.project.project_id, f"image:{identity}")
         if not history and page["recovery"].get("legacy_key"):
             history = recent_media(self.project_root, self.session.project.project_id, f"image:{page['recovery']['legacy_key']}")
         recent = tuple((Path(value), label) for value, label in history if Path(value).is_file())
-        dialog = StockImageDialog(PAGE_TYPES[page["type"]].label, files, self, allow_browse=True,
+        dialog = StockImageDialog(PAGE_TYPES[page["type"]].label, () if recent else files, self, allow_browse=True,
                                   recent_paths=tuple(path for path, label in recent),
                                   recent_labels=tuple(label for path, label in recent))
         if dialog.exec() != QtWidgets.QDialog.Accepted:
@@ -844,7 +951,41 @@ class ImageTab(QtWidgets.QWidget):
         self._resource_timer.stop()
 
     def set_compact_layout(self, compact):
-        self.splitter.setOrientation(QtCore.Qt.Vertical if compact and self.width() < 560 else QtCore.Qt.Horizontal)
+        self._update_workspace_layout()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_workspace_layout()
+
+    def _update_workspace_layout(self):
+        # Reflow by available width, including standalone widgets.
+        narrow = self.width() < 620
+        short = self.height() < 520
+        very_short = self.height() < 420
+        inline = self.width() < (760 if short else 900)
+        mode = (narrow, inline, short, very_short)
+        if self._workspace_mode == mode:
+            return
+        self._workspace_mode = mode
+        self.splitter.setOrientation(QtCore.Qt.Vertical if narrow else QtCore.Qt.Horizontal)
+        self.page_list.setMaximumHeight(180 if narrow else 16777215)
+        self.artwork_layout.setDirection(
+            QtWidgets.QBoxLayout.TopToBottom if inline else QtWidgets.QBoxLayout.LeftToRight
+        )
+        self.creation_layout.setDirection(
+            QtWidgets.QBoxLayout.LeftToRight if inline else QtWidgets.QBoxLayout.TopToBottom
+        )
+        self.creation_panel.setMinimumWidth(0 if inline else 178)
+        self.creation_panel.setMaximumWidth(16777215 if inline else 194)
+        self.pwrite_fab.set_artwork_size(88 if inline or very_short else 112 if short else 152)
+        margin = 8 if short else 12
+        self.creation_layout.setContentsMargins(margin, margin, margin, margin)
+        self.creation_layout.setSpacing(6 if short else 10)
+        self.prompt_target.setMaximumHeight(self.prompt_target.fontMetrics().lineSpacing() * (2 if short else 3))
+        self.creation_layout.setAlignment(self.pwrite_fab, QtCore.Qt.AlignCenter)
+        self.prompt_hint.setVisible(not inline and not short)
+        self.prompt_title.setVisible(not very_short)
+        self.creation_layout.setStretch(1, 1 if inline else 0)
 
     def minimumSizeHint(self):
         return QtCore.QSize(480, 320)
@@ -854,6 +995,7 @@ class ImageTab(QtWidgets.QWidget):
 
     def apply_theme_assets(self, theme_service=None):
         self.card.apply_theme_assets(theme_service)
+        self.pwrite_fab.apply_theme_assets(theme_service, self.project_root)
 
     def prepare_for_project_restore(self, timeout_ms=5000):
         self._resource_timer.stop()
