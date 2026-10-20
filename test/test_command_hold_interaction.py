@@ -84,47 +84,35 @@ class CommandHoldInteractionTests(unittest.TestCase):
         button._scale_anim.setCurrentTime(button._scale_anim.duration())
         self.app.processEvents()
 
-        self.assertEqual(activations, [])
+        self.assertEqual(activations, [True])
         self.assertFalse(button._holding)
         self.assertEqual(button._scale, 1.0)
         button.close()
 
-    def test_completed_hold_shrinks_bursts_and_activates_once(self) -> None:
+    def test_completed_hold_activates_reset_once_without_click(self) -> None:
         button = self._button()
-        button.HOLD_DURATION_MS = 120
-        button.BURST_DURATION_MS = 70
-        activations = []
-        button.clicked.connect(lambda: activations.append(True))
-
-        QtTest.QTest.mousePress(
-            button,
-            QtCore.Qt.LeftButton,
-            pos=button.rect().center(),
-        )
-        button._scale_anim.setCurrentTime(80)
-        shrinking_scale = button._scale
+        clicks, holds = [], []
+        button.clicked.connect(lambda: clicks.append(True))
+        button.held.connect(lambda: holds.append(True))
+        QtTest.QTest.mousePress(button, QtCore.Qt.LeftButton, pos=button.rect().center())
         button._hold_timer.stop()
         button._complete_hold()
-
-        self.assertLess(shrinking_scale, 1.0)
-        self.assertFalse(button._holding)
-        self.assertTrue(button._hold_completed)
-        self.assertEqual(
-            button._burst_anim.state(),
-            QtCore.QAbstractAnimation.Running,
-        )
-
-        button._burst_anim.setCurrentTime(button.BURST_DURATION_MS)
-        self.app.processEvents()
-        QtTest.QTest.mouseRelease(
-            button,
-            QtCore.Qt.LeftButton,
-            pos=button.rect().center(),
-        )
-
-        self.assertEqual(activations, [True])
+        button._complete_hold()
+        QtTest.QTest.mouseRelease(button, QtCore.Qt.LeftButton, pos=button.rect().center())
+        self.assertEqual(holds, [True])
+        self.assertEqual(clicks, [])
         self.assertEqual(button._scale, 1.0)
-        self.assertFalse(button._use_gray)
+        button.close()
+
+    def test_leaving_or_hiding_cancels_hold(self) -> None:
+        button = self._button()
+        holds = []
+        button.held.connect(lambda: holds.append(True))
+        for event in (QtCore.QEvent.Leave, QtCore.QEvent.Hide):
+            button._start_hold()
+            self.app.sendEvent(button, QtCore.QEvent(event))
+            button._complete_hold()
+        self.assertEqual(holds, [])
         button.close()
 
     def test_hold_plays_blip_on_each_completed_second(self) -> None:
@@ -181,138 +169,15 @@ class CommandHoldInteractionTests(unittest.TestCase):
         )
         tab.close()
 
-    def test_command_notice_reappears_and_click_dismisses_it(self) -> None:
+    def test_command_has_only_go_without_entry_notice(self) -> None:
         tab = CommandTab(PROJECT_ROOT)
         tab.resize(900, 600)
         tab.show()
         self.app.processEvents()
-
-        notice = tab._entry_notice
         self.assertEqual(tab.font().family(), COMMAND_FONT_FAMILY)
-        self.assertEqual(
-            tab.go_btn._countdown_label.font().family(),
-            COMMAND_FONT_FAMILY,
-        )
-        self.assertEqual(tab.go_btn._countdown_label.font().pixelSize(), 92)
-        self.assertEqual(notice.message.font().family(), COMMAND_FONT_FAMILY)
-        self.assertEqual(notice.message.font().pixelSize(), 15)
-        self.assertEqual(
-            notice.completion_message.font().family(),
-            COMMAND_FONT_FAMILY,
-        )
-        self.assertEqual(notice.completion_message.font().pixelSize(), 30)
-        _toast(tab, "Command ready", msecs=10_000)
-        self.app.processEvents()
-        toast = tab.findChildren(QtWidgets.QDialog)[0]
-        toast_label = toast.findChild(QtWidgets.QLabel)
-        self.assertEqual(toast.font().family(), COMMAND_FONT_FAMILY)
-        self.assertEqual(toast_label.font().family(), COMMAND_FONT_FAMILY)
-        toast.close()
-        self.assertEqual(notice._dismiss_timer.interval(), 10_000)
-        self.assertEqual(notice._fade_timer.interval(), 6_000)
-        self.assertEqual(notice._fade_animation.duration(), 4_000)
-        self.assertNotIn("10 seconds", notice.message.text())
-        self.assertTrue(notice.isVisible())
-        self.assertEqual(
-            notice.panel.palette().color(QtGui.QPalette.Window).name(),
-            "#4a090c",
-        )
-        self.assertEqual(
-            notice.message.palette().color(QtGui.QPalette.WindowText).name(),
-            "#ffb0bb",
-        )
-        self.assertTrue(notice.message.wordWrap())
-        self.assertEqual(notice.panel.width(), 836)
-        self.assertLessEqual(notice.panel.height(), notice.height() - 64)
-        self.assertEqual(
-            notice.message_scroll.horizontalScrollBarPolicy(),
-            QtCore.Qt.ScrollBarAlwaysOff,
-        )
-
-        tab.resize(480, 320)
-        self.app.processEvents()
-        self.assertEqual(notice.panel.width(), 416)
-        self.assertLessEqual(notice.panel.height(), 256)
-
-        QtTest.QTest.mouseClick(
-            notice,
-            QtCore.Qt.LeftButton,
-            pos=QtCore.QPoint(10, 10),
-        )
-        self.assertFalse(notice.isVisible())
-
-        tab.hide()
-        tab.show()
-        self.app.processEvents()
-        self.assertTrue(notice.isVisible())
-        notice._fade_animation.setDuration(80)
-        notice._fade_timer.setInterval(10)
-        notice._dismiss_timer.setInterval(200)
-        notice._fade_timer.stop()
-        notice._dismiss_timer.stop()
-        notice._begin_fade()
-        notice._fade_animation.setCurrentTime(40)
-        self.assertTrue(notice.isVisible())
-        self.assertLess(notice._opacity_effect.opacity(), 1.0)
-        self.assertGreater(notice._opacity_effect.opacity(), 0.0)
-        QtTest.QTest.mouseClick(
-            notice,
-            QtCore.Qt.LeftButton,
-            pos=QtCore.QPoint(10, 10),
-        )
-        self.assertFalse(notice.isVisible())
-        self.assertEqual(notice._opacity_effect.opacity(), 1.0)
-
-        tab.hide()
-        tab.show()
-        self.app.processEvents()
-        notice._fade_timer.stop()
-        notice._dismiss_timer.stop()
-        notice._begin_fade()
-        notice._fade_animation.setCurrentTime(
-            notice._fade_animation.duration()
-        )
-        self.app.processEvents()
-        self.assertFalse(notice.isVisible())
-        tab.close()
-
-    def test_confirmation_colors_and_shockwave(self) -> None:
-        tab = CommandTab(PROJECT_ROOT)
-        tab.resize(900, 600)
-        tab.show()
-        self.app.processEvents()
-
-        tab._do_reset()
-        self.app.processEvents()
-
-        dialog = tab._confirm_dialog
-        question = dialog.findChild(QtWidgets.QLabel, "question")
-        yes_button = dialog.findChild(QtWidgets.QPushButton, "danger")
-        no_button = dialog.findChild(QtWidgets.QPushButton, "cancel")
-        waves = tab.findChildren(_ShockwaveWidget)
-
-        self.assertEqual(question.font().family(), COMMAND_FONT_FAMILY)
-        self.assertEqual(yes_button.font().family(), COMMAND_FONT_FAMILY)
-        self.assertEqual(no_button.font().family(), COMMAND_FONT_FAMILY)
-        self.assertEqual(
-            question.palette().color(QtGui.QPalette.WindowText).name(),
-            "#ff4d4f",
-        )
-        self.assertEqual(
-            yes_button.palette().color(QtGui.QPalette.ButtonText).name(),
-            "#ff4d4f",
-        )
-        self.assertEqual(
-            no_button.palette().color(QtGui.QPalette.ButtonText).name(),
-            "#00e5ff",
-        )
-        self.assertEqual(len(waves), 1)
-        self.assertTrue(waves[0].isVisible())
-        self.assertTrue(tab.go_btn._busy)
-        self.assertTrue(tab.go_btn._use_gray)
-
-        dialog.reject()
-        self.app.processEvents()
+        self.assertEqual(tab.findChildren(QtWidgets.QPushButton), [])
+        self.assertFalse(hasattr(tab, "_entry_notice"))
+        self.assertIn("Click GO to save", tab.go_btn.toolTip())
         tab.close()
 
 

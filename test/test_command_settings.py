@@ -162,17 +162,139 @@ class CommandSettingsUiTests(unittest.TestCase):
             QtTest.QTest.keyClicks(editor, text)
         self.window.open_prompt_writer(page_id=self.ids[3])
         panel = self.window._prompt_writer_win
-        self.assertTrue(panel.isWindow())
+        self.assertIs(self.window.application_stack.currentWidget(), panel)
+        self.assertTrue(panel.isVisibleTo(self.window))
         editor = panel._view_spec.preview_widget
         editor.moveCursor(QtGui.QTextCursor.End)
         QtTest.QTest.keyClicks(editor, " Last prompt")
-        return self.session.project.get_prompt(self.ids[3])["text"]
+        return editor.toPlainText()
 
     def new_project(self, choice, kinds=CLASSIC_PAGE_TYPES):
         with mock.patch.object(NewProjectDialog, "exec", return_value=QtWidgets.QDialog.Accepted), \
              mock.patch.object(NewProjectDialog, "page_types", return_value=kinds), \
              mock.patch.object(QtWidgets.QMessageBox, "question", return_value=choice):
             return self.window.project_lifecycle.new_project()
+
+    def command_ready(self):
+        self.window.tabbar.setCurrentIndex(4)
+        self.wait(lambda: self.window._autosave_active_revision is None and not self.forge._busy)
+        self.app.processEvents()
+        return self.window.command_tab.go_btn
+
+    def test_go_click_saves_without_reset_or_history_loss(self):
+        from recent_media import remember_type_image, recent_type_images
+        remember_type_image(self.root, "cover", self.root / "still.png", "Personal")
+        original = self.session.project.project_id
+        button = self.command_ready()
+        self.assertTrue(recent_type_images(self.root, "cover"))
+        with mock.patch.object(QtWidgets.QMessageBox, "question") as question:
+            QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton, pos=button.rect().center())
+            self.wait(lambda: not self.window.project_lifecycle.busy and not self.forge._busy)
+        question.assert_not_called()
+        self.assertEqual(self.session.project.project_id, original)
+        self.assertTrue(recent_type_images(self.root, "cover"))
+        saved = ProjectRepository(self.service.editable_root / original / ".lettersmith-project").load()
+        self.assertEqual(saved.project.get_prompt(self.ids[1])["text"], self.session.project.get_prompt(self.ids[1])["text"])
+
+    def test_three_second_go_saves_clears_and_restarts_fresh(self):
+        from recent_media import remember_type_image, recent_type_images
+        from project_model import PAGE_TYPES
+        from project_paths import application_paths
+        exact = self.edits()
+        original = self.session.project.project_id
+        histories = {}
+        for kind in PAGE_TYPES:
+            remember_type_image(self.root, kind, self.root / "still.png", kind)
+            histories[kind] = recent_type_images(self.root, kind)
+        settings = SettingsStore(self.root)
+        settings.update_fields(ui_window_width=1170, forge_preview_mode="window")
+        before_settings = settings.snapshot()
+        library = application_paths(self.root).custom_palette_root / "command-personal-palette.json"
+        library.parent.mkdir(parents=True, exist_ok=True)
+        library.write_text('{"colors": ["#123456"]}', encoding="utf-8")
+        button = self.command_ready()
+        with mock.patch.object(QtWidgets.QMessageBox, "question") as question:
+            QtTest.QTest.mousePress(button, QtCore.Qt.LeftButton, pos=button.rect().center())
+            QtTest.QTest.qWait(3100)
+            QtTest.QTest.mouseRelease(button, QtCore.Qt.LeftButton, pos=button.rect().center())
+            self.wait(lambda: not self.window.project_lifecycle.busy and not self.forge._busy)
+        question.assert_not_called()
+        self.assertNotEqual(self.session.project.project_id, original, self.window._status.currentMessage())
+        saved = ProjectRepository(self.service.editable_root / original / ".lettersmith-project").load()
+        self.assertEqual(saved.project.get_prompt(self.ids[3])["text"], exact)
+        self.assertIn("Final B", saved.project.get_message(self.ids[3])["html"])
+        self.assertTrue(saved.project.to_dict()["sound"]["playlist"])
+        self.assertTrue(all((saved.asset_root / page["artwork"]["asset"]).is_file() for page in saved.project.pages))
+        fresh = self.session.project.to_dict()
+        self.assertTrue(all(not page["artwork"]["asset"] and not page["prompt"]["text"] for page in fresh["pages"]))
+        self.assertFalse(fresh["sound"].get("playlist"))
+        self.assertFalse(fresh["publication"])
+        self.assertFalse(fresh["metadata"].get("recipient_name"))
+        self.assertFalse(fresh["prompt_settings"])
+        for kind, entries in histories.items():
+            self.assertEqual(recent_type_images(self.root, kind), ())
+            self.assertTrue(all(Path(value).is_file() for value, _ in entries))
+        self.assertTrue(library.is_file())
+        for key in ("application_theme", "theme_family", "ui_window_width", "forge_preview_mode"):
+            self.assertEqual(settings.snapshot().get(key), before_settings.get(key))
+        self.assertFalse(settings.snapshot().get("active_play_dir"))
+        self.assertIsNone(self.window._last_pixmap)
+        for index in range(5):
+            self.window.tabbar.setCurrentIndex(index)
+            self.app.processEvents()
+        self.wait(lambda: self.window._autosave_active_revision is None and not self.forge._busy)
+        fresh_id = self.session.project.project_id
+        self.assertTrue(self.window.shutdown())
+        restarted = get_project_session(self.root)
+        self.assertEqual(restarted.project.project_id, fresh_id)
+        self.assertFalse(restarted.project.to_dict()["metadata"].get("recipient_name"))
+        self.assertTrue(all(not p["artwork"]["asset"] and not p["prompt"]["text"] for p in restarted.project.pages))
+        self.assertEqual(ProjectRepository(self.service.editable_root / original / ".lettersmith-project").load().revision, saved.revision)
+
+    def test_go_failed_save_keeps_workspace_and_histories(self):
+        from recent_media import remember_type_image, recent_type_images
+        remember_type_image(self.root, "letter", self.root / "still.png", "Personal")
+        button = self.command_ready()
+        token = self.session.session_id
+        with mock.patch.object(self.service, "commit_editable_save", side_effect=OSError("disk full")):
+            button.held.emit()
+            self.wait(lambda: not self.window.project_lifecycle.busy and not self.forge._busy)
+        self.assertEqual(self.session.session_id, token)
+        self.assertTrue(recent_type_images(self.root, "letter"))
+        self.assertIn("disk full", self.window._status.currentMessage())
+        self.assertTrue(self.window._toast.isVisible())
+        self.assertIn("disk full", self.window._toast.text())
+        self.assertTrue(button.isEnabled())
+
+    def test_go_edit_during_save_prevents_reset_and_reentry(self):
+        self.command_ready()
+        token = self.session.session_id
+        started, release = threading.Event(), threading.Event()
+        commit = self.service.commit_editable_save
+        def delayed(capture):
+            started.set()
+            if not release.wait(10):
+                raise RuntimeError("save timed out")
+            return commit(capture)
+        with mock.patch.object(self.service, "commit_editable_save", side_effect=delayed):
+            try:
+                self.assertTrue(self.window.project_lifecycle.command_save(reset=True))
+                self.wait(started.is_set)
+                self.assertFalse(self.window.project_lifecycle.command_save(reset=True))
+                self.session.project.rename_page(self.ids[0], "Newer edit")
+            finally:
+                release.set()
+            self.wait(lambda: not self.window.project_lifecycle.busy and not self.forge._busy)
+        self.assertEqual(self.session.session_id, token)
+        self.assertEqual(self.session.project.get_page(self.ids[0])["name"], "Newer edit")
+
+    def test_settings_only_load_and_curtains_under_project(self):
+        bar = self.window.title_bar
+        project = bar.project_menu
+        self.assertEqual([a.text() for a in project.actions()], ["Load Project", "Project Curtains"])
+        self.assertNotIn(bar.exit_action, bar.settings_menu.actions())
+        for action in (bar.new_project_action, bar.save_project_action, bar.open_project_action, bar.exit_action):
+            self.assertIn(action, self.window.actions())
 
     def test_cancel_dialog_and_exit_leave_editors_and_session_usable(self):
         exact = self.edits()
@@ -237,7 +359,7 @@ class CommandSettingsUiTests(unittest.TestCase):
                 self.assertTrue(self.new_project(QtWidgets.QMessageBox.Save))
                 self.wait(started.is_set)
                 self.assertFalse(self.window.title_bar.new_project_action.isEnabled())
-                self.assertFalse(self.window.command_tab.project_actions.isEnabled())
+                self.assertFalse(self.window.command_tab.go_btn.isEnabled())
                 self.assertFalse(self.window.project_lifecycle.new_project())
                 self.session.project.rename_page(self.ids[0], "Newer change")
             finally:

@@ -970,21 +970,18 @@ class TitleBar(QtWidgets.QWidget):
         # Reuse the actual actions, grouped by ownership rather than another settings store.
         for action in self.settings_menu.actions():
             self.settings_menu.removeAction(action)
-        project_menu = self.settings_menu.addMenu("Project")
-        project_menu.addAction(self.new_project_action)
+        self.project_menu = project_menu = self.settings_menu.addMenu("Project")
         self.new_project_action.setShortcut(QtGui.QKeySequence.New)
         self._nexus.addAction(self.new_project_action)
-        self.save_project_action = project_menu.addAction("Save Project", self._nexus.save_project)
+        self.save_project_action = QtGui.QAction("Save Project", self)
+        self.save_project_action.triggered.connect(self._nexus.save_project)
         self.save_project_action.setShortcut(QtGui.QKeySequence.Save)
         self._nexus.addAction(self.save_project_action)
-        self.open_project_action = project_menu.addAction("Open Saved Project…", self._nexus._show_saved_letters_from_recipient_page)
+        self.open_project_action = project_menu.addAction("Load Project", self._nexus._show_saved_letters_from_recipient_page)
         self.open_project_action.setShortcut(QtGui.QKeySequence.Open)
         self._nexus.addAction(self.open_project_action)
         project_menu.addMenu(self.curtain_menu)
-        self.curtain_menu.setTitle("Current Project Curtains")
-        self.delete_project_action.setText("Manage Saved Projects…")
-        set_action_help(self.delete_project_action, "Open Saved Letters to rename, duplicate or delete a selected save with recovery.")
-        project_menu.addAction(self.delete_project_action)
+        self.curtain_menu.setTitle("Project Curtains")
         preferences = self.settings_menu.addMenu("Application Preferences")
         preferences.addMenu(self.themes_menu)
         preferences.addAction(self.visionary_location_action)
@@ -994,11 +991,9 @@ class TitleBar(QtWidgets.QWidget):
         diagnostics = self.settings_menu.addMenu("Help & Diagnostics")
         diagnostics.addAction(self.repair_music_action)
         diagnostics.addAction(self.about_action)
-        self.settings_menu.addSeparator()
         self.exit_action.setText("Exit Application")
         self.exit_action.setShortcut(QtGui.QKeySequence.Quit)
         self._nexus.addAction(self.exit_action)
-        self.settings_menu.addAction(self.exit_action)
         self.settings_menu.aboutToShow.connect(
             self._sync_curtain_menu
         )
@@ -2053,8 +2048,7 @@ class Nexus(QtWidgets.QMainWindow):
             ("Sound", "Choose one song or arrange a playlist for this letter."),
             ("Messages", "Write, import, and format each Letter page's message."),
             ("Forge", "Review, preview, load, publish, and share the letter."),
-            ("Command", "New Project, application preferences, and Exit Application. "
-                        "Clicking clears recent image lists; assigned artwork is kept."),
+            ("Command", "Click GO to save; hold for three seconds to save and clear the workspace and recent images."),
         )
         for name, help_text in tab_help:
             index = self.tabbar.addTab(name)
@@ -2071,7 +2065,6 @@ class Nexus(QtWidgets.QMainWindow):
             self._hide_readiness_after_image_tab_hover
         )
         self.tabbar.currentChanged.connect(self._tab_changed)
-        self.tabbar.tabBarClicked.connect(self._clear_image_history_from_command)
         main_layout.addWidget(self.tabbar)
         self._command_immersive = False
         self._command_status_was_visible = True
@@ -3302,16 +3295,6 @@ class Nexus(QtWidgets.QMainWindow):
     # =============================================================================================
     # Tabs ΓÇö show correct preview per tab + update help visibility/content
     # =============================================================================================
-    def _clear_image_history_from_command(self, idx: int) -> None:
-        if idx != 4:
-            return
-        from recent_media import clear_type_image_history
-        try:
-            clear_type_image_history(self.project_root)
-        except OSError:
-            _LOGGER.exception("Could not clear remembered image selections")
-            self.status("Image history could not be cleared. Try Command again.")
-
     def _tab_changed(self, idx: int) -> None:
         """
         Route the requested tab transition.

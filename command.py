@@ -39,7 +39,6 @@ from typing import Callable, Mapping, Optional, Tuple
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from command_bar import CommandBarData, build_command_bar_data
 from protected_projects import (
     PROTECTED_PROJECT_KIND_KEY,
     PROTECTED_PROJECT_MASTER_PATH_KEY,
@@ -1058,6 +1057,7 @@ class _PressGoLabel(
     QtWidgets.QLabel
 ):
     clicked = QtCore.Signal()
+    held = QtCore.Signal()
     HOLD_DURATION_MS = 3000
     BURST_DURATION_MS = 280
 
@@ -1129,6 +1129,7 @@ class _PressGoLabel(
             self
         )
         self._hold_timer.setSingleShot(True)
+        self._hold_timer.setTimerType(Qt.PreciseTimer)
         self._hold_timer.timeout.connect(
             self._complete_hold
         )
@@ -1541,22 +1542,7 @@ class _PressGoLabel(
         self._use_gray = False
         self._stop_blink()
 
-        if not self._animations_enabled:
-            self._emit_held()
-            return
-
-        start_scale = max(
-            0.38,
-            min(1.0, self._scale),
-        )
-        self._burst_anim.stop()
-        self._burst_anim.setDuration(
-            int(self.BURST_DURATION_MS)
-        )
-        self._burst_anim.setStartValue(start_scale)
-        self._burst_anim.setKeyValueAt(0.68, 1.24)
-        self._burst_anim.setEndValue(1.0)
-        self._burst_anim.start()
+        self._emit_held()
 
     def resizeEvent(
         self,
@@ -1574,7 +1560,7 @@ class _PressGoLabel(
             return
         self._hold_completed = False
         self._apply_scale(1.0)
-        self.clicked.emit()
+        self.held.emit()
 
     def mousePressEvent(
         self,
@@ -1596,6 +1582,8 @@ class _PressGoLabel(
         if event.button() == Qt.LeftButton:
             if self._holding:
                 self.cancel_hold()
+                if self.rect().contains(event.position().toPoint()):
+                    self.clicked.emit()
             event.accept()
             return
 
@@ -2157,204 +2145,30 @@ class CommandTab(
         )
         set_control_help(
             self.go_btn,
-            "Hold Go for three seconds to choose a new project. You can save, discard changes, or cancel.",
-            accessible_name="New Project",
+            "Click GO to save. Hold for 3 seconds to save and clear the workspace and recent images.",
+            accessible_name="GO — Save; hold to save and reset",
         )
 
-        self._interaction_state = "idle"
-        self._confirm_dialog: Optional[_ConfirmDialog] = None
-        self._command_bar_data: Optional[CommandBarData] = None
-
-        self.go_btn.clicked.connect(
-            self._do_reset
-        )
-
-        self._entry_notice = _CommandEntryNotice(
-            self
-        )
-
-        self.project_actions = QtWidgets.QWidget(self)
-        actions = QtWidgets.QHBoxLayout(self.project_actions)
-        actions.setContentsMargins(8, 8, 8, 8)
-        for label, route in (("New Project", "start_new_project"), ("Save Project", "save_project"),
-                             ("Open Saved Project", "_show_saved_letters_from_recipient_page"), ("Exit Application", "close")):
-            button = QtWidgets.QPushButton(label, self.project_actions)
-            button.clicked.connect(lambda _checked=False, name=route: self._route_project_action(name))
-            actions.addWidget(button)
-
+        self.go_btn.clicked.connect(self._save)
+        self.go_btn.held.connect(self._do_reset)
         self._relayout()
 
-    def showEvent(
-        self,
-        event: QtGui.QShowEvent,
-    ) -> None:
-        super().showEvent(
-            event
-        )
-        QtCore.QTimer.singleShot(
-            0,
-            self._entry_notice.present,
-        )
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        self.go_btn.cancel_hold(animate=False)
+        super().hideEvent(event)
 
-    def hideEvent(
-        self,
-        event: QtGui.QHideEvent,
-    ) -> None:
-        self._entry_notice.dismiss()
-        self.go_btn.cancel_hold(
-            animate=False
-        )
-        super().hideEvent(
-            event
-        )
+    def _save(self) -> None:
+        self._run_command(reset=False)
 
-    def _do_reset(
-        self,
-    ) -> None:
-        if callable(getattr(self.window(), "start_new_project", None)):
-            self._route_project_action("start_new_project")
+    def _do_reset(self) -> None:
+        self._run_command(reset=True)
+
+    def _run_command(self, *, reset: bool) -> None:
+        lifecycle = getattr(self.window(), "project_lifecycle", None)
+        if lifecycle is None:
+            _toast(self, "Open LetterSmith to save the project.", msecs=3000)
             return
-        if self._interaction_state != "idle":
-            return
-
-        try:
-            self._command_bar_data = build_command_bar_data(
-                project_root=self.project_root,
-            )
-        except Exception:
-            LOGGER.exception("Could not capture the completed letter for Command Bar")
-            _toast(
-                self,
-                "The completed letter could not be captured.",
-                msecs=3000,
-            )
-            return
-
-        self._interaction_state = "confirming"
-        self.go_btn.setEnabled(False)
-        set_control_help(
-            self.go_btn,
-            "Confirm or cancel clearing the current letter in the open dialog.",
-        )
-        self.go_btn.set_busy(True)
-
-        dialog = _ConfirmDialog(
-            self
-        )
-        self._confirm_dialog = dialog
-
-        center = self.mapToGlobal(
-            self.rect().center()
-        )
-        dialog.move(
-            center.x() - dialog.width() // 2,
-            center.y() - dialog.height() // 2,
-        )
-
-        dialog.accepted.connect(
-            self._begin_reset
-        )
-        dialog.rejected.connect(
-            self._cancel_reset
-        )
-        dialog.finished.connect(
-            self._release_confirm_dialog
-        )
-        shockwave = _ShockwaveWidget(
-            self
-        )
-        shockwave.start(
-            animate=self.go_btn._animations_enabled
-        )
-        dialog.open()
-
-    def _begin_reset(
-        self,
-    ) -> None:
-        if self._interaction_state != "confirming":
-            return
-        self._interaction_state = "running"
-        set_control_help(
-            self.go_btn,
-            "Clearing the completed letter and preparing a new workspace.",
-        )
-        QtCore.QTimer.singleShot(
-            0,
-            self._execute_reset,
-        )
-
-    def _execute_reset(
-        self,
-    ) -> None:
-        if self._interaction_state != "running":
-            return
-        try:
-            opener = getattr(
-                self.window(),
-                "open_command_bar_and_close_editor",
-                None,
-            )
-            if not callable(opener):
-                raise RuntimeError("Command Bar integration is unavailable")
-            if not _perform_confirmed_reset(
-                self,
-                project_root=self.project_root,
-                project_state=self.project_state,
-                announce=False,
-            ):
-                raise RuntimeError("The project reset was not completed")
-            data = self._command_bar_data
-            if data is None:
-                raise RuntimeError("Command Bar data was not captured")
-            if not opener(data):
-                raise RuntimeError("Command Bar could not be opened")
-            self._command_bar_data = None
-        except Exception as error:
-            LOGGER.exception(
-                "Command reset failed"
-            )
-            detail = str(error).strip() or type(error).__name__
-            _toast(
-                self,
-                f"Wipe failed: {detail}",
-                msecs=4000,
-            )
-        finally:
-            self._finish_interaction()
-
-    def _cancel_reset(
-        self,
-    ) -> None:
-        if self._interaction_state != "confirming":
-            return
-        _toast(
-            self,
-            "Wipe cancelled.",
-            msecs=900,
-        )
-        self._command_bar_data = None
-        self._finish_interaction()
-
-    def _release_confirm_dialog(
-        self,
-        _result: int,
-    ) -> None:
-        dialog = self._confirm_dialog
-        self._confirm_dialog = None
-        if dialog is not None:
-            dialog.deleteLater()
-
-    def _finish_interaction(
-        self,
-    ) -> None:
-        self.go_btn.set_busy(False)
-        self.go_btn.setEnabled(True)
-        set_control_help(
-            self.go_btn,
-            "Hold Go for three seconds to choose a new project. You can save, discard changes, or cancel.",
-            accessible_name="New Project",
-        )
-        self._interaction_state = "idle"
+        lifecycle.command_save(reset=reset)
 
     def resizeEvent(
         self,
@@ -2386,9 +2200,6 @@ class CommandTab(
             height,
         )
 
-        if hasattr(self, "project_actions"):
-            self.project_actions.setGeometry(12, max(0, height - 70), max(1, width - 24), 58)
-            self.project_actions.raise_()
         if self._bg_pix.isNull() or self._go_pix.isNull():
             self.bg_label.clear()
             self.go_btn.set_base(
@@ -2424,19 +2235,6 @@ class CommandTab(
         )
 
         self.go_btn.raise_()
-        if hasattr(self, "project_actions"):
-            self.project_actions.raise_()
-        if self._entry_notice.isVisible():
-            self._entry_notice.setGeometry(
-                self.rect()
-            )
-            self._entry_notice.raise_()
-
-    def _route_project_action(self, name):
-        action = getattr(self.window(), name, None)
-        if callable(action):
-            self._entry_notice.dismiss()
-            action()
 
 
 def main() -> None:

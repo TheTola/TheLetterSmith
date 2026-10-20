@@ -106,9 +106,10 @@ class ProjectLifecycle(QtCore.QObject):
             action = getattr(title_bar, name, None)
             if action is not None:
                 action.setEnabled(not busy)
-        commands = getattr(getattr(self.window, "command_tab", None), "project_actions", None)
+        commands = getattr(getattr(self.window, "command_tab", None), "go_btn", None)
         if commands is not None:
             commands.setEnabled(not busy)
+            commands.set_busy(busy)
 
     def _begin(self):
         window = self.window
@@ -180,6 +181,66 @@ class ProjectLifecycle(QtCore.QObject):
             self._discard = True
         guarded()
         return True
+
+    def command_save(self, *, reset=False):
+        """Save through Saved Letters, then optionally activate an empty workspace."""
+        window = self.window
+
+        def explain(message=None):
+            message = message or window.statusBar().currentMessage() or "Save did not finish. Your project remains open."
+            window.status(message)
+            # Command hides the status bar; failures must still be visible.
+            window.toast(message, ms=5000)
+
+        if not self._begin():
+            explain()
+            return False
+        try:
+            if not window.flush_project_edits():
+                explain()
+                self.finish()
+                return False
+            token = self.token()
+
+            def complete():
+                try:
+                    if reset:
+                        if not window.flush_project_edits() or token != self.token():
+                            explain("New edits arrived. Saved version retained; reset cancelled.")
+                            return
+                        candidate = window.project_save_service.prepare_new_project(CLASSIC_PAGE_TYPES)
+                        window.prepare_for_project_reset()
+                        if not window.flush_project_edits() or token != self.token():
+                            explain("New edits arrived. Saved version retained; reset cancelled.")
+                            return
+                        window.project_save_service.activate_new_project(candidate)
+                        from recent_media import clear_type_image_history
+                        clear_type_image_history(window.project_root)
+                        window._show_new_project()
+                except Exception as error:
+                    retained = ("Your saved project is retained." if token[0] == self.token()[0] else
+                                "The fresh project is recoverable. Reopen to restore its views.")
+                    explain(f"Reset stopped: {error}. {retained}")
+                finally:
+                    self.finish()
+
+            def saved(current):
+                if current:
+                    window.forge_tab._defer_until_idle(complete)
+                else:
+                    explain()
+                    self.finish()
+
+            window._initialize_project_tabs()
+            if not window.forge_tab.saved_projects.save(finished=saved):
+                explain()
+                self.finish()
+                return False
+            return True
+        except Exception as error:
+            explain(f"Save stopped: {error}. Your project remains open.")
+            self.finish()
+            return False
 
     def new_project(self):
         if not self._begin():
