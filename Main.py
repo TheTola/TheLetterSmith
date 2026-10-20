@@ -32,6 +32,19 @@ if sys.argv[1:2] == ["--lettersmith-message-import-worker"]:
 
     raise SystemExit(_run_message_import_worker(sys.argv[2:]))
 
+from fault_diagnostics import enable_fault_logging, record_fault_context
+from project_paths import (
+    ApplicationPaths,
+    application_paths,
+    configure_application_paths,
+)
+
+if __name__ == "__main__":
+    enable_fault_logging(ApplicationPaths.for_runtime().logs_root)
+    record_fault_context("Importing PySide6")
+
+import PySide6
+import shiboken6
 from PySide6 import QtCore, QtGui, QtWidgets
 from application_identity import (
     APPLICATION_NAME,
@@ -40,11 +53,6 @@ from application_identity import (
     PUBLISHER_NAME,
 )
 from app_icon import configure_windows_app_identity, resolve_app_icon
-from project_paths import (
-    ApplicationPaths,
-    application_paths,
-    configure_application_paths,
-)
 from performance_trace import PerformanceTimer
 
 
@@ -291,11 +299,15 @@ def log_startup(
         f"— {APP_NAME} {APP_VERSION} —"
     )
 
-    logging.info(
-        f"[Env] Python {python_version} "
+    runtime_versions = (
+        f"Python {python_version} "
+        f"| PySide6 {PySide6.__version__} "
+        f"| shiboken6 {shiboken6.__version__} "
         f"| Qt {qt_version} "
         f"| Mode: {mode}"
     )
+    logging.info("[Env] %s", runtime_versions)
+    record_fault_context(runtime_versions)
 
     logging.info(
         f"[Workspace] {root}"
@@ -668,6 +680,8 @@ def main(*, open_new_project: bool = False) -> None:
     paths = configure_application_paths(
         ApplicationPaths.for_runtime(resource_root)
     )
+    fault_path = enable_fault_logging(paths.logs_root)
+    record_fault_context("Initializing writable storage")
     setup_logging({}, paths.logs_root)
     try:
         paths.initialize(resource_root)
@@ -696,6 +710,8 @@ def main(*, open_new_project: bool = False) -> None:
         "[Logging] Diagnostic log: %s",
         paths.logs_root / LOG_FILE_NAME,
     )
+    if fault_path is not None:
+        logging.info("[Faults] Native fault log: %s", fault_path)
 
     configure_qt_logging()
 
@@ -715,6 +731,7 @@ def main(*, open_new_project: bool = False) -> None:
         settings,
     )
 
+    record_fault_context("Creating QApplication")
     application = bootstrap_qt(
         icon
     )
@@ -740,6 +757,7 @@ def main(*, open_new_project: bool = False) -> None:
         beta_diagnostics,
     )
 
+    record_fault_context("Preparing startup choices")
     # Saved projects migrate into isolated working copies when explicitly opened.
     # Startup must never bulk-rewrite the user's library.
 
@@ -767,6 +785,7 @@ def main(*, open_new_project: bool = False) -> None:
     nexus_startup_timer = PerformanceTimer("startup.nexus_visible")
 
     # Import Nexus only after logging and Qt have been initialized.
+    record_fault_context("Importing Nexus")
     try:
         from Nexus import Nexus
 
@@ -794,6 +813,7 @@ def main(*, open_new_project: bool = False) -> None:
         raise
 
     try:
+        record_fault_context("Constructing Nexus")
         window = Nexus(
             root
         )
@@ -822,6 +842,7 @@ def main(*, open_new_project: bool = False) -> None:
 
         raise
 
+    record_fault_context("Showing Nexus")
     window.show()
     nexus_startup_timer.finish(
         project_ready=bool(
@@ -843,12 +864,14 @@ def main(*, open_new_project: bool = False) -> None:
     )
 
     try:
+        record_fault_context("Entering Qt event loop")
         exit_code = application.exec()
     except BaseException:
         logging.exception("[Crash] Qt event loop failed.")
         raise
 
     logging.info("[Shutdown] Qt event loop stopped with code %s.", exit_code)
+    record_fault_context(f"Qt event loop stopped: exit_code={exit_code}")
     logging.shutdown()
 
     raise SystemExit(

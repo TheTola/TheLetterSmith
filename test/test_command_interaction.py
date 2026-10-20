@@ -1221,6 +1221,48 @@ class CommandInteractionTests(unittest.TestCase):
         curtain_styles.sync_from_settings.assert_called_once_with()
         curtain_styles.set_preview_colors.assert_called_once_with({})
 
+    def test_identical_curtain_choices_are_not_applicable(self) -> None:
+        from curtain_color import curtain_variant_rgbs
+        from curtain_controls import CurtainStyleComboBox, CurtainStyleModel
+
+        model = CurtainStyleModel()
+        selector = CurtainStyleComboBox()
+        selector.setModel(model)
+        selector.set_current_style("complementary_average_color")
+        menu = selector.popup_menu()
+        selected = []
+        selector.styleActivated.connect(selected.append)
+        gray = {
+            "average_color": (112, 112, 112),
+            "complementary_average_color": (112, 112, 112),
+            "normal_light": (215, 215, 215),
+            "complementary_light": (215, 215, 215),
+            "normal_dark": (50, 50, 50),
+            "complementary_dark": (50, 50, 50),
+        }
+        try:
+            model.set_preview_colors(gray)
+            self.assertEqual(selector.currentText(), "Not applicable")
+            self.assertEqual(selector.current_style(), "complementary_average_color")
+            for style in ("complementary_average_color", "complementary_light", "complementary_dark"):
+                self.assertFalse(menu.leaf_action(style).isEnabled())
+                self.assertEqual(menu.leaf_action(style).text(), "Not applicable")
+                self.assertIn("identical", menu.leaf_widget(style).toolTip())
+                menu.leaf_widget(style).click()
+            self.assertEqual(selected, [])
+            for style in ("average_color", "normal_light", "normal_dark"):
+                self.assertTrue(menu.leaf_action(style).isEnabled())
+            with mock.patch("curtain_color._representative_cover_color", return_value=(42, 80, 170)):
+                model.set_preview_colors(curtain_variant_rgbs(Path("cover.png")))
+            self.assertEqual(selector.currentText(), "Complementary Curtains")
+            for style in ("complementary_average_color", "complementary_light", "complementary_dark"):
+                self.assertTrue(menu.leaf_action(style).isEnabled())
+                self.assertEqual(menu.leaf_widget(style).toolTip(), "")
+            menu.leaf_widget("complementary_light").click()
+            self.assertEqual(selected, ["complementary_light"])
+        finally:
+            selector.close()
+
     def test_curtain_setting_invalidates_source_before_preview(self) -> None:
         from Forge_Tab import ForgeTab
 

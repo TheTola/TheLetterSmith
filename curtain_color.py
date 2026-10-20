@@ -188,6 +188,11 @@ def get_curtain_display_colors(
     background = backgrounds[normalized]
     if normalized == CURTAIN_STYLE_WHITE:
         foreground = (0, 0, 0)
+    elif normal == complementary and normalized in (
+        CURTAIN_STYLE_NORMAL,
+        CURTAIN_STYLE_COMPLEMENTARY,
+    ):
+        foreground = _readable_foreground_rgb(background, normal)
     elif normalized == CURTAIN_STYLE_NORMAL:
         foreground = complementary
     elif normalized == CURTAIN_STYLE_COMPLEMENTARY:

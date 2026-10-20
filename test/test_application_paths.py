@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -286,6 +287,90 @@ class ApplicationPathsTests(unittest.TestCase):
                     internal,
                     {},
                     "darwin",
+                )
+
+    def test_packaged_certifi_bundle_loads_in_windows_and_macos_layouts(self) -> None:
+        import certifi
+        from release.build_release import _validate_certificate_bundle
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for layout in ("_internal", "Contents/Resources", "Contents/Resources/_internal"):
+                with self.subTest(layout=layout):
+                    resources = root / layout
+                    packaged = resources / "certifi" / "cacert.pem"
+                    packaged.parent.mkdir(parents=True)
+                    shutil.copyfile(certifi.where(), packaged)
+                    if layout == "_internal":
+                        _validate_certificate_bundle(resources)
+                    else:
+                        frameworks = root / layout.replace("Resources", "Frameworks")
+                        runtime = frameworks / "certifi" / "cacert.pem"
+                        runtime.parent.mkdir(parents=True)
+                        shutil.copyfile(packaged, runtime)
+                        _validate_certificate_bundle(
+                            resources,
+                            runtime_root=frameworks,
+                            bundle_root=root / "Contents",
+                        )
+
+    def test_packaged_certifi_bundle_rejects_missing_unreadable_and_different_files(self) -> None:
+        import certifi
+        from release import build_release
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packaged = root / "certifi" / "cacert.pem"
+            packaged.parent.mkdir()
+            with self.assertRaisesRegex(build_release.ReleaseValidationError, "rebuild"):
+                build_release._validate_certificate_bundle(root)
+            packaged.write_bytes(b"invalid or outdated bundle")
+            with self.assertRaisesRegex(build_release.ReleaseValidationError, "differs"):
+                build_release._validate_certificate_bundle(root)
+            shutil.copyfile(certifi.where(), packaged)
+            with mock.patch.object(build_release, "_files_equal", side_effect=PermissionError):
+                with self.assertRaisesRegex(build_release.ReleaseValidationError, "unreadable"):
+                    build_release._validate_certificate_bundle(root)
+
+    def test_packaged_certifi_bundle_rejects_invalid_pem_even_when_source_matches(self) -> None:
+        import certifi
+        from release import build_release
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packaged = root / "certifi" / "cacert.pem"
+            packaged.parent.mkdir()
+            packaged.write_bytes(b"not a PEM certificate")
+            with mock.patch.object(certifi, "where", return_value=str(packaged)):
+                with self.assertRaisesRegex(build_release.ReleaseValidationError, "invalid"):
+                    build_release._validate_certificate_bundle(root)
+
+    def test_macos_certifi_bundle_requires_runtime_path_inside_app(self) -> None:
+        import certifi
+        from release import build_release
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            contents = root / "Contents"
+            resources = contents / "Resources"
+            packaged = resources / "certifi" / "cacert.pem"
+            packaged.parent.mkdir(parents=True)
+            shutil.copyfile(certifi.where(), packaged)
+            with self.assertRaisesRegex(build_release.ReleaseValidationError, "missing"):
+                build_release._validate_certificate_bundle(
+                    resources,
+                    runtime_root=contents / "Frameworks",
+                    bundle_root=contents,
+                )
+            external = root / "external"
+            runtime = external / "certifi" / "cacert.pem"
+            runtime.parent.mkdir(parents=True)
+            shutil.copyfile(packaged, runtime)
+            with self.assertRaisesRegex(build_release.ReleaseValidationError, "outside"):
+                build_release._validate_certificate_bundle(
+                    resources,
+                    runtime_root=external,
+                    bundle_root=contents,
                 )
 
     def test_macos_otool_parser_handles_universal_output(self) -> None:

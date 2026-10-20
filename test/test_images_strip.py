@@ -1,11 +1,14 @@
 """Interaction regressions for the ordered, horizontal Images strip."""
 import unittest
 from unittest import mock
+from pathlib import Path
 
 from PIL import Image
 from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
-from project_model import MAX_PAGES, create_project
+from project_model import MAX_PAGES, PAGE_TYPES, create_project
+from recent_media import (clear_type_image_history, recent_type_images,
+                          remember_type_image, remember_media, recent_media)
 import test_images_workspace as fixture
 
 
@@ -19,6 +22,133 @@ class ImagesStripTests(unittest.TestCase):
     page = fixture.ImagesWorkspaceTests.page
     select = fixture.ImagesWorkspaceTests.select
     list_ids = fixture.ImagesWorkspaceTests.list_ids
+
+    def test_import_history_retains_each_type_and_original_gif_after_project_switch(self):
+        gif = fixture.ImagesWorkspaceTests.gif(self)
+        original = gif.read_bytes()
+        for row in (0, 1, 2, 4):
+            page = self.session.project.pages[row]
+            self.assertTrue(self.tab.import_image(page["id"], str(gif)))
+            self.wait_for(lambda: self.tab._image_import_thread is None)
+            history = recent_type_images(self.root, page["type"])
+            self.assertEqual(len(history), 1)
+            self.assertEqual(Path(history[0][0]).read_bytes(), original)
+        gif.unlink()
+        self.session.replace(create_project(), asset_root=self.root)
+        for kind in PAGE_TYPES:
+            history = recent_type_images(self.root, kind)
+            self.assertEqual(Path(history[0][0]).read_bytes(), original)
+            with Image.open(history[0][0]) as retained:
+                self.assertEqual(retained.n_frames, 2)
+
+    def test_ten_recent_images_are_shared_by_type_across_projects_and_clear_keeps_files(self):
+        originals = []
+        for number in range(12):
+            source = self.root / f"recent-{number}.png"
+            Image.new("RGB", (24, 36), (number*20, 20, 80)).save(source)
+            originals.append(source)
+            for kind in PAGE_TYPES:
+                remember_type_image(self.root, kind, source, f"{kind}-{number}")
+        for kind in PAGE_TYPES:
+            self.assertEqual([label for _, label in recent_type_images(self.root, kind)],
+                             [f"{kind}-{i}" for i in reversed(range(2, 12))])
+        remember_type_image(self.root, "letter", originals[5], "letter-5")
+        self.assertEqual(len(recent_type_images(self.root, "letter")), 10)
+        self.assertEqual(recent_type_images(self.root, "letter")[0][1], "letter-5")
+        self.assertEqual(recent_type_images(self.root, "cover")[0][1], "cover-11")
+        before = {kind: recent_type_images(self.root, kind) for kind in PAGE_TYPES}
+        self.session.replace(create_project(("letter", "letter", "illustration")), asset_root=self.root)
+        self.assertEqual(before, {kind: recent_type_images(self.root, kind) for kind in PAGE_TYPES})
+        remember_media(self.root, self.session.project.project_id, "music", "track", "Track")
+        files = {Path(path): Path(path).read_bytes() for entries in before.values() for path, _ in entries}
+        files.update({p: p.read_bytes() for p in originals})
+        project = self.session.project.to_dict()
+        clear_type_image_history(self.root)
+        for kind in PAGE_TYPES:
+            self.assertEqual(recent_type_images(self.root, kind), ())
+        self.assertEqual({p: p.read_bytes() for p in files}, files)
+        self.assertEqual(self.session.project.to_dict(), project)
+        self.assertEqual(recent_media(self.root, self.session.project.project_id, "music"), (("track", "Track"),))
+
+    def test_every_same_type_page_uses_shared_history_then_its_three_stock_images(self):
+        from Image_tab import STOCK_IMAGE_FILES
+        from page_layout import PAGE_INDICES
+        from project_paths import application_paths
+        self.session.replace(create_project(tuple(PAGE_TYPES) * 2), asset_root=self.root)
+        for kind, definition in PAGE_TYPES.items():
+            directory = application_paths(self.root).stock_images_root / definition.artwork_template
+            directory.mkdir(parents=True, exist_ok=True)
+            for name in STOCK_IMAGE_FILES[PAGE_INDICES[definition.artwork_template]]:
+                Image.new("RGB", (24, 36), "navy").save(directory / name)
+            remember_type_image(self.root, kind, self.image(), kind)
+        expected = {kind: recent_type_images(self.root, kind) for kind in PAGE_TYPES}
+        for cleared in (False, True):
+            if cleared:
+                clear_type_image_history(self.root)
+            for page in self.session.project.pages:
+                self.select(page["id"])
+                # Old per-page selections must not reappear after Command.
+                remember_media(self.root, self.session.project.project_id, f"image:{page['id']}",
+                               str(self.image()), "Old private selection")
+                with mock.patch("Image_tab.StockImageDialog") as dialog:
+                    dialog.return_value.exec.return_value = QtWidgets.QDialog.Rejected
+                    self.tab._stock_selected()
+                if cleared:
+                    self.assertEqual(len(dialog.call_args.args[1]), 3)
+                    self.assertEqual(dialog.call_args.kwargs["recent_paths"], ())
+                else:
+                    self.assertEqual(dialog.call_args.args[1], ())
+                    self.assertEqual(dialog.call_args.kwargs["recent_paths"],
+                                     tuple(Path(p) for p, _ in expected[page["type"]]))
+
+    def test_single_click_opens_picker_and_keyboard_can_choose_tenth_image(self):
+        from Image_tab import StockImageDialog
+        source = self.image()
+        for i in range(10):
+            Image.new("RGB", (24, 36), (i*20, 20, 100)).save(source)
+            remember_type_image(self.root, "letter", source, f"Choice {i}")
+        choices = recent_type_images(self.root, "letter")
+        with Image.open(choices[9][0]) as expected:
+            expected_size, expected_pixels = expected.size, expected.convert("RGB").tobytes()
+        before = self.page(self.second)
+        chosen = []
+        class AutoChoose(StockImageDialog):
+            def showEvent(dialog, event):
+                super().showEvent(event)
+                def pick():
+                    view = dialog._recent_images
+                    self.assertEqual(view.count(), 10)
+                    view.setFocus()
+                    QtTest.QTest.keyClick(view, QtCore.Qt.Key_End)
+                    self.assertEqual(view.currentRow(), 9)
+                    chosen.append(view.currentItem().data(QtCore.Qt.UserRole))
+                    QtTest.QTest.keyClick(view, QtCore.Qt.Key_Return)
+                QtCore.QTimer.singleShot(0, dialog, pick)
+        view = self.tab.page_list
+        view.scrollToItem(view.item(1))
+        self.pump()
+        with mock.patch("Image_tab.StockImageDialog", AutoChoose):
+            QtTest.QTest.mouseClick(view.viewport(), QtCore.Qt.LeftButton,
+                                   pos=view.visualItemRect(view.item(1)).center())
+            self.wait_for(lambda: bool(chosen) and self.tab._image_import_thread is None)
+        self.assertEqual(chosen, [choices[9][0]])
+        self.assertEqual(recent_type_images(self.root, "letter")[0][1], "Choice 0")
+        with Image.open(self.tab.artwork.resolve_asset(self.first)) as imported:
+            self.assertEqual(imported.size, expected_size)
+            self.assertEqual(imported.convert("RGB").tobytes(), expected_pixels)
+        self.assertEqual(self.page(self.second), before)
+
+    def test_delayed_click_does_not_open_in_replaced_session(self):
+        view = self.tab.page_list
+        with mock.patch.object(self.tab, "_stock_selected") as picker:
+            QtTest.QTest.mouseClick(view.viewport(), QtCore.Qt.LeftButton,
+                                   pos=view.visualItemRect(view.item(0)).center())
+            previous = self.session.project
+            self.session.replace(create_project(), asset_root=self.root)
+            self.session.replace(previous, asset_root=self.root)
+            view._choice_timer.stop()
+            view._choose_after_click()
+            picker.assert_not_called()
 
     def wheel(self, angle=0, pixel=0, horizontal=False):
         view = self.tab.page_list.viewport()
@@ -95,7 +225,8 @@ class ImagesStripTests(unittest.TestCase):
         for label in ("Import image…", "Stock & recent images…", "Crop image…",
                       "Clear page artwork", "Delete page…", "Add page"):
             self.assertIn(label, actions)
-        self.assertFalse(any("Duplicate" in name for name in actions))
+        self.assertIn("Duplicate page", actions)
+        self.assertIn("Open Artwork Folder", actions)
         self.select(self.second)
         actions["Clear page artwork"].trigger()
         self.assertIsNone(self.page(self.first)["artwork"]["asset"])
@@ -139,9 +270,10 @@ class ImagesStripTests(unittest.TestCase):
             rect = QtCore.QRect(widget.mapTo(self.tab, QtCore.QPoint()), widget.size())
             self.assertLess(rect.bottom(), strip_y)
         self.assertLess(self.tab.pwrite_fab.x(), self.tab.name_edit.x())
+        self.assertTrue(self.tab.add_button.isVisibleTo(self.tab))
         for button in (self.tab.import_button, self.tab.stock_button, self.tab.crop_button,
                        self.tab.duplicate_button, self.tab.delete_button, self.tab.more_button,
-                       self.tab.add_button, self.tab.undo_button):
+                       self.tab.undo_button):
             self.assertFalse(button.isVisibleTo(self.tab))
         self.assertFalse(self.tab.limit_label.isVisibleTo(self.tab))
 
@@ -157,15 +289,50 @@ class ImagesStripTests(unittest.TestCase):
                 self.assertLess(label_rect.right(), field_rect.left())
                 self.assertLessEqual(abs(label_rect.center().y()-field_rect.center().y()), 2)
                 self.assertTrue(self.tab.rect().contains(field_rect))
+                self.assertTrue(label.font().bold())
+                self.assertTrue(field.font().bold())
             self.assertGreaterEqual(self.tab.pwrite_fab.width(), 128)
             self.assertLess(self.tab.type_combo.mapTo(self.tab, QtCore.QPoint()).x(), width-160)
+            self.assertLessEqual(abs(self.tab._identity_panel.geometry().center().x()
+                                     - self.tab.rect().center().x()), 1)
+            self.assertEqual(self.tab.pwrite_fab.y(), self.tab.layout().contentsMargins().top())
+
+    def test_visible_add_page_menu_inserts_after_selection_and_respects_limit(self):
+        self.select(self.first)
+        before = self.list_ids()
+        action = next(action for action in self.tab.add_button.menu().actions()
+                      if action.text().startswith("Illustration"))
+        action.trigger()
+        self.pump()
+        added = self.session.selected_page_id
+        self.assertEqual(self.page(added)["type"], "illustration")
+        self.assertEqual(self.list_ids().index(added), before.index(self.first) + 1)
+        while len(self.session.project.pages) < MAX_PAGES:
+            self.tab.add_page("illustration")
+        self.assertTrue(self.tab.add_button.isVisibleTo(self.tab))
+        self.assertFalse(self.tab.add_button.isEnabled())
+
+    def test_short_strip_is_centered_and_expands_for_scrolling(self):
+        self.session.replace(create_project(), asset_root=self.root)
+        for width in (1900, 900, 1900):
+            self.tab.resize(width, 760)
+            self.pump()
+            view = self.tab.page_list
+            first = view.visualItemRect(view.item(0))
+            last = view.visualItemRect(view.item(view.count()-1))
+            if view.horizontalScrollBar().maximum() == 0:
+                center = view.viewport().mapTo(self.tab, first.united(last).center())
+                self.assertLessEqual(abs(center.x()-self.tab.rect().center().x()), 1)
+            else:
+                self.assertEqual(view.viewportMargins().left(), 0)
 
     def test_context_add_at_limit_reports_limit_without_losing_pages(self):
         while len(self.session.project.pages) < MAX_PAGES:
             self.tab.add_page("illustration")
         ids = self.list_ids()
         menu = self.tab._page_menu(self.session.selected_page_id)
-        submenu = next(a.menu() for a in menu.actions() if a.text() == "Add page")
+        submenu_action = next(a for a in menu.actions() if a.text() == "Add page")
+        submenu = submenu_action.menu()
         submenu.actions()[0].trigger()
         self.assertEqual(self.list_ids(), ids)
         self.assertIn("maximum of 10", self.tab.status.text())

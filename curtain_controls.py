@@ -33,6 +33,11 @@ _DIRECT_STYLES = (
 )
 _LIGHT_STYLES = ("normal_light", "complementary_light")
 _DARK_STYLES = ("normal_dark", "complementary_dark")
+_COMPLEMENTARY_PAIRS = {
+    "complementary_average_color": "average_color",
+    "complementary_light": "normal_light",
+    "complementary_dark": "normal_dark",
+}
 
 
 def _qcolor(value: object, fallback: str) -> QtGui.QColor:
@@ -94,6 +99,19 @@ class CurtainStyleModel(QtGui.QStandardItemModel):
             item = self.item(row)
             style = str(item.data(CURTAIN_STYLE_ROLE))
             display = palette[style]
+            normal_style = _COMPLEMENTARY_PAIRS.get(style)
+            duplicate = (
+                style in colors
+                and normal_style in colors
+                and variants[style] == variants[normal_style]
+            )
+            item.setText("Not applicable" if duplicate else CURTAIN_STYLE_LABELS[style])
+            item.setEnabled(not duplicate)
+            item.setToolTip(
+                f"{CURTAIN_STYLE_LABELS[style]}: not applicable because the "
+                "normal and complementary colors are identical. Use the normal option."
+                if duplicate else ""
+            )
             item.setData(
                 QtGui.QColor(*display.background),
                 CURTAIN_BACKGROUND_ROLE,
@@ -109,7 +127,7 @@ class CurtainStyleModel(QtGui.QStandardItemModel):
             self.dataChanged.emit(
                 self.index(0, 0),
                 self.index(self.rowCount() - 1, 0),
-                [CURTAIN_BACKGROUND_ROLE, CURTAIN_FOREGROUND_ROLE],
+                [],
             )
 
 
@@ -128,6 +146,7 @@ class CurtainStyleDelegate(QtWidgets.QStyledItemDelegate):
             "#202830",
         )
         self._fallback_foreground = _qcolor(colors.text, "#ffffff")
+        self._disabled_foreground = _qcolor(colors.muted_text, "#999999")
 
     def sizeHint(
         self,
@@ -149,6 +168,9 @@ class CurtainStyleDelegate(QtWidgets.QStyledItemDelegate):
             background = self._fallback_background
         if not isinstance(foreground, QtGui.QColor) or not foreground.isValid():
             foreground = self._fallback_foreground
+        if not option.state & QtWidgets.QStyle.State_Enabled:
+            background = self._fallback_background
+            foreground = self._disabled_foreground
 
         painter.save()
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
@@ -368,6 +390,7 @@ class _CurtainChoiceMenu(QtWidgets.QMenu):
         for style in _DARK_STYLES:
             self._add_leaf(self.dark_menu, style)
         self.apply_theme_tokens(self._theme_tokens)
+        self._refresh_rows()
 
     @QtCore.Slot()
     def _before_show(self) -> None:
@@ -376,10 +399,24 @@ class _CurtainChoiceMenu(QtWidgets.QMenu):
 
     @QtCore.Slot()
     def _refresh_rows(self, *_args: object) -> None:
-        for row in self._leaf_rows.values():
+        for style, row in self._leaf_rows.items():
+            index = self._model.index(self._model.row_for_style(style), 0)
+            action = self._leaf_actions[style]
+            label = str(index.data(Qt.DisplayRole) or "")
+            tooltip = str(index.data(Qt.ToolTipRole) or "")
+            action.setText(label)
+            action.setEnabled(bool(index.flags() & Qt.ItemIsEnabled))
+            action.setToolTip(tooltip)
+            row.setToolTip(tooltip)
+            row.setAccessibleName(
+                f"{CURTAIN_STYLE_LABELS[style]}: {label}"
+                if label != CURTAIN_STYLE_LABELS[style] else label
+            )
             row.set_current_style(self._current_style)
 
     def _activate(self, style: str) -> None:
+        if not self._leaf_actions[style].isEnabled():
+            return
         self.styleActivated.emit(normalize_curtain_style(style))
         self.close()
 
@@ -453,11 +490,9 @@ class CurtainStyleComboBox(QtWidgets.QToolButton):
         if self._choices_available == available:
             return
         self._choices_available = available
-        if available:
-            self.set_current_style(self._current_style)
-        else:
+        if not available:
             self.hidePopup()
-            self.setText("")
+        self.set_current_style(self._current_style)
         self._arrow.setVisible(available)
         self._refresh_selected_visual()
 
@@ -507,7 +542,7 @@ class CurtainStyleComboBox(QtWidgets.QToolButton):
                 label = str(
                     self._model.index(row, 0).data(Qt.DisplayRole) or label
                 )
-        self.setText(label if self._choices_available else "")
+        self.setText(label)
         self._refresh_selected_visual()
 
     def current_style(self) -> str:
@@ -561,7 +596,7 @@ class CurtainStyleComboBox(QtWidgets.QToolButton):
 
     @QtCore.Slot()
     def _model_changed(self, *_args: object) -> None:
-        self._refresh_selected_visual()
+        self.set_current_style(self._current_style)
 
     def _refresh_selected_visual(self) -> None:
         colors = self._theme_tokens

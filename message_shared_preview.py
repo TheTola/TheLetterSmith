@@ -65,6 +65,8 @@ class SharedMessagePreview(QtWidgets.QWidget):
     """Own only preview jobs, temporary outputs and a local, muted browser view."""
 
     status_changed = QtCore.Signal(str)
+    expand_requested = QtCore.Signal()
+    contrast_changed = QtCore.Signal(float)
 
     def __init__(self, parent, session, cache, adapter):
         super().__init__(parent)
@@ -101,8 +103,7 @@ class SharedMessagePreview(QtWidgets.QWidget):
                 except (OSError, ValueError):
                     return False
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        self._page_aspect = 2 / 3
         # Create the view before its profile so child destruction releases the
         # page before destroying the profile.
         self.view = QWebEngineView(self)
@@ -117,13 +118,14 @@ class SharedMessagePreview(QtWidgets.QWidget):
         settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, False)
         settings.setAttribute(QWebEngineSettings.JavascriptCanOpenWindows, False)
         self.view.setAccessibleName("Interactive preview of the selected Letter")
-        layout.addWidget(self.view)
+        QtWidgets.QApplication.instance().installEventFilter(self)
         self.view.hide()
         self.view.loadFinished.connect(self._loaded)
         self._pool = QtCore.QThreadPool(self)
         self._pool.setMaxThreadCount(1)
         self._tasks = {}
         self._revision = 0
+        self._displayed_revision = None
         self._page_id = None
         self._current = None
         self._retired = []
@@ -172,6 +174,7 @@ class SharedMessagePreview(QtWidgets.QWidget):
 
     def invalidate(self):
         self._revision += 1
+        self._displayed_revision = None
         self._poll.stop()
         self._resource_timer.stop()
         self._request_key = None
@@ -213,6 +216,8 @@ class SharedMessagePreview(QtWidgets.QWidget):
         if self._current is not None:
             self._retired.append(self._current[0])
         self._current = (temporary, render, warnings)
+        self._displayed_revision = None
+        self._poll.stop()
         self._warning = ""
         self._resource_stamp = self.adapter.referenced_resource_stamp(render)
         self._view_released = False
@@ -249,6 +254,7 @@ class SharedMessagePreview(QtWidgets.QWidget):
                 self.status_changed.emit("The shared viewer could not open this Letter page.")
                 return
             self.view.show()
+            self._displayed_revision = revision
             self._poll.start()
             self._resource_timer.start()
             self._inspect_page()
@@ -267,9 +273,12 @@ class SharedMessagePreview(QtWidgets.QWidget):
 
     def _inspect_page(self):
         revision = self._revision
+        if self._displayed_revision != revision:
+            return
 
         def inspected(state):
-            if self._closed or revision != self._revision or self._current is None:
+            if (self._closed or revision != self._revision or self._current is None
+                    or self._displayed_revision != revision):
                 return
             try:
                 state = json.loads(state)
@@ -281,6 +290,9 @@ class SharedMessagePreview(QtWidgets.QWidget):
             if not isinstance(page_id, str):
                 return
             self.viewed_page_id = page_id
+            contrast = state.get("contrast")
+            if page_id == self._page_id and not self._warning and isinstance(contrast, (int, float)):
+                self.contrast_changed.emit(float(contrast))
             _, render, warnings = self._current
             page = next(((i, p) for i, p in enumerate(render.snapshot["pages"], 1) if p["id"] == page_id), None)
             if page is not None:
@@ -299,6 +311,8 @@ class SharedMessagePreview(QtWidgets.QWidget):
 
         self.view.page().runJavaScript(
             "JSON.stringify({page_id: window.LetterSmithViewer?.currentPageId() || null, "
+            "contrast: (() => { const raw=document.querySelector('.text-wall.is-open')?.dataset.minimumContrast; "
+            "return raw ? Number(raw) : null; })(), "
             "issues: window.LetterSmithViewer?.layoutIssues?.() || []})", inspected,
         )
 
@@ -325,6 +339,29 @@ class SharedMessagePreview(QtWidgets.QWidget):
 
     def set_zoom(self, value):
         self.view.setZoomFactor(max(0.25, min(2.0, value / 100)))
+
+    def set_page_aspect(self, width, height):
+        if width > 0 and height > 0:
+            self._page_aspect = width / height
+            self._fit_view()
+
+    def _fit_view(self):
+        width = min(self.width(), round(self.height() * self._page_aspect))
+        height = min(self.height(), round(width / self._page_aspect))
+        self.view.setGeometry((self.width() - width) // 2,
+                              (self.height() - height) // 2, width, height)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_view()
+
+    def eventFilter(self, watched, event):
+        if event.type() == QtCore.QEvent.MouseButtonDblClick and self.isVisible():
+            widget = watched if isinstance(watched, QtWidgets.QWidget) else None
+            if widget is not None and (widget is self or self.isAncestorOf(widget)):
+                self.expand_requested.emit()
+                return True
+        return False
 
     def _cleanup_retired(self):
         if not self._view_released:
@@ -378,6 +415,7 @@ class SharedMessagePreview(QtWidgets.QWidget):
         if not self.release():
             return False
         self._closed = True
+        QtWidgets.QApplication.instance().removeEventFilter(self)
         self._cleanup_timer.stop()
         self._cleanup_retired()
         if self._retired:

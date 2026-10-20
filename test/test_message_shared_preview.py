@@ -150,6 +150,44 @@ class SharedMessagesPreviewTests(unittest.TestCase):
         self.assertIsNone(self.preview._current)
         self.assertIsNone(self.workspace.page_id)
 
+    def test_editor_and_expanded_preview_share_artwork_text_and_live_contrast(self):
+        from PySide6 import QtTest
+        self.open_preview(self.a)
+        self.workspace.open_editor()
+        self.app.processEvents()
+        self.wait_for(lambda: self.js("return !!document.querySelector('.ls-editor-message');"))
+        self.workspace.preset.setCurrentIndex(self.workspace.preset.findData("black"))
+        self.workspace.opacity.setValue(100)
+        editor = self.workspace.editor
+        editor.editor.selectAll()
+        editor._apply_named_style("normal_text")
+        editor.set_paper_text_color("normal_text", QtGui.QColor("#ffffff"))
+        self.workspace.render_preview()
+        self.wait_for(lambda: not self.preview._tasks and self.workspace._preview_contrast is not None)
+        self.assertGreater(self.workspace._preview_contrast, 7)
+        content = self.js("return document.querySelector('.ls-editor-message').textContent;")
+        source = self.js("return document.querySelector('.slide.active img').src;")
+        url = self.preview.view.url()
+        QtTest.QTest.mouseDClick(self.preview.view.focusProxy(), QtCore.Qt.LeftButton)
+        self.app.processEvents()
+        overlay = self.workspace.expanded_preview
+        self.assertIsNotNone(overlay)
+        self.assertTrue(overlay.isVisible())
+        self.assertEqual(self.preview.view.url(), url)
+        self.assertEqual(self.js("return document.querySelector('.ls-editor-message').textContent;"), content)
+        self.assertEqual(self.js("return document.querySelector('.slide.active img').src;"), source)
+        self.assertAlmostEqual(self.preview.view.width() / self.preview.view.height(), 2 / 3, places=2)
+        QtTest.QTest.keyClick(overlay, QtCore.Qt.Key_Escape)
+        self.app.processEvents()
+        self.assertIsNone(self.workspace.expanded_preview)
+        self.assertTrue(self.workspace.preview_panel.isAncestorOf(self.preview))
+        self.workspace.expand_preview()
+        self.app.processEvents()
+        overlay = self.workspace.expanded_preview
+        QtTest.QTest.mouseClick(overlay, QtCore.Qt.LeftButton, pos=QtCore.QPoint(3, 3))
+        self.app.processEvents()
+        self.assertIsNone(self.workspace.expanded_preview)
+
     def test_hide_and_restore_release_generated_files_and_reopen_selected_page(self):
         self.open_preview(self.b)
         previous = Path(self.preview._current[0].name)

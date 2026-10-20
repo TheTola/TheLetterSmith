@@ -387,7 +387,7 @@ class ImagesWorkspaceTests(unittest.TestCase):
     def test_page_limits_and_out_of_range_import_keep_all_pages_visible(self):
         self.session.replace(create_project(("illustration",) * MAX_PAGES), asset_root=self.root)
         self.pump()
-        self.assertTrue(self.tab.add_button.isEnabled())
+        self.assertFalse(self.tab.add_button.isEnabled())
         self.assertFalse(self.tab.limit_label.isVisible())
         with self.assertRaisesRegex(ValueError, 'maximum of 10'):
             self.tab.add_page('illustration')
@@ -402,7 +402,7 @@ class ImagesWorkspaceTests(unittest.TestCase):
         self.session.replace(ProjectModel.from_dict(imported), asset_root=self.root)
         self.pump()
         self.assertEqual(self.tab.page_list.count(), MAX_PAGES + 2)
-        self.assertTrue(self.tab.add_button.isEnabled())
+        self.assertFalse(self.tab.add_button.isEnabled())
         self.select(imported["pages"][-1]["id"])
         self.assertEqual(self.tab.page_list.currentRow(), MAX_PAGES + 1)
 

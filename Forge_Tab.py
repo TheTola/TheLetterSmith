@@ -609,7 +609,7 @@ class _PreviewModeCombo(QtWidgets.QComboBox):
         super().__init__(parent)
         self.setObjectName("PreviewFormatSelector")
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedWidth(144)
+        self.setFixedWidth(164)
         self.setMinimumHeight(34)
         self.setMaxVisibleItems(len(PREVIEW_MODES))
         view = QtWidgets.QListView(self)
@@ -1663,7 +1663,7 @@ class ForgeTab(QtWidgets.QWidget):
         )
         saved_holder = QtWidgets.QHBoxLayout()
         self.saved_actions_layout = saved_holder
-        saved_holder.setSpacing(5)
+        saved_holder.setSpacing(12)
         saved_holder.setContentsMargins(0, 0, 0, 0)
         saved_holder.addWidget(self._unpublish_balance)
         saved_holder.addStretch(1)
@@ -1843,9 +1843,13 @@ class ForgeTab(QtWidgets.QWidget):
             "QFrame#ForgeIdentity{background:#111921;"
             "border:1px solid #253d49;border-radius:7px;}"
         )
-        identity_row = QtWidgets.QHBoxLayout(self.identity_panel)
-        identity_row.setContentsMargins(9, 6, 9, 6)
-        identity_row.setSpacing(9)
+        identity_layout = QtWidgets.QVBoxLayout(self.identity_panel)
+        identity_layout.setContentsMargins(14, 10, 14, 10)
+        identity_layout.setSpacing(8)
+        identity_row = QtWidgets.QHBoxLayout()
+        identity_row.setContentsMargins(0, 0, 0, 0)
+        identity_row.setSpacing(12)
+        identity_layout.addLayout(identity_row)
         identity_row.addWidget(self._muted_label("Title"))
         self.identity_title = _IdentitySummaryLabel()
         self.identity_title.setStyleSheet("color:#f2fbff;font:600 10pt 'Segoe UI';")
@@ -1862,14 +1866,14 @@ class ForgeTab(QtWidgets.QWidget):
         identity_holder = QtWidgets.QHBoxLayout()
         self._identity_holder = identity_holder
         identity_holder.setContentsMargins(0, 0, 0, 0)
-        identity_holder.addStretch(1)
+        identity_holder.addStretch(0)
         identity_holder.addWidget(self.identity_panel, 1)
-        identity_holder.addStretch(1)
+        identity_holder.addStretch(0)
         self._main_layout.addLayout(identity_holder)
 
         self.preview_format_panel = QtWidgets.QFrame(self)
         self.preview_format_panel.setObjectName("ForgePreviewFormat")
-        self.preview_format_panel.setFixedWidth(468)
+        self.preview_format_panel.setFixedWidth(488)
         self.preview_format_panel.setStyleSheet(
             "QFrame#ForgePreviewFormat{background:rgba(13,31,40,.86);"
             "border:1px solid #315c69;border-radius:10px;}"
@@ -1966,7 +1970,11 @@ class ForgeTab(QtWidgets.QWidget):
         set_control_help(self.export_btn, "Save a portable ZIP or Single HTML presentation.")
         self.export_btn.clicked.connect(self.show_export_menu)
         publishing_row.addWidget(self.export_btn)
-        self._main_layout.addLayout(publishing_row)
+        self.identity_separator = QtWidgets.QFrame()
+        self.identity_separator.setObjectName("ForgeIdentitySeparator")
+        self.identity_separator.setFixedHeight(1)
+        identity_layout.addWidget(self.identity_separator)
+        identity_layout.addLayout(publishing_row)
 
         actions = QtWidgets.QHBoxLayout()
         self._actions_layout = actions
@@ -2031,6 +2039,7 @@ class ForgeTab(QtWidgets.QWidget):
         self.status = QtWidgets.QLabel()
         self.status.setObjectName("ForgeStatus")
         self.status.setWordWrap(True)
+        self.status.setAlignment(Qt.AlignCenter)
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.status.setMinimumHeight(24)
         self.status.setMaximumHeight(46)
@@ -2061,8 +2070,11 @@ class ForgeTab(QtWidgets.QWidget):
             return
         self._compact_layout = compact
         self._heading_row.setContentsMargins(0, 0, 0, 0 if compact else 5)
-        self._main_layout.setSpacing(0 if compact else 11)
-        self.identity_panel.layout().setContentsMargins(9, 0 if compact else 6, 9, 0 if compact else 6)
+        self._main_layout.setSpacing(4 if compact else 11)
+        self.identity_panel.layout().setContentsMargins(
+            14, 4 if compact else 10, 14, 4 if compact else 10,
+        )
+        self.identity_panel.layout().setSpacing(4 if compact else 8)
         self._actions_layout.setSpacing(6 if compact else 9)
         format_layout = self.preview_format_panel.layout()
         format_layout.setContentsMargins(11, 1 if compact else 6, 9, 1 if compact else 6)
@@ -2233,6 +2245,14 @@ class ForgeTab(QtWidgets.QWidget):
         app_font_family: str = "Segoe UI",
     ) -> None:
         self._theme_tokens = colors
+        self.identity_panel.setStyleSheet(
+            "QFrame#ForgeIdentity{"
+            f"background:{colors.panel_background};"
+            f"border:1px solid {colors.border};border-radius:10px;}}"
+        )
+        self.identity_separator.setStyleSheet(
+            f"QFrame#ForgeIdentitySeparator{{background:{colors.border};border:none;}}"
+        )
         self.preview_format_panel.setStyleSheet(
             "QFrame#ForgePreviewFormat{"
             f"background:{_rgba(colors.panel_background, 235)};"
@@ -3028,19 +3048,16 @@ class ForgeTab(QtWidgets.QWidget):
     def _sync_preview_option_controls(self, readiness: ReadinessResult) -> None:
         available = readiness.can_preview
         with QtCore.QSignalBlocker(self.preview_mode):
-            if available:
-                if self.preview_mode.count() == 0:
-                    for label, mode in PREVIEW_MODES:
-                        self.preview_mode.addItem(label, mode)
-                        self.preview_mode.setItemData(
-                            self.preview_mode.count() - 1,
-                            PREVIEW_MODE_DESCRIPTIONS[mode],
-                            Qt.UserRole + 1,
-                        )
-                current = self.preview_mode.findData(self._preview_mode)
-                self.preview_mode.setCurrentIndex(current)
-            else:
-                self.preview_mode.clear()
+            if self.preview_mode.count() == 0:
+                for label, mode in PREVIEW_MODES:
+                    self.preview_mode.addItem(label, mode)
+                    self.preview_mode.setItemData(
+                        self.preview_mode.count() - 1,
+                        PREVIEW_MODE_DESCRIPTIONS[mode],
+                        Qt.UserRole + 1,
+                    )
+            current = self.preview_mode.findData(self._preview_mode)
+            self.preview_mode.setCurrentIndex(current)
         self.preview_mode.setEnabled(available and not self._busy)
         self.preview_mode._arrow.setVisible(available)
         self.curtain_style_selector.set_choices_available(available)
@@ -5631,7 +5648,6 @@ class ForgeTab(QtWidgets.QWidget):
     def _set_busy(self, busy: bool) -> None:
         controller = getattr(self, "saved_projects", None)
         if controller is not None:
-            controller.save_button.setEnabled(not busy)
             controller.actions.setEnabled(not busy)
             controller.open_button.setEnabled(not busy and bool(self._selected_saved_letter and self._selected_saved_letter.valid))
         for card in self._saved_cards:

@@ -140,10 +140,12 @@ class CommandImmersiveLayoutTests(unittest.TestCase):
                     self.app.processEvents()
 
                     card = window.sound_tab.single_panel
-                    button = window.sound_tab.single_action_btn
+                    button = window.sound_tab.import_btn
                     self.assertGreaterEqual(card.height(), 230)
+                    self.assertTrue(window.sound_tab.single_action_btn.isHidden())
+                    self.assertTrue(button.isVisible())
                     self.assertLessEqual(
-                        button.y() + button.height(), card.height()
+                        button.y() + button.height(), window.sound_tab.height()
                     )
                     self.assertFalse(window.help_anchor.isVisible())
                     self.assertLessEqual(

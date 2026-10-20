@@ -46,6 +46,17 @@ ID, and tester for each run. Do not record credentials or private user data.
   crash messages.
 - GitHub App/device authentication, Keychain allow/deny/locked behavior,
   credential persistence/refresh/sign-out, repository access, publish, and retry.
+- On a fresh Python 3.13 environment, install `requirements.txt` and launch the
+  source app without running `Install Certificates.command`. Complete GitHub
+  device authorization/token polling, repository listing, and publish/update a
+  disposable test letter. Record Python and `certifi` versions and results only;
+  never copy tokens or device codes into the QA record.
+- Build the package and confirm its certificate gate passes. On a separate clean
+  Mac/profile with no repaired Python certificate store, launch the copied app
+  through Finder and repeat GitHub sign-in, repository listing, publishing, and
+  relaunch with saved credentials. Also launch from a working directory outside
+  the source/build tree. Record app checksum, architecture, and result; source or
+  fixture tests do not substitute for this packaged test.
 - GitHub authorization and The Visionary open in the default browser; test the
   retry and copied-address behavior after an intentionally failed launch.
 - Finder folder/file opening and native file dialogs.

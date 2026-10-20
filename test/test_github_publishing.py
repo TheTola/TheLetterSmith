@@ -42,6 +42,7 @@ from publishing.github_config import GitHubApplicationConfiguration
 from publishing.github_pages import (
     REPOSITORY_MARKER,
     GitHubPagesPublisher,
+    _fetch_public_bytes,
     _git_blob_sha,
     _publication_path,
     _published_files,
@@ -507,7 +508,7 @@ class GitHubAuthenticationTests(unittest.TestCase):
                 form=True,
             )
 
-        self.assertEqual(raised.exception.code, "network")
+        self.assertEqual(raised.exception.code, "certificate_verification")
         self.assertIn("certificate", raised.exception.user_message.casefold())
         self.assertIn("CERTIFICATE_VERIFY_FAILED", raised.exception.technical_details)
 
@@ -1432,6 +1433,237 @@ class GitHubPublishingTests(unittest.TestCase):
             self.assertTrue(
                 all("lettersmith-publication.json" in url for url in fetches)
             )
+
+    def test_publish_retry_recovers_unverified_upload_after_restart(self) -> None:
+        for occupied, title in (
+            (False, "Timeout Letter"),
+            (False, "Renamed Letter"),
+            (True, "Renamed Letter"),
+        ):
+            with (
+                self.subTest(occupied=occupied, title=title),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                build = self._build(root)
+                project_id = str(uuid.uuid4())
+                api = _PublishingAPI(
+                    project_id,
+                    repository_exists=occupied,
+                    pages_exists=occupied,
+                    existing_tree=[
+                        {
+                            "path": "timeout-letter/index.html",
+                            "type": "blob",
+                            "sha": "other",
+                        }
+                    ] if occupied else [],
+                    existing_remote_files={
+                        "timeout-letter/index.html": b"another letter"
+                    } if occupied else {},
+                )
+                clock = _Clock()
+                metadata = {
+                    "project_id": project_id,
+                    "recipient_title": "Timeout Letter",
+                    "source_fingerprint": "source-timeout",
+                }
+                publisher = GitHubPagesPublisher(
+                    root,
+                    self.session,
+                    configuration=self.configuration,
+                    api=api,
+                    public_fetcher=lambda *_args: None,
+                    sleeper=clock.sleep,
+                    clock=clock.now,
+                    verification_timeout=1,
+                )
+                failed = publisher.publish(build, metadata)
+                self.assertEqual(failed.error_code, "publication_timeout")
+                self.assertEqual(SettingsStore(root).get(PUBLISHED_PAGE_URL_KEY), "")
+
+                metadata["recipient_title"] = title
+                retry = GitHubPagesPublisher(
+                    root,
+                    self.session,
+                    configuration=self.configuration,
+                    api=api,
+                    public_fetcher=api.public_fetch,
+                )
+                result = retry.publish(build, dict(metadata))
+                expected = "timeout-letter-2" if occupied else "timeout-letter"
+                self.assertTrue(result.success, result.message)
+                self.assertEqual(result.public_path, expected)
+                own_markers = [
+                    path for path, content in api.remote_files.items()
+                    if path.endswith("/lettersmith-publication.json")
+                    and json.loads(content)["project_id"] == project_id
+                ]
+                self.assertEqual(
+                    own_markers, [f"{expected}/lettersmith-publication.json"]
+                )
+                removed = retry.unpublish({
+                    **SettingsStore(root).snapshot(), "project_id": project_id,
+                })
+                self.assertTrue(removed.success, removed.message)
+                self.assertNotIn(f"{expected}/index.html", api.remote_files)
+                if occupied:
+                    self.assertEqual(
+                        api.remote_files["timeout-letter/index.html"], b"another letter"
+                    )
+
+    def test_recovery_does_not_reuse_another_projects_public_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = self._build(root)
+            api = _PublishingAPI(str(uuid.uuid4()))
+            publisher = GitHubPagesPublisher(
+                root,
+                self.session,
+                configuration=self.configuration,
+                api=api,
+                public_fetcher=api.public_fetch,
+            )
+            first = publisher.publish(build, {
+                "project_id": str(uuid.uuid4()), "recipient_title": "Shared Title",
+            })
+            before = dict(api.remote_files)
+            second = publisher.publish(build, {
+                "project_id": str(uuid.uuid4()), "recipient_title": "Shared Title",
+            })
+            self.assertTrue(first.success, first.message)
+            self.assertTrue(second.success, second.message)
+            self.assertEqual(second.public_path, "shared-title-2")
+            for path, content in before.items():
+                if path.startswith("shared-title/"):
+                    self.assertEqual(api.remote_files[path], content)
+
+    def test_recovery_refuses_ambiguous_or_mismatched_remote_identity(self) -> None:
+        for duplicate in (False, True):
+            with (
+                self.subTest(duplicate=duplicate),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                build = self._build(root)
+                project_id = str(uuid.uuid4())
+                remote_files = {}
+                for path in ("letter", "letter-2") if duplicate else ("letter",):
+                    remote_files[f"{path}/lettersmith-publication.json"] = json.dumps({
+                        "project_id": project_id,
+                        "public_path": path if duplicate else "wrong-path",
+                    }).encode("utf-8")
+                    remote_files[f"{path}/index.html"] = b"existing letter"
+                api = _PublishingAPI(
+                    project_id,
+                    repository_exists=True,
+                    pages_exists=True,
+                    existing_tree=[
+                        {"path": path, "type": "blob", "sha": _git_blob_sha(content)}
+                        for path, content in remote_files.items()
+                    ],
+                    existing_remote_files=remote_files,
+                )
+                publisher = GitHubPagesPublisher(
+                    root,
+                    self.session,
+                    configuration=self.configuration,
+                    api=api,
+                    public_fetcher=api.public_fetch,
+                )
+                result = publisher.publish(build, {
+                    "project_id": project_id, "recipient_title": "Retry",
+                })
+                self.assertFalse(result.success)
+                self.assertEqual(result.error_code, "publication_conflict")
+                self.assertEqual(api.remote_files, remote_files)
+                self.assertTrue(all(method == "GET" for method, *_ in api.calls))
+
+    def test_unpublish_network_failure_preserves_details_for_retry(self) -> None:
+        for error in (
+            urllib.error.URLError("offline"),
+            TimeoutError("timed out"),
+            urllib.error.HTTPError(
+                "https://ada.github.io/", 503, "Unavailable", {}, None
+            ),
+        ):
+            with (
+                self.subTest(error=type(error).__name__),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                build = self._build(root)
+                project_id = str(uuid.uuid4())
+                api = _PublishingAPI(project_id)
+                publisher = GitHubPagesPublisher(
+                    root,
+                    self.session,
+                    configuration=self.configuration,
+                    api=api,
+                    public_fetcher=api.public_fetch,
+                )
+                published = publisher.publish(build, {
+                    "project_id": project_id, "recipient_title": "Remove Me",
+                })
+                self.assertTrue(published.success, published.message)
+                before = SettingsStore(root).snapshot()
+                metadata = {**before, "project_id": project_id}
+                publisher.public_fetcher = _fetch_public_bytes
+                with mock.patch(
+                    "publishing.github_pages.urllib.request.urlopen", side_effect=error
+                ):
+                    removed = publisher.unpublish(metadata)
+                self.assertFalse(removed.success)
+                self.assertEqual(removed.error_code, "network")
+                self.assertEqual(SettingsStore(root).snapshot(), before)
+
+                publisher.public_fetcher = api.public_fetch
+                retried = publisher.unpublish(metadata)
+                self.assertTrue(retried.success, retried.message)
+                self.assertEqual(SettingsStore(root).get(PUBLISHED_PAGE_URL_KEY), "")
+
+    def test_unpublication_requires_both_public_resources_to_be_absent(self) -> None:
+        for marker, index, expected in (
+            (b"changed marker", b"changed index", False),
+            (None, b"changed index", False),
+            (None, None, True),
+        ):
+            with (
+                self.subTest(marker=marker, index=index),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                clock = _Clock()
+                publisher = GitHubPagesPublisher(
+                    directory,
+                    self.session,
+                    configuration=self.configuration,
+                    public_fetcher=lambda url, _timeout: (
+                        marker if "lettersmith-publication.json" in url else index
+                    ),
+                    sleeper=clock.sleep,
+                    clock=clock.now,
+                    verification_timeout=1,
+                )
+                self.assertEqual(
+                    publisher._verify_unpublication(
+                        "https://ada.github.io/letter/", b"old marker", b"old index", "nonce",
+                    ),
+                    expected,
+                )
+
+    def test_public_fetch_only_treats_404_and_410_as_absent(self) -> None:
+        for status in (403, 404, 410, 429, 500, 503):
+            error = urllib.error.HTTPError(
+                "https://ada.github.io/", status, "HTTP error", {}, None
+            )
+            with self.subTest(status=status), mock.patch(
+                "publishing.github_pages.urllib.request.urlopen", side_effect=error
+            ):
+                if status in {404, 410}:
+                    self.assertIsNone(_fetch_public_bytes("https://ada.github.io/", 1))
+                else:
+                    with self.assertRaises(GitHubOperationError):
+                        _fetch_public_bytes("https://ada.github.io/", 1)
 
     def test_republish_rejects_a_different_authenticated_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

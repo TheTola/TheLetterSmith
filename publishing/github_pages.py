@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import quote, urlsplit
 
+from https_transport import CertificateConfigurationError, create_ssl_context
 from publishing.base import Publisher
 from publishing.expiration import GITHUB_PAGES_PROVIDER_ID
 from publishing.github_auth import (
@@ -25,6 +26,7 @@ from publishing.github_auth import (
     GitHubFailureKind,
     GitHubOperationError,
     GitHubSession,
+    _transport_error,
     classify_github_error,
 )
 from publishing.github_config import (
@@ -245,17 +247,34 @@ def _safe_pages_url(value: object) -> str:
 
 
 def _fetch_public_bytes(url: str, timeout: float) -> bytes | None:
+    """Return None only when the server confirms the resource is absent."""
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "LetterSmith/GitHub-Publisher", "Cache-Control": "no-cache"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            if int(response.status) != 200:
+        with urllib.request.urlopen(
+            request, timeout=timeout, context=create_ssl_context()
+        ) as response:
+            status = int(response.status)
+            if status in {404, 410}:
                 return None
+            if status != 200:
+                raise GitHubOperationError(
+                    "network",
+                    "The public page could not be checked. Please retry.",
+                    status=status,
+                    technical_details=f"Public page returned HTTP {status}.",
+                )
             return response.read()
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
-        return None
+    except CertificateConfigurationError as error:
+        raise _transport_error(error) from error
+    except urllib.error.HTTPError as error:
+        if error.code in {404, 410}:
+            return None
+        raise _transport_error(error) from error
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise _transport_error(error) from error
 
 
 class GitHubPagesPublisher(Publisher):
@@ -386,13 +405,23 @@ class GitHubPagesPublisher(Publisher):
                 for entry in tree
                 if isinstance(entry, dict)
             }
+            recovered_public_path = (
+                None
+                if has_saved_publication
+                else self._recover_public_path(
+                    owner, repository_name, project_id, existing_entries
+                )
+            )
             public_path = (
                 requested_public_path
                 if has_saved_publication
-                else _allocate_public_path(requested_public_path, existing_entries)
+                else recovered_public_path
+                or _allocate_public_path(
+                    requested_public_path, existing_entries
+                )
             )
             prefix = _publication_prefix(repository_name, owner, public_path)
-            if has_saved_publication:
+            if has_saved_publication or recovered_public_path:
                 target_entries = tuple(
                     entry
                     for entry in tree
@@ -761,6 +790,43 @@ class GitHubPagesPublisher(Publisher):
                 "invalid_response",
                 "GitHub returned invalid publication file content.",
             ) from error
+
+    def _recover_public_path(
+        self,
+        owner: str,
+        repository: str,
+        project_id: str,
+        existing_entries: dict[str, dict],
+    ) -> str | None:
+        """Find an upload committed before its local verification completed."""
+        matches: list[str] = []
+        for path, entry in existing_entries.items():
+            public_path, _separator, name = path.partition("/")
+            if (
+                name != PUBLICATION_MARKER
+                or entry.get("type") != "blob"
+                or not _PUBLIC_PATH_PATTERN.fullmatch(public_path)
+            ):
+                continue
+            marker = self._remote_blob_bytes(
+                owner, repository, str(entry.get("sha", ""))
+            )
+            try:
+                payload = json.loads(marker.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(payload, dict)
+                and str(payload.get("project_id", "")).strip().casefold()
+                == project_id.casefold()
+            ):
+                matches.append(public_path)
+        if len(matches) > 1:
+            raise GitHubOperationError(
+                "publication_conflict",
+                "More than one online copy belongs to this letter. Resolve the duplicate copies before publishing again.",
+            )
+        return matches[0] if matches else None
 
     def _validated_remote_marker(
         self,
@@ -1146,6 +1212,8 @@ class GitHubPagesPublisher(Publisher):
         index: bytes | None,
         nonce: str,
     ) -> bool:
+        # Changed content is not proof of removal; both resources must be absent.
+        del marker, index
         deadline = self.clock() + self.verification_timeout
         marker_url = f"{url}{quote(PUBLICATION_MARKER)}?lettersmith={quote(nonce)}"
         index_url = f"{url}index.html?lettersmith={quote(nonce)}"
@@ -1156,15 +1224,9 @@ class GitHubPagesPublisher(Publisher):
                     "Unpublishing was canceled. Your local letter is unchanged.",
                 )
             hosted_marker = self.public_fetcher(marker_url, 6.0)
-            marker_removed = (
-                hosted_marker is None if marker is None else hosted_marker != marker
-            )
-            if marker_removed:
+            if hosted_marker is None:
                 hosted_index = self.public_fetcher(index_url, 6.0)
-                index_removed = (
-                    hosted_index is None if index is None else hosted_index != index
-                )
-                if index_removed:
+                if hosted_index is None:
                     return True
             self._wait(3.0)
         return False

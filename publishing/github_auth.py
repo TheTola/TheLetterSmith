@@ -21,6 +21,7 @@ import keyring
 from keyring.errors import KeyringError, PasswordDeleteError
 
 from application_identity import APPLICATION_NAME, PUBLISHER_NAME
+from https_transport import CertificateConfigurationError, create_ssl_context
 from publishing.github_config import (
     GITHUB_API_URL,
     GITHUB_API_VERSION,
@@ -84,9 +85,9 @@ def _network_failure_message(error: BaseException) -> str:
         "certificate_verify_failed" in detail
     ):
         return (
-            "GitHub's security certificate could not be verified. Update the "
-            "system or Python certificate store, then retry. Your letter is "
-            "still saved locally."
+            "GitHub's security certificate could not be verified. Update Letter "
+            "Smith and check the system clock and any VPN or HTTPS proxy's "
+            "trusted certificates, then retry. Your letter is still saved locally."
         )
     if isinstance(reason, socket.gaierror):
         return (
@@ -143,6 +144,8 @@ _ACTION_REQUIRED_ERROR_CODES = frozenset(
         "app_permissions_not_configured",
         "authentication",
         "authorization_revoked",
+        "certificate_setup",
+        "certificate_verification",
         "credential_model_mismatch",
         "installation_permissions",
         "installation_required",
@@ -153,6 +156,29 @@ _ACTION_REQUIRED_ERROR_CODES = frozenset(
         "repository_owner_mismatch",
     }
 )
+
+
+def _transport_error(error: BaseException) -> GitHubOperationError:
+    if isinstance(error, CertificateConfigurationError):
+        return GitHubOperationError(
+            "certificate_setup",
+            str(error),
+            technical_details="Local HTTPS certificate configuration could not be loaded.",
+        )
+    reason = getattr(error, "reason", error)
+    if isinstance(reason, ssl.SSLCertVerificationError) or (
+        "certificate_verify_failed" in str(reason).casefold()
+    ):
+        return GitHubOperationError(
+            "certificate_verification",
+            _network_failure_message(error),
+            technical_details="HTTPS certificate verification failed (CERTIFICATE_VERIFY_FAILED).",
+        )
+    return GitHubOperationError(
+        "network",
+        _network_failure_message(error),
+        technical_details=f"{type(error).__name__}: {error}",
+    )
 
 
 def classify_github_error(error: GitHubOperationError) -> GitHubFailureKind:
@@ -322,7 +348,9 @@ class GitHubAPI:
             method=str(method).upper(),
         )
         try:
-            with self.opener(request, timeout=self.timeout) as response:
+            with self.opener(
+                request, timeout=self.timeout, context=create_ssl_context()
+            ) as response:
                 response_status = getattr(response, "status", None)
                 status = int(
                     response_status
@@ -333,12 +361,10 @@ class GitHubAPI:
         except urllib.error.HTTPError as error:
             raw = error.read()
             self._raise_http_error(error.code, raw, error.headers)
-        except (urllib.error.URLError, TimeoutError, OSError) as error:
-            raise GitHubOperationError(
-                "network",
-                _network_failure_message(error),
-                technical_details=f"{type(error).__name__}: {error}",
-            ) from error
+        except (
+            CertificateConfigurationError, urllib.error.URLError, TimeoutError, OSError
+        ) as error:
+            raise _transport_error(error) from error
         if status not in expected:
             self._raise_http_error(status, raw, {})
         if not raw:
@@ -740,7 +766,10 @@ class GitHubAuthenticator:
             try:
                 token = self._refresh(token)
             except GitHubOperationError as error:
-                if classify_github_error(error) == GitHubFailureKind.ACTION_REQUIRED:
+                if (
+                    classify_github_error(error) == GitHubFailureKind.ACTION_REQUIRED
+                    and error.code not in {"certificate_setup", "certificate_verification"}
+                ):
                     self.credential_store.clear()
                 raise
         try:

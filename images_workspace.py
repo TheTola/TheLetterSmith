@@ -13,7 +13,7 @@ from project_model import PAGE_TYPES, MIN_PAGES, MAX_PAGES
 from project_paths import application_paths
 from project_session import get_project_session
 from page_artwork import PageArtworkController
-from recent_media import recent_media, remember_image_copy
+from recent_media import recent_type_images, remember_type_image
 from ui_theme import apply_tab_heading_style
 
 
@@ -762,9 +762,10 @@ class ImageTab(QtWidgets.QWidget):
             self._commit("image_imported")
             path = str(self.artwork.resolve_asset(target.page_id))
             try:
-                remember_image_copy(self.project_root, target.project_id, target.page_id, path, result.source_path.name)
-                from recent_media import remember_type_image
-                remember_type_image(self.project_root, self.session.project.get_page(target.page_id)["type"], path, result.source_path.name)
+                kind = self.session.project.get_page(target.page_id)["type"]
+                label = next((label for source, label in recent_type_images(self.project_root, kind)
+                              if Path(source) == result.source_path), result.source_path.name)
+                remember_type_image(self.project_root, kind, path, label)
             except (OSError, ValueError):
                 # History is a convenience cache; a failure cannot roll back a
                 # successfully validated canonical artwork change.
@@ -820,12 +821,7 @@ class ImageTab(QtWidgets.QWidget):
         slot = PAGE_TYPES[page["type"]].artwork_template
         directory = application_paths(self.project_root).stock_images_root / slot
         files = tuple(path for name in STOCK_IMAGE_FILES[PAGE_INDICES[slot]] if (path := directory / name).is_file())
-        from recent_media import recent_type_images
         history = recent_type_images(self.project_root, page["type"])
-        if not history:
-            history = recent_media(self.project_root, self.session.project.project_id, f"image:{identity}")
-        if not history and page["recovery"].get("legacy_key"):
-            history = recent_media(self.project_root, self.session.project.project_id, f"image:{page['recovery']['legacy_key']}")
         recent = tuple((Path(value), label) for value, label in history if Path(value).is_file())
         dialog = StockImageDialog(PAGE_TYPES[page["type"]].label, () if recent else files, self, allow_browse=True,
                                   recent_paths=tuple(path for path, label in recent),

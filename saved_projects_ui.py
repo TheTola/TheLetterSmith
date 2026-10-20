@@ -50,10 +50,6 @@ class SavedProjectsController(QtCore.QObject):
         close.clicked.connect(forge.saved_panel.hide)
         row.addWidget(close)
         layout.addLayout(row)
-        self.save_button = QtWidgets.QPushButton("Save Project")
-        self.save_button.setToolTip("Save the complete editable project, including unfinished pages.")
-        self.save_button.clicked.connect(self.save)
-        forge.saved_actions_layout.insertWidget(2, self.save_button)
         self.shortcut = QtGui.QShortcut(QtGui.QKeySequence.Save, forge.window())
         self.shortcut.activated.connect(self.save)
         # A hidden Forge widget cannot own the application's global shortcut.

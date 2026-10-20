@@ -365,9 +365,10 @@ class SoundArchivePreviewTests(unittest.TestCase):
             tab = SoundTab(Path(directory))
             try:
                 with (
-                    mock.patch.object(tab, "_choose_new_files"),
+                    mock.patch.object(tab, "_open_user_music_for_current_mode"),
                     mock.patch("sound_tab.play_ui_sound") as play,
                 ):
+                    tab.project_sound.state.single_track_id = "unavailable-track"
                     tab._create_playlist()
                     tab._create_playlist()
                     tab._convert_to_single()
@@ -448,10 +449,13 @@ class SoundArchivePreviewTests(unittest.TestCase):
                 self.assertGreaterEqual(view.viewport().height(), 2 * rects[0].height())
                 self.assertGreater(view.verticalScrollBar().maximum(), 0)
                 self.assertEqual(view.horizontalScrollBarPolicy(), QtCore.Qt.ScrollBarAlwaysOff)
-                for button in (tab.playlist_preview_btn, tab.move_up_btn, tab.move_down_btn, tab.remove_track_btn):
+                for button in (tab.playlist_preview_btn,):
                     self.assertTrue(button.isVisible())
                     self.assertNotEqual(button.focusPolicy(), QtCore.Qt.NoFocus)
                     self.assertTrue(tab.rect().contains(button.mapTo(tab, button.rect().bottomRight())))
+                labels = {button.text() for button in tab.findChildren(QtWidgets.QAbstractButton)}
+                self.assertFalse(labels & {"Move Up", "Move Down", "Remove from Playlist",
+                                           "Advanced Audio", "Repair Music Archive"})
             finally:
                 tab.close()
 

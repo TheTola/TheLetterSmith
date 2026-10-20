@@ -2036,7 +2036,8 @@ class Nexus(QtWidgets.QMainWindow):
             ("Sound", "Choose one song or arrange a playlist for this letter."),
             ("Messages", "Write, import, and format each Letter page's message."),
             ("Forge", "Review, preview, load, publish, and share the letter."),
-            ("Command", "New Project, application preferences, and Exit Application."),
+            ("Command", "New Project, application preferences, and Exit Application. "
+                        "Clicking clears recent image lists; assigned artwork is kept."),
         )
         for name, help_text in tab_help:
             index = self.tabbar.addTab(name)
@@ -2053,6 +2054,7 @@ class Nexus(QtWidgets.QMainWindow):
             self._hide_readiness_after_image_tab_hover
         )
         self.tabbar.currentChanged.connect(self._tab_changed)
+        self.tabbar.tabBarClicked.connect(self._clear_image_history_from_command)
         main_layout.addWidget(self.tabbar)
         self._command_immersive = False
         self._command_status_was_visible = True
@@ -2526,6 +2528,8 @@ class Nexus(QtWidgets.QMainWindow):
         )
         self.message_tab.background_requested.connect(self._edit_message_background)
         self.message_tab.images_requested.connect(lambda: self.tabbar.setCurrentIndex(0))
+        if self.message_tab.messages_workspace is not None:
+            self.message_tab.messages_workspace.attach_readability_footer(self._status)
         self.forge_tab = ForgeTab(
             self.project_root,
             project_state=self.project_state,
@@ -2565,6 +2569,13 @@ class Nexus(QtWidgets.QMainWindow):
             self.message_tab,
             scroll_name="MessageControlsScroll",
         )
+        self.message_page.controls_scroll.setAlignment(Qt.AlignHCenter)
+        if self.message_tab.messages_workspace is not None:
+            identity_row = QtWidgets.QHBoxLayout()
+            identity_row.setSpacing(12)
+            identity_row.addWidget(self.message_tab.title_recipient_container, 1)
+            identity_row.addWidget(self.help_anchor, 0, Qt.AlignVCenter)
+            self.message_tab.layout().insertLayout(0, identity_row)
         self.forge_page = self._make_page_surface(
             "ForgePageSurface",
             self.forge_tab,
@@ -3206,6 +3217,16 @@ class Nexus(QtWidgets.QMainWindow):
     # =============================================================================================
     # Tabs ΓÇö show correct preview per tab + update help visibility/content
     # =============================================================================================
+    def _clear_image_history_from_command(self, idx: int) -> None:
+        if idx != 4:
+            return
+        from recent_media import clear_type_image_history
+        try:
+            clear_type_image_history(self.project_root)
+        except OSError:
+            _LOGGER.exception("Could not clear remembered image selections")
+            self.status("Image history could not be cleared. Try Command again.")
+
     def _tab_changed(self, idx: int) -> None:
         """
         Route the requested tab transition.
@@ -3246,7 +3267,7 @@ class Nexus(QtWidgets.QMainWindow):
             not active and not self.preview_frame.isHidden()
         )
         self.help_anchor.setVisible(
-            not active and self.tabbar.currentIndex() not in {1, 4}
+            not active and self.tabbar.currentIndex() not in {0, 1, 4}
         )
         if self._command_immersive == active:
             self._sync_protected_project_ui()
@@ -3467,7 +3488,7 @@ class Nexus(QtWidgets.QMainWindow):
             self.preview_stack.setCurrentIndex(0)
 
         self.help_icon.setVisible(idx != 4)
-        self.help_anchor.setVisible(idx not in {1, 3, 4})
+        self.help_anchor.setVisible(idx not in {0, 1, 3, 4})
         if idx == 4:
             self._stop_help_movies()
         else:
@@ -3690,12 +3711,13 @@ class Nexus(QtWidgets.QMainWindow):
         self.preview_tools_layout.setContentsMargins(left_margin, 0, 0, 0)
         current_tab = self.tabbar.currentIndex()
         compact = current_tab in {0, 1, 2, 3} and self.body.height() - 24 < 600
+        inline_messages = current_tab == 2 and self.message_tab.messages_workspace is not None
         if current_tab in {0, 1, 2, 3}:
-            self.help_anchor.setVisible(current_tab in {0, 2} and not compact)
+            self.help_anchor.setVisible(current_tab == 2 and (inline_messages or not compact))
         icon_size = round(HELP_ICON_PX * 0.9) if forge_visible else HELP_ICON_PX
-        if compact:
+        if compact or inline_messages:
             icon_size = 64
-        if current_tab in {0, 1, 2, 3} and self.help_anchor.isHidden():
+        if current_tab in {1, 2, 3} and self.help_anchor.isHidden():
             icon_size = min(icon_size, max(32, self.preview_frame.height()))
         if self.help_icon.width() != icon_size:
             self.help_anchor.setFixedSize(icon_size, icon_size)
@@ -4695,6 +4717,10 @@ class Nexus(QtWidgets.QMainWindow):
             self.preview_frame.hide()
             if isinstance(region, QtWidgets.QWidget):
                 region.hide()
+            self.message_tab.set_compact_layout(body_height < 600)
+            self._update_preview_tools_geometry()
+            self.body_layout.activate()
+            self._position_help_icon()
             return
         if hasattr(self, "forge_tab"):
             compact = current_tab in {0, 1, 2, 3} and body_height < 600

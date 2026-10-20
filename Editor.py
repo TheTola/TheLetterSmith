@@ -49,6 +49,7 @@ import shutil
 import time
 import uuid
 from bisect import bisect_right
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -132,6 +133,7 @@ from message_html import (
 )
 from named_text_styles import (
     InvalidStyleSetError,
+    NamedStyleSet,
     SavedStyleSetStore,
     STYLE_KEYS,
     STYLE_LABELS,
@@ -935,9 +937,9 @@ class EditorSurface(QFrame):
 
     def readability_backgrounds(self) -> tuple[tuple[int, int, int], ...]:
         """Return representative composited backgrounds for live contrast checks."""
-        definition = LETTER_PAGE_PRESETS[self._preset]
         samples = ((0.50, 0.43), (0.20, 0.25), (0.80, 0.75))
-        image = self._wall_pixmap.toImage() if self._wall_pixmap is not None else None
+        background = self._scaled_background()
+        image = background.toImage() if background is not None else None
         if image is not None and not image.isNull():
             image = image.convertToFormat(QImage.Format_RGB32)
 
@@ -945,10 +947,12 @@ class EditorSurface(QFrame):
         alpha = self._opacity / 100.0
         for x_fraction, y_fraction in samples:
             if image is None or image.isNull():
-                wall_rgb = definition.base_rgb
+                wall_rgb = (14, 14, 18)
             else:
-                x = max(0, min(image.width() - 1, round((image.width() - 1) * x_fraction)))
-                y = max(0, min(image.height() - 1, round((image.height() - 1) * y_fraction)))
+                x = max(0, min(image.width() - 1, round(
+                    (image.width() - self.width()) / 2 + (self.width() - 1) * x_fraction)))
+                y = max(0, min(image.height() - 1, round(
+                    (image.height() - self.height()) / 2 + (self.height() - 1) * y_fraction)))
                 color = image.pixelColor(x, y)
                 wall_rgb = (color.red(), color.green(), color.blue())
             backgrounds.append(
@@ -1018,6 +1022,7 @@ class Editor(QDialog):
         embedded: bool = False,
         document_label: str = "",
         display_settings: Optional[dict] = None,
+        paper_colors: Optional[dict] = None,
     ) -> None:
         super().__init__(parent)
         self._save_callback = save_callback
@@ -1025,6 +1030,13 @@ class Editor(QDialog):
         self._embedded = bool(embedded)
         self._document_label = str(document_label)
         self._display_settings = dict(display_settings or {})
+        self._paper_colors = {
+            preset: {key: str(color) for key, color in colors.items()
+                     if key in STYLE_KEYS and isinstance(color, str)
+                     and re.fullmatch(r"#[0-9a-fA-F]{6}", color)}
+            for preset, colors in (paper_colors or {}).items()
+            if preset in LETTER_PAGE_PRESETS and isinstance(colors, dict)
+        } if isinstance(paper_colors, dict) else {}
         self._resource_roots = tuple(Path(root).resolve() for root in resource_roots)
         self._missing_resources = frozenset(missing_resources)
         self._bound_dirty = False
@@ -1184,8 +1196,8 @@ class Editor(QDialog):
 
     def _build_ui(self, wall_pixmap: Optional[QPixmap]) -> None:
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+        main_layout.setSpacing(4)
 
         self.title_bar = None
         if not self._embedded:
@@ -1347,8 +1359,49 @@ class Editor(QDialog):
         self._update_readability_indicator()
 
     def set_display_settings(self, settings: dict) -> None:
+        previous = self._editor_background_setting()[0]
         self._display_settings = dict(settings)
+        preset = self._editor_background_setting()[0]
+        if previous != preset and not self._unsupported_style_state:
+            current = self.named_styles.active_set
+            self._paper_colors[previous] = {
+                key: current.get(key).font_color for key in STYLE_KEYS
+            }
+            stored = self._paper_colors.get(preset, {})
+            old_ink = LETTER_PAGE_PRESETS[previous].default_ink
+            new_ink = LETTER_PAGE_PRESETS[preset].default_ink
+            self.named_styles.load_set(NamedStyleSet({
+                key: replace(current.get(key), font_color=stored.get(
+                    key, new_ink if current.get(key).font_color.lower() == old_ink
+                    else current.get(key).font_color))
+                for key in STYLE_KEYS
+            }))
+            self._sync_current_format()
+            self._schedule_autosave()
         self.refresh_background_from_settings()
+
+    def paper_colors(self) -> dict:
+        colors = {preset: dict(values) for preset, values in self._paper_colors.items()}
+        colors[self._editor_background_setting()[0]] = {
+            key: self.named_styles.active_set.get(key).font_color for key in STYLE_KEYS
+        }
+        return colors
+
+    def set_paper_text_color(self, key: str, color: QColor) -> None:
+        if key not in STYLE_KEYS or not color.isValid() or self._unsupported_style_state:
+            return
+        current = self.named_styles.active_set
+        self.named_styles.load_set(NamedStyleSet({
+            name: replace(current.get(name), font_color=color.name()) if name == key
+            else current.get(name) for name in STYLE_KEYS
+        }))
+        self._sync_current_format()
+        self._schedule_autosave()
+
+    def set_background_artwork(self, pixmap: Optional[QPixmap]) -> None:
+        self._wall_pixmap = pixmap
+        self.editor_surface.set_wall_pixmap(pixmap)
+        self._update_readability_indicator()
 
     def _update_readability_indicator(self, *_args: object) -> None:
         if not hasattr(self, "readability_indicator") or self._closing:
@@ -1685,7 +1738,7 @@ class Editor(QDialog):
         self.btn_color.setObjectName("textColorButton")
         self.btn_color.setAccessibleName("Text color")
         self.btn_color.setAutoRaise(True)
-        self.btn_color.setFixedSize(96, 38)
+        self.btn_color.setFixedSize(48, 30)
         self.btn_color.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self.btn_color.clicked.connect(self.act_color.trigger)
         color_button_layout.addWidget(self.btn_color)
@@ -1823,15 +1876,15 @@ class Editor(QDialog):
 
         # Font family + size
         self.font_combo = QFontComboBox()
-        self.font_combo.setMinimumWidth(180)
-        self.font_combo.setMaximumWidth(300)
+        self.font_combo.setMinimumWidth(125)
+        self.font_combo.setMaximumWidth(220)
         self.font_combo.setAccessibleName("Font family")
         self.font_combo.setToolTip("Choose the font for selected text or new typing")
         self.font_combo.currentFontChanged.connect(self._font_family_changed)
 
         self.font_size_spin = FontSizeSpinBox()
         self.font_size_spin.setRange(FONT_SIZE_MIN, FONT_SIZE_MAX)
-        self.font_size_spin.setMinimumSize(92, 34)
+        self.font_size_spin.setMinimumSize(76, 30)
         self.font_size_spin.setSingleStep(FONT_SIZE_STEP)
         self.font_size_spin.setValue(DEFAULT_FONT_SIZE)
         self.font_size_spin.setSuffix(" pt")
@@ -1931,7 +1984,7 @@ class Editor(QDialog):
         self._named_style_selector_base_font = QFont(self.btn_named_style.font())
         self.btn_named_style.setPopupMode(QToolButton.InstantPopup)
         self.btn_named_style.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self.btn_named_style.setMinimumWidth(145)
+        self.btn_named_style.setMinimumWidth(110)
         self.btn_named_style.setAutoRaise(True)
         self.named_style_menu = StyleSelectionMenu(self.btn_named_style)
         self.named_style_menu.setToolTipsVisible(True)

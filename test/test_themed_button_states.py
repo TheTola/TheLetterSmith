@@ -441,11 +441,13 @@ class ThemedButtonStateTests(unittest.TestCase):
         image.clear_action.trigger()
         self.assertEqual(image.session.project.to_dict(), before)
 
-        self.assertEqual(sound.single_action_btn._artwork_filename, "BButton.png")
-        self.assertEqual(sound.create_playlist_btn._artwork_filename, "BButton.png")
-        self.assertEqual(sound.archive_btn._artwork_filename, "EButton.png")
-        self.assertEqual(sound.clear_btn._artwork_filename, "DButton.png")
-        self.assertEqual(sound.single_action_btn.text(), "Add Music")
+        for button in (sound.single_action_btn, sound.create_playlist_btn,
+                       sound.archive_btn, sound.import_btn, sound.add_track_btn,
+                       sound.convert_single_btn, sound.clear_btn):
+            self.assertEqual(button._artwork_filename, "AButton.png")
+            self.assertEqual(button.height(), sound.archive_btn.height())
+        self.assertEqual(sound.single_action_btn.text(), "Replace Music")
+        self.assertTrue(sound.single_action_btn.isHidden())
         self.assertTrue(sound.single_action_btn.isEnabled())
         self.assertTrue(sound.stock_btn.isEnabled())
         self.assertTrue(sound.archive_btn.isEnabled())
@@ -812,8 +814,12 @@ class ThemedButtonStateTests(unittest.TestCase):
                 tier = ButtonTier(str(button.property("buttonTier")))
                 with self.subTest(theme_id=theme_id, button=button.text()):
                     self.assertEqual(
-                        button.size(),
-                        BASIC_BUTTON_TIER_STYLES[tier].size,
+                        button.height(),
+                        BASIC_BUTTON_TIER_STYLES[tier].height,
+                    )
+                    self.assertGreaterEqual(
+                        button.width(),
+                        BASIC_BUTTON_TIER_STYLES[tier].width,
                     )
 
         service.set_theme("obsidian_forge", persist=False)

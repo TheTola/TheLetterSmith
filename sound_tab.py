@@ -1587,19 +1587,9 @@ class ProjectSound(
     def create_playlist(
         self,
     ) -> None:
-        if (
-            self.library.path_for(
-                self.state.single_track_id
-            )
-            is not None
-        ):
-            first = (
-                self.state
-                .single_track_id
-            )
-
-        else:
-            first = ""
+        if self.state.mode == "playlist":
+            return
+        first = self.state.single_track_id
 
         self.state.mode = "playlist"
 
@@ -1714,28 +1704,14 @@ class ProjectSound(
                 .selected_track_id
             )
 
-        if (
-            self.library.path_for(
-                chosen
-            )
-            is None
-        ):
-            chosen = next(
-                (
-                    playlist_track_id
-                    for playlist_track_id
-                    in self.state.playlist
-                    if self.library.path_for(
-                        playlist_track_id
-                    )
-                    is not None
-                ),
-                "",
-            )
-
-        self.set_single(
-            chosen
-        )
+        if chosen not in self.state.playlist:
+            return
+        # Retain the chosen assignment even if its source is unavailable.
+        self.state.mode = "single"
+        self.state.single_track_id = chosen
+        self.state.playlist = []
+        self.state.selected_track_id = chosen
+        self.save()
 
     def clear(
         self,
@@ -4205,9 +4181,11 @@ class PlaylistItemWidget(
             "≡"
         )
         drag.setFixedWidth(12)
+        drag.setAttribute(Qt.WA_TransparentForMouseEvents)
 
         self._title_text = record.display_title
         title = QtWidgets.QLabel(self._title_text)
+        title.setObjectName("playlistTrackTitle")
         self._title_label = title
         title.setToolTip(record.display_title)
         title.setAccessibleName(record.display_title)
@@ -4225,6 +4203,8 @@ class PlaylistItemWidget(
                 record.duration_seconds
             )
         )
+        duration.setObjectName("playlistTrackDetail")
+        duration.setAttribute(Qt.WA_TransparentForMouseEvents)
 
         remove = QtWidgets.QToolButton()
         remove.setObjectName("playlistRemove")
@@ -4259,9 +4239,11 @@ class PlaylistItemWidget(
             1,
         )
         source_label = QtWidgets.QLabel(source)
+        source_label.setObjectName("playlistTrackDetail")
         source_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         row.addWidget(source_label)
 
+        row.addSpacing(10)
         row.addWidget(
             duration
         )
@@ -4352,6 +4334,16 @@ class PlaylistItemWidget(
 
             QLabel {{
                 color: {text};
+            }}
+
+            QLabel#playlistTrackTitle {{
+                font-size: 11pt;
+                font-weight: 600;
+            }}
+
+            QLabel#playlistTrackDetail {{
+                color: {muted};
+                font-size: 9pt;
             }}
 
             QToolButton#playlistRemove {{
@@ -4550,7 +4542,7 @@ class SoundTab(QtWidgets.QWidget):
         with QtCore.QSignalBlocker(self.volume):
             self.volume.setValue(snapshot["volume"])
         self._last_saved_volume = self.volume.value()
-        self.volume_value.setText(str(self.volume.value()))
+        self.volume_value.setText(f"{self.volume.value()}%")
         self.player.set_volume(self.volume.value())
         self.player.set_muted(snapshot["muted"])
         self._refresh_mute_control()
@@ -4558,8 +4550,28 @@ class SoundTab(QtWidgets.QWidget):
     def _refresh_mute_control(self) -> None:
         muted = self.player.is_muted()
         self.mute_btn.setText("\U0001F507" if muted else "\U0001F50A")
+        self._set_transport_icon(
+            self.mute_btn,
+            QtWidgets.QStyle.SP_MediaVolumeMuted if muted else QtWidgets.QStyle.SP_MediaVolume
+        )
         self.mute_btn.setToolTip("Unmute project soundtrack" if muted else "Mute project soundtrack (saved)")
         self.mute_btn.setAccessibleName(self.mute_btn.toolTip())
+
+    def _set_transport_icon(self, button: QtWidgets.QToolButton, symbol) -> None:
+        tokens = getattr(self, "_transport_theme_tokens", None)
+        source = self.style().standardIcon(symbol).pixmap(20, 20)
+        icon = QtGui.QIcon()
+        for mode, color in (
+            (QtGui.QIcon.Normal, getattr(tokens, "text", "#e7eef8")),
+            (QtGui.QIcon.Disabled, getattr(tokens, "muted_text", "#93a8bd")),
+        ):
+            pixmap = source.copy()
+            painter = QtGui.QPainter(pixmap)
+            painter.setCompositionMode(QtGui.QPainter.CompositionMode_SourceIn)
+            painter.fillRect(pixmap.rect(), QtGui.QColor(color))
+            painter.end()
+            icon.addPixmap(pixmap, mode)
+        button.setIcon(icon)
 
     def apply_theme_assets(
         self,
@@ -4575,6 +4587,9 @@ class SoundTab(QtWidgets.QWidget):
         for name in (
             "stock_btn",
             "archive_btn",
+            "import_btn",
+            "add_track_btn",
+            "convert_single_btn",
             "clear_btn",
             "single_action_btn",
             "create_playlist_btn",
@@ -4585,9 +4600,19 @@ class SoundTab(QtWidgets.QWidget):
                 None,
             )
             if isinstance(button, ThemedArtworkButton):
+                button.set_artwork_stretch(True)
                 button.apply_theme_assets(
                     theme_service
                 )
+        self._transport_theme_tokens = getattr(theme_service, "tokens", None)
+        for button, symbol in (
+            (self.prev_btn, QtWidgets.QStyle.SP_MediaSkipBackward),
+            (self.play_btn, QtWidgets.QStyle.SP_MediaPause if self.player.is_playing()
+             else QtWidgets.QStyle.SP_MediaPlay),
+            (self.next_btn, QtWidgets.QStyle.SP_MediaSkipForward),
+        ):
+            self._set_transport_icon(button, symbol)
+        self._refresh_mute_control()
 
     def set_compact_layout(self, compact: bool) -> None:
         """Keep the transport and both music modes reachable in short windows."""
@@ -4602,9 +4627,13 @@ class SoundTab(QtWidgets.QWidget):
             self.layout().setSpacing(8)
         self._header_layout.setContentsMargins(4, 0, 4, 0 if compact else 2)
         self._header_layout.setSpacing(8 if compact else SECTION_LAYOUT_SPACING)
-        self.advanced_btn.setStyleSheet("padding: 2px 6px; min-height: 18px;")
         self._transport_layout.setContentsMargins(4, 2 if compact else 4,
                                                  4, 2 if compact else 4)
+        self.playback_panel.layout().setContentsMargins(
+            8 if compact else 12, 4 if compact else 10,
+            8 if compact else 12, 4 if compact else 10,
+        )
+        self.volume.setFixedWidth(100 if compact else 120)
         self._status_layout.setContentsMargins(4, 0 if compact else 2, 4, 0)
         self.mode_stack.setMinimumHeight(0 if compact else 230)
         self.single_panel.layout().setContentsMargins(
@@ -4618,15 +4647,20 @@ class SoundTab(QtWidgets.QWidget):
         )
         self.playlist_panel.layout().setSpacing(4 if compact else SECTION_LAYOUT_SPACING)
         self.playlist_list.setMinimumHeight(56 if compact else 110)
-        for button in (self.playlist_preview_btn, self.move_up_btn, self.move_down_btn, self.remove_track_btn):
-            button.setStyleSheet("padding: 3px 6px; min-height: 18px;" if compact else "")
+        self.playlist_preview_btn.setStyleSheet(
+            "padding: 3px 6px; min-height: 18px;" if compact else ""
+        )
         for button, tier in (
-            (self.stock_btn, ButtonTier.STANDARD),
-            (self.archive_btn, ButtonTier.STANDARD),
-            (self.clear_btn, ButtonTier.STANDARD),
+            (self.stock_btn, ButtonTier.MEDIUM),
+            (self.archive_btn, ButtonTier.MEDIUM),
+            (self.import_btn, ButtonTier.MEDIUM),
+            (self.clear_btn, ButtonTier.MEDIUM),
+            (self.add_track_btn, ButtonTier.MEDIUM),
+            (self.convert_single_btn, ButtonTier.MEDIUM),
             (self.single_action_btn, ButtonTier.MEDIUM),
             (self.create_playlist_btn, ButtonTier.MEDIUM),
         ):
+            button.set_artwork_stretch(True)
             button.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, 0.7 if compact else 1.0)
             button.apply_theme_assets()
             apply_button_tier(button, tier)
@@ -4719,7 +4753,7 @@ class SoundTab(QtWidgets.QWidget):
             "Available Music"
         )
         apply_tab_heading_style(self.heading)
-        self.heading.setAlignment(Qt.AlignCenter)
+        self.heading.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.heading.setWordWrap(True)
 
         header = QtWidgets.QHBoxLayout()
@@ -4727,11 +4761,13 @@ class SoundTab(QtWidgets.QWidget):
         header.setSpacing(SECTION_LAYOUT_SPACING)
         self._header_layout = header
         header.addWidget(self.heading)
+        header.addStretch(1)
 
         self.stock_btn = ThemedArtworkButton(
             "Stock Music",
             self.project_root,
             "AButton.png",
+            tier=ButtonTier.MEDIUM,
         )
 
         self.stock_btn.setToolTip(
@@ -4743,9 +4779,10 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         self.archive_btn = ThemedArtworkButton(
-            "Music Archive",
+            "Open Music Archive",
             self.project_root,
-            "EButton.png",
+            "AButton.png",
+            tier=ButtonTier.MEDIUM,
         )
 
         self.archive_btn.setToolTip(
@@ -4759,8 +4796,9 @@ class SoundTab(QtWidgets.QWidget):
         self.clear_btn = ThemedArtworkButton(
             "Clear",
             self.project_root,
-            "DButton.png",
-            broken_artwork_filename="BButton.png",
+            "AButton.png",
+            broken_artwork_filename="AButton.png",
+            tier=ButtonTier.MEDIUM,
         )
         self.clear_btn.setProperty("themeRole", "clearAction")
 
@@ -4772,18 +4810,16 @@ class SoundTab(QtWidgets.QWidget):
             "Clear project music"
         )
 
-        self.import_btn = QtWidgets.QPushButton("Import Music…")
+        self.import_btn = ThemedArtworkButton(
+            "Import Music", self.project_root, "AButton.png", tier=ButtonTier.MEDIUM,
+        )
         self.import_btn.setToolTip(
-            "Import into Music Archive and assign to this project's playlist."
+            "Import music into Music Archive and select it for this project."
         )
         self.import_btn.clicked.connect(self._choose_new_files)
 
         header.addWidget(
             self.stock_btn
-        )
-
-        header.addStretch(
-            1
         )
 
         header.addWidget(
@@ -4799,8 +4835,13 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         playlist_header = QtWidgets.QHBoxLayout()
+        playlist_header.setContentsMargins(4, 0, 4, 0)
         self.playlist_heading = QtWidgets.QLabel("Current Playlist")
-        playlist_header.addWidget(self.playlist_heading, 1)
+        self.playlist_heading.setStyleSheet("font-size: 11pt; font-weight: 600;")
+        playlist_labels = QtWidgets.QVBoxLayout()
+        playlist_labels.setSpacing(2)
+        playlist_labels.addWidget(self.playlist_heading)
+        playlist_header.addLayout(playlist_labels, 1)
         playlist_header.addWidget(self.clear_btn)
         root.addLayout(playlist_header)
 
@@ -4819,8 +4860,10 @@ class SoundTab(QtWidgets.QWidget):
         self.playlist_panel = (
             self._build_playlist_panel()
         )
-        playlist_header.insertWidget(1, self.playlist_summary, 1)
-        playlist_header.insertWidget(2, self.add_track_btn)
+        playlist_labels.addWidget(self.playlist_summary)
+        playlist_header.insertWidget(1, self.add_track_btn)
+        playlist_header.insertWidget(2, self.convert_single_btn)
+        playlist_header.setSpacing(ROW_LAYOUT_SPACING + 2)
 
         self.mode_stack.addWidget(
             self.single_panel
@@ -4836,14 +4879,25 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         self.playback_heading = QtWidgets.QLabel("Playback and Settings")
+        self.playback_heading.setStyleSheet("font-size: 11pt; font-weight: 600;")
+        self.playback_panel = QtWidgets.QFrame()
+        self.playback_panel.setObjectName("soundPlaybackPanel")
+        self.playback_panel.setStyleSheet(
+            "QFrame#soundPlaybackPanel { background: #121820;"
+            "border: 1px solid #2b3a4d; border-radius: 12px; }"
+        )
+        playback_layout = QtWidgets.QVBoxLayout(self.playback_panel)
+        playback_layout.setContentsMargins(12, 10, 12, 10)
+        playback_layout.setSpacing(4)
         playback_header = QtWidgets.QHBoxLayout()
         playback_header.addWidget(self.playback_heading, 1)
-        root.addLayout(playback_header)
+        playback_layout.addLayout(playback_header)
 
         self.now_playing = QtWidgets.QLabel(
             "No music selected"
         )
         self.now_playing.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        self.now_playing.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         self.now_playing.setStyleSheet(
             """
@@ -4942,53 +4996,15 @@ class SoundTab(QtWidgets.QWidget):
         )
         self.mute_btn.setAccessibleName("Mute project soundtrack")
 
-        self.mute_btn.setFont(
-            QtGui.QFont(
-                "Segoe UI Emoji",
-                20,
-            )
-        )
-
-        self.mute_btn.setFixedSize(
-            58,
-            46,
-        )
-
-        self.mute_btn.setStyleSheet(
-            """
-            QToolButton {
-                background: #1b2430;
-                border: 1px solid #33475f;
-                border-radius: 8px;
-                padding: 0px;
-                margin: 0px;
-                font-family: "Segoe UI Emoji";
-                font-size: 20px;
-            }
-
-            QToolButton:hover {
-                border-color: #00c8ff;
-                background: #233447;
-            }
-
-            QToolButton#soundPlayButton[playing="true"] {
-                color: #9bfffb;
-                border-color: #00c8ff;
-            }
-
-            QToolButton#soundPlayButton[playing="true"][pulse="true"] {
-                background: #294858;
-                border-color: #d8ffff;
-            }
-            """
-        )
-
         self.volume = CleanSlider()
         self.volume.setToolTip(
             "Project soundtrack volume, saved from 0 to 100."
         )
         self.volume.setAccessibleName("Project soundtrack volume")
         self.volume_value = QtWidgets.QLabel()
+        self.volume_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.volume_value.setFixedWidth(38)
+        self.volume_value.setStyleSheet("font-size: 10pt;")
 
         self.volume.setRange(
             0,
@@ -5001,25 +5017,21 @@ class SoundTab(QtWidgets.QWidget):
         self._last_saved_volume = self.volume.value()
 
         self.volume.setFixedWidth(
-            156
+            120
         )
 
-        for button in (
-            self.prev_btn,
-            self.play_btn,
-            self.next_btn,
+        for button, icon in (
+            (self.prev_btn, QtWidgets.QStyle.SP_MediaSkipBackward),
+            (self.play_btn, QtWidgets.QStyle.SP_MediaPlay),
+            (self.next_btn, QtWidgets.QStyle.SP_MediaSkipForward),
+            (self.mute_btn, QtWidgets.QStyle.SP_MediaVolume),
         ):
-            button.setFixedSize(
-                48,
-                42,
-            )
-
-            button.setFont(
-                QtGui.QFont(
-                    "Segoe UI Symbol",
-                    18,
-                )
-            )
+            self._set_transport_icon(button, icon)
+            button.setIconSize(QtCore.QSize(20, 20))
+            button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            button.setFixedSize(40, 36)
+            button.setStyleSheet("QToolButton { padding: 0; min-width: 0; min-height: 0; }")
+        self.play_btn.setFixedSize(46, 36)
 
         transport.addWidget(
             self.prev_btn
@@ -5054,34 +5066,14 @@ class SoundTab(QtWidgets.QWidget):
             self.volume
         )
         transport.addWidget(self.volume_value)
-        self.volume_value.setText(str(self.volume.value()))
-        self.volume.valueChanged.connect(lambda value: self.volume_value.setText(str(value)))
+        self.volume_value.setText(f"{self.volume.value()}%")
+        self.volume.valueChanged.connect(lambda value: self.volume_value.setText(f"{value}%"))
 
-        root.addLayout(
+        playback_layout.addLayout(
             transport
         )
+        root.addWidget(self.playback_panel)
 
-        self.advanced_btn = QtWidgets.QToolButton()
-        self.advanced_btn.setText("Advanced Audio")
-        self.advanced_btn.setCheckable(True)
-        self.advanced_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.advanced_btn.setArrowType(Qt.RightArrow)
-        playback_header.addWidget(self.advanced_btn)
-        self.advanced_panel = QtWidgets.QWidget()
-        advanced_layout = QtWidgets.QHBoxLayout(self.advanced_panel)
-        advanced_layout.setContentsMargins(4, 0, 4, 0)
-        advanced_layout.addWidget(self.convert_single_btn)
-        self.repair_archive_btn = QtWidgets.QPushButton("Repair Music Archive")
-        self.repair_archive_btn.setToolTip("Check and repair imported audio using the existing archive tools.")
-        self.repair_archive_btn.clicked.connect(self.repair_music_archive)
-        advanced_layout.addWidget(self.repair_archive_btn)
-        advanced_layout.addStretch(1)
-        root.addWidget(self.advanced_panel)
-        self.advanced_panel.hide()
-        self.advanced_btn.toggled.connect(self.advanced_panel.setVisible)
-        self.advanced_btn.toggled.connect(
-            lambda expanded: self.advanced_btn.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
-        )
         self._play_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Space"), self.playlist_list)
         self._play_shortcut.setContext(Qt.WidgetShortcut)
         self._play_shortcut.activated.connect(self._toggle_play)
@@ -5210,9 +5202,9 @@ class SoundTab(QtWidgets.QWidget):
         button_row.setSpacing(ROW_LAYOUT_SPACING + 2)
 
         self.single_action_btn = ThemedArtworkButton(
-            "Add Music",
+            "Replace Music",
             self.project_root,
-            "BButton.png",
+            "AButton.png",
         )
         self.single_action_btn.setToolTip(
             "Choose music from your computer or recently used songs."
@@ -5223,7 +5215,7 @@ class SoundTab(QtWidgets.QWidget):
         self.create_playlist_btn = ThemedArtworkButton(
             "Create Playlist",
             self.project_root,
-            "BButton.png",
+            "AButton.png",
         )
         self.create_playlist_btn.setToolTip(
             "Keep this song and add more tracks as a playlist."
@@ -5300,28 +5292,21 @@ class SoundTab(QtWidgets.QWidget):
         self.playlist_summary = QtWidgets.QLabel(
             "Playlist"
         )
+        self.playlist_summary.setStyleSheet("color: #93a8bd; font-size: 9pt;")
 
-        self.add_track_btn = QtWidgets.QPushButton(
-            "Add to Playlist"
+        self.add_track_btn = ThemedArtworkButton(
+            "Add to Playlist", self.project_root, "AButton.png", tier=ButtonTier.MEDIUM,
         )
         self.add_track_btn.setToolTip(
             "Choose music from your computer or recently used songs."
         )
 
-        self.convert_single_btn = QtWidgets.QPushButton(
-            "Convert to Single Track"
+        self.convert_single_btn = ThemedArtworkButton(
+            "Convert to Single Track", self.project_root, "AButton.png", tier=ButtonTier.MEDIUM,
         )
         self.convert_single_btn.setToolTip(
-            "Keep the selected song and remove playlist mode."
+            "Choose which song to keep as the project's single track."
         )
-
-        for button in (
-            self.add_track_btn,
-            self.convert_single_btn,
-        ):
-            button.setMinimumHeight(
-                40
-            )
 
         self.playlist_list = QtWidgets.QListWidget()
         self.playlist_list.setObjectName("playlistList")
@@ -5368,17 +5353,10 @@ class SoundTab(QtWidgets.QWidget):
 
         actions = QtWidgets.QHBoxLayout()
         self.playlist_preview_btn = QtWidgets.QPushButton("Preview Track")
-        self.move_up_btn = QtWidgets.QPushButton("Move Up")
-        self.move_down_btn = QtWidgets.QPushButton("Move Down")
-        self.remove_track_btn = QtWidgets.QPushButton("Remove from Playlist")
-        self.remove_track_btn.setToolTip("Remove this assignment; keep the source file and Music Archive item.")
-        for button in (self.playlist_preview_btn, self.move_up_btn, self.move_down_btn, self.remove_track_btn):
-            actions.addWidget(button)
+        actions.addWidget(self.playlist_preview_btn)
+        actions.addStretch(1)
         layout.addLayout(actions)
         self.playlist_preview_btn.clicked.connect(self._preview_selected_track)
-        self.move_up_btn.clicked.connect(lambda: self._move_selected_track(-1))
-        self.move_down_btn.clicked.connect(lambda: self._move_selected_track(1))
-        self.remove_track_btn.clicked.connect(self._remove_selected_track)
         self._playlist_shortcuts = []
         for key, callback in (
             ("Return", self._preview_selected_track),
@@ -5526,6 +5504,10 @@ class SoundTab(QtWidgets.QWidget):
     ) -> None:
         self._transport_state_changed(self.player.transport_state)
         playing = bool(playing)
+        self._set_transport_icon(
+            self.play_btn,
+            QtWidgets.QStyle.SP_MediaPause if playing else QtWidgets.QStyle.SP_MediaPlay
+        )
         self.play_btn.setProperty("playing", playing)
         self.play_btn.setProperty("pulse", False)
         if playing:
@@ -5708,10 +5690,17 @@ class SoundTab(QtWidgets.QWidget):
         refresh_track: bool = True,
     ) -> None:
         state = self.project_sound.state
-        self.playlist_summary.setVisible(state.mode == "playlist")
-        self.add_track_btn.setVisible(state.mode == "playlist")
+        has_tracks = bool(self.project_sound.ordered_ids())
+        playlist_active = state.mode == "playlist" and has_tracks
+        self.playlist_heading.setText("Current Playlist" if playlist_active else "Current Music")
+        self.playlist_summary.setVisible(playlist_active)
+        self.add_track_btn.setVisible(playlist_active)
+        self.convert_single_btn.setVisible(playlist_active)
+        self.clear_btn.setVisible(has_tracks)
+        self.import_btn.setVisible(not has_tracks)
+        self.single_action_btn.setVisible(has_tracks and not playlist_active)
 
-        if state.mode == "playlist":
+        if playlist_active:
             self.create_playlist_btn.hide()
 
             self.mode_stack.setCurrentWidget(
@@ -5738,9 +5727,7 @@ class SoundTab(QtWidgets.QWidget):
             ):
                 record = None
 
-            has_single_track = (
-                record is not None
-            )
+            has_single_track = bool(state.single_track_id)
 
             self.create_playlist_btn.setVisible(
                 has_single_track
@@ -5755,10 +5742,6 @@ class SoundTab(QtWidgets.QWidget):
                     "The assignment is retained. Restore the source or repair Music Archive."
                     if state.single_track_id else
                     "No music is required. Add a track or keep this project silent."
-                )
-
-                self.single_action_btn.setText(
-                    "Add Music"
                 )
 
             else:
@@ -5884,7 +5867,7 @@ class SoundTab(QtWidgets.QWidget):
             suffix = ""
 
         self.playlist_summary.setText(
-            f"Playlist • {count} track{suffix} • "
+            f"{count} track{suffix} • "
             f"{_format_duration(total_duration)}"
             + (f" • {missing} unavailable" if missing else "")
             if count else "No music is required. This project is silent."
@@ -5896,15 +5879,11 @@ class SoundTab(QtWidgets.QWidget):
         item: QtWidgets.QListWidgetItem | None,
     ) -> None:
         selected = item.data(Qt.UserRole) if item is not None else ""
-        row = self.playlist_list.row(item) if item is not None else -1
         for index in range(self.playlist_list.count()):
             widget = self.playlist_list.itemWidget(self.playlist_list.item(index))
             if isinstance(widget, PlaylistItemWidget):
                 widget.set_selected(widget.track_id == selected)
         self.playlist_preview_btn.setEnabled(bool(selected) and self.library.path_for(selected) is not None)
-        self.remove_track_btn.setEnabled(bool(selected))
-        self.move_up_btn.setEnabled(row > 0)
-        self.move_down_btn.setEnabled(0 <= row < self.playlist_list.count() - 1)
 
     def _preview_selected_track(self) -> None:
         item = self.playlist_list.currentItem()
@@ -6020,8 +5999,6 @@ class SoundTab(QtWidgets.QWidget):
         )
         self.mute_btn.setEnabled(playable)
         self.volume.setEnabled(True)
-        self.import_btn.setEnabled(not busy)
-        self.repair_archive_btn.setEnabled(not busy)
 
         self.clear_btn.set_action_state(
             broken=not has_tracks,
@@ -6032,21 +6009,14 @@ class SoundTab(QtWidgets.QWidget):
             self.create_playlist_btn,
             self.archive_btn,
             self.stock_btn,
+            self.import_btn,
+            self.add_track_btn,
+            self.convert_single_btn,
         ):
             button.set_action_state(
                 broken=False,
                 invisible=busy,
             )
-        set_control_invisible(
-            self.add_track_btn,
-            busy,
-            available=playlist_mode,
-        )
-        set_control_invisible(
-            self.convert_single_btn,
-            busy,
-            available=playlist_mode and has_tracks,
-        )
 
     def _choose_new_files(
         self,
@@ -6058,6 +6028,7 @@ class SoundTab(QtWidgets.QWidget):
             .state
             .mode
             == "playlist"
+            and self.project_sound.ordered_ids()
         ):
             paths, _selected_filter = (
                 QtWidgets.QFileDialog
@@ -6135,7 +6106,9 @@ class SoundTab(QtWidgets.QWidget):
 
         self._import_context = self._project_context()
         self._import_target = self.session.capture_project_target(fields=("sound",))
-        self._pending_import_mode = self.project_sound.state.mode
+        self._pending_import_mode = (
+            self.project_sound.state.mode if self.project_sound.ordered_ids() else "single"
+        )
 
         self.player.stop(
             reset_position=True
@@ -6338,6 +6311,7 @@ class SoundTab(QtWidgets.QWidget):
                 .state
                 .mode
                 == "playlist"
+                and bool(self.project_sound.ordered_ids())
             ),
             parent=self,
         )
@@ -6360,6 +6334,7 @@ class SoundTab(QtWidgets.QWidget):
                 .state
                 .mode
                 == "playlist"
+                and bool(self.project_sound.ordered_ids())
             ),
             parent=self,
             recent_track_ids=tuple(
@@ -6432,6 +6407,7 @@ class SoundTab(QtWidgets.QWidget):
             .state
             .mode
             == "playlist"
+            and self.project_sound.ordered_ids()
         ):
             self.project_sound.add_to_playlist(
                 track_ids
@@ -6685,17 +6661,21 @@ class SoundTab(QtWidgets.QWidget):
     def _create_playlist(
         self,
     ) -> None:
+        if self.project_sound.state.mode == "playlist" or not self.project_sound.ordered_ids():
+            return
         previous_mode = self.project_sound.state.mode
         self.project_sound.create_playlist()
         if self.project_sound.state.mode != previous_mode:
             play_ui_sound(UiSound.BLIP)
-
-        if not self.project_sound.state.playlist:
-            self._choose_new_files()
+            self._open_user_music_for_current_mode()
 
     def _convert_to_single(
         self,
     ) -> None:
+        tracks = list(self.project_sound.state.playlist)
+        if self.project_sound.state.mode != "playlist" or not tracks:
+            return
+        target = self.session.capture_project_target(fields=("sound",))
         selected = (
             self.project_sound
             .state
@@ -6716,10 +6696,43 @@ class SoundTab(QtWidgets.QWidget):
                 or selected
             )
 
+        if len(tracks) > 1:
+            dialog = LetterSmithConfirmationDialog(
+                self,
+                title="Convert to Single Track",
+                question="Choose the song to keep. Other songs remain in Music Archive.",
+                primary_text="Keep Song",
+                secondary_text="Cancel",
+                click_outside_dismiss=False,
+            )
+            choices = QtWidgets.QComboBox(dialog)
+            choices.setAccessibleName("Song to keep")
+            choices.setMinimumHeight(40)
+            choices.setStyleSheet(
+                f"background:{dialog.colors['background']};color:{dialog.colors['text']};"
+                f"border:1px solid {dialog.colors['border']};border-radius:7px;"
+                "padding:0 10px;font:10pt 'Segoe UI';"
+            )
+            for index, track_id in enumerate(tracks, 1):
+                record = self.library.get(track_id)
+                title = record.display_title if record else track_id
+                suffix = " (unavailable)" if self.library.path_for(track_id) is None else ""
+                choices.addItem(f"{index}. {title}{suffix}", track_id)
+            choices.setCurrentIndex(max(0, choices.findData(selected)))
+            dialog.content_layout.insertWidget(2, choices)
+            accepted = dialog.exec() == QtWidgets.QDialog.Accepted
+            selected = choices.currentData()
+            dialog.deleteLater()
+            if not accepted:
+                return
+        else:
+            selected = tracks[0]
+
         previous_mode = self.project_sound.state.mode
-        self.project_sound.convert_to_single(
-            selected
-        )
+        if not self.session.apply_project_result(
+            target, lambda _model: self.project_sound.convert_to_single(selected),
+        ):
+            return
         if self.project_sound.state.mode != previous_mode:
             play_ui_sound(UiSound.BLIP)
 
@@ -6728,18 +6741,21 @@ class SoundTab(QtWidgets.QWidget):
     ) -> None:
         if not self.project_sound.ordered_ids():
             return
+        target = self.session.capture_project_target(fields=("sound",))
 
         confirmation = LetterSmithConfirmationDialog(
             self,
             title="Clear Music",
-            question="Remove all music from this letter?",
-            primary_text="Yes",
-            secondary_text="No",
+            question="Remove all music from this letter? Music Archive and source files are kept.",
+            primary_text="Clear",
+            secondary_text="Cancel",
             destructive_primary=True,
             click_outside_dismiss=False,
         )
 
-        if confirmation.exec() == QtWidgets.QDialog.Accepted:
+        accepted = confirmation.exec() == QtWidgets.QDialog.Accepted
+        confirmation.deleteLater()
+        if accepted and self.session.project_target_is_current(target):
             self.player.stop(
                 reset_position=True
             )

@@ -229,6 +229,23 @@ class CurtainCacheTests(unittest.TestCase):
             },
         )
 
+    def test_grayscale_curtain_text_remains_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cover = Path(directory) / "cover.png"
+            for gray in (0, 64, 128, 192, 255):
+                with self.subTest(gray=gray):
+                    Image.new("RGB", (32, 32), (gray, gray, gray)).save(cover)
+                    variants = curtain_color.curtain_variant_rgbs(cover)
+                    self.assertEqual(
+                        variants[CURTAIN_STYLE_NORMAL],
+                        variants[CURTAIN_STYLE_COMPLEMENTARY],
+                    )
+                    for display in curtain_color.curtain_display_palette(variants).values():
+                        self.assertGreaterEqual(
+                            self._contrast_ratio(display.background, display.foreground),
+                            4.5,
+                        )
+
     def test_display_palette_uses_all_seven_shared_color_relationships(self) -> None:
         variants = {
             CURTAIN_STYLE_WHITE: (255, 255, 255),

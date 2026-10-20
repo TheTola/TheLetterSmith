@@ -921,11 +921,6 @@ class MessageTab(QtWidgets.QWidget):
         shell.addWidget(self.heading)
 
         self.title_recipient_container = QtWidgets.QWidget(self.message_content_shell)
-        title_recipient_layout = QtWidgets.QFormLayout(self.title_recipient_container)
-        title_recipient_layout.setContentsMargins(0, 0, 0, 0)
-        title_recipient_layout.setHorizontalSpacing(10)
-        title_recipient_layout.setVerticalSpacing(12)
-        title_recipient_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
 
         self.title_input = IdentityLineEdit(self.settings.get("recipient_title", ""))
         self.title_input.setPlaceholderText("e.g. Letter Title")
@@ -962,22 +957,10 @@ class MessageTab(QtWidgets.QWidget):
             persist=True
         )
 
-        title_recipient_layout.addRow("Letter Title:", self.title_input)
-        title_recipient_layout.addRow("Recipient:", self.name_input)
-        title_recipient_layout.addRow("Published Page URL:", self.url_input)
-        for identity_input in (
-            self.title_input,
-            self.name_input,
-            self.url_input,
-        ):
-            controls = (
-                title_recipient_layout.labelForField(identity_input),
-                identity_input,
-            )
-            for control in controls:
-                font = QFont(control.font())
-                font.setPointSizeF(font.pointSizeF() + 1.0)
-                control.setFont(font)
+        self._layout_identity_fields(
+            self.title_recipient_container,
+            (self.title_input, self.name_input, self.url_input),
+        )
 
         self.title_input.editingFinished.connect(self._save_settings)
         self.name_input.editingFinished.connect(self._save_settings)
@@ -1065,13 +1048,12 @@ class MessageTab(QtWidgets.QWidget):
         session = session_for(self.project_root)
         if session is not None:
             from floating_messages import MessagesWorkspace
+            self.setMaximumWidth(1180)
+            layout.setContentsMargins(20, 12, 20, 12)
+            layout.setSpacing(14)
             self.message_content_shell.hide()
-            self.project_details_toggle = QtWidgets.QPushButton("Project title and recipient")
-            self.project_details_toggle.setCheckable(True)
-            self.project_details_toggle.toggled.connect(self.title_recipient_container.setVisible)
-            layout.insertWidget(0, self.project_details_toggle, 0, Qt.AlignLeft)
-            layout.insertWidget(1, self.title_recipient_container)
-            self.title_recipient_container.hide()
+            layout.insertWidget(0, self.title_recipient_container)
+            self.title_recipient_container.show()
             spacer = layout.takeAt(layout.count() - 1)
             del spacer
             self.messages_workspace = MessagesWorkspace(self, session)
@@ -1082,10 +1064,62 @@ class MessageTab(QtWidgets.QWidget):
             self._check_existing()
             self._update_message_summary()
 
+    @staticmethod
+    def _layout_identity_fields(container, fields):
+        container.setObjectName("MessageIdentityPanel")
+        container.setProperty("themeRole", "card")
+        container.setAttribute(Qt.WA_StyledBackground, True)
+        container.setStyleSheet(
+            "QWidget#MessageIdentityPanel{border-radius:10px;}"
+        )
+        layout = QtWidgets.QGridLayout(container)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(8)
+        for index, (label, field) in enumerate(zip(
+            ("Letter Title", "Recipient", "Published Page URL"), fields
+        )):
+            row, column = (0, index * 2) if index < 2 else (1, 0)
+            caption = QtWidgets.QLabel(label)
+            caption.setProperty("themeRole", "mutedText")
+            caption.setStyleSheet("font-weight:600;")
+            caption.setBuddy(field)
+            layout.addWidget(caption, row, column)
+            layout.addWidget(field, row, column + 1, 1, 1 if index < 2 else 3)
+            field.setMinimumWidth(0)
+            field.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(3, 1)
+        container.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+    def create_identity_panel(self, parent):
+        """A second view of the existing project identity, including its locks."""
+        panel = QtWidgets.QWidget(parent)
+        fields = []
+        for source, key in ((self.title_input, "title"), (self.name_input, "recipient"),
+                            (self.url_input, "published_url")):
+            field = IdentityLineEdit(source.text(), panel)
+            field.setPlaceholderText(source.placeholderText())
+            field.setReadOnly(source.isReadOnly())
+            field.setToolTip(source.toolTip())
+            source._identity_mirrors = getattr(source, "_identity_mirrors", []) + [field]
+            source.textChanged.connect(field.setText)
+            field.textChanged.connect(source.setText)
+            field.double_clicked.connect(
+                lambda source=source, key=key: self._unlock_identity_field(source, key))
+            field.returnPressed.connect(
+                lambda source=source, key=key: self._commit_identity_field(source, key))
+            field.editingFinished.connect(self._save_settings)
+            self._style_identity_field(source)
+            fields.append(field)
+        self._layout_identity_fields(panel, fields)
+        return panel
+
     def set_compact_layout(self, compact: bool) -> None:
         """Reduce control geometry without moving controls above the preview."""
         if getattr(self, "messages_workspace", None) is not None:
-            self.layout().setContentsMargins(8, 0, 8, 0)
+            margin = 12 if compact else 20
+            self.layout().setContentsMargins(margin, 12, margin, 12)
             return
         if self._compact_layout == compact:
             return
@@ -1360,7 +1394,7 @@ class MessageTab(QtWidgets.QWidget):
             if target == "message":
                 self.open_editor()
                 return
-            self.project_details_toggle.setChecked(True)
+            self.title_recipient_container.show()
         widget = {
             "recipient": self.name_input,
             "title": self.title_input,
@@ -1374,7 +1408,7 @@ class MessageTab(QtWidgets.QWidget):
     # Nexus / Over_Nexus hooks
     # ──────────────────────────────────────────────────────────────────
     def toggle_title_recipient_area(self) -> None:
-        self.title_recipient_container.setVisible(not self.title_recipient_container.isVisible())
+        self.title_recipient_container.show()
 
     def open_message_editor(self) -> None:
         self.open_editor()
@@ -1685,12 +1719,10 @@ class MessageTab(QtWidgets.QWidget):
             field.setToolTip(
                 "Committed. Double-click to edit, then press Enter to commit again."
             )
-        field.setMinimumHeight(
-            max(
-                field.sizeHint().height(),
-                field.fontMetrics().height() + 10,
-            )
-        )
+        field.setFixedHeight(max(34, field.fontMetrics().height() + 12))
+        for mirror in getattr(field, "_identity_mirrors", ()):
+            mirror.setReadOnly(locked)
+            MessageTab._style_identity_field(mirror)
 
     def _unlock_identity_field(
         self,
@@ -2215,7 +2247,6 @@ class MessageTab(QtWidgets.QWidget):
             self._message_import_target = workspace.capture_import(path)
             if self._message_import_target is None:
                 return
-            workspace.import_button.setEnabled(False)
         else:
             self._message_import_target = self._capture_message_target(fields=("type", "message"))
 
@@ -2229,7 +2260,6 @@ class MessageTab(QtWidgets.QWidget):
                 remove_result_path(result_path, attempts=3)
             self.status.setText("That file could not be imported.")
             if workspace is not None:
-                workspace.import_button.setEnabled(True)
                 workspace.notice.setText("That file could not be imported.")
             return
         process = QtCore.QProcess(self)
@@ -2342,8 +2372,6 @@ class MessageTab(QtWidgets.QWidget):
         self._message_import_target = None
         if hasattr(self, "btn"):
             self.btn.setEnabled(True)
-        if getattr(self, "messages_workspace", None) is not None:
-            self.messages_workspace.import_button.setEnabled(True)
         if process is not None:
             if process.state() != QtCore.QProcess.ProcessState.NotRunning:
                 process.kill()

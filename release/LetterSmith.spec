@@ -37,6 +37,7 @@ for item in MANIFEST["data_directories"] + MANIFEST["data_files"]:
     )
 
 datas += collect_data_files("spellchecker")
+datas += collect_data_files("certifi", includes=["cacert.pem"])
 
 binaries_config = MACOS["binaries"] if IS_MACOS else MANIFEST["binaries"]
 binaries = [

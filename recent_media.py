@@ -1,4 +1,4 @@
-"""Small, project- and slot-specific history for media selectors."""
+"""Shared artwork history and project-specific audio/media selections."""
 
 from __future__ import annotations
 
@@ -14,16 +14,41 @@ from transactional_io import atomic_copy_file, atomic_write_json
 
 _LOCK = RLock()
 _LIMIT = 3
+_TYPE_IMAGE_LIMIT = 10
 _TYPE_HISTORY_ID = "a406f198-533b-4d72-8777-a79b7dd8b061"
 
 
 def recent_type_images(project_root, page_type):
-    """The last three images used for this artwork type, across projects."""
-    return recent_media(project_root, _TYPE_HISTORY_ID, f"image:{page_type}")
+    """The last ten available images for this canonical type, across projects."""
+    _validate_page_type(page_type)
+    return tuple((value, label) for value, label in
+                 recent_media(project_root, _TYPE_HISTORY_ID, f"image:{page_type}")
+                 if Path(value).is_file())
 
 
 def remember_type_image(project_root, page_type, source, label):
+    _validate_page_type(page_type)
     remember_image_copy(project_root, _TYPE_HISTORY_ID, page_type, source, label)
+
+
+def _validate_page_type(page_type):
+    from project_model import PAGE_TYPES
+    if page_type not in PAGE_TYPES:
+        raise ValueError("Choose a supported artwork type.")
+
+
+def clear_type_image_history(project_root) -> None:
+    """Forget shared image selections; retain every source and cached file."""
+    path = _history_path(project_root)
+    with _LOCK:
+        payload = _load(path)
+        if _TYPE_HISTORY_ID in payload:
+            del payload[_TYPE_HISTORY_ID]
+            atomic_write_json(path, payload)
+
+
+def _entry_limit(project_id, slot):
+    return _TYPE_IMAGE_LIMIT if project_id == _TYPE_HISTORY_ID and slot.startswith("image:") else _LIMIT
 
 
 def _history_path(project_root: str | Path) -> Path:
@@ -38,7 +63,7 @@ def _load(path: Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _unique_entries(values: list) -> list[dict[str, str]]:
+def _unique_entries(values: list, limit: int = _LIMIT) -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
     seen: set[str] = set()
     for item in values:
@@ -52,7 +77,7 @@ def _unique_entries(values: list) -> list[dict[str, str]]:
             continue
         seen.add(value)
         entries.append({"value": value, "label": label})
-        if len(entries) == _LIMIT:
+        if len(entries) == limit:
             break
     return entries
 
@@ -72,7 +97,7 @@ def recent_media(
         return ()
     return tuple(
         (item["value"], item["label"])
-        for item in _unique_entries(values)
+        for item in _unique_entries(values, _entry_limit(project_id, slot))
     )
 
 
@@ -83,7 +108,7 @@ def remember_media(
     value: str,
     label: str,
 ) -> None:
-    """Keep at most three distinct selections without changing other slots."""
+    """Keep the slot's bounded, distinct selections without changing other slots."""
     if not all((project_id, slot, value)):
         return
     path = _history_path(project_root)
@@ -96,7 +121,7 @@ def remember_media(
         if not isinstance(old, list):
             old = []
         project[slot] = _unique_entries(
-            [{"value": value, "label": label}, *old]
+            [{"value": value, "label": label}, *old], _entry_limit(project_id, slot)
         )
         payload[project_id] = project
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -115,7 +140,7 @@ def remember_image_copy(
         raise ValueError("An image page ID is required.")
     # Keep historical folders readable; canonical IDs may contain characters
     # that cannot safely be used as a filesystem component.
-    folder = slot if slot in {"cover", "letter", "wall", "back"} else hashlib.sha256(slot.encode("utf-8")).hexdigest()
+    folder = slot if slot in {"cover", "illustration", "letter", "end_page", "wall", "back"} else hashlib.sha256(slot.encode("utf-8")).hexdigest()
     identity = str(UUID(project_id))
     image = Path(source).resolve(strict=True)
     if not image.is_file() or image.suffix.lower() not in {".png", ".gif"}:

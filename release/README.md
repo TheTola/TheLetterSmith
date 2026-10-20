@@ -91,6 +91,35 @@ renderer state from leaking between independent fixtures. No test module is
 excluded. Integrated multi-feature journeys still run together within their suite.
 Check out Git LFS assets (`git lfs checkout`) before resource validation.
 
+## HTTPS certificate dependency
+
+GitHub HTTPS uses the explicit runtime dependency `certifi`. Letter Smith loads
+its Mozilla CA bundle in addition to Python's default system/custom trust, with
+certificate and hostname verification enabled. Source launches locate the bundle
+through `certifi.where()`; users do not need Python's macOS
+`Install Certificates.command`. Keep the dependency installed in the same Python
+environment used to launch `Main.py`.
+
+Before each release, refresh the dependency in the build environment and run the
+certificate and publishing regression tests:
+
+```bash
+python3 -m pip install --upgrade -r requirements.txt
+python3 -m pip install --upgrade certifi
+python3 -m unittest discover -s test -p 'test_github_tls.py' -v
+python3 -m unittest discover -s test -p 'test_github_publishing.py' -v
+python3 -m unittest discover -s test -p 'test_application_paths.py' -v
+```
+
+Record the installed `certifi` version with release QA evidence. The shared
+PyInstaller spec explicitly collects `certifi/cacert.pem`. Frozen discovery uses
+the package location, independently of the working directory; macOS links its
+Frameworks package path to the Resources payload. Both release builders require
+a readable PEM containing CA roots and matching the installed dependency. The
+macOS gate also checks the runtime-facing path stays inside the app. Missing or
+damaged bundles stop validation and require rebuilding; no startup downloads or
+changes to the user's Python installation occur.
+
 ## macOS 15+
 
 The macOS application is a direct-download Developer ID distribution, not a Mac
@@ -157,3 +186,39 @@ Gatekeeper assessment. Complete the packaged-app and clean-profile checks in
 `release/MACOS_MANUAL_TEST_CHECKLIST.md` on both Apple Silicon and Intel. A real
 macOS 15 system is required to prove the stated minimum OS; newer CI runners do
 not substitute for that test.
+
+## Diagnosing native startup crashes
+
+Run the failing source checkout with its own interpreter:
+
+```bash
+.venv/bin/python -X faulthandler Main.py
+```
+
+Before importing Qt, the entrypoint enables Python's native fault handler with
+all-thread tracebacks in a separate `native-fault-<pid>-*.log`. Its descriptor
+remains open until process exit, including logging shutdown and native teardown.
+The regular startup log prints its location and the Python, PySide6, shiboken6,
+and Qt versions. On macOS, logs are in
+`~/Library/Application Support/Infini Works/Letter Smith/logs/`. Each launch gets
+a separate file; keep the file matching the failing launch. If file creation
+fails, capture the terminal's `-X faulthandler` output instead. These traces do
+not include Python local variables or credentials and are never uploaded.
+
+For a SIGSEGV report, provide that fault file, the startup log, and the matching
+timestamp/process report from `~/Library/Logs/DiagnosticReports/`. A Python trace
+ending at `application.exec()` cannot identify a native Qt/Chromium fault. If
+needed, capture the native stacks using Xcode's LLDB:
+
+```bash
+lldb -- .venv/bin/python -X faulthandler Main.py
+# At the LLDB prompt:
+run
+# After the crash stops the process:
+thread backtrace all
+```
+
+Record whether the startup opened an existing project or the recipient screen.
+For a verified correction, repeat startup, idle at least 30 seconds, exercise the
+affected interaction, and quit cleanly on the failing Mac. Windows/offscreen
+tests and nearby font/asset warnings alone do not establish a macOS crash cause.

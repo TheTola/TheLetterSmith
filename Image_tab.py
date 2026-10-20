@@ -2,7 +2,7 @@
 """
 Shared image preview, stock tray and GIF settings widgets for Letter Smith.
 
-The public ImageTab entry point is implemented in images_workspace.py over the
+The public ImageTab entry point uses images_grid.py and images_workspace.py over the
 canonical project session. Slot preview files are disposable compatibility
 views; page_artwork.py stages immutable source artwork by page ID.
 """
@@ -198,39 +198,70 @@ class StockImageDialog(QtWidgets.QDialog):
         self.setAccessibleName(
             f"{'Recently Used' if recent_paths else 'Stock Images'} - {title}"
         )
-        self.setFixedSize(420, (205 if allow_browse else 146) + (146 if recent_paths and image_paths else 0))
+        self.setWindowTitle(f"Choose {title} artwork")
+        screen = QtGui.QGuiApplication.screenAt(QtGui.QCursor.pos()) or self.screen()
+        available = screen.availableGeometry().size()
+        count = max(len(recent_paths), len(image_paths), 1)
+        self._columns = min(5, max(2, (available.width() - 64) // 144), max(3, count))
+        self.resize(self._columns * 144 + 52,
+                    min(available.height() - 40, 156 + ((count + self._columns - 1) // self._columns) * 164
+                        + (192 if recent_paths and image_paths else 0)))
         self._selected_path: Path | None = None
         self.browse_requested = False
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+        header = QtWidgets.QHBoxLayout()
+        heading = QtWidgets.QLabel(f"Choose {title} artwork")
+        heading.setObjectName("ImageChoiceHeading")
+        header.addWidget(heading, 1)
+        close = QtWidgets.QToolButton()
+        close.setText("×")
+        close.setAccessibleName("Close image choices")
+        close.setToolTip("Close (Esc)")
+        close.setFixedSize(28, 28)
+        close.setAutoRaise(True)
+        close.clicked.connect(self.reject)
+        header.addWidget(close)
+        layout.addLayout(header)
 
         self._images: QtWidgets.QListWidget | None = None
         self._recent_images: QtWidgets.QListWidget | None = None
         if recent_paths:
-            if allow_browse:
-                layout.addWidget(QtWidgets.QLabel("Recently Used"))
+            layout.addWidget(QtWidgets.QLabel(f"Recently used · {len(recent_paths)} images"))
             self._recent_images = self._make_image_list(
                 recent_paths, recent_labels
             )
-            layout.addWidget(self._recent_images)
+            self._recent_images.setAccessibleName(f"Recent {title} images")
+            layout.addWidget(self._recent_images, 1)
         if image_paths or not recent_paths:
-            if allow_browse:
-                layout.addWidget(QtWidgets.QLabel("Stock Images"))
-            self._images = self._make_image_list(image_paths)
-            layout.addWidget(self._images)
+            layout.addWidget(QtWidgets.QLabel("Stock images"))
+            self._images = self._make_image_list(
+                image_paths, tuple(f"{title} {index+1}" for index in range(len(image_paths)))
+            )
+            self._images.setAccessibleName(f"Stock {title} images")
+            layout.addWidget(self._images, 1)
         if allow_browse:
-            browse = QtWidgets.QPushButton("Choose Image…")
+            browse = QtWidgets.QPushButton("Import image…")
             browse.clicked.connect(self._browse)
             layout.addWidget(browse)
+        choices = self._recent_images or self._images
+        if choices is not None and choices.count():
+            choices.setCurrentRow(0)
+            self.setFocusProxy(choices)
         self.setStyleSheet(
-            "QDialog#StockImageTray{background:#101317;border:1px solid #394654;"
-            "border-radius:8px;}"
-            "QLabel{color:#e8edf5;font-weight:600;}"
-            "QListWidget{background:transparent;border:none;outline:none;}"
-            "QListWidget::item{border:1px solid #2d3540;border-radius:6px;}"
-            "QListWidget::item:hover,QListWidget::item:selected{"
-            "border:2px solid #00d0ff;background:#19232d;}"
+            "QDialog#StockImageTray{background:palette(window);border:1px solid palette(mid);"
+            "border-radius:12px;}"
+            "QLabel{color:palette(window-text);}"
+            "QLabel#ImageChoiceHeading{font-size:16px;font-weight:600;}"
+            "QPushButton{min-height:30px;padding:2px 12px;border-radius:7px;}"
+            "QListWidget{background:transparent;border:none;}"
+            "QListWidget::item{background:palette(base);border:1px solid palette(mid);"
+            "border-radius:8px;padding:5px;margin:3px;color:palette(text);}"
+            "QListWidget::item:hover{border:1px solid palette(highlight);}"
+            "QListWidget::item:selected{border:2px solid palette(highlight);"
+            "background:palette(alternate-base);color:palette(text);}"
         )
 
     def _make_image_list(
@@ -239,20 +270,30 @@ class StockImageDialog(QtWidgets.QDialog):
         labels: tuple[str, ...] = (),
     ) -> QtWidgets.QListWidget:
         images = QtWidgets.QListWidget()
+        font = QtGui.QFont(self.font())
+        font.setPointSizeF(max(9, font.pointSizeF()))
+        images.setFont(font)
         images.setViewMode(QtWidgets.QListView.IconMode)
-        images.setIconSize(QtCore.QSize(112, 112))
-        images.setGridSize(QtCore.QSize(130, 126))
-        images.setSpacing(3)
+        images.setIconSize(QtCore.QSize(116, 120))
+        images.setGridSize(QtCore.QSize(144, 164))
+        images.setWordWrap(False)
+        images.setTextElideMode(QtCore.Qt.ElideMiddle)
+        images.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        images.setSpacing(0)
         images.setMovement(QtWidgets.QListView.Static)
         images.setResizeMode(QtWidgets.QListView.Adjust)
         images.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        images.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        images.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        images.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         for index, path in enumerate(paths):
-            item = QtWidgets.QListWidgetItem(QIcon(str(path)), "")
+            label = labels[index] if index < len(labels) else path.stem
+            item = QtWidgets.QListWidgetItem(QIcon(str(path)), label)
             item.setData(QtCore.Qt.UserRole, str(path))
-            item.setToolTip(labels[index] if index < len(labels) else path.stem)
+            item.setToolTip(label)
+            item.setData(QtCore.Qt.AccessibleTextRole, label)
             images.addItem(item)
         images.itemClicked.connect(self._accept_item)
+        images.itemActivated.connect(self._accept_item)
         return images
 
     def _browse(self) -> None:
@@ -265,10 +306,6 @@ class StockImageDialog(QtWidgets.QDialog):
     def _accept_item(self, item: QtWidgets.QListWidgetItem) -> None:
         self._selected_path = Path(str(item.data(QtCore.Qt.UserRole)))
         self.accept()
-
-    def focusOutEvent(self, event: QtGui.QFocusEvent) -> None:
-        self.reject()
-        super().focusOutEvent(event)
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)

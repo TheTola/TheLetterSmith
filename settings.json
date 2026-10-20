@@ -17,5 +17,6 @@
   "active_play_dir": "",
   "visionary_url": "https://chatgpt.com/g/g-68ce5925196c8191a222e24d29323813-the-visionary",
   "curtain_style": "average_color",
-  "theme_family": "forge"
+  "theme_family": "forge",
+  "prompt_writer_provider": ""
 }

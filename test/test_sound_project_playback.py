@@ -382,12 +382,12 @@ class SoundProjectPlaybackTests(unittest.TestCase):
             self.assertTrue(tab.player.is_muted())
             play.assert_not_called()
 
-            tab.advanced_btn.setFocus()
-            self.app.processEvents()
-            QtTest.QTest.keyClick(tab.advanced_btn, QtCore.Qt.Key_Space)
-            self.assertTrue(tab.advanced_btn.isChecked())
-            self.assertTrue(tab.advanced_panel.isVisible())
-            play.assert_not_called()
+            with mock.patch.object(tab, "_open_music_selector") as selector:
+                tab.add_track_btn.setFocus()
+                self.app.processEvents()
+                QtTest.QTest.keyClick(tab.add_track_btn, QtCore.Qt.Key_Space)
+                selector.assert_called_once_with(user_music=True)
+                play.assert_not_called()
 
             tab.playlist_list.setFocus()
             self.app.processEvents()
@@ -526,10 +526,113 @@ class SoundProjectPlaybackTests(unittest.TestCase):
         self.assertEqual(tab.playlist_list.count(), 2)
         self.assertIn("unavailable", tab.playlist_list.item(1).text())
         self.assertFalse(tab.playlist_preview_btn.isEnabled())
-        self.assertTrue(tab.remove_track_btn.isEnabled())
+        remove = tab.playlist_list.itemWidget(tab.playlist_list.item(1)).findChild(
+            QtWidgets.QToolButton, "playlistRemove",
+        )
+        self.assertTrue(remove.isEnabled())
         self.assertIn("1 unavailable", tab.playlist_summary.text())
-        tab.remove_track_btn.click()
+        remove.click()
         self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-0"])
+        self._assert_sources_unchanged()
+
+    def test_music_workflow_visibility_preserves_song_and_returns_to_empty(self) -> None:
+        tab = self._tab(playlist=False)
+        self._show_tab(tab)
+        self.assertTrue(tab.archive_btn.isVisible())
+        self.assertTrue(tab.import_btn.isVisible())
+        for button in (tab.single_action_btn, tab.create_playlist_btn,
+                       tab.add_track_btn, tab.convert_single_btn, tab.clear_btn):
+            self.assertFalse(button.isVisible())
+
+        tab._archive_tracks_chosen(["synthetic-1"])
+        self.assertTrue(tab.single_action_btn.isVisible())
+        self.assertEqual(tab.single_action_btn.text(), "Replace Music")
+        self.assertTrue(tab.create_playlist_btn.isVisible())
+        self.assertFalse(tab.convert_single_btn.isVisible())
+        self.assertFalse(tab.import_btn.isVisible())
+        with mock.patch.object(tab, "_open_user_music_for_current_mode") as selector:
+            tab.create_playlist_btn.click()
+            selector.assert_called_once_with()
+        self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-1"])
+        self.assertTrue(tab.add_track_btn.isVisible())
+        self.assertTrue(tab.convert_single_btn.isVisible())
+        self.assertFalse(tab.single_action_btn.isVisible())
+        tab._archive_tracks_chosen(["synthetic-0"])
+        self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-1", "synthetic-0"])
+
+        for expected in (["synthetic-0"], []):
+            row = tab.playlist_list.itemWidget(tab.playlist_list.item(0))
+            row.findChild(QtWidgets.QToolButton, "playlistRemove").click()
+            self.assertEqual(tab.project_sound.ordered_ids(), expected)
+            self.assertEqual(load_project_state(self.root).ordered_track_ids(), expected)
+        self.assertTrue(tab.import_btn.isVisible())
+        self.assertFalse(tab.convert_single_btn.isVisible())
+        self.assertFalse(tab.add_track_btn.isVisible())
+        tab._archive_tracks_chosen(["synthetic-0"])
+        self.assertEqual(tab.project_sound.state.mode, "single")
+        self._assert_sources_unchanged()
+
+    def test_conversion_requires_choice_and_cancel_preserves_playlist(self) -> None:
+        tab = self._tab()
+        before = tab.project_sound.state.to_dict()
+        with mock.patch("sound_tab.LetterSmithConfirmationDialog.exec",
+                        return_value=QtWidgets.QDialog.Rejected):
+            tab._convert_to_single()
+        self.assertEqual(tab.project_sound.state.to_dict(), before)
+
+        # Missing sources must not cause a different song to be retained.
+        tab.library.records.pop("synthetic-1")
+        def choose(dialog):
+            combo = dialog.findChild(QtWidgets.QComboBox)
+            self.assertEqual(combo.count(), 2)
+            combo.setCurrentIndex(1)
+            return QtWidgets.QDialog.Accepted
+        with mock.patch("sound_tab.LetterSmithConfirmationDialog.exec", choose):
+            tab._convert_to_single()
+        self.assertEqual(tab.project_sound.state.mode, "single")
+        self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-1"])
+        self.assertEqual(load_project_state(self.root).single_track_id, "synthetic-1")
+        with mock.patch.object(tab, "_open_user_music_for_current_mode"):
+            tab._create_playlist()
+        self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-1"])
+        self._assert_sources_unchanged()
+
+    def test_conversion_distinguishes_songs_with_the_same_title(self) -> None:
+        tab = self._tab()
+        tab.library.records["synthetic-1"].display_title = "Synthetic track 1"
+        def choose(dialog):
+            combo = dialog.findChild(QtWidgets.QComboBox)
+            self.assertEqual(combo.itemText(0), "1. Synthetic track 1")
+            self.assertEqual(combo.itemText(1), "2. Synthetic track 1")
+            combo.setCurrentIndex(1)
+            return QtWidgets.QDialog.Accepted
+        with mock.patch("sound_tab.LetterSmithConfirmationDialog.exec", choose):
+            tab._convert_to_single()
+        self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-1"])
+        self.assertEqual(load_project_state(self.root).single_track_id, "synthetic-1")
+        self._assert_sources_unchanged()
+
+    def test_conversion_and_clear_ignore_a_changed_soundtrack(self) -> None:
+        tab = self._tab()
+        def change_sound(dialog):
+            tab.project_sound.set_single("synthetic-0")
+            return QtWidgets.QDialog.Accepted
+        with mock.patch("sound_tab.LetterSmithConfirmationDialog.exec", change_sound):
+            tab._convert_to_single()
+        self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-0"])
+
+        with mock.patch("sound_tab.LetterSmithConfirmationDialog.exec",
+                        return_value=QtWidgets.QDialog.Rejected):
+            tab.clear_btn.click()
+        self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-0"])
+        tab.project_sound.set_single("synthetic-1")
+        with mock.patch("sound_tab.LetterSmithConfirmationDialog.exec", change_sound):
+            tab.clear_btn.click()
+        self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-0"])
+        with mock.patch("sound_tab.LetterSmithConfirmationDialog.exec",
+                        return_value=QtWidgets.QDialog.Accepted):
+            tab.clear_btn.click()
+        self.assertEqual(tab.project_sound.ordered_ids(), [])
         self._assert_sources_unchanged()
 
 

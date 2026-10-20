@@ -353,7 +353,7 @@ def validate_render(render: RenderInput) -> tuple[RenderIssue, ...]:
                 issue("invalid_artwork", f"Artwork cannot be rendered: {error}", "images")
         message = page.get("message")
         if message is not None:
-            unknown = set(message.get("settings", {})) - set(_READABILITY)
+            unknown = set(message.get("settings", {})) - {*_READABILITY, "editor_paper_colors"}
             if unknown:
                 issue("unsupported_message_settings", "Unsupported message settings: " + ", ".join(sorted(unknown)), "messages")
             try:

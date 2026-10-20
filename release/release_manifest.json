@@ -178,10 +178,12 @@
     "mammoth",
     "docx",
     "PyPDF2",
-    "keyring"
+    "keyring",
+    "certifi"
   ],
   "hidden_imports": [
     "Nexus",
+    "certifi",
     "PySide6.QtWebEngineCore",
     "PySide6.QtWebEngineWidgets",
     "PySide6.QtMultimedia",

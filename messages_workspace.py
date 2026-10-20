@@ -13,6 +13,119 @@ from message_document_import import message_resources, stage_import_html
 from message_html import sanitize_message_html
 from project_paths import application_paths
 from ui_dialogs import LetterSmithConfirmationDialog
+from named_text_styles import STYLE_LABELS
+
+
+class ReadabilityControls(QtWidgets.QWidget):
+    """Synchronized views of the selected page's existing styling controls."""
+
+    def __init__(self, workspace, parent=None):
+        super().__init__(parent)
+        self.workspace = workspace
+        self.setObjectName("letterReadabilityControls")
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.setStyleSheet(
+            "#letterReadabilityControls QComboBox, #letterReadabilityControls QSpinBox"
+            "{min-height:24px;padding:1px 4px;font:9pt 'Segoe UI';}"
+            "#letterReadabilityControls QLabel{font:9pt 'Segoe UI';}"
+        )
+        row = QtWidgets.QHBoxLayout(self)
+        row.setContentsMargins(4, 2, 4, 2)
+        row.setSpacing(6)
+        self.preset = QtWidgets.QComboBox()
+        self.preset.setAccessibleName("Letter paper")
+        self.preset.setToolTip("Paper for the selected letter")
+        for key, label in LETTER_PAGE_PRESET_LABELS.items():
+            self.preset.addItem(label, key)
+        row.addWidget(self.preset)
+        self.opacity = QtWidgets.QSpinBox()
+        self.opacity.setRange(0, 100)
+        self.opacity.setSuffix("%")
+        self.opacity.setAccessibleName("Paper opacity")
+        self.opacity.setToolTip("Paper opacity: 0% reveals the artwork")
+        row.addWidget(self.opacity)
+        self.category = QtWidgets.QComboBox()
+        self.category.setAccessibleName("Text color category")
+        for key, label in STYLE_LABELS.items():
+            self.category.addItem(label, key)
+        row.addWidget(self.category)
+        self.color = QtWidgets.QToolButton()
+        self.color.setText("Color")
+        self.color.setAccessibleName("Choose category text color")
+        self.color.clicked.connect(self.choose_color)
+        row.addWidget(self.color)
+        self.contrast = QtWidgets.QLabel()
+        self.contrast.setAccessibleName("Letter contrast")
+        row.addWidget(self.contrast)
+        row.addStretch(1)
+        self.zoom = QtWidgets.QSpinBox()
+        self.zoom.setRange(25, 200)
+        self.zoom.setSuffix("%")
+        self.zoom.setAccessibleName("Page preview zoom")
+        self.zoom.setToolTip("Preview zoom")
+        row.addWidget(self.zoom)
+        self.summary = QtWidgets.QLabel()
+        self.summary.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        row.addWidget(self.summary)
+        self.preset.currentIndexChanged.connect(self.apply)
+        self.opacity.valueChanged.connect(self.apply)
+        self.category.currentIndexChanged.connect(self.sync)
+        self.zoom.valueChanged.connect(workspace.zoom.setValue)
+        workspace.readability_changed.connect(self.sync)
+        self.sync()
+
+    def apply_theme_assets(self, service):
+        service.apply_semantic_styles(self)
+
+    def apply(self, *_):
+        workspace = self.workspace
+        if workspace.binding is None or workspace._failed:
+            return
+        # Transparent displays 0% without replacing the last paper opacity.
+        patch = ({"message_overlay_opacity": self.opacity.value()}
+                 if self.sender() is self.opacity else
+                 {"message_overlay_preset": self.preset.currentData()})
+        workspace.set_readability(patch)
+
+    def choose_color(self):
+        editor = self.workspace.editor
+        if editor is None:
+            return
+        page_id = self.workspace.page_id
+        key = self.category.currentData()
+        color = QtWidgets.QColorDialog.getColor(
+            QtGui.QColor(editor.named_styles.active_set.get(key).font_color), self,
+            f"{self.category.currentText()} · {self.preset.currentText()}")
+        if self.workspace.editor is editor and self.workspace.page_id == page_id:
+            editor.set_paper_text_color(key, color)
+            self.workspace.readability_changed.emit()
+
+    def sync(self, *_):
+        workspace = self.workspace
+        self.setEnabled(workspace.page_id is not None and not workspace._failed)
+        if workspace.page_id is None:
+            self.summary.clear()
+            return
+        preset, opacity, _, _ = normalized_letter_page_settings(
+            workspace._display_settings())
+        with QtCore.QSignalBlocker(self.preset), QtCore.QSignalBlocker(self.opacity), QtCore.QSignalBlocker(self.zoom):
+            self.preset.setCurrentIndex(self.preset.findData(preset))
+            self.opacity.setValue(opacity)
+            self.opacity.setEnabled(preset != "clear")
+            self.zoom.setValue(workspace.zoom.value())
+        self.summary.setText(f"{LETTER_PAGE_PRESET_LABELS[preset]} · {workspace.zoom.value()}%")
+        self.setToolTip(workspace.binding.label)
+        if workspace.editor is not None:
+            editor = workspace.editor
+            color = editor.named_styles.active_set.get(self.category.currentData()).font_color
+            self.color.setStyleSheet(f"QToolButton{{border-bottom:3px solid {color};padding:3px 6px;}}")
+            self.color.setToolTip(f"{self.category.currentText()} color: {color}")
+            self.contrast.setText(editor.readability_indicator.text())
+            self.contrast.setToolTip(editor.readability_indicator.toolTip())
+            if workspace._preview_contrast is not None:
+                ratio = workspace._preview_contrast
+                self.contrast.setText("Contrast good" if ratio >= 4.5 else "Contrast reduced" if ratio >= 3 else "Low contrast")
+                self.contrast.setToolTip(f"Lowest sampled contrast in the visible page: {ratio:.1f}:1.")
 
 
 @dataclass
@@ -28,6 +141,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
     session_changed = QtCore.Signal(object)
     background_requested = QtCore.Signal(str)
     images_requested = QtCore.Signal()
+    readability_changed = QtCore.Signal()
 
     def __init__(self, owner, session):
         super().__init__(owner)
@@ -52,6 +166,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.preview_page_id = None
         self.preview_background = None
         self.preview_html = ""
+        self._preview_contrast = None
         self._save_timer = QtCore.QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(650)
@@ -77,7 +192,9 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.selector.setAccessibleName("Letter page to edit")
         self.selector.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.selector.setMinimumContentsLength(18)
-        header.addWidget(self.selector, 1)
+        self.selector.setMaximumWidth(320)
+        header.addWidget(self.selector)
+        header.addStretch(1)
         self.background_button = QtWidgets.QPushButton("Edit Background Artwork")
         self.background_button.clicked.connect(self._edit_background)
         header.addWidget(self.background_button)
@@ -96,10 +213,6 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.actions = QtWidgets.QWidget()
         actions = QtWidgets.QHBoxLayout(self.actions)
         actions.setContentsMargins(0, 0, 0, 0)
-        self.import_button = QtWidgets.QPushButton("Import Text")
-        self.import_button.clicked.connect(owner.select_file)
-        self.clear_button = QtWidgets.QPushButton("Clear Text")
-        self.clear_button.clicked.connect(self.clear_text)
         self.save_button = QtWidgets.QPushButton("Save Draft")
         self.save_button.clicked.connect(self.save)
         self.review_button = QtWidgets.QPushButton("Review Import")
@@ -108,43 +221,12 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.recover_button = QtWidgets.QPushButton("Discard draft and reload")
         self.recover_button.clicked.connect(self.discard_draft)
         self.recover_button.hide()
-        for widget in (self.import_button, self.clear_button, self.save_button,
-                       self.recover_button):
+        for widget in (self.save_button, self.recover_button):
             actions.addWidget(widget)
         actions.addStretch(1)
-        self.layout_button = QtWidgets.QPushButton("Text Layout")
-        self.layout_button.clicked.connect(self.edit_layout)
-        actions.addWidget(self.layout_button)
-        self.style_toggle = QtWidgets.QPushButton("Readability")
-        self.style_toggle.setCheckable(True)
-        actions.addWidget(self.style_toggle)
         layout.addWidget(self.actions)
         # A delayed import can outlive every Letter page in the active project.
         layout.addWidget(self.review_button, 0, QtCore.Qt.AlignLeft)
-
-        self.style_panel = QtWidgets.QWidget()
-        style = QtWidgets.QHBoxLayout(self.style_panel)
-        style.setContentsMargins(0, 0, 0, 0)
-        self.style_scope = QtWidgets.QLabel()
-        style.addWidget(self.style_scope)
-        self.preset = QtWidgets.QComboBox()
-        self.preset.setAccessibleName("This page's readability treatment")
-        for key, label in LETTER_PAGE_PRESET_LABELS.items():
-            self.preset.addItem(label, key)
-        style.addWidget(self.preset)
-        self.opacity = QtWidgets.QSpinBox()
-        self.opacity.setRange(0, 100)
-        self.opacity.setSuffix("%")
-        self.opacity.setAccessibleName("This page's readability opacity")
-        style.addWidget(self.opacity)
-        self.default_button = QtWidgets.QPushButton("Use project default")
-        self.default_button.clicked.connect(self.use_project_style)
-        style.addWidget(self.default_button)
-        self.style_panel.hide()
-        layout.addWidget(self.style_panel)
-        self.style_toggle.toggled.connect(self.style_panel.setVisible)
-        self.preset.currentIndexChanged.connect(self.customize_style)
-        self.opacity.valueChanged.connect(self.customize_style)
 
         self.empty = QtWidgets.QWidget()
         empty_layout = QtWidgets.QVBoxLayout(self.empty)
@@ -179,6 +261,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.shared_preview = create_shared_preview(self.preview_panel, session, cache / f"shared-{uuid4().hex}")
         if self.shared_preview is not None:
             self.shared_preview.status_changed.connect(self.preview_note.setText)
+            self.shared_preview.contrast_changed.connect(self._update_preview_contrast)
             preview_layout.addWidget(self.shared_preview, 1)
             self.shared_preview.hide()
         self.zoom = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -186,12 +269,17 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.zoom.setValue(100)
         self.zoom.setAccessibleName("Preview zoom, view only")
         self.zoom.valueChanged.connect(self._fit_preview)
-        preview_layout.addWidget(self.zoom)
+        self.zoom.hide()
+        self.zoom.valueChanged.connect(self.readability_changed)
         self.splitter.addWidget(self.preview_panel)
         self.splitter.setStretchFactor(0, 4)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([800, 260])
         layout.addWidget(self.splitter, 1)
+        self.style_panel = ReadabilityControls(self, self)
+        self.preset = self.style_panel.preset
+        self.opacity = self.style_panel.opacity
+        layout.addWidget(self.style_panel)
         self.preview_toggle.toggled.connect(self.preview_panel.setVisible)
         self.preview_toggle.toggled.connect(self._preview_visibility_changed)
         self.selector.currentIndexChanged.connect(self._select)
@@ -261,6 +349,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
                     return
                 self._dispose_editor()
             if reload_editor:
+                self._preview_contrast = None
                 self._render_gate.invalidate(accepting=True)
                 if self.shared_preview is not None and not same:
                     self.shared_preview.invalidate()
@@ -281,7 +370,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
             self.actions.setVisible(has_letter)
             self.background_button.setEnabled(has_letter)
             self.selector.setEnabled(has_letter)
-            self.style_panel.setVisible(has_letter and self.style_toggle.isChecked())
+            self.style_panel.setVisible(has_letter)
             from project_model import MAX_PAGES
             self.add_button.setEnabled(len(self.session.project.pages) < MAX_PAGES)
             if not has_letter:
@@ -292,12 +381,12 @@ class MessagesWorkspace(QtWidgets.QWidget):
                 self.preview_page_id = None
                 self.deactivate_preview()
                 self.owner.current_html = ""
+                self.readability_changed.emit()
                 self._show_recovery_notice()
                 return
             index, page = next((i, p) for i, p in letters if p["id"] == selected)
             label = self._label(index, page)
             self.heading.setText(label)
-            self.import_button.setToolTip(f"Import Text into {label}")
             self._last_letter = selected
             if reload_editor:
                 self.binding = _Binding(self.session.capture_target(selected, fields=("type", "message"), include_shared=False), document, label)
@@ -306,8 +395,11 @@ class MessagesWorkspace(QtWidgets.QWidget):
                                      save_callback=lambda html: self._commit_html(binding, html),
                                      resource_roots=self._resource_roots(), document_label=label,
                                      missing_resources=self._missing_resources(),
-                                     display_settings=self.session.project.resolve_settings(selected))
+                                     display_settings=self._display_settings(selected),
+                                     paper_colors=document.get("settings", {}).get("editor_paper_colors"))
                 self.editor.bound_error.connect(self._error)
+                self.editor.editor.currentCharFormatChanged.connect(self.readability_changed)
+                self.editor.editor.textChanged.connect(self.readability_changed)
                 self.editor_layout.addWidget(self.editor)
                 self.editor.show()
                 view = self._views.get((self.session.session_id, selected))
@@ -323,6 +415,20 @@ class MessagesWorkspace(QtWidgets.QWidget):
             else:
                 self.binding.label = label
             self.owner.current_html = document["html"]
+            if reload_editor and not document["html"].strip():
+                settings = self._display_settings()
+                remembered = self.editor.settings.value("paper/lastPreset")
+                if ("message_overlay_preset" not in settings and isinstance(remembered, str)
+                        and remembered in LETTER_PAGE_PRESET_LABELS):
+                    preset, opacity, _, _ = normalized_letter_page_settings({
+                        "message_overlay_preset": remembered,
+                        "message_overlay_opacity": self.editor.settings.value("paper/lastOpacity", 68),
+                    })
+                    self.session.project.update_page_settings(selected, {
+                        "message_overlay_preset": preset, "message_overlay_opacity": opacity,
+                    })
+                    self._dirty = True
+                    self._save_timer.start()
             self._sync_style()
             self._show_recovery_notice()
             self._preview_timer.start()
@@ -361,6 +467,12 @@ class MessagesWorkspace(QtWidgets.QWidget):
         html = sanitize_message_html(html)
         document = dict(binding.document)
         document["html"] = html
+        self._preview_contrast = None
+        if self.editor is not None:
+            document["settings"] = {
+                **document.get("settings", {}),
+                "editor_paper_colors": self.editor.paper_colors(),
+            }
         resources = list(document.get("resources", []))
         for reference in message_resources(html):
             if reference not in resources:
@@ -501,16 +613,20 @@ class MessagesWorkspace(QtWidgets.QWidget):
     def _sync_style(self):
         if not self.page_id:
             return
-        page = self.session.project.get_page(self.page_id)
-        preset, opacity, _, _ = normalized_letter_page_settings(self.session.project.resolve_settings(self.page_id))
-        with QtCore.QSignalBlocker(self.preset), QtCore.QSignalBlocker(self.opacity):
-            self.preset.setCurrentIndex(self.preset.findData(preset))
-            self.opacity.setValue(opacity)
-        customized = any(key in page["design_overrides"] for key in ("message_overlay_preset", "message_overlay_opacity"))
-        self.style_scope.setText("Customized for this page" if customized else "Using project text style")
-        self.default_button.setEnabled(customized)
         if self.editor is not None:
-            self.editor.set_display_settings(self.session.project.resolve_settings(self.page_id))
+            self.editor.set_display_settings(self._display_settings())
+        self.readability_changed.emit()
+
+    def _update_preview_contrast(self, ratio):
+        self._preview_contrast = ratio
+        self.readability_changed.emit()
+
+    def _display_settings(self, page_id=None):
+        page_id = page_id or self.page_id
+        if page_id is None:
+            return {}
+        return {**self.session.project.resolve_settings(page_id),
+                **self.session.project.get_message(page_id).get("settings", {})}
 
     def edit_layout(self):
         if not self.page_id or not self.save():
@@ -563,11 +679,27 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.refresh()
         self.save()
 
+    def set_readability(self, patch):
+        if self.binding is None or self._failed:
+            return
+        def apply(model, page_id):
+            model.update_page_settings(page_id, patch)
+            document = model.get_message(page_id)
+            # Older documents may carry a more specific presentation override.
+            if any(key in document.get("settings", {}) for key in patch):
+                document["settings"] = {**document["settings"], **patch}
+                model.update_message(page_id, document)
+        self._apply_style(apply)
+        if not self._failed and self.editor is not None:
+            preset, opacity, _, _ = normalized_letter_page_settings(self._display_settings())
+            self.editor.settings.setValue("paper/lastPreset", preset)
+            self.editor.settings.setValue("paper/lastOpacity", opacity)
+
     def customize_style(self, *_):
         if self.binding is None or self._refreshing or self._failed:
             return
         patch = {"message_overlay_preset": self.preset.currentData(), "message_overlay_opacity": self.opacity.value()}
-        self._apply_style(lambda model, page_id: model.update_page_settings(page_id, patch))
+        self.set_readability(patch)
 
     def use_project_style(self):
         if self.binding is None or self._failed:
@@ -578,11 +710,14 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self._apply_style(reset)
 
     def _apply_style(self, callback):
+        self._preview_contrast = None
         self._committing = True
         try:
             if not self.session.apply_result(self.binding.target, callback):
                 self._error("The original page changed. Its readability settings were not overwritten.")
                 return
+            self.binding.document = self.session.project.get_message(self.page_id)
+            self.binding.target = self.session.capture_target(self.page_id, fields=("type", "message"), include_shared=False)
             self._dirty = True
             self._save_timer.start()
         except (ValueError, RuntimeError, OSError, KeyError) as error:
@@ -590,6 +725,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
         finally:
             self._committing = False
         self.refresh()
+        self.owner.project_changed.emit()
 
     def capture_import(self, path, *, mode=None):
         if not self.page_id or not self.save():
@@ -735,6 +871,9 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.preview_html = page["message"]["html"]
         self.preview_background = page["artwork"].get("asset")
         background = self._asset(self.preview_background)
+        if self.editor is not None:
+            self.editor.set_background_artwork(QtGui.QPixmap(str(background)) if background else None)
+            self.readability_changed.emit()
         self.preview_label.clear()
         if background is None:
             if self.shared_preview is not None:
@@ -746,6 +885,13 @@ class MessagesWorkspace(QtWidgets.QWidget):
             self.preview_note.setText("Choose background artwork in Images.")
             return
         if self.shared_preview is not None:
+            geometry = page.get("resolved_layout") or {}
+            canvas = (geometry.get("artwork") or geometry.get("message") or {}).get("canvas")
+            if canvas:
+                self.shared_preview.set_page_aspect(canvas["width"], canvas["height"])
+            else:
+                size = QtGui.QImageReader(str(background)).size()
+                self.shared_preview.set_page_aspect(size.width(), size.height())
             self.preview_scroll.hide()
             self.shared_preview.show()
             self.shared_preview.request(page["id"])

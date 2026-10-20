@@ -88,13 +88,14 @@ class RestoredWriterTests(unittest.TestCase):
             self.assertTrue(self.panel.isVisible())
 
     def test_type_history_is_limited_and_independent_of_page_identity(self):
-        for i in range(4):
+        for i in range(12):
             path = self.root / f'history-{i}.png'
-            Image.new('RGB', (12, 18), (i*50, 10, 20)).save(path)
+            Image.new('RGB', (12, 18), (i*20, 10, 20)).save(path)
             remember_type_image(self.root, 'cover', path, str(i))
         remember_type_image(self.root, 'end_page', path, 'Ending')
         self.session.replace(create_project(), asset_root=self.root)
-        self.assertEqual([label for _, label in recent_type_images(self.root, 'cover')], ['3', '2', '1'])
+        self.assertEqual([label for _, label in recent_type_images(self.root, 'cover')],
+                         [str(i) for i in reversed(range(2, 12))])
         self.assertEqual([label for _, label in recent_type_images(self.root, 'end_page')], ['Ending'])
 
 

@@ -739,11 +739,11 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 blocked = tab._readiness_result
                 self.assertFalse(blocked.can_preview)
                 self.assertFalse(tab.export_btn.isEnabled())
-                self.assertEqual(tab.preview_mode.count(), 0)
-                self.assertEqual(tab.preview_mode.currentIndex(), -1)
+                self.assertEqual(tab.preview_mode.count(), 3)
+                self.assertEqual(tab.preview_mode.currentText(), "Landscape")
                 self.assertFalse(tab.preview_mode.isEnabled())
                 self.assertEqual(tab.curtain_style_selector.count(), 0)
-                self.assertEqual(tab.curtain_style_selector.currentText(), "")
+                self.assertEqual(tab.curtain_style_selector.currentText(), "Normal Curtains")
                 self.assertFalse(tab.curtain_style_selector.isEnabled())
 
                 ready = ReadinessResult((), 100, "Ready")
@@ -778,11 +778,11 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                 tab.curtain_style_selector.set_current_style("normal_dark")
                 with mock.patch("Forge_Tab.evaluate_readiness", return_value=blocked):
                     tab.refresh_readiness()
-                self.assertEqual(tab.preview_mode.count(), 0)
-                self.assertEqual(tab.preview_mode.currentText(), "")
+                self.assertEqual(tab.preview_mode.count(), 3)
+                self.assertEqual(tab.preview_mode.currentText(), "Browser")
                 self.assertFalse(tab.preview_mode.isEnabled())
                 self.assertEqual(tab.curtain_style_selector.count(), 0)
-                self.assertEqual(tab.curtain_style_selector.currentText(), "")
+                self.assertEqual(tab.curtain_style_selector.currentText(), "Normal Dark Curtains")
                 self.assertFalse(tab.curtain_style_selector.isEnabled())
                 with mock.patch("Forge_Tab.evaluate_readiness", return_value=ready):
                     tab.refresh_readiness()

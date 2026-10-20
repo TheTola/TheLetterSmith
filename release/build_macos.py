@@ -50,6 +50,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from release.build_release import (
     ReleaseValidationError,
     _load_json,
+    _validate_certificate_bundle,
     _validate_frozen_payload,
     _validate_identity,
     _validate_private_binary_markers,
@@ -488,6 +489,7 @@ def validate_macos_configuration(
         "bundle_identifier",
         "CFBundleVersion",
         "macos_entitlements.plist",
+        'collect_data_files("certifi", includes=["cacert.pem"])',
     ):
         if required not in spec_text:
             raise MacOSReleaseError(f"PyInstaller macOS bundle setting is missing: {required}")
@@ -843,6 +845,11 @@ def _validate_bundle(
 
     try:
         _validate_frozen_payload(resource_internal, manifest, "darwin")
+        _validate_certificate_bundle(
+            resource_internal,
+            runtime_root=framework_internal,
+            bundle_root=contents,
+        )
     except ReleaseValidationError as error:
         raise MacOSReleaseError(str(error)) from error
     files = _validate_bundle_sanitation(contents, manifest)

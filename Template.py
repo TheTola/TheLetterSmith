@@ -643,13 +643,29 @@ document.addEventListener('DOMContentLoaded', () => {
       const center=cssRgb('--message-overlay-center-rgb',[0,0,0]);
       const edge=cssRgb('--message-overlay-edge-rgb',center);
       const groups=new Map();
+      let minimumContrast=Infinity;
+      function recordContrast(ink,background,opacity){
+        const visible=background.map((value,index)=>value+(ink[index]-value)*opacity);
+        minimumContrast=Math.min(minimumContrast,ratio(visible,background));
+      }
+      function reportContrast(){
+        wall.dataset.minimumContrast=Number.isFinite(minimumContrast)?String(minimumContrast):'';
+      }
+      const imageStyle=getComputedStyle(wallImage);
+      const imageScale=(imageStyle.objectFit==='cover'?Math.max:Math.min)(
+        imageRect.width/wallImage.naturalWidth,imageRect.height/wallImage.naturalHeight);
+      const drawnWidth=wallImage.naturalWidth*imageScale,drawnHeight=wallImage.naturalHeight*imageScale;
+      const position=imageStyle.objectPosition.split(' ').map(value=>Number.parseFloat(value)/100);
+      const imageLeft=imageRect.left+(imageRect.width-drawnWidth)*(Number.isFinite(position[0])?position[0]:.5);
+      const imageTop=imageRect.top+(imageRect.height-drawnHeight)*(Number.isFinite(position[1])?position[1]:.5);
 
       function pixelAt(clientX,clientY){
-        const inside=clientX>=imageRect.left && clientX<=imageRect.right && clientY>=imageRect.top && clientY<=imageRect.bottom;
+        const inside=clientX>=Math.max(imageRect.left,imageLeft) && clientX<=Math.min(imageRect.right,imageLeft+drawnWidth) &&
+          clientY>=Math.max(imageRect.top,imageTop) && clientY<=Math.min(imageRect.bottom,imageTop+drawnHeight);
         let artwork=[14,14,18];
         if (inside){
-          const px=clamp(Math.round(((clientX-imageRect.left)/imageRect.width)*(sampleImage.width-1)),0,sampleImage.width-1);
-          const py=clamp(Math.round(((clientY-imageRect.top)/imageRect.height)*(sampleImage.height-1)),0,sampleImage.height-1);
+          const px=clamp(Math.round(((clientX-imageLeft)/drawnWidth)*(sampleImage.width-1)),0,sampleImage.width-1);
+          const py=clamp(Math.round(((clientY-imageTop)/drawnHeight)*(sampleImage.height-1)),0,sampleImage.height-1);
           const offset=((py*sampleImage.width)+px)*4;
           artwork=[sampleImage.data[offset],sampleImage.data[offset+1],sampleImage.data[offset+2]];
         }
@@ -696,8 +712,10 @@ document.addEventListener('DOMContentLoaded', () => {
             textBackgroundLayers(glyph),
           );
           const adjusted=adjustedColor(intended,background,maximum);
+          recordContrast(adjusted,background,intended[3]);
           glyph.style.color=`rgba(${adjusted[0]},${adjusted[1]},${adjusted[2]},${intended[3]})`;
         }
+        reportContrast();
         return;
       }
       for(const node of textNodes){
@@ -714,6 +732,7 @@ document.addEventListener('DOMContentLoaded', () => {
           if (!rect.width || !rect.height || rect.bottom<wallRect.top || rect.top>wallRect.bottom) continue;
           const background=compositeLayers(localBackground(rect),formatBackgrounds);
           const adjusted=adjustedColor(intended,background,maximum);
+          recordContrast(adjusted,background,intended[3]);
           if (adjusted[0]===intended[0] && adjusted[1]===intended[1] && adjusted[2]===intended[2]) continue;
           const color=`rgba(${adjusted[0]},${adjusted[1]},${adjusted[2]},${intended[3]})`;
           if (!groups.has(color)) groups.set(color,[]);
@@ -730,12 +749,14 @@ document.addEventListener('DOMContentLoaded', () => {
         rules.push(`#${content.id}::highlight(${name}){color:${color}}`);
       }
       style.textContent=rules.join('\n');
+      reportContrast();
     }
     function schedule(){
       if (frame) cancelAnimationFrame(frame);
       frame=requestAnimationFrame(run);
     }
     wall.addEventListener('scroll',schedule,{passive:true});
+    wall.querySelector('.text-wall-viewport')?.addEventListener('scroll',schedule,{passive:true});
     window.addEventListener('resize',schedule,{passive:true});
     slides.forEach((slide) => slide.querySelector('img').addEventListener('load',()=>{ imageSample=null; schedule(); }));
     return {schedule};

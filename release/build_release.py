@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 from pathlib import Path
@@ -787,6 +788,44 @@ def _files_equal(first: Path, second: Path) -> bool:
                 return True
 
 
+def _validate_certificate_bundle(
+    resource_root: Path,
+    *,
+    runtime_root: Path | None = None,
+    bundle_root: Path | None = None,
+) -> None:
+    """Check the shipped CA file and the path used by frozen certifi.where()."""
+    try:
+        import certifi
+
+        source = Path(certifi.where())
+        packaged = resource_root / "certifi" / "cacert.pem"
+        runtime = (runtime_root or resource_root) / "certifi" / "cacert.pem"
+        boundary = (bundle_root or resource_root).resolve(strict=True)
+        for path in (packaged, runtime):
+            try:
+                path.resolve(strict=True).relative_to(boundary)
+            except ValueError as error:
+                raise ReleaseValidationError(
+                    "The packaged certifi CA bundle resolves outside the application."
+                ) from error
+            if not _files_equal(source, path):
+                raise ReleaseValidationError(
+                    "The packaged certifi CA bundle differs from the installed dependency; "
+                    "rebuild with the current requirements."
+                )
+        # Load only the packaged roots so system trust cannot hide a broken file.
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations(cafile=str(packaged))
+        if not context.cert_store_stats()["x509_ca"]:
+            raise ReleaseValidationError("The packaged certifi CA bundle contains no trusted roots.")
+    except (ImportError, OSError) as error:
+        raise ReleaseValidationError(
+            "The packaged certifi/cacert.pem CA bundle is missing, unreadable, or invalid; "
+            "install the current requirements and rebuild the application."
+        ) from error
+
+
 def _validate_frozen_payload(
     internal: Path,
     manifest: dict[str, Any],
@@ -934,6 +973,7 @@ def _validate_distribution(manifest: dict[str, Any]) -> Path:
     if not any(internal.rglob("qwindows.dll")):
         raise ReleaseValidationError("Qt Windows platform plugin is missing from the build.")
     _validate_frozen_payload(internal, manifest)
+    _validate_certificate_bundle(internal)
     return executable
 
 

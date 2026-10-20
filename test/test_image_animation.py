@@ -18,7 +18,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
 from config import CONTROL_FILES
 from curtain_color import recolor_banner_to_curtain_color
@@ -809,7 +809,8 @@ class ImageAnimationTests(unittest.TestCase):
         try:
             self.assertTrue(dialog.windowFlags() & QtCore.Qt.Popup)
             self.assertTrue(dialog.windowFlags() & QtCore.Qt.FramelessWindowHint)
-            self.assertEqual(dialog.size(), QtCore.QSize(420, 146))
+            self.assertLessEqual(dialog.width(), dialog.screen().availableGeometry().width())
+            self.assertGreater(dialog.height(), dialog._images.iconSize().height())
             self.assertIsNone(dialog.findChild(QtWidgets.QDialogButtonBox))
             self.assertIsNone(dialog._recent_images)
             self.assertEqual(dialog._images.count(), 3)
@@ -826,10 +827,7 @@ class ImageAnimationTests(unittest.TestCase):
         try:
             self.assertEqual(browse_dialog._images.count(), 3)
             self.assertIsNone(browse_dialog._recent_images)
-            self.assertEqual(
-                browse_dialog.findChildren(QtWidgets.QLabel)[0].text(),
-                "Stock Images",
-            )
+            self.assertIn("Stock images", [label.text() for label in browse_dialog.findChildren(QtWidgets.QLabel)])
         finally:
             browse_dialog.close()
 
@@ -869,13 +867,11 @@ class ImageAnimationTests(unittest.TestCase):
                 "Cover Page", paths[:3], recent_paths=paths[1:], allow_browse=True
             )
             try:
-                self.assertEqual(dialog.size(), QtCore.QSize(420, 351))
+                self.assertLessEqual(dialog.height(), dialog.screen().availableGeometry().height())
                 self.assertEqual(dialog._images.count(), 3)
                 self.assertEqual(dialog._recent_images.count(), 3)
-                self.assertEqual(
-                    dialog.findChildren(QtWidgets.QLabel)[0].text(),
-                    "Recently Used",
-                )
+                self.assertIn("Recently used · 3 images",
+                              [label.text() for label in dialog.findChildren(QtWidgets.QLabel)])
                 dialog._recent_images.itemClicked.emit(dialog._recent_images.item(0))
                 self.assertEqual(dialog.selected_path(), paths[1])
             finally:
@@ -917,13 +913,15 @@ class ImageAnimationTests(unittest.TestCase):
             recent_path = Path(directory) / "recent.png"
             Image.new("RGB", (8, 8), "red").save(recent_path)
             page_id = tab.session.selected_page_id
-            remember_media(directory, tab.session.project.project_id, f"image:{page_id}",
-                           str(recent_path), recent_path.name)
+            from recent_media import remember_type_image, recent_type_images
+            kind = tab.session.project.get_page(page_id)["type"]
+            remember_type_image(directory, kind, recent_path, recent_path.name)
             with mock.patch("Image_tab.StockImageDialog") as dialog_type:
                 dialog_type.return_value.exec.return_value = QtWidgets.QDialog.Rejected
                 tab._stock_selected()
             self.assertEqual(dialog_type.call_args.args[1], ())
-            self.assertEqual(dialog_type.call_args.kwargs["recent_paths"], (recent_path,))
+            self.assertEqual(dialog_type.call_args.kwargs["recent_paths"],
+                             tuple(Path(value) for value, _ in recent_type_images(directory, kind)))
 
     def test_recent_image_uses_owned_copy_after_source_is_removed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1096,9 +1094,10 @@ class ImageAnimationTests(unittest.TestCase):
             tab.resize(1100, 720)
             tab.show()
             self.app.processEvents()
-            artwork = QtCore.QRect(tab.card.mapTo(tab, QtCore.QPoint()), tab.card.size())
-            for button in (tab.import_button, tab.stock_button, tab.crop_button, tab.more_button):
+            artwork = QtCore.QRect(tab.page_list.mapTo(tab, QtCore.QPoint()), tab.page_list.size())
+            for button in (tab.add_button, tab.page_actions_button):
                 bounds = QtCore.QRect(button.mapTo(tab, QtCore.QPoint()), button.size())
+                self.assertTrue(button.isVisibleTo(tab))
                 self.assertFalse(bounds.intersects(artwork))
                 self.assertTrue(button.text())
 
@@ -1111,11 +1110,12 @@ class ImageAnimationTests(unittest.TestCase):
             tab.show()
             self.app.processEvents()
             self.assertEqual(tab.page_list.count(), MAX_PAGES)
-            self.assertGreater(tab.page_list.verticalScrollBar().maximum(), 0)
-            tab.page_list.setCurrentRow(MAX_PAGES - 1)
-            tab.page_list.scrollToItem(tab.page_list.currentItem())
+            self.assertGreater(tab.page_list.horizontalScrollBar().maximum(), 0)
+            self.assertEqual(tab.page_list.verticalScrollBar().maximum(), 0)
+            tab.page_list.setCurrentRow(0)
+            QtTest.QTest.keyClick(tab.page_list, QtCore.Qt.Key_End)
             self.app.processEvents()
-            self.assertGreater(tab.page_list.verticalScrollBar().value(), 0)
+            self.assertGreater(tab.page_list.horizontalScrollBar().value(), 0)
             self.assertEqual(tab.session.selected_page_id, tab.session.project.pages[-1]["id"])
 
 class ImageTabPerformanceTests(unittest.TestCase):
