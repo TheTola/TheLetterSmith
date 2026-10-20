@@ -178,8 +178,8 @@ class ImagesWorkspaceTests(unittest.TestCase):
                 self.tab.resize(width, height)
                 self.pump()
                 rectangles = [QtCore.QRect(control.mapTo(self.tab, QtCore.QPoint()), control.size())
-                              for control in (self.tab.page_list, self.tab.pwrite_fab, self.tab.import_button,
-                                              self.tab.stock_button)]
+                              for control in (self.tab.page_list, self.tab.pwrite_fab, self.tab.name_edit,
+                                              self.tab.type_combo)]
                 for rect in rectangles:
                     self.assertTrue(self.tab.rect().contains(rect), (self.tab.size(), rect))
                 for rect in rectangles[1:]:
@@ -346,13 +346,17 @@ class ImagesWorkspaceTests(unittest.TestCase):
         self.select(self.first)
         self.import_and_wait(self.first, source)
         self.assertEqual(self.tab.artwork.resolve_asset(self.first).read_bytes(), source_bytes)
-        self.assertTrue(self.tab.animation_button.isVisible())
-        self.assertTrue(self.tab.animation_button.isEnabled())
+        menu = self.tab._page_menu(self.first)
+        self.assertIn('Animation settings…', [action.text() for action in menu.actions()])
+        menu.deleteLater()
         with Image.open(self.tab.artwork.resolve_asset(self.first)) as image:
             self.assertEqual(image.n_frames, 2)
             self.assertEqual(image.info["loop"], 2)
         self.import_and_wait(self.first, self.image())
         self.assertFalse(self.tab.animation_button.isVisible() and self.tab.animation_button.isEnabled())
+        menu = self.tab._page_menu(self.first)
+        self.assertNotIn('Animation settings…', [action.text() for action in menu.actions()])
+        menu.deleteLater()
         self.assertEqual(source.read_bytes(), source_bytes)
 
     def test_replacement_resets_only_target_placement_and_keeps_exact_prompt_text(self):

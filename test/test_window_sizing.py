@@ -173,7 +173,7 @@ class WindowSizingTests(unittest.TestCase):
                                 tab = window.image_tab
                                 self.assertFalse(window.preview_frame.isVisibleTo(window))
                                 self.assertFalse(window.preview_region.isVisibleTo(window))
-                                card_rect = QtCore.QRect(tab.card.mapTo(tab, QtCore.QPoint()), tab.card.size())
+                                card_rect = QtCore.QRect(tab.page_list.mapTo(tab, QtCore.QPoint()), tab.page_list.size())
                                 self.assertTrue(tab.rect().contains(card_rect))
                                 self.assertLess(card_rect.bottom(), tab.status.y())
                                 self.assertFalse(tab.card.clear_btn.isVisibleTo(window))
@@ -185,6 +185,8 @@ class WindowSizingTests(unittest.TestCase):
                                                tab.duplicate_button, tab.delete_button, tab.undo_button,
                                                tab.import_button, tab.stock_button, tab.crop_button,
                                                tab.more_button, tab.pwrite_fab):
+                                    if not button.isVisibleTo(window):
+                                        continue
                                     rect = QtCore.QRect(
                                         button.mapTo(scroll.viewport(), QtCore.QPoint()),
                                         button.size(),

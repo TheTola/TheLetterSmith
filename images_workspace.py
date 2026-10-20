@@ -163,6 +163,7 @@ class _CropDialog(QtWidgets.QDialog):
 
 
 class ImageTab(QtWidgets.QWidget):
+    navigator_class = PageNavigator
     image_selected = QtCore.Signal(QtGui.QPixmap)
     hover_preview_image = QtCore.Signal(QtGui.QPixmap)
     clear_preview = QtCore.Signal()
@@ -237,7 +238,7 @@ class ImageTab(QtWidgets.QWidget):
         self.limit_label = QtWidgets.QLabel()
         self.limit_label.setWordWrap(True)
         nav.addWidget(self.limit_label)
-        self.page_list = PageNavigator()
+        self.page_list = self.navigator_class()
         nav.addWidget(self.page_list, 1)
         moves = QtWidgets.QHBoxLayout()
         self.up_button = self._button("Move Up", lambda: self._run(lambda: self.move_page(self.session.selected_page_id, -1)))
