@@ -450,6 +450,8 @@ class GitHubPagesPublisher(Publisher):
                     "provider": GITHUB_PAGES_PROVIDER_ID,
                     "project_id": project_id,
                     "public_path": public_path,
+                    "title": str(metadata.get("recipient_title") or ""),
+                    "recipient": str(metadata.get("recipient_name") or ""),
                     "published_at": published_at,
                     "source_fingerprint": source_fingerprint,
                     "bundle_sha256": bundle_sha256,

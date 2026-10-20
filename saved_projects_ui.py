@@ -20,6 +20,7 @@ class SavedProjectsController(QtCore.QObject):
         self.forge = forge
         self.service = getattr(forge, "project_save_service", None) or getattr(forge.window(), "project_save_service", None) or ProjectSaveService(forge.project_root, forge.project_state)
         self.previews = []
+        self.github_library = None
         layout = forge.saved_panel.layout()
         self.details = QtWidgets.QLabel("Select a project to see its saved version.")
         self.details.setTextFormat(QtCore.Qt.PlainText)
@@ -28,6 +29,7 @@ class SavedProjectsController(QtCore.QObject):
         self.details.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         layout.addWidget(self.details)
         row = QtWidgets.QHBoxLayout()
+        self.row = row
         self.open_button = QtWidgets.QPushButton("Open Project")
         self.open_button.setDefault(True)
         self.open_button.clicked.connect(self.open_selected)
@@ -50,6 +52,8 @@ class SavedProjectsController(QtCore.QObject):
         close.clicked.connect(forge.saved_panel.hide)
         row.addWidget(close)
         layout.addLayout(row)
+        from github_library_ui import GitHubLibraryController
+        self.github_library = GitHubLibraryController(self)
         self.shortcut = QtGui.QShortcut(QtGui.QKeySequence.Save, forge.window())
         self.shortcut.activated.connect(self.save)
         # A hidden Forge widget cannot own the application's global shortcut.
@@ -162,7 +166,8 @@ class SavedProjectsController(QtCore.QObject):
             if hasattr(card, "state_label"):
                 card.state_label.setText("Currently open" if current else "Selected" if card.entry == entry else "")
         if not isinstance(entry, SavedLetter):
-            self.details.setText("Select a project. Save Project also keeps unfinished drafts.")
+            self.details.setText("Select a local project to open it, or a GitHub letter to download it.")
+            self.github_library.update_selection()
             return
         state = "Example / template" if entry.example else "Recovery copy" if entry.recovery else "Saved draft"
         if entry.project_id == self.session.project.project_id and entry.path.resolve() == active_path:
@@ -175,9 +180,13 @@ class SavedProjectsController(QtCore.QObject):
             text += "\n" + entry.warning
         self.details.setText(text)
         self.details.setToolTip(text + "\n" + str(entry.path))
+        self.github_library.update_selection()
 
     def open_selected(self):
         entry = self.forge._selected_saved_letter
+        if entry is None and (self.github_library.selected() is not None
+                              or self.github_library.selected_id in self.github_library.downloads):
+            return self.github_library.download_selected()
         if not isinstance(entry, SavedLetter) or not entry.valid or self.forge._busy:
             return False
         lifecycle = getattr(self.forge.window(), "project_lifecycle", None)

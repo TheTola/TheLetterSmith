@@ -16,6 +16,7 @@ from PySide6.QtCore import Qt, QUrl
 import generate
 from curtain_controls import CurtainStyleComboBox, CurtainStyleController
 from image_button import ArtworkButton
+from library_status import badge_style, local_badges
 from config import MESSAGE_HTML_FILE, ensure_output_dirs
 from message_html import read_text_normalized
 from publishing import GitHubPagesPublisher, PublishResult
@@ -696,7 +697,7 @@ class SavedLetterCard(QtWidgets.QFrame):
         self.setProperty("selected", False)
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.setFixedSize(184, 238)
+        self.setFixedSize(184, 260)
         self.setToolTip(
             f"{entry.title} — {entry.recipient}\n"
             f"{entry.path}\n"
@@ -766,8 +767,17 @@ class SavedLetterCard(QtWidgets.QFrame):
         self.status_label.setFixedHeight(20)
         self.status_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         layout.addWidget(self.status_label)
+        self.publication_label = QtWidgets.QLabel()
+        self.publication_label.setAlignment(Qt.AlignCenter)
+        self.publication_label.setFixedHeight(20)
+        self.publication_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        for badge in (self.status_label, self.publication_label):
+            badge.setProperty("themeIndependent", True)
+            badge.setTextFormat(Qt.PlainText)
+        layout.addWidget(self.publication_label)
         self.state_label = QtWidgets.QLabel()
         self.state_label.setTextFormat(Qt.PlainText)
+        self.state_label.setProperty("themeIndependent", True)
         self.state_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         layout.addWidget(self.state_label)
 
@@ -813,19 +823,8 @@ class SavedLetterCard(QtWidgets.QFrame):
 
     @staticmethod
     def _publication_presentation(entry: SavedLetter) -> tuple[str, str]:
-        if entry.example:
-            return "Example", "ExampleStatus"
-        if entry.stock:
-            return "published", "StockStatus"
-        if not entry.valid:
-            return "Cannot open — see details", "ExpiredStatus"
-        if entry.canonical:
-            return ("Draft · See warnings" if entry.warning else "Saved draft"), "LocalStatus"
-        if entry.published:
-            return "Published", "PublishedStatus"
-        if entry.expired:
-            return "Expired", "ExpiredStatus"
-        return "Local", "LocalStatus"
+        label, kind = local_badges(entry)[0]
+        return label, kind.title() + "Status"
 
     @staticmethod
     def _shorten(text: str, limit: int) -> str:
@@ -945,6 +944,13 @@ class SavedLetterCard(QtWidgets.QFrame):
             self.status_label.setObjectName(status_name)
             self.status_label.style().unpolish(self.status_label)
             self.status_label.style().polish(self.status_label)
+        location, publication = local_badges(entry)
+        self.status_label.setStyleSheet(badge_style(location[1]))
+        self.status_label.setAccessibleName("Location and type: " + location[0])
+        self.publication_label.setText(publication[0])
+        self.publication_label.setToolTip(entry.saved_publication_state or publication[0])
+        self.publication_label.setAccessibleName("Publication: " + publication[0])
+        self.publication_label.setStyleSheet(badge_style(publication[1]))
         self.set_delete_mode(self._delete_mode)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
@@ -3376,6 +3382,8 @@ class ForgeTab(QtWidgets.QWidget):
         self.saved_panel.activateWindow()
         self.saved_scroll.setFocus(Qt.PopupFocusReason)
         QtCore.QTimer.singleShot(0, self._layout_saved_cards)
+        if not stock_mode:
+            QtCore.QTimer.singleShot(0, self.saved_projects.github_library.refresh)
 
     def repair_duplicate_autosave_ids(self) -> tuple[tuple[Path, str], ...]:
         """Repair independent autosave copies while preserving the active path."""
@@ -3451,6 +3459,8 @@ class ForgeTab(QtWidgets.QWidget):
             and entries == self._rendered_catalog_entries
         ):
             self._watch_saved_letter_paths(entries)
+            if hasattr(self, "saved_projects"):
+                self.saved_projects.github_library.sync_cards()
             return
         recent_entries = entries[:RECENT_SAVED_LETTER_LIMIT]
         archived_entries = entries[RECENT_SAVED_LETTER_LIMIT:]
@@ -3503,6 +3513,7 @@ class ForgeTab(QtWidgets.QWidget):
         self._pending_scroll_position = (horizontal, vertical)
         self._scroll_restore_timer.start(0)
         if hasattr(self, "saved_projects"):
+            self.saved_projects.github_library.sync_cards()
             self.saved_projects.selected_changed()
 
     def _start_catalog_reconciliation(
@@ -4043,15 +4054,21 @@ class ForgeTab(QtWidgets.QWidget):
     def _layout_saved_cards(self) -> None:
         if not hasattr(self, "saved_cards_layout"):
             return
+        github = getattr(getattr(self, "saved_projects", None), "github_library", None)
+        remote_cards = github.cards if github is not None and self._saved_panel_mode != "stock" else []
+        for card in github.cards if github is not None else []:
+            card.setVisible(self._saved_panel_mode != "stock")
+        cards = [*self._saved_cards, *remote_cards]
         while self.saved_cards_layout.count():
             item = self.saved_cards_layout.takeAt(0)
             widget = item.widget()
             if (
                 widget is not None
                 and not isinstance(widget, SavedLetterCard)
+                and (github is None or widget not in github.cards)
             ):
                 widget.deleteLater()
-        if not self._saved_cards:
+        if not cards:
             self.saved_cards_widget.setMinimumHeight(180)
             empty = QtWidgets.QLabel(
                 "No stock letters available."
@@ -4068,9 +4085,9 @@ class ForgeTab(QtWidgets.QWidget):
 
         available = max(184, self.saved_scroll.viewport().width() - 8)
         columns = max(1, available // 192)
-        rows = (len(self._saved_cards) + columns - 1) // columns
-        self.saved_cards_widget.setMinimumHeight((rows * 246) + 4)
-        for index, card in enumerate(self._saved_cards):
+        rows = (len(cards) + columns - 1) // columns
+        self.saved_cards_widget.setMinimumHeight((rows * 268) + 4)
+        for index, card in enumerate(cards):
             self.saved_cards_layout.addWidget(
                 card,
                 index // columns,
@@ -5670,6 +5687,8 @@ class ForgeTab(QtWidgets.QWidget):
         self.refresh_readiness()
         self._sync_published_url()
         self._sync_publishing_controls()
+        if controller is not None:
+            controller.github_library.update_selection()
 
     def _set_status(
         self,

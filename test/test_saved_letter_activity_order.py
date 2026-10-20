@@ -169,7 +169,7 @@ class SavedLetterActivityOrderTests(unittest.TestCase):
             QtCore.QThread.msleep(5)
         self.fail("saved-letter catalog reconciliation did not finish")
 
-    def test_stock_letter_card_uses_lowercase_purple_published_badge(self) -> None:
+    def test_stock_letter_card_separates_purple_stock_from_publication(self) -> None:
         entry = SavedLetter(
             path=Path("Stock Letter 1"),
             recipient="Example Recipient",
@@ -182,7 +182,8 @@ class SavedLetterActivityOrderTests(unittest.TestCase):
         card = SavedLetterCard(entry)
         self.addCleanup(card.deleteLater)
 
-        self.assertEqual(card.status_label.text(), "published")
+        self.assertEqual(card.status_label.text(), "Stock letter")
+        self.assertEqual(card.publication_label.text(), "Unpublished")
         self.assertEqual(card.status_label.objectName(), "StockStatus")
         self.assertIn(
             "QLabel#StockStatus{color:#e6d4ff;background:#271b38;",
