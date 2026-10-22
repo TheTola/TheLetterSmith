@@ -1263,15 +1263,6 @@ class TitleBar(QtWidgets.QWidget):
         self._sync_theme_menu()
         self._apply_command_presentation()
 
-    def _resolve_theme_asset(
-        self,
-        logical_name: str,
-    ) -> Path:
-        resolver = getattr(self._nexus, "resolve_theme_asset", None)
-        if callable(resolver):
-            return resolver(logical_name)
-        return self.theme_service.resolve_asset(logical_name)
-
     def _reload_settings_assets(self) -> None:
         animated = self._settings_icon_animated or self._settings_menu_open
         previous_movie = self._settings_movie
@@ -1401,9 +1392,6 @@ class TitleBar(QtWidgets.QWidget):
         colors: dict[str, tuple[int, int, int]],
     ) -> None:
         self.curtain_styles.set_preview_colors(colors)
-
-    def _set_curtain_style(self, style: str) -> None:
-        self.curtain_styles.set_style(style)
 
     def _edit_visionary_location(self) -> None:
         settings = SettingsStore(self._nexus.project_root)
@@ -4142,13 +4130,6 @@ class Nexus(QtWidgets.QMainWindow):
             self._preview_display_key = cache_key
         self.image_preview.setPixmap(self._preview_display_pixmap)
 
-    def _show_html(self, html: str):
-        view = self._ensure_forge_preview()
-        self._clear_preview()
-        view.setHtml(html or "<p></p>")
-        self.preview_stack.setCurrentWidget(view)
-        self.status("HTML preview updated.")
-
     def _fade_preview(self):
         effect = QGraphicsOpacityEffect(self.image_preview)
         self.image_preview.setGraphicsEffect(effect)
@@ -4648,19 +4629,6 @@ class Nexus(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self._update_forge_preview_zoom)
         QtCore.QTimer.singleShot(0, self._position_help_icon)
         view.setFocus()
-
-    def _read_project_title(self) -> str:
-        """Read recipient_title from settings.json (best available 'project title' signal)."""
-        try:
-            settings_path = os.path.join(self.project_root, "settings.json")
-            if os.path.exists(settings_path):
-                data = json.loads(Path(settings_path).read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    t = str(data.get("recipient_title", "")).strip()
-                    return t
-        except Exception:
-            pass
-        return ""
 
     def _usable_normal_geometry(self, geometry: QtCore.QRect | None) -> QtCore.QRect:
         target = QtCore.QRect(geometry) if geometry is not None else QtCore.QRect()
@@ -5264,7 +5232,7 @@ class Nexus(QtWidgets.QMainWindow):
     def delete_project(self) -> None:
         """Library deletion belongs to Saved Letters and retains a recovery copy."""
         self._show_saved_letters_from_recipient_page()
-        self.status("Select the saved project, then Project Actions → Delete Saved Project. A recovery copy is kept.")
+        self.status("Right-click the saved project and choose Delete Saved Project. A recovery copy is kept.")
 
     def open_command_bar_and_close_editor(self, data: object) -> bool:
         """Transfer the completed-letter snapshot to the post-reset controller."""
@@ -5298,17 +5266,10 @@ class Nexus(QtWidgets.QMainWindow):
             self._release_forge_preview_files()
             previous_quit_policy = application.quitOnLastWindowClosed()
             application.setQuitOnLastWindowClosed(False)
+            bar.present()
             if not self.close():
                 raise RuntimeError("Letter Smith could not close for the handoff")
-
-            QtCore.QTimer.singleShot(
-                0,
-                lambda: self._show_command_bar_after_close(
-                    bar,
-                    application,
-                    previous_quit_policy,
-                ),
-            )
+            application.setQuitOnLastWindowClosed(previous_quit_policy)
             return True
         except Exception:
             _LOGGER.exception("Could not transition to the Command Bar")
