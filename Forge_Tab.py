@@ -16,7 +16,7 @@ from PySide6.QtCore import Qt, QUrl
 import generate
 from curtain_controls import CurtainStyleComboBox, CurtainStyleController
 from image_button import ArtworkButton
-from library_status import badge_style, local_badges
+from library_status import local_badges, set_card_status, paint_card_status
 from config import MESSAGE_HTML_FILE, ensure_output_dirs
 from message_html import read_text_normalized
 from publishing import GitHubPagesPublisher, PublishResult
@@ -459,6 +459,7 @@ def _stage_publish_display(project_root: Path, play_dir: Path, render_input):
 
 def _publication_fields_from_result(publish_result: PublishResult) -> dict:
     publication = {
+        "published_destination": dict(getattr(publish_result, "destination", {}) or {}),
         PUBLISHED_PAGE_URL_KEY: normalize_published_page_url(
             getattr(publish_result, "url", "")
         ),
@@ -697,7 +698,7 @@ class SavedLetterCard(QtWidgets.QFrame):
         self.setProperty("selected", False)
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.setFixedSize(184, 260)
+        self.setFixedSize(208, 276)
         self.setToolTip(
             f"{entry.title} — {entry.recipient}\n"
             f"{entry.path}\n"
@@ -729,7 +730,7 @@ class SavedLetterCard(QtWidgets.QFrame):
 
         self.cover = QtWidgets.QLabel()
         self.cover.setObjectName("SavedLetterCover")
-        self.cover.setFixedHeight(96)
+        self.cover.setFixedHeight(196)
         self.cover.setAlignment(Qt.AlignCenter)
         self.cover.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.cover.setText("No cover")
@@ -744,42 +745,18 @@ class SavedLetterCard(QtWidgets.QFrame):
         self.name_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         layout.addWidget(self.name_label)
 
-        self.title_label = QtWidgets.QLabel(
-            f"Title: {self._shorten(entry.title, 25)}"
-        )
-        self.title_label.setToolTip(entry.title)
-        self.title_label.setAttribute(Qt.WA_TransparentForMouseEvents)
-        layout.addWidget(self.title_label)
-
-        self.recipient_label = QtWidgets.QLabel(
-            f"Recipient: {self._shorten(entry.recipient, 21)}"
-        )
-        self.recipient_label.setToolTip(entry.recipient)
-        self.recipient_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.recipient_label = QtWidgets.QLabel()
+        self.date_label = QtWidgets.QLabel()
+        for label in (self.name_label, self.recipient_label, self.date_label):
+            label.setTextFormat(Qt.PlainText)
+            label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.name_label.setFixedHeight(20)
+        self.name_label.setWordWrap(False)
+        self.recipient_label.setFixedHeight(18)
+        self.date_label.setFixedHeight(14)
         layout.addWidget(self.recipient_label)
-
-        publication_label, publication_status_name = (
-            self._publication_presentation(entry)
-        )
-        self.status_label = QtWidgets.QLabel(publication_label)
-        self.status_label.setObjectName(publication_status_name)
-        self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setFixedHeight(20)
-        self.status_label.setAttribute(Qt.WA_TransparentForMouseEvents)
-        layout.addWidget(self.status_label)
-        self.publication_label = QtWidgets.QLabel()
-        self.publication_label.setAlignment(Qt.AlignCenter)
-        self.publication_label.setFixedHeight(20)
-        self.publication_label.setAttribute(Qt.WA_TransparentForMouseEvents)
-        for badge in (self.status_label, self.publication_label):
-            badge.setProperty("themeIndependent", True)
-            badge.setTextFormat(Qt.PlainText)
-        layout.addWidget(self.publication_label)
-        self.state_label = QtWidgets.QLabel()
-        self.state_label.setTextFormat(Qt.PlainText)
-        self.state_label.setProperty("themeIndependent", True)
-        self.state_label.setAttribute(Qt.WA_TransparentForMouseEvents)
-        layout.addWidget(self.state_label)
+        layout.addWidget(self.date_label)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
 
         self.setStyleSheet(
             "QFrame#SavedLetterCard{background:#111b23;"
@@ -802,29 +779,13 @@ class SavedLetterCard(QtWidgets.QFrame):
             "font:600 9pt 'Segoe UI';border:none;background:transparent;}"
             "QLabel{color:#aac0ca;font:8pt 'Segoe UI';"
             "border:none;background:transparent;}"
-            "QLabel#LocalStatus{color:#b8c9d0;background:#1b2932;"
-            "border:1px solid #3b515d;border-radius:8px;"
-            "font:600 8pt 'Segoe UI';}"
-            "QLabel#PublishedStatus{color:#8bf0aa;background:#122a21;"
-            "border:1px solid #35734d;border-radius:8px;"
-            "font:600 8pt 'Segoe UI';}"
-            "QLabel#ExpiredStatus{color:#ffc4a8;background:#302018;"
-            "border:1px solid #8d5940;border-radius:8px;"
-            "font:600 8pt 'Segoe UI';}"
-            "QLabel#ExampleStatus{color:#ffe6a0;background:#2d2512;"
-            "border:1px solid #8d7330;border-radius:8px;"
-            "font:600 8pt 'Segoe UI';}"
-            "QLabel#StockStatus{color:#e6d4ff;background:#271b38;"
-            "border:1px solid #7b52a8;border-radius:8px;"
-            "font:600 8pt 'Segoe UI';}"
         )
         self._request_cover(entry.cover_path)
         self.update_entry(entry)
 
-    @staticmethod
-    def _publication_presentation(entry: SavedLetter) -> tuple[str, str]:
-        label, kind = local_badges(entry)[0]
-        return label, kind.title() + "Status"
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        paint_card_status(self)
 
     @staticmethod
     def _shorten(text: str, limit: int) -> str:
@@ -871,7 +832,7 @@ class SavedLetterCard(QtWidgets.QFrame):
                 expected_path,
             )
             return
-        pixmap = _scaled_cover_pixmap(path, 168, 92)
+        pixmap = _scaled_cover_pixmap(path, 192, 192)
         self.apply_cover_result(
             request_generation,
             expected_path,
@@ -930,27 +891,11 @@ class SavedLetterCard(QtWidgets.QFrame):
         self._request_cover(entry.cover_path)
         display_name = entry.title
         self.name_label.setTextFormat(Qt.PlainText)
-        self.name_label.setText(display_name)
+        self.name_label.setText(self.name_label.fontMetrics().elidedText(display_name, Qt.ElideRight, 192))
         self.name_label.setToolTip(display_name)
-        self.title_label.setText(entry.summary)
-        self.title_label.setToolTip(entry.title)
-        self.recipient_label.setText(
-            entry.modified_at.astimezone().strftime("Saved %Y-%m-%d %H:%M")
-        )
-        self.recipient_label.setToolTip(entry.recipient)
-        publication_label, status_name = self._publication_presentation(entry)
-        self.status_label.setText(publication_label)
-        if self.status_label.objectName() != status_name:
-            self.status_label.setObjectName(status_name)
-            self.status_label.style().unpolish(self.status_label)
-            self.status_label.style().polish(self.status_label)
-        location, publication = local_badges(entry)
-        self.status_label.setStyleSheet(badge_style(location[1]))
-        self.status_label.setAccessibleName("Location and type: " + location[0])
-        self.publication_label.setText(publication[0])
-        self.publication_label.setToolTip(entry.saved_publication_state or publication[0])
-        self.publication_label.setAccessibleName("Publication: " + publication[0])
-        self.publication_label.setStyleSheet(badge_style(publication[1]))
+        self.recipient_label.setText(self._shorten(entry.recipient, 28))
+        self.date_label.setText(entry.modified_at.astimezone().strftime("%b %d, %Y"))
+        set_card_status(self, *local_badges(entry))
         self.set_delete_mode(self._delete_mode)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
@@ -1327,6 +1272,7 @@ class ForgeTab(QtWidgets.QWidget):
     publication_activity_changed = QtCore.Signal(bool, str, str)
     preview_visibility_changed = QtCore.Signal(bool)
     published_url_changed = QtCore.Signal(str)
+    repository_changed = QtCore.Signal(str)
     _settings_refresh_requested = QtCore.Signal()
     _curtain_style_refresh_requested = QtCore.Signal()
     _cover_decode_completed = QtCore.Signal(int, object, object)
@@ -1401,6 +1347,8 @@ class ForgeTab(QtWidgets.QWidget):
         self._github_account_worker: Optional[_TaskWorker] = None
         self._github_account_thread: Optional[QtCore.QThread] = None
         self._github_sign_in_cancelled = False
+        self._repository_setup_attempted: set[int] = set()
+        self._repository_onboarding_enabled = False
         self._pending_publish_context: tuple | None = None
         self._pending_unpublish_context: tuple[dict, Path | None] | None = None
         self._pending_publish_retry_attempt = 0
@@ -1695,12 +1643,20 @@ class ForgeTab(QtWidgets.QWidget):
         saved_layout.setSpacing(8)
         saved_header = QtWidgets.QHBoxLayout()
         saved_header.setContentsMargins(0, 0, 0, 0)
-        self.saved_heading = QtWidgets.QLabel("Saved Letters")
+        self.saved_heading = QtWidgets.QLabel("Load letter")
         self.saved_heading.setStyleSheet(
             "color:#dff9ff;font:600 11pt 'Segoe UI';"
         )
         saved_header.addWidget(self.saved_heading)
         saved_header.addStretch(1)
+        self.last_project_button = self._tier_button(
+            "Last project", ButtonTier.SMALL, "AButton.png"
+        )
+        self.last_project_button.setObjectName("SavedLetterLastProject")
+        self.last_project_button.clicked.connect(
+            lambda: self.window().open_last_project()
+        )
+        saved_header.addWidget(self.last_project_button)
         self.saved_delete_toggle = QtWidgets.QToolButton()
         self.saved_delete_toggle.setObjectName("SavedLetterDeleteToggle")
         self.saved_delete_toggle.setText("−")
@@ -1983,6 +1939,11 @@ class ForgeTab(QtWidgets.QWidget):
         )
         self.github_account_btn.clicked.connect(self.show_github_account)
         publishing_row.addWidget(self.github_account_btn)
+        self.repository_summary = QtWidgets.QLabel()
+        self.repository_summary.setObjectName("ForgeRepositorySummary")
+        self.repository_summary.setTextFormat(Qt.PlainText)
+        self.repository_summary.setWordWrap(True)
+        publishing_row.addWidget(self.repository_summary)
         self.export_btn = self._tier_button("Export", ButtonTier.SMALL, "BButton.png")
         set_control_help(self.export_btn, "Save a portable ZIP or Single HTML presentation.")
         self.export_btn.clicked.connect(self.show_export_menu)
@@ -2494,6 +2455,7 @@ class ForgeTab(QtWidgets.QWidget):
             else "GitHub Account — not connected"
         )
         self.github_account_dialog.set_connection(snapshot)
+        self._sync_repository_summary()
         if hasattr(self, "readiness_summary"):
             self._update_readiness_summary(
                 self._readiness_result,
@@ -2624,6 +2586,8 @@ class ForgeTab(QtWidgets.QWidget):
         ):
             play_ui_sound(UiSound.GITHUB_DISCONNECTED)
         self._sync_publishing_controls()
+        if result.state == GitHubConnectionState.CONNECTED and self._repository_onboarding_enabled:
+            QtCore.QTimer.singleShot(0, lambda: self._defer_until_idle(self._ensure_publishing_repository))
 
     def _schedule_github_reconnect(
         self,
@@ -2685,6 +2649,79 @@ class ForgeTab(QtWidgets.QWidget):
         self.github_account_dialog.activateWindow()
         if not self._github_account_checking:
             self._validate_github_account_async()
+
+    def _sync_repository_summary(self) -> None:
+        from publishing.destinations import DestinationStore, destination_for, repository_display_name
+        session = self._github_session
+        name = ""
+        try:
+            store = DestinationStore(self.project_root)
+            metadata = SettingsStore(self.project_root).snapshot()
+            if session and (store.default(session.account.account_id)
+                            or metadata.get("published_github_repository")
+                            or metadata.get("published_destination")):
+                name = destination_for(session, metadata, store).repository
+        except ValueError:
+            _LOGGER.warning("The saved publishing repository could not be resolved.")
+        label = "GitHub repository: " + (repository_display_name(name) if name else "Not configured")
+        self.repository_summary.setText(label)
+        self.repository_summary.setToolTip(name)
+        self.repository_changed.emit(label)
+
+    def _ensure_publishing_repository(self) -> None:
+        if self._shutdown:
+            return
+        snapshot = self._github_service.snapshot
+        session = snapshot.session
+        if snapshot.state != GitHubConnectionState.CONNECTED or session is None:
+            return
+        if self._busy or self._publication_operation:
+            return
+        from publishing.destinations import DestinationStore
+        from publishing.github_collections import GitHubCollections
+        store = DestinationStore(self.project_root)
+        try:
+            if store.default(session.account.account_id):
+                self._sync_repository_summary()
+                return
+        except ValueError as error:
+            self._set_status(str(error), error=True)
+            return
+        if session.account.account_id in self._repository_setup_attempted:
+            return
+        self._repository_setup_attempted.add(session.account.account_id)
+        cancelled = lambda: self._shutdown or self._github_service.snapshot.generation != snapshot.generation
+        def check():
+            api = self._github_service.authorized_api(session)
+            return GitHubCollections(session, api, store, cancelled=cancelled).restore_default()
+        def finished(destination):
+            def show_setup():
+                if cancelled():
+                    return
+                if destination is None:
+                    self._run_repository_setup(session)
+                self._sync_repository_summary()
+            self._defer_until_idle(show_setup)
+        self._start_operation("Checking your letter repository…", check, finished,
+                              "Could not check your letter repository. Try publishing again when connected.", quiet=True)
+
+    def start_repository_setup(self) -> None:
+        self._repository_onboarding_enabled = True
+        self._validate_github_account_async()
+
+    def _run_repository_setup(self, session: GitHubSession) -> bool:
+        from publishing.collections_ui import CollectionDialog
+        from publishing.destinations import DestinationStore
+        if DestinationStore(self.project_root).default(session.account.account_id):
+            return True
+        snapshot = self._github_service.snapshot
+        if snapshot.session is None or snapshot.session.account.account_id != session.account.account_id:
+            return False
+        dialog = CollectionDialog(session, self._github_service.authorized_api(session), self.project_root, self.window(),
+            cancelled=lambda: self._shutdown or self._github_service.snapshot.generation != snapshot.generation)
+        accepted = dialog.exec() == QtWidgets.QDialog.Accepted and dialog.destination is not None
+        self._sync_repository_summary()
+        return bool(accepted)
 
     def _validate_github_account_async(self) -> None:
         if self._shutdown or self._github_account_checking:
@@ -2862,6 +2899,7 @@ class ForgeTab(QtWidgets.QWidget):
         return True
 
     def _finish_github_sign_in(self, session: GitHubSession) -> None:
+        self._repository_onboarding_enabled = True
         self._apply_github_state(self._github_service.snapshot)
         self._github_account_checked = True
         self._github_account_error = ""
@@ -3343,7 +3381,11 @@ class ForgeTab(QtWidgets.QWidget):
         self._set_saved_delete_mode(False)
         stock_mode = self._saved_panel_mode == "stock"
         self.saved_heading.setText(
-            "Stock Letters" if stock_mode else "Saved Letters"
+            "Stock Letters" if stock_mode else "Load letter"
+        )
+        self.last_project_button.setVisible(not stock_mode)
+        self.last_project_button.setEnabled(
+            callable(getattr(self.window(), "open_last_project", None))
         )
         self.saved_delete_toggle.hide()
         self.refresh_saved_letters(
@@ -3490,6 +3532,8 @@ class ForgeTab(QtWidgets.QWidget):
                 card.selected.connect(self._select_saved_letter)
                 card.activated.connect(self._activate_saved_letter)
                 card.delete_requested.connect(self._delete_saved_letter)
+                card.customContextMenuRequested.connect(
+                    lambda point, card=card: self.saved_projects.show_context_menu(card, point))
             else:
                 card.update_entry(entry)
             card.setEnabled(not self._busy)
@@ -3620,7 +3664,7 @@ class ForgeTab(QtWidgets.QWidget):
     ) -> None:
         if self._shutdown:
             return
-        identity = _cover_cache_identity(path, 168, 92)
+        identity = _cover_cache_identity(path, 192, 192)
         if identity is None:
             card.apply_cover_result(
                 request_generation,
@@ -3664,8 +3708,8 @@ class ForgeTab(QtWidgets.QWidget):
                 self._cover_decode_generation,
                 key,
                 resolved,
-                168,
-                92,
+                192,
+                192,
             )
         )
 
@@ -4091,10 +4135,10 @@ class ForgeTab(QtWidgets.QWidget):
             self.saved_cards_layout.addWidget(empty, 0, 0)
             return
 
-        available = max(184, self.saved_scroll.viewport().width() - 8)
-        columns = max(1, available // 192)
+        available = max(208, self.saved_scroll.viewport().width() - 8)
+        columns = max(1, available // 216)
         rows = (len(cards) + columns - 1) // columns
-        self.saved_cards_widget.setMinimumHeight((rows * 268) + 4)
+        self.saved_cards_widget.setMinimumHeight((rows * 284) + 4)
         for index, card in enumerate(cards):
             self.saved_cards_layout.addWidget(
                 card,
@@ -4931,6 +4975,32 @@ class ForgeTab(QtWidgets.QWidget):
             self._set_status("The project changed. Start publishing again from the current project.", error=True)
             return
 
+        if (not metadata.get("_confirmed_publication") and not metadata.get("published_destination")
+                and not metadata.get("published_github_repository")):
+            if not self._run_repository_setup(session):
+                self._abort_publication_activity("publish")
+                self._set_status("Repository setup postponed. Your local letter is unchanged.")
+                return
+
+        if not metadata.get("_confirmed_publication"):
+            from publishing.collections_ui import PublicationDialog
+            snapshot = self._github_service.snapshot
+            preview_publisher = GitHubPagesPublisher(self.project_root, session,
+                api=self._github_service.authorized_api(session), persist_publication=False,
+                cancelled=lambda: self._github_service.snapshot.generation != snapshot.generation
+                or not _forge_context_is_current(self.project_root, project_context))
+            dialog = PublicationDialog(preview_publisher, metadata, self)
+            if dialog.exec() != QtWidgets.QDialog.Accepted or not dialog.result:
+                self._abort_publication_activity("publish")
+                self._set_status("Publishing cancelled. Existing letters and links are unchanged.")
+                return
+            metadata = dict(dialog.metadata)
+            metadata["_confirmed_publication"] = dialog.result
+            metadata["published_destination"] = dialog.result["destination"]
+            updated_context = list(context)
+            updated_context[2] = metadata
+            self._pending_publish_context = tuple(updated_context)
+
         def task() -> tuple:
             _require_forge_context(self.project_root, project_context)
             api = self._github_service.authorized_api(session)
@@ -5542,13 +5612,15 @@ class ForgeTab(QtWidgets.QWidget):
         error_message: str,
         *,
         on_failure: Callable[[], None] | None = None,
+        quiet: bool = False,
     ) -> None:
         if self._shutdown or self._busy:
             return
         self._busy = True
         self._busy_operation = activity
         self._set_busy(True)
-        self._set_status(activity, timeout_ms=0)
+        if not quiet:
+            self._set_status(activity, timeout_ms=0)
 
         thread = QtCore.QThread(self)
         worker = _TaskWorker(task)
@@ -5681,7 +5753,7 @@ class ForgeTab(QtWidgets.QWidget):
     def _set_busy(self, busy: bool) -> None:
         controller = getattr(self, "saved_projects", None)
         if controller is not None:
-            controller.actions.setEnabled(not busy)
+            controller.menu.setEnabled(not busy)
             controller.open_button.setEnabled(not busy and bool(self._selected_saved_letter and self._selected_saved_letter.valid))
         for card in self._saved_cards:
             card.setEnabled(not busy)
@@ -5751,6 +5823,8 @@ class ForgeTab(QtWidgets.QWidget):
             if timeout_ms is None
             else monotonic() + (max(0, int(timeout_ms)) / 1000.0)
         )
+        if hasattr(self, "saved_projects") and not self.saved_projects.github_library.shutdown(timeout_ms):
+            return False
         cover_timeout_ms = (
             None
             if deadline is None

@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from threading import Event
+from time import monotonic, sleep
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -129,6 +131,31 @@ class GitHubLibraryTests(unittest.TestCase):
                                prefix + "/index.html": b"<html>Letter</html>",
                                prefix + "/media/image.png": b"image bytes"})
 
+    def test_cover_previews_use_verified_artwork_from_backup_and_publication(self):
+        artwork = (Path(__file__).resolve().parents[1] / "resources/stock/images/cover/stock cover 1.png").read_bytes()
+        (self.root / "cover.png").write_bytes(artwork)
+        self.project.update_artwork(self.project.pages[0]["id"], {"asset": "cover.png"})
+        self.library.backup_project(self.capture)
+        project = self.library.discover()[0][0]
+        self.api.calls.clear()
+        preview = self.library.cover_preview(project, self.root / "covers")
+        self.assertEqual(preview.read_bytes(), artwork)
+        self.assertTrue(all(method == "GET" for method, _, _ in self.api.calls))
+        self.publication()
+        copy = self.library.discover()[0][0].presentation
+        files = {copy.prefix + "/" + name: self.api.blobs[sha] for name, sha, size in copy.files}
+        source = "gallery/pages/page-123/artwork.png"
+        files[copy.prefix + "/" + source] = artwork
+        files[copy.prefix + "/lettersmith-display.json"] = json.dumps({
+            "pages": [{"type": "cover", "source": source}]}).encode()
+        self.api.add_repo("ada.github.io", files)
+        presentation = self.library.discover()[0][0].presentation
+        preview = self.library.cover_preview(LibraryProject(presentation.project_id, presentation=presentation), self.root / "public-covers")
+        self.assertEqual(preview.read_bytes(), artwork)
+        downloaded = self.library.download_presentation(presentation, self.root / "downloads")
+        from publishing.github_library import presentation_cover
+        self.assertEqual(presentation_cover(presentation, downloaded).read_bytes(), artwork)
+
     def test_public_discovery_download_is_pinned_and_does_not_upload(self):
         self.publication()
         projects, warnings = self.library.discover()
@@ -232,6 +259,26 @@ class GitHubLibraryTests(unittest.TestCase):
             self.library.discover()
         self.assertFalse(self.api.calls)
 
+    def test_discovery_deadline_stops_before_request(self):
+        library = GitHubLibrary(self.session, self.api, deadline=monotonic() - 1)
+        with self.assertRaises(GitHubOperationError) as caught:
+            library.discover()
+        self.assertEqual(caught.exception.code, "library_timeout")
+        self.assertFalse(self.api.calls)
+
+    def test_shared_verified_markers_are_requested_once(self):
+        self.publication()
+        original = self.library.discover()[0][0].presentation
+        self.library._metadata.clear()
+        self.publication(legacy=True)
+        self.api.calls.clear()
+        projects, warnings = self.library.discover()
+        self.assertFalse(warnings)
+        self.assertEqual(len(projects), 1)
+        self.assertEqual(len(projects[0].retained_presentations), 1)
+        self.assertEqual(sum(path.endswith('/git/blobs/' + original.marker_sha)
+                             for _, path, _ in self.api.calls), 1)
+
     def test_truncated_listing_reports_failure_without_empty_success(self):
         self.publication()
         original = self.api.request
@@ -259,13 +306,16 @@ class LibraryBadgeTests(unittest.TestCase):
         entry = self.entry(canonical=True)
         card = SavedLetterCard(entry)
         self.addCleanup(card.deleteLater)
-        self.assertEqual(card.status_label.text(), "Saved draft")
-        self.assertEqual(card.publication_label.text(), "Unpublished")
-        self.assertNotEqual(local_badges(entry)[0], local_badges(self.entry())[0])
+        self.assertEqual(card.storage_status, ("Local", "local"))
+        self.assertEqual(card.publication_status, ("Unpublished", "draft"))
+        self.assertEqual(local_badges(entry)[0], local_badges(self.entry())[0])
         self.assertEqual(len(set(BADGE_COLORS.values())), 8)
+        self.assertEqual(local_badges(self.entry(example=True))[1], ("", ""))
+        self.assertGreater(card.cover.height(), card.height() * .65)
+        self.assertFalse(hasattr(card, "status_label"))
         card.update_entry(replace(entry, saved_publication_state="Saved changes not published (last known publication)"))
-        self.assertEqual(card.status_label.text(), "Saved draft")
-        self.assertIn("Local changes", card.publication_label.text())
+        self.assertEqual(card.storage_status, ("Local", "local"))
+        self.assertIn("Local changes", card.publication_status[0])
 
     def test_badge_colors_survive_all_themes(self):
         from Forge_Tab import SavedLetterCard
@@ -275,11 +325,11 @@ class LibraryBadgeTests(unittest.TestCase):
             service = ThemeService(Path(__file__).resolve().parents[1], settings=SettingsStore(root))
             card = SavedLetterCard(self.entry(canonical=True))
             self.addCleanup(card.deleteLater)
-            expected = card.status_label.styleSheet()
+            expected = card.storage_status
             for theme in ("cyber_forge", "obsidian_forge", "velvet_rose", "celestial_rose", "dark", "light"):
                 service.set_theme(theme, persist=False)
                 service.apply_semantic_styles(card)
-                self.assertEqual(card.status_label.styleSheet(), expected)
+                self.assertEqual(card.storage_status, expected)
 
 
 class GitHubLibraryUiTests(unittest.TestCase):
@@ -305,6 +355,9 @@ class GitHubLibraryUiTests(unittest.TestCase):
         self.addCleanup(self.cleanup)
         self.forge.saved_panel.resize(900, 600)
         self.forge.saved_panel.show()
+        question = mock.patch("saved_projects_ui.QtWidgets.QMessageBox.question", return_value=QtWidgets.QMessageBox.Discard)
+        question.start()
+        self.addCleanup(question.stop)
 
     def cleanup(self):
         self.forge.saved_panel.close()
@@ -317,11 +370,12 @@ class GitHubLibraryUiTests(unittest.TestCase):
         deadline = QtCore.QDeadlineTimer(30000)
         while not deadline.hasExpired():
             self.app.processEvents()
-            if not self.forge._busy and not self.library.working:
-                QtTest.QTest.qWait(100)
-                if not self.forge._busy and not self.library.working:
+            if not self.forge._busy and not self.library.working and self.library._refresh_thread is None:
+                sleep(0.1)
+                self.app.processEvents()
+                if not self.forge._busy and not self.library.working and self.library._refresh_thread is None:
                     return
-            QtTest.QTest.qWait(10)
+            sleep(0.01)
         self.fail(f"Library did not settle: busy={self.forge._busy}, working={self.library.working}, "
                   f"activity={self.forge._busy_operation}, details={self.library.status.text()}, "
                   f"status={self.forge.status.text()}")
@@ -330,16 +384,16 @@ class GitHubLibraryUiTests(unittest.TestCase):
         from project_session import get_project_session
         session = get_project_session(self.fixture.root)
         before = session.project.to_dict()
-        QtTest.QTest.mouseClick(self.library.refresh_button, QtCore.Qt.LeftButton)
+        self.library.refresh()
         self.settle()
         self.assertEqual(len(self.library.cards), 1)
+        self.assertFalse(any(button.text() in ("Project Actions", "Refresh GitHub", "Download")
+            for button in self.forge.saved_panel.findChildren(QtWidgets.QAbstractButton)))
         card = self.library.cards[0]
         QtTest.QTest.mouseClick(card, QtCore.Qt.LeftButton)
-        self.assertEqual(card.location_label.text(), "GitHub only")
-        self.assertEqual(card.publication_label.text(), "Published")
-        self.assertFalse(self.library.download_project_action.isEnabled())
-        self.assertTrue(self.library.download_presentation_action.isEnabled())
-        self.assertEqual(self.forge.saved_projects.open_button.text(), "Download Presentation")
+        self.assertEqual(card.storage_status[0], "GitHub only")
+        self.assertEqual(card.publication_status[0], "Published")
+        self.assertEqual(self.forge.saved_projects.open_button.text(), "Open Project")
         with mock.patch("github_library_ui.QtGui.QDesktopServices.openUrl") as opened:
             QtTest.QTest.mouseClick(self.forge.saved_projects.open_button, QtCore.Qt.LeftButton)
             self.settle()
@@ -347,24 +401,30 @@ class GitHubLibraryUiTests(unittest.TestCase):
             QtTest.QTest.qWait(120)
             self.settle()
             opened.assert_called_once()
-        self.assertEqual(self.library.cards[0].location_label.text(), "Local + GitHub")
+        self.assertEqual(self.library.cards[0].storage_status[0], "Local + GitHub")
         self.assertEqual(session.project.to_dict(), before)
 
-    def test_editable_download_is_available_and_existing_version_is_compared(self):
+    def test_remote_open_activates_project_and_refresh_preserves_local_edits(self):
         self.fixture.library.backup_project(self.fixture.capture)
         self.library.refresh()
         self.settle()
         QtTest.QTest.mouseClick(self.library.cards[0], QtCore.Qt.LeftButton)
-        self.assertTrue(self.library.download_project_action.isEnabled())
         QtTest.QTest.mouseClick(self.forge.saved_projects.open_button, QtCore.Qt.LeftButton)
         self.settle()
         QtTest.QTest.qWait(120)
         self.settle()
+        # Opening now hides the panel; render the local catalog when returning.
+        self.forge.saved_panel.show()
+        self.forge.refresh_saved_letters(force_reconcile=True)
+        deadline = QtCore.QDeadlineTimer(5000)
+        while self.forge._catalog_reconcile_active and not deadline.hasExpired():
+            self.app.processEvents()
+            sleep(0.01)
         self.assertEqual(len(self.library.cards), 0)
         self.assertEqual(len(self.forge._saved_cards), 1)
-        self.assertEqual(self.library.rows[self.fixture.project.project_id][3], "Matching backup")
+        self.assertEqual(self.forge.saved_projects.session.project.project_id, self.fixture.project.project_id)
+        self.assertEqual(self.forge._saved_cards[0].storage_status, ("Local + GitHub", "both"))
         self.assertEqual(self.forge.saved_projects.open_button.text(), "Open Project")
-        self.assertTrue(self.library.download_project_action.isEnabled())
         directory = self.forge.saved_projects.service.editable_root / self.fixture.project.project_id
         stored = ProjectRepository(directory / ".lettersmith-project").load()
         stored.project.update_prompt(stored.project.pages[1]["id"], {"text": "local edits"})
@@ -372,7 +432,9 @@ class GitHubLibraryUiTests(unittest.TestCase):
             stored.project, asset_root=stored.asset_root, expected_revision=stored.revision)
         self.library.refresh()
         self.settle()
-        self.assertEqual(self.library.rows[self.fixture.project.project_id][3], "Compare versions")
+        self.assertEqual(ProjectRepository(directory / ".lettersmith-project").load().project.get_prompt(
+            stored.project.pages[1]["id"])["text"], "local edits")
+        self.assertTrue(self.library.status.isHidden())
 
     def test_account_change_clears_rows_and_disables_actions(self):
         from publishing.github_auth import GitHubConnectionSnapshot, GitHubConnectionState
@@ -383,8 +445,123 @@ class GitHubLibraryUiTests(unittest.TestCase):
         self.forge._github_state_changed.emit(self.connection.snapshot)
         self.app.processEvents()
         self.assertEqual(len(self.library.cards), 0)
-        self.assertFalse(self.library.download_presentation_action.isEnabled())
         self.assertFalse(self.library.open_action.isEnabled())
+
+    def test_listing_is_usable_before_slow_covers_and_refresh_does_not_overlap(self):
+        release, entered = Event(), Event()
+        def slow_cover(*args):
+            entered.set()
+            release.wait(5)
+            return None
+        with mock.patch('github_library_ui.GitHubLibrary.cover_preview', side_effect=slow_cover):
+            try:
+                self.library.refresh()
+                deadline = QtCore.QDeadlineTimer(5000)
+                while (not entered.is_set() or not self.library.cards) and not deadline.hasExpired():
+                    QtTest.QTest.qWait(10)
+                self.assertTrue(entered.is_set())
+                self.assertEqual(len(self.library.cards), 1)
+                self.assertTrue(self.library.cards[0].isEnabled())
+                self.assertTrue(self.forge.saved_projects.menu.isEnabled())
+                self.assertFalse(self.forge._busy)
+                self.assertTrue(self.library.status.isHidden())
+                calls = len(self.fixture.api.calls)
+                self.library.refresh()
+                QtTest.QTest.qWait(50)
+                self.assertEqual(len(self.fixture.api.calls), calls)
+            finally:
+                release.set()
+                self.settle()
+
+    def test_timeout_restores_controls_ignores_late_response_and_retry_recovers(self):
+        release, entered = Event(), Event()
+        request = self.fixture.api.request
+        def stalled_request(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+            return request(*args, **kwargs)
+        self.library.REFRESH_TIMEOUT_MS = 50
+        with mock.patch.object(self.fixture.api, 'request', side_effect=stalled_request):
+            try:
+                self.library.refresh()
+                QtTest.QTest.qWait(150)
+                self.assertTrue(entered.is_set())
+                self.assertIn('too long', self.library.status.text())
+                self.assertTrue(self.library.retry_button.isVisible())
+                self.assertTrue(self.forge.saved_projects.menu.isEnabled())
+                self.assertFalse(self.forge._busy)
+            finally:
+                release.set()
+                self.settle()
+        self.assertFalse(self.library.rows)
+        self.library.REFRESH_TIMEOUT_MS = 5000
+        QtTest.QTest.mouseClick(self.library.retry_button, QtCore.Qt.LeftButton)
+        self.settle()
+        self.assertEqual(len(self.library.cards), 1)
+        self.assertTrue(self.library.retry_button.isHidden())
+
+    def test_authentication_failure_is_visible_and_retry_loads_existing_letters(self):
+        with mock.patch.object(self.fixture.api, 'request', side_effect=GitHubOperationError(
+                'authentication', 'GitHub sign-in has expired. Please sign in again.')) as request:
+            self.library.refresh()
+            self.settle()
+            self.assertEqual(request.call_count, 1)
+        self.assertIn('sign-in has expired', self.library.status.text())
+        self.assertTrue(self.library.retry_button.isVisible())
+        QtTest.QTest.mouseClick(self.library.retry_button, QtCore.Qt.LeftButton)
+        self.settle()
+        self.assertEqual(len(self.library.cards), 1)
+        self.assertTrue(self.library.status.isHidden())
+
+    def test_connecting_account_times_out_and_retry_resumes_listing(self):
+        from publishing.github_auth import GitHubConnectionSnapshot, GitHubConnectionState
+        self.connection.snapshot = GitHubConnectionSnapshot(GitHubConnectionState.CONNECTING)
+        self.library.REFRESH_TIMEOUT_MS = 50
+        self.library.refresh()
+        self.assertFalse(self.forge._busy)
+        QtTest.QTest.qWait(100)
+        self.assertIn('too long', self.library.status.text())
+        self.assertTrue(self.library.retry_button.isVisible())
+        def restored():
+            self.connection.snapshot = GitHubConnectionSnapshot(
+                GitHubConnectionState.CONNECTED, session=self.fixture.session)
+            self.forge._github_state_changed.emit(self.connection.snapshot)
+            return self.connection.snapshot
+        self.connection.restore = restored
+        self.library.REFRESH_TIMEOUT_MS = 5000
+        QtTest.QTest.mouseClick(self.library.retry_button, QtCore.Qt.LeftButton)
+        deadline = QtCore.QDeadlineTimer(5000)
+        while not self.library.rows and not deadline.hasExpired():
+            self.app.processEvents()
+            sleep(0.01)
+        self.settle()
+        self.assertEqual(len(self.library.cards), 1)
+        self.assertTrue(self.library.status.isHidden())
+
+    def test_retry_waits_for_cancelled_request_without_starting_overlapping_workers(self):
+        release, entered = Event(), Event()
+        request = self.fixture.api.request
+        def stalled(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+            return request(*args, **kwargs)
+        with mock.patch.object(self.fixture.api, 'request', side_effect=stalled) as call:
+            try:
+                self.library.refresh()
+                deadline = QtCore.QDeadlineTimer(5000)
+                while not entered.is_set() and not deadline.hasExpired():
+                    self.app.processEvents()
+                    sleep(0.01)
+                self.library._refresh_timed_out()
+                self.library.retry()
+                self.library.retry()
+                self.assertEqual(call.call_count, 1)
+                self.assertFalse(self.forge._busy)
+            finally:
+                release.set()
+                self.settle()
+        self.assertEqual(len(self.library.cards), 1)
+        self.assertTrue(self.library.retry_button.isHidden())
 
     def test_downloaded_presentation_stays_in_normal_library_offline(self):
         from publishing.github_auth import GitHubConnectionSnapshot, GitHubConnectionState
@@ -395,9 +572,9 @@ class GitHubLibraryUiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(len(self.library.cards), 1)
         card = self.library.cards[0]
-        self.assertEqual(card.location_label.text(), "Local")
+        self.assertEqual(card.storage_status[0], "Local")
         QtTest.QTest.mouseClick(card, QtCore.Qt.LeftButton)
-        self.assertEqual(self.forge.saved_projects.open_button.text(), "Open Downloaded Letter")
+        self.assertEqual(self.forge.saved_projects.open_button.text(), "Open Project")
         with mock.patch("github_library_ui.QtGui.QDesktopServices.openUrl") as opened:
             QtTest.QTest.mouseClick(self.forge.saved_projects.open_button, QtCore.Qt.LeftButton)
             self.assertEqual(opened.call_args.args[0].toLocalFile(), str(path / "index.html").replace("\\", "/"))

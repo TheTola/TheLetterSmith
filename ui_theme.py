@@ -120,6 +120,8 @@ _CYBER_UI_COLOR_ROLES: Mapping[str, str] = MappingProxyType(
         "#8ce3e3": "accent_bright",
         "#9bfffb": "accent_bright",
         "#4fe5ff": "accent_bright",
+        "#58a6ff": "accent_bright",
+        "#0d1117": "control_background",
         "#ffffff": "text_primary",
         "#fffefc": "text_primary",
         "#f4ffff": "text_primary",
@@ -434,6 +436,9 @@ PRIMARY_PAGE_LAYOUT = LayoutMetrics(20, 16, 20, 18, 12)
 SOUND_PAGE_LAYOUT = LayoutMetrics(28, 22, 28, 24, 18)
 SECTION_LAYOUT_SPACING = 14
 ROW_LAYOUT_SPACING = 10
+CONTROL_RADIUS = 6
+PANEL_RADIUS = 10
+COMPACT_RADIUS = 4
 
 
 def apply_tab_heading_style(label: QtWidgets.QLabel) -> QtWidgets.QLabel:
@@ -1484,14 +1489,17 @@ QPushButton, QToolButton {{ text-align: center; }}
 QWidget[themeRole="panel"] {{
     background: {c.panel_background};
     border: 1px solid {c.border};
+    border-radius: {PANEL_RADIUS}px;
 }}
 QWidget[themeRole="card"] {{
     background: {c.card_background};
     border: 1px solid {c.border};
+    border-radius: {PANEL_RADIUS}px;
 }}
 QWidget[themeRole="secondarySurface"] {{
     background: {c.secondary_surface};
     border: 1px solid {c.control_border};
+    border-radius: {PANEL_RADIUS}px;
 }}
 QLabel[themeRole="text"] {{ color: {c.text}; }}
 QLabel[themeRole="mutedText"] {{ color: {c.muted_text}; }}
@@ -1508,6 +1516,7 @@ QPushButton[themeRole="button"], QToolButton[themeRole="button"] {{
     border: 1px solid {c.border};
     color: {c.text};
     text-align: center;
+    border-radius: {CONTROL_RADIUS}px;
 }}
 QPushButton[themeRole="button"]:hover,
 QToolButton[themeRole="button"]:hover {{
@@ -1559,6 +1568,14 @@ QLineEdit[themeRole="input"], QComboBox[themeRole="input"] {{
     border: 1px solid {c.border};
     color: {c.text};
     selection-background-color: {c.active};
+    selection-color: {c.selected_text};
+    border-radius: {CONTROL_RADIUS}px;
+}}
+QLineEdit[themeRole="input"]:focus, QComboBox[themeRole="input"]:focus,
+QPushButton[themeRole="button"]:focus, QToolButton[themeRole="button"]:focus,
+QPushButton[themeRole="accentButton"]:focus,
+QPushButton[themeRole="clearAction"]:focus {{
+    border-color: {c.input_focus};
 }}
 {tier_styles}
 *[themeFontRole="application"] {{ font-family: {app_font}; }}
@@ -1570,10 +1587,9 @@ QLineEdit[themeRole="input"], QComboBox[themeRole="input"] {{
         c = self.tokens
         app_font = _qss_font_family(self.app_font_family)
         user_entry_font = _qss_font_family(self.user_entry_font_family)
-        rose_family = theme_family_for_id(self._theme_id) == "rose"
-        radius = 9 if rose_family else 4
-        small_radius = 6 if rose_family else 3
-        border_width = 1 if rose_family else 2
+        radius = CONTROL_RADIUS
+        small_radius = CONTROL_RADIUS
+        border_width = 1
         font_size_adjustment = self.current.font_size_adjustment
         tier_styles = _button_tier_stylesheet(
             'QWidget[ordinaryThemeRoot="true"] ',
@@ -1602,6 +1618,12 @@ QWidget[ordinaryThemeRoot="true"] {{
 }}
 QWidget[ordinaryThemeRoot="true"] QLabel {{
     color: {c.text_primary};
+}}
+QWidget[ordinaryThemeRoot="true"] QWidget[themeRole="panel"] {{
+    background: {c.panel_background};
+    color: {c.text_primary};
+    border: 1px solid {c.border};
+    border-radius: {PANEL_RADIUS}px;
 }}
 QWidget[ordinaryThemeRoot="true"] QLabel[themeRole="headingText"] {{
     color: {c.heading_text};
@@ -1639,6 +1661,10 @@ QWidget[ordinaryThemeRoot="true"] QToolButton:pressed {{
     background: {c.button_pressed};
     border-color: {c.border_active};
 }}
+QWidget[ordinaryThemeRoot="true"] QPushButton:focus,
+QWidget[ordinaryThemeRoot="true"] QToolButton:focus {{
+    border-color: {c.border_focus};
+}}
 {basic_checked_state}
 QWidget[ordinaryThemeRoot="true"] QPushButton:disabled,
 QWidget[ordinaryThemeRoot="true"] QToolButton:disabled {{
@@ -1668,6 +1694,7 @@ QWidget[ordinaryThemeRoot="true"] QLineEdit:hover,
 QWidget[ordinaryThemeRoot="true"] QTextEdit:hover,
 QWidget[ordinaryThemeRoot="true"] QPlainTextEdit:hover,
 QWidget[ordinaryThemeRoot="true"] QSpinBox:hover,
+QWidget[ordinaryThemeRoot="true"] QDoubleSpinBox:hover,
 QWidget[ordinaryThemeRoot="true"] QComboBox:hover {{
     border-color: {c.input_hover};
 }}
@@ -1675,8 +1702,31 @@ QWidget[ordinaryThemeRoot="true"] QLineEdit:focus,
 QWidget[ordinaryThemeRoot="true"] QTextEdit:focus,
 QWidget[ordinaryThemeRoot="true"] QPlainTextEdit:focus,
 QWidget[ordinaryThemeRoot="true"] QSpinBox:focus,
+QWidget[ordinaryThemeRoot="true"] QDoubleSpinBox:focus,
 QWidget[ordinaryThemeRoot="true"] QComboBox:focus {{
     border-color: {c.input_focus};
+}}
+QWidget[ordinaryThemeRoot="true"] QLineEdit:disabled,
+QWidget[ordinaryThemeRoot="true"] QTextEdit:disabled,
+QWidget[ordinaryThemeRoot="true"] QPlainTextEdit:disabled,
+QWidget[ordinaryThemeRoot="true"] QAbstractSpinBox:disabled,
+QWidget[ordinaryThemeRoot="true"] QComboBox:disabled {{
+    background: {c.button_disabled};
+    color: {c.text_disabled};
+    border-color: {c.border_subtle};
+}}
+QWidget[ordinaryThemeRoot="true"] QGroupBox {{
+    border: 1px solid {c.border_normal};
+    border-radius: {PANEL_RADIUS}px;
+    margin-top: 10px;
+    padding-top: 8px;
+    font-weight: 600;
+}}
+QWidget[ordinaryThemeRoot="true"] QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 4px;
+    color: {c.text_secondary};
 }}
 QWidget[ordinaryThemeRoot="true"] QLineEdit[themeRole="selectedState"] {{
     background: {c.selection_background};
@@ -1703,7 +1753,7 @@ QWidget[ordinaryThemeRoot="true"] QRadioButton::indicator {{
     border: 1px solid {c.input_border};
 }}
 QWidget[ordinaryThemeRoot="true"] QCheckBox::indicator {{
-    border-radius: {small_radius}px;
+    border-radius: {COMPACT_RADIUS}px;
 }}
 QWidget[ordinaryThemeRoot="true"] QRadioButton::indicator {{
     border-radius: 8px;
@@ -1712,6 +1762,20 @@ QWidget[ordinaryThemeRoot="true"] QCheckBox::indicator:checked,
 QWidget[ordinaryThemeRoot="true"] QRadioButton::indicator:checked {{
     background: {c.accent_primary};
     border-color: {c.accent_bright};
+}}
+QWidget[ordinaryThemeRoot="true"] QCheckBox::indicator:hover,
+QWidget[ordinaryThemeRoot="true"] QRadioButton::indicator:hover,
+QWidget[ordinaryThemeRoot="true"] QCheckBox::indicator:focus,
+QWidget[ordinaryThemeRoot="true"] QRadioButton::indicator:focus {{
+    border-color: {c.border_focus};
+}}
+QWidget[ordinaryThemeRoot="true"] QCheckBox:disabled,
+QWidget[ordinaryThemeRoot="true"] QRadioButton:disabled {{
+    color: {c.text_disabled};
+}}
+QWidget[ordinaryThemeRoot="true"] QCheckBox::indicator:disabled,
+QWidget[ordinaryThemeRoot="true"] QRadioButton::indicator:disabled {{
+    border-color: {c.text_disabled};
 }}
 QWidget[ordinaryThemeRoot="true"] QSlider::groove:horizontal {{
     height: 5px;
@@ -1750,15 +1814,30 @@ QWidget[ordinaryThemeRoot="true"] QMenu {{
     background: {c.surface_raised};
     color: {c.text_primary};
     border: 1px solid {c.border_normal};
+    border-radius: {CONTROL_RADIUS}px;
+    padding: 4px;
+}}
+QWidget[ordinaryThemeRoot="true"] QMenu::item {{
+    padding: 4px 16px;
+    border-radius: {COMPACT_RADIUS}px;
 }}
 QWidget[ordinaryThemeRoot="true"] QMenu::item:selected {{
     background: {c.selection_background};
     color: {c.selection_text};
 }}
+QWidget[ordinaryThemeRoot="true"] QMenu::item:disabled {{
+    color: {c.text_disabled};
+}}
+QWidget[ordinaryThemeRoot="true"] QMenu::separator {{
+    height: 1px;
+    background: {c.separator};
+    margin: 4px 8px;
+}}
 QWidget[ordinaryThemeRoot="true"] QToolTip {{
     background: {c.tooltip_background};
     color: {c.tooltip_text};
     border: 1px solid {c.tooltip_border};
+    border-radius: {COMPACT_RADIUS}px;
     padding: 4px 7px;
 }}
 QWidget[ordinaryThemeRoot="true"] *[themeFontRole="application"] {{

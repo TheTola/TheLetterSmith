@@ -22,23 +22,20 @@ class SavedProjectsController(QtCore.QObject):
         self.previews = []
         self.github_library = None
         layout = forge.saved_panel.layout()
-        self.details = QtWidgets.QLabel("Select a project to see its saved version.")
+        self.details = QtWidgets.QLabel()
         self.details.setTextFormat(QtCore.Qt.PlainText)
         self.details.setWordWrap(True)
         self.details.setMaximumHeight(115)
         self.details.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         layout.addWidget(self.details)
+        self.details.hide()
         row = QtWidgets.QHBoxLayout()
         self.row = row
         self.open_button = QtWidgets.QPushButton("Open Project")
         self.open_button.setDefault(True)
         self.open_button.clicked.connect(self.open_selected)
         row.addWidget(self.open_button)
-        self.actions = QtWidgets.QToolButton()
-        self.actions.setText("Project Actions")
-        self.actions.setPopupMode(QtWidgets.QToolButton.InstantPopup)
-        self.menu = QtWidgets.QMenu(self.actions)
-        self.actions.setMenu(self.menu)
+        self.menu = QtWidgets.QMenu(forge.saved_panel)
         self.preview_action = self.menu.addAction("Preview Saved Version", self.preview_selected)
         self.duplicate_action = self.menu.addAction("Duplicate Saved Version", self.duplicate_selected)
         self.rename_action = self.menu.addAction("Rename Saved Project", self.rename_selected)
@@ -46,7 +43,6 @@ class SavedProjectsController(QtCore.QObject):
         self.menu.addSeparator()
         self.copy_action = self.menu.addAction("Save a Copy of Open Project…", lambda: self.save(copy=True))
         self.recovery_action = self.menu.addAction("Recover Content in Open Project…", self.recover_content)
-        row.addWidget(self.actions)
         row.addStretch(1)
         close = QtWidgets.QPushButton("Close")
         close.clicked.connect(forge.saved_panel.hide)
@@ -73,6 +69,7 @@ class SavedProjectsController(QtCore.QObject):
         self.forge._set_status(text, error=error, timeout_ms=0)
         if error:
             self.details.setText(text)
+            self.details.show()
         hook = getattr(self.forge.window(), "status", None)
         if callable(hook):
             hook(text)
@@ -83,7 +80,7 @@ class SavedProjectsController(QtCore.QObject):
             return bool(hook())
         return self.forge._flush_prompt_writer_state()
 
-    def _run(self, activity, task, success, *, failed=None):
+    def _run(self, activity, task, success, *, failed=None, quiet=False):
         if self.forge._busy:
             self._status("Wait for the current operation to finish.")
             return False
@@ -108,7 +105,7 @@ class SavedProjectsController(QtCore.QObject):
                 if failed is not None:
                     failed(False)
 
-        self.forge._start_operation(activity, work, finished, "The project operation failed; your edits remain open.")
+        self.forge._start_operation(activity, work, finished, "The project operation failed; your edits remain open.", quiet=quiet)
         return True
 
     def save(self, _checked=False, *, copy=False, after=None, finished=None):
@@ -160,7 +157,7 @@ class SavedProjectsController(QtCore.QObject):
         self.open_button.setEnabled(valid)
         self.preview_action.setEnabled(valid)
         self.duplicate_action.setEnabled(valid)
-        editable = valid and entry.canonical and entry.path.parent.resolve() == self.service.editable_root.resolve()
+        editable = valid and entry.canonical and not (entry.example or entry.stock or entry.recovery)
         self.rename_action.setEnabled(editable)
         self.delete_action.setEnabled(valid and not (entry.example or entry.stock or entry.recovery))
         self.recovery_action.setEnabled(bool(self.session.project.recoverable_items()))
@@ -169,25 +166,17 @@ class SavedProjectsController(QtCore.QObject):
         for card in self.forge._saved_cards:
             current = card.entry.project_id == self.session.project.project_id and card.entry.path.resolve() == active_path
             card.setProperty("currentProject", current)
-            card.setToolTip(f"{card.entry.title}\n{card.entry.summary}\n{card.entry.path}\n" + ("Currently open project\n" if current else "") + card.entry.warning)
-            if hasattr(card, "state_label"):
-                card.state_label.setText("Currently open" if current else "Selected" if card.entry == entry else "")
-        if not isinstance(entry, SavedLetter):
-            self.details.setText("Select a local project to open it, or a GitHub letter to download it.")
-            self.github_library.update_selection()
-            return
-        state = "Example / template" if entry.example else "Recovery copy" if entry.recovery else "Saved draft"
-        if entry.project_id == self.session.project.project_id and entry.path.resolve() == active_path:
-            state += " · Currently open"
-            if self.service.has_unsaved_editable_changes():
-                state += " · Unsaved changes"
-        publication = entry.saved_publication_state or (("Last publication confirmed; saved revision unverified" if entry.publication_verified else "Publication status unknown / unverified") if entry.published_url else "Unpublished")
-        text = f"{entry.title}\n{entry.summary} · Saved {entry.modified_at.astimezone():%Y-%m-%d %H:%M}\nSelected · {state} · {publication}"
-        if entry.warning:
-            text += "\n" + entry.warning
-        self.details.setText(text)
-        self.details.setToolTip(text + "\n" + str(entry.path))
         self.github_library.update_selection()
+
+    def show_context_menu(self, card, point):
+        if self.forge._busy:
+            return
+        if hasattr(card, "entry"):
+            self.forge._select_saved_letter(card.entry)
+        else:
+            self.github_library.select(card.key)
+        self.selected_changed()
+        self.menu.exec(card.mapToGlobal(point))
 
     def open_selected(self):
         entry = self.forge._selected_saved_letter
@@ -233,13 +222,13 @@ class SavedProjectsController(QtCore.QObject):
                 self.forge.project_restored.emit(payload)
                 self.forge.letter_loaded.emit(payload)
                 self.forge.saved_panel.hide()
+                self.forge._refresh_catalog_entry(entry.path)
                 self.selected_changed()
                 view_errors = getattr(self.forge.window(), "_project_view_restore_errors", ())
                 if view_errors:
                     self._status("Project activated and retained, but these views need reopening: " + ", ".join(view_errors), error=True)
                     return
-                self._status("Project opened." + (" Legacy/example content is an editable copy; its original is unchanged." if not candidate.revision or entry.example else "") +
-                             (" " + entry.warning if entry.warning else ""))
+                self._status("Project opened.")
             except Exception as error:
                 retained = ("The previous project is retained." if origin == self.session.session_id else
                             "The activated project is recoverable; reopen the application to restore its views.")

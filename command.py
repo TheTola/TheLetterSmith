@@ -2151,7 +2151,19 @@ class CommandTab(
 
         self.go_btn.clicked.connect(self._save)
         self.go_btn.held.connect(self._do_reset)
+        self.repository_summary = QtWidgets.QLabel("GitHub repository: Not configured", self)
+        self.repository_summary.setObjectName("CommandRepositorySummary")
+        self.repository_summary.setTextFormat(Qt.PlainText)
+        self.repository_summary.setAlignment(Qt.AlignCenter)
+        self.repository_summary.setWordWrap(True)
+        self.repository_summary.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.repository_summary.setStyleSheet(
+            "color:#d4c8ca;background:transparent;font:10pt 'Segoe UI';"
+        )
         self._relayout()
+
+    def set_repository_summary(self, text: str) -> None:
+        self.repository_summary.setText(text)
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
         self.go_btn.cancel_hold(animate=False)
@@ -2199,6 +2211,8 @@ class CommandTab(
             width,
             height,
         )
+        self.repository_summary.setGeometry(16, max(0, height - 56), max(1, width - 32), 40)
+        self.repository_summary.raise_()
 
         if self._bg_pix.isNull() or self._go_pix.isNull():
             self.bg_label.clear()
@@ -2235,6 +2249,7 @@ class CommandTab(
         )
 
         self.go_btn.raise_()
+        self.repository_summary.raise_()
 
 
 def main() -> None:

@@ -1,6 +1,6 @@
 """Page-ID artwork operations using the shared project's target guards.
 
-Call ``capture_target`` before opening a picker or crop dialog, prepare media
+Call ``capture_target`` before opening a picker, prepare media
 without changing authored state, then apply to that same target. The UI owns
 session persistence; this module never writes compatibility manifests.
 """
@@ -10,7 +10,6 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path, PureWindowsPath
 import shutil
-from typing import Sequence
 
 from PIL import Image
 
@@ -188,39 +187,3 @@ class PageArtworkController:
         return self.session.apply_result(target, lambda project, captured_id: project.update_artwork(
             captured_id, {"asset": None, "media_type": None, "placement": {}, "animation": {}},
         ))
-
-    def crop(self, page_id: str, rectangle: Sequence[int], *, target: WorkTarget | None = None) -> bool:
-        """Derive a static PNG from ``(left, top, right, bottom)`` pixel edges.
-
-        Pass a captured target when a dialog precedes this operation. Animated
-        GIF cropping is deliberately rejected because the static crop tool does
-        not preserve its animation. A duplicate's shared source is never edited.
-        """
-        if target is None:
-            target = self.capture_target(page_id)
-        elif target.page_id != page_id:
-            raise ValueError("The crop target does not belong to this page.")
-        if not self.session.target_is_current(target):
-            return False
-        source = self.resolve_asset(target.page_id)
-        if source is None:
-            raise ValueError("Import an image before cropping.")
-        if len(rectangle) != 4 or any(isinstance(edge, bool) or not isinstance(edge, int) for edge in rectangle):
-            raise ValueError("Crop bounds must be four integer pixel edges.")
-        directory = self._staging_directory()
-        try:
-            with Image.open(source) as original:
-                if getattr(original, "n_frames", 1) > 1:
-                    raise ValueError("Animated GIF cropping is unavailable; animation and source artwork are preserved.")
-            normalized = directory / "normalized.png"
-            _write_static_png(source, normalized)
-            with Image.open(normalized) as image:
-                left, top, right, bottom = rectangle
-                if not (0 <= left < right <= image.width and 0 <= top < bottom <= image.height):
-                    raise ValueError("Crop bounds must stay inside the image and have positive size.")
-                cropped = directory / "cropped.png"
-                image.crop(tuple(rectangle)).save(cropped, format="PNG")
-            return self.apply_import(target, self.stage_import(cropped))
-        finally:
-            directory.resolve().relative_to(self.project_root)
-            shutil.rmtree(directory)

@@ -1,13 +1,20 @@
 """GitHub entries and actions within the existing Saved Letters library."""
 from __future__ import annotations
 
+from datetime import datetime
+import logging
+from threading import Event
+from time import monotonic
+
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from library_status import badge_style
+from library_status import badge_style, set_card_status, paint_card_status
 from project_paths import application_paths
-from project_repository import ProjectRepository
-from publishing.github_library import GitHubLibrary, LibraryProject, downloaded_presentations, project_digest
-from saved_letters import SavedLetterCatalog
+from publishing.github_auth import GitHubConnectionState, GitHubOperationError
+from publishing.destinations import DestinationStore
+from publishing.github_library import GitHubLibrary, LibraryProject, downloaded_presentations
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class GitHubLetterCard(QtWidgets.QFrame):
@@ -19,7 +26,7 @@ class GitHubLetterCard(QtWidgets.QFrame):
         super().__init__(parent)
         self.project = project
         self.key = project.project_id
-        self.setFixedSize(184, 260)
+        self.setFixedSize(208, 276)
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setCursor(QtCore.Qt.PointingHandCursor)
         self.setObjectName("GitHubLetterCard")
@@ -32,33 +39,49 @@ class GitHubLetterCard(QtWidgets.QFrame):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(7, 7, 7, 7)
         layout.setSpacing(3)
-        cover = QtWidgets.QLabel("GitHub")
-        cover.setAlignment(QtCore.Qt.AlignCenter)
-        cover.setFixedHeight(96)
-        cover.setStyleSheet("background:#142d50;color:#b7d9ff;border-radius:4px;font:600 14pt 'Segoe UI';")
-        cover.setProperty("themeIndependent", True)
-        layout.addWidget(cover)
-        title = QtWidgets.QLabel(project.title)
-        title.setWordWrap(True)
-        title.setMaximumHeight(34)
+        self.cover = QtWidgets.QLabel("No cover")
+        self.cover.setAlignment(QtCore.Qt.AlignCenter)
+        self.cover.setFixedHeight(196)
+        self.cover.setStyleSheet("background:#091116;color:#78909a;border-radius:4px;")
+        layout.addWidget(self.cover)
+        title = QtWidgets.QLabel()
+        title.setText(title.fontMetrics().elidedText(project.title, QtCore.Qt.ElideRight, 192))
+        title.setFixedHeight(20)
         title.setStyleSheet("color:#f0fbff;font:600 9pt 'Segoe UI';")
         layout.addWidget(title)
-        layout.addWidget(QtWidgets.QLabel("Editable backup" if project.backup else "Presentation only"))
-        layout.addWidget(QtWidgets.QLabel(project.recipient))
-        self.location_label = QtWidgets.QLabel(location)
-        self.publication_label = QtWidgets.QLabel("Published" if project.presentation else "Publication not found")
-        for label, color in ((self.location_label, kind),
-                             (self.publication_label, "published" if project.presentation else "draft")):
-            label.setFixedHeight(20)
-            label.setAlignment(QtCore.Qt.AlignCenter)
-            label.setProperty("themeIndependent", True)
-            label.setStyleSheet(badge_style(color))
-            layout.addWidget(label)
-        layout.addWidget(QtWidgets.QLabel(version if version != "Not compared" else ""))
+        recipient = QtWidgets.QLabel()
+        recipient.setText(recipient.fontMetrics().elidedText(project.recipient, QtCore.Qt.ElideRight, 192))
+        recipient.setFixedHeight(18)
+        layout.addWidget(recipient)
+        timestamp = (project.backup or project.presentation).timestamp
+        try:
+            timestamp = datetime.fromisoformat(timestamp).astimezone().strftime("%b %d, %Y")
+        except ValueError:
+            timestamp = timestamp[:10]
+        date = QtWidgets.QLabel(timestamp)
+        date.setFixedHeight(14)
+        layout.addWidget(date)
         for label in self.findChildren(QtWidgets.QLabel):
             label.setTextFormat(QtCore.Qt.PlainText)
             label.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
-        self.setToolTip(project.title + "\n" + location + "\nDouble-click to download.")
+        set_card_status(self, (location, "both" if location == "Local + GitHub" else kind),
+                        ("Published", "published") if project.presentation else ("Unpublished", "draft"))
+        self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        paint_card_status(self)
+
+    def set_cover(self, path):
+        from pathlib import Path
+        if path and Path(path).is_file():
+            image = QtGui.QImageReader(str(path))
+            size = image.size()
+            if size.isValid():
+                image.setScaledSize(size.scaled(192, 192, QtCore.Qt.KeepAspectRatio))
+            pixmap = QtGui.QPixmap.fromImage(image.read())
+            if not pixmap.isNull():
+                self.cover.setPixmap(pixmap)
 
     def set_selected(self, selected):
         self.setProperty("selected", selected)
@@ -89,6 +112,10 @@ class GitHubLetterCard(QtWidgets.QFrame):
 
 
 class GitHubLibraryController(QtCore.QObject):
+    _listing_ready = QtCore.Signal(int, object)
+    _cover_ready = QtCore.Signal(int, str, object)
+    REFRESH_TIMEOUT_MS = 60000
+
     def __init__(self, controller):
         super().__init__(controller)
         self.controller = controller
@@ -99,19 +126,26 @@ class GitHubLibraryController(QtCore.QObject):
         self.selected_id = ""
         self.account = None
         self.working = False
+        self.covers = {}
+        self._refresh_thread = None
+        self._refresh_worker = None
+        self._refresh_cancel = Event()
+        self._refresh_id = 0
+        self._retry_pending = False
+        self._refresh_deferred = False
+        self._awaiting_auth = False
+        self._refresh_timer = QtCore.QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._refresh_timed_out)
+        self._listing_ready.connect(self._show_listing, QtCore.Qt.QueuedConnection)
+        self._cover_ready.connect(self._show_cover, QtCore.Qt.QueuedConnection)
         self.download_root = application_paths(self.forge.project_root).saved_letters_root / "GitHub Downloads"
-        self.refresh_button = QtWidgets.QPushButton("Refresh GitHub")
-        self.refresh_button.clicked.connect(self.refresh)
-        controller.row.insertWidget(2, self.refresh_button)
-        self.status = QtWidgets.QLabel()
-        self.status.setTextFormat(QtCore.Qt.PlainText)
-        self.status.setWordWrap(True)
-        self.status.setMaximumHeight(45)
-        self.forge.saved_panel.layout().insertWidget(
-            self.forge.saved_panel.layout().indexOf(controller.details), self.status)
+        self.status = controller.details
+        self.retry_button = QtWidgets.QPushButton("Retry GitHub", self.forge.saved_panel)
+        self.retry_button.clicked.connect(self.retry)
+        controller.row.insertWidget(1, self.retry_button)
+        self.retry_button.hide()
         controller.menu.addSeparator()
-        self.download_project_action = controller.menu.addAction("Download Separate Editable Copy", self.download_project)
-        self.download_presentation_action = controller.menu.addAction("Download Published Presentation", self.download_presentation)
         self.open_action = controller.menu.addAction("Open Published Letter", self.open_online)
         self.backup_action = controller.menu.addAction("Back Up Open Project to GitHub", self.backup_current)
         controller.menu.addAction("GitHub Account", self.forge.show_github_account)
@@ -119,18 +153,30 @@ class GitHubLibraryController(QtCore.QObject):
         self.update_selection()
 
     def _session(self):
-        return self.forge._github_service.snapshot.session
+        snapshot = self.forge._github_service.snapshot
+        return snapshot.session if snapshot.state == GitHubConnectionState.CONNECTED else None
 
     def account_changed(self, snapshot):
         if snapshot.account is None or snapshot.account.account_id != self.account:
+            self._refresh_cancel.set()
             self.rows.clear()
             self.selected_id = ""
             self.account = None
             self.sync_cards()
-            self.status.setText("Connect GitHub to see online letters here." if snapshot.account is None
-                                else "Select Refresh GitHub to load this account's letters.")
-            if snapshot.account is not None and self.forge.saved_panel.isVisible() and not self.working:
-                self.forge._defer_until_idle(self.refresh)
+            if snapshot.state not in {GitHubConnectionState.CONNECTED, GitHubConnectionState.CONNECTING, GitHubConnectionState.RECONNECTING}:
+                self._refresh_timer.stop()
+                self._refresh_error(snapshot.message or "Sign in using GitHub Account to load your online letters.")
+        if self._awaiting_auth and snapshot.state == GitHubConnectionState.CONNECTED:
+            self._awaiting_auth = False
+            self.refresh()
+        elif self._awaiting_auth and snapshot.state not in {
+            GitHubConnectionState.CONNECTING, GitHubConnectionState.RECONNECTING,
+        }:
+            self._refresh_timer.stop()
+            self._awaiting_auth = False
+            self._refresh_error(snapshot.message or "Sign in using GitHub Account, then retry.")
+        elif snapshot.account is not None and snapshot.account.account_id != self.account and self.forge.saved_panel.isVisible():
+            self.refresh()
 
     def selected(self):
         session = self._session()
@@ -153,8 +199,6 @@ class GitHubLibraryController(QtCore.QObject):
     def download_selected(self):
         downloaded = self.downloads.get(self.selected_id)
         row = self.selected()
-        if not downloaded and row and not row[0].backup:
-            downloaded = self._download_for(row[0])
         if downloaded:
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(downloaded[1] / "index.html")))
             return
@@ -168,18 +212,23 @@ class GitHubLibraryController(QtCore.QObject):
                      and value[0].marker_sha == project.presentation.marker_sha
                      and value[2].casefold() == session.account.login.casefold()), None)
 
-    def _run(self, activity, operation, success):
+    def _run(self, activity, operation, success, *, quiet=False):
         session = self._session()
         if session is None:
-            self.status.setText("Connect GitHub through Project Actions, then select Refresh GitHub.")
+            self.controller._status("Connect GitHub to open this letter.", error=True)
             return False
         if self.working or self.forge._busy:
             return False
+        self._refresh_cancel.set()
         account = session.account.account_id
         generation = self.forge._github_service.snapshot.generation
         self.account, self.working = account, True
         self.status.setStyleSheet("")
-        self.status.setText(activity)
+        self.status.hide()
+        self.retry_button.hide()
+        if not quiet:
+            self.status.setText(activity)
+            self.status.show()
         self.update_selection()
 
         def cancelled():
@@ -189,11 +238,13 @@ class GitHubLibraryController(QtCore.QObject):
                     or current.generation != generation)
 
         def work():
-            library = GitHubLibrary(session, self.forge._github_service.authorized_api(session), cancelled=cancelled)
+            library = GitHubLibrary(session, self.forge._github_service.authorized_api(session), cancelled=cancelled,
+                                    store=DestinationStore(self.forge.project_root))
             return operation(library)
 
         def finished(value):
             self.working = False
+            self.status.hide()
             if cancelled():
                 self.account_changed(self.forge._github_service.snapshot)
             else:
@@ -204,26 +255,73 @@ class GitHubLibraryController(QtCore.QObject):
             self.working = False
             if cancelled():
                 self.account_changed(self.forge._github_service.snapshot)
-            self.status.setText(self.controller.details.text())
+            self.status.show()
             self.status.setStyleSheet(badge_style("error"))
             self.update_selection()
 
-        return self.controller._run(activity, work, finished, failed=failed)
+        return self.controller._run(activity, work, finished, failed=failed, quiet=quiet)
 
     def refresh(self):
-        if self.working or self.forge._saved_panel_mode == "stock":
+        if self.working or self.forge._shutdown or self.forge._saved_panel_mode == "stock":
+            return
+        if self._refresh_thread is not None:
+            if self._refresh_cancel.is_set():
+                self._retry_pending = True
             return
         if self.forge._busy:
-            self.forge._defer_until_idle(self.refresh)
+            if not self._refresh_deferred:
+                self._refresh_deferred = True
+                def later():
+                    self._refresh_deferred = False
+                    self.refresh()
+                self.forge._defer_until_idle(later)
             return
         session = self._session()
         if session is None:
-            self.account_changed(self.forge._github_service.snapshot)
+            snapshot = self.forge._github_service.snapshot
+            if snapshot.state in {GitHubConnectionState.CONNECTING, GitHubConnectionState.RECONNECTING}:
+                self._awaiting_auth = True
+                self.status.setText("Connecting to GitHub… Local letters remain available.")
+                self.status.show()
+                if not self._refresh_timer.isActive():
+                    self._refresh_timer.start(self.REFRESH_TIMEOUT_MS)
+            else:
+                self._refresh_error(snapshot.message or "Sign in using GitHub Account to load your online letters.")
             return
 
-        def load(library):
+        from Forge_Tab import _TaskWorker
+        self._awaiting_auth = False
+        self.account = session.account.account_id
+        generation = self.forge._github_service.snapshot.generation
+        self._refresh_id += 1
+        refresh_id = self._refresh_id
+        cancel = self._refresh_cancel = Event()
+        deadline = monotonic() + self.REFRESH_TIMEOUT_MS / 1000
+        # The local catalog is already loaded. Listing GitHub must not rehash
+        # downloaded letters or hold Forge's global project-operation lock.
+        local = tuple(self.forge._rendered_catalog_entries)
+        self.status.setStyleSheet("")
+        self.status.setText("Loading GitHub letters…")
+        self.status.show()
+        self.retry_button.hide()
+        self._refresh_timer.start(self.REFRESH_TIMEOUT_MS)
+        _LOGGER.info("[Saved Letters] GitHub listing started; local controls remain available.")
+
+        def cancelled():
+            current = self.forge._github_service.snapshot
+            return (cancel.is_set() or current.session is None
+                    or current.session.account.account_id != session.account.account_id
+                    or current.generation != generation)
+
+        def load():
+            api = self.forge._github_service.authorized_api(session)
+            if hasattr(api, "timeout"):
+                api.timeout = min(api.timeout, 10.0)
+            library = GitHubLibrary(session, api, cancelled=cancelled,
+                store=DestinationStore(self.forge.project_root), deadline=deadline)
             projects, warnings = library.discover()
-            local = SavedLetterCatalog(self.forge.project_root).list_entries(force_refresh=True)
+            _LOGGER.info("[Saved Letters] GitHub metadata loaded: projects=%s warnings=%s elapsed=%.2fs",
+                         len(projects), len(warnings), monotonic() - (deadline - self.REFRESH_TIMEOUT_MS / 1000))
             downloads = downloaded_presentations(self.download_root)
             by_id = {}
             for entry in local:
@@ -232,22 +330,7 @@ class GitHubLibraryController(QtCore.QObject):
             for project in projects:
                 copies = by_id.get(project.project_id, [])
                 location, kind = ("Local + GitHub", "local") if copies else ("GitHub only", "github")
-                version, version_kind = "Not compared", "draft"
-                if any(not entry.valid for entry in copies):
-                    version, version_kind = "Files damaged", "error"
-                elif project.backup and any(entry.canonical for entry in copies):
-                    try:
-                        digests = {project_digest(ProjectRepository(entry.path / ".lettersmith-project").load())
-                                   for entry in copies if entry.canonical}
-                        version, version_kind = (("Matching backup", "local") if digests == {project.backup.digest}
-                                                 else ("Compare versions", "different"))
-                    except Exception:
-                        version, version_kind = "Files damaged", "error"
-                elif project.presentation and copies:
-                    fingerprints = {entry.published_source_fingerprint for entry in copies}
-                    if project.presentation.fingerprint and (project.presentation.fingerprint not in fingerprints
-                            or any("not published" in entry.saved_publication_state for entry in copies)):
-                        version, version_kind = "Compare versions", "different"
+                version, version_kind = "", "draft"
                 if project.presentation:
                     path = library.presentation_path(project.presentation, self.download_root)
                     previous = [item for item in downloads.values()
@@ -255,28 +338,115 @@ class GitHubLibraryController(QtCore.QObject):
                                 and item[2].casefold() == library.owner.casefold()]
                     if previous and not path.exists():
                         location, kind = "Local + GitHub", "local"
-                        version, version_kind = "Compare versions", "different"
+
                     if path.exists():
-                        try:
-                            library.download_presentation(project.presentation, self.download_root)
-                            location, kind = "Local + GitHub", "local"
-                        except (OSError, ValueError):
-                            location, kind = "Download damaged", "error"
+                        location, kind = (("Local + GitHub", "local") if (path / "index.html").is_file()
+                                          else ("Download damaged", "error"))
                 rows.append((project, location, kind, version, version_kind, copies))
-            return rows, warnings
+            library._check()
+            self._listing_ready.emit(refresh_id, (rows, warnings))
+            # Covers arrive after the usable listing, never as a prerequisite.
+            for row in rows:
+                try:
+                    library._check()
+                    cover = library.cover_preview(row[0],
+                        application_paths(self.forge.project_root).cache_root / "github-covers")
+                    library._check()
+                    self._cover_ready.emit(refresh_id, row[0].project_id, cover)
+                except GitHubOperationError:
+                    break
+                except (OSError, ValueError, TypeError, KeyError):
+                    pass
+            return refresh_id
 
-        def loaded(result):
-            rows, warnings = result
-            self.rows = {row[0].project_id: row for row in rows}
-            count = f"{len(rows)} letter" + ("" if len(rows) == 1 else "s")
-            self.status.setText(f"GitHub · {session.account.login} · {count}" +
-                                (" · Some letters could not be checked. See details." if warnings else ""))
+        thread = self._refresh_thread = QtCore.QThread(self)
+        worker = self._refresh_worker = _TaskWorker(load)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.failed.connect(self._refresh_failed, QtCore.Qt.QueuedConnection)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit, QtCore.Qt.DirectConnection)
+        thread.finished.connect(self._refresh_finished, QtCore.Qt.QueuedConnection)
+        thread.start()
+
+    @QtCore.Slot(int, object)
+    def _show_listing(self, refresh_id, result):
+        if refresh_id != self._refresh_id or self._refresh_cancel.is_set() or self.forge._shutdown:
+            return
+        self._refresh_timer.stop()
+        rows, warnings = result
+        self.rows = {row[0].project_id: row for row in rows}
+        self.status.hide()
+        if warnings:
+            self._refresh_error("Some GitHub letters could not be loaded: " + warnings[0])
             self.status.setToolTip("\n".join(warnings))
-            if warnings:
-                self.controller.details.setText("\n".join(warnings[:3]))
-            self.sync_cards()
+        self.sync_cards()
 
-        self._run("Checking GitHub letters…", load, loaded)
+    @QtCore.Slot(int, str, object)
+    def _show_cover(self, refresh_id, project_id, path):
+        if refresh_id != self._refresh_id or self._refresh_cancel.is_set() or self.forge._shutdown:
+            return
+        self.covers[project_id] = path
+        for card in self.cards:
+            if card.key == project_id:
+                card.set_cover(path)
+
+    def _refresh_error(self, message):
+        self.status.setText(message + " Your local letters remain available.")
+        self.status.setStyleSheet(badge_style("error"))
+        self.status.show()
+        self.retry_button.show()
+
+    def _refresh_timed_out(self):
+        self._awaiting_auth = False
+        self._retry_pending = False
+        self._refresh_cancel.set()
+        _LOGGER.warning("[Saved Letters] GitHub listing timed out; late results will be ignored.")
+        self._refresh_error("GitHub took too long to load your letters. Check your connection and choose Retry GitHub.")
+
+    @QtCore.Slot(str, str, bool)
+    def _refresh_failed(self, message, _technical, _safe):
+        self._refresh_timer.stop()
+        if not self._refresh_cancel.is_set() and not self.forge._shutdown:
+            _LOGGER.warning("[Saved Letters] GitHub listing failed: %s", message)
+            self._refresh_error(message or "GitHub could not load your letters. Please retry.")
+
+    @QtCore.Slot()
+    def _refresh_finished(self):
+        thread = self._refresh_thread
+        self._refresh_thread = self._refresh_worker = None
+        self._refresh_timer.stop()
+        if thread is not None:
+            thread.deleteLater()
+        if self._retry_pending and not self.forge._shutdown:
+            self._retry_pending = False
+            self.refresh()
+
+    def retry(self):
+        if self._refresh_thread is not None:
+            self._refresh_cancel.set()
+            self._retry_pending = True
+            self.status.setText("Stopping the previous request before retrying GitHub…")
+            self._refresh_timer.start(self.REFRESH_TIMEOUT_MS)
+        elif self._session() is None:
+            self._awaiting_auth = True
+            self.status.setText("Connecting to GitHub… Local letters remain available.")
+            self.status.show()
+            self._refresh_timer.start(self.REFRESH_TIMEOUT_MS)
+            self.forge._validate_github_account_async()
+        else:
+            self.refresh()
+
+    def shutdown(self, timeout_ms=None):
+        self._refresh_timer.stop()
+        self._retry_pending = self._awaiting_auth = False
+        self._refresh_cancel.set()
+        thread = self._refresh_thread
+        if thread is not None and thread.isRunning():
+            thread.requestInterruption()
+            thread.quit()
+            return thread.wait() if timeout_ms is None else thread.wait(max(0, timeout_ms))
+        return True
 
     def sync_cards(self):
         for card in self.cards:
@@ -290,6 +460,9 @@ class GitHubLibraryController(QtCore.QObject):
                 if project_id in local_ids:
                     continue
                 card = GitHubLetterCard(*row[:4], self.forge.saved_cards_widget)
+                card.customContextMenuRequested.connect(
+                    lambda point, card=card: self.controller.show_context_menu(card, point))
+                card.set_cover(self.covers.get(project_id))
                 card.selected.connect(self.select)
                 card.activated.connect(self.activate)
                 self.cards.append(card)
@@ -305,6 +478,10 @@ class GitHubLibraryController(QtCore.QObject):
                     "Local" if available else "Files damaged", "local" if available else "error",
                     "Downloaded presentation", self.forge.saved_cards_widget)
                 card.key = key
+                card.customContextMenuRequested.connect(
+                    lambda point, card=card: self.controller.show_context_menu(card, point))
+                from publishing.github_library import presentation_cover
+                card.set_cover(presentation_cover(copy, path))
                 card.selected.connect(self.select)
                 card.activated.connect(self.activate)
                 self.cards.append(card)
@@ -322,56 +499,25 @@ class GitHubLibraryController(QtCore.QObject):
             self.selected_id = ""
         row = self.selected()
         ready = row is not None and not self.working and not self.forge._busy
-        self.refresh_button.setEnabled(not self.working and not self.forge._busy)
-        self.download_project_action.setEnabled(bool(ready and row[0].backup))
-        self.download_presentation_action.setEnabled(bool(ready and row[0].presentation))
         self.open_action.setEnabled(bool(ready and row[0].presentation))
         self.backup_action.setEnabled(bool(self._session() and not self.working and not self.forge.is_protected_project()))
         self.controller.open_button.setText("Open Project")
         if local is None:
-            self.controller.open_button.setEnabled(False)
-        if local is None and row:
-            self.controller.open_button.setText("Download Project" if row[0].backup else "Download Presentation")
-            self.controller.open_button.setEnabled(ready)
-            project = row[0]
-            self.controller.details.setText(
-                f"{project.title}\n{row[1]} · {row[3]}\n" +
-                (f"Editable backup: {project.backup.timestamp}" if project.backup else
-                 "Presentation only. Back up the original editable project on its source computer to edit it here."))
-        if row and row[3] == "Compare versions":
-            project = row[0]
-            dates = [entry.modified_at.astimezone().strftime("%Y-%m-%d %H:%M") for entry in row[5]]
-            dates.extend(copy.timestamp for copy, _path, _owner in self.downloads.values()
-                         if copy.project_id == project.project_id)
-            remote_date = (project.backup or project.presentation).timestamp
-            self.controller.details.setText(self.controller.details.text().split("\nLocal: ", 1)[0] +
-                f"\nLocal: {', '.join(dates)} · GitHub: {remote_date}. Downloads keep both versions.")
-        downloaded = self.downloads.get(self.selected_id)
-        if not downloaded and row and not row[0].backup:
-            downloaded = self._download_for(row[0])
-        if local is None and downloaded:
-            self.controller.open_button.setText("Open Downloaded Letter")
-            self.controller.open_button.setEnabled(not self.working and not self.forge._busy
-                                                    and (downloaded[1] / "index.html").is_file())
-            self.controller.details.setText(f"{downloaded[0].title}\nDownloaded presentation · Available offline\n{downloaded[1]}")
+            downloaded = self.downloads.get(self.selected_id)
+            self.controller.open_button.setEnabled(bool(ready or (downloaded and
+                (downloaded[1] / "index.html").is_file() and not self.working and not self.forge._busy)))
         for card in self.cards:
             card.set_selected(card.key == self.selected_id)
             card.setEnabled(not self.working)
         for card in self.forge._saved_cards:
+            from library_status import local_badges
+            location, publication = local_badges(card.entry)
             remote = self.rows.get(card.entry.project_id)
-            card.update_entry(card.entry)
-            if remote:
-                card.status_label.setText("Saved draft · GitHub" if card.entry.canonical else "Local + GitHub")
-                if remote[0].presentation:
-                    card.publication_label.setText("Published")
-                    card.publication_label.setStyleSheet(badge_style("published"))
-                if remote[3] != "Not compared":
-                    card.state_label.setText(remote[3])
-                    card.state_label.setStyleSheet(badge_style(remote[4]))
-            else:
-                card.state_label.setStyleSheet("")
-                card.state_label.setText("Currently open" if card.property("currentProject")
-                                         else "Selected" if card.entry == local else "")
+            if remote and not (card.entry.example or card.entry.stock):
+                location = ("Local + GitHub", "both")
+                if remote[0].presentation and publication[1] != "different":
+                    publication = ("Published", "published")
+            set_card_status(card, location, publication)
 
     def download_project(self):
         row = self.selected()
@@ -380,25 +526,45 @@ class GitHubLibraryController(QtCore.QObject):
         project = row[0]
         def completed(path):
             self.forge._refresh_catalog_entry(path)
-            self.controller._status("Editable project downloaded. Select its card to open it.")
-            self.status.setText("Editable project downloaded; your open project is unchanged.")
             self.selected_id = ""
             self.forge._selected_saved_letter = self.forge.catalog._entry(path)
             self.controller.selected_changed()
-            self.forge._defer_until_idle(self.refresh)
-        self._run("Downloading editable project…",
-            lambda library: library.download_project(project.backup, self.controller.service.editable_root, as_copy=bool(row[5])), completed)
+            def open_downloaded():
+                selected = self.forge._selected_saved_letter
+                if selected is not None and selected.path == path:
+                    self.controller.open_selected()
+            self.forge._defer_until_idle(open_downloaded)
+        def retrieve(library):
+            current = self._latest(library, project.project_id)
+            if not current.backup:
+                raise ValueError("This editable project is no longer available on GitHub.")
+            destination = self.controller.service.editable_root / current.project_id
+            if destination.exists():
+                return destination
+            return library.download_project(current.backup, self.controller.service.editable_root)
+        return self._run("Opening project…", retrieve, completed)
 
     def download_presentation(self):
         row = self.selected()
         if not row or not row[0].presentation or self.working:
             return
         def completed(path):
-            self.status.setText(f"Presentation downloaded to {path}")
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path / "index.html")))
             self.forge._defer_until_idle(self.refresh)
-        self._run("Downloading presentation…",
-            lambda library: library.download_presentation(row[0].presentation, self.download_root), completed)
+        def retrieve(library):
+            current = self._latest(library, row[0].project_id)
+            if not current.presentation:
+                raise ValueError("This published letter is no longer available on GitHub.")
+            return library.download_presentation(current.presentation, self.download_root)
+        return self._run("Opening letter…", retrieve, completed)
+
+    @staticmethod
+    def _latest(library, project_id):
+        projects, warnings = library.discover()
+        project = next((item for item in projects if item.project_id == project_id), None)
+        if project is None:
+            raise ValueError(warnings[0] if warnings else "This letter is no longer available on GitHub.")
+        return project
 
     def open_online(self):
         row = self.selected()
@@ -411,7 +577,7 @@ class GitHubLibraryController(QtCore.QObject):
         try:
             capture = self.controller.service.capture_editable_save()
         except Exception as error:
-            self.status.setText(str(error))
+            self.controller._status(str(error), error=True)
             return
         row = self.rows.get(capture.project.project_id)
         remote = row[0].backup if row else None
@@ -423,7 +589,7 @@ class GitHubLibraryController(QtCore.QObject):
             if choice != QtWidgets.QMessageBox.Yes:
                 return
         def completed(_project_id):
-            self.status.setText("Editable project backed up privately to GitHub.")
+            self.controller._status("Project backed up to GitHub.")
             self.forge._defer_until_idle(self.refresh)
         self._run("Backing up editable project…",
             lambda library: library.backup_project(capture, expected_marker=remote.marker_sha if remote else ""), completed)

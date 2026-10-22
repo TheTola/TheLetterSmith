@@ -18,6 +18,7 @@ import random
 import re
 import shutil
 import time
+from uuid import NAMESPACE_URL, uuid4, uuid5
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -100,6 +101,9 @@ PROMPT_COLORS: Dict[str, str] = {
     "subject": "#FF5C7A",
     "scheme": "#35D07F",
     "helpful": "#32C7E8",
+    "style_bias": "#D6A0D9",
+    "clean_output": "#A8CE6B",
+    "framing": "#70B8B0",
     "global": "#E5E7EB",
     "cover": "#FFD54A",
     "letter": "#4D8DFF",
@@ -359,8 +363,12 @@ class PromptPayload:
             paragraphs.append(_as_prompt_sentence(self.baseline))
         if self.color_choice.strip():
             paragraphs.append(f"Use the {self.color_choice.strip()} palette.")
+        else:
+            paragraphs.append("Choose a color scheme that suits the composition.")
         if self.type_choice.strip():
             paragraphs.append(f"Use {self.type_choice.strip()} as the visual style.")
+        else:
+            paragraphs.append("Choose an illustration style that suits the page and its intended purpose.")
         if self.global_extra.strip():
             paragraphs.append(f"Shared visual direction: {self.global_extra.strip()}")
         if self.image_extra.strip():
@@ -379,6 +387,23 @@ class ManagedListEntry:
     text: str
     is_header: bool = False
     is_user: bool = False
+    identity: str = ""
+
+
+def _group_managed_entries(entries: List[ManagedListEntry]) -> List[ManagedListEntry]:
+    """Keep custom options first and omit every empty heading."""
+    custom = [entry for entry in entries if entry.is_user and not entry.is_header]
+    result = [ManagedListEntry(USER_ADDED_HEADER, True, True), *custom] if custom else []
+    header = None
+    for entry in entries:
+        if entry.is_header:
+            header = entry if entry.text != USER_ADDED_HEADER else None
+        elif not entry.is_user:
+            if header is not None:
+                result.append(header)
+                header = None
+            result.append(entry)
+    return result
 
 
 class HeaderAwareItemDelegate(QtWidgets.QStyledItemDelegate):
@@ -513,9 +538,10 @@ class ListManagerDialog(QtWidgets.QDialog):
     ) -> None:
         super().__init__(parent)
         self._entries: List[ManagedListEntry] = [
-            ManagedListEntry(entry.text, entry.is_header, entry.is_user)
-            for entry in entries
+            replace(entry, identity=entry.identity or uuid4().hex)
+            for entry in _group_managed_entries(entries)
         ]
+        self._editing_id = None
         self._allow_headers = bool(allow_headers)
         self._auto_user_header = _normalize_text(auto_user_header, strip=True, max_length=120)
         self._user_owned_only = bool(user_owned_only)
@@ -547,10 +573,18 @@ class ListManagerDialog(QtWidgets.QDialog):
 
         title_label = QtWidgets.QLabel(f"Manage {title}", self)
         title_label.setObjectName("managerTitle")
-        root.addWidget(title_label)
+        title_row = QtWidgets.QHBoxLayout()
+        title_row.addWidget(title_label, 1)
+        self.btn_removal_mode = QtWidgets.QToolButton(self)
+        self.btn_removal_mode.setText("−")
+        self.btn_removal_mode.setCheckable(True)
+        self.btn_removal_mode.setAccessibleName("Toggle removal mode")
+        self.btn_removal_mode.setToolTip("Show or hide removal buttons")
+        title_row.addWidget(self.btn_removal_mode)
+        root.addLayout(title_row)
 
         hint_label = QtWidgets.QLabel(
-            "Select an entry to update or remove it. New entries are saved to your library.",
+            "Add a new option, or select a User Added option to update it.",
             self,
         )
         hint_label.setObjectName("managerHint")
@@ -560,6 +594,8 @@ class ListManagerDialog(QtWidgets.QDialog):
         self.list_widget = QtWidgets.QListWidget(self)
         self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.list_widget.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.list_widget.setMouseTracking(True)
+        self.list_widget.viewport().installEventFilter(self)
         root.addWidget(self.list_widget, 1)
 
         form = QtWidgets.QHBoxLayout()
@@ -573,14 +609,13 @@ class ListManagerDialog(QtWidgets.QDialog):
         button_row.setSpacing(8)
         self.btn_add = QtWidgets.QPushButton("Add", self)
         self.btn_update = QtWidgets.QPushButton("Update", self)
-        self.btn_remove = QtWidgets.QPushButton("Remove", self)
         set_control_help(
             self.entry_edit,
             "Enter the option text you want to add or use to update the selected entry.",
         )
         set_control_help(
             self.list_widget,
-            "Select a saved option to edit or remove it.",
+            "Select a User Added option to edit or remove it.",
         )
         set_control_help(
             self.btn_add,
@@ -590,21 +625,17 @@ class ListManagerDialog(QtWidgets.QDialog):
             self.btn_update,
             "Replace the selected option with the entered text.",
         )
-        set_control_help(
-            self.btn_remove,
-            "Remove the selected option from this Prompt Writer list.",
-        )
         button_row.addWidget(self.btn_add)
         button_row.addWidget(self.btn_update)
-        button_row.addWidget(self.btn_remove)
         button_row.addStretch(1)
         root.addLayout(button_row)
 
         self.list_widget.currentRowChanged.connect(self._sync_editor_from_selection)
-        self.list_widget.itemDoubleClicked.connect(lambda *_: self.entry_edit.setFocus())
+        self.list_widget.itemEntered.connect(self._hover_entry)
         self.btn_add.clicked.connect(self._add_entry)
         self.btn_update.clicked.connect(self._update_entry)
-        self.btn_remove.clicked.connect(self._remove_entry)
+        self.btn_removal_mode.toggled.connect(self._toggle_removal_mode)
+        self.entry_edit.textChanged.connect(self._sync_button_state)
         self.entry_edit.returnPressed.connect(self._submit_from_enter)
 
         self._base_stylesheet = """
@@ -693,6 +724,17 @@ class ListManagerDialog(QtWidgets.QDialog):
                 item.setForeground(self._header_color)
 
     def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if event.type() == QtCore.QEvent.MouseMove and hasattr(self, "list_widget"):
+            if obj is self.list_widget.viewport():
+                item = self.list_widget.itemAt(event.position().toPoint())
+            elif obj.property("optionIdentity"):
+                row = next((i for i, entry in enumerate(self._entries)
+                            if entry.identity == obj.property("optionIdentity")), -1)
+                item = self.list_widget.item(row)
+            else:
+                item = None
+            if item is not None:
+                self._hover_entry(item)
         if self.isVisible() and event.type() == QtCore.QEvent.MouseButtonPress:
             try:
                 pos = event.globalPosition().toPoint()
@@ -745,9 +787,23 @@ class ListManagerDialog(QtWidgets.QDialog):
         return 0 <= row < len(self._entries) and not self._entries[row].is_header
 
     def _is_editable_row(self, row: int) -> bool:
-        return self._is_selectable_row(row) and (
-            not self._user_owned_only or self._entries[row].is_user
-        )
+        return self._is_selectable_row(row) and self._entries[row].is_user
+
+    def _editing_row(self) -> int:
+        return next((i for i, entry in enumerate(self._entries)
+                     if entry.identity == self._editing_id and entry.is_user and not entry.is_header), -1)
+
+    def _hover_entry(self, item: QtWidgets.QListWidgetItem) -> None:
+        # Hover may start editing, but never replaces a draft or an established target.
+        if self._editing_id is not None or self.entry_edit.text() or self.entry_edit.hasFocus():
+            return
+        row = self.list_widget.row(item)
+        if self._is_editable_row(row):
+            self.list_widget.setCurrentRow(row)
+
+    def _toggle_removal_mode(self, active: bool) -> None:
+        for button in self.list_widget.findChildren(QtWidgets.QToolButton, "removeOption"):
+            button.setVisible(active)
 
     def _duplicate_conflict(self, text: str, *, exclude_row: int = -1) -> Optional[str]:
         candidate = _managed_entry_key(text)
@@ -789,9 +845,8 @@ class ListManagerDialog(QtWidgets.QDialog):
     def _insert_under_auto_header(self, entry: ManagedListEntry) -> int:
         header_index = self._header_index()
         if header_index < 0:
-            self._entries.append(ManagedListEntry(self._auto_user_header, True))
-            self._entries.append(entry)
-            return len(self._entries) - 1
+            self._entries[0:0] = [ManagedListEntry(self._auto_user_header, True, True), entry]
+            return 1
 
         insert_at = header_index + 1
         while insert_at < len(self._entries) and not self._entries[insert_at].is_header:
@@ -816,10 +871,15 @@ class ListManagerDialog(QtWidgets.QDialog):
 
     def _refresh_list(self, preferred_row: Optional[int] = None) -> None:
         current_row = self._selected_row() if preferred_row is None else preferred_row
+        current_item = self.list_widget.currentItem()
+        selected_id = (current_item.data(Qt.UserRole) if current_item else None) if preferred_row is None else (
+            self._entries[current_row].identity if 0 <= current_row < len(self._entries) else None)
+        self._entries = _group_managed_entries(self._entries)
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         for entry in self._entries:
             item = QtWidgets.QListWidgetItem(entry.text)
+            item.setData(Qt.UserRole, entry.identity)
             item.setData(MANAGED_LIST_HEADER_ROLE, entry.is_header)
             if entry.is_header:
                 item.setFlags(Qt.ItemIsEnabled)
@@ -828,39 +888,54 @@ class ListManagerDialog(QtWidgets.QDialog):
                 item.setFont(font)
                 item.setForeground(self._header_color)
             self.list_widget.addItem(item)
+            if not entry.is_header:
+                row_widget = QtWidgets.QWidget(self.list_widget)
+                row_widget.setProperty("optionIdentity", entry.identity)
+                row_widget.setMouseTracking(True)
+                row_widget.installEventFilter(self)
+                row_layout = QtWidgets.QHBoxLayout(row_widget)
+                row_layout.setContentsMargins(4, 0, 2, 0)
+                label = QtWidgets.QLabel(entry.text, row_widget)
+                label.setTextFormat(Qt.PlainText)
+                label.setMinimumWidth(0)
+                label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+                label.setAttribute(Qt.WA_TransparentForMouseEvents)
+                row_layout.addWidget(label, 1)
+                if entry.is_user:
+                    button = QtWidgets.QToolButton(row_widget)
+                    button.setObjectName("removeOption")
+                    button.setText("×")
+                    button.setAccessibleName(f"Remove {entry.text}")
+                    button.clicked.connect(lambda _checked=False, identity=entry.identity: self._remove_entry(identity))
+                    button.setVisible(self.btn_removal_mode.isChecked())
+                    row_layout.addWidget(button)
+                item.setText("")
+                item.setSizeHint(QtCore.QSize(0, 30))
+                self.list_widget.setItemWidget(item, row_widget)
+                item.setData(Qt.AccessibleTextRole, entry.text)
+        row = next((i for i, entry in enumerate(self._entries) if entry.identity == selected_id), -1)
+        self.list_widget.setCurrentRow(row)
         self.list_widget.blockSignals(False)
-
-        if self._entries:
-            row = self._nearest_selectable_row(max(0, min(current_row, len(self._entries) - 1)))
-            if row >= 0:
-                self.list_widget.setCurrentRow(row)
-            else:
-                self.list_widget.clearSelection()
-                self.entry_edit.clear()
-        else:
-            self.entry_edit.clear()
-        self._sync_editor_from_selection(self._selected_row())
+        if preferred_row is not None:
+            self._sync_editor_from_selection(row)
         self._sync_button_state()
 
     def _sync_editor_from_selection(self, row: int) -> None:
-        if self._is_selectable_row(row):
+        if self._is_editable_row(row):
             entry = self._entries[row]
+            self._editing_id = entry.identity
             self.entry_edit.setText(entry.text)
         else:
-            self.entry_edit.clear()
+            self._editing_id = None
         self._sync_button_state()
 
     def _sync_button_state(self) -> None:
-        has_selection = self._is_selectable_row(self._selected_row())
-        editable = self._is_editable_row(self._selected_row())
-        self.btn_update.setEnabled(editable)
-        self.btn_remove.setEnabled(editable)
+        has_text = bool(_clean_user_added_entry(self.entry_edit.text()))
+        self.btn_add.setEnabled(has_text)
+        self.btn_update.setEnabled(has_text and self._editing_row() >= 0)
 
     def _emit_entries_changed(self, *, selected_text: Optional[str] = None) -> bool:
-        entries = [
-            ManagedListEntry(entry.text, entry.is_header, entry.is_user)
-            for entry in self._entries
-        ]
+        entries = list(self._entries)
         if self._save_entries_callback is not None:
             if not self._save_entries_callback(entries, selected_text):
                 return False
@@ -868,7 +943,7 @@ class ListManagerDialog(QtWidgets.QDialog):
         return True
 
     def _submit_from_enter(self) -> None:
-        if self._is_editable_row(self._selected_row()):
+        if self._editing_row() >= 0:
             self._update_entry()
         else:
             self._add_entry()
@@ -886,11 +961,11 @@ class ListManagerDialog(QtWidgets.QDialog):
         previous_row = self._selected_row()
         draft_text = self.entry_edit.text()
         if self._allow_headers and self._auto_user_header:
-            insert_at = self._insert_under_auto_header(ManagedListEntry(entry.text, False, True))
+            insert_at = self._insert_under_auto_header(ManagedListEntry(entry.text, False, True, uuid4().hex))
         else:
             row = self._selected_row()
             insert_at = row + 1 if row >= 0 else len(self._entries)
-            self._entries.insert(insert_at, ManagedListEntry(entry.text, False, True))
+            self._entries.insert(insert_at, ManagedListEntry(entry.text, False, True, uuid4().hex))
         self._refresh_list(insert_at)
         if not self._emit_entries_changed(selected_text=entry.text):
             self._entries = previous_entries
@@ -900,7 +975,7 @@ class ListManagerDialog(QtWidgets.QDialog):
         play_ui_sound(UiSound.ADDED)
 
     def _update_entry(self) -> None:
-        row = self._selected_row()
+        row = self._editing_row()
         entry = self._current_form_entry()
         if row < 0 or entry is None or not self._is_editable_row(row):
             return
@@ -908,19 +983,32 @@ class ListManagerDialog(QtWidgets.QDialog):
         if conflict is not None:
             self._show_duplicate_notice(conflict)
             return
-        self._entries[row] = ManagedListEntry(entry.text, False, self._entries[row].is_user)
+        previous_entries = list(self._entries)
+        draft_text = self.entry_edit.text()
+        self._entries[row] = replace(self._entries[row], text=entry.text)
         self._refresh_list(row)
-        self._emit_entries_changed()
+        if not self._emit_entries_changed(selected_text=entry.text):
+            self._entries = previous_entries
+            self._refresh_list(row)
+            self.entry_edit.setText(draft_text)
 
-    def _remove_entry(self) -> None:
-        row = self._selected_row()
+    def _remove_entry(self, identity: Optional[str] = None) -> None:
+        if not self.btn_removal_mode.isChecked():
+            return
+        row = next((i for i, entry in enumerate(self._entries) if entry.identity == identity), -1)
         if not self._is_editable_row(row):
             return
+        previous_entries = list(self._entries)
+        removed = self._entries[row]
         del self._entries[row]
         self._cleanup_auto_header()
-        next_row = min(row, len(self._entries) - 1)
-        self._refresh_list(next_row)
-        self._emit_entries_changed()
+        if not self._emit_entries_changed():
+            self._entries = previous_entries
+            return
+        if self._editing_id == removed.identity:
+            self._editing_id = None
+            self.entry_edit.clear()
+        self._refresh_list()
         play_ui_sound(UiSound.REMOVED)
 
 
@@ -1341,8 +1429,11 @@ class GoldenCheckBox(QtWidgets.QCheckBox):
             path.lineTo(indicator.right() - 3.0, indicator.top() + 4.0)
             painter.drawPath(path)
 
-        painter.setPen(
-            QColor(
+        semantic_color = self.property("promptColor")
+        if semantic_color and self.isEnabled():
+            painter.setPen(QColor(semantic_color))
+        else:
+            painter.setPen(QColor(
                 str(
                     getattr(
                         tokens,
@@ -1350,8 +1441,7 @@ class GoldenCheckBox(QtWidgets.QCheckBox):
                         "#d9e6ec" if self.isEnabled() else "#667985",
                     )
                 )
-            )
-        )
+            ))
         painter.drawText(contents, Qt.AlignVCenter | Qt.AlignLeft, self.text())
         painter.end()
 
@@ -1483,6 +1573,8 @@ def _build_prompt_payload(
         s = _without_terminal_punctuation(_normalize_text(subject, strip=True, max_length=300))
         if s:
             subject_core = s
+    if not subject_core:
+        order_core = "Choose an appropriate subject for this page"
 
     payload = PromptPayload(
         page_key=page_key,
@@ -1952,32 +2044,26 @@ class PromptWriterPanel(QtWidgets.QWidget):
         return application_paths().workspace_root
 
     def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
-        if event.type() == QtCore.QEvent.MouseButtonDblClick:
-            list_key = obj.property("managed_list_key")
-            if isinstance(list_key, str) and list_key:
-                self._open_list_manager(list_key)
-                event.accept()
-                return True
         return super().eventFilter(obj, event)
 
     def _managed_list_config(self, key: str) -> dict:
         configs = {
             "type": {
-                "title": "Graphics & Illustration",
+                "title": "Illustration Styles",
                 "primary_name": "type.txt",
                 "allow_none": True,
                 "allow_headers": True,
                 "auto_user_header": USER_ADDED_HEADER,
             },
             "subject": {
-                "title": "Subject",
+                "title": "Subjects",
                 "primary_name": "topic.txt",
-                "allow_none": False,
-                "allow_headers": False,
-                "auto_user_header": None,
+                "allow_none": True,
+                "allow_headers": True,
+                "auto_user_header": USER_ADDED_HEADER,
             },
             "color": {
-                "title": "Color Scheme",
+                "title": "Color Schemes",
                 "primary_name": "color.txt",
                 "allow_none": True,
                 "allow_headers": True,
@@ -2068,25 +2154,78 @@ class PromptWriterPanel(QtWidgets.QWidget):
             return normalize(legacy_user)
         return []
 
-    def _read_managed_entries(self, key: str) -> List[ManagedListEntry]:
-        config = self._managed_list_config(key)
-        path = self._resolve_managed_list_path(key)
-        lines, _ = _read_list_file_cached(path)
+    def _managed_options_path(self, key: str) -> Path:
         if key == "color":
-            builtin_entries = [entry for entry in _parse_color_list_entries(lines) if not entry.is_user]
-            builtin_keys = {
-                _managed_entry_key(entry.text)
-                for entry in builtin_entries
-                if not entry.is_header
-            }
-            builtin_entries.append(ManagedListEntry(USER_ADDED_HEADER, True))
-            for text in self._load_user_colors():
-                item_key = _managed_entry_key(text)
-                if item_key and item_key not in builtin_keys:
-                    builtin_entries.append(ManagedListEntry(text, False, True))
-                    builtin_keys.add(item_key)
-            return builtin_entries
-        return _parse_managed_list_entries(lines, allow_headers=bool(config["allow_headers"]))
+            return self._user_colors_path()
+        return self._user_modules_dir() / f"user_{key}.json"
+
+    def _managed_library(self, key: str, *, strict: bool = False):
+        """Read bundled definitions plus the existing user library without rewriting either."""
+        config = self._managed_list_config(key)
+
+        def parse(path):
+            lines, _ = _read_list_file_cached(path)
+            if key == "color":
+                return _parse_color_list_entries(lines)
+            entries = _parse_managed_list_entries(lines, allow_headers=True)
+            in_user_group = False
+            result = []
+            seen = set()
+            for entry in entries:
+                if entry.is_header:
+                    in_user_group = entry.text.casefold() == USER_ADDED_HEADER.casefold()
+                text = "Encouragement" if key == "subject" and entry.text.casefold() == "discouragement" else entry.text
+                identity = (_managed_entry_key(text), entry.is_header)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                result.append(replace(entry, text=text, is_user=in_user_group))
+            return result
+
+        builtin_path = self._builtin_modules_dir() / config["primary_name"]
+        bundled = parse(builtin_path)
+        builtins = [entry for entry in bundled if not entry.is_user]
+        builtin_keys = {_managed_entry_key(entry.text) for entry in builtins if not entry.is_header}
+        legacy_path = self._resolve_managed_list_path(key)
+        legacy = parse(legacy_path)
+        custom = [entry.text for entry in legacy if not entry.is_header and
+                  (entry.is_user or _managed_entry_key(entry.text) not in builtin_keys)]
+        if key == "color":
+            custom = self._load_user_colors()
+        path = self._managed_options_path(key)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            if not isinstance(payload, dict) or payload.get("version", 1) != 1:
+                raise ValueError("Unsupported option library")
+            if "entries" in payload and (not isinstance(payload["entries"], list) or
+                    any(not isinstance(record, dict) or not isinstance(record.get("text"), str)
+                        or ("id" in record and not isinstance(record["id"], str)) for record in payload["entries"])):
+                raise ValueError("Invalid custom option records")
+        except (OSError, UnicodeError, ValueError) as error:
+            if strict:
+                raise
+            LOGGER.warning("Option library could not be read: %s (%s)", path, error)
+            payload = {"entries": []}
+        records = payload.get("entries")
+        if records is None:
+            records = [{"text": text} for text in custom]
+        users = []
+        seen = set(builtin_keys)
+        for record in records:
+            text = _clean_user_added_entry(record["text"])
+            normalized = _managed_entry_key(text)
+            if text and normalized not in seen:
+                identity = record.get("id") or uuid5(NAMESPACE_URL, f"lettersmith:{key}:user:{normalized}").hex
+                users.append(ManagedListEntry(text, False, True, identity))
+                seen.add(normalized)
+        builtins = [replace(entry, identity=uuid5(NAMESPACE_URL,
+                    f"lettersmith:{key}:builtin:{_managed_entry_key(entry.text)}").hex)
+                    for entry in builtins]
+        return builtins, users
+
+    def _read_managed_entries(self, key: str) -> List[ManagedListEntry]:
+        builtins, users = self._managed_library(key)
+        return _group_managed_entries(users + builtins)
 
     def _style_header_item(self, item: Optional[QtGui.QStandardItem]) -> None:
         if item is None:
@@ -2112,8 +2251,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         signals_were_blocked = combo.blockSignals(True)
         try:
             combo.clear()
-            if allow_none:
-                combo.addItem(NONE_CHOICE_LABEL)
             for entry in entries:
                 combo.addItem(entry.text)
                 model_item = combo.model().item(combo.count() - 1)
@@ -2131,14 +2268,17 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 if restored_index >= 0:
                     combo.setCurrentIndex(restored_index)
                 elif is_editable:
+                    combo.setCurrentIndex(-1)
                     combo.setEditText(current_text)
                 else:
                     # Keep a project-local historical selection available even
                     # when the permanent source library no longer contains it.
                     combo.addItem(current_text)
                     combo.setCurrentIndex(combo.count() - 1)
-            elif allow_none and combo.count() > 0:
-                combo.setCurrentIndex(0)
+            else:
+                combo.setCurrentIndex(-1)
+                if is_editable:
+                    combo.clearEditText()
         finally:
             combo.blockSignals(signals_were_blocked)
 
@@ -2168,7 +2308,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
         normalized_match: bool = False,
     ) -> None:
         if not value:
-            combo.setCurrentIndex(empty_index)
+            combo.setCurrentIndex(-1)
+            if combo.isEditable():
+                combo.clearEditText()
             return
         index = PromptWriterPanel._find_combo_text(
             combo,
@@ -2215,33 +2357,24 @@ class PromptWriterPanel(QtWidgets.QWidget):
             return False
         self._list_save_in_progress = True
         config = self._managed_list_config(key)
-        path = (
-            self._user_colors_path()
-            if key == "color"
-            else self._managed_list_write_path(key)
-        )
+        path = self._managed_options_path(key)
         try:
+            self._managed_library(key, strict=True)
+            records = [{"id": entry.identity or uuid4().hex, "text": entry.text}
+                       for entry in entries if entry.is_user and not entry.is_header]
+            payload = {"version": 1, "entries": records}
             if key == "color":
-                values: List[str] = []
-                seen: set[str] = set()
-                for entry in entries:
-                    if entry.is_header or not entry.is_user:
-                        continue
-                    value = _clean_user_added_entry(entry.text)
-                    key_value = _managed_entry_key(value)
-                    if value and key_value not in seen:
-                        values.append(value)
-                        seen.add(key_value)
-                safe_write_json(path, {"version": 1, "colors": values})
-            else:
-                atomic_write_text(
-                    path,
-                    _serialize_managed_list_entries(entries, allow_headers=bool(config["allow_headers"])),
-                )
+                # Keep the original colors field readable by existing installations.
+                payload["colors"] = [record["text"] for record in records]
+            safe_write_json(path, payload)
             self._clear_managed_list_cache(path)
             self._reload_managed_list(key)
             if selected_text is not None:
                 combo = target_combo if target_combo is not None else self._managed_combo_for_key(key)
+                if selected_text == "":
+                    combo.setCurrentIndex(-1)
+                    if combo.isEditable():
+                        combo.clearEditText()
                 index = self._find_combo_text(
                     combo, selected_text, normalized=key == "color"
                 )
@@ -2272,14 +2405,15 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
         config = self._managed_list_config(key)
         dialog = ListManagerDialog(
-            title=config["title"] + (" — This Page" if for_page else " — Project Style"),
+            title=config["title"],
             entries=self._read_managed_entries(key),
             allow_headers=bool(config["allow_headers"]),
             auto_user_header=config.get("auto_user_header"),
-            user_owned_only=key == "color",
+            user_owned_only=True,
             app_font_family=self._app_font_family,
             parent=self,
         )
+        dialog.setProperty("promptCategory", "scheme" if key == "color" else key)
         dialog._for_page = for_page
         if for_page:
             self.use_project_palette.setChecked(False)
@@ -2296,9 +2430,38 @@ class PromptWriterPanel(QtWidgets.QWidget):
         dialog.raise_()
         dialog.activateWindow()
 
-    def _install_manage_trigger(self, widget: QtWidgets.QWidget, key: str) -> None:
-        widget.setProperty("managed_list_key", key)
-        widget.installEventFilter(self)
+    def _build_managed_control(self, key: str, label_text: str, grid, row: int) -> None:
+        semantic = "scheme" if key == "color" else key
+        label = QtWidgets.QLabel(label_text)
+        label.setProperty("inputLabel", True)
+        label.setProperty("promptCategory", semantic)
+        combo = QtWidgets.QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        combo.setFixedSize(238, 34)
+        combo.view().setMinimumWidth(320)
+        combo.setItemDelegate(HeaderAwareItemDelegate(combo))
+        combo.setProperty("promptCategory", semantic)
+        combo.lineEdit().setClearButtonEnabled(True)
+        combo.lineEdit().setPlaceholderText("Let the AI decide")
+        combo.setAccessibleName(label_text)
+        set_control_help(combo, "Choose or type an option. Clear it to let the AI decide.")
+        setattr(self, f"lbl_{key}", label)
+        setattr(self, f"cmb_{key}", combo)
+        self._populate_managed_combo(combo, self._read_managed_entries(key), allow_none=True, normalized_match=True)
+        button = QtWidgets.QToolButton()
+        button.setText("…")
+        button.setAccessibleName(f"Manage {self._managed_list_config(key)['title']}")
+        button.setToolTip(button.accessibleName())
+        button.setProperty("promptCategory", semantic)
+        button.clicked.connect(lambda: self._open_list_manager(key))
+        setattr(self, f"btn_manage_{key}", button)
+        header = QtWidgets.QHBoxLayout()
+        header.addWidget(label)
+        header.addStretch(1)
+        header.addWidget(button)
+        grid.addLayout(header, row, 0)
+        grid.addWidget(combo, row + 1, 0, Qt.AlignLeft)
 
     def _schedule_persist_state(self, delay_ms: Optional[int] = None) -> None:
         try:
@@ -2789,69 +2952,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
         sel_grid.setColumnStretch(0, 0)
         sel_grid.setColumnStretch(1, 1)
 
-        self.lbl_type = QtWidgets.QLabel("Graphics and Illustration")
-        self.lbl_type.setProperty("inputLabel", True)
-        _set_help(
-            self.lbl_type,
-            "Choose the overall visual or illustration style for the generated images. This changes how the full image set looks, not what the subject is.",
-        )
-        self.cmb_type = QtWidgets.QComboBox()
-        self.cmb_type.setEditable(False)
-        self.cmb_type.setFixedSize(238, 34)
-        self.cmb_type.view().setMinimumWidth(320)
-        self.cmb_type.setItemDelegate(HeaderAwareItemDelegate(self.cmb_type))
-        _set_help(
-            self.cmb_type,
-            "Choose the overall visual or illustration style for the generated images. This changes how the full image set looks, not what the subject is.",
-        )
-        self._populate_managed_combo(self.cmb_type, self._read_managed_entries("type"), allow_none=True)
-        self._install_manage_trigger(self.lbl_type, "type")
-        self._install_manage_trigger(self.cmb_type, "type")
-        sel_grid.addWidget(self.lbl_type, 0, 0)
-        sel_grid.addWidget(self.cmb_type, 1, 0, Qt.AlignLeft)
-
-        self.lbl_subject = QtWidgets.QLabel("Subject")
-        self.lbl_subject.setProperty("inputLabel", True)
-        _set_help(
-            self.lbl_subject,
-            "Choose the main thing the images should be about. Double-click Subject to add, update, or remove subject entries.",
-        )
-        self.cmb_subject = QtWidgets.QComboBox()
-        self.cmb_subject.setEditable(True)
-        self.cmb_subject.setFixedSize(238, 34)
-        self.cmb_subject.view().setMinimumWidth(320)
-        self.cmb_subject.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
-        self.cmb_subject.setItemDelegate(HeaderAwareItemDelegate(self.cmb_subject))
-        _set_help(
-            self.cmb_subject,
-            "Choose or type the project subject. Double-click the label to manage reusable subjects.",
-        )
-        self._populate_managed_combo(self.cmb_subject, self._read_managed_entries("subject"), allow_none=False)
-        self._install_manage_trigger(self.lbl_subject, "subject")
-        self._install_manage_trigger(self.cmb_subject, "subject")
-        sel_grid.addWidget(self.lbl_subject, 2, 0)
-        sel_grid.addWidget(self.cmb_subject, 3, 0, Qt.AlignLeft)
-
-        self.lbl_color = QtWidgets.QLabel("Color Scheme")
-        self.lbl_color.setProperty("inputLabel", True)
-        _set_help(
-            self.lbl_color,
-            "Choose the main palette or color direction for the images. Leave it empty if you do not want to force a shared color mood.",
-        )
-        self.cmb_color = QtWidgets.QComboBox()
-        self.cmb_color.setEditable(False)
-        self.cmb_color.setFixedSize(238, 34)
-        self.cmb_color.view().setMinimumWidth(320)
-        self.cmb_color.setItemDelegate(HeaderAwareItemDelegate(self.cmb_color))
-        _set_help(
-            self.cmb_color,
-            "Choose the main palette or color direction for the images. Leave it empty if you do not want to force a shared color mood.",
-        )
-        self._reload_managed_list("color")
-        self._install_manage_trigger(self.lbl_color, "color")
-        self._install_manage_trigger(self.cmb_color, "color")
-        sel_grid.addWidget(self.lbl_color, 4, 0)
-        sel_grid.addWidget(self.cmb_color, 5, 0, Qt.AlignLeft)
+        self._build_managed_control("subject", "Subject", sel_grid, 0)
+        self._build_managed_control("type", "Illustration Style", sel_grid, 2)
+        self._build_managed_control("color", "Color Scheme", sel_grid, 4)
 
         selection_layout.addLayout(sel_grid)
         left_v.addWidget(selection_card)
@@ -3042,16 +3145,16 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.page_style = QtWidgets.QLineEdit()
         override_form.addRow(self.use_project_style)
         override_form.addRow("Page visual style", self.page_style)
-        self.use_project_palette = QtWidgets.QCheckBox("Use project palette")
+        self.use_project_palette = QtWidgets.QCheckBox("Use project color scheme")
         self.page_palette = QtWidgets.QComboBox()
         self.page_palette.setEditable(True)
         override_form.addRow(self.use_project_palette)
         palette_row = QtWidgets.QHBoxLayout()
         palette_row.addWidget(self.page_palette, 1)
-        self.btn_page_palette = QtWidgets.QPushButton("Add palette")
+        self.btn_page_palette = QtWidgets.QPushButton("Manage…")
         palette_row.addWidget(self.btn_page_palette)
         self.btn_page_palette.clicked.connect(lambda: self._open_list_manager("color", for_page=True))
-        override_form.addRow("Page palette", palette_row)
+        override_form.addRow("Color Scheme", palette_row)
         details_layout.addLayout(override_form)
 
         for page in self._page_specs:
@@ -3694,9 +3797,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         selected = getattr(self, "_view_page_id", None)
         busy = self._generation_in_progress
         text = self.session.project.get_prompt(selected)["text"] if selected else None
-        choices = self.session.project.prompt_context(selected) if selected else None
-        subject = ({**choices["shared"], **choices["prompt"]["overrides"]}.get("subject") if choices else "")
-        for button, enabled in ((self.btn_generate, bool(selected and subject and str(subject).strip()) and not busy),
+        for button, enabled in ((self.btn_generate, bool(selected) and not busy),
                                 (self.btn_copy, text is not None and not busy),
                                 (self.btn_erase, self._has_erasable_content() and not busy)):
             button.setEnabled(enabled)
@@ -3773,10 +3874,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
             for checkbox, phrase in self._guidance_checkbox_specs()
             if checkbox.isChecked()
         ]
-        if not any(checkbox.isChecked() for checkbox in (self.cb_real, self.cb_paint, self.cb_minimal)):
-            guidance.append(HIDDEN_STYLE_DEFAULT)
-        if not any(checkbox.isChecked() for checkbox in (self.cb_close_up_focus, self.cb_full_body_view, self.cb_wide_scene)):
-            guidance.append(HIDDEN_FRAMING_DEFAULT)
         return guidance
 
     def _get_color_choice(self) -> Optional[str]:
@@ -3826,8 +3923,9 @@ class PromptWriterPanel(QtWidgets.QWidget):
         widget.setExtraSelections([])
         plain = widget.toPlainText()
         choices = {}
-        if self._view_page_id:
-            context = self.session.project.prompt_context(self._view_page_id)
+        page_id = page.key if page.key != "current" else self._view_page_id
+        if page_id:
+            context = self.session.project.prompt_context(page_id)
             choices = context['prompt']['resolved_components'].get('choices') or {**context['shared'], **context['prompt']['overrides']}
 
         def color_exact(
@@ -3900,7 +3998,11 @@ class PromptWriterPanel(QtWidgets.QWidget):
             "",
             self._display_prompt_color("global"),
         )
-        color_exact("Page-specific direction: ", image_extra, "", page.preview_color)
+        page_color = self._page_prompt_color(page_id, page.color_key)
+        color_exact("Page-specific direction: ", image_extra, "", page_color)
+        paragraphs = plain.split("\n\n")
+        if len(paragraphs) > 1:
+            self._color_preview_range(widget, len(paragraphs[0]) + 2, len(paragraphs[1]), page_color)
 
         guidance_start = plain.find("Guidance:")
         if guidance_start >= 0:
@@ -3910,16 +4012,25 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._color_preview_range(
                 widget,
                 guidance_start,
-                guidance_end - guidance_start,
-                self._display_prompt_color("helpful"),
-            )
-            self._color_preview_range(
-                widget,
-                guidance_start,
                 len("Guidance:"),
                 self._display_prompt_color("helpful"),
                 bold=True,
             )
+            phrase_colors = {}
+            for checkbox, phrase in self._guidance_checkbox_specs():
+                normalized = _normalize_guidance_lines([phrase])
+                if normalized:
+                    phrase_colors[normalized[0]] = checkbox.property("promptCategory") or "helpful"
+            for phrase, checkbox in ((HIDDEN_STYLE_DEFAULT, self.cb_real), (HIDDEN_FRAMING_DEFAULT, self.cb_wide_scene)):
+                phrase_colors[_normalize_guidance_lines([phrase])[0]] = checkbox.property("promptCategory") or "helpful"
+            offset = guidance_start + len("Guidance:\n")
+            for line in plain[offset:guidance_end].splitlines(keepends=True):
+                key = phrase_colors.get(line.removeprefix("- ").rstrip("\n"), "helpful")
+                self._color_preview_range(widget, offset + 2, len(line.rstrip("\n")) - 2, self._display_prompt_color(key))
+                offset += len(line)
+
+    def _page_prompt_color(self, page_id: str, fallback: str) -> str:
+        return self._display_prompt_color(fallback)
 
     def set_semantic_color(self, semantic_key: str, color: str) -> None:
         """Update one semantic color and immediately refresh the visible panel."""

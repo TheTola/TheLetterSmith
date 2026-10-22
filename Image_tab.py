@@ -188,6 +188,7 @@ class StockImageDialog(QtWidgets.QDialog):
         *,
         recent_paths: tuple[Path, ...] = (),
         recent_labels: tuple[str, ...] = (),
+        all_stock_paths: tuple[Path, ...] = (),
         allow_browse: bool = False,
     ) -> None:
         super().__init__(
@@ -242,6 +243,16 @@ class StockImageDialog(QtWidgets.QDialog):
             )
             self._images.setAccessibleName(f"Stock {title} images")
             layout.addWidget(self._images, 1)
+        if all_stock_paths:
+            all_stock = QtWidgets.QPushButton("View All Stock Images")
+            def show_all():
+                picker = StockImageDialog("Stock Images", all_stock_paths, self)
+                if picker.exec() == QtWidgets.QDialog.Accepted:
+                    self._selected_path = picker.selected_path()
+                    self.accept()
+                picker.deleteLater()
+            all_stock.clicked.connect(show_all)
+            layout.addWidget(all_stock)
         if allow_browse:
             browse = QtWidgets.QPushButton("Import image…")
             browse.clicked.connect(self._browse)
@@ -925,10 +936,6 @@ class _ImageThumbnail(
             )
             painter.end()
         self.update()
-
-    @property
-    def theme_frame_path(self) -> Path:
-        return self._theme_frame_path
 
     @property
     def theme_frame_color(self) -> QtGui.QColor:

@@ -178,6 +178,16 @@ class ProjectSaveService:
 
     def _validate_editable_directory(self, directory: Path):
         directory = Path(directory)
+        from transactional_io import is_link_or_reparse_point
+        from project_repository import ProjectRepository
+        managed = self.editable_root.parent.resolve()
+        resolved = directory.resolve()
+        if resolved.is_relative_to(managed) and resolved != managed:
+            ancestors = (directory, *directory.parents)
+            if any(is_link_or_reparse_point(path) for path in ancestors if path.resolve().is_relative_to(managed)):
+                raise ProjectSaveError("Editable saves must not use linked folders")
+            if ProjectRepository(directory / ".lettersmith-project").exists:
+                return
         root = self.editable_root.resolve()
         if directory.is_symlink() or directory.resolve().parent != root or directory.parent.is_symlink():
             raise ProjectSaveError("Editable saves must remain in the managed project library")
@@ -213,17 +223,47 @@ class ProjectSaveService:
         from project_session import get_project_session
         from saved_letters import SavedLetterRestorer
         loaded = loaded or self.read_saved_project(entry)
-        independent = entry.example or entry.stock or entry.recovery or not loaded.revision
+        independent = entry.example or entry.stock or entry.recovery
         if independent:
             loaded = replace(loaded, project=loaded.project.independent_copy())
+        elif not loaded.revision:
+            loaded = self._convert_saved_project(entry, loaded)
         stored = SavedLetterRestorer(self.project_root).restore_canonical(loaded)
         session = get_project_session(self.project_root)
-        if not independent and Path(entry.path).resolve().parent == self.editable_root.resolve():
+        if not independent:
+            self._validate_editable_directory(entry.path)
             self._bind(session, entry.path, loaded.revision, session.project.revision)
         else:
             self._bind(session, self.editable_root / session.project.project_id, None, -1)
         self.project_state.initialize()
         return stored
+
+    def _convert_saved_project(self, entry, loaded):
+        """Publish a complete canonical repository beside the untouched old files."""
+        import tempfile
+        from uuid import UUID
+        from project_model import ProjectModel
+        from project_repository import ProjectRepository, _writer_lock
+        source = Path(entry.path)
+        destination = source / ".lettersmith-project"
+        with _writer_lock(self.editable_root / ".library-lock"):
+            if destination.exists():
+                raise ProjectSaveError("The saved project changed while opening; open it again")
+            with tempfile.TemporaryDirectory(prefix=".s-convert-", dir=source.parent) as temporary:
+                staging = Path(temporary) / ".lettersmith-project"
+                repository = ProjectRepository(staging)
+                document = loaded.project.to_dict()
+                try:
+                    UUID(document["project_id"])
+                except ValueError:
+                    # Old names are retained in the migration snapshot. The
+                    # settings bridge requires a UUID to keep the save binding.
+                    document["project_id"] = str(uuid4())
+                repository.save(ProjectModel.from_dict(document), asset_root=loaded.asset_root,
+                                migration_report=loaded.migration_report)
+                repository.load(allow_missing=True)
+                os.rename(staging, destination)
+        return ProjectRepository(destination).load(allow_missing=True)
 
     def duplicate_saved_project(self, entry, *, title: str | None = None):
         loaded = self.read_saved_project(entry)

@@ -88,10 +88,10 @@ class PromptWriterHardeningTests(unittest.TestCase):
         for page in self.panel._page_specs:
             plain = self.panel._generated_prompts[page.key]
             preview = page.preview_widget.toPlainText()
-            self.assertIn(HIDDEN_STYLE_DEFAULT, plain)
-            self.assertIn(HIDDEN_FRAMING_DEFAULT, plain)
-            self.assertIn(HIDDEN_STYLE_DEFAULT, preview)
-            self.assertIn(HIDDEN_FRAMING_DEFAULT, preview)
+            self.assertNotIn(HIDDEN_STYLE_DEFAULT, plain)
+            self.assertNotIn(HIDDEN_FRAMING_DEFAULT, plain)
+            self.assertNotIn(HIDDEN_STYLE_DEFAULT, preview)
+            self.assertNotIn(HIDDEN_FRAMING_DEFAULT, preview)
 
         self.panel.cb_real.setChecked(True)
         self.panel.cb_close_up_focus.setChecked(True)
@@ -102,7 +102,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
         self.panel = PromptWriterPanel(project_root=str(self.project_root))
         self.panel.cmb_subject.setCurrentIndex(-1)
 
-        self.assertFalse(self.panel.btn_generate.isEnabled())
+        self.assertTrue(self.panel.btn_generate.isEnabled())
         self.assertFalse(self.panel.btn_copy.isEnabled())
         self.assertFalse(self.panel.btn_erase.isEnabled())
 
@@ -135,7 +135,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
         )
 
         self.panel.cmb_subject.setCurrentIndex(-1)
-        self.assertFalse(self.panel.btn_generate.isEnabled())
+        self.assertTrue(self.panel.btn_generate.isEnabled())
         self.assertTrue(self.panel.btn_copy.isEnabled())
 
     def test_titlebar_uses_minimize_artwork_as_its_only_close_control(self):
@@ -422,6 +422,9 @@ class PromptWriterHardeningTests(unittest.TestCase):
                 "subject": "#FF5C7A",
                 "scheme": "#35D07F",
                 "helpful": "#32C7E8",
+                "style_bias": "#D6A0D9",
+                "clean_output": "#A8CE6B",
+                "framing": "#70B8B0",
                 "global": "#E5E7EB",
                 "cover": "#FFD54A",
                 "letter": "#4D8DFF",
@@ -647,7 +650,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
         dialog.entries_changed.connect(changes.append)
         self.assertFalse(dialog.entry_edit.isReadOnly())
         self.assertFalse(dialog.btn_update.isEnabled())
-        self.assertFalse(dialog.btn_remove.isEnabled())
+        self.assertFalse(dialog.btn_removal_mode.isChecked())
         dialog.entry_edit.selectAll()
         QtTest.QTest.keyClicks(dialog.entry_edit, "  blue and lavender purple  ")
         self.assertEqual(dialog.entry_edit.text(), "  blue and lavender purple  ")

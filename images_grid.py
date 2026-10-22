@@ -210,8 +210,9 @@ class ImageTab(_ImagesWorkspace):
         self.pwrite_fab.set_surface(self)
         self._identity_panel = QtWidgets.QFrame()
         self._identity_panel.setObjectName("ImagesPageDetails")
+        self._identity_panel.setProperty("themeRole", "panel")
         self._identity_panel.setStyleSheet(
-            "QFrame#ImagesPageDetails { background: palette(base); border: 1px solid palette(mid); border-radius: 12px; }"
+            "QFrame#ImagesPageDetails { border-radius: 12px; }"
             "QLineEdit, QComboBox { min-height: 28px; padding: 2px 8px; border-radius: 6px; }"
             "QPushButton, QToolButton { min-height: 26px; padding: 2px 12px; border-radius: 6px; }")
         identity_panel_layout = QtWidgets.QVBoxLayout(self._identity_panel)
@@ -305,7 +306,7 @@ class ImageTab(_ImagesWorkspace):
 
     def _choose_page(self, identity):
         if not self._shutdown and self.isVisible() and self._select_for_action(identity):
-            self._run(self._stock_selected)
+            self._run(self._choose_images)
 
     def _page_menu(self, identity):
         menu = QtWidgets.QMenu(self)
@@ -327,8 +328,8 @@ class ImageTab(_ImagesWorkspace):
         if identity is not None:
             page = self.session.project.get_page(identity)
             add("Import image…", self._browse_selected)
-            add("Stock & recent images…", self._stock_selected)
-            add("Crop image…", self._crop_selected, self.crop_button.isEnabled())
+            add("Stock Images", self._stock_selected)
+            add("View All Stock Images", self._all_stock_images)
             cached = self._thumbnail_cache.get(identity)
             if cached and cached[1]:
                 add("Animation settings…", self._animation_selected)
@@ -353,9 +354,6 @@ class ImageTab(_ImagesWorkspace):
             action = menu.addAction("Undo delete")
             action.setEnabled(self.undo_button.isEnabled())
             action.triggered.connect(lambda checked=False: invoke(self.undo_delete, False))
-        menu.addSeparator()
-        action = menu.addAction("Open Artwork Folder")
-        action.triggered.connect(lambda checked=False: invoke(self.open_gallery_folder, False))
         return menu
 
     def _show_page_menu(self, position):
@@ -399,7 +397,7 @@ class ImageTab(_ImagesWorkspace):
             item.setData(QtCore.Qt.AccessibleTextRole, f"{row+1}, {item.text()}, {status}")
         for widget in (self.heading, self.limit_label, self.duplicate_button,
                        self.delete_button, self.undo_button, self.import_button, self.stock_button,
-                       self.crop_button, self.more_button, self.animation_mode, self.animation_button):
+                       self.more_button, self.animation_mode, self.animation_button):
             widget.hide()
         self._size_grid()
         if (selected == self._last_strip_selection

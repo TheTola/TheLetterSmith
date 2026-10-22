@@ -918,7 +918,7 @@ class ImageAnimationTests(unittest.TestCase):
             remember_type_image(directory, kind, recent_path, recent_path.name)
             with mock.patch("Image_tab.StockImageDialog") as dialog_type:
                 dialog_type.return_value.exec.return_value = QtWidgets.QDialog.Rejected
-                tab._stock_selected()
+                tab._choose_images()
             self.assertEqual(dialog_type.call_args.args[1], ())
             self.assertEqual(dialog_type.call_args.kwargs["recent_paths"],
                              tuple(Path(value) for value, _ in recent_type_images(directory, kind)))

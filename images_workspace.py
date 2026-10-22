@@ -111,57 +111,6 @@ class _ImportWorker(QtCore.QObject):
             self.finished.emit()
 
 
-class _CropDialog(QtWidgets.QDialog):
-    """Pixel bounds with a live selection overlay; source files stay immutable."""
-    def __init__(self, path, parent):
-        super().__init__(parent)
-        self.setWindowTitle("Crop artwork")
-        self.resize(520, 540)
-        root = QtWidgets.QVBoxLayout(self)
-        note = QtWidgets.QLabel("Position the crop using pixel bounds. The original source is retained.")
-        note.setWordWrap(True)
-        root.addWidget(note)
-        self.original = QtGui.QPixmap(str(path))
-        self.preview = QtWidgets.QLabel()
-        self.preview.setAlignment(QtCore.Qt.AlignCenter)
-        root.addWidget(self.preview, 1)
-        form = QtWidgets.QFormLayout()
-        self.bounds = []
-        for label, maximum, value in (("Left", self.original.width()-1, 0),
-                                       ("Top", self.original.height()-1, 0),
-                                       ("Right", self.original.width(), self.original.width()),
-                                       ("Bottom", self.original.height(), self.original.height())):
-            control = QtWidgets.QSpinBox()
-            control.setRange(0, maximum)
-            control.setValue(value)
-            control.setAccessibleName("Crop " + label)
-            control.valueChanged.connect(self.refresh)
-            self.bounds.append(control)
-            form.addRow(label, control)
-        root.addLayout(form)
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        self.ok = buttons.button(QtWidgets.QDialogButtonBox.Ok)
-        self.ok.setText("Apply Crop")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
-        self.refresh()
-
-    def rectangle(self):
-        return tuple(control.value() for control in self.bounds)
-
-    def refresh(self):
-        left, top, right, bottom = self.rectangle()
-        self.ok.setEnabled(left < right and top < bottom)
-        display = self.original.scaled(460, 330, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-        painter = QtGui.QPainter(display)
-        painter.setPen(QtGui.QPen(self.palette().highlight().color(), 3))
-        scale = display.width() / max(1, self.original.width())
-        painter.drawRect(QtCore.QRectF(left*scale, top*scale, (right-left)*scale, (bottom-top)*scale))
-        painter.end()
-        self.preview.setPixmap(display)
-
-
 class ImageTab(QtWidgets.QWidget):
     navigator_class = PageNavigator
     image_selected = QtCore.Signal(QtGui.QPixmap)
@@ -287,14 +236,11 @@ class ImageTab(QtWidgets.QWidget):
         tools = QtWidgets.QHBoxLayout()
         self.import_button = self._button("Import Image", self._browse_selected)
         self.stock_button = self._button("Stock Images", self._stock_selected)
-        self.crop_button = self._button("Crop / Position", self._crop_selected)
-        tools.addWidget(self.crop_button)
         self.more_button = QtWidgets.QToolButton()
         self.more_button.setText("More")
         self.more_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         more = QtWidgets.QMenu(self.more_button)
         self.clear_action = more.addAction("Clear Image", lambda: self._run(lambda: self.clear_page_image(self.session.selected_page_id)))
-        more.addAction("Open Artwork Folder", self.open_gallery_folder)
         self.more_button.setMenu(more)
         tools.addWidget(self.more_button)
         self.empty_label = QtWidgets.QLabel("Start with a prompt, import an image, or choose stock artwork.")
@@ -543,8 +489,6 @@ class ImageTab(QtWidgets.QWidget):
         self.more_button.setEnabled(selected_page is not None)
         path, animated, _icon = selected_media
         self.clear_action.setEnabled(selected_page is not None and bool(selected_page["artwork"].get("asset")))
-        self.crop_button.setEnabled(path is not None and not animated)
-        self.crop_button.setToolTip("Animated GIF cropping is not supported; its source animation is preserved." if animated else "Adjust the crop position and size without changing the original source.")
         self.animation_button.setVisible(animated)
         self.animation_mode.setVisible(animated)
         self.message_button.setEnabled(selected_page is not None and selected_page["type"] == "letter")
@@ -811,6 +755,12 @@ class ImageTab(QtWidgets.QWidget):
             self._run(lambda: self.import_image(identity, path, target=target))
 
     def _stock_selected(self):
+        return self._choose_images(stock_only=True)
+
+    def _all_stock_images(self):
+        return self._choose_images(stock_only=True, all_stock=True)
+
+    def _choose_images(self, *, stock_only=False, all_stock=False):
         from Image_tab import StockImageDialog, STOCK_IMAGE_FILES, _downloads_directory
         self._prepare_page_operation()
         identity = self.session.selected_page_id
@@ -821,11 +771,16 @@ class ImageTab(QtWidgets.QWidget):
         slot = PAGE_TYPES[page["type"]].artwork_template
         directory = application_paths(self.project_root).stock_images_root / slot
         files = tuple(path for name in STOCK_IMAGE_FILES[PAGE_INDICES[slot]] if (path := directory / name).is_file())
-        history = recent_type_images(self.project_root, page["type"])
+        all_files = tuple(path for path in sorted(application_paths(self.project_root).stock_images_root.rglob("*"))
+                          if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".bmp"})
+        if all_stock:
+            files = all_files
+        history = () if stock_only else recent_type_images(self.project_root, page["type"])
         recent = tuple((Path(value), label) for value, label in history if Path(value).is_file())
         dialog = StockImageDialog(PAGE_TYPES[page["type"]].label, () if recent else files, self, allow_browse=True,
                                   recent_paths=tuple(path for path, label in recent),
-                                  recent_labels=tuple(label for path, label in recent))
+                                  recent_labels=tuple(label for path, label in recent),
+                                  all_stock_paths=all_files if not all_stock else ())
         if dialog.exec() != QtWidgets.QDialog.Accepted:
             return
         if dialog.browse_requested:
@@ -834,22 +789,6 @@ class ImageTab(QtWidgets.QWidget):
             path = dialog.selected_path()
         if path:
             self._run(lambda: self.import_image(identity, str(path), target=target))
-
-    def _crop_selected(self):
-        self._prepare_page_operation()
-        identity = self.session.selected_page_id
-        if identity is None:
-            return
-        target = self.artwork.capture_target(identity)
-        path = self.artwork.resolve_asset(identity)
-        if path is None:
-            return
-        dialog = _CropDialog(path, self)
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
-            def apply():
-                if self.artwork.crop(identity, dialog.rectangle(), target=target):
-                    self._commit("image_cropped")
-            self._run(apply)
 
     def _set_animation_mode(self):
         self._prepare_page_operation()
@@ -922,11 +861,6 @@ class ImageTab(QtWidgets.QWidget):
 
     def has_meaningful_images(self):
         return any(page["artwork"].get("asset") for page in self.session.project.pages)
-
-    def open_gallery_folder(self):
-        path = self.project_root / "artwork"
-        path.mkdir(exist_ok=True)
-        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
 
     def reset_project_images(self):
         # New Project is owned by the foundation; the shell has already reset it.

@@ -322,7 +322,7 @@ class WindowSizingTests(unittest.TestCase):
                                 self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
                                 for button in (tab.add_button, tab.up_button, tab.down_button,
                                                tab.duplicate_button, tab.delete_button, tab.undo_button,
-                                               tab.import_button, tab.stock_button, tab.crop_button,
+                                               tab.import_button, tab.stock_button,
                                                tab.more_button, tab.pwrite_fab):
                                     if not button.isVisibleTo(window):
                                         continue

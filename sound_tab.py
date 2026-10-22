@@ -4024,7 +4024,7 @@ class StockMusicDialog(
             self.recent_list.clear()
             for track_id in self._recent_track_ids:
                 record = self.library.get(track_id)
-                if record is None or self.library.path_for(track_id) is None:
+                if record is None or record.source_kind == "stock" or self.library.path_for(track_id) is None:
                     continue
                 item = QtWidgets.QListWidgetItem(record.display_title)
                 item.setData(Qt.UserRole, track_id)
@@ -6384,7 +6384,7 @@ class SoundTab(QtWidgets.QWidget):
             return
         for track_id in track_ids:
             record = self.library.get(track_id)
-            if record is None or self.library.path_for(track_id) is None:
+            if record is None or record.source_kind == "stock" or self.library.path_for(track_id) is None:
                 continue
             try:
                 remember_media(

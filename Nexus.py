@@ -60,6 +60,8 @@ from ui_constants import (
     TRANSIENT_STATUS_MS,
 )
 from ui_theme import (
+    COMPACT_RADIUS,
+    CONTROL_RADIUS,
     HELP_THEME_ASSET_CANDIDATES,
     MAXIMIZE_THEME_ASSET,
     RESTORE_THEME_ASSET_CANDIDATES,
@@ -2373,6 +2375,10 @@ class Nexus(QtWidgets.QMainWindow):
             }}
             QTabBar#MainTabBar::tab:hover {{
                 color:{colors.highlight};
+                background:{colors.hover};
+            }}
+            QTabBar#MainTabBar::tab:disabled {{
+                color:{colors.disabled_text};
             }}
 
             QTabBar#MainTabBar::tab:last {{
@@ -2404,14 +2410,15 @@ class Nexus(QtWidgets.QMainWindow):
 
             QWidget#PreviewFrame {{
                 background:transparent;
-                border:2px solid {colors.preview_frame_border};
-                border-radius:6px;
+                border:1px solid {colors.preview_frame_border};
+                border-radius:{CONTROL_RADIUS}px;
             }}
 
             QToolTip {{
                 background:{colors.control_background};
                 color:{colors.text};
                 border:1px solid {colors.border};
+                border-radius:{COMPACT_RADIUS}px;
                 padding:4px 7px;
             }}
         """
@@ -2499,6 +2506,10 @@ class Nexus(QtWidgets.QMainWindow):
                     type(widget).__name__,
                 )
 
+    def start_repository_setup(self) -> None:
+        self._initialize_project_tabs()
+        self.forge_tab.start_repository_setup()
+
     @performance_timed("startup.project_tabs")
     def _initialize_project_tabs(self) -> None:
         if self._project_tabs_initialized:
@@ -2543,6 +2554,8 @@ class Nexus(QtWidgets.QMainWindow):
             project_state=self.project_state,
         )
         self.command_tab.setProperty("themeIndependent", True)
+        self.forge_tab.repository_changed.connect(self.command_tab.set_repository_summary)
+        self.forge_tab._sync_repository_summary()
         self._initialize_context_footer()
 
         self.preview_tools_layout.insertWidget(

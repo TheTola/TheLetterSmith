@@ -12,7 +12,7 @@ import stat
 import tempfile
 import uuid
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from html import unescape
 from pathlib import Path
@@ -141,6 +141,7 @@ RESTORABLE_SETTING_KEYS = (
     "required_features",
 )
 PUBLICATION_METADATA_KEYS = (
+    "published_destination",
     PROJECT_PUBLISHED_AT_KEY,
     PUBLISHED_PAGE_URL_KEY,
     PUBLISHED_PUBLIC_PATH_KEY,
@@ -243,6 +244,7 @@ def _ensure_saved_cover_thumbnail(
 
 def _publication_metadata(state: dict[str, Any]) -> dict[str, Any]:
     return {
+        "published_destination": dict(state.get("published_destination") or {}),
         PROJECT_PUBLISHED_AT_KEY: str(
             valid_project_timestamp(state.get(PROJECT_PUBLISHED_AT_KEY))
             or valid_project_timestamp(state.get(PUBLISHED_AT_KEY))
@@ -425,6 +427,7 @@ class SavedLetter:
     saved_publication_state: str = ""
     warning: str = ""
     valid: bool = True
+    published_destination: dict = field(default_factory=dict)
 
     @property
     def summary(self) -> str:
@@ -464,6 +467,7 @@ class SavedLetter:
                 PUBLISHED_SOURCE_FINGERPRINT_KEY: self.published_source_fingerprint,
                 PUBLISHED_GITHUB_OWNER_KEY: self.published_github_owner,
                 PUBLISHED_GITHUB_REPOSITORY_KEY: self.published_github_repository,
+            "published_destination": dict(self.published_destination),
             }
         )
 
@@ -497,6 +501,7 @@ class RestoredProject:
     published_source_fingerprint: str = ""
     published_github_owner: str = ""
     published_github_repository: str = ""
+    published_destination: dict = field(default_factory=dict)
 
     @property
     def identity(self) -> ProjectIdentity:
@@ -527,6 +532,7 @@ class RestoredProject:
             PUBLISHED_SOURCE_FINGERPRINT_KEY: self.published_source_fingerprint,
             PUBLISHED_GITHUB_OWNER_KEY: self.published_github_owner,
             PUBLISHED_GITHUB_REPOSITORY_KEY: self.published_github_repository,
+            "published_destination": dict(self.published_destination),
         }
 
 
@@ -1186,6 +1192,7 @@ class SavedLetterCatalog:
             "published_source_fingerprint": (
                 entry.published_source_fingerprint
             ),
+            "published_destination": dict(entry.published_destination),
             "published_github_owner": entry.published_github_owner,
             "published_github_repository": (
                 entry.published_github_repository
@@ -1266,6 +1273,7 @@ class SavedLetterCatalog:
             published_github_owner=str(
                 raw_entry.get("published_github_owner", "")
             ).strip(),
+            published_destination=dict(raw_entry.get("published_destination") or {}),
             published_github_repository=str(
                 raw_entry.get("published_github_repository", "")
             ).strip(),
@@ -1377,8 +1385,6 @@ class SavedLetterCatalog:
                             finally:
                                 preview_session.close()
                 warnings = [issue.message for issue in stored.project.validate()]
-                if stored.migration_report:
-                    warnings.insert(0, "Migrated project; recovery details are retained.")
                 pages = data["pages"]
                 candidates = sorted(enumerate(pages), key=lambda item: (item[1]["type"] != "cover", item[0]))
                 cover = next((path / ".lettersmith-project" / "g" / stored.revision / page["artwork"]["asset"] for _, page in candidates
@@ -1401,6 +1407,7 @@ class SavedLetterCatalog:
                     published_public_path=str(publication.get(PUBLISHED_PUBLIC_PATH_KEY, "")),
                     publication_provider=str(publication.get(PUBLICATION_PROVIDER_KEY, "")),
                     published_github_owner=str(publication.get(PUBLISHED_GITHUB_OWNER_KEY, "")),
+                    published_destination=dict(publication.get("published_destination") or {}),
                     published_github_repository=str(publication.get(PUBLISHED_GITHUB_REPOSITORY_KEY, "")),
                     publication_verified=publication.get(PUBLICATION_VERIFIED_KEY) is True,
                     published_source_fingerprint=str(publication.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")))
@@ -1429,7 +1436,7 @@ class SavedLetterCatalog:
             from project_repository import read_legacy_project
             legacy = read_legacy_project(path, saved=True)
             legacy_pages = legacy.project.pages
-            warning = "Legacy project — opening creates an editable copy; the original is retained."
+            warning = ""
             valid = True
         except Exception as error:
             legacy_pages, warning, valid = (), str(error), False
@@ -1473,6 +1480,7 @@ class SavedLetterCatalog:
             published_github_owner=str(
                 metadata.get(PUBLISHED_GITHUB_OWNER_KEY, "")
             ).strip(),
+            published_destination=dict(metadata.get("published_destination") or {}),
             published_github_repository=str(
                 metadata.get(PUBLISHED_GITHUB_REPOSITORY_KEY, "")
             ).strip(),
@@ -1720,6 +1728,7 @@ class SavedLetterRestorer:
                 publication_verified=settings.get(PUBLICATION_VERIFIED_KEY) is True,
                 published_source_fingerprint=str(settings.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")),
                 published_github_owner=str(settings.get(PUBLISHED_GITHUB_OWNER_KEY, "")),
+                published_destination=dict(settings.get("published_destination") or {}),
                 published_github_repository=str(settings.get(PUBLISHED_GITHUB_REPOSITORY_KEY, "")),
             )
         session = get_project_session(self.project_root)
@@ -2056,6 +2065,7 @@ class SavedLetterRestorer:
             published_github_owner=str(
                 restored_settings.get(PUBLISHED_GITHUB_OWNER_KEY, "")
             ),
+            published_destination=dict(restored_settings.get("published_destination") or {}),
             published_github_repository=str(
                 restored_settings.get(PUBLISHED_GITHUB_REPOSITORY_KEY, "")
             ),

@@ -315,6 +315,7 @@ class GitHubAPI:
         expected: tuple[int, ...] = (200,),
         authenticate: bool = True,
         form: bool = False,
+        allow_list: bool = False,
     ) -> dict:
         url = (
             path_or_url
@@ -378,7 +379,7 @@ class GitHubAPI:
                 technical_details=f"HTTP {status}: response was not JSON",
                 status=status,
             ) from error
-        if not isinstance(value, dict):
+        if not isinstance(value, (dict, list) if allow_list else dict):
             raise GitHubOperationError(
                 "invalid_response",
                 "GitHub returned an invalid response. Please try again.",
@@ -483,7 +484,15 @@ class GitHubCredentialStore:
         self.keyring = keyring_module
         # Development profiles must never restore or change the user's account.
         # Injected test stores remain usable; no plaintext credential store is added.
-        self._isolated = keyring_module is keyring and bool(os.environ.get("LETTER_SMITH_PROFILE_ROOT", "").strip())
+        profile = os.environ.get("LETTER_SMITH_PROFILE_ROOT", "").strip()
+        self._isolated = keyring_module is keyring and bool(profile)
+        if self._isolated and os.environ.get("LETTER_SMITH_PROFILE_CREDENTIALS") == "1":
+            import hashlib
+            from pathlib import Path
+            identity = os.path.normcase(str(Path(profile).expanduser().resolve()))
+            suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+            self.SERVICE_NAME = f"{self.SERVICE_NAME} Profile {suffix}"
+            self._isolated = False
 
     def load(self) -> StoredGitHubCredential | None:
         if self._isolated:
@@ -826,6 +835,11 @@ class GitHubAuthenticator:
     def installation_present(self, session: GitHubSession) -> bool:
         return self._matching_installation(session) is not None
 
+    def _publishing_repository(self, session: GitHubSession) -> str:
+        from publishing.destinations import DestinationStore
+        destination = DestinationStore().default(session.account.account_id)
+        return destination.repository if destination else github_pages_repository_name(session.account.login)
+
     def publishing_access(
         self,
         session: GitHubSession,
@@ -860,7 +874,7 @@ class GitHubAuthenticator:
         *,
         log_details: bool = True,
     ) -> GitHubPublishingAccess:
-        repository = github_pages_repository_name(session.account.login)
+        repository = self._publishing_repository(session)
         if log_details:
             _LOGGER.info(
                 "Validating GitHub publishing access: account=%s repository=%s",
@@ -995,17 +1009,19 @@ class GitHubAuthenticator:
                 "invalid_response",
                 "GitHub returned invalid application-installation details.",
             )
-        repositories = self.authorized_api_factory(
-            session.token.access_token
-        ).request(
-            "GET",
-            f"/user/installations/{installation_id}/repositories?per_page=100",
-        ).get("repositories", [])
-        if not isinstance(repositories, list):
-            raise GitHubOperationError(
-                "invalid_response",
-                "GitHub returned invalid publishing-project access details.",
-            )
+        repositories = []
+        page = 1
+        while True:
+            suffix = "" if page == 1 else f"&page={page}"
+            batch = self.authorized_api_factory(session.token.access_token).request(
+                "GET", f"/user/installations/{installation_id}/repositories?per_page=100{suffix}",
+            ).get("repositories", [])
+            if not isinstance(batch, list):
+                raise GitHubOperationError("invalid_response", "GitHub returned invalid repository access details.")
+            repositories.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
         repository_name = repository.casefold()
         repository_access = any(
             isinstance(repository, dict)
@@ -1078,7 +1094,7 @@ class GitHubAuthenticator:
         self,
         session: GitHubSession,
     ) -> GitHubPublishingAccess:
-        repository = github_pages_repository_name(session.account.login)
+        repository = self._publishing_repository(session)
         granted = set(session.token.granted_scopes)
         required = set(GITHUB_OAUTH_REQUIRED_SCOPES)
         _LOGGER.info(
@@ -1121,7 +1137,7 @@ class GitHubAuthenticator:
         allow_missing: bool,
     ) -> GitHubPublishingAccess:
         owner = session.account.login
-        repository = github_pages_repository_name(owner)
+        repository = self._publishing_repository(session)
         api = self.authorized_api_factory(session.token.access_token)
         try:
             metadata = api.request(
@@ -1191,33 +1207,24 @@ class GitHubAuthenticator:
         )
 
     def _matching_installation(self, session: GitHubSession) -> dict | None:
-        response = self.authorized_api_factory(session.token.access_token).request(
-            "GET",
-            "/user/installations?per_page=100",
-        )
-        installations = response.get("installations", [])
-        if not isinstance(installations, list):
-            raise GitHubOperationError(
-                "invalid_response",
-                "GitHub returned invalid application-installation details.",
-            )
-        for installation in installations:
-            if not isinstance(installation, dict):
-                continue
-            account = installation.get("account", {})
-            if not isinstance(account, dict):
-                account = {}
-            try:
-                account_id = int(account.get("id", 0) or 0)
-            except (TypeError, ValueError):
-                account_id = 0
-            if (
-                str(installation.get("app_slug", "")).casefold()
-                == self.configuration.app_slug.casefold()
-                and account_id == session.account.account_id
-            ):
-                return installation
-        return None
+        page = 1
+        while True:
+            suffix = "" if page == 1 else f"&page={page}"
+            installations = self.authorized_api_factory(session.token.access_token).request(
+                "GET", f"/user/installations?per_page=100{suffix}",
+            ).get("installations", [])
+            if not isinstance(installations, list):
+                raise GitHubOperationError("invalid_response", "GitHub returned invalid application-installation details.")
+            for installation in installations:
+                if not isinstance(installation, dict):
+                    continue
+                account = installation.get("account") or {}
+                if (str(installation.get("app_slug", "")).casefold() == self.configuration.app_slug.casefold()
+                        and account.get("id") == session.account.account_id):
+                    return installation
+            if len(installations) < 100:
+                return None
+            page += 1
 
     def wait_for_installation(
         self,

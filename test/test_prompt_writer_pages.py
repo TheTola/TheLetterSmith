@@ -84,7 +84,8 @@ class PromptWriterPageTests(unittest.TestCase):
             self.assertIn('1600×900', text)
             self.assertIn('16:9', text)
             self.assertNotIn('four-page', text)
-            self.assertIn('5-page', text)
+            self.assertNotIn('5-page', text)
+            self.assertIn('Create exactly one image', text)
             self.assertNotIn('Message A', text)
             self.assertNotIn('Message B', text)
             if page['type'] == 'letter':
@@ -288,7 +289,8 @@ class PromptWriterPageTests(unittest.TestCase):
         last = self.session.project.get_prompt(ids[-1])['text']
         self.assertNotIn('The End', last)
         self.assertIn('artwork-only', last)
-        self.assertIn('3-page', last)
+        self.assertNotIn('3-page', last)
+        self.assertIn('Create exactly one image', last)
 
     def test_empty_draft_and_explicit_copy_preserve_exact_authored_text(self):
         exact = '  Emoji 🌲 café 雪\r\n\n '

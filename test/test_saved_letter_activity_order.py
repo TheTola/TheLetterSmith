@@ -182,13 +182,8 @@ class SavedLetterActivityOrderTests(unittest.TestCase):
         card = SavedLetterCard(entry)
         self.addCleanup(card.deleteLater)
 
-        self.assertEqual(card.status_label.text(), "Stock letter")
-        self.assertEqual(card.publication_label.text(), "Unpublished")
-        self.assertEqual(card.status_label.objectName(), "StockStatus")
-        self.assertIn(
-            "QLabel#StockStatus{color:#e6d4ff;background:#271b38;",
-            card.styleSheet(),
-        )
+        self.assertEqual(card.storage_status, ("Stock letter", "stock"))
+        self.assertEqual(card.publication_status, ("", ""))
 
     def test_created_and_published_dates_control_order_not_activity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -508,8 +503,8 @@ class SavedLetterActivityOrderTests(unittest.TestCase):
                         QtCore.QThread.msleep(5)
                     else:
                         self.fail("decoded cover was not applied to its card")
-                self.assertLessEqual(pixmap.width(), 168)
-                self.assertLessEqual(pixmap.height(), 92)
+                self.assertLessEqual(pixmap.width(), 192)
+                self.assertLessEqual(pixmap.height(), 192)
             finally:
                 decode_release.set()
                 tab.close()

@@ -334,13 +334,17 @@ class SavedProjectTests(unittest.TestCase):
         self.assertEqual([item.path for item in self.catalog.list_entries(force_refresh=True)], [entry.path])
         self.assertEqual([item.path for item in self.catalog.refresh_entry(output)], [entry.path])
 
-    def test_legacy_classic_variable_and_over_limit_save_copy_keep_originals(self):
+    def test_legacy_conversion_preserves_content_and_reuses_one_library_card(self):
         from config import PLAY_METADATA_FILE
         from page_layout import LAYOUT_FILE
         from saved_letters import PROMPT_WRITER_STATE_FILE
         for count in (4, 6, 12):
             with self.subTest(count=count):
                 fixture = legacy_fixture(count=count)
+                fixture["metadata"].update(recipient_title="Legacy letter", recipient_name="Legacy recipient")
+                if count == 6:
+                    from uuid import uuid4
+                    fixture["metadata"]["project_id"] = str(uuid4())
                 source = self.catalog.play_root / f"legacy-{count}"
                 pages = source / "gallery/pages"
                 pages.mkdir(parents=True)
@@ -353,17 +357,39 @@ class SavedProjectTests(unittest.TestCase):
                 for page in fixture["page_layout"]:
                     Image.new("RGB", (6, 9), "purple").save(pages / (page["key"] + ".png"))
                 (pages / "lettersmith-images.json").write_text(json.dumps({"schema_version": 1, "slots": fixture["images"]}), encoding="utf-8")
+                sounds = source / "gallery/sounds"
+                sounds.mkdir()
+                (sounds / "music.wav").write_bytes((self.root / "music.wav").read_bytes())
+                (sounds / "lettersmith-sound.json").write_text(json.dumps({
+                    "mode": "playlist", "playlist": ["legacy-music"], "volume": 40, "muted": True,
+                    "tracks": [{"track_id": "legacy-music", "filename": "music.wav"}]}), encoding="utf-8")
                 originals = {path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()}
                 entry = self.catalog._entry(source)
                 candidate = self.service.read_saved_project(entry)
                 self.assertEqual(len(candidate.project.pages), count)
                 self.assertEqual([page["type"] for page in candidate.project.pages[:3]], ["cover", "illustration", "letter"])
+                before = self.session.project.to_dict()
+                with mock.patch("project_repository.os.replace", side_effect=OSError("conversion failed")):
+                    with self.assertRaises(ProjectRepositoryError):
+                        self.service.open_saved_project(entry)
+                self.assertEqual(self.session.project.to_dict(), before)
+                self.assertFalse((source / ".lettersmith-project").exists())
+                self.assertEqual({path: (source / path).read_bytes() for path in originals}, originals)
                 self.service.open_saved_project(entry)
                 destination, saved = self.service.save_editable()
                 self.assertTrue(saved.migration_report)
                 self.assertEqual(len(saved.project.pages), count)
                 self.assertEqual(saved.project.pages[0]["prompt"]["text"], fixture["prompt_writer_state"]["generated_prompts"]["cover"])
-                self.assertEqual({path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()}, originals)
+                self.assertEqual(destination, source)
+                if count == 6:
+                    self.assertEqual(saved.project.project_id, fixture["metadata"]["project_id"])
+                self.assertEqual(saved.project.to_dict()["metadata"]["recipient_name"], "Legacy recipient")
+                self.assertEqual(saved.project.to_dict()["sound"]["volume"], 40)
+                self.assertEqual((saved.asset_root / "gallery/sounds/music.wav").read_bytes(), (self.root / "music.wav").read_bytes())
+                self.assertIn("Legacy — 雪", next(page["message"]["html"] for page in saved.project.pages if page["type"] == "letter"))
+                self.assertEqual({path: (source / path).read_bytes() for path in originals}, originals)
+                self.assertEqual(len([item for item in self.catalog.list_entries(force_refresh=True)
+                    if item.project_id == saved.project.project_id]), 1)
                 self.service.open_saved_project(self.catalog._entry(destination))
                 self.assertEqual(len(self.session.project.pages), count)
                 self.assertEqual(len({page["id"] for page in self.session.project.pages}), count)
@@ -527,7 +553,8 @@ class SavedProjectUiTests(unittest.TestCase):
             QtTest.QTest.keyClick(card, QtCore.Qt.Key_Space)
             activated.assert_called_once()
         self.assertEqual(self.forge._selected_saved_letter.path, entry.path)
-        self.assertIn("letter pages", card.title_label.text())
+        self.assertFalse(any("letter pages" in label.text() for label in card.findChildren(QtWidgets.QLabel)))
+        self.assertEqual(card.recipient_label.text(), card.entry.recipient)
         before = (entry.path / ".lettersmith-project/current.json").read_bytes()
         with mock.patch.object(QtWidgets.QMessageBox, "question", return_value=QtWidgets.QMessageBox.Cancel):
             self.assertFalse(self.ui.delete_selected())

@@ -90,6 +90,51 @@ def _image_content_key(path: str, size: int, modified: int, changed: int) -> str
     return digest.hexdigest()
 
 
+@lru_cache(maxsize=128)
+def _file_content_key(path: str, size: int, modified: int, changed: int) -> str:
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _is_stock_media(project_root, slot, value):
+    """Recognize bundled assets even after copying them into project/history files."""
+    paths = application_paths(project_root)
+    if (slot == "music" or slot.startswith("sound:")) and value.startswith("stock:"):
+        return True
+    source = Path(value)
+    try:
+        if source.resolve().is_relative_to(paths.stock_root.resolve()):
+            return True
+        if slot.startswith("image:"):
+            if not source.is_file():
+                return False
+            stat = source.stat()
+            key = _image_content_key(str(source.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            for stock in paths.stock_images_root.rglob("*"):
+                if stock.suffix.lower() not in {".png", ".gif", ".jpg", ".jpeg", ".bmp"} or not stock.is_file():
+                    continue
+                stat = stock.stat()
+                if key == _image_content_key(str(stock.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns):
+                    return True
+        elif slot == "music" or slot.startswith("sound:"):
+            if value.startswith("stock:"):
+                return True
+            for stock in (paths.stock_root / "music").glob("*"):
+                if not stock.is_file():
+                    continue
+                stat = stock.stat()
+                digest = _file_content_key(str(stock.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                if value in (digest, digest[:24]):
+                    return True
+                if source.is_file():
+                    stat = source.stat()
+                    if digest == _file_content_key(str(source.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns):
+                        return True
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+        pass
+    return False
+
+
 def _unique_entries(values: list, limit: int = _LIMIT, *, image_content: bool = False) -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -130,6 +175,8 @@ def recent_media(
         values = entries.get(slot, []) if isinstance(entries, dict) else []
     if not isinstance(values, list):
         return ()
+    values = [item for item in values if isinstance(item, dict) and isinstance(item.get("value"), str)
+              and not _is_stock_media(project_root, slot, item["value"])]
     return tuple(
         (item["value"], item["label"])
         for item in _unique_entries(values, _entry_limit(project_id, slot),
@@ -147,6 +194,8 @@ def remember_media(
     """Keep the slot's bounded, distinct selections without changing other slots."""
     if not all((project_id, slot, value)):
         return
+    if _is_stock_media(project_root, slot, value):
+        return
     path = _history_path(project_root)
     with _LOCK:
         payload = _load(path)
@@ -156,6 +205,8 @@ def remember_media(
         old = project.get(slot, [])
         if not isinstance(old, list):
             old = []
+        old = [item for item in old if isinstance(item, dict) and isinstance(item.get("value"), str)
+               and not _is_stock_media(project_root, slot, item["value"])]
         project[slot] = _unique_entries(
             [{"value": value, "label": label}, *old], _entry_limit(project_id, slot),
             image_content=project_id == _TYPE_HISTORY_ID and slot.startswith("image:")
@@ -180,6 +231,8 @@ def remember_image_copy(
     folder = slot if slot in {"cover", "illustration", "letter", "end_page", "wall", "back"} else hashlib.sha256(slot.encode("utf-8")).hexdigest()
     identity = str(UUID(project_id))
     image = Path(source).resolve(strict=True)
+    if _is_stock_media(project_root, f"image:{slot}", str(image)):
+        return
     if not image.is_file() or image.suffix.lower() not in {".png", ".gif"}:
         raise ValueError("The imported image is unavailable.")
     with image.open("rb") as stream:

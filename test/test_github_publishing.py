@@ -103,8 +103,8 @@ class _PublishingAPI:
         publication_id: str,
         *,
         owner: str = "ada",
-        repository_exists: bool = False,
-        pages_exists: bool = False,
+        repository_exists: bool = True,
+        pages_exists: bool = True,
         existing_tree: list[dict] | None = None,
         existing_remote_files: dict[str, bytes] | None = None,
     ) -> None:
@@ -206,6 +206,9 @@ class _PublishingAPI:
     def _repository(self) -> dict:
         return {
             "name": self.repository_name,
+            "id": 21,
+            "owner": {"login": self.owner, "id": 8 if self.owner == "manmike" else 7},
+            "permissions": {"push": True, "admin": True},
             "default_branch": "main",
             "private": False,
             "archived": False,
@@ -229,6 +232,34 @@ class _Clock:
 
 
 class GitHubAuthenticationTests(unittest.TestCase):
+    def test_opted_in_profile_credentials_use_separate_secure_namespace(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {
+                "LETTER_SMITH_PROFILE_ROOT": directory, "LETTER_SMITH_PROFILE_CREDENTIALS": "1"}):
+            store = GitHubCredentialStore()
+            self.assertNotEqual(store.SERVICE_NAME, GitHubCredentialStore.SERVICE_NAME)
+            self.assertEqual(store.SERVICE_NAME, GitHubCredentialStore().SERVICE_NAME)
+            session = GitHubSession(GitHubAccount("second-user", 42), GitHubToken("synthetic-profile-token"))
+            with mock.patch.object(store.keyring, "set_password") as save:
+                store.save(session)
+            self.assertEqual(save.call_args.args[0], store.SERVICE_NAME)
+            with mock.patch.object(store.keyring, "get_password", return_value=save.call_args.args[2]):
+                self.assertEqual(store.load().account.account_id, 42)
+            with mock.patch.object(store.keyring, "delete_password") as clear:
+                store.clear()
+            self.assertEqual(clear.call_args.args[0], store.SERVICE_NAME)
+            with mock.patch.dict(os.environ, {"LETTER_SMITH_PROFILE_ROOT": str(Path(directory) / "other")}):
+                self.assertNotEqual(store.SERVICE_NAME, GitHubCredentialStore().SERVICE_NAME)
+
+    def test_profile_credentials_remain_disabled_without_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {
+                "LETTER_SMITH_PROFILE_ROOT": directory, "LETTER_SMITH_PROFILE_CREDENTIALS": ""}):
+            store = GitHubCredentialStore()
+            with mock.patch.object(store.keyring, "get_password") as read:
+                self.assertIsNone(store.load())
+                read.assert_not_called()
+            with self.assertRaises(GitHubOperationError):
+                store.save(GitHubSession(GitHubAccount("second-user", 42), GitHubToken("synthetic")))
+
     def setUp(self) -> None:
         self.configuration = GitHubApplicationConfiguration(
             client_id="Iv1.1234567890abcdef",
@@ -1012,6 +1043,63 @@ class GitHubAuthenticationTests(unittest.TestCase):
 
 
 class GitHubPublishingTests(unittest.TestCase):
+    def test_custom_collection_unicode_docs_and_confirmed_collision(self):
+        from dataclasses import replace
+        from urllib.parse import unquote, urlsplit
+        from publishing.destinations import DestinationStore, PublishingDestination
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = self._build(root)
+            project_id = str(uuid.uuid4())
+            api = _PublishingAPI(project_id)
+            api.repository_name = "Letters-to-Keep"
+            original_request = api.request
+            def request(method, path, payload=None, **kwargs):
+                if method == "GET" and path.endswith("/pages"):
+                    return {"html_url": "https://ada.github.io/Letters-to-Keep", "source": {"branch": "main", "path": "/docs"}}
+                return original_request(method, path, payload, **kwargs)
+            api.request = request
+            destination = PublishingDestination(7, "ada", "Letters-to-Keep", 21, "Letters", source="/docs",
+                base_url="https://ada.github.io/Letters-to-Keep", confirmed=True)
+            DestinationStore(root).save(destination, make_default=True)
+            def fetch(url, timeout):
+                return api.remote_files.get("docs/" + unquote(urlsplit(url).path.removeprefix("/Letters-to-Keep/")))
+            publisher = GitHubPagesPublisher(root, self.session, configuration=self.configuration, api=api, public_fetcher=fetch)
+            metadata = {"project_id": project_id, "recipient_title": "Valley & Shepard", "_requested_public_path": "Valley & Shepard"}
+            preview = publisher.preview(metadata)
+            self.assertEqual(preview["url"], "https://ada.github.io/Letters-to-Keep/Valley%20%26%20Shepard/")
+            self.assertTrue(all(method == "GET" for method, *_ in api.calls))
+            # A competing root file appears after the preview. Do not silently suffix the confirmed URL.
+            api.existing_tree.append({"path": "docs/Valley & Shepard", "type": "blob", "sha": "occupied"})
+            result = publisher.publish(build, dict(metadata, _confirmed_publication=preview))
+            self.assertFalse(result.success)
+            self.assertEqual(result.error_code, "publication_conflict")
+            self.assertTrue(all(method == "GET" for method, *_ in api.calls))
+            api.existing_tree.clear()
+            result = publisher.publish(build, dict(metadata, _confirmed_publication=preview))
+            self.assertTrue(result.success, result.message)
+            self.assertIn("docs/Valley & Shepard/index.html", api.remote_files)
+            self.assertNotIn("index.html", api.remote_files)
+            self.assertEqual(result.destination["repository_id"], 21)
+            # GitHub recursive trees include directories as well as their blobs.
+            api.existing_tree.append({"path": "docs/Valley & Shepard", "type": "tree", "sha": "directory"})
+            # A title change retains case, spaces and the exact verified address.
+            saved = SettingsStore(root).snapshot()
+            saved.update(project_id=project_id, recipient_title="Changed title")
+            updated = publisher.publish(build, saved)
+            self.assertTrue(updated.success, updated.message)
+            self.assertEqual(updated.url, result.url)
+
+    def test_missing_collection_does_not_create_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_id = str(uuid.uuid4())
+            api = _PublishingAPI(project_id, repository_exists=False)
+            result = GitHubPagesPublisher(root, self.session, configuration=self.configuration, api=api).publish(
+                self._build(root), {"project_id": project_id, "recipient_title": "Hello"})
+            self.assertFalse(result.success)
+            self.assertTrue(all(method == "GET" for method, *_ in api.calls))
+
     def setUp(self) -> None:
         self.configuration = GitHubApplicationConfiguration(
             client_id="Iv1.1234567890abcdef",
@@ -1449,8 +1537,8 @@ class GitHubPublishingTests(unittest.TestCase):
                 project_id = str(uuid.uuid4())
                 api = _PublishingAPI(
                     project_id,
-                    repository_exists=occupied,
-                    pages_exists=occupied,
+                    repository_exists=True,
+                    pages_exists=True,
                     existing_tree=[
                         {
                             "path": "timeout-letter/index.html",
@@ -2262,7 +2350,7 @@ class GitHubAccountUITests(unittest.TestCase):
             session=session,
             access=GitHubPublishingAccess(True, "ready"),
         )
-        publish_context = (Path.cwd(), object(), {}, 1, "source", "source")
+        publish_context = (Path.cwd(), object(), {"_confirmed_publication": {"reviewed": True}}, 1, "source", "source")
         publish_forge = SimpleNamespace(
             _busy=False,
             _pending_publish_context=publish_context,

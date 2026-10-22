@@ -226,14 +226,16 @@ class ImagesWorkspaceTests(unittest.TestCase):
         self.assertEqual(self.tab.artwork.resolve_asset(self.second).read_bytes(), source)
         self.assertIn("Second Letter", self.tab.header.text())
 
-    def test_duplicate_crop_does_not_modify_original_or_shared_source(self):
+    def test_duplicate_import_does_not_modify_original_or_shared_source(self):
         source = self.tab.artwork.resolve_asset(self.first)
         source_bytes = source.read_bytes()
         original = self.page(self.first)
         duplicate = self.tab.duplicate_page(self.first)
         self.assertNotEqual(duplicate, self.first)
         self.assertEqual(self.session.selected_page_id, duplicate)
-        self.assertTrue(self.tab.artwork.crop(duplicate, (10, 10, 100, 160)))
+        replacement = self.root / "replacement.png"
+        Image.new("RGB", (90, 150), "orange").save(replacement)
+        self.import_and_wait(duplicate, replacement)
         self.assertEqual(self.page(self.first)["artwork"], original["artwork"])
         self.assertEqual(source.read_bytes(), source_bytes)
         self.assertNotEqual(self.page(duplicate)["artwork"]["asset"], original["artwork"]["asset"])
@@ -368,21 +370,6 @@ class ImagesWorkspaceTests(unittest.TestCase):
         self.assertEqual(self.page(self.first)["prompt"]["text"], original["prompt"]["text"])
         self.assertEqual(self.page(self.first)["message"], original["message"])
         self.assert_same_content(self.page(self.second), other)
-
-    def test_crop_rejects_changed_dialog_target_and_retains_animated_source(self):
-        captured = self.tab.artwork.capture_target(self.first)
-        self.tab.clear_page_image(self.first)
-        after_clear = self.session.project.to_dict()
-        self.assertFalse(self.tab.artwork.crop(self.first, (0, 0, 30, 40), target=captured))
-        self.assertEqual(self.session.project.to_dict(), after_clear)
-        self.import_and_wait(self.first, self.gif())
-        source = self.tab.artwork.resolve_asset(self.first)
-        original = source.read_bytes()
-        before = self.page(self.first)
-        with self.assertRaises(ValueError):
-            self.tab.artwork.crop(self.first, (0, 0, 30, 40))
-        self.assertEqual(source.read_bytes(), original)
-        self.assertEqual(self.page(self.first), before)
 
     def test_page_limits_and_out_of_range_import_keep_all_pages_visible(self):
         self.session.replace(create_project(("illustration",) * MAX_PAGES), asset_root=self.root)

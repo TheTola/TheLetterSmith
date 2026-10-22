@@ -6,7 +6,7 @@ from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ui_theme import ensure_button_text_fits
+from ui_theme import CONTROL_RADIUS, PANEL_RADIUS, ensure_button_text_fits
 from window_chrome import place_window_on_launcher
 
 
@@ -19,6 +19,8 @@ _FALLBACK_COLORS = {
     "muted_text": "#aeb8c6",
     "accent": "#00d0ff",
     "hover": "#132a31",
+    "active": "#1c3640",
+    "disabled_text": "#7d8998",
     "error": "#ff626c",
 }
 
@@ -92,20 +94,20 @@ class LetterSmithDialog(QtWidgets.QDialog):
         self.setStyleSheet(
             "QFrame#LetterSmithDialogPanel{"
             f"background:{colors['panel_background']};"
-            f"border:1px solid {colors['border']};border-radius:10px;}}"
+            f"border:1px solid {colors['border']};border-radius:{PANEL_RADIUS}px;}}"
             "QLabel#LetterSmithDialogHeading{"
             f"color:{colors['text']};background:transparent;border:none;"
             "font:700 14pt 'Segoe UI';}"
             "QLabel#LetterSmithDialogMessage{"
             f"color:{colors['text']};background:transparent;border:none;"
-            "font:600 12pt 'Segoe UI';}"
+            "font:400 12pt 'Segoe UI';}"
             "QLabel#LetterSmithDialogDetail{"
             f"color:{colors['muted_text']};background:transparent;border:none;"
             "font:10pt 'Segoe UI';}"
             "QPushButton[dialogAction=\"true\"]{"
             f"background:{colors['control_background']};color:{colors['text']};"
-            f"border:1px solid {colors['border']};border-radius:7px;"
-            "font:700 11pt 'Segoe UI';padding:0 14px;}"
+            f"border:1px solid {colors['border']};border-radius:{CONTROL_RADIUS}px;"
+            "font:600 11pt 'Segoe UI';padding:0 14px;}"
             "QPushButton[dialogAction=\"true\"]:hover{"
             f"background:{colors['hover']};border-color:{colors['accent']};}}"
             "QPushButton[dialogRole=\"secondary\"]{"
@@ -114,9 +116,22 @@ class LetterSmithDialog(QtWidgets.QDialog):
             f"color:{colors['error']};border-color:{colors['error']};}}"
             "QPushButton[dialogRole=\"destructive\"]:hover{"
             f"background:{colors['error']};color:{colors['background']};}}"
+            "QPushButton[dialogAction=\"true\"]:pressed{"
+            f"background:{colors['active']};}}"
+            "QPushButton[dialogAction=\"true\"]:focus{"
+            f"border-color:{colors['accent']};}}"
+            "QPushButton[dialogAction=\"true\"]:disabled{"
+            f"background:{colors['panel_background']};color:{colors['disabled_text']};"
+            f"border-color:{colors['border']};}}"
+            "QLineEdit#LetterSmithDialogInput{"
+            f"background:{colors['control_background']};color:{colors['text']};"
+            f"border:1px solid {colors['border']};border-radius:{CONTROL_RADIUS}px;"
+            "padding:0 10px;font:10pt 'Segoe UI';}"
+            "QLineEdit#LetterSmithDialogInput:focus{"
+            f"border-color:{colors['accent']};}}"
             "QPlainTextEdit#LetterSmithDialogDetails{"
             f"background:{colors['background']};color:{colors['muted_text']};"
-            f"border:1px solid {colors['border']};border-radius:7px;"
+            f"border:1px solid {colors['border']};border-radius:{CONTROL_RADIUS}px;"
             "font:9pt 'Consolas';padding:8px;}"
         )
 
@@ -349,12 +364,8 @@ class LetterSmithInputDialog(LetterSmithDialog):
         self.prompt_label.setWordWrap(True)
         self.content_layout.addWidget(self.prompt_label)
         self.input = QtWidgets.QLineEdit(text, self.panel)
+        self.input.setObjectName("LetterSmithDialogInput")
         self.input.setMinimumHeight(40)
-        self.input.setStyleSheet(
-            f"background:{self.colors['background']};color:{self.colors['text']};"
-            f"border:1px solid {self.colors['border']};border-radius:7px;"
-            "padding:0 10px;font:10pt 'Segoe UI';"
-        )
         self.input.selectAll()
         self.content_layout.addWidget(self.input)
 

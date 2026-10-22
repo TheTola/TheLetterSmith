@@ -36,6 +36,8 @@ from publishing.github_config import (
     github_pages_repository_name,
 )
 from publishing.models import PublishConfiguration, PublishResult
+from publishing.destinations import DESTINATION_KEY, DestinationStore, destination_for, default_pages_url, public_path as validate_path, path_key
+from publishing.github_collections import GitHubCollections
 from project_timestamps import PROJECT_PUBLISHED_AT_KEY
 from settings_store import (
     PUBLICATION_PROVIDER_KEY,
@@ -66,6 +68,7 @@ MAX_PARALLEL_BLOB_BYTES = 128 * 1024 * 1024
 _PUBLIC_PATH_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?")
 _UNSUPPORTED_SLUG_CHARACTERS = re.compile(r"[^a-z0-9]+")
 _EXCLUDED_ROOT_FILES = {
+    "lettersmith-publication.json",
     "lettersmith-build.json",
     "lettersmith-metadata.json",
     "prompt_writer_state.json",
@@ -137,13 +140,13 @@ def _git_blob_sha(content: bytes) -> str:
 
 
 def _valid_public_path(value: object) -> str:
-    candidate = str(value or "").strip().casefold()
-    if not _PUBLIC_PATH_PATTERN.fullmatch(candidate):
+    try:
+        return validate_path(value)
+    except ValueError as error:
         raise GitHubOperationError(
             "invalid_publication_id",
-            "The letter's publication identity is invalid.",
-        )
-    return candidate
+            str(error),
+        ) from error
 
 
 def _project_publication_id(metadata: dict) -> str:
@@ -176,6 +179,8 @@ def _publication_path(metadata: dict) -> str:
         if existing:
             return _valid_public_path(existing)
     _project_publication_id(metadata)
+    if metadata.get("_requested_public_path"):
+        return _valid_public_path(metadata["_requested_public_path"])
     return _slugify_title(metadata.get("recipient_title", ""))
 
 
@@ -185,25 +190,27 @@ def _publication_prefix(repository: str, owner: str, public_path: str) -> str:
         return f"{public_path}/"
     if repository.casefold() == GITHUB_REPOSITORY_NAME.casefold():
         return f"{LEGACY_PUBLICATION_PREFIX}/{public_path}/"
-    raise GitHubOperationError(
-        "repository_mismatch",
-        "This letter's saved GitHub publishing project is not recognized.",
-    )
+    default_pages_url(owner, repository)
+    return f"{public_path}/"
 
 
 def _allocate_public_path(base: str, existing_paths: Iterable[str]) -> str:
     occupied = {
-        str(path).split("/", 1)[0].casefold()
+        path_key(str(path).split("/", 1)[0])
         for path in existing_paths
-        if "/" in str(path) and str(path).split("/", 1)[0]
+        if str(path).split("/", 1)[0]
     }
-    if base.casefold() not in occupied:
+    if path_key(base) not in occupied:
         return base
     suffix = 2
     while True:
         suffix_text = f"-{suffix}"
-        candidate = f"{base[:80 - len(suffix_text)].rstrip('-')}{suffix_text}"
-        if candidate.casefold() not in occupied:
+        stem = base
+        budget = 80 if _PUBLIC_PATH_PATTERN.fullmatch(base) else 180
+        while len((stem + suffix_text).encode("utf-8")) > budget:
+            stem = stem[:-1]
+        candidate = f"{stem.rstrip('-')}{suffix_text}"
+        if path_key(candidate) not in occupied:
             return _valid_public_path(candidate)
         suffix += 1
 
@@ -222,10 +229,7 @@ def _publication_url(owner: str, repository: str, public_path: str) -> str:
             f"{_user_site_url(owner)}/{quote(repository)}/"
             f"{quote(LEGACY_PUBLICATION_PREFIX)}/{quote(public_path)}/"
         )
-    raise GitHubOperationError(
-        "repository_mismatch",
-        "This letter's saved GitHub publishing project is not recognized.",
-    )
+    return f"{default_pages_url(owner, repository)}/{quote(_valid_public_path(public_path), safe='')}/"
 
 
 def _safe_pages_url(value: object) -> str:
@@ -307,13 +311,48 @@ class GitHubPagesPublisher(Publisher):
         self.cancelled = cancelled
         self.verification_timeout = max(1, int(verification_timeout))
         self.persist_publication = bool(persist_publication)
+        self.destination_store = DestinationStore(self.project_root)
+        self.destination = None
 
     def is_configured(self) -> bool:
         return self.configuration.configured
 
+    def _validated_destination(self, metadata):
+        destination = destination_for(self.session, metadata, self.destination_store)
+        service = GitHubCollections(self.session, self.api, self.destination_store, cancelled=self.cancelled)
+        return service.validate(destination)
+
+    def _migrated_metadata(self, metadata):
+        primary = self.destination_store.primary(self.session.account.account_id, metadata)
+        if primary:
+            metadata = dict(metadata)
+            metadata.update(published_destination=primary["destination"], published_public_path=primary["path"],
+                published_page_url=primary["url"], published_github_repository=primary["destination"]["repository"])
+        return metadata
+
+    def preview(self, metadata: dict) -> dict:
+        """Resolve a final card path without creating repositories or committing files."""
+        metadata = self._migrated_metadata(metadata)
+        self.destination = self._validated_destination(metadata)
+        destination = self.destination
+        _head, _tree_sha, tree, _initialized = self._current_tree(
+            destination.owner, destination.repository, destination.branch)
+        entries = {entry["path"]: entry for entry in tree}
+        project_id = _project_publication_id(metadata)
+        path = _publication_path(metadata)
+        saved = bool(metadata.get(PUBLISHED_PUBLIC_PATH_KEY))
+        if not saved:
+            path = self._recover_public_path(destination.owner, destination.repository, project_id, entries) or _allocate_public_path(
+                path, self._collection_entries(entries))
+        return {"destination": destination.to_dict(), "path": path, "url": destination.url(path)}
+
+    def _collection_entries(self, entries):
+        prefix = self.destination.prefix if self.destination else ""
+        return {path[len(prefix):]: value for path, value in entries.items() if path.startswith(prefix)}
+
     def configure(self, parent=None) -> PublishConfiguration:
         del parent
-        repository = github_pages_repository_name(self.session.account.login)
+        repository = destination_for(self.session, {}, self.destination_store).repository
         return PublishConfiguration(
             configured=self.is_configured(),
             repository=(
@@ -329,9 +368,10 @@ class GitHubPagesPublisher(Publisher):
         )
 
     def publish(self, build_dir: Path, metadata: dict) -> PublishResult:
+        metadata = self._migrated_metadata(metadata)
         build = Path(build_dir).resolve()
         owner = self.session.account.login
-        target_repository = github_pages_repository_name(owner)
+        target_repository = str(metadata.get(PUBLISHED_GITHUB_REPOSITORY_KEY) or github_pages_repository_name(owner))
         _LOGGER.info(
             "GitHub publishing started: account=%s repository=%s build=%s",
             owner,
@@ -363,18 +403,8 @@ class GitHubPagesPublisher(Publisher):
                         f"authenticated_owner={owner}"
                     ),
                 )
-            if previous_repository and (
-                previous_repository.casefold()
-                != target_repository.casefold()
-            ):
-                raise GitHubOperationError(
-                    "repository_mismatch",
-                    "This letter uses an older GitHub publishing location. Unpublish it first, then publish again to create a clean link.",
-                    technical_details=(
-                        f"expected_repository={previous_repository}; "
-                        f"configured_repository={target_repository}"
-                    ),
-                )
+            self.destination = self._validated_destination(metadata)
+            target_repository = self.destination.repository
             project_id = _project_publication_id(metadata)
             requested_public_path = _publication_path(metadata)
             has_saved_publication = bool(
@@ -390,11 +420,8 @@ class GitHubPagesPublisher(Publisher):
                 )
             source_fingerprint = str(metadata.get("source_fingerprint", "")).strip()
             bundle_sha256 = _bundle_digest(files)
-            repository, repository_created = self._ensure_repository(
-                target_repository
-            )
-            repository_name = str(repository["name"])
-            branch = str(repository.get("default_branch", "main") or "main")
+            repository_name = target_repository
+            branch = self.destination.branch
             commit_sha, tree_sha, tree, initialized = self._current_tree(
                 owner,
                 repository_name,
@@ -417,11 +444,21 @@ class GitHubPagesPublisher(Publisher):
                 if has_saved_publication
                 else recovered_public_path
                 or _allocate_public_path(
-                    requested_public_path, existing_entries
+                    requested_public_path, self._collection_entries(existing_entries)
                 )
             )
-            prefix = _publication_prefix(repository_name, owner, public_path)
+            confirmed = metadata.get("_confirmed_publication")
+            if confirmed and (confirmed.get("destination") != self.destination.to_dict()
+                    or confirmed.get("path") != public_path or confirmed.get("url") != self.destination.url(public_path)):
+                raise GitHubOperationError("publication_conflict", "The destination or available path changed. Review the publishing preview again.")
+            prefix = self.destination.prefix + public_path + "/"
             if has_saved_publication or recovered_public_path:
+                aliases = [name for name, entry in self._collection_entries(existing_entries).items()
+                           if path_key(name.split("/", 1)[0]) == path_key(public_path)
+                           and (name.split("/", 1)[0] != public_path
+                                or ("/" not in name and entry.get("type") != "tree"))]
+                if aliases:
+                    raise GitHubOperationError("publication_conflict", "Another file or folder conflicts with this letter's saved path. No files were changed.")
                 target_entries = tuple(
                     entry
                     for entry in tree
@@ -469,7 +506,7 @@ class GitHubPagesPublisher(Publisher):
                 marker,
                 existing_entries,
                 include_root_index=(
-                    repository_created or "index.html" not in existing_entries
+                    self.destination.root + "index.html" not in existing_entries
                 ),
             )
             new_tree = self.api.request(
@@ -505,8 +542,7 @@ class GitHubPagesPublisher(Publisher):
                 f"/repos/{quote(owner)}/{quote(repository_name)}/git/refs/heads/{quote(branch, safe='')}",
                 {"sha": new_commit_sha, "force": False},
             )
-            self._ensure_pages(owner, repository_name, branch)
-            url = _publication_url(owner, repository_name, public_path)
+            url = self.destination.url(public_path)
             index_bytes = (build / "index.html").read_bytes()
             if not self._verify_publication(url, marker, index_bytes, nonce):
                 raise GitHubOperationError(
@@ -514,6 +550,7 @@ class GitHubPagesPublisher(Publisher):
                     "GitHub received the letter, but the public page was not ready in time. Your local letter is unchanged.",
                 )
             publication = {
+                DESTINATION_KEY: self.destination.to_dict(),
                 PUBLISHED_PAGE_URL_KEY: url,
                 PUBLISHED_PUBLIC_PATH_KEY: public_path,
                 PUBLISHED_AT_KEY: published_at,
@@ -549,6 +586,7 @@ class GitHubPagesPublisher(Publisher):
                 source_fingerprint=source_fingerprint,
                 owner=owner,
                 repository=repository_name,
+                destination=self.destination.to_dict(),
                 verified=True,
                 message="Published with GitHub.",
             )
@@ -577,12 +615,13 @@ class GitHubPagesPublisher(Publisher):
         except (OSError, ValueError) as error:
             return PublishResult(
                 False,
-                message="The generated letter could not be prepared for GitHub. Your local letter is unchanged.",
+                message=str(error) if isinstance(error, ValueError) else "The generated letter could not be prepared for GitHub. Your local letter is unchanged.",
                 technical_details=f"{type(error).__name__}: {error}",
                 error_code="invalid_build",
             )
 
     def unpublish(self, metadata: dict) -> PublishResult:
+        metadata = self._migrated_metadata(metadata)
         owner = self.session.account.login
         try:
             self.configuration.require_configured()
@@ -609,10 +648,11 @@ class GitHubPagesPublisher(Publisher):
                         f"expected_owner={previous_owner}; authenticated_owner={owner}"
                     ),
                 )
-            prefix = _publication_prefix(repository_name, owner, public_path)
-            url = _publication_url(owner, repository_name, public_path)
+            self.destination = self._validated_destination(metadata)
+            prefix = self.destination.prefix + public_path + "/"
+            url = self.destination.url(public_path)
             saved_url = f"{_safe_pages_url(metadata.get(PUBLISHED_PAGE_URL_KEY, ''))}/"
-            if saved_url.casefold() != url.casefold():
+            if saved_url != url:
                 raise GitHubOperationError(
                     "publication_conflict",
                     "The saved public link does not match this letter's GitHub publication identity.",
@@ -622,7 +662,7 @@ class GitHubPagesPublisher(Publisher):
                 "GET",
                 f"/repos/{quote(owner)}/{quote(repository_name)}",
             )
-            branch = str(repository.get("default_branch", "main") or "main")
+            branch = self.destination.branch
             commit_sha, tree_sha, tree, _initialized = self._current_tree(
                 owner,
                 repository_name,
@@ -802,13 +842,16 @@ class GitHubPagesPublisher(Publisher):
     ) -> str | None:
         """Find an upload committed before its local verification completed."""
         matches: list[str] = []
-        for path, entry in existing_entries.items():
+        for path, entry in self._collection_entries(existing_entries).items():
             public_path, _separator, name = path.partition("/")
             if (
                 name != PUBLICATION_MARKER
                 or entry.get("type") != "blob"
-                or not _PUBLIC_PATH_PATTERN.fullmatch(public_path)
             ):
+                continue
+            try:
+                _valid_public_path(public_path)
+            except GitHubOperationError:
                 continue
             marker = self._remote_blob_bytes(
                 owner, repository, str(entry.get("sha", ""))
@@ -872,7 +915,7 @@ class GitHubPagesPublisher(Publisher):
         remote_public_path = str(marker_payload.get("public_path", "")).strip()
         legacy_match = not remote_project_id and public_path == project_id
         if (
-            remote_public_path.casefold() != public_path.casefold()
+            remote_public_path != public_path
             or (
                 remote_project_id
                 and remote_project_id.casefold() != project_id.casefold()
@@ -894,21 +937,7 @@ class GitHubPagesPublisher(Publisher):
         except GitHubOperationError as error:
             if error.code != "not_found":
                 raise
-            repository = self.api.request(
-                "POST",
-                "/user/repos",
-                {
-                    "name": name,
-                    "description": "Letters published with Letter Smith",
-                    "private": False,
-                    "auto_init": True,
-                    "has_issues": False,
-                    "has_projects": False,
-                    "has_wiki": False,
-                },
-                expected=(201,),
-            )
-            created = True
+            raise GitHubOperationError("collection_setup_required", "Choose and confirm a publishing collection before creating a repository.") from error
         if repository.get("private") is True:
             raise GitHubOperationError(
                 "repository_private",
@@ -942,18 +971,7 @@ class GitHubPagesPublisher(Publisher):
         except GitHubOperationError as error:
             if error.code != "not_found":
                 raise
-            self.api.request(
-                "PUT",
-                f"/repos/{quote(owner)}/{quote(repository)}/contents/.nojekyll",
-                {
-                    "message": "Initialize Letter Smith publishing",
-                    "content": base64.b64encode(b"\n").decode("ascii"),
-                    "branch": branch,
-                },
-                expected=(201,),
-            )
-            initialized = True
-            reference = self.api.request("GET", ref_path)
+            raise GitHubOperationError("collection_setup_required", "The publishing branch is empty or unavailable. Initialize it on GitHub, then review collection setup.") from error
         commit_sha = str(reference.get("object", {}).get("sha", "")).strip()
         if not commit_sha:
             raise GitHubOperationError(
@@ -1003,15 +1021,16 @@ class GitHubPagesPublisher(Publisher):
             for path, relative, _size in files
         }
         payloads[f"{prefix}{PUBLICATION_MARKER}"] = marker
-        payloads[REPOSITORY_MARKER] = json.dumps(
+        site_root = self.destination.root if self.destination else ""
+        payloads[site_root + REPOSITORY_MARKER] = json.dumps(
             {"schema_version": 1, "application": "Letter Smith"},
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        payloads[".nojekyll"] = b"\n"
+        payloads[site_root + ".nojekyll"] = b"\n"
         if include_root_index:
-            payloads["index.html"] = _ROOT_INDEX
+            payloads[site_root + "index.html"] = _ROOT_INDEX
 
         updates: list[dict[str, object]] = []
         target_paths = set(payloads)
@@ -1150,37 +1169,10 @@ class GitHubPagesPublisher(Publisher):
             )
 
     def _ensure_pages(self, owner: str, repository: str, branch: str) -> str:
-        path = f"/repos/{quote(owner)}/{quote(repository)}/pages"
-        try:
-            pages = self.api.request("GET", path)
-            source = pages.get("source", {})
-            if not isinstance(source, dict):
-                source = {}
-            if source.get("branch") != branch or source.get("path") != "/":
-                self.api.request(
-                    "PUT",
-                    path,
-                    {
-                        "build_type": "legacy",
-                        "source": {"branch": branch, "path": "/"},
-                    },
-                    expected=(204,),
-                )
-                pages = self.api.request("GET", path)
-        except GitHubOperationError as error:
-            if error.code != "not_found":
-                raise
-            pages = self.api.request(
-                "POST",
-                path,
-                {
-                    "build_type": "legacy",
-                    "source": {"branch": branch, "path": "/"},
-                },
-                expected=(201,),
-            )
-        if not str(pages.get("html_url", "")).strip():
-            pages = self.api.request("GET", path)
+        pages = self.api.request("GET", f"/repos/{quote(owner)}/{quote(repository)}/pages")
+        source = pages.get("source") or {}
+        if pages.get("build_type") == "workflow" or source.get("branch") != branch or source.get("path") not in ("/", "/docs"):
+            raise GitHubOperationError("collection_setup_required", "Review the Pages source in collection setup. It has not been changed.")
         return _safe_pages_url(pages.get("html_url", ""))
 
     def _verify_publication(

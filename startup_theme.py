@@ -56,7 +56,6 @@ class _GlowToolButton(QtWidgets.QToolButton):
         self._glow.setOffset(0, 0)
         self._glow.setEnabled(False)
         self.setGraphicsEffect(self._glow)
-        self._pending_click: Callable[[], None] | None = None
 
         self._press_animation = QtCore.QPropertyAnimation(
             self,
@@ -76,30 +75,6 @@ class _GlowToolButton(QtWidgets.QToolButton):
         self._restore_animation.setEndValue(self._icon_size)
         self._restore_animation.setEasingCurve(QtCore.QEasingCurve.OutCubic)
 
-        self._bounce_animation = QtCore.QPropertyAnimation(
-            self,
-            b"iconSize",
-            self,
-        )
-        self._bounce_animation.setDuration(280)
-        self._bounce_animation.setKeyValueAt(
-            0.45,
-            QtCore.QSize(
-                round(self._icon_size.width() * 1.024),
-                round(self._icon_size.height() * 1.024),
-            ),
-        )
-        self._bounce_animation.setKeyValueAt(
-            0.72,
-            QtCore.QSize(
-                round(self._icon_size.width() * 0.968),
-                round(self._icon_size.height() * 0.968),
-            ),
-        )
-        self._bounce_animation.setEndValue(self._icon_size)
-        self._bounce_animation.setEasingCurve(QtCore.QEasingCurve.OutCubic)
-        self._bounce_animation.finished.connect(self._finish_click)
-
         self.pressed.connect(self._animate_pressed)
         self.released.connect(self._animate_released)
 
@@ -113,18 +88,10 @@ class _GlowToolButton(QtWidgets.QToolButton):
         self.setIconSize(self._icon_size)
         self._press_animation.setEndValue(self._depressed_icon_size)
         self._restore_animation.setEndValue(self._icon_size)
-        self._bounce_animation.setKeyValueAt(
-            0.45, QtCore.QSize(round(icon_edge * 1.024), round(icon_edge * 1.024))
-        )
-        self._bounce_animation.setKeyValueAt(
-            0.72, QtCore.QSize(round(icon_edge * 0.968), round(icon_edge * 0.968))
-        )
-        self._bounce_animation.setEndValue(self._icon_size)
 
     def _stop_icon_animations(self) -> None:
         self._press_animation.stop()
         self._restore_animation.stop()
-        self._bounce_animation.stop()
 
     def _animate_pressed(self) -> None:
         self._stop_icon_animations()
@@ -136,19 +103,6 @@ class _GlowToolButton(QtWidgets.QToolButton):
         self._restore_animation.setStartValue(self.iconSize())
         self._restore_animation.start()
 
-    def animate_click(self, callback: Callable[[], None]) -> None:
-        self._stop_icon_animations()
-        self._pending_click = callback
-        self.setEnabled(False)
-        self._bounce_animation.setStartValue(self.iconSize())
-        self._bounce_animation.start()
-
-    def _finish_click(self) -> None:
-        callback = self._pending_click
-        self._pending_click = None
-        if callback is not None:
-            callback()
-
     def enterEvent(self, event: QtCore.QEvent) -> None:
         self._glow.setEnabled(True)
         super().enterEvent(event)
@@ -159,8 +113,7 @@ class _GlowToolButton(QtWidgets.QToolButton):
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         super().mouseReleaseEvent(event)
-        if self._pending_click is None:
-            self._animate_released()
+        self._animate_released()
 
 
 class ThemeFamilySelector(QtWidgets.QDialog):

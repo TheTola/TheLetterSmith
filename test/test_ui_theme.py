@@ -1021,6 +1021,10 @@ class ThemeServiceTests(unittest.TestCase):
             "QPushButton{color:#edf7fb;border:1px solid #00d0ff;"
             "background:#101317;}"
         )
+        status = QtWidgets.QLabel("Sign in to GitHub to publish", root)
+        status.setStyleSheet(
+            "color:#f0f6fc;background:#0d1117;border:1px solid #58a6ff;"
+        )
         self.addCleanup(root.deleteLater)
 
         translated_styles = set()
@@ -1029,6 +1033,8 @@ class ThemeServiceTests(unittest.TestCase):
             "obsidian_forge",
             "velvet_rose",
             "celestial_rose",
+            "dark",
+            "light",
         ):
             service.set_theme(theme_id, persist=False)
             service.apply_semantic_styles(root)
@@ -1037,7 +1043,10 @@ class ThemeServiceTests(unittest.TestCase):
             self.assertNotIn("#00d0ff", translated)
             self.assertIn(service.tokens.accent_secondary, translated)
             self.assertIn(service.tokens.panel_background, translated)
-        self.assertEqual(len(translated_styles), 4)
+            self.assertIn(f"color:{service.tokens.text_primary}", status.styleSheet())
+            self.assertIn(f"background:{service.tokens.control_background}", status.styleSheet())
+            self.assertIn(service.tokens.accent_bright, status.styleSheet())
+        self.assertEqual(len(translated_styles), 6)
 
     def test_semantic_text_colors_follow_light_and_dark_after_runtime_updates(self) -> None:
         service = ThemeService(self.root)

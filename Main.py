@@ -846,6 +846,7 @@ def main(*, open_new_project: bool = False, open_saved_project: str = "") -> Non
     window.show()
     if open_saved_project:
         QtCore.QTimer.singleShot(0, lambda: window.open_last_project(open_saved_project))
+    QtCore.QTimer.singleShot(0, window.start_repository_setup)
     nexus_startup_timer.finish(
         project_ready=bool(
             getattr(getattr(window, "project_state", None), "is_project_ready", False)

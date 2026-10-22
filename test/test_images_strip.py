@@ -24,6 +24,57 @@ class ImagesStripTests(unittest.TestCase):
     select = fixture.ImagesWorkspaceTests.select
     list_ids = fixture.ImagesWorkspaceTests.list_ids
 
+    def test_stock_assets_and_old_cached_copies_never_enter_personal_history(self):
+        import hashlib
+        import shutil
+        from recent_media import _history_path, _TYPE_HISTORY_ID
+        from transactional_io import atomic_write_json
+        from project_paths import application_paths
+        paths = application_paths(self.root)
+        bundled = Path(__file__).resolve().parents[1] / "resources/stock"
+        stock = paths.stock_images_root / "cover/stock cover 1.png"
+        stock.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(bundled / "images/cover/stock cover 1.png", stock)
+        copied = self.root / "old-cached-stock.png"
+        with Image.open(stock) as image:
+            image.save(copied, compress_level=0)
+        for kind in PAGE_TYPES:
+            remember_type_image(self.root, kind, stock, "Stock")
+            remember_type_image(self.root, kind, copied, "Copied stock")
+            self.assertEqual(recent_type_images(self.root, kind), ())
+        atomic_write_json(_history_path(self.root), {_TYPE_HISTORY_ID: {
+            "image:cover": [{"value": str(copied), "label": "Old stock"}]}})
+        self.assertEqual(recent_type_images(self.root, "cover"), ())
+        personal = self.image()
+        remember_type_image(self.root, "cover", personal, "Personal")
+        self.assertEqual([label for _, label in recent_type_images(self.root, "cover")], ["Personal"])
+        music = next((bundled / "music").glob("*.mp3"))
+        local = paths.stock_root / "music" / music.name
+        local.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(music, local)
+        track_id = hashlib.sha256(local.read_bytes()).hexdigest()[:24]
+        for slot in ("music", "sound:opening"):
+            remember_media(self.root, self.session.project.project_id, slot, track_id, "Stock music")
+            remember_media(self.root, self.session.project.project_id, slot, "stock:" + track_id, "Old stock music")
+            self.assertEqual(recent_media(self.root, self.session.project.project_id, slot), ())
+
+    def test_stock_menu_keeps_three_defaults_and_all_stock_with_personal_history(self):
+        import shutil
+        from project_paths import application_paths
+        bundled = Path(__file__).resolve().parents[1] / "resources/stock/images"
+        shutil.copytree(bundled, application_paths(self.root).stock_images_root, dirs_exist_ok=True)
+        page = self.session.project.pages[0]
+        self.select(page["id"])
+        remember_type_image(self.root, page["type"], self.image(), "Personal")
+        with mock.patch("Image_tab.StockImageDialog") as dialog:
+            dialog.return_value.exec.return_value = QtWidgets.QDialog.Rejected
+            self.tab._stock_selected()
+            self.assertEqual(len(dialog.call_args.args[1]), 3)
+            self.assertEqual(dialog.call_args.kwargs["recent_paths"], ())
+            self.assertEqual(len(dialog.call_args.kwargs["all_stock_paths"]), 12)
+            self.tab._all_stock_images()
+            self.assertEqual(len(dialog.call_args.args[1]), 12)
+
     def test_import_history_retains_each_type_and_original_gif_after_project_switch(self):
         gif = fixture.ImagesWorkspaceTests.gif(self)
         original = gif.read_bytes()
@@ -169,7 +220,7 @@ class ImagesStripTests(unittest.TestCase):
                                str(self.image()), "Old private selection")
                 with mock.patch("Image_tab.StockImageDialog") as dialog:
                     dialog.return_value.exec.return_value = QtWidgets.QDialog.Rejected
-                    self.tab._stock_selected()
+                    self.tab._choose_images()
                 if cleared:
                     self.assertEqual(len(dialog.call_args.args[1]), 3)
                     self.assertEqual(dialog.call_args.kwargs["recent_paths"], ())
@@ -218,7 +269,7 @@ class ImagesStripTests(unittest.TestCase):
 
     def test_delayed_click_does_not_open_in_replaced_session(self):
         view = self.tab.page_list
-        with mock.patch.object(self.tab, "_stock_selected") as picker:
+        with mock.patch.object(self.tab, "_choose_images") as picker:
             QtTest.QTest.mouseClick(view.viewport(), QtCore.Qt.LeftButton,
                                    pos=view.visualItemRect(view.item(0)).center())
             previous = self.session.project
@@ -300,12 +351,13 @@ class ImagesStripTests(unittest.TestCase):
         other = self.page(self.second)
         menu = self.tab._page_menu(self.first)
         actions = {action.text(): action for action in menu.actions()}
-        for label in ("Import image…", "Stock & recent images…", "Crop image…",
+        for label in ("Import image…", "Stock Images", "View All Stock Images",
                       "Clear page artwork", "Delete page…", "Add page", "Prompt Writer",
                       "Edit letter text", "Move left", "Move right"):
             self.assertIn(label, actions)
         self.assertIn("Duplicate page", actions)
-        self.assertIn("Open Artwork Folder", actions)
+        self.assertNotIn("Open Artwork Folder", actions)
+        self.assertNotIn("Crop image…", actions)
         self.select(self.second)
         actions["Clear page artwork"].trigger()
         self.assertIsNone(self.page(self.first)["artwork"]["asset"])
@@ -352,7 +404,7 @@ class ImagesStripTests(unittest.TestCase):
         self.assertTrue(self.tab.add_button.isVisibleTo(self.tab))
         self.assertFalse(any(button.text() == "Page actions"
                              for button in self.tab.findChildren(QtWidgets.QAbstractButton)))
-        for button in (self.tab.import_button, self.tab.stock_button, self.tab.crop_button,
+        for button in (self.tab.import_button, self.tab.stock_button,
                        self.tab.duplicate_button, self.tab.delete_button, self.tab.more_button,
                        self.tab.undo_button):
             self.assertFalse(button.isVisibleTo(self.tab))

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -27,3 +27,4 @@ class PublishResult:
     message: str = ""
     technical_details: str = ""
     error_code: str = ""
+    destination: dict = field(default_factory=dict)

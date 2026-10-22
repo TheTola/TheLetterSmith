@@ -21,6 +21,8 @@ build/
 release/installer/
 .lettersmith-publishing/
 .lettersmith-publishing-workspaces/
+/publishing-collections.json
+/.publishing-lock/
 Quarantine/
 *.bak_*
 editor_error.log

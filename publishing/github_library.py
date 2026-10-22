@@ -14,6 +14,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import tempfile
+from time import monotonic
 from urllib.parse import quote
 import uuid
 
@@ -21,6 +22,7 @@ from project_repository import ProjectRepository, _safe_file, _writer_lock
 from transactional_io import atomic_write_json, is_link_or_reparse_point
 from publishing.github_auth import GitHubOperationError
 from publishing.github_config import GITHUB_REPOSITORY_NAME, github_pages_repository_name
+from publishing.destinations import DestinationStore, PublishingDestination, repository_name
 from publishing.github_pages import (
     PUBLICATION_MARKER, MAX_BLOB_BYTES, MAX_BUNDLE_BYTES, _git_blob_sha,
     _publication_url, _valid_public_path,
@@ -66,6 +68,7 @@ class RemoteCopy:
     editable: bool = False
     url: str = ""
     digest: str = ""
+    destination: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,7 @@ class LibraryProject:
     project_id: str
     presentation: RemoteCopy | None = None
     backup: RemoteCopy | None = None
+    retained_presentations: tuple[RemoteCopy, ...] = ()
 
     @property
     def title(self):
@@ -92,6 +96,20 @@ def project_digest(stored) -> str:
     return hashlib.sha256(_document({"project": value, "resources": resources})).hexdigest()
 
 
+def presentation_cover(copy, root):
+    files = {name for name, _sha, _size in copy.files}
+    try:
+        if "lettersmith-display.json" in files:
+            data = json.loads(_safe_file(root, "lettersmith-display.json").read_text(encoding="utf-8"))
+            name = next((page.get("source", "") for page in data.get("pages", []) if page.get("type") == "cover"), "")
+            if name in files:
+                return _safe_file(root, name)
+        name = next((name for name in files if name.lower().startswith("gallery/pages/cover.")), "")
+        return _safe_file(root, name) if name else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def downloaded_presentations(root):
     """List managed downloads offline, without contacting or signing in to GitHub."""
     root = Path(root)
@@ -107,7 +125,10 @@ def downloaded_presentations(root):
                 continue
             owner, data = value["owner"], value["presentation"]
             repository = github_pages_repository_name(owner)
-            if data["repository"] not in (repository, GITHUB_REPOSITORY_NAME) or data["editable"]:
+            destination = PublishingDestination.from_dict(data["destination"]) if data.get("destination") else None
+            if data["editable"] or (destination is None and data["repository"] not in (repository, GITHUB_REPOSITORY_NAME)):
+                continue
+            if destination and (destination.owner.casefold() != owner.casefold() or destination.repository != data["repository"]):
                 continue
             project_id = str(uuid.UUID(data["project_id"]))
             sha = data["marker_sha"]
@@ -123,7 +144,7 @@ def downloaded_presentations(root):
             if sum(item[2] for item in files) > MAX_BUNDLE_BYTES:
                 continue
             slug = _valid_public_path(data["prefix"].split("/")[-1])
-            data.update(files=files, url=_publication_url(owner, data["repository"], slug))
+            data.update(files=files, url=destination.url(slug) if destination else _publication_url(owner, data["repository"], slug))
             copy = RemoteCopy(**data)
             _safe_file(expected, "index.html")
             result[f"download:{owner.casefold()}:{project_id}:{sha}"] = (copy, expected, owner)
@@ -133,16 +154,23 @@ def downloaded_presentations(root):
 
 
 class GitHubLibrary:
-    def __init__(self, session, api, *, cancelled=lambda: False):
+    def __init__(self, session, api, *, cancelled=lambda: False, store=None, deadline=None):
         self.session = session
         self.owner = session.account.login
         github_pages_repository_name(self.owner)  # Validate before constructing API paths.
         self.api = api
         self.cancelled = cancelled
+        self.deadline = deadline
+        self._metadata = {}
+        self.store = store or DestinationStore()
+        self.destinations = {d.repository: d for d in self.store.all(session.account.account_id)
+                             if d.owner.casefold() == self.owner.casefold()}
 
     def _check(self):
         if self.cancelled():
             raise GitHubOperationError("cancelled", "The GitHub library operation was cancelled.")
+        if self.deadline is not None and monotonic() >= self.deadline:
+            raise GitHubOperationError("library_timeout", "GitHub took too long to load your letters. Check your connection and retry.")
 
     def _request(self, method, path, payload=None, **kwargs):
         self._check()
@@ -151,7 +179,7 @@ class GitHubLibrary:
         return result
 
     def _base(self, repository):
-        if repository not in (github_pages_repository_name(self.owner), GITHUB_REPOSITORY_NAME, BACKUP_REPOSITORY):
+        if repository not in (*self.destinations, github_pages_repository_name(self.owner), GITHUB_REPOSITORY_NAME, BACKUP_REPOSITORY):
             raise ValueError("This is not a Letter Smith repository.")
         return f"/repos/{quote(self.owner)}/{quote(repository)}"
 
@@ -165,9 +193,12 @@ class GitHubLibrary:
             raise
         if str(info.get("owner", {}).get("login", "")).casefold() != self.owner.casefold():
             raise ValueError("GitHub returned a repository belonging to another account.")
+        destination = self.destinations.get(repository)
+        if destination and (info.get("id") != destination.repository_id or info.get("owner", {}).get("id") != destination.account_id):
+            raise ValueError("The publishing repository identity changed. Review the collection before downloading.")
         if repository == BACKUP_REPOSITORY and info.get("private") is not True:
             raise ValueError("LetterSmith-Projects must be private. No editable project was uploaded or downloaded.")
-        branch = str(info.get("default_branch") or "main")
+        branch = destination.branch if destination else str(info.get("default_branch") or "main")
         try:
             ref = self._request("GET", f"{base}/git/ref/heads/{quote(branch, safe='')}")
         except GitHubOperationError as error:
@@ -177,18 +208,28 @@ class GitHubLibrary:
         head = ref.get("object", {}).get("sha", "")
         if not _SHA.fullmatch(head):
             raise ValueError("GitHub returned an invalid branch.")
-        commit = self._request("GET", f"{base}/git/commits/{head}")
+        commit = self._metadata.get(("commit", head))
+        if commit is None:
+            commit = self._request("GET", f"{base}/git/commits/{head}")
+            self._metadata[("commit", head)] = commit
         tree_sha = commit.get("tree", {}).get("sha", "")
         if not _SHA.fullmatch(tree_sha):
             raise ValueError("GitHub returned an invalid tree.")
-        tree = self._request("GET", f"{base}/git/trees/{tree_sha}?recursive=1")
+        tree = self._metadata.get(("tree", tree_sha))
+        if tree is None:
+            tree = self._request("GET", f"{base}/git/trees/{tree_sha}?recursive=1")
+            self._metadata[("tree", tree_sha)] = tree
         if tree.get("truncated") or not isinstance(tree.get("tree"), list):
             raise ValueError("GitHub's file listing is incomplete. Retry after reducing the repository size.")
         return info, branch, head, tree_sha, tree["tree"]
 
     def _blob(self, repository, sha, size):
+        self._check()
         if not _SHA.fullmatch(sha) or not isinstance(size, int) or not 0 <= size <= MAX_BLOB_BYTES:
             raise ValueError("GitHub returned invalid file metadata.")
+        cached = self._metadata.get(("blob", sha))
+        if cached is not None and len(cached) == size:
+            return cached
         value = self._request("GET", f"{self._base(repository)}/git/blobs/{sha}")
         content = value.get("content", "")
         if value.get("encoding") != "base64" or not isinstance(content, str) or len(content) > MAX_BLOB_BYTES * 2:
@@ -196,6 +237,10 @@ class GitHubLibrary:
         data = base64.b64decode("".join(content.split()), validate=True)
         if len(data) != size or _git_blob_sha(data) != sha:
             raise ValueError("GitHub file verification failed. Nothing was imported.")
+        # Retained URL repositories often share markers. Reuse verified small
+        # blobs within this operation, without retaining full letter assets.
+        if size <= 65536:
+            self._metadata[("blob", sha)] = data
         return data
 
     def _files(self, tree, prefix):
@@ -219,15 +264,23 @@ class GitHubLibrary:
 
     def discover(self):
         projects, warnings = {}, []
-        for repository in (github_pages_repository_name(self.owner), GITHUB_REPOSITORY_NAME, BACKUP_REPOSITORY):
+        default = self.store.default(self.session.account.account_id)
+        repositories = ([default.repository] if default else []) + list(self.destinations) + [github_pages_repository_name(self.owner), GITHUB_REPOSITORY_NAME, BACKUP_REPOSITORY]
+        for repository in dict.fromkeys(repositories):
             try:
-                snapshot = self._snapshot(repository)
+                snapshot = self._snapshot(repository, missing_ok=repository not in self.destinations)
                 if snapshot is None:
                     continue
                 tree = snapshot[4]
                 marker_name = BACKUP_MARKER if repository == BACKUP_REPOSITORY else PUBLICATION_MARKER
                 for entry in tree:
-                    parts = str(entry.get("path", "")).split("/")
+                    self._check()
+                    destination = self.destinations.get(repository)
+                    name = str(entry.get("path", ""))
+                    site_root = destination.root if destination else ""
+                    if not name.startswith(site_root):
+                        continue
+                    parts = name[len(site_root):].split("/")
                     # Older publishing used letters/<slug>; current publishing uses <slug>.
                     valid_depth = ((len(parts) == 3 and parts[0] == "letters") if repository == GITHUB_REPOSITORY_NAME
                                    else len(parts) == 2)
@@ -238,7 +291,7 @@ class GitHubLibrary:
                             raise ValueError("The letter marker is too large.")
                         marker = json.loads(self._blob(repository, entry["sha"], entry["size"]))
                         project_id = str(uuid.UUID(marker["project_id"]))
-                        prefix = "/".join(parts[:-1])
+                        prefix = site_root + "/".join(parts[:-1])
                         editable = repository == BACKUP_REPOSITORY
                         if editable:
                             if prefix != project_id or marker.get("format") != "lettersmith.editable-backup" or marker.get("version") != 1:
@@ -257,17 +310,23 @@ class GitHubLibrary:
                             str(marker.get("recipient") or ""),
                             str(marker.get("saved_at") or marker.get("published_at") or ""),
                             str(marker.get("source_fingerprint") or ""), files, entry["sha"], editable,
-                            "" if editable else _publication_url(self.owner, repository, parts[-2]),
-                            str(marker.get("project_digest") or ""))
+                            "" if editable else destination.url(parts[-2]) if destination else _publication_url(self.owner, repository, parts[-2]),
+                            str(marker.get("project_digest") or ""), destination.to_dict() if destination else None)
                         previous = projects.get(project_id, LibraryProject(project_id))
+                        if not editable and previous.presentation and previous.presentation.repository != repository:
+                            projects[project_id] = LibraryProject(project_id, previous.presentation, previous.backup,
+                                previous.retained_presentations + (copy,))
+                            continue
                         if (editable and previous.backup) or (not editable and previous.presentation):
                             raise ValueError("Multiple GitHub copies share this project identity.")
                         projects[project_id] = LibraryProject(project_id,
-                            previous.presentation if editable else copy, copy if editable else previous.backup)
+                            previous.presentation if editable else copy, copy if editable else previous.backup, previous.retained_presentations)
                     except (ValueError, KeyError, TypeError) as error:
                         warnings.append(f"{repository}/{entry.get('path', '')}: {error}")
             except (GitHubOperationError, ValueError) as error:
-                if isinstance(error, GitHubOperationError) and error.code == "cancelled":
+                if isinstance(error, GitHubOperationError) and error.code in {
+                    "cancelled", "library_timeout", "authentication", "rate_limit", "github_unavailable", "network",
+                }:
                     raise
                 warnings.append(f"{repository}: {error}")
         return tuple(sorted(projects.values(), key=lambda p: (p.title.casefold(), p.project_id))), tuple(warnings)
@@ -286,6 +345,42 @@ class GitHubLibrary:
         if not _SHA.fullmatch(copy.marker_sha):
             raise ValueError("GitHub returned an invalid letter identity.")
         return _safe_file(Path(root), f"{self.owner.casefold()}/{project_id}/{copy.marker_sha}")
+
+    def cover_preview(self, project, root):
+        """Fetch only the cover's verified blob; never import or upload a project."""
+        for copy in (project.backup, project.presentation):
+            if copy is None:
+                continue
+            files = {name: (sha, size) for name, sha, size in copy.files}
+            candidate = ""
+            if copy.editable:
+                pointer = files.get(".lettersmith-project/current.json")
+                if pointer and pointer[1] <= 1024 * 1024:
+                    head = json.loads(self._blob(copy.repository, *pointer))
+                    base = f".lettersmith-project/g/{head.get('revision', '')}/"
+                    document = files.get(base + "project.json")
+                    if document and document[1] <= 4 * 1024 * 1024:
+                        data = json.loads(self._blob(copy.repository, *document))
+                        page = next((page for page in data.get("pages", []) if page.get("type") == "cover"), {})
+                        candidate = base + (page.get("artwork", {}).get("asset") or "")
+            else:
+                manifest = files.get("lettersmith-display.json")
+                if manifest and manifest[1] <= 4 * 1024 * 1024:
+                    data = json.loads(self._blob(copy.repository, *manifest))
+                    candidate = next((page.get("source", "") for page in data.get("pages", [])
+                                      if page.get("type") == "cover"), "")
+                if not candidate:
+                    candidate = next((name for name in files if name.lower().startswith("gallery/pages/cover.")), "")
+            record = files.get(candidate)
+            if record and record[1] <= 12 * 1024 * 1024:
+                destination = Path(root) / (record[0] + Path(candidate).suffix.lower())
+                if not destination.is_file() or _git_blob_sha(destination.read_bytes()) != record[0]:
+                    data = self._blob(copy.repository, *record)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    from transactional_io import atomic_write_bytes
+                    atomic_write_bytes(destination, data)
+                return destination
+        return None
 
     def download_presentation(self, copy, root):
         if copy.editable:
