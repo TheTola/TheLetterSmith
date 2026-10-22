@@ -183,7 +183,7 @@ class ProjectLifecycle(QtCore.QObject):
         return True
 
     def command_save(self, *, reset=False):
-        """Save through Saved Letters, then optionally activate an empty workspace."""
+        """Save, then optionally clear the workspace and hand off the finished letter."""
         window = self.window
 
         def explain(message=None):
@@ -208,6 +208,8 @@ class ProjectLifecycle(QtCore.QObject):
                         if not window.flush_project_edits() or token != self.token():
                             explain("New edits arrived. Saved version retained; reset cancelled.")
                             return
+                        from command_bar import build_command_bar_data
+                        completed_letter = build_command_bar_data(window.project_root)
                         candidate = window.project_save_service.prepare_new_project(CLASSIC_PAGE_TYPES)
                         window.prepare_for_project_reset()
                         if not window.flush_project_edits() or token != self.token():
@@ -217,7 +219,13 @@ class ProjectLifecycle(QtCore.QObject):
                         from recent_media import clear_type_image_history
                         clear_type_image_history(window.project_root)
                         window._show_new_project()
+                        if not window.flush_project_edits():
+                            raise RuntimeError("The fresh workspace could not be prepared for closing")
+                        self._exit_token = self.token()
+                        if not window.open_command_bar_and_close_editor(completed_letter):
+                            raise RuntimeError("The completed letter's Command Bar could not open")
                 except Exception as error:
+                    self._exit_token = None
                     retained = ("Your saved project is retained." if token[0] == self.token()[0] else
                                 "The fresh project is recoverable. Reopen to restore its views.")
                     explain(f"Reset stopped: {error}. {retained}")

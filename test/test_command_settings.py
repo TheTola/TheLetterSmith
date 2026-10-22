@@ -196,7 +196,7 @@ class CommandSettingsUiTests(unittest.TestCase):
         saved = ProjectRepository(self.service.editable_root / original / ".lettersmith-project").load()
         self.assertEqual(saved.project.get_prompt(self.ids[1])["text"], self.session.project.get_prompt(self.ids[1])["text"])
 
-    def test_three_second_go_saves_clears_and_restarts_fresh(self):
+    def test_three_second_go_hands_off_then_restarts_fresh(self):
         from recent_media import remember_type_image, recent_type_images
         from project_model import PAGE_TYPES
         from project_paths import application_paths
@@ -208,6 +208,13 @@ class CommandSettingsUiTests(unittest.TestCase):
             histories[kind] = recent_type_images(self.root, kind)
         settings = SettingsStore(self.root)
         settings.update_fields(ui_window_width=1170, forge_preview_mode="window")
+        from config import canonical_play_root
+        preview = canonical_play_root(self.root) / "completed-letter"
+        preview.mkdir(parents=True, exist_ok=True)
+        (preview / "index.html").write_text("<html>Completed letter</html>", encoding="utf-8")
+        settings.update_fields(active_play_dir=str(preview))
+        from command_bar import build_command_bar_data
+        completed_letter = build_command_bar_data(self.root)
         before_settings = settings.snapshot()
         library = application_paths(self.root).custom_palette_root / "command-personal-palette.json"
         library.parent.mkdir(parents=True, exist_ok=True)
@@ -219,6 +226,15 @@ class CommandSettingsUiTests(unittest.TestCase):
             QtTest.QTest.mouseRelease(button, QtCore.Qt.LeftButton, pos=button.rect().center())
             self.wait(lambda: not self.window.project_lifecycle.busy and not self.forge._busy)
         question.assert_not_called()
+        self.assertTrue(self.window._shutdown_complete)
+        self.assertFalse(self.window.isVisible())
+        bar = self.window._command_bar
+        self.assertIsNotNone(bar)
+        self.addCleanup(bar.abort_launch)
+        self.assertTrue(bar.isVisible())
+        self.assertEqual(bar.data, completed_letter)
+        self.assertEqual(bar.data.local_preview_path, preview.resolve() / "index.html")
+        self.assertTrue(bar.preview_button.isEnabled())
         self.assertNotEqual(self.session.project.project_id, original, self.window._status.currentMessage())
         saved = ProjectRepository(self.service.editable_root / original / ".lettersmith-project").load()
         self.assertEqual(saved.project.get_prompt(self.ids[3])["text"], exact)
@@ -239,17 +255,35 @@ class CommandSettingsUiTests(unittest.TestCase):
             self.assertEqual(settings.snapshot().get(key), before_settings.get(key))
         self.assertFalse(settings.snapshot().get("active_play_dir"))
         self.assertIsNone(self.window._last_pixmap)
-        for index in range(5):
-            self.window.tabbar.setCurrentIndex(index)
-            self.app.processEvents()
-        self.wait(lambda: self.window._autosave_active_revision is None and not self.forge._busy)
         fresh_id = self.session.project.project_id
-        self.assertTrue(self.window.shutdown())
         restarted = get_project_session(self.root)
         self.assertEqual(restarted.project.project_id, fresh_id)
         self.assertFalse(restarted.project.to_dict()["metadata"].get("recipient_name"))
         self.assertTrue(all(not p["artwork"]["asset"] and not p["prompt"]["text"] for p in restarted.project.pages))
         self.assertEqual(ProjectRepository(self.service.editable_root / original / ".lettersmith-project").load().revision, saved.revision)
+
+    def test_go_handoff_failure_keeps_fresh_workspace_and_saved_letter(self):
+        original = self.session.project.project_id
+        button = self.command_ready()
+        with mock.patch.object(self.window, "open_command_bar_and_close_editor", return_value=False) as handoff:
+            button.held.emit()
+            self.wait(lambda: not self.window.project_lifecycle.busy and not self.forge._busy)
+        handoff.assert_called_once()
+        self.assertFalse(self.window._shutdown_complete)
+        self.assertIsNone(self.window.project_lifecycle._exit_token)
+        self.assertNotEqual(self.session.project.project_id, original)
+        self.assertTrue(ProjectRepository(self.service.editable_root / original / ".lettersmith-project").load())
+        self.assertIn("Command Bar could not open", self.window._toast.text())
+
+    def test_go_capture_failure_does_not_clear_workspace(self):
+        original = self.session.project.project_id
+        button = self.command_ready()
+        with mock.patch("command_bar.build_command_bar_data", side_effect=OSError("capture failed")):
+            button.held.emit()
+            self.wait(lambda: not self.window.project_lifecycle.busy and not self.forge._busy)
+        self.assertEqual(self.session.project.project_id, original)
+        self.assertFalse(self.window._shutdown_complete)
+        self.assertIn("capture failed", self.window._toast.text())
 
     def test_go_failed_save_keeps_workspace_and_histories(self):
         from recent_media import remember_type_image, recent_type_images
