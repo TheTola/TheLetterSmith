@@ -214,7 +214,8 @@ class CommandSettingsUiTests(unittest.TestCase):
         (preview / "index.html").write_text("<html>Completed letter</html>", encoding="utf-8")
         settings.update_fields(active_play_dir=str(preview))
         from command_bar import build_command_bar_data
-        completed_letter = build_command_bar_data(self.root)
+        from dataclasses import replace
+        completed_letter = replace(build_command_bar_data(self.root), saved_project_id=original)
         before_settings = settings.snapshot()
         library = application_paths(self.root).custom_palette_root / "command-personal-palette.json"
         library.parent.mkdir(parents=True, exist_ok=True)
@@ -224,6 +225,11 @@ class CommandSettingsUiTests(unittest.TestCase):
             QtTest.QTest.mousePress(button, QtCore.Qt.LeftButton, pos=button.rect().center())
             QtTest.QTest.qWait(3100)
             QtTest.QTest.mouseRelease(button, QtCore.Qt.LeftButton, pos=button.rect().center())
+            self.wait(lambda: getattr(self.window, "_go_completion_card", None) is not None)
+            self.assertTrue(self.window._go_completion_card.isVisible())
+            self.assertTrue(self.window.isVisible())
+            self.assertIsNone(self.window._command_bar)
+            self.assertEqual(self.window._go_completion_card.windowTitle(), "Saved and workspace reset")
             self.wait(lambda: not self.window.project_lifecycle.busy and not self.forge._busy)
         question.assert_not_called()
         self.assertTrue(self.window._shutdown_complete)
@@ -235,6 +241,7 @@ class CommandSettingsUiTests(unittest.TestCase):
         self.assertEqual(bar.data, completed_letter)
         self.assertEqual(bar.data.local_preview_path, preview.resolve() / "index.html")
         self.assertTrue(bar.preview_button.isEnabled())
+        self.assertTrue(bar.reopen_button.isEnabled())
         self.assertNotEqual(self.session.project.project_id, original, self.window._status.currentMessage())
         saved = ProjectRepository(self.service.editable_root / original / ".lettersmith-project").load()
         self.assertEqual(saved.project.get_prompt(self.ids[3])["text"], exact)
@@ -262,6 +269,18 @@ class CommandSettingsUiTests(unittest.TestCase):
         self.assertTrue(all(not p["artwork"]["asset"] and not p["prompt"]["text"] for p in restarted.project.pages))
         self.assertEqual(ProjectRepository(self.service.editable_root / original / ".lettersmith-project").load().revision, saved.revision)
 
+    def test_last_project_loads_exact_saved_project_from_fresh_workspace(self):
+        original = self.session.project.project_id
+        expected = self.session.project.get_prompt(self.ids[1])["text"]
+        self.window.save_project()
+        self.wait(lambda: not self.forge._busy)
+        self.service.activate_new_project(self.service.prepare_new_project(CLASSIC_PAGE_TYPES))
+        self.window._show_new_project()
+        self.window.open_last_project(original)
+        self.wait(lambda: not self.window.project_lifecycle.busy and not self.forge._busy)
+        self.assertEqual(self.session.project.project_id, original)
+        self.assertEqual(self.session.project.get_prompt(self.ids[1])["text"], expected)
+
     def test_go_handoff_failure_keeps_fresh_workspace_and_saved_letter(self):
         original = self.session.project.project_id
         button = self.command_ready()
@@ -273,7 +292,7 @@ class CommandSettingsUiTests(unittest.TestCase):
         self.assertIsNone(self.window.project_lifecycle._exit_token)
         self.assertNotEqual(self.session.project.project_id, original)
         self.assertTrue(ProjectRepository(self.service.editable_root / original / ".lettersmith-project").load())
-        self.assertIn("Command Bar could not open", self.window._toast.text())
+        self.assertIn("Mini Bar could not open", self.window._toast.text())
 
     def test_go_capture_failure_does_not_clear_workspace(self):
         original = self.session.project.project_id

@@ -816,6 +816,9 @@ class TitleBar(QtWidgets.QWidget):
         self._project_title = ""
         self._project_dirty = False
         layout.addWidget(self.title_label)
+        self.save_indicator = QtWidgets.QLabel("Saved", self)
+        self.save_indicator.setAccessibleName("Project save status")
+        layout.addWidget(self.save_indicator)
         layout.addStretch()
 
         # ---------------------------------------------------------------------
@@ -2870,6 +2873,8 @@ class Nexus(QtWidgets.QMainWindow):
         controller = getattr(getattr(self, "forge_tab", None), "saved_projects", None)
         unsaved = controller.service.has_unsaved_editable_changes() if controller is not None else False
         self.title_bar.set_project_dirty(dirty or unsaved)
+        if self._autosave_active_revision is None:
+            self.title_bar.save_indicator.setText("Unsaved changes" if dirty or unsaved else "Saved")
 
     def _on_project_state_transition(
         self,
@@ -2950,6 +2955,22 @@ class Nexus(QtWidgets.QMainWindow):
 
     def _show_saved_letters_from_recipient_page(self) -> None:
         self._show_letter_menu_from_recipient_page(stock=False)
+
+    def open_last_project(self, project_id: str = "") -> None:
+        from saved_letters import SavedLetterCatalog
+        entries = (entry for entry in SavedLetterCatalog(self.project_root).list_entries()
+                   if entry.canonical and entry.valid and not (entry.example or entry.stock or entry.recovery)
+                   and (not project_id or entry.project_id == project_id))
+        entry = max(entries, key=lambda item: item.modified_at, default=None)
+        if entry is None:
+            self.toast("The saved project is unavailable. Choose Load to browse saved projects.", ms=5000)
+            return
+        self._initialize_project_tabs()
+        if self.project_state.is_project_ready:
+            self.project_lifecycle.open_saved(entry)
+        elif self.project_lifecycle._begin():
+            if not self.forge_tab.saved_projects._read_and_open(entry, finished=self.project_lifecycle.finish):
+                self.project_lifecycle.finish()
 
     def _show_stock_letters_from_recipient_page(self) -> None:
         self._show_letter_menu_from_recipient_page(stock=True)
@@ -3054,6 +3075,12 @@ class Nexus(QtWidgets.QMainWindow):
         if not msg:
             return
         try:
+            animation = getattr(self, "_save_feedback_animation", None)
+            if animation is not None:
+                animation.stop()
+            effect = self._toast.graphicsEffect()
+            if isinstance(effect, QtWidgets.QGraphicsOpacityEffect):
+                effect.setOpacity(1.0)
             self._toast.setText(msg)
             self._toast.adjustSize()
             # place top-center, below title bar
@@ -3065,6 +3092,85 @@ class Nexus(QtWidgets.QMainWindow):
             self._toast_timer.start(ms)
         except Exception:
             pass
+
+    def set_save_feedback(self, state: str) -> None:
+        self.title_bar.save_indicator.setText(state)
+        self.toast(state, ms=60000 if state == "Saving…" else 1600)
+        animation = getattr(self, "_save_feedback_animation", None)
+        if animation is not None:
+            animation.stop()
+        effect = self._toast.graphicsEffect()
+        if not isinstance(effect, QtWidgets.QGraphicsOpacityEffect):
+            effect = QtWidgets.QGraphicsOpacityEffect(self._toast)
+            self._toast.setGraphicsEffect(effect)
+        group = QtCore.QSequentialAnimationGroup(self)
+        fade = QtCore.QPropertyAnimation(effect, b"opacity", group)
+        fade.setDuration(160)
+        fade.setStartValue(0.0)
+        fade.setEndValue(1.0)
+        group.addAnimation(fade)
+        if state == "Saving…":
+            pulse = QtCore.QPropertyAnimation(effect, b"opacity", group)
+            pulse.setDuration(800)
+            pulse.setStartValue(1.0)
+            pulse.setKeyValueAt(0.5, 0.55)
+            pulse.setEndValue(1.0)
+            pulse.setLoopCount(-1)
+            group.addAnimation(pulse)
+        else:
+            group.addPause(1100)
+            fade_out = QtCore.QPropertyAnimation(effect, b"opacity", group)
+            fade_out.setDuration(220)
+            fade_out.setStartValue(1.0)
+            fade_out.setEndValue(0.0)
+            group.addAnimation(fade_out)
+            group.finished.connect(self._toast.hide)
+        if animation is not None:
+            animation.deleteLater()
+        self._save_feedback_animation = group
+        group.start()
+
+    def show_go_completion(self, project_name: str, finished) -> None:
+        self.set_save_feedback("Saved")
+        card = QtWidgets.QDialog(self, Qt.Dialog | Qt.FramelessWindowHint)
+        card.setWindowTitle("Saved and workspace reset")
+        card.setModal(True)
+        card.reject = lambda: None
+        card.setStyleSheet("QDialog {background:#171b20;border:1px solid #53666d;border-radius:12px;}"
+                          "QLabel {color:#f0fbff;border:none;font:12pt 'Segoe UI';}")
+        layout = QtWidgets.QVBoxLayout(card)
+        layout.setContentsMargins(28, 24, 28, 24)
+        for text in ("✓  Saved and workspace reset", project_name,
+                     "Your letter is saved. A fresh workspace is ready."):
+            label = QtWidgets.QLabel(text, card)
+            label.setTextFormat(Qt.PlainText)
+            label.setWordWrap(True)
+            layout.addWidget(label)
+        card.setFixedWidth(min(500, max(320, self.width() - 48)))
+        card.adjustSize()
+        card.move(self.mapToGlobal(self.rect().center()) - card.rect().center())
+        card.setWindowOpacity(0.0)
+        card.show()
+        card.raise_()
+        sequence = QtCore.QSequentialAnimationGroup(self)
+        for target, start, end, duration in ((card, 0., 1., 180), (card, 1., 0., 180), (self, 1., 0., 180)):
+            fade = QtCore.QPropertyAnimation(target, b"windowOpacity", sequence)
+            fade.setDuration(duration)
+            fade.setStartValue(start)
+            fade.setEndValue(end)
+            fade.setEasingCurve(QtCore.QEasingCurve.InOutSine)
+            sequence.addAnimation(fade)
+            if sequence.animationCount() == 1:
+                sequence.addPause(1300)
+        def complete():
+            card.accept()
+            card.deleteLater()
+            finished()
+        sequence.finished.connect(complete)
+        # Keep the card and animation alive through the asynchronous handoff.
+        self._go_completion_card = card
+        self._go_completion_animation = sequence
+        sequence.start()
 
     # =============================================================================================
     # Sound preview mounting (widget-based visualizer)
@@ -3616,6 +3722,7 @@ class Nexus(QtWidgets.QMainWindow):
         task.signals.failed.connect(self._project_autosave_failed)
         self._autosave_active_revision = int(revision)
         self._autosave_tasks[int(revision)] = task
+        self.set_save_feedback("Saving…")
         self._autosave_pool.start(task)
 
     @QtCore.Slot(int, str)
@@ -3660,6 +3767,7 @@ class Nexus(QtWidgets.QMainWindow):
         ):
             play_ui_sound(UiSound.SAVED)
             self.status("Project autosaved.")
+            self.set_save_feedback("Saved")
 
     @QtCore.Slot(int, str)
     def _project_autosave_failed(self, revision: int, message: str) -> None:
@@ -3685,6 +3793,7 @@ class Nexus(QtWidgets.QMainWindow):
         if not self._shutdown_in_progress and not self._shutdown_complete:
             play_ui_sound(UiSound.ERROR)
             self.status(f"Project autosave failed: {message}")
+            self.set_save_feedback("Save failed")
 
     def _finish_project_autosave_for_shutdown(
         self,
@@ -5266,9 +5375,9 @@ class Nexus(QtWidgets.QMainWindow):
             self._release_forge_preview_files()
             previous_quit_policy = application.quitOnLastWindowClosed()
             application.setQuitOnLastWindowClosed(False)
-            bar.present()
             if not self.close():
                 raise RuntimeError("Letter Smith could not close for the handoff")
+            bar.present()
             application.setQuitOnLastWindowClosed(previous_quit_policy)
             return True
         except Exception:

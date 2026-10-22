@@ -1,6 +1,8 @@
 """Shared shell decisions; canonical state, copying and storage stay in Foundation."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 from PySide6 import QtCore, QtWidgets
 
 from project_model import CLASSIC_PAGE_TYPES, MIN_PAGES, MAX_PAGES, PAGE_TYPES
@@ -190,6 +192,7 @@ class ProjectLifecycle(QtCore.QObject):
             message = message or window.statusBar().currentMessage() or "Save did not finish. Your project remains open."
             window.status(message)
             # Command hides the status bar; failures must still be visible.
+            window.set_save_feedback("Save failed")
             window.toast(message, ms=5000)
 
         if not self._begin():
@@ -201,15 +204,18 @@ class ProjectLifecycle(QtCore.QObject):
                 self.finish()
                 return False
             token = self.token()
+            window.set_save_feedback("Saving…")
 
             def complete():
+                handing_off = False
                 try:
                     if reset:
                         if not window.flush_project_edits() or token != self.token():
                             explain("New edits arrived. Saved version retained; reset cancelled.")
                             return
                         from command_bar import build_command_bar_data
-                        completed_letter = build_command_bar_data(window.project_root)
+                        completed_letter = replace(build_command_bar_data(window.project_root),
+                                                   saved_project_id=window.project_session.project.project_id)
                         candidate = window.project_save_service.prepare_new_project(CLASSIC_PAGE_TYPES)
                         window.prepare_for_project_reset()
                         if not window.flush_project_edits() or token != self.token():
@@ -222,15 +228,26 @@ class ProjectLifecycle(QtCore.QObject):
                         if not window.flush_project_edits():
                             raise RuntimeError("The fresh workspace could not be prepared for closing")
                         self._exit_token = self.token()
-                        if not window.open_command_bar_and_close_editor(completed_letter):
-                            raise RuntimeError("The completed letter's Command Bar could not open")
+                        def handoff():
+                            try:
+                                if not window.open_command_bar_and_close_editor(completed_letter):
+                                    self._exit_token = None
+                                    window.setWindowOpacity(1.0)
+                                    explain("Mini Bar could not open. Your saved project is retained.")
+                            finally:
+                                self.finish()
+                        window.show_go_completion(completed_letter.recipient_title, handoff)
+                        handing_off = True
+                    else:
+                        window.set_save_feedback("Saved")
                 except Exception as error:
                     self._exit_token = None
                     retained = ("Your saved project is retained." if token[0] == self.token()[0] else
                                 "The fresh project is recoverable. Reopen to restore its views.")
                     explain(f"Reset stopped: {error}. {retained}")
                 finally:
-                    self.finish()
+                    if not handing_off:
+                        self.finish()
 
             def saved(current):
                 if current:

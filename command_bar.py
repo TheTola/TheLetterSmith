@@ -133,6 +133,7 @@ class CommandBarData:
     recipient_title: str
     local_preview_path: Path | None
     published_url: str
+    saved_project_id: str = ""
 
 
 def _valid_preview_dir(value: object) -> Path | None:
@@ -453,6 +454,7 @@ class CommandBarWindow(QtWidgets.QWidget):
             recipient_title=recipient_title or "Untitled Letter",
             local_preview_path=data.local_preview_path,
             published_url=normalize_published_page_url(data.published_url),
+            saved_project_id=data.saved_project_id,
         )
         self.project_root = Path(project_root).resolve()
         self.settings = SettingsStore(self.project_root)
@@ -492,7 +494,7 @@ class CommandBarWindow(QtWidgets.QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setObjectName("CommandBarWindow")
-        self.setWindowTitle("Letter Smith Command Bar")
+        self.setWindowTitle("Letter Smith Mini Bar")
         apply_qt_window_icon(self, self.project_root)
 
         self._surface = _DragRegion(self, self)
@@ -742,8 +744,12 @@ class CommandBarWindow(QtWidgets.QWidget):
             "open.png", "↗", "Open", "Open Published Letter", self._open_published
         )
         self.copy_button = self._make_button(
-            "copy.png", "⧉", "Copy", "Copy Published Link", self._copy_published
+            "copy.png", "⧉", "Copy Link", "Copy Link", self._copy_published
         )
+        self.reopen_button = self._make_button(
+            "", "↶", "Reopen", "Reopen Last Project", self._reopen_last_project
+        )
+        self.reopen_button.setEnabled(bool(self.data.saved_project_id))
         self._copy_icon = self.copy_button.icon()
         self._copy_text = self.copy_button.text()
         self.minimize_button = self._make_button(
@@ -756,6 +762,7 @@ class CommandBarWindow(QtWidgets.QWidget):
             self.preview_button,
             self.open_button,
             self.copy_button,
+            self.reopen_button,
             self.minimize_button,
             self.close_button,
         ):
@@ -1006,7 +1013,10 @@ class CommandBarWindow(QtWidgets.QWidget):
         self.raise_()
         self.activateWindow()
 
-    def _reopen_letter_smith(self) -> None:
+    def _reopen_last_project(self) -> None:
+        self._reopen_letter_smith(project_id=self.data.saved_project_id)
+
+    def _reopen_letter_smith(self, *, project_id: str = "") -> None:
         if self._reopen_started:
             return
         paths = application_paths(self.project_root)
@@ -1028,6 +1038,8 @@ class CommandBarWindow(QtWidgets.QWidget):
                 return
             program = sys.executable
             arguments.append(str(entrypoint))
+        if project_id:
+            arguments.extend(["--open-saved-project", project_id])
         result = QtCore.QProcess.startDetached(
             program,
             arguments,
@@ -1154,9 +1166,19 @@ class CommandBarWindow(QtWidgets.QWidget):
         if self._compact_mode:
             self._restore_expanded_mode()
             return
+        first_show = not self.isVisible()
+        if first_show:
+            self.setWindowOpacity(0.0)
         self.show()
         self.raise_()
         self.activateWindow()
+        if first_show:
+            self._entrance = QtCore.QPropertyAnimation(self, b"windowOpacity", self)
+            self._entrance.setDuration(240)
+            self._entrance.setStartValue(0.0)
+            self._entrance.setEndValue(1.0)
+            self._entrance.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+            self._entrance.start()
 
     def abort_launch(self) -> None:
         self._quit_on_close = False
@@ -1240,9 +1262,7 @@ def launch_command_bar(
     """Show one top-level Command Bar without starting another process."""
     global _COMMAND_BAR_INSTANCE
     if not command_bar_has_openable_target(data, project_root):
-        _LOGGER.info(
-            "Command Bar suppressed because no local preview or published letter is available."
-        )
+        _LOGGER.info("Mini Bar suppressed because no local preview or published letter is available.")
         return None
 
     existing = _COMMAND_BAR_INSTANCE

@@ -684,6 +684,25 @@ class CommandBarTests(unittest.TestCase):
             finally:
                 window.abort_launch()
 
+    def test_reopen_button_targets_saved_project_and_retains_bar_on_launch_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Main.py").write_text("", encoding="utf-8")
+            window = CommandBarWindow(CommandBarData("Recipient", "Title", None, "", "saved-id"), root)
+            try:
+                with mock.patch.object(QtCore.QProcess, "startDetached", return_value=(False, 0)) as start, \
+                     mock.patch.object(window, "close") as close:
+                    window.reopen_button.click()
+                    self.assertEqual(start.call_args.args[1][-2:], ["--open-saved-project", "saved-id"])
+                    close.assert_not_called()
+                    self.assertFalse(window._reopen_started)
+                with mock.patch.object(QtCore.QProcess, "startDetached", return_value=(True, 42)), \
+                     mock.patch.object(window, "close") as close:
+                    window.reopen_button.click()
+                    close.assert_called_once()
+            finally:
+                window.abort_launch()
+
     def test_compact_envelope_right_click_menu_actions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1036,10 +1055,9 @@ class CommandBarTests(unittest.TestCase):
             self.assertTrue(
                 Nexus.open_command_bar_and_close_editor(FakeNexus(), data)
             )
-            self.assertEqual(events, ["create", "release", "close"])
-            self.assertFalse(bar.presented)
-            self.assertFalse(self.app.quitOnLastWindowClosed())
-            callbacks[0]()
+            self.assertEqual(events, ["create", "release", "close", "present"])
+            self.assertTrue(bar.presented)
+            self.assertEqual(callbacks, [])
 
         self.assertTrue(bar.presented)
         self.assertEqual(events[-1], "present")

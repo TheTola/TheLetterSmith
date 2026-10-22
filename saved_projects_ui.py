@@ -127,6 +127,8 @@ class SavedProjectsController(QtCore.QObject):
             return False
         dirty = getattr(self.forge.window(), "project_dirty", None)
         dirty_revision = dirty.revision if dirty is not None else None
+        feedback = getattr(self.forge.window(), "set_save_feedback", lambda _state: None)
+        feedback("Saving…")
 
         def saved(stored):
             current = self.service.complete_editable_save(capture, stored)
@@ -138,12 +140,17 @@ class SavedProjectsController(QtCore.QObject):
             self._status("Copy saved; the current project remains open." if copy else
                          "Project saved." if current else "Saved the captured version; newer edits remain unsaved.")
             self.selected_changed()
+            feedback("Saved" if current else "Unsaved changes")
             if after is not None and current:
                 self.forge._defer_until_idle(after)
             if finished is not None:
                 finished(current)
 
-        return self._run("Saving project…", lambda: self.service.commit_editable_save(capture), saved, failed=finished)
+        def failed(current):
+            feedback("Save failed")
+            if finished is not None:
+                finished(current)
+        return self._run("Saving project…", lambda: self.service.commit_editable_save(capture), saved, failed=failed)
 
     def selected_changed(self):
         if self.session.is_restoring:

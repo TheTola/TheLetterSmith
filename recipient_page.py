@@ -105,6 +105,10 @@ class RecipientPage(QtWidgets.QWidget):
         apply_button_tier(self.load_button, ButtonTier.MEDIUM)
         self.load_button.clicked.connect(self.load_requested.emit)
         action_row.addWidget(self.load_button)
+        self.last_project_button = ArtworkButton("Last Project", self.project_root, "AButton.png", panel)
+        apply_button_tier(self.last_project_button, ButtonTier.MEDIUM)
+        self.last_project_button.clicked.connect(lambda: self.window().open_last_project())
+        action_row.addWidget(self.last_project_button)
         self.stock_button = ArtworkButton(
             "Stock",
             self.project_root,

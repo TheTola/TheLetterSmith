@@ -672,7 +672,7 @@ def _upgrade_saved_letters_at_startup(project_root: Path) -> None:
         )
 
 
-def main(*, open_new_project: bool = False) -> None:
+def main(*, open_new_project: bool = False, open_saved_project: str = "") -> None:
     """
     Launch Letter Smith.
     """
@@ -844,6 +844,8 @@ def main(*, open_new_project: bool = False) -> None:
 
     record_fault_context("Showing Nexus")
     window.show()
+    if open_saved_project:
+        QtCore.QTimer.singleShot(0, lambda: window.open_last_project(open_saved_project))
     nexus_startup_timer.finish(
         project_ready=bool(
             getattr(getattr(window, "project_state", None), "is_project_ready", False)
@@ -880,4 +882,8 @@ def main(*, open_new_project: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--open-saved-project", default="")
+    args, _qt_args = parser.parse_known_args()
+    main(open_saved_project=args.open_saved_project)
