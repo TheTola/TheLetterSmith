@@ -10,8 +10,7 @@ import os
 import tempfile
 
 from audio_tools import AudioToolError, decode_mono_pcm16, toolchain_available
-from project_paths import application_paths
-from sound_model import analysis_cache_path
+from sound_model import analysis_cache_path, analysis_dir, processed_dir
 
 import zlib
 from dataclasses import dataclass
@@ -53,7 +52,7 @@ def analysis_runtime_status(project_root: Optional[Path] = None) -> tuple[bool, 
     if not toolchain_available():
         return False, "The bundled FFmpeg tools are unavailable."
     if project_root is not None:
-        directory = application_paths(project_root).music_archive_root / "analysis"
+        directory = analysis_dir(project_root)
         try:
             directory.mkdir(parents=True, exist_ok=True)
             fd, probe_name = tempfile.mkstemp(prefix=".analysis-write-test.", dir=directory)
@@ -376,9 +375,8 @@ class AudioAnalysisManager(QtCore.QObject):
         super().__init__(parent)
         self.project_root = Path(project_root).resolve()
 
-        base = application_paths(self.project_root).music_archive_root
-        self.processed_dir = base / "processed"
-        self.analysis_dir = base / "analysis"
+        self.processed_dir = processed_dir(self.project_root)
+        self.analysis_dir = analysis_dir(self.project_root)
         self.analysis_dir.mkdir(parents=True, exist_ok=True)
 
         self._queue: Deque[_Job] = deque()

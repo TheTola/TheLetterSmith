@@ -104,6 +104,8 @@ class SharedMessagePreview(QtWidgets.QWidget):
                     return False
 
         self._page_aspect = 2 / 3
+        self._device_size = None
+        self._zoom = 1.0
         # Create the view before its profile so child destruction releases the
         # page before destroying the profile.
         self.view = QWebEngineView(self)
@@ -127,6 +129,7 @@ class SharedMessagePreview(QtWidgets.QWidget):
         self._revision = 0
         self._displayed_revision = None
         self._page_id = None
+        self._turn_to = None
         self._current = None
         self._retired = []
         self._view_released = True
@@ -148,10 +151,11 @@ class SharedMessagePreview(QtWidgets.QWidget):
         self._cleanup_timer.setInterval(250)
         self._cleanup_timer.timeout.connect(self._cleanup_retired)
 
-    def request(self, page_id, *, force=False, external=False):
+    def request(self, page_id, *, force=False, external=False, turn_to=None):
         if self._closed:
             return
-        key = (self.session.session_id, page_id, self.adapter.render_content_key(self.session.project.render_snapshot()))
+        key = (self.session.session_id, page_id, turn_to,
+               self.adapter.render_content_key(self.session.project.render_snapshot()))
         if not force and key == self._request_key:
             return
         keep = (self._current is not None and self._page_id == page_id
@@ -165,6 +169,7 @@ class SharedMessagePreview(QtWidgets.QWidget):
             self.invalidate()
         self._request_key = key
         self._page_id = page_id
+        self._turn_to = turn_to
         target = self.session.capture_target(page_id, fields=("type", "message", "artwork", "design_overrides"), include_shared=False)
         task = _Build(self._revision, self.session, target, self.adapter, self.cache, external=external)
         self._tasks[self._revision] = task
@@ -182,6 +187,7 @@ class SharedMessagePreview(QtWidgets.QWidget):
         self._warning = ""
         self.viewed_page_id = None
         self._page_id = None
+        self._turn_to = None
         for task in self._tasks.values():
             task.cancelled.set()
         if self._current is not None:
@@ -245,13 +251,13 @@ class SharedMessagePreview(QtWidgets.QWidget):
             return
         self._cleanup_retired()
         revision = self._revision
-        page_id = self._page_id
+        page_id, turn_to = self._page_id, self._turn_to
 
         def selected(success):
             if self._closed or revision != self._revision:
                 return
             if not success:
-                self.status_changed.emit("The shared viewer could not open this Letter page.")
+                self.status_changed.emit("The shared viewer could not open the requested preview.")
                 return
             self.view.show()
             self._displayed_revision = revision
@@ -262,14 +268,13 @@ class SharedMessagePreview(QtWidgets.QWidget):
         # Sound's shared playback gate rejects hidden documents. Show the view
         # before requesting its start action so GIFs also start in this preview.
         self.view.show()
-        # Use Forge's public page-ID API and the viewer's existing start action.
-        # Composition, layout, animation and scrolling stay entirely in Forge.
-        self.view.page().runJavaScript(
-            "(() => { const viewer = window.LetterSmithViewer; "
-            f"if (!viewer || !viewer.goToPage({json.dumps(page_id)})) return false; "
-            "document.getElementById('curtain-overlay')?.click(); return true; })()",
-            selected,
-        )
+        if turn_to is not None:
+            script = f"window.LetterSmithViewer?.previewTurn({json.dumps(page_id)}, {json.dumps(turn_to)})"
+        else:
+            script = ("(() => { const viewer = window.LetterSmithViewer; "
+                      f"if (!viewer || !viewer.goToPage({json.dumps(page_id)})) return false; "
+                      "document.getElementById('curtain-overlay')?.click(); return true; })()")
+        self.view.page().runJavaScript(script, selected)
 
     def _inspect_page(self):
         revision = self._revision
@@ -335,10 +340,15 @@ class SharedMessagePreview(QtWidgets.QWidget):
             return
         self._resource_stamp = stamp
         self._pending_resource_stamp = None
-        self.request(self._page_id, force=True, external=True)
+        self.request(self._page_id, force=True, external=True, turn_to=self._turn_to)
 
     def set_zoom(self, value):
-        self.view.setZoomFactor(max(0.25, min(2.0, value / 100)))
+        self._zoom = max(0.25, min(2.0, value / 100))
+        self._fit_view()
+
+    def set_device(self, size):
+        self._device_size = size
+        self._fit_view()
 
     def set_page_aspect(self, width, height):
         if width > 0 and height > 0:
@@ -346,10 +356,22 @@ class SharedMessagePreview(QtWidgets.QWidget):
             self._fit_view()
 
     def _fit_view(self):
-        width = min(self.width(), round(self.height() * self._page_aspect))
-        height = min(self.height(), round(width / self._page_aspect))
+        zoom = self._zoom
+        if self._device_size is not None:
+            viewport_width, viewport_height = self._device_size
+            scale = min(self.width() / viewport_width, self.height() / viewport_height)
+            frame_scale = scale * min(1.0, zoom)
+            width = round(viewport_width * frame_scale)
+            height = round(viewport_height * frame_scale)
+            # Scale the actual browser viewport so the viewer's media queries
+            # use device dimensions even when the preview is fitted to a panel.
+            zoom *= scale
+        else:
+            width = min(self.width(), round(self.height() * self._page_aspect))
+            height = min(self.height(), round(width / self._page_aspect))
         self.view.setGeometry((self.width() - width) // 2,
                               (self.height() - height) // 2, width, height)
+        self.view.setZoomFactor(max(0.25, min(5.0, zoom)))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

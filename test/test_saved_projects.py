@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import time
 import unittest
 from unittest import mock
+from uuid import uuid4
 import wave
 
 from PIL import Image
@@ -73,6 +75,205 @@ class SavedProjectTests(unittest.TestCase):
     def save_entry(self):
         destination, stored = self.service.save_editable()
         return self.catalog._entry(destination), stored
+
+    def test_identical_retry_reopen_and_real_revision_share_one_letter(self):
+        first_capture = self.service.capture_editable_save()
+        first = self.service.commit_editable_save(first_capture)
+        raced = self.service.commit_editable_save(first_capture)
+        self.assertEqual(first.revision, raced.revision)
+        entry = self.catalog._entry(first_capture.directory)
+        self.service.open_saved_project(entry)
+        unchanged, repeated = self.save_entry()
+        self.assertEqual((unchanged.path, repeated.revision), (entry.path, first.revision))
+        self.session.project.update_message(self.ids[1], {**self.session.project.pages[1]["message"], "html": "<p>Revised letter</p>"})
+        current, second = self.save_entry()
+        self.assertEqual(current.path, entry.path)
+        self.assertEqual([version.revision for version in self.service.saved_revisions(current)], [second.revision, first.revision])
+        historical = self.service.read_saved_project(current, revision=first.revision)
+        self.session.project.update_prompt(self.ids[1], {"text": "Saved while the selected revision stays available"})
+        _, third = self.save_entry()
+        self.service.open_saved_project(current, loaded=historical, revision=first.revision)
+        self.assertIn("Letter A", self.session.project.pages[1]["message"]["html"])
+        self.assertEqual(self.session.project.project_id, current.project_id)
+        self.assertTrue(self.service.has_unsaved_editable_changes())
+        self.assertEqual(self.catalog._entry(current.path).storage_revision, third.revision)
+
+    def test_workspace_autosave_reuses_letter_and_keeps_manual_head(self):
+        from concurrent.futures import ThreadPoolExecutor
+        entry, first = self.save_entry()
+        self.service.open_saved_project(entry)
+        self.session.project.update_message(self.ids[1], {**self.session.project.pages[1]["message"], "html": "<p>Autosaved edit</p>"})
+        capture = self.service.capture_editable_save()
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            autosave = workers.submit(self.service.save_workspace_snapshot, reason="test")
+            manual = workers.submit(self.service.commit_editable_save, capture)
+            destination, saved = autosave.result(), manual.result()
+        self.assertEqual(self.service.resolver._metadata_project_id(destination), first.project.project_id)
+        self.assertEqual(self.service.save_workspace_snapshot(reason="repeat"), destination)
+        current = self.catalog._entry(entry.path)
+        self.assertEqual(current.storage_revision, saved.revision)
+        self.assertEqual(len(self.service.saved_revisions(current)), 2)
+        self.session.project.update_message(self.ids[1], {**self.session.project.pages[1]["message"], "html": "<p>Different autosaved edit</p>"})
+        self.service.save_workspace_snapshot(reason="test")
+        self.assertEqual(self.catalog._entry(entry.path).storage_revision, saved.revision)
+        self.assertEqual(len(self.service.saved_revisions(current)), 3)
+
+    def test_reconciles_legacy_copies_and_keeps_distinct_recipients(self):
+        from config import PLAY_METADATA_FILE
+        from recipient_registry import RecipientRegistry
+        from test_saved_letter_activity_order import _saved_bundle
+
+        original = _saved_bundle(self.root, "Legacy Letter", recipient="Ada Lovelace")
+        for page in (original / "gallery/pages").glob("*.png"):
+            Image.new("RGB", (12, 18), "purple" if page.stem == "cover" else "green").save(page)
+        sounds = original / "gallery/sounds"
+        (sounds / "music.wav").write_bytes((self.root / "music.wav").read_bytes())
+        (sounds / "lettersmith-sound.json").write_text(json.dumps({"version": 2, "mode": "single",
+            "tracks": [{"filename": "music.wav"}], "selected_track_index": 0}), encoding="utf-8")
+        renamed = original.with_name("Folder copy")
+        different = original.with_name("Different recipient")
+        for target in (renamed, different):
+            shutil.copytree(original, target)
+            metadata = json.loads((target / PLAY_METADATA_FILE).read_text(encoding="utf-8"))
+            metadata["project_id"] = str(uuid4())
+            if target == different:
+                recipient = RecipientRegistry(self.root).get_or_create("Grace Hopper")
+                metadata.update(recipient_id=recipient.recipient_id, recipient_name=recipient.display_name)
+            else:
+                metadata.pop("project_id")
+                metadata["schema_version"] = 1
+            (target / PLAY_METADATA_FILE).write_text(json.dumps(metadata), encoding="utf-8")
+        entries = self.catalog.list_entries(force_refresh=True)
+        self.assertEqual({item.recipient for item in entries}, {"Ada Lovelace", "Grace Hopper"})
+        self.assertEqual(len(entries), 2)
+        ada = next(item for item in entries if item.recipient == "Ada Lovelace")
+        self.assertTrue(ada.canonical)
+        self.assertEqual(ada.path, original.resolve())
+        self.assertEqual(len(self.service.saved_revisions(ada)), 1)
+        self.assertTrue(different.exists())
+        backup, = (self.catalog.recovery_root / "Consolidated Letters").glob("*/original")
+        record = json.loads(backup.with_name("reconciliation.json").read_text(encoding="utf-8"))
+        self.assertEqual(Path(record["canonical"]), ada.path)
+        self.assertTrue((backup / PLAY_METADATA_FILE).is_file())
+        self.assertEqual(self.catalog.list_entries(force_refresh=True), entries)
+
+    def test_autosave_repair_preserves_same_id_versions_and_repaired_aliases(self):
+        from project_paths import PROJECT_METADATA_FILE
+        from transactional_io import atomic_write_json
+
+        entry, _ = self.save_entry()
+        self.service.open_saved_project(entry)
+        self.service.save_workspace_snapshot(reason="test")
+        resolver = self.service.resolver
+        active = self.service.current_context().autosave_directory
+        original = active.with_name("Original title")
+        reassigned = active.with_name("Previously reassigned")
+        shutil.copytree(active, original)
+        shutil.copytree(active, reassigned)
+        repository = ProjectRepository(original / ".lettersmith-project")
+        first = repository.load()
+        first.project.update_message(self.ids[1], {**first.project.pages[1]["message"], "html": "<p>Historical autosave edit</p>"})
+        repository.save(first.project, asset_root=first.asset_root, expected_revision=first.revision, track_history=True)
+        metadata = json.loads((reassigned / PROJECT_METADATA_FILE).read_text(encoding="utf-8"))
+        atomic_write_json(reassigned / (PROJECT_METADATA_FILE + ".backup-test"), metadata)
+        atomic_write_json(reassigned / PROJECT_METADATA_FILE, {**metadata, "project_id": str(uuid4())})
+        resolved = self.service.current_context()
+        self.assertEqual(resolved.autosave_directory, active)
+        self.assertFalse(original.exists())
+        self.assertFalse(reassigned.exists())
+        archives = list((resolver.autosave_root / ".consolidated-autosaves").glob("*/reconciliation.json"))
+        self.assertEqual(len(archives), 2)
+        repository = ProjectRepository(active / ".lettersmith-project")
+        self.assertEqual(len(repository.revision_history()), 2)
+        self.assertEqual(resolver.repair_duplicate_autosave_ids(active_autosave_directory=active), ())
+        self.service.save_workspace_snapshot(reason="retry")
+        self.assertEqual(len(repository.revision_history()), 2)
+        self.assertEqual(len(self.service.saved_revisions(self.catalog._entry(entry.path))), 2)
+
+    def test_consolidation_retains_authored_and_publication_history(self):
+        from project_model import ProjectModel
+
+        published = {"publication_provider": "github_pages", "publication_verified": True,
+                     "published_at": "2026-11-01T00:00:00+00:00", "published_public_path": "live",
+                     "published_page_url": "https://example.github.io/live/"}
+        self.session.project.update_project_data("publication", published)
+        entry, first = self.save_entry()
+        duplicate_path = self.catalog.play_root / "Older Named Folder"
+        historical = ProjectModel.from_dict(first.project.to_dict())
+        historical.update_project_data("metadata", {"recipient_title": "Older title"})
+        historical.update_message(self.ids[1], {**historical.pages[1]["message"], "html": "<p>Earlier message</p>"})
+        old_url = "https://example.github.io/older/"
+        historical.update_project_data("publication", {**published, "published_page_url": old_url, "published_public_path": "older"})
+        historical.update_project_data("metadata", {"published_page_url": old_url})
+        ProjectRepository(duplicate_path / ".lettersmith-project").save(historical, asset_root=first.asset_root)
+        self.assertEqual([item.path for item in self.catalog.list_entries(force_refresh=True)], [entry.path])
+        versions = self.service.saved_revisions(entry)
+        self.assertEqual(len(versions), 2)
+        self.assertEqual({item.project.to_dict()["publication"]["published_page_url"] for item in versions},
+                         {old_url, published["published_page_url"]})
+        reopened = self.service.read_saved_project(entry, revision=versions[1].revision)
+        self.assertEqual(reopened.project.to_dict()["publication"]["published_page_url"], published["published_page_url"])
+        self.assertIn("Earlier message", reopened.project.pages[1]["message"]["html"])
+        self.service.open_saved_project(entry, loaded=reopened, revision=reopened.revision)
+        self.assertEqual(SettingsStore(self.root).get("published_page_url"), published["published_page_url"])
+
+    def test_restore_deleted_letter_preserves_revisions_and_handles_existing_identity(self):
+        entry, first = self.save_entry()
+        self.session.project.update_prompt(self.ids[1], {"text": "Existing revision"})
+        entry, second = self.save_entry()
+        recovery = self.service.trash_saved_project(entry)
+        deleted = self.catalog._entry(recovery, recovery=True)
+        self.assertTrue(deleted.deleted)
+        self.assertEqual(self.service.restore_deleted_project(deleted), entry.path)
+        self.assertEqual([item.revision for item in self.service.saved_revisions(self.catalog._entry(entry.path))],
+                         [second.revision, first.revision])
+
+        recovery = self.service.trash_saved_project(self.catalog._entry(entry.path))
+        deleted = self.catalog._entry(recovery, recovery=True)
+        archived = self.service.read_saved_project(deleted)
+        archived.project.update_prompt(self.ids[1], {"text": "Newer local edit"})
+        newer = ProjectRepository(entry.path / ".lettersmith-project").save(archived.project, asset_root=archived.asset_root)
+        self.assertEqual(self.service.restore_deleted_project(deleted), entry.path)
+        entries = self.catalog.list_entries(force_refresh=True)
+        self.assertEqual([item.path for item in entries], [entry.path])
+        self.assertEqual(entries[0].project_id, entry.project_id)
+        self.assertEqual(entries[0].storage_revision, newer.revision)
+        self.assertEqual(len(self.service.saved_revisions(entries[0])), 3)
+
+        recovery = self.service.trash_saved_project(entries[0])
+        deleted = self.catalog._entry(recovery, recovery=True)
+        archived = self.service.read_saved_project(deleted)
+        archived.project.update_project_data("metadata", {"recipient_id": str(uuid4()), "recipient_name": "Another recipient"})
+        unrelated = ProjectRepository(entry.path / ".lettersmith-project").save(archived.project, asset_root=archived.asset_root)
+        with self.assertRaisesRegex(ProjectSaveError, "same identity"):
+            self.service.restore_deleted_project(deleted)
+        self.assertTrue(recovery.is_dir())
+        self.assertEqual(self.catalog._entry(entry.path).storage_revision, unrelated.revision)
+
+    def test_revision_summaries_pair_distinct_dates_and_git_status(self):
+        from saved_letter_versions import summarize_revisions, write_letter_state
+        entry, first = self.save_entry()
+        repo = ProjectRepository(entry.path / ".lettersmith-project")
+        write_letter_state(self.root, entry.project_id, "backup", {
+            "timestamp": "2026-11-25T20:15:00+00:00", "revision_key": repo.version_key(first.revision, ignore_page_ids=True),
+        })
+        self.session.project.update_message(self.ids[1], {**self.session.project.pages[1]["message"], "html": "<p>New message</p>"})
+        entry, second = self.save_entry()
+        write_letter_state(self.root, entry.project_id, "live", {
+            "publication": {"publication_provider": "github_pages", "publication_verified": True,
+                "published_at": "2026-11-25T22:00:00+00:00", "published_public_path": "my-letter",
+                "published_page_url": "https://example.github.io/my-letter/", "published_source_fingerprint": "fixture"},
+            "revision_key": repo.version_key(second.revision, ignore_page_ids=True),
+        })
+        entry = self.catalog._entry(entry.path)
+        rows, backup = summarize_revisions(self.root, entry, self.service.saved_revisions(entry))
+        self.assertEqual(entry.published_url, "https://example.github.io/my-letter/")
+        self.assertEqual([row.revision for row in rows], [second.revision, first.revision])
+        self.assertIn("Messages", rows[0].changes)
+        self.assertTrue(rows[0].live)
+        self.assertTrue(rows[1].backed_up)
+        self.assertEqual(backup["timestamp"], "2026-11-25T20:15:00+00:00")
+        self.assertGreaterEqual(rows[0].date, rows[1].date)
 
     def test_complete_five_page_snapshot_copy_and_reopen(self):
         entry, stored = self.save_entry()
@@ -483,6 +684,171 @@ class SavedProjectUiTests(unittest.TestCase):
         faulthandler.dump_traceback()
         notes = [label.text() for dialog, *_ in self.ui.previews for label in dialog.findChildren(QtWidgets.QLabel)]
         self.fail(self.ui.details.text() + "\n" + repr(notes))
+
+    def test_saved_list_search_last_target_and_recovery_comparison(self):
+        directory, _ = self.service.save_editable()
+        self.session.project.update_prompt(self.ids[1], {"text": "Updated prompt"})
+        self.service.save_editable()
+        self.forge.show_saved_letters()
+        self.wait(lambda: not self.forge._catalog_reconcile_active)
+        self.assertIn("Same title", self.forge.last_project_target.text())
+        self.forge.saved_search.setText("TEST recipient")
+        self.assertEqual([card.entry.path for card in self.forge._saved_cards], [directory])
+        self.forge.saved_search.setText("no match")
+        self.assertFalse(self.forge.saved_no_matches.isHidden())
+        self.assertIn("Same title", self.forge.last_project_target.text())
+        with mock.patch.object(self.window, "open_last_project") as open_last:
+            self.forge.last_project_button.click()
+        self.assertEqual(open_last.call_args.kwargs["entry"].path, directory)
+        self.forge.saved_search.setText("same title")
+        self.forge._select_saved_letter(self.forge._saved_cards[0].entry)
+        self.wait(lambda: self.ui.history_list.topLevelItemCount() == 2)
+        self.assertIn("Prompts", self.ui.history_list.topLevelItem(0).text(1))
+
+        self.session.project.update_project_data("recovery", {"unassigned_message": {
+            "format": "html", "html": "<b>Recovered message</b>", "layout": {}, "settings": {}, "resources": [],
+        }})
+        def inspect_dialog(dialog):
+            destination = next(combo for combo in dialog.findChildren(QtWidgets.QComboBox) if combo.accessibleName() == "Destination page")
+            destination.setCurrentIndex(destination.findData(self.ids[1]))
+            panes = {pane.accessibleName(): pane.toPlainText() for pane in dialog.findChildren(QtWidgets.QPlainTextEdit)}
+            self.assertEqual(panes["Recovered text"], "Recovered message")
+            self.assertIn("Letter A", panes["Current destination text"])
+            return QtWidgets.QDialog.Rejected
+        with mock.patch.object(QtWidgets.QDialog, "exec", new=inspect_dialog):
+            self.ui.recover_content()
+
+        recovered = self.service.trash_saved_project(self.forge._selected_saved_letter).resolve()
+        self.forge.saved_search.clear()
+        self.forge.refresh_saved_letters(force_reconcile=True)
+        self.wait(lambda: any(card.entry.path == recovered for card in self.forge._saved_cards))
+        self.forge._select_saved_letter(next(card.entry for card in self.forge._saved_cards if card.entry.path == recovered))
+        self.assertTrue(self.ui.restore_button.isEnabled())
+        self.ui.restore_button.click()
+        self.wait(lambda: not self.forge._busy and not recovered.exists() and directory.is_dir())
+
+    def test_title_warning_checks_saved_projects_as_text_changes(self):
+        active, _ = self.service.save_editable()
+        directory, _ = self.service.save_editable(copy=True, title="Archived title")
+        self.assertTrue(directory.is_dir())
+        tab = self.window.message_tab
+        tab.title_input.setText("ARCHIVED TITLE")
+        self.wait(lambda: bool(tab.title_input._duplicate_title_warning.text()))
+        self.assertIn("already has a letter", tab.title_input._duplicate_title_warning.text())
+        tab.title_input.setText("Different title")
+        self.wait(lambda: not tab.title_input._duplicate_title_warning.text())
+        self.forge._select_saved_letter(self.catalog._entry(active))
+
+        def inspect_rename(dialog):
+            dialog.setTextValue("Archived title")
+            self.assertIn("already has a letter", dialog.labelText())
+            return QtWidgets.QDialog.Rejected
+
+        with mock.patch.object(QtWidgets.QInputDialog, "exec", new=inspect_rename):
+            self.ui.rename_selected()
+
+    def test_compare_opens_selected_revision_and_stock_template_starts_fresh(self):
+        from saved_projects_ui import SavedVersionsDialog
+        directory, first = self.service.save_editable()
+        message = self.session.project.pages[1]["message"]
+        self.session.project.update_message(self.ids[1], {**message, "html": "<p>Comparison revision</p>"})
+        self.service.save_editable()
+        self.forge.show_saved_letters()
+        self.wait(lambda: not self.forge._catalog_reconcile_active)
+        entry = next(card.entry for card in self.forge._saved_cards if card.entry.path == directory)
+        self.forge._select_saved_letter(entry)
+        self.assertTrue(self.ui.compare_button.isEnabled())
+
+        def choose(dialog):
+            self.assertEqual(dialog.versions[1].revision, first.revision)
+            self.assertTrue(any("Comparison revision" in label.text()
+                                for label in dialog.panes[1].findChildren(QtWidgets.QLabel)))
+            dialog._open(1)
+            return QtWidgets.QDialog.Accepted
+
+        with mock.patch.object(SavedVersionsDialog, "exec", new=choose), mock.patch.object(
+                QtWidgets.QMessageBox, "question", return_value=QtWidgets.QMessageBox.Discard):
+            self.ui.compare_button.click()
+            self.wait(lambda: "Letter A" in self.session.project.pages[1]["message"]["html"] and not self.forge._busy)
+        self.assertEqual(self.session.project.project_id, entry.project_id)
+
+        self.forge.show_stock_letters()
+        self.wait(lambda: not self.forge._catalog_reconcile_active)
+        stock = self.forge._saved_cards[0].entry
+        self.forge._select_saved_letter(stock)
+        self.assertTrue(self.ui.template_button.isEnabled())
+        source = self.service.read_saved_project(stock).project.to_dict()
+        with mock.patch.object(QtWidgets.QMessageBox, "question", return_value=QtWidgets.QMessageBox.Discard):
+            self.ui.template_button.click()
+            self.wait(lambda: self.session.project.project_id != entry.project_id and not self.forge._busy)
+        draft = self.session.project.to_dict()
+        self.assertFalse(draft["metadata"].get("recipient_name"))
+        self.assertFalse(draft["metadata"].get("recipient_title"))
+        self.assertTrue(all(not page["message"]["html"] for page in draft["pages"] if page["message"] is not None))
+        self.assertEqual([bool(page["artwork"]["asset"]) for page in draft["pages"]],
+                         [bool(page["artwork"]["asset"]) for page in source["pages"]])
+        self.assertEqual(len(draft["sound"]["tracks"]), len(source["sound"]["tracks"]))
+
+    def test_finished_preview_switches_device_controls_and_keeps_the_page(self):
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+
+        self.window.tabbar.setCurrentIndex(3)
+        self.wait(lambda: self.window.html_preview is not None and self.window.html_preview.url().isLocalFile())
+        view = self.window.html_preview
+
+        def run(script, browser=view):
+            values = []
+            browser.page().runJavaScript(script, values.append)
+            self.wait(lambda: bool(values), seconds=8)
+            return values[0]
+
+        selector = self.forge.preview_mode
+        self.assertEqual([selector.itemText(index) for index in range(selector.count())], ["Desktop / Tablet", "Phone"])
+        self.assertEqual(selector.currentText(), "Desktop / Tablet")
+        self.wait(lambda: run("typeof window.LetterSmithViewer") == "object")
+        self.assertFalse(run("!!document.querySelector('.phone-viewer')"))
+        page_id = self.ids[2]
+        self.assertTrue(run(f"window.LetterSmithViewer.goToPage({json.dumps(page_id)})"))
+        index = view.url().toLocalFile()
+        token = QtCore.QUrlQuery(view.url()).queryItemValue("lettersmith")
+
+        selector.setCurrentIndex(selector.findText("Phone"))
+        self.wait(lambda: run("!!document.querySelector('.phone-viewer') && "
+                              "!document.getElementById('phone-start-controls').hidden && "
+                              "document.getElementById('next').parentElement.id === 'phone-navigation'"))
+        self.assertEqual(view.url().toLocalFile(), index)
+        self.assertEqual(run("window.LetterSmithViewer.currentPageId()"), page_id)
+        phone_url = view.url()
+        run("document.getElementById('phone-open').click()")
+        self.wait(lambda: run("!document.getElementById('curtain-overlay') && !document.getElementById('next').disabled"))
+        self.assertEqual(run("window.LetterSmithViewer.currentPageId()"), page_id)
+        run("document.getElementById('next').click()")
+        self.wait(lambda: run("window.LetterSmithViewer.currentPageId()") == self.ids[3])
+
+        selector.setCurrentIndex(selector.findText("Desktop / Tablet"))
+        self.wait(lambda: run("typeof window.LetterSmithViewer === 'object' && "
+                              "!document.querySelector('.phone-viewer') && !document.getElementById('curtain-overlay')"))
+        self.assertEqual(view.url().toLocalFile(), index)
+        self.assertEqual(QtCore.QUrlQuery(view.url()).queryItemValue("lettersmith"), token)
+        self.assertEqual(run("window.LetterSmithViewer.currentPageId()"), self.ids[3])
+
+        selector.setCurrentIndex(selector.findText("Phone"))
+        self.wait(lambda: run("!!document.querySelector('.phone-viewer') && !document.getElementById('curtain-overlay')"))
+        self.assertEqual(run("window.LetterSmithViewer.currentPageId()"), self.ids[3])
+
+        native_view = QWebEngineView()
+        try:
+            loads = []
+            native_view.loadFinished.connect(loads.append)
+            native_view.setUrl(phone_url)
+            self.wait(lambda: bool(loads))
+            self.assertEqual(loads, [True])
+            self.assertTrue(run("typeof window.LetterSmithViewer === 'object' && "
+                                "typeof window.letterSmithForgePreview === 'undefined' && "
+                                "!document.querySelector('.phone-viewer')", native_view))
+        finally:
+            native_view.close()
+            native_view.deleteLater()
 
     def test_last_keystrokes_detached_prompt_save_open_and_saved_preview(self):
         self.assertTrue(self.window.open_message_page(self.ids[1]))

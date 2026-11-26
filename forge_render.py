@@ -22,13 +22,13 @@ from weakref import WeakKeyDictionary
 
 from PIL import Image
 
-from project_repository import ProjectRepositoryError, _safe_file
+from project_repository import ProjectRepositoryError, _safe_file, selected_sound_tracks, sound_track_reference as _track_reference
 from transactional_io import PathTransaction, atomic_copy_file, atomic_write_json, atomic_write_text
 
 DISPLAY_MANIFEST = "lettersmith-display.json"
 RENDERER_VERSION = 1
 _READABILITY = ("message_overlay_preset", "message_overlay_opacity")
-_PRESENTATION = ("recipient_name", "recipient_title", "starting_volume", "music_volume", "curtain_style", *_READABILITY)
+_PRESENTATION = ("recipient_name", "recipient_title", "starting_volume", "music_volume", "curtain_style", "transition", *_READABILITY)
 _GENERATIONS = WeakKeyDictionary()
 _GENERATION_LOCK = RLock()
 
@@ -116,23 +116,12 @@ def _settings(render):
 
 
 def _selected_tracks(render):
-    sound = render.snapshot.get("sound", {})
-    records = sound.get("tracks", ())
-    by_id = {str(item.get("track_id", "")): item for item in records if isinstance(item, Mapping)}
-    if "playlist" in sound or "single_track_id" in sound:
-        identifiers = sound.get("playlist", ()) if sound.get("mode") == "playlist" else (sound.get("single_track_id"),)
-        return tuple(by_id.get(str(key), {"track_id": str(key), "missing": True}) for key in identifiers if key)
-    # Imported display manifests carry ordered active tracks, without archive IDs.
-    return tuple(item for item in records if isinstance(item, Mapping))
+    return selected_sound_tracks(render.snapshot.get("sound", {}))
 
 
 def render_has_music(render: RenderInput) -> bool:
     """Whether the canonical playlist selects any soundtrack (including missing)."""
     return bool(_selected_tracks(render))
-
-
-def _track_reference(track):
-    return str(track.get("asset") or ("gallery/sounds/" + str(track["filename"]) if track.get("filename") else ""))
 
 
 def _message_sources(render, page):
@@ -539,7 +528,8 @@ def build_render_to(render: RenderInput, destination, *, seed_sfx=True, reuse_pl
                     "IMAGE_ANIMATIONS_JSON": legacy._script_json(animations)}
     for key, value in replacements.items():
         content = content.replace("{{" + key + "}}", value)
-    content = template_for_project_pages(pages, template_html=content)
+    content = template_for_project_pages(pages, template_html=content,
+                                         transition=render.snapshot["presentation"].get("transition"))
     atomic_write_text(target / "index.html", content)
     atomic_write_text(target / "styles.css", fonts.css + "\n" + TEMPLATE_CSS)
     atomic_write_text(target / "script.js", TEMPLATE_JS)
@@ -658,6 +648,8 @@ def generate_render(session, *, render_input=None, output_mode="display", destin
     if not render_is_current(session, render):
         raise StaleRenderError("The captured project changed; update the preview again.")
     target = Path(destination).resolve() if destination else legacy.play_bundle_directory(render.project_root)
+    if (target / ".lettersmith-project").exists():
+        raise ValueError("A finished preview cannot replace an editable saved project.")
     legacy._preserve_published_play_bundle(render.project_root, target)
     transaction = PathTransaction(_io_path(target), staging_suffix=".build-staging", backup_suffix=".build-backup", unique_staging=True)
     try:
@@ -666,7 +658,7 @@ def generate_render(session, *, render_input=None, output_mode="display", destin
         def commit(_model, _page_id):
             with _GENERATION_LOCK:
                 if (_GENERATIONS.get(session) != generation or (cancelled is not None and cancelled())
-                        or not render_is_current(session, render)):
+                        or not render_is_current(session, render) or (target / ".lettersmith-project").exists()):
                     raise StaleRenderError("A newer generation, project edit, or resource change superseded this render; previous output is preserved.")
                 transaction.commit(keep_backup=True, validator=lambda path: bool(validate_display_output(path)))
         if not session.apply_result(render.targets[0], commit):

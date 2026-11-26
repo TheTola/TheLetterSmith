@@ -60,22 +60,57 @@ class ForgeRenderTests(unittest.TestCase):
     def build(self, name="display", mode="display"):
         return build_render_to(capture_render(self.session, mode), self.root / name, seed_sfx=False)
 
+    def test_verified_publish_retains_exact_staged_revision_without_advancing_save(self):
+        from Forge_Tab import _forge_project_context, _record_verified_publication, _stage_publish_display
+        from project_save import ProjectSaveService
+        from project_state import ProjectStateController
+        from saved_letters import SavedLetterCatalog
+        from saved_letter_versions import summarize_revisions
+
+        session = get_project_session(self.root)
+        session.replace(self.project, asset_root=self.root)
+        service = ProjectSaveService(self.root, ProjectStateController(self.root))
+        destination, manual = service.save_editable()
+        page = session.project.pages[1]
+        session.project.update_message(page["id"], {**page["message"], "html": "<p>Published draft</p>"})
+        render = capture_render(session, "display")
+        display = build_render_to(render, self.root / "publish-display", seed_sfx=False)
+        with _stage_publish_display(self.root, display, render, session.project) as staged:
+            # A later edit must not be labeled as the uploaded revision.
+            page = session.project.pages[1]
+            session.project.update_message(page["id"], {**page["message"], "html": "<p>Later edit</p>"})
+            publication = {"publication_provider": "github_pages", "publication_verified": True,
+                "published_at": "2026-11-25T22:00:00+00:00", "published_public_path": "letter",
+                "published_page_url": "https://example.github.io/letter/", "published_source_fingerprint": render.source_fingerprint}
+            self.assertEqual(_record_verified_publication(self.root, _forge_project_context(self.root), publication,
+                                                          authored_root=staged), destination)
+        entry = SavedLetterCatalog(self.root)._entry(destination)
+        self.assertEqual(entry.storage_revision, manual.revision)
+        versions = service.saved_revisions(entry)
+        rows, _ = summarize_revisions(self.root, entry, versions)
+        live, = [row for row in rows if row.live]
+        self.assertIn("Published draft", service.read_saved_project(entry, revision=live.revision).project.pages[1]["message"]["html"])
+
     def seed_app_sounds(self):
         source = generate.application_paths(Path(__file__).resolve().parents[1]).app_resource_path(generate.APP_SOUNDS_DIR)
         destination = self.root / "resources/app/sounds"
         destination.mkdir(parents=True, exist_ok=True)
         for name in generate._sfx_names():
-            shutil.copy2(source / name, destination / name)
+            cue = destination / name
+            cue.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / name, cue)
 
     def test_long_saved_title_staging_preserves_relative_display_resources(self):
-        from forge_render import validate_display_output
+        from forge_render import _io_path, validate_display_output
         from transactional_io import _remove_path
         destination = self.root / ("recipient-" + "r" * 80) / ("title-" + "t" * 85)
         try:
-            output = generate_render(self.session, destination=destination, seed_sfx=False)
+            self.seed_app_sounds()
+            output = generate_render(self.session, destination=destination)
             verified = validate_display_output(output)
-            manifest = json.loads((verified / DISPLAY_MANIFEST).read_text(encoding="utf-8"))
+            manifest = json.loads((_io_path(verified) / DISPLAY_MANIFEST).read_text(encoding="utf-8"))
             self.assertTrue(manifest["files"])
+            self.assertIn("gallery/sounds/transitions/pixelate/dissolve-reveal.mp3", manifest["files"])
             self.assertTrue(all(not Path(name).is_absolute() and ".." not in Path(name).parts for name in manifest["files"]))
         finally:
             self.assertTrue(destination.parent.resolve().is_relative_to(self.root.resolve()))
@@ -354,10 +389,16 @@ class ForgeRenderTests(unittest.TestCase):
         completed = mock.Mock()
         forge = SimpleNamespace(project_root=self.root, _busy=False, _publication_operation="",
                                 _flush_prompt_writer_state=lambda: True, _required_gate=lambda **kwargs: True,
-                                _export_completed=completed, _set_status=mock.Mock())
+                                _export_completed=completed, _set_status=mock.Mock(),
+                                _defer_until_idle=lambda callback: callback())
         forge._start_operation = lambda _status, task, success, _error: success(task())
-        with mock.patch("Forge_Tab.QtWidgets.QFileDialog.getSaveFileName", return_value=(str(destination), "HTML")):
+        from PySide6.QtWidgets import QDialog
+        with mock.patch("Forge_Tab.LetterSmithConfirmationDialog") as review, mock.patch(
+                "Forge_Tab.QtWidgets.QFileDialog.getSaveFileName", return_value=(str(destination), "HTML")):
+            review.return_value.exec.return_value = QDialog.Accepted
             ForgeTab.export_letter(forge, "html")
+        self.assertIn("Estimated size", review.call_args.kwargs["question"])
+        self.assertIn("one self-contained file", review.call_args.kwargs["question"])
         self.assertIn("Message A", destination.read_text(encoding="utf-8"))
         self.assertIn("Message B", destination.read_text(encoding="utf-8"))
         self.assertEqual(completed.call_args.args[0][0], destination)
@@ -415,6 +456,11 @@ class ForgeRenderTests(unittest.TestCase):
         ids = [page["id"] for page in self.project.pages]
         self.project.reorder_pages(list(reversed(ids)))
         self.project.reorder_pages(ids)
+        self.assertFalse(render_is_current(self.session, render, check_sources=False))
+        render = capture_render(self.session)
+        self.project.set_letter_transition("curtain")
+        self.assertNotEqual(capture_render(self.session).source_fingerprint, render.source_fingerprint)
+        self.project.set_letter_transition("classic")
         self.assertFalse(render_is_current(self.session, render, check_sources=False))
 
     def test_unchanged_saves_and_resource_normalization_keep_visible_fingerprint(self):

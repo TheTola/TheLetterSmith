@@ -35,6 +35,7 @@ from project_paths import ProjectPathError, ProjectPathResolver, application_pat
 from project_save import ProjectNotReadyError, ProjectSaveService
 from project_state import ProjectStateController
 from readiness import (
+    ReadinessItem,
     ReadinessResult,
     evaluate_project_save_eligibility,
     evaluate_readiness,
@@ -157,7 +158,9 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             tab._readiness_requested = True
             tab.readiness_window.show()
             self.app.processEvents()
-            tab.readiness_window._missing_buttons["cover"].click()
+            cover_button = next(button for button in tab.readiness_window._missing_buttons.values()
+                                if "Cover" in button.text())
+            cover_button.click()
             self.app.processEvents()
             self.assertFalse(tab.readiness_window.isVisible())
             self.assertFalse(tab._readiness_requested)
@@ -185,7 +188,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                     QtWidgets.QStyleOptionViewItem(),
                     tab.preview_mode.model().index(0, 0),
                 ).height(),
-                48,
+                34,
             )
             tab.close()
 
@@ -735,12 +738,12 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             tab = ForgeTab(Path(directory))
             try:
-                self.assertEqual(tab.preview_mode_value, "landscape")
+                self.assertEqual(tab.preview_mode_value, "window")
                 blocked = tab._readiness_result
                 self.assertFalse(blocked.can_preview)
                 self.assertFalse(tab.export_btn.isEnabled())
-                self.assertEqual(tab.preview_mode.count(), 3)
-                self.assertEqual(tab.preview_mode.currentText(), "Landscape")
+                self.assertEqual(tab.preview_mode.count(), 2)
+                self.assertEqual(tab.preview_mode.currentText(), "Desktop / Tablet")
                 self.assertFalse(tab.preview_mode.isEnabled())
                 self.assertEqual(tab.curtain_style_selector.count(), 0)
                 self.assertEqual(tab.curtain_style_selector.currentText(), "Normal Curtains")
@@ -762,31 +765,34 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
                     tab.export_btn.click()
                 self.assertEqual(menu_labels, ["ZIP Package…", "Single HTML…", "Website ZIP…"])
                 export_letter.assert_called_once_with("html")
-                self.assertEqual(tab.preview_mode.count(), 3)
-                self.assertEqual(tab.preview_mode.currentData(), "landscape")
+                self.assertEqual(tab.preview_mode.count(), 2)
+                self.assertEqual(tab.preview_mode.currentData(), "window")
                 self.assertEqual(
-                    [tab.preview_mode.itemText(index) for index in range(3)],
-                    ["Portrait", "Landscape", "Browser"],
+                    [tab.preview_mode.itemText(index) for index in range(2)],
+                    ["Desktop / Tablet", "Phone"],
                 )
                 self.assertTrue(tab.curtain_style_selector.isEnabled())
                 self.assertEqual(tab.curtain_style_selector.count(), 7)
 
+                modes = []
+                tab.preview_format_changed.connect(modes.append)
                 with mock.patch.object(tab, "request_preview") as request_preview:
-                    tab.preview_mode.setCurrentIndex(tab.preview_mode.findData("window"))
-                request_preview.assert_called_once_with()
-                self.assertEqual(SettingsStore(directory).get("forge_preview_mode"), "window")
+                    tab.preview_mode.setCurrentIndex(tab.preview_mode.findData("portrait"))
+                request_preview.assert_not_called()
+                self.assertEqual(modes, ["portrait"])
+                self.assertEqual(SettingsStore(directory).get("forge_preview_mode"), "portrait")
                 tab.curtain_style_selector.set_current_style("normal_dark")
                 with mock.patch("Forge_Tab.evaluate_readiness", return_value=blocked):
                     tab.refresh_readiness()
-                self.assertEqual(tab.preview_mode.count(), 3)
-                self.assertEqual(tab.preview_mode.currentText(), "Browser")
+                self.assertEqual(tab.preview_mode.count(), 2)
+                self.assertEqual(tab.preview_mode.currentText(), "Phone")
                 self.assertFalse(tab.preview_mode.isEnabled())
                 self.assertEqual(tab.curtain_style_selector.count(), 0)
                 self.assertEqual(tab.curtain_style_selector.currentText(), "Normal Dark Curtains")
                 self.assertFalse(tab.curtain_style_selector.isEnabled())
                 with mock.patch("Forge_Tab.evaluate_readiness", return_value=ready):
                     tab.refresh_readiness()
-                self.assertEqual(tab.preview_mode.currentData(), "window")
+                self.assertEqual(tab.preview_mode.currentData(), "portrait")
             finally:
                 tab.shutdown()
                 tab.close()
@@ -794,11 +800,115 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             with mock.patch("Forge_Tab.evaluate_readiness", return_value=ready):
                 reopened = ForgeTab(Path(directory))
             try:
-                self.assertEqual(reopened.preview_mode_value, "window")
-                self.assertEqual(reopened.preview_mode.currentText(), "Browser")
+                self.assertEqual(reopened.preview_mode_value, "portrait")
+                self.assertEqual(reopened.preview_mode.currentText(), "Phone")
+                for saved, label in (("Landscape", "Desktop / Tablet"),
+                                     ("Browser", "Desktop / Tablet"),
+                                     ("window", "Desktop / Tablet"),
+                                     ("Portrait", "Phone")):
+                    with self.subTest(saved=saved):
+                        SettingsStore(directory).update_fields({"forge_preview_mode": saved})
+                        with mock.patch("Forge_Tab.evaluate_readiness", return_value=ready):
+                            reopened.refresh_project_state(refresh_source=False)
+                        self.assertEqual(reopened.preview_mode.currentText(), label)
             finally:
                 reopened.shutdown()
                 reopened.close()
+
+    def test_readiness_lists_publish_blockers_before_optional_items(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            panel = ReadinessWindow(directory)
+            panel.refresh(ReadinessResult((
+                ReadinessItem("music", "Music", False, False, "Choose music", "sound", "music"),
+                ReadinessItem("title", "Title", False, True, "Enter a title", "message", "title"),
+            ), 0, "Not Ready"))
+            self.assertEqual([panel.items_layout.itemAt(i).widget().text() for i in range(2)],
+                             ["Title", "Music (optional)"])
+            panel.shutdown()
+
+    def test_preview_curtains_opens_over_current_cover(self) -> None:
+        from PIL import Image
+        from config import USER_CONTROLS_DIR
+        from Forge_Tab import _CurtainPreview
+        from project_session import get_project_session, release_project_session
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            controls = root / USER_CONTROLS_DIR
+            controls.mkdir(parents=True)
+            for side in ("cleft.png", "cright.png"):
+                Image.new("RGBA", (32, 48), "gray").save(controls / side)
+            Image.new("RGB", (32, 48), "green").save(root / "current.png")
+            tab = ForgeTab(root)
+            try:
+                session = get_project_session(root)
+                session.project.update_artwork(session.project.pages[0]["id"], {"asset": "current.png"})
+                tab.curtain_styles.set_style("complementary_light")
+                self.assertFalse(tab.refresh_readiness().can_preview)
+                self.assertTrue(tab.curtain_preview_btn.isEnabled())
+                tab.curtain_preview_btn.click()
+                preview = None
+                for _ in range(160):
+                    QtTest.QTest.qWait(20)
+                    preview = tab.findChild(_CurtainPreview)
+                    if preview is not None and preview.progress == 1:
+                        break
+                self.assertIsNotNone(preview)
+                self.assertEqual(preview.progress, 1)
+                self.assertIn("Complementary Light", preview.window().windowTitle())
+                self.assertEqual(preview.cover.pixelColor(10, 10), QtGui.QColor("green"))
+                preview.window().close()
+            finally:
+                tab.shutdown()
+                tab.close()
+                release_project_session(root)
+
+    def test_publication_review_and_link_actions_use_exact_verified_address(self) -> None:
+        from publishing.collections_ui import PublicationDialog
+        from project_session import release_project_session
+
+        url = "https://example.github.io/letters/Valley%20%26%20Shepard/"
+        metadata = {"recipient_title": "Valley & Shepard", "recipient_name": "Ada",
+                    "publication_provider": "github_pages", "publication_verified": True,
+                    "published_at": "2026-11-01T12:00:00+00:00", "published_public_path": "Valley & Shepard",
+                    "published_page_url": url,
+                    "_publication_summary": {"pages": 4, "message_pages": 1, "tracks": 2}}
+        plan = {"destination": {"owner": "example", "repository": "letters"},
+                "path": "Valley & Shepard", "url": url}
+        publisher = SimpleNamespace(preview=mock.Mock(return_value=plan))
+        dialog = PublicationDialog(publisher, metadata)
+        dialog.show()
+        for _ in range(100):
+            if dialog.confirm.isEnabled():
+                break
+            QtTest.QTest.qWait(10)
+        self.assertEqual(dialog.confirm.text(), "Publish update")
+        self.assertTrue(dialog.confirm.isEnabled())
+        for text in ("GitHub Pages address", url, "Valley & Shepard for Ada", "4 pages", "replace the finished letter"):
+            self.assertIn(text, dialog.preview.toPlainText())
+        dialog.reject()
+
+        with tempfile.TemporaryDirectory() as directory:
+            tab = ForgeTab(Path(directory))
+            try:
+                tab.settings.update_fields({key: value for key, value in metadata.items() if not key.startswith("_")})
+                tab.refresh_saved_page_url()
+                self.assertTrue(tab.copy_link_btn.isEnabled())
+                tab.copy_link_btn.click()
+                self.assertEqual(QtGui.QGuiApplication.clipboard().text(), url)
+                with mock.patch("Forge_Tab.LetterSmithConfirmationDialog") as confirm, mock.patch.object(tab, "_start_operation") as start:
+                    confirm.return_value.exec.return_value = QtWidgets.QDialog.Rejected
+                    tab.unpublish_letter()
+                self.assertIn("Valley & Shepard", confirm.call_args.kwargs["question"])
+                self.assertIn(url, confirm.call_args.kwargs["question"])
+                start.assert_not_called()
+                tab.settings.update_fields(publication_verified=False)
+                tab.refresh_saved_page_url()
+                self.assertTrue(tab.copy_link_btn.isHidden())
+            finally:
+                tab.shutdown()
+                tab.close()
+                release_project_session(directory)
 
     def test_forge_actions_and_preview_format_follow_each_theme(self) -> None:
         def contrast_ratio(foreground: str, background: str) -> float:
@@ -1446,7 +1556,7 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             replacement="the",
             suggestions=("the",),
             confidence="high",
-            auto_fix=False,
+            auto_fix=True,
         )
         service = FakeLanguageService((issue,))
         editor, holder = self._make_editor(
@@ -1495,6 +1605,30 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             self.assertTrue(editor.editor.document().isUndoAvailable())
             editor.editor.undo()
             self.assertEqual(editor.editor.toPlainText(), "teh world")
+        finally:
+            editor._closing = True
+            editor.close()
+            editor.deleteLater()
+            editor._host_for_test.deleteLater()
+            self.app.processEvents()
+            holder.cleanup()
+
+    def test_save_does_not_accept_grammar_or_uncertain_spelling(self) -> None:
+        issues = (
+            SimpleNamespace(start=0, end=1, text="a", category="grammar",
+                            replacement="an", suggestions=("an",), confidence="high", auto_fix=True),
+            SimpleNamespace(start=8, end=11, text="wrd", category="spelling",
+                            replacement="word", suggestions=("word",), confidence="high", auto_fix=False),
+        )
+        editor, holder = self._make_editor("paper", language_service=FakeLanguageService(issues))
+        try:
+            editor.editor.setPlainText("a apple wrd")
+            with mock.patch.object(editor.project_save_service, "save_message") as save:
+                self.assertTrue(editor._save_document())
+            saved = QtGui.QTextDocument()
+            saved.setHtml(save.call_args.args[0])
+            self.assertEqual(saved.toPlainText(), "a apple wrd")
+            self.assertEqual(editor.editor.toPlainText(), "a apple wrd")
         finally:
             editor._closing = True
             editor.close()
@@ -2133,8 +2267,8 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
             index = (play_dir / "index.html").read_text(encoding="utf-8")
             script = (play_dir / "script.js").read_text(encoding="utf-8")
             self.assertIn("const HAS_MESSAGE = false;", index)
-            self.assertIn("wall.dataset.hasMessage", script)
-            self.assertIn("if (!hasMessage || !isWallPage()){", script)
+            self.assertIn("dataset.hasMessage", script)
+            self.assertIn("hasWallMessage(wall) && isWallPage()", script)
             self.assertEqual(
                 (play_dir / "gallery/message/message.html").read_text(
                     encoding="utf-8"
@@ -2552,7 +2686,8 @@ class ReadinessEditorAndProjectPathTests(unittest.TestCase):
         )
         try:
             labels = {button.text() for button in dialog.findChildren(QtWidgets.QPushButton)}
-            self.assertEqual(labels & {"Preview", "Show Original", "Repair Archive", "Close"}, set())
+            self.assertEqual(labels & {"Show Original", "Repair Archive", "Close"}, set())
+            self.assertIn("Preview", labels)
             self.assertIn("Rename Title", labels)
             self.assertIn("Delete from Archive", labels)
             self.assertIn("Use Track", labels)

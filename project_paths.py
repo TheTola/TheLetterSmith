@@ -22,8 +22,10 @@ from save_schema import (
     stamp_current_save_schema,
 )
 from transactional_io import (
+    atomic_copy_file,
     atomic_write_json,
     enforce_internal_tree_visibility,
+    is_link_or_reparse_point,
     safe_write_json,
     set_path_hidden,
 )
@@ -31,7 +33,37 @@ from transactional_io import (
 
 PROJECT_METADATA_FILE = "lettersmith-metadata.json"
 PROJECT_METADATA_SCHEMA_VERSION = 2
-AUTOSAVE_RELATIVE_PATH = Path("output") / "projects"
+LEGACY_OUTPUT_DIR = "output"
+LEGACY_PLAY_DIR = "Play"
+AUTOSAVE_RELATIVE_PATH = Path(LEGACY_OUTPUT_DIR) / "projects"
+
+WORKSPACE_USER_DIR = Path("gallery") / "user"
+WORKSPACE_PAGES_DIR = WORKSPACE_USER_DIR / "pages"
+WORKSPACE_CONTROLS_DIR = WORKSPACE_USER_DIR / "card" / "controls"
+WORKSPACE_MESSAGE_DIR = WORKSPACE_USER_DIR / "message"
+WORKSPACE_SOUNDS_DIR = WORKSPACE_USER_DIR / "sounds"
+WORKSPACE_SOUND_STATE_DIR = WORKSPACE_SOUNDS_DIR / "appssong"
+_WORKSPACE_MEDIA_DIRS = (
+    WORKSPACE_PAGES_DIR,
+    WORKSPACE_CONTROLS_DIR,
+    WORKSPACE_MESSAGE_DIR,
+    WORKSPACE_USER_DIR / "fonts",
+)
+MUSIC_FILE_NAME = "music.mp3"
+AUDIO_ORIGINALS_DIR_NAME = "originals"
+AUDIO_PROCESSED_DIR_NAME = "processed"
+AUDIO_ANALYSIS_DIR_NAME = "analysis"
+AUDIO_LIBRARY_FILE_NAME = "library.json"
+AUDIO_PROJECT_STATE_NAME = "project_sound.json"
+AUDIO_CURRENT_MANIFEST_NAME = "current.json"
+_MUSIC_ARCHIVE_DIRS = (
+    AUDIO_ORIGINALS_DIR_NAME,
+    AUDIO_PROCESSED_DIR_NAME,
+    AUDIO_ANALYSIS_DIR_NAME,
+)
+
+_BUNDLED_PROMPT_WRITER_DIR = Path("resources") / "prompt_writer"
+_LEGACY_PROMPT_WRITER_DIR = Path("Prompter") / "modules"
 _LOGGER = logging.getLogger(__name__)
 
 STORAGE_LAYOUT_VERSION = 1
@@ -48,6 +80,20 @@ def _resolved(path: str | Path) -> Path:
 
 def _is_transaction_artifact_directory(path: Path) -> bool:
     return bool(_TRANSACTION_DIRECTORY_PATTERN.search(path.name))
+
+
+def _copy_missing_file(source: Path, destination: Path) -> None:
+    if source.is_file() and not destination.exists():
+        atomic_copy_file(source, destination)
+
+
+def _copy_missing_tree(source: Path, destination: Path) -> None:
+    if not source.is_dir():
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    for item in source.rglob("*"):
+        if item.is_file() and not item.is_symlink():
+            _copy_missing_file(item, destination / item.relative_to(source))
 
 
 @dataclass(frozen=True)
@@ -79,33 +125,36 @@ class ApplicationPaths:
     profile_root: Path | None = None
 
     @classmethod
-    def for_project(cls, project_root: str | Path) -> "ApplicationPaths":
+    def for_project(
+        cls, project_root: str | Path, *, output_root: str | Path | None = None,
+    ) -> "ApplicationPaths":
         """Keep explicitly supplied development/test projects self-contained."""
         root = _resolved(project_root)
-        output = root / "output"
-        archive = root / "gallery" / "user" / "sounds" / "appssong"
+        output = root / LEGACY_OUTPUT_DIR if output_root is None else _resolved(output_root)
+        archive = root / WORKSPACE_SOUND_STATE_DIR
+        prompt_writer = root / _LEGACY_PROMPT_WRITER_DIR
         return cls(
             resource_root=root,
             workspace_root=root,
             app_data_root=root,
             settings_root=root,
-            prompt_writer_content_root=root / "Prompter" / "modules",
-            custom_palette_root=root / "Prompter" / "modules",
+            prompt_writer_content_root=prompt_writer,
+            custom_palette_root=prompt_writer,
             music_archive_root=archive,
             logs_root=root / "logs",
-            cache_root=root / "gallery" / "user" / "cache",
+            cache_root=root / WORKSPACE_USER_DIR / "cache",
             publication_root=output / "publication",
             migration_root=root / "migrations",
             documents_root=output,
-            saved_letters_root=output / "Play",
+            saved_letters_root=output / LEGACY_PLAY_DIR,
             recovery_root=output / "Recovery",
             export_root=output / "Exports",
             generated_root=output / "Generated Packages",
             temporary_root=output,
-            autosave_root=output / "projects",
+            autosave_root=output / AUTOSAVE_RELATIVE_PATH.name,
             recipient_registry_file=output / "recipients.json",
-            project_sound_state_file=archive / "project_sound.json",
-            current_sound_manifest_file=archive / "current.json",
+            project_sound_state_file=archive / AUDIO_PROJECT_STATE_NAME,
+            current_sound_manifest_file=archive / AUDIO_CURRENT_MANIFEST_NAME,
             settings_file=root / "settings.json",
         )
 
@@ -161,8 +210,6 @@ class ApplicationPaths:
             app_data = local_app_data / PUBLISHER_NAME / APPLICATION_NAME
             cache = app_data / "cache"
         documents = documents_base / APPLICATION_NAME
-        workspace = app_data / "Active Project"
-        sound_workspace = workspace / "gallery" / "user" / "sounds" / "appssong"
         temporary = _resolved(
             temporary_base
             or environment.get("LETTER_SMITH_TEMP_ROOT")
@@ -174,9 +221,9 @@ class ApplicationPaths:
             app_data = profile / "app"
             cache = profile / "cache"
             documents = profile / "documents"
-            workspace = app_data / "Active Project"
-            sound_workspace = workspace / "gallery" / "user" / "sounds" / "appssong"
             temporary = cache / "temp"
+        workspace = app_data / "Active Project"
+        sound_workspace = workspace / WORKSPACE_SOUND_STATE_DIR
         return cls(
             resource_root=resources,
             workspace_root=workspace,
@@ -197,8 +244,8 @@ class ApplicationPaths:
             temporary_root=temporary,
             autosave_root=app_data / "autosaves",
             recipient_registry_file=documents / "recipients.json",
-            project_sound_state_file=sound_workspace / "project_sound.json",
-            current_sound_manifest_file=sound_workspace / "current.json",
+            project_sound_state_file=sound_workspace / AUDIO_PROJECT_STATE_NAME,
+            current_sound_manifest_file=sound_workspace / AUDIO_CURRENT_MANIFEST_NAME,
             settings_file=app_data / "settings" / "settings.json",
             profile_root=profile,
         )
@@ -224,11 +271,29 @@ class ApplicationPaths:
         return self.resource_root / "resources" / "examples"
 
     @property
+    def workspace_sounds_root(self) -> Path:
+        return self.workspace_root / WORKSPACE_SOUNDS_DIR
+
+    @property
+    def music_library_file(self) -> Path:
+        return self.music_archive_root / AUDIO_LIBRARY_FILE_NAME
+
+    @property
     def bundled_prompt_writer_root(self) -> Path:
-        primary = self.resource_root / "resources" / "prompt_writer"
+        primary = self.resource_root / _BUNDLED_PROMPT_WRITER_DIR
         if primary.is_dir():
             return primary
-        return self.resource_root / "Prompter" / "modules"
+        return self.resource_root / _LEGACY_PROMPT_WRITER_DIR
+
+    def bundled_prompt_writer_path(self, filename: str) -> Path:
+        if Path(filename).name != filename or filename in {"", ".", ".."}:
+            raise ValueError("Prompt Writer module names must be filenames.")
+        path = self.bundled_prompt_writer_root / filename
+        if not path.is_file():
+            legacy = self.resource_root / _LEGACY_PROMPT_WRITER_DIR / filename
+            if legacy.is_file():
+                return legacy
+        return path
 
     def resource_path(self, relative: str | Path) -> Path:
         value = Path(relative)
@@ -266,20 +331,27 @@ class ApplicationPaths:
             raise ValueError("Bundled tool names cannot contain directories.")
         return (self.resource_root / "tools" / filename).resolve()
 
-    def ensure_writable_roots(self) -> None:
+    def ensure_sound_dirs(self) -> None:
         directories = (
-            self.workspace_root,
-            self.workspace_root / "gallery" / "user" / "pages",
-            self.workspace_root / "gallery" / "user" / "card" / "controls",
-            self.workspace_root / "gallery" / "user" / "message",
-            self.workspace_root / "gallery" / "user" / "sounds" / "appssong",
-            self.workspace_root / "gallery" / "user" / "fonts",
+            self.workspace_sounds_root,
+            self.project_sound_state_file.parent,
+            self.current_sound_manifest_file.parent,
+            *(self.music_archive_root / name for name in _MUSIC_ARCHIVE_DIRS),
+        )
+        for directory in dict.fromkeys(directories):
+            directory.mkdir(parents=True, exist_ok=True)
+
+    def ensure_workspace_media_dirs(self) -> None:
+        for relative in _WORKSPACE_MEDIA_DIRS:
+            (self.workspace_root / relative).mkdir(parents=True, exist_ok=True)
+        self.ensure_sound_dirs()
+
+    def ensure_writable_roots(self) -> None:
+        self.ensure_workspace_media_dirs()
+        directories = (
             self.settings_root,
             self.prompt_writer_content_root,
             self.custom_palette_root,
-            self.music_archive_root / "originals",
-            self.music_archive_root / "processed",
-            self.music_archive_root / "analysis",
             self.logs_root,
             self.cache_root,
             self.publication_root,
@@ -316,8 +388,8 @@ class ApplicationPaths:
             self.workspace_root / "prompt_writer_state.json",
             self.project_sound_state_file,
             self.current_sound_manifest_file,
-            self.music_archive_root / "library.json",
-            self.workspace_root / "gallery/user/card/controls",
+            self.music_library_file,
+            self.workspace_root / WORKSPACE_CONTROLS_DIR,
         ):
             if set_path_hidden(path):
                 hidden.append(path)
@@ -330,20 +402,15 @@ class ApplicationPaths:
         if self.profile_root is not None:
             # Development profiles must never import private source-tree state
             # or the normal user's active project on first launch.
-            source = self.app_resource_path("controls")
-            destination = self.workspace_root / "gallery/user/card/controls"
-            if source.is_dir():
-                for item in source.rglob("*"):
-                    if item.is_file() and not item.is_symlink():
-                        target = destination / item.relative_to(source)
-                        if not target.exists():
-                            target.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(item, target)
+            _copy_missing_tree(
+                self.app_resource_path("controls"),
+                self.workspace_root / WORKSPACE_CONTROLS_DIR,
+            )
             return
         if legacy_root is None or self.workspace_root == self.resource_root:
             _LOGGER.debug("Writable application storage is ready: %s", self.app_data_root)
             return
-        legacy = _resolved(legacy_root)
+        legacy = self.for_project(legacy_root)
         marker = self.migration_root / f"storage-layout-{STORAGE_LAYOUT_VERSION}.json"
         if marker.is_file():
             _LOGGER.debug(
@@ -357,58 +424,41 @@ class ApplicationPaths:
             STORAGE_LAYOUT_VERSION,
         )
 
-        def copy_file(source: Path, destination: Path) -> None:
-            if not source.is_file() or destination.exists():
-                return
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
-
-        def copy_tree(source: Path, destination: Path) -> None:
-            if not source.is_dir():
-                return
-            destination.mkdir(parents=True, exist_ok=True)
-            for item in source.rglob("*"):
-                if not item.is_file() or item.is_symlink():
-                    continue
-                target = destination / item.relative_to(source)
-                copy_file(item, target)
-
-        copy_file(legacy / "settings.json", self.settings_file)
-        copy_file(
-            legacy / "prompt_writer_state.json",
-            self.workspace_root / "prompt_writer_state.json",
-        )
-        copy_tree(
+        for relative in _WORKSPACE_MEDIA_DIRS:
+            _copy_missing_tree(legacy.workspace_root / relative, self.workspace_root / relative)
+        _copy_missing_tree(
             self.app_resource_path("controls"),
-            self.workspace_root / "gallery/user/card/controls",
+            self.workspace_root / WORKSPACE_CONTROLS_DIR,
         )
-        for relative in (
-            Path("gallery/user/pages"),
-            Path("gallery/user/card/controls"),
-            Path("gallery/user/message"),
-            Path("gallery/user/fonts"),
+
+        for name in _MUSIC_ARCHIVE_DIRS:
+            _copy_missing_tree(legacy.music_archive_root / name, self.music_archive_root / name)
+        _copy_missing_tree(legacy.saved_letters_root, self.saved_letters_root)
+        _copy_missing_tree(legacy.recovery_root, self.recovery_root)
+        _copy_missing_tree(legacy.autosave_root, self.autosave_root)
+
+        for source, destination in (
+            (legacy.settings_file, self.settings_file),
+            (legacy.workspace_root / "prompt_writer_state.json",
+             self.workspace_root / "prompt_writer_state.json"),
+            (legacy.workspace_sounds_root / MUSIC_FILE_NAME,
+             self.workspace_sounds_root / MUSIC_FILE_NAME),
+            (legacy.music_library_file, self.music_library_file),
+            (legacy.project_sound_state_file, self.project_sound_state_file),
+            (legacy.current_sound_manifest_file, self.current_sound_manifest_file),
+            (legacy.recipient_registry_file, self.recipient_registry_file),
         ):
-            copy_tree(legacy / relative, self.workspace_root / relative)
+            _copy_missing_file(source, destination)
 
-        legacy_sounds = legacy / "gallery" / "user" / "sounds"
-        copy_file(legacy_sounds / "music.mp3", self.workspace_root / "gallery/user/sounds/music.mp3")
-        legacy_archive = legacy_sounds / "appssong"
-        for directory in ("originals", "processed", "analysis"):
-            copy_tree(legacy_archive / directory, self.music_archive_root / directory)
-        copy_file(legacy_archive / "library.json", self.music_archive_root / "library.json")
-        copy_file(legacy_archive / "project_sound.json", self.project_sound_state_file)
-        copy_file(legacy_archive / "current.json", self.current_sound_manifest_file)
-
-        copy_tree(legacy / "output" / "Play", self.saved_letters_root)
-        copy_tree(legacy / "output" / "Recovery", self.recovery_root)
-        copy_tree(legacy / "output" / "projects", self.autosave_root)
-        copy_file(legacy / "output" / "recipients.json", self.recipient_registry_file)
-
-        legacy_modules = legacy / "Prompter" / "modules"
-        for filename in ("type.txt", "topic.txt", "color.txt"):
-            copy_file(legacy_modules / filename, self.prompt_writer_content_root / filename)
-        copy_file(
-            legacy_modules / "user_colors.json",
+        for filename in (
+            "type.txt", "topic.txt", "color.txt", "user_type.json", "user_subject.json", "user_color.json",
+        ):
+            _copy_missing_file(
+                legacy.prompt_writer_content_root / filename,
+                self.prompt_writer_content_root / filename,
+            )
+        _copy_missing_file(
+            legacy.custom_palette_root / "user_colors.json",
             self.custom_palette_root / "user_colors.json",
         )
 
@@ -416,7 +466,7 @@ class ApplicationPaths:
             marker,
             {
                 "storage_layout_version": STORAGE_LAYOUT_VERSION,
-                "legacy_root": str(legacy),
+                "legacy_root": str(legacy.workspace_root),
             },
         )
         self.enforce_internal_visibility()
@@ -577,7 +627,7 @@ class ProjectPathResolver:
             for child in root.iterdir():
                 if _is_transaction_artifact_directory(child):
                     continue
-                if child.is_dir() and self._metadata_project_id(child) == stable_project_id:
+                if child.is_dir() and not is_link_or_reparse_point(child) and self._metadata_project_id(child) == stable_project_id:
                     matches.append(child.resolve())
         return tuple(dict.fromkeys(matches))
 
@@ -627,6 +677,14 @@ class ProjectPathResolver:
         self,
         settings: Mapping[str, Any],
     ) -> ProjectContext:
+        with self.autosave_lock():
+            return self._context_from_settings(settings)
+
+    def autosave_lock(self):
+        from project_repository import _writer_lock
+        return _writer_lock(self.autosave_root / ".snapshot-lock")
+
+    def _context_from_settings(self, settings: Mapping[str, Any]) -> ProjectContext:
         from project_state import require_project_identity
 
         identity = require_project_identity(settings)
@@ -634,35 +692,31 @@ class ProjectPathResolver:
         if record is None:
             raise ProjectPathError("Active recipient is not registered.")
         title = _safe_title(settings.get("recipient_title"))
-        conflict = self.find_title_conflict(
-            identity.recipient_id,
-            title,
-            project_id=identity.project_id,
-        )
-        if conflict is not None:
-            raise ProjectPathError(
-                f"{record.display_name} already has a letter titled "
-                f"{title!r}. Enter a different letter title."
-            )
-        existing_matches = self.find_autosave_directories(
-            identity.project_id,
-        )
+        owned = self.find_autosave_directories(identity.project_id, recipient_id=record.recipient_id)
+        existing_matches = owned or self.find_autosave_directories(identity.project_id)
         matching_title = _safe_title(title).casefold()
         named_matches = tuple(
             path for path in existing_matches if path.name.casefold() == matching_title
         )
         if len(existing_matches) > 1 and len(named_matches) == 1:
-            self.repair_duplicate_autosave_ids(
-                active_autosave_directory=named_matches[0],
-            )
             existing = named_matches[0]
         elif len(existing_matches) > 1:
-            raise ProjectPathError(
-                "Project ID appears in more than one autosave folder: "
-                + "; ".join(str(path) for path in existing_matches)
-            )
+            existing = max(existing_matches, key=lambda path: (path.stat().st_mtime_ns, path.name))
+            if not all(path == existing or self._confirmed_autosave_duplicate(existing, path, repaired_identity=False)
+                       for path in existing_matches):
+                raise ProjectPathError(
+                    "Project ID appears in more than one autosave folder: "
+                    + "; ".join(str(path) for path in existing_matches)
+                )
         else:
             existing = existing_matches[0] if existing_matches else None
+        if existing is not None:
+            self.repair_duplicate_autosave_ids(active_autosave_directory=existing)
+        conflict = self.find_title_conflict(identity.recipient_id, title, project_id=identity.project_id)
+        if conflict is not None:
+            raise ProjectPathError(
+                f"{record.display_name} already has a letter titled {title!r}. Enter a different letter title."
+            )
         autosave_directory = (
             self._relocate_autosave_directory(
                 existing,
@@ -701,9 +755,11 @@ class ProjectPathResolver:
         if not stable_project_id:
             raise ProjectPathError("Project ID must be a UUID.")
         requested_title = _safe_title(title).casefold()
+        recipient = self.registry.find_by_id(recipient_id)
         roots = (
             self.resolve_autosave_recipient_directory(recipient_id),
             self.resolve_play_recipient_directory(recipient_id),
+            self.play_root / "Editable Projects",
         )
         for recipient_directory in roots:
             if not recipient_directory.is_dir():
@@ -711,20 +767,57 @@ class ProjectPathResolver:
             for directory in sorted(recipient_directory.iterdir()):
                 if (
                     not directory.is_dir()
+                    or is_link_or_reparse_point(directory)
                     or _is_transaction_artifact_directory(directory)
                 ):
                     continue
-                candidate_title = self._directory_title(
-                    directory
-                ).casefold()
+                canonical = self._canonical_letter_metadata(directory) if not directory.is_relative_to(self.autosave_root) else None
+                if canonical is not None:
+                    candidate_project_id, metadata = canonical
+                    stored_recipient = _valid_uuid(metadata.get("recipient_id"))
+                    stored_name = " ".join(str(metadata.get("recipient_name") or "").split()).casefold()
+                    same_recipient = (stored_recipient == recipient.recipient_id if stored_recipient
+                                      else stored_name == recipient.normalized_key)
+                    if not same_recipient:
+                        continue
+                    candidate_title = _safe_title(metadata.get("recipient_title") or metadata.get("title")).casefold()
+                elif recipient_directory == roots[-1]:
+                    continue
+                else:
+                    candidate_title = self._directory_title(directory).casefold()
+                    candidate_project_id = self._directory_project_id(directory)
                 if candidate_title != requested_title:
                     continue
-                candidate_project_id = self._directory_project_id(
-                    directory
-                )
                 if candidate_project_id == stable_project_id:
                     continue
+                if directory.is_relative_to(self.autosave_root):
+                    active = self.find_autosave_directories(stable_project_id, recipient_id=recipient_id)
+                    if len(active) == 1 and self._confirmed_autosave_duplicate(
+                            active[0], directory, repaired_identity=stable_project_id in self._autosave_original_ids(directory)):
+                        continue
                 return directory.resolve()
+        return None
+
+    def find_title_conflict_for_name(self, name: str, title: str, *, project_id: str) -> Path | None:
+        key = " ".join(name.split()).casefold()
+        if not key or not title.strip() or not project_id:
+            return None
+        recipient = next((record for record in self.registry.list() if record.normalized_key == key), None)
+        return self.find_title_conflict(recipient.recipient_id, title, project_id=project_id) if recipient else None
+
+    @staticmethod
+    def _canonical_letter_metadata(directory: Path):
+        from project_repository import ProjectRepository, ProjectRepositoryError, _safe_file, _json
+        repository = ProjectRepository(directory / ".lettersmith-project")
+        try:
+            head = repository._head()
+            if head:
+                document = _json(_safe_file(repository.directory, f"g/{head['revision']}/project.json"))
+                metadata = document.get("metadata")
+                if isinstance(metadata, dict):
+                    return _valid_uuid(document.get("project_id")), metadata
+        except (OSError, ProjectRepositoryError):
+            return None
         return None
 
     def ensure_autosave_storage(
@@ -785,29 +878,56 @@ class ProjectPathResolver:
         *,
         active_autosave_directory: str | Path,
     ) -> tuple[tuple[Path, str], ...]:
-        """Give independent duplicate autosaves new IDs without merging them."""
-        active = Path(active_autosave_directory).resolve()
+        """Consolidate actual copies before splitting legacy identity collisions."""
+        with self.autosave_lock():
+            return self._repair_duplicate_autosave_ids(Path(active_autosave_directory).resolve())
+
+    def _repair_duplicate_autosave_ids(self, active: Path) -> tuple[tuple[Path, str], ...]:
+        from saved_letter_reconciliation import AUTOSAVE_ARCHIVE, merge_duplicate
+
         if not active.is_dir():
             raise ProjectPathError("The active autosave folder does not exist.")
         active_id = self._metadata_project_id(active)
         if not active_id:
             raise ProjectPathError("The active project metadata has no valid project ID.")
-        matches = self.find_autosave_directories(active_id)
+        same_id = self.find_autosave_directories(active_id)
+        if active not in same_id:
+            raise ProjectPathError("The active autosave folder does not match the duplicate ID.")
+        former_ids = {active_id, *self._autosave_original_ids(active)}
+        title = self._directory_title(active).casefold()
+        related = {}
+        for path in active.parent.iterdir():
+            if (path == active or not path.is_dir() or is_link_or_reparse_point(path)
+                    or _is_transaction_artifact_directory(path)):
+                continue
+            related_id = bool(former_ids.intersection({self._metadata_project_id(path), *self._autosave_original_ids(path)}))
+            if related_id or self._directory_title(path).casefold() == title:
+                related[path] = related_id
+        matches = tuple(dict.fromkeys((*same_id, *related)))
         if len(matches) < 2:
             return ()
-        if active not in matches:
-            raise ProjectPathError("The active autosave folder does not match the duplicate ID.")
-
-        used_ids = {
-            self._metadata_project_id(path)
-            for path in self._all_autosave_directories()
-        }
+        used_ids = {self._metadata_project_id(path) for path in self._all_autosave_directories()}
         repaired: list[tuple[Path, str]] = []
         for path in matches:
             if path == active:
                 continue
+            duplicate = self._confirmed_autosave_duplicate(active, path, repaired_identity=path not in same_id and related.get(path, False))
+            if duplicate:
+                canonical, original = duplicate
+                merge_duplicate(self.autosave_root / AUTOSAVE_ARCHIVE, path, active,
+                                original=original, canonical=canonical, project_id=active_id)
+                repaired.append((path, active_id))
+                continue
+            if path not in same_id or (path / ".lettersmith-project").exists():
+                continue
+            # Old metadata-only collisions can be split safely. A content-bearing
+            # autosave with unclear ownership stays intact for later inspection.
+            active_metadata = self._read_metadata(active / PROJECT_METADATA_FILE)
             metadata_path = path / PROJECT_METADATA_FILE
             metadata = self._read_metadata(metadata_path)
+            same_recipient = _valid_uuid(active_metadata.get("recipient_id")) == _valid_uuid(metadata.get("recipient_id"))
+            if same_recipient and any((path / name).exists() for name in ("pages", "message", "sounds")):
+                continue
             backup = metadata_path.with_name(
                 f"{metadata_path.name}.backup-{uuid.uuid4().hex}"
             )
@@ -838,6 +958,42 @@ class ProjectPathResolver:
             repaired.append((path, new_id))
         return tuple(repaired)
 
+    @classmethod
+    def _autosave_original_ids(cls, path: Path) -> set[str]:
+        result = set()
+        for backup in path.glob(f"{PROJECT_METADATA_FILE}.backup-*"):
+            try:
+                identifier = _valid_uuid(cls._read_metadata(backup).get("project_id"))
+                if identifier:
+                    result.add(identifier)
+            except ProjectPathError:
+                continue
+        return result
+
+    @classmethod
+    def _confirmed_autosave_duplicate(cls, active: Path, other: Path, *, repaired_identity: bool):
+        from project_repository import ProjectRepositoryError
+        from saved_letter_reconciliation import LetterEvidence, load_letter
+
+        if any(is_link_or_reparse_point(path) for path in (active, other)):
+            return None
+        try:
+            letters = []
+            for path in (active, other):
+                metadata = cls._read_metadata(path / PROJECT_METADATA_FILE)
+                stored = load_letter(path, autosave=True)
+                if not stored.project.pages:
+                    return None
+                letters.append(LetterEvidence.read(stored, project_id=metadata.get("project_id", ""),
+                    recipient_id=metadata.get("recipient_id", ""), recipient=metadata.get("recipient_name", ""),
+                    title=metadata.get("recipient_title", "")))
+        except (OSError, ValueError, ProjectPathError, ProjectRepositoryError):
+            return None
+        first, second = letters
+        if first.matches(second, repaired_identity=repaired_identity):
+            return first.stored, second.stored
+        return None
+
     def _all_autosave_directories(self) -> tuple[Path, ...]:
         paths: list[Path] = []
         for record in self.registry.list():
@@ -847,6 +1003,7 @@ class ProjectPathResolver:
                     child.resolve()
                     for child in root.iterdir()
                     if child.is_dir()
+                    and not is_link_or_reparse_point(child)
                     and not _is_transaction_artifact_directory(child)
                 )
         return tuple(paths)

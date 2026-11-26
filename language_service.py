@@ -150,6 +150,15 @@ class LanguageResult:
     issues: tuple[LanguageIssue, ...]
 
 
+def is_automatic_spelling_fix(issue) -> bool:
+    """Only established spelling fixes may change text without acceptance."""
+    return (
+        getattr(issue, "category", "") == "spelling"
+        and bool(getattr(issue, "auto_fix", False))
+        and getattr(issue, "replacement", None) is not None
+    )
+
+
 def _preserve_case(source: str, replacement: str) -> str:
     if not source:
         return replacement
@@ -221,6 +230,15 @@ class LanguageService:
                 self._custom_words[key]
                 for key in sorted(self._custom_words)
             )
+
+    @property
+    def protected_words(self) -> tuple[str, ...]:
+        """Share dictionary exceptions with local AI without exposing settings."""
+        with self._lock:
+            return tuple(sorted(
+                {*_PROTECTED_WORDS, *self._custom_words.values(), *self._ignored_words},
+                key=str.casefold,
+            ))
 
     def _load_custom_dictionary(self) -> None:
         try:

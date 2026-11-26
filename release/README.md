@@ -1,5 +1,15 @@
 # Letter Smith 1.0.0 Beta 1 Release Automation
 
+Windows builds include the verified offline dictation runtime. Source checkouts can
+prepare it with `py -3.13 tools/build_dictation.py`; verify it with `--check`.
+Speech models are separate optional downloads. See [dictation](../docs/dictation.md).
+
+Offline spelling and grammar builds include the proofreading worker and its pinned
+runtime hash manifest. Grammar model weights and llama.cpp binaries remain a
+separate, verified local model pack; they are not copied into the installer.
+Letter Smith can reuse a verified Holo Desk pack without Holo Desk running, or
+install its own pack through writing settings. See [proofreading](../docs/proofreading.md).
+
 ## Complete production release
 
 Run the complete signed release pipeline from the repository root:

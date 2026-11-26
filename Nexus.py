@@ -82,7 +82,7 @@ from Over_Nexus import install_over_nexus
 # Qt
 # ===================================================================================================================================================================================
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtCore import Qt, QUrl, QEvent, QSize, QPoint
+from PySide6.QtCore import Qt, QUrl, QUrlQuery, QEvent, QSize, QPoint
 from PySide6.QtGui import QColor, QPixmap, QIcon, QMouseEvent, QMovie, QFont
 from PySide6.QtWidgets import (
     QGraphicsOpacityEffect, QStatusBar, QLabel, QVBoxLayout, QHBoxLayout, QDialog,
@@ -2275,7 +2275,7 @@ class Nexus(QtWidgets.QMainWindow):
         # === Mounted Sound visualizer state ===
         self._sound_preview_widget: Optional[QtWidgets.QWidget] = None
         self._sound_preview_index: Optional[int] = None
-        self._forge_preview_mode = "landscape"
+        self._forge_preview_mode = "window"
         self._forge_preview_generation = 0
         self._forge_viewport_measurement: dict[str, object] | None = None
         self._forge_viewport_timer = QtCore.QTimer(self)
@@ -2622,6 +2622,7 @@ class Nexus(QtWidgets.QMainWindow):
             self._route_forge_correction
         )
         self.forge_tab.preview_requested.connect(self._load_forge_preview)
+        self.forge_tab.preview_format_changed.connect(self._set_forge_preview_mode)
         self.forge_tab.preview_failed.connect(self._forge_preview_failed)
         self.forge_tab.preview_visibility_changed.connect(
             self._set_forge_preview_visible
@@ -2969,12 +2970,10 @@ class Nexus(QtWidgets.QMainWindow):
     def _show_saved_letters_from_recipient_page(self) -> None:
         self._show_letter_menu_from_recipient_page(stock=False)
 
-    def open_last_project(self, project_id: str = "") -> None:
+    def open_last_project(self, project_id: str = "", *, entry=None) -> None:
         from saved_letters import SavedLetterCatalog
-        entries = (entry for entry in SavedLetterCatalog(self.project_root).list_entries()
-                   if entry.canonical and entry.valid and not (entry.example or entry.stock or entry.recovery)
-                   and (not project_id or entry.project_id == project_id))
-        entry = max(entries, key=lambda item: item.modified_at, default=None)
+        if entry is None:
+            entry = SavedLetterCatalog.last_project(SavedLetterCatalog(self.project_root).list_entries(), project_id)
         if entry is None:
             self.toast("The saved project is unavailable. Choose Load to browse saved projects.", ms=5000)
             return
@@ -4183,8 +4182,27 @@ class Nexus(QtWidgets.QMainWindow):
         if view is not None:
             return view
 
+        from PySide6.QtWebEngineCore import QWebEngineScript
+
         web_view_type, settings_type = _webengine_components()
         view = web_view_type()
+        preview_script = QWebEngineScript()
+        preview_script.setName("Forge preview format")
+        preview_script.setInjectionPoint(QWebEngineScript.DocumentCreation)
+        preview_script.setWorldId(QWebEngineScript.MainWorld)
+        preview_script.setSourceCode("""
+            (() => {
+                const params = new URLSearchParams(location.search);
+                if (location.protocol !== 'file:' || !params.has('lettersmith')) return;
+                const page = params.get('forgePage');
+                window.letterSmithForgePreview = {
+                    phone: params.get('forgePhone') === '1',
+                    page: page === null ? null : Number(page),
+                    opened: params.get('forgeOpened') === '1',
+                };
+            })();
+        """)
+        view.page().scripts().insert(preview_script)
         view.setStyleSheet(f"background-color:{FORGE_PREVIEW_BACKGROUND};")
         view.page().setBackgroundColor(QColor(FORGE_PREVIEW_BACKGROUND))
         view.settings().setAttribute(
@@ -4397,6 +4415,55 @@ class Nexus(QtWidgets.QMainWindow):
         self.preview_caption.setText("Preparing interactive preview…")
         self.preview_caption.setVisible(True)
 
+    def _set_forge_preview_mode(self, mode: str) -> None:
+        self._forge_preview_mode = mode
+        self._update_preview_geometry()
+        self._reload_forge_preview_format()
+
+    def _reload_forge_preview_format(self) -> None:
+        """Carry the current position into the new format of the same build."""
+        view = self.html_preview
+        if view is None or self.preview_stack.currentWidget() is not view:
+            return
+        source_url = view.url()
+        query = QUrlQuery(source_url)
+        token = query.queryItemValue("lettersmith")
+        mode = self._forge_preview_mode
+        phone = mode == "portrait"
+        if not source_url.isLocalFile() or not token or phone == (query.queryItemValue("forgePhone") == "1"):
+            return
+
+        def reload_format(value: object) -> None:
+            if (self._shutdown_in_progress or self._shutdown_complete
+                    or self.tabbar.currentIndex() != 3 or self.html_preview is not view
+                    or self.preview_stack.currentWidget() is not view
+                    or self._forge_preview_mode != mode or view.url() != source_url
+                    or getattr(self, "_forge_preview_releasing", False)
+                    or getattr(self, "_forge_preview_unload_pending", False)):
+                return
+            try:
+                position = json.loads(str(value)) if value else None
+            except ValueError:
+                position = None
+            query.removeQueryItem("forgePhone")
+            if phone:
+                query.addQueryItem("forgePhone", "1")
+            if isinstance(position, list) and len(position) == 2 and type(position[0]) is int:
+                query.removeQueryItem("forgePage")
+                query.addQueryItem("forgePage", str(position[0]))
+                query.removeQueryItem("forgeOpened")
+                if position[1] is True:
+                    query.addQueryItem("forgeOpened", "1")
+            target = QUrl(source_url)
+            target.setQuery(query)
+            view.setUrl(target)
+
+        view.page().runJavaScript(
+            "JSON.stringify(new URLSearchParams(location.search).get('lettersmith') === "
+            f"{json.dumps(token)} ? window.letterSmithForgePreview?.position?.() ?? null : null)",
+            reload_format,
+        )
+
     def _load_forge_preview(self, index_path: str, mode: str) -> None:
         if (self.tabbar.currentIndex() != 3 or getattr(self, "_forge_preview_releasing", False)
                 or getattr(self, "_forge_preview_unload_pending", False)):
@@ -4406,10 +4473,7 @@ class Nexus(QtWidgets.QMainWindow):
             self.status("The playable letter is missing. Preview it again.")
             return
         view = self._ensure_forge_preview()
-        self._forge_preview_mode = (
-            mode if mode in {"portrait", "landscape", "window"} else "landscape"
-        )
-        self._update_preview_geometry()
+        self._forge_preview_mode = mode
         self._last_pixmap = None
         try:
             modified = index.stat().st_mtime_ns
@@ -4425,20 +4489,17 @@ class Nexus(QtWidgets.QMainWindow):
             except OSError:
                 same_build = False
         if same_build and modified is not None:
-            same_build = current_url.query().startswith(
-                f"lettersmith={modified}-"
-            )
+            token = QUrlQuery(current_url).queryItemValue("lettersmith")
+            same_build = token.startswith(f"{modified}-")
 
         self._clear_preview()
         self.preview_caption.setVisible(False)
         self._update_preview_geometry()
         self.preview_stack.setCurrentWidget(view)
+        self.status("Interactive letter preview")
         if same_build:
             self._set_forge_preview_visible(True)
-            self.status(
-                f"Interactive letter preview: "
-                f"{self._forge_preview_mode.replace('-', ' ')}"
-            )
+            self._reload_forge_preview_format()
             return
 
         self._forge_preview_generation += 1
@@ -4448,14 +4509,12 @@ class Nexus(QtWidgets.QMainWindow):
             if modified is not None
             else self._forge_preview_generation
         )
-        viewer_url.setQuery(
-            f"lettersmith={cache_token}-{self._forge_preview_generation}"
-        )
+        query = QUrlQuery()
+        query.addQueryItem("lettersmith", f"{cache_token}-{self._forge_preview_generation}")
+        if mode == "portrait":
+            query.addQueryItem("forgePhone", "1")
+        viewer_url.setQuery(query)
         view.setUrl(viewer_url)
-        self.status(
-            f"Interactive letter preview: "
-            f"{self._forge_preview_mode.replace('-', ' ')}"
-        )
 
     def _set_forge_preview_visible(self, visible: bool) -> None:
         view = self.html_preview
@@ -4918,16 +4977,12 @@ class Nexus(QtWidgets.QMainWindow):
                 else 0
             )
             gaps = max(0, self.body_layout.spacing()) * (3 if caption_height else 2)
-            mode = getattr(self, "_forge_preview_mode", "landscape")
+            mode = getattr(self, "_forge_preview_mode", "window")
             height_budget = max(
                 PREVIEW_FRAME_EXTRA + 1,
                 body_height - panel_height - controls_height - caption_height - gaps,
             )
-            source = (
-                FORGE_WINDOW_VIEWPORT if mode == "window"
-                else QSize(16, 9) if mode == "landscape"
-                else QSize(4, 5)
-            )
+            source = FORGE_WINDOW_VIEWPORT if mode == "window" else QSize(4, 5)
             max_height = min(
                 height_budget - PREVIEW_FRAME_EXTRA,
                 int(window_height * (0.495 if mode == "window" else 0.306)),

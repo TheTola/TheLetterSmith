@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import asdict, dataclass
+import logging
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -69,6 +70,7 @@ class RemoteCopy:
     url: str = ""
     digest: str = ""
     destination: dict | None = None
+    revision_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -153,14 +155,18 @@ def downloaded_presentations(root):
     return result
 
 
+_LOGGER = logging.getLogger(__name__)
+
+
 class GitHubLibrary:
-    def __init__(self, session, api, *, cancelled=lambda: False, store=None, deadline=None):
+    def __init__(self, session, api, *, cancelled=lambda: False, store=None, deadline=None, project_root=None):
         self.session = session
         self.owner = session.account.login
         github_pages_repository_name(self.owner)  # Validate before constructing API paths.
         self.api = api
         self.cancelled = cancelled
         self.deadline = deadline
+        self.project_root = project_root
         self._metadata = {}
         self.store = store or DestinationStore()
         self.destinations = {d.repository: d for d in self.store.all(session.account.account_id)
@@ -311,7 +317,8 @@ class GitHubLibrary:
                             str(marker.get("saved_at") or marker.get("published_at") or ""),
                             str(marker.get("source_fingerprint") or ""), files, entry["sha"], editable,
                             "" if editable else destination.url(parts[-2]) if destination else _publication_url(self.owner, repository, parts[-2]),
-                            str(marker.get("project_digest") or ""), destination.to_dict() if destination else None)
+                            str(marker.get("project_digest") or ""), destination.to_dict() if destination else None,
+                            str(marker.get("revision_key") or ""))
                         previous = projects.get(project_id, LibraryProject(project_id))
                         if not editable and previous.presentation and previous.presentation.repository != repository:
                             projects[project_id] = LibraryProject(project_id, previous.presentation, previous.backup,
@@ -474,6 +481,7 @@ class GitHubLibrary:
                 "recipient": payload["metadata"].get("recipient_name", ""),
                 "saved_at": datetime.now(timezone.utc).isoformat(),
                 "project_digest": project_digest(stored),
+                "revision_key": repository.version_key(stored.revision, ignore_page_ids=True),
             }
             files = {BACKUP_MARKER: _document(marker), ".lettersmith-project/current.json": repository.pointer.read_bytes()}
             for path in stored.asset_root.rglob("*"):
@@ -507,4 +515,12 @@ class GitHubLibrary:
             ref = self._request("GET", f"{base}/git/ref/heads/{quote(branch, safe='')}")
             if ref.get("object", {}).get("sha") != commit["sha"]:
                 raise ValueError("GitHub changed during backup verification. Refresh the library to check the saved copy.")
+            if self.project_root is not None:
+                from saved_letter_versions import write_letter_state
+                try:
+                    write_letter_state(self.project_root, project_id, "backup", {
+                        "timestamp": marker["saved_at"], "revision_key": marker["revision_key"], "digest": marker["project_digest"],
+                    })
+                except OSError:
+                    _LOGGER.warning("Verified backup receipt could not be cached for %s", project_id, exc_info=True)
             return project_id

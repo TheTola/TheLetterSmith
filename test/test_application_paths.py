@@ -791,6 +791,83 @@ TeamIdentifier=ABCDE12345
                     unrelated.resolve() / "settings.json",
                 )
 
+    def test_compatibility_helpers_use_runtime_roots_from_either_entry_point(self) -> None:
+        import config
+        from project_paths import ProjectPathResolver
+        from sound_model import (
+            ProjectSoundState,
+            TrackRecord,
+            current_music_path,
+            library_path,
+            processed_dir,
+            sync_current_compatibility,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            bundle = base / "bundle"
+            bundle.mkdir()
+            paths = ApplicationPaths.for_runtime(
+                bundle, environ={"LETTER_SMITH_PROFILE_ROOT": str(base / "profile")},
+            )
+
+            with mock.patch("project_paths._APPLICATION_PATHS", paths):
+                for root in (paths.resource_root, paths.workspace_root):
+                    with self.subTest(root=root):
+                        self.assertEqual(config.canonical_output_root(root), paths.documents_root)
+                        self.assertEqual(config.canonical_play_root(root), ProjectPathResolver(root).play_root)
+                        self.assertEqual(config.canonical_recovery_root(root), paths.recovery_root)
+                        self.assertEqual(config.canonical_stock_letters_root(root), paths.stock_letters_root)
+                        self.assertEqual(current_music_path(root), paths.workspace_sounds_root / "music.mp3")
+                        self.assertEqual(library_path(root), paths.music_library_file)
+                config.ensure_gallery_dirs(bundle)
+                config.ensure_output_dirs(bundle)
+
+                track_path = processed_dir(bundle) / "archived.mp3"
+                track_path.write_bytes(b"archived audio")
+                track = TrackRecord.from_dict({"track_id": "archived", "processed_file": track_path.name})
+                state = ProjectSoundState(single_track_id=track.track_id)
+                records = {track.track_id: track}
+
+                self.assertTrue(sync_current_compatibility(bundle, state, records))
+                manifest = json.loads(paths.current_sound_manifest_file.read_text(encoding="utf-8"))
+                playable = paths.workspace_root / manifest["current_rel"]
+                self.assertEqual(playable, current_music_path(bundle))
+                self.assertEqual(playable.read_bytes(), track_path.read_bytes())
+                self.assertFalse(sync_current_compatibility(paths.workspace_root, state, records))
+
+            self.assertTrue(paths.project_sound_state_file.parent.is_dir())
+            self.assertTrue(paths.saved_letters_root.is_dir())
+            self.assertFalse((paths.project_sound_state_file.parent / "processed").exists())
+            self.assertFalse((bundle / "gallery").exists())
+            self.assertFalse((bundle / "output").exists())
+
+            legacy_project = base / "legacy"
+            legacy_output = legacy_project / "OUTPUT"
+            legacy_output.mkdir(parents=True)
+            self.assertEqual(config.canonical_output_root(legacy_output), legacy_output)
+            self.assertEqual(config.canonical_play_root(legacy_output), legacy_output / "Play")
+            self.assertEqual(config.canonical_recovery_root(legacy_output), legacy_output / "Recovery")
+            self.assertEqual(
+                config.canonical_stock_letters_root(legacy_output),
+                legacy_project / "resources/stock/letters",
+            )
+
+    def test_prompt_writer_resolves_each_default_from_the_bundled_or_legacy_location(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            bundled = root / "resources/prompt_writer"
+            legacy = root / "Prompter/modules"
+            bundled.mkdir(parents=True)
+            legacy.mkdir(parents=True)
+            (bundled / "type.txt").write_text("Bundled style", encoding="utf-8")
+            (legacy / "type.txt").write_text("Legacy style", encoding="utf-8")
+            (legacy / "role.txt").write_text("Legacy role", encoding="utf-8")
+
+            paths = ApplicationPaths.for_project(root)
+            self.assertEqual(paths.bundled_prompt_writer_path("type.txt"), bundled / "type.txt")
+            self.assertEqual(paths.bundled_prompt_writer_path("role.txt"), legacy / "role.txt")
+
     def test_legacy_migration_copies_without_overwriting(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -799,6 +876,13 @@ TeamIdentifier=ABCDE12345
             home = base / "profile"
             (legacy / "gallery/user/pages").mkdir(parents=True)
             (legacy / "gallery/user/pages/cover.png").write_bytes(b"cover")
+            legacy_controls = legacy / "gallery/user/card/controls"
+            legacy_controls.mkdir(parents=True)
+            (legacy_controls / "front.png").write_bytes(b"custom control")
+            bundled_controls = legacy / "gallery/app/controls"
+            bundled_controls.mkdir(parents=True)
+            (bundled_controls / "front.png").write_bytes(b"default control")
+            (bundled_controls / "back.png").write_bytes(b"fallback control")
             (legacy / "gallery/user/sounds/appssong").mkdir(parents=True)
             (legacy / "gallery/user/sounds/appssong/library.json").write_text(
                 '{"tracks": {}}',
@@ -818,6 +902,8 @@ TeamIdentifier=ABCDE12345
                 "Illustration\n",
                 encoding="utf-8",
             )
+            managed_options = '{"entries": [{"text": "Custom subject"}]}'
+            (legacy / "Prompter/modules/user_subject.json").write_text(managed_options, encoding="utf-8")
             (legacy / "Prompter/modules/user_colors.json").write_text(
                 '{"colors": ["Copper"]}',
                 encoding="utf-8",
@@ -848,7 +934,14 @@ TeamIdentifier=ABCDE12345
                 (paths.saved_letters_root / "A Friend/Welcome/index.html").is_file()
             )
             self.assertTrue((paths.prompt_writer_content_root / "type.txt").is_file())
+            self.assertEqual(
+                (paths.prompt_writer_content_root / "user_subject.json").read_text(encoding="utf-8"),
+                managed_options,
+            )
             self.assertTrue((paths.custom_palette_root / "user_colors.json").is_file())
+            controls = paths.workspace_root / "gallery/user/card/controls"
+            self.assertEqual((controls / "front.png").read_bytes(), b"custom control")
+            self.assertEqual((controls / "back.png").read_bytes(), b"fallback control")
             set_path_hidden(paths.settings_file, False)
             paths.settings_file.write_text('{"starting_volume": 77}', encoding="utf-8")
             paths.initialize(legacy)

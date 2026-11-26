@@ -831,7 +831,7 @@ class PromptWriterHardeningTests(unittest.TestCase):
         )
 
     def test_bundled_color_schemes_include_each_intended_option_once(self):
-        color_path = Path(__file__).resolve().parents[1] / "Prompter" / "modules" / "color.txt"
+        color_path = Path(__file__).resolve().parents[1] / "resources" / "prompt_writer" / "color.txt"
         choices = [
             line.strip()
             for line in color_path.read_text(encoding="utf-8").splitlines()

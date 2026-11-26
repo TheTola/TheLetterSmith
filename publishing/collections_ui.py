@@ -4,6 +4,7 @@ from __future__ import annotations
 from PySide6 import QtCore, QtWidgets
 
 from publishing.destinations import DestinationStore, public_path, repository_display_name
+from publishing.expiration import publication_status
 from publishing.github_collections import GitHubCollections
 from publishing.github_ui import _active_theme_tokens
 
@@ -144,7 +145,8 @@ class CollectionDialog(_PublishingDialog):
 
 class PublicationDialog(_PublishingDialog):
     def __init__(self, publisher, metadata, parent=None):
-        super().__init__(parent, "Review publishing")
+        self.updating = publication_status(metadata) == "published" and metadata.get("publication_verified") is True
+        super().__init__(parent, "Review Published Update" if self.updating else "Review Publishing")
         self.publisher, self.metadata, self.result = publisher, dict(metadata), None
         title = QtWidgets.QLabel(str(metadata.get("recipient_title", "")))
         title.setTextFormat(QtCore.Qt.PlainText)
@@ -164,11 +166,12 @@ class PublicationDialog(_PublishingDialog):
         self.folder.setEnabled(False)
         self.preview = QtWidgets.QTextEdit()
         self.preview.setReadOnly(True)
+        self.preview.setAccessibleName("GitHub Pages address and public letter contents")
         self.layout.addWidget(self.preview)
         self.layout.addWidget(self.status)
         actions = QtWidgets.QHBoxLayout()
         self.review = QtWidgets.QPushButton("Preview address")
-        self.confirm = QtWidgets.QPushButton("Publish letter")
+        self.confirm = QtWidgets.QPushButton("Publish update" if self.updating else "Publish letter")
         cancel = QtWidgets.QPushButton("Cancel")
         for button in (self.review, self.confirm, cancel):
             actions.addWidget(button)
@@ -212,9 +215,18 @@ class PublicationDialog(_PublishingDialog):
                 return
             self.result = result
             d = result["destination"]
-            self.preview.setPlainText(f"Account: {d['owner']}\nCollection: {d['display_name']}\n"
-                f"Repository: {d['repository']}\nFolder: {result['path']}\n{result['url']}\n\n"
-                "The finished letter and repository contents will be public. Updating a published letter keeps its address.")
+            subject = str(reviewed.get("recipient_title") or "Untitled Letter")
+            recipient = str(reviewed.get("recipient_name") or "").strip()
+            contents = subject + (f" for {recipient}" if recipient else "")
+            summary = reviewed.get("_publication_summary")
+            if summary:
+                contents += (f"\n{summary['pages']} pages, {summary['message_pages']} with messages, "
+                             f"{summary['tracks']} soundtrack tracks")
+            action = ("This version will replace the finished letter at this address." if self.updating
+                      else "This version will be published at this address.")
+            self.preview.setPlainText(f"GitHub Pages address\n{result['url']}\n\n"
+                f"What will go live\n{contents}\n\n{action} Anyone with the link can open it.\n\n"
+                f"GitHub repository {d['owner']}/{d['repository']}")
             self.confirm.setEnabled(True)
         self.run_task(lambda: self.publisher.preview(reviewed), done)
 

@@ -122,6 +122,30 @@ class MessagesWorkspaceTests(unittest.TestCase):
         cursor.movePosition(QtGui.QTextCursor.NextCharacter, QtGui.QTextCursor.KeepAnchor)
         return cursor.charFormat()
 
+    def _set_html(self, page_id, html):
+        document = self.session.project.get_message(page_id)
+        self.session.project.update_message(page_id, {**document, "html": html})
+
+    def _interact_with_dialog(self, open_dialog, interact):
+        failures = []
+
+        def visit():
+            dialog = self.app.activeModalWidget() or self.app.activePopupWidget()
+            try:
+                self.assertIsNotNone(dialog)
+                interact(dialog)
+            except BaseException as error:
+                failures.append(error)
+                if isinstance(dialog, QtWidgets.QDialog):
+                    dialog.reject()
+                elif dialog is not None:
+                    dialog.close()
+
+        QtCore.QTimer.singleShot(0, visit)
+        open_dialog()
+        if failures:
+            raise failures[0]
+
     def _background(self, page_id: str, color: str) -> str:
         reference = f"assets/{page_id}.png"
         target = self.root / reference
@@ -823,6 +847,485 @@ class MessagesWorkspaceTests(unittest.TestCase):
         for field in (self.tab.title_input, self.tab.name_input, self.tab.url_input):
             self.assertEqual(field.text(), "")
             self.assertEqual(field._identity_mirrors[0].text(), "")
+
+    def test_explicit_name_update_rewrites_all_pages_and_preserves_rich_text(self):
+        workspace = self.workspace
+        self.tab.project_state.establish_project("Maya Michaels", custom_capitalization=True)
+        self.tab.sync_from_disk()
+        self._set_html(self.letter_a, '<p>🙂 <b>Maya</b> <i>Michaels</i> and Maya’s. Mayan.</p>')
+        self._set_html(self.letter_b, '<p>Michaels’s note for MAYA. <a href="https://example.com/Maya">Link</a></p>')
+        workspace.open_page(self.letter_a)
+        workspace.open_editor()
+        self.tab.name_input.setText("Mia Michaels")
+        self.assertTrue(self.tab._save_settings())
+        self.assertIn("Maya Michaels", self._plain(self.letter_a))
+
+        self.assertIn("Maya Michaels to Mia Michaels", workspace.update_name_button.toolTip())
+        workspace.update_name_button.click()
+        self.assertEqual(self._plain(self.letter_a), "🙂 Mia Michaels and Mia’s. Mayan.")
+
+        def change_surname(dialog):
+            old_name, new_name = dialog.findChildren(QtWidgets.QLineEdit)
+            old_name.setText("Mia Michaels")
+            new_name.setText("Mia Thomas")
+            next(button for button in dialog.findChildren(QtWidgets.QPushButton)
+                 if button.text() == "Update Name").click()
+
+        self._interact_with_dialog(workspace.update_name_button.click, change_surname)
+        self.assertEqual(self._plain(self.letter_a), "🙂 Mia Thomas and Mia’s. Mayan.")
+        self.assertEqual(self._plain(self.letter_b), "Thomas’s note for MIA. Link")
+        editor = workspace.editor.editor
+        document = editor.document()
+        self.assertGreater(document.find("Mia").charFormat().fontWeight(), QtGui.QFont.Weight.Normal)
+        self.assertTrue(document.find("Thomas").charFormat().fontItalic())
+        self.assertIn('href="https://example.com/Maya"', self.session.project.get_message(self.letter_b)["html"])
+
+    def test_letter_search_previews_matches_and_rejects_stale_results(self):
+        workspace = self.workspace
+        self._set_html(self.letter_a, "<p>🙂 <b>anchor</b></p>")
+        self._set_html(self.letter_b, "<p>Anchor already here</p>")
+        workspace.open_page(self.letter_a)
+        workspace.open_editor()
+
+        def replace(dialog):
+            dialog.query.setText("anchor")
+            dialog.replacement.setText("<changed>")
+            self.assertFalse(dialog.replace_all.isEnabled())
+            QtTest.QTest.keyClick(dialog.query, QtCore.Qt.Key_Return)
+            self.assertEqual(dialog.results.topLevelItemCount(), 2)
+            self._set_html(self.letter_b, "<p>Anchor edited elsewhere</p>")
+            dialog.replace_all.click()
+            self.assertIn("changed", dialog.status.text())
+            self.assertEqual(self._plain(self.letter_a), "🙂 anchor")
+            dialog.search()
+            dialog.replace_all.click()
+            dialog.reject()
+
+        self._interact_with_dialog(workspace.editor.act_find.trigger, replace)
+        self.assertEqual(self._plain(self.letter_a), "🙂 <changed>")
+        self.assertEqual(self._plain(self.letter_b), "<changed> edited elsewhere")
+
+    def test_copy_style_and_selection_actions_use_the_rich_text_editor(self):
+        workspace = self.workspace
+        self._set_html(self.letter_a, '<p style="line-height:185%;font-family:Arial;'
+                                     'font-size:24pt;color:#933822">Source style</p>')
+        self._set_html(self.letter_b, '<ul><li>Keep this emphasis and <b>list</b>.</li></ul>')
+        workspace.open_page(self.letter_b)
+        workspace.open_editor()
+        workspace.copy_style_menu.aboutToShow.emit()
+        workspace.copy_style_menu.actions()[0].trigger()
+        editor = workspace.editor.editor
+        block = editor.document().begin()
+        self.assertEqual(block.blockFormat().lineHeight(), 185)
+        self.assertIsNotNone(block.textList())
+        style = editor.document().find("emphasis").charFormat()
+        self.assertIn("Arial", style.fontFamilies())
+        self.assertEqual(style.fontPointSize(), 24)
+        self.assertEqual(style.foreground().color().name(), "#933822")
+        self.assertGreater(editor.document().find("list").charFormat().fontWeight(), QtGui.QFont.Weight.Normal)
+        editor.setTextCursor(editor.document().find("emphasis"))
+        tools = workspace.editor.selection_actions
+        self.assertTrue(tools.isVisible())
+        buttons = {button.text(): button for button in tools.findChildren(QtWidgets.QToolButton)}
+        self.assertEqual(set(buttons), {"List", "Link", "Pop-up Note"})
+        self.assertEqual([action.text() for action in buttons["List"].menu().actions()],
+                         ["Bullet list", "Numbered list", "", "Move List Item Up", "Move List Item Down"])
+        with mock.patch("Editor.LetterSmithInputDialog.get_text", return_value=("https://example.com", True)):
+            buttons["Link"].click()
+        self.assertEqual(editor.document().find("emphasis").charFormat().anchorHref(), "https://example.com")
+        editor.setTextCursor(editor.document().find("Keep"))
+
+        def add_note(dialog):
+            dialog.message_edit.setPlainText("A note for this phrase.")
+            dialog.save_button.click()
+
+        self._interact_with_dialog(buttons["Pop-up Note"].click, add_note)
+        from message_html import ultralink_message_from_href
+        href = editor.document().find("Keep").charFormat().anchorHref()
+        self.assertEqual(ultralink_message_from_href(href), "A note for this phrase.")
+
+    def test_whole_letter_proofreading_groups_dictionary_and_local_grammar(self):
+        workspace = self.workspace
+        self._set_html(self.letter_a, "<p>I saw teh moon.</p>")
+        self._set_html(self.letter_b, "<p>We was lucky.</p>")
+        workspace.open_page(self.letter_a)
+        workspace.open_editor()
+        grammar = mock.Mock()
+        grammar.ready.return_value = True
+
+        def submit(_owner, text, *, context, protected_terms, callback):
+            corrected = text.replace("was", "were")
+            QtCore.QTimer.singleShot(0, lambda: callback(1, corrected, ""))
+
+        grammar.submit.side_effect = submit
+
+        def review(dialog):
+            self._wait_for(lambda: "Checking" not in dialog.status.text())
+            first, second = (dialog.results.topLevelItem(index) for index in range(2))
+            self.assertIn("Page 2", first.text(0))
+            self.assertIn("Page 4", second.text(0))
+            self.assertIn("the", [first.child(index).text(1) for index in range(first.childCount())])
+            suggestion = next(second.child(index) for index in range(second.childCount())
+                              if second.child(index).text(1) == "were")
+            dialog.results.setCurrentItem(suggestion)
+            dialog.apply_button.click()
+            dialog.reject()
+
+        with mock.patch("language_ai.get_grammar_service", return_value=grammar):
+            self._interact_with_dialog(workspace.proofread_letter_button.click, review)
+        self.assertEqual(self._plain(self.letter_a), "I saw teh moon.")
+        self.assertEqual(self._plain(self.letter_b), "We were lucky.")
+
+    def test_single_microphone_stops_then_restarts_from_the_same_button(self):
+        from test_dictation import _Speech
+
+        workspace = self.workspace
+        workspace.open_page(self.letter_a)
+        workspace.open_editor()
+        editor = workspace.editor
+        editor.editor.moveCursor(QtGui.QTextCursor.End)
+        manager = mock.Mock()
+        manager.active = None
+        manager.speech = _Speech()
+        manager.ensure_model.return_value = True
+        with mock.patch("dictation._manager", return_value=manager):
+            editor.btn_dictate.click()
+            first = manager.speech.callbacks[-1]
+            first({"event": "ready"})
+            self.assertEqual(editor.dictation_status.text(), "Listening…")
+            editor.btn_dictate.click()
+            self.assertEqual(manager.speech.stopped, ["session-1"])
+            editor.btn_dictate.click()
+            self.assertEqual(editor.dictation_status.text(), "Restart queued…")
+            first({"event": "final", "text": "first phrase"})
+            first({"event": "done"})
+            second = manager.speech.callbacks[-1]
+            self.assertIsNot(second, first)
+            first({"event": "final", "text": "stale phrase"})
+            second({"event": "ready"})
+            self.assertEqual(editor.dictation_status.text(), "Listening…")
+            editor.btn_dictate.click()
+            second({"event": "done"})
+            self.assertEqual(editor.dictation_status.text(), "")
+            self.assertIn("first phrase", editor.editor.toPlainText())
+            self.assertNotIn("stale phrase", editor.editor.toPlainText())
+
+    def test_empty_indicator_and_autosaved_history_survive_reopening(self):
+        from message_history import list_revisions
+
+        workspace = self.workspace
+        self._set_html(self.letter_a, "<p><br></p>")
+        workspace.open_page(self.letter_a)
+        workspace.open_editor()
+        self.assertTrue(workspace.selector.currentText().endswith(" · Empty"))
+        path = workspace._draft_path(self.letter_a)
+        self._type("First draft")
+        self._wait_for(lambda: len(list_revisions(path)) >= 2)
+        self.assertFalse(workspace.selector.currentText().endswith(" · Empty"))
+        self._type("Second draft")
+        self._wait_for(lambda: len(list_revisions(path)) >= 3)
+        self.assertTrue(self.tab.shutdown())
+        self.tab.hide()
+        self.tab.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        release_project_session(self.root)
+        self.session = get_project_session(self.root)
+        self._open_tab()
+        self.workspace.open_page(self.letter_a)
+        self.workspace.open_editor()
+
+        def restore(dialog):
+            drafts = dialog.findChild(QtWidgets.QListWidget)
+            drafts.setCurrentRow(1)
+            self.assertEqual(dialog.findChild(QtWidgets.QPlainTextEdit).toPlainText(), "First draft")
+            next(button for button in dialog.findChildren(QtWidgets.QPushButton)
+                 if button.text() == "Restore Draft").click()
+
+        self._interact_with_dialog(self.workspace.history_button.click, restore)
+        self.assertEqual(self._plain(self.letter_a), "First draft")
+        self.assertFalse(list_revisions(self.workspace._draft_path(self.letter_b)))
+
+    def test_contrast_suggestion_and_device_preview_use_selected_letter(self):
+        workspace = self.workspace
+        self._background(self.letter_a, "#141414")
+        self._set_html(self.letter_a, '<p style="color:#000000">Contrast test</p>')
+        self.session.project.update_page_settings(self.letter_a, {"message_overlay_preset": "clear"})
+        workspace.open_page(self.letter_a)
+        workspace.render_preview()
+        suggestion = workspace.main_style_panel.suggest_button
+        self.assertTrue(suggestion.isVisible())
+        suggestion.click()
+        settings = self.session.project.resolve_settings(self.letter_a)
+        self.assertIn(settings["message_overlay_preset"], ("paper", "white"))
+        self.assertGreater(settings["message_overlay_opacity"], 0)
+        preview = workspace.shared_preview
+        self._wait_for(lambda: preview.viewed_page_id == self.letter_a)
+        original = self.session.project.get_message(self.letter_a)
+        for index, zoom, phone in ((1, 100, True), (2, 100, False), (1, 25, True)):
+            workspace.preview_device.setCurrentIndex(index)
+            workspace.zoom.setValue(zoom)
+            results = []
+
+            def device_matches():
+                preview.view.page().runJavaScript("window.matchMedia('(max-width: 640px)').matches", results.append)
+                self.app.processEvents()
+                return any(result is phone for result in results)
+
+            self._wait_for(device_matches)
+            self.assertEqual(preview.viewed_page_id, self.letter_a)
+            self.assertEqual(self.session.project.get_message(self.letter_a), original)
+
+    def test_editor_settings_greetings_default_single_and_saved_choices(self):
+        workspace = self.workspace
+        workspace.open_page(self.letter_a)
+        workspace.open_editor()
+        editor = workspace.editor
+        editor.recipient_name = "Mia Michaels"
+        editor.act_salutation.trigger()
+        self.assertTrue(editor.editor.toPlainText().startswith("Dear Mia Michaels,\n"))
+        editor.act_undo.trigger()
+
+        def save_greetings(text):
+            def edit_settings(dialog):
+                dialog.findChild(QtWidgets.QPlainTextEdit).setPlainText(text)
+                dialog.findChild(QtWidgets.QDialogButtonBox).button(QtWidgets.QDialogButtonBox.Save).click()
+            self._interact_with_dialog(editor.editor_settings_button.click, edit_settings)
+
+        save_greetings("Hello <Mia>,")
+        editor.act_salutation.trigger()
+        self.assertTrue(editor.editor.toPlainText().startswith("Hello <Mia>,\n"))
+        self.assertIn("Undo Insert salutation", editor.act_undo.toolTip())
+        editor.act_undo.trigger()
+        save_greetings("Hello again,\nWelcome back,")
+        workspace.open_page(self.letter_b)
+        reopened = workspace.editor
+
+        def choose(dialog):
+            choices = dialog.findChild(QtWidgets.QListWidget)
+            self.assertEqual(choices.count(), 2)
+            choices.setCurrentRow(1)
+            next(button for button in dialog.findChildren(QtWidgets.QPushButton)
+                 if button.text() == "Insert").click()
+
+        self._interact_with_dialog(reopened.act_salutation.trigger, choose)
+        self.assertTrue(reopened.editor.toPlainText().startswith("Welcome back,\n"))
+        reopened.editor.setTextCursor(reopened.editor.document().find("back"))
+        QtTest.QTest.keyClicks(reopened.editor, "home")
+        self.assertTrue(reopened.editor.toPlainText().startswith("Welcome home,\n"))
+
+    def test_editor_rich_clipboard_plain_copy_and_undo_descriptions(self):
+        workspace = self.workspace
+        self._set_html(self.letter_a, '<p><b style="color:#914010">Ink</b></p><p>Next </p>')
+        workspace.open_page(self.letter_a)
+        workspace.open_editor()
+        editor = workspace.editor
+        edit = editor.editor
+        clipboard = self.app.clipboard()
+        self.addCleanup(clipboard.clear)
+        edit.setTextCursor(edit.document().find("Ink"))
+        QtTest.QTest.keyClick(edit, QtCore.Qt.Key_C, QtCore.Qt.ControlModifier)
+        self.assertTrue(clipboard.mimeData().hasHtml())
+        self.assertEqual(clipboard.text(), "Ink")
+        edit.moveCursor(QtGui.QTextCursor.End)
+        QtTest.QTest.keyClick(edit, QtCore.Qt.Key_V, QtCore.Qt.ControlModifier)
+        pasted = edit.document().find("Ink", 3)
+        self.assertEqual(pasted.charFormat().foreground().color().name(), "#914010")
+        self.assertGreater(pasted.charFormat().fontWeight(), QtGui.QFont.Weight.Normal)
+        self.assertIn("Undo Paste", editor.act_undo.toolTip())
+        editor.act_undo.trigger()
+        self.assertIn("Redo Paste", editor.act_redo.toolTip())
+        editor.act_redo.trigger()
+
+        edit.setTextCursor(edit.document().find("Ink"))
+        point = edit.cursorRect().center()
+        event = QtGui.QContextMenuEvent(QtGui.QContextMenuEvent.Mouse, point,
+                                        edit.viewport().mapToGlobal(point))
+
+        def plain_copy(menu):
+            next(action for action in menu.actions() if action.text() == "Copy Without Formatting").trigger()
+            menu.close()
+
+        self._interact_with_dialog(lambda: self.app.sendEvent(edit.viewport(), event), plain_copy)
+        self.assertFalse(clipboard.mimeData().hasHtml())
+        self.assertEqual(clipboard.text(), "Ink")
+        rich = QtCore.QMimeData()
+        rich.setHtml("<p><i>Mixed clipboard</i></p>")
+        rich.setText("Mixed clipboard")
+        rich.setImageData(QtGui.QImage(5, 5, QtGui.QImage.Format_RGB32))
+        clipboard.setMimeData(rich)
+        edit.moveCursor(QtGui.QTextCursor.End)
+        QtTest.QTest.keyClick(edit, QtCore.Qt.Key_V, QtCore.Qt.ControlModifier)
+        self.assertTrue(edit.document().find("Mixed clipboard").charFormat().fontItalic())
+
+    def test_editor_paragraph_previews_and_numbered_item_moves(self):
+        workspace = self.workspace
+        self._set_html(self.letter_a, '<p>First paragraph with words</p><p>Second paragraph</p>'
+                       '<ol start="4"><li><b>Red</b><ul><li>Red child</li></ul></li>'
+                       '<li><i>Blue</i><ol start="8"><li>Blue child</li></ol></li><li>Green</li></ol>')
+        workspace.open_page(self.letter_a)
+        workspace.open_editor()
+        editor = workspace.editor
+        edit = editor.editor
+        edit.setTextCursor(edit.document().find("First paragraph"))
+        original = edit.toHtml()
+        steps = edit.document().availableUndoSteps()
+        spacing = editor.spacing_actions[1.5]
+        editor.btn_spacing.menu().aboutToShow.emit()
+        editor.btn_spacing.menu().hovered.emit(spacing)
+        self.assertEqual(editor.spacing_preview.toPlainText(), "First paragraph with words")
+        self.assertEqual(editor.spacing_preview.document().begin().blockFormat().lineHeight(), 150)
+        alignment = editor.alignment_actions["right"]
+        editor.btn_align.menu().aboutToShow.emit()
+        editor.btn_align.menu().hovered.emit(alignment)
+        self.assertEqual(editor.alignment_preview.document().begin().blockFormat().alignment(),
+                         QtCore.Qt.AlignRight)
+        self.assertEqual(edit.toHtml(), original)
+        self.assertEqual(edit.document().availableUndoSteps(), steps)
+        spacing.trigger()
+        alignment.trigger()
+        self.assertEqual(edit.document().begin().blockFormat().lineHeight(), 150)
+        self.assertEqual(edit.document().begin().next().blockFormat().lineHeight(), 0)
+        self.assertEqual(edit.document().begin().blockFormat().alignment(), QtCore.Qt.AlignRight)
+        self.assertIn("Undo Align right", editor.act_undo.toolTip())
+
+        edit.setTextCursor(edit.document().find("Blue"))
+        self.assertTrue(editor.list_move_actions[-1].isEnabled())
+        editor.list_move_actions[-1].trigger()
+        self.assertEqual(edit.toPlainText().splitlines()[-5:], ["Blue", "Blue child", "Red", "Red child", "Green"])
+        blue = edit.textCursor().block()
+        self.assertEqual(blue.textList().format().start(), 4)
+        self.assertEqual(blue.textList().itemNumber(blue), 0)
+        self.assertEqual(blue.next().textList().format().start(), 8)
+        self.assertTrue(edit.textCursor().charFormat().fontItalic())
+        editor.act_undo.trigger()
+        self.assertIn("Redo Move List Item Up", editor.act_redo.toolTip())
+        self.assertEqual(edit.toPlainText().splitlines()[-5:], ["Red", "Red child", "Blue", "Blue child", "Green"])
+        editor.act_redo.trigger()
+        edit.setTextCursor(edit.document().find("Blue"))
+        editor.list_move_actions[1].trigger()
+        self.assertEqual(edit.toPlainText().splitlines()[-5:], ["Red", "Red child", "Blue", "Blue child", "Green"])
+
+    def test_editor_names_saved_styles_and_jumps_to_page_links(self):
+        from message_html import make_ultralink_href
+
+        workspace = self.workspace
+        note_href = make_ultralink_href("A note for Mia")
+        self._set_html(self.letter_a, '<p><a href="https://example.com"><b>Web</b> site</a>'
+                       f' and <a href="{note_href}">Note</a></p>')
+        workspace.open_page(self.letter_a)
+        workspace.open_editor()
+        editor = workspace.editor
+
+        def enter_name(name):
+            def interact(dialog):
+                dialog.input.setText(name)
+                dialog.accept_button.click()
+            return interact
+
+        self._interact_with_dialog(editor._style_save_actions[1].trigger, enter_name("Personal Letters"))
+        original_styles = editor._style_slots.load(1)
+        self._interact_with_dialog(editor._style_rename_actions[1].trigger, enter_name("Warm Letters"))
+        self.assertEqual(editor._style_slots.load(1), original_styles)
+
+        def jump_to_note(dialog):
+            tree = dialog.findChild(QtWidgets.QTreeWidget)
+            groups = {tree.topLevelItem(index).text(0): tree.topLevelItem(index)
+                      for index in range(tree.topLevelItemCount())}
+            self.assertEqual(groups["Website links"].child(0).text(0), "Web site")
+            note = groups["Ultra Links"].child(0)
+            self.assertEqual(note.text(1), "A note for Mia")
+            tree.setCurrentItem(note)
+            next(button for button in dialog.findChildren(QtWidgets.QPushButton)
+                 if button.text() == "Jump to Link").click()
+
+        self._interact_with_dialog(editor.act_page_links.trigger, jump_to_note)
+        self.assertEqual(editor.editor.textCursor().selectedText(), "Note")
+        workspace.open_page(self.letter_b)
+        workspace.editor._refresh_named_style_menu()
+        self.assertIn("Warm Letters", workspace.editor._style_slot_buttons[1].text())
+
+    def test_editor_selection_only_replace_stays_in_scope_and_can_undo(self):
+        workspace = self.workspace
+        self._set_html(self.letter_a, "<p>aa 🙂 <b>aa aa</b> aa</p>")
+        self._set_html(self.letter_b, "<p>aa on another page</p>")
+        workspace.open_page(self.letter_a)
+        workspace.open_editor()
+        editor = workspace.editor
+        editor.editor.setTextCursor(editor.editor.document().find("aa aa"))
+
+        def replace_selection(dialog):
+            self.assertTrue(dialog.selection_only.isEnabled())
+            dialog.selection_only.setChecked(True)
+            dialog.query.setText("aa")
+            dialog.replacement.setText("long")
+            dialog.search()
+            self.assertEqual(dialog.results.topLevelItem(0).childCount(), 2)
+            dialog.replace_all.click()
+            dialog.query.setText("long")
+            dialog.replacement.setText("x")
+            dialog.search()
+            self.assertEqual(dialog.results.topLevelItem(0).childCount(), 2)
+            dialog.replace_all.click()
+            dialog.reject()
+
+        self._interact_with_dialog(editor.act_find.trigger, replace_selection)
+        self.assertEqual(self._plain(self.letter_a), "aa 🙂 x x aa")
+        self.assertEqual(self._plain(self.letter_b), "aa on another page")
+        self.assertIn("Undo Replace text", editor.act_undo.toolTip())
+        editor.act_undo.trigger()
+        self.assertEqual(self._plain(self.letter_a), "aa 🙂 long long aa")
+        editor.act_redo.trigger()
+        self.assertEqual(self._plain(self.letter_a), "aa 🙂 x x aa")
+
+    def test_editor_word_selection_contrast_and_offline_writing_shortcuts(self):
+        from Editor import READABILITY_SELECTION_PROPERTY
+        from language_service import LanguageIssue
+        from proofreading import PROOFREADING_SELECTION_PROPERTY
+        from test_dictation import _Speech
+
+        workspace = self.workspace
+        self._background(self.letter_a, "#171717")
+        self._set_html(self.letter_a, '<p style="color:#191919">Dark words</p>'
+                       '<p style="color:#ffffff">Bright words</p>')
+        self.session.project.update_page_settings(self.letter_a, {"message_overlay_preset": "clear"})
+        self.assertTrue(workspace.open_page(self.letter_a))
+        self.assertTrue(workspace.open_editor())
+        workspace.render_preview()
+        editor = workspace.editor
+        edit = editor.editor
+        editor._proofreading.set_issues((LanguageIssue(0, 4, "Dark", "spelling", "First"),
+                                       LanguageIssue(11, 17, "Bright", "spelling", "Second")))
+        edit.setTextCursor(edit.document().find("Dark words"))
+        self.assertIn("Selected: 2 words", editor.word_label.text())
+        self._wait_for(lambda: any(item.format.property(READABILITY_SELECTION_PROPERTY)
+                                   for item in edit.extraSelections()))
+        low = [item.cursor.selectedText() for item in edit.extraSelections()
+               if item.format.property(READABILITY_SELECTION_PROPERTY)]
+        self.assertEqual(low, ["Dark words"])
+        self.assertTrue(any(item.format.property(PROOFREADING_SELECTION_PROPERTY)
+                            for item in edit.extraSelections()))
+        edit.moveCursor(QtGui.QTextCursor.Start)
+        edit.setFocus()
+        QtTest.QTest.keyClick(edit, QtCore.Qt.Key_F7)
+        self.assertEqual(edit.textCursor().selectedText(), "Dark")
+        QtTest.QTest.keyClick(edit, QtCore.Qt.Key_F7)
+        self.assertEqual(edit.textCursor().selectedText(), "Bright")
+        QtTest.QTest.keyClick(edit, QtCore.Qt.Key_F7, QtCore.Qt.ShiftModifier)
+        self.assertEqual(edit.textCursor().selectedText(), "Dark")
+
+        manager = mock.Mock(active=None)
+        manager.speech = _Speech()
+        manager.ensure_model.return_value = True
+        modifiers = QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier
+        with mock.patch("dictation._manager", return_value=manager):
+            QtTest.QTest.keyClick(edit, QtCore.Qt.Key_M, modifiers)
+            self._wait_for(lambda: bool(manager.speech.callbacks))
+            manager.speech.callbacks[0]({"event": "ready"})
+            self.assertEqual(editor.dictation_status.text(), "Listening…")
+            QtTest.QTest.keyClick(edit, QtCore.Qt.Key_M, modifiers)
+            self._wait_for(lambda: manager.speech.stopped == ["session-1"])
+            manager.speech.callbacks[0]({"event": "done"})
+        self.assertEqual(editor.dictation_status.text(), "")
 
 
 if __name__ == "__main__":

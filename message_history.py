@@ -193,12 +193,25 @@ def _snapshot_content(path: Path, current: str, reason: str) -> Optional[Path]:
         if messages_equal(current, revision.path.read_text(encoding="utf-8")):
             return None
 
+    return _write_revision(path, current, reason)
+
+
+def _write_revision(path: Path, content: str, reason: str, *, keep: int = MAX_REVISIONS) -> Path:
     folder = revision_directory(path)
     folder.mkdir(parents=True, exist_ok=True)
     revision_path = folder / _revision_filename(reason)
-    _atomic_write(revision_path, current)
-    prune_revisions(path)
+    _atomic_write(revision_path, content)
+    prune_revisions(path, keep=keep)
     return revision_path
+
+
+def record_draft(message_path: Path, content: str, *, reason: str = "autosave") -> None:
+    """Keep the eight most recent distinct saves for a page-bound draft."""
+    content = sanitize_message_html(content)
+    revisions = list_revisions(message_path)
+    if revisions and revisions[0].path.read_text(encoding="utf-8") == content:
+        return
+    _write_revision(message_path, content, reason, keep=8)
 
 
 def write_message_with_revision(
@@ -234,15 +247,17 @@ def write_message_with_revision(
     return True
 
 
+def read_revision(message_path: str | Path, revision_path: str | Path) -> str:
+    revision = Path(revision_path).resolve()
+    if not revision.is_file() or revision.parent != revision_directory(message_path).resolve():
+        raise FileNotFoundError("The selected revision is not available.")
+    return sanitize_message_html(revision.read_text(encoding="utf-8"))
+
+
 def restore_revision(message_path: str | Path, revision_path: str | Path) -> str:
     message = Path(message_path).resolve()
-    revision = Path(revision_path).resolve()
-    folder = revision_directory(message).resolve()
-
-    if not revision.is_file() or revision.parent != folder:
-        raise FileNotFoundError("The selected revision is not available.")
-
-    content = sanitize_message_html(revision.read_text(encoding="utf-8"))
+    folder = revision_directory(message)
+    content = read_revision(message, revision_path)
     snapshot_current(message, reason="before-restore", skip_if_content=content)
     _atomic_write(message, content)
     _atomic_write(folder / ".baseline", content)

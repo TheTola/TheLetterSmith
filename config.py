@@ -25,8 +25,26 @@ from html import unescape
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from page_transitions import FLIP_COUNT, FLIP_PREFIX
 from transactional_io import atomic_write_json, _replace_directory_path
-from project_paths import application_paths
+from project_paths import (
+    AUDIO_ANALYSIS_DIR_NAME,
+    AUDIO_CURRENT_MANIFEST_NAME,
+    AUDIO_ORIGINALS_DIR_NAME,
+    AUDIO_PROCESSED_DIR_NAME,
+    LEGACY_OUTPUT_DIR,
+    LEGACY_PLAY_DIR,
+    MUSIC_FILE_NAME,
+    PROJECT_METADATA_FILE,
+    WORKSPACE_CONTROLS_DIR,
+    WORKSPACE_MESSAGE_DIR,
+    WORKSPACE_PAGES_DIR,
+    WORKSPACE_SOUND_STATE_DIR,
+    WORKSPACE_SOUNDS_DIR,
+    WORKSPACE_USER_DIR,
+    ApplicationPaths,
+    application_paths,
+)
 from protected_projects import (
     demo_preview_directory,
     is_reserved_save_identity,
@@ -39,10 +57,10 @@ from protected_projects import (
 
 SETTINGS_FILE = "settings.json"
 PUBLISHED_PAGE_URL_KEY = "published_page_url"
-PLAY_METADATA_FILE = "lettersmith-metadata.json"
+PLAY_METADATA_FILE = PROJECT_METADATA_FILE
 
 DEFAULT_VOLUME = 31
-DEFAULT_AUDIO = "music.mp3"
+DEFAULT_AUDIO = MUSIC_FILE_NAME
 
 # Prompt again only when the saved theme-family preference is missing or invalid.
 FORCE_THEME_FAMILY_PROMPT = False
@@ -76,12 +94,12 @@ ICONS_DIR = CONTROLS_DIR
 # Canonical source asset tree
 # ─────────────────────────────────────────────────────────────────────────────
 
-GALLERY_USER_DIR = "gallery/user"
+GALLERY_USER_DIR = WORKSPACE_USER_DIR.as_posix()
 
-USER_PAGES_DIR = f"{GALLERY_USER_DIR}/pages"
-USER_CONTROLS_DIR = f"{GALLERY_USER_DIR}/card/controls"
-USER_MESSAGE_DIR = f"{GALLERY_USER_DIR}/message"
-USER_SOUNDS_DIR = f"{GALLERY_USER_DIR}/sounds"
+USER_PAGES_DIR = WORKSPACE_PAGES_DIR.as_posix()
+USER_CONTROLS_DIR = WORKSPACE_CONTROLS_DIR.as_posix()
+USER_MESSAGE_DIR = WORKSPACE_MESSAGE_DIR.as_posix()
+USER_SOUNDS_DIR = WORKSPACE_SOUNDS_DIR.as_posix()
 MESSAGE_ASSETS_DIR = f"{GALLERY_DIR}/message_assets"
 
 
@@ -125,10 +143,7 @@ CONTROL_FILES = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 GLISS_FILE = "glissando.mp3"
-MUSIC_FILE = "music.mp3"
-
-FLIP_PREFIX = "flip"
-FLIP_COUNT = 10
+MUSIC_FILE = MUSIC_FILE_NAME
 
 MAX_AUDIO_MB = 15
 
@@ -137,15 +152,13 @@ MAX_AUDIO_MB = 15
 # User audio archive
 # ─────────────────────────────────────────────────────────────────────────────
 
-USER_AUDIO_ARCHIVE_DIR = f"{USER_SOUNDS_DIR}/appssong"
+USER_AUDIO_ARCHIVE_DIR = WORKSPACE_SOUND_STATE_DIR.as_posix()
 
-USER_AUDIO_ORIGINALS_DIR = f"{USER_AUDIO_ARCHIVE_DIR}/originals"
-USER_AUDIO_PROCESSED_DIR = f"{USER_AUDIO_ARCHIVE_DIR}/processed"
-USER_AUDIO_ANALYSIS_DIR = f"{USER_AUDIO_ARCHIVE_DIR}/analysis"
+USER_AUDIO_ORIGINALS_DIR = f"{USER_AUDIO_ARCHIVE_DIR}/{AUDIO_ORIGINALS_DIR_NAME}"
+USER_AUDIO_PROCESSED_DIR = f"{USER_AUDIO_ARCHIVE_DIR}/{AUDIO_PROCESSED_DIR_NAME}"
+USER_AUDIO_ANALYSIS_DIR = f"{USER_AUDIO_ARCHIVE_DIR}/{AUDIO_ANALYSIS_DIR_NAME}"
 
-USER_AUDIO_CURRENT_MANIFEST = (
-    f"{USER_AUDIO_ARCHIVE_DIR}/current.json"
-)
+USER_AUDIO_CURRENT_MANIFEST = f"{USER_AUDIO_ARCHIVE_DIR}/{AUDIO_CURRENT_MANIFEST_NAME}"
 
 USER_AUDIO_PLAYLIST_FILE = (
     f"{USER_AUDIO_ARCHIVE_DIR}/playlist.json"
@@ -156,12 +169,9 @@ USER_AUDIO_PLAYLIST_FILE = (
 # Output layout
 # ─────────────────────────────────────────────────────────────────────────────
 
-OUTPUT_DIR = "output"
+OUTPUT_DIR = LEGACY_OUTPUT_DIR
 
-OUTPUT_PLAY_DIR = os.path.join(
-    OUTPUT_DIR,
-    "Play",
-)
+OUTPUT_PLAY_DIR = os.path.join(OUTPUT_DIR, LEGACY_PLAY_DIR)
 
 WINDOWS_RESERVED_FOLDER_NAMES = {
     "CON",
@@ -207,41 +217,29 @@ CONFIG_DICT = dict(_SETTINGS)
 # Directory helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def canonical_output_root(project_root: str | Path) -> Path:
-    """Return the one output root, even when a frozen app passes it directly."""
+def _output_paths(project_root: str | Path) -> ApplicationPaths:
+    """Accept historical calls that pass the output directory itself."""
     root = Path(project_root).resolve()
     paths = application_paths(root)
-    if paths.workspace_root == root and paths.resource_root != root:
-        return paths.documents_root.resolve()
-    if root.name.casefold() == OUTPUT_DIR.casefold():
-        return root
-    return (root / OUTPUT_DIR).resolve()
+    if root == paths.workspace_root == paths.resource_root and root.name.casefold() == OUTPUT_DIR:
+        return ApplicationPaths.for_project(root.parent, output_root=root)
+    return paths
+
+
+def canonical_output_root(project_root: str | Path) -> Path:
+    return _output_paths(project_root).documents_root.resolve()
 
 
 def canonical_play_root(project_root: str | Path) -> Path:
-    root = Path(project_root).resolve()
-    paths = application_paths(root)
-    if paths.workspace_root == root and paths.resource_root != root:
-        return paths.saved_letters_root.resolve()
-    return (canonical_output_root(root) / "Play").resolve()
+    return _output_paths(project_root).saved_letters_root.resolve()
 
 
 def canonical_recovery_root(project_root: str | Path) -> Path:
-    root = Path(project_root).resolve()
-    paths = application_paths(root)
-    if paths.workspace_root == root and paths.resource_root != root:
-        return paths.recovery_root.resolve()
-    return (canonical_output_root(root) / "Recovery").resolve()
+    return _output_paths(project_root).recovery_root.resolve()
 
 
 def canonical_stock_letters_root(project_root: str | Path) -> Path:
-    root = Path(project_root).resolve()
-    paths = application_paths(root)
-    if paths.workspace_root == root and paths.resource_root != root:
-        return paths.stock_letters_root.resolve()
-    if root.name.casefold() == OUTPUT_DIR.casefold():
-        root = root.parent
-    return (root / "resources" / "stock" / "letters").resolve()
+    return _output_paths(project_root).stock_letters_root.resolve()
 
 
 def is_stock_letter_title(title: object) -> bool:
@@ -798,6 +796,7 @@ def resolve_play_bundle_directory(
     project_id: object,
     migrate_existing: bool = True,
     active_play_dir: Optional[str | Path] = None,
+    preserve_saved: bool = False,
 ) -> Path:
     """Resolve the active project's canonical visible folder."""
     stable_id = _valid_project_uuid(project_id)
@@ -816,6 +815,19 @@ def resolve_play_bundle_directory(
         stock_root.mkdir(parents=True, exist_ok=True)
 
     active_value = str(active_play_dir or "").strip()
+    def saved_project(path: Path) -> bool:
+        return preserve_saved and ((path / ".lettersmith-project").exists() or (
+            (path / PLAY_METADATA_FILE).is_file() and not (path / "lettersmith-display.json").is_file()
+        ))
+
+    if preserve_saved and not stock_title:
+        recipient_name = safe_folder_name(recipient, "Unknown Recipient")
+        title_name = safe_folder_name(title, "Untitled Letter")
+        recipient_path = _casefold_child(play_root, recipient_name) or play_root / recipient_name
+        named = _casefold_child(recipient_path, title_name) or recipient_path / title_name
+        isolated = play_root / ".forge" / stable_id
+        if isolated.is_dir() or saved_project(named):
+            return isolated
     if active_value:
         direct = _validated_direct_play_bundle(
             active_value,
@@ -825,7 +837,7 @@ def resolve_play_bundle_directory(
             project_id=stable_id,
             require_canonical_names=False,
         )
-        if direct is not None:
+        if direct is not None and not saved_project(direct):
             return direct
     elif not stock_title:
         direct = _validated_direct_play_bundle(
@@ -837,7 +849,7 @@ def resolve_play_bundle_directory(
             title=title,
             project_id=stable_id,
         )
-        if direct is not None:
+        if direct is not None and not saved_project(direct):
             return direct
 
     candidates = [
@@ -846,6 +858,7 @@ def resolve_play_bundle_directory(
         for bundle in _iter_play_bundles(root)
         if _bundle_project_id(bundle) == stable_id
         and not _bundle_has_reserved_save_identity(bundle)
+        and not saved_project(bundle)
     ]
     candidates.sort(
         key=lambda path: (
@@ -925,47 +938,13 @@ def resolve_play_bundle_directory(
     return destination
 
 
-def ensure_output_dirs(
-    project_root: str | Path,
-) -> None:
-    for directory in (
-        canonical_play_root(project_root),
-    ):
-        directory.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+def ensure_output_dirs(project_root: str | Path) -> None:
+    canonical_play_root(project_root).mkdir(parents=True, exist_ok=True)
 
 
-def ensure_gallery_dirs(
-    project_root: str | Path,
-) -> None:
-    """
-    Ensure all canonical source directories exist.
-
-    Runtime Play bundle directories are created by plan_build().
-    """
-
-    pr = Path(project_root)
-
-    source_directories = (
-        USER_PAGES_DIR,
-        USER_CONTROLS_DIR,
-        USER_MESSAGE_DIR,
-        USER_SOUNDS_DIR,
-        USER_AUDIO_ARCHIVE_DIR,
-        USER_AUDIO_ORIGINALS_DIR,
-        USER_AUDIO_PROCESSED_DIR,
-        USER_AUDIO_ANALYSIS_DIR,
-    )
-
-    for directory in source_directories:
-        (
-            pr / directory
-        ).mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+def ensure_gallery_dirs(project_root: str | Path) -> None:
+    """Create source media directories for the active workspace and library."""
+    application_paths(project_root).ensure_workspace_media_dirs()
 
 
 def safe_slug(
@@ -1058,6 +1037,7 @@ def plan_build(
     title: str,
     project_id: str,
     play_dir_override: Optional[str | Path] = None,
+    preserve_saved: bool = False,
 ) -> BuildPaths:
     """
     Create a deterministic project build location.
@@ -1091,6 +1071,7 @@ def plan_build(
         recipient=recipient,
         title=title,
         project_id=project_id,
+        preserve_saved=preserve_saved,
     )
     play_dir = (
         Path(play_dir_override).resolve()

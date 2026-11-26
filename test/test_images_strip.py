@@ -58,7 +58,7 @@ class ImagesStripTests(unittest.TestCase):
             remember_media(self.root, self.session.project.project_id, slot, "stock:" + track_id, "Old stock music")
             self.assertEqual(recent_media(self.root, self.session.project.project_id, slot), ())
 
-    def test_stock_menu_keeps_three_defaults_and_all_stock_with_personal_history(self):
+    def test_stock_tab_keeps_three_defaults_and_all_stock_with_personal_history(self):
         import shutil
         from project_paths import application_paths
         bundled = Path(__file__).resolve().parents[1] / "resources/stock/images"
@@ -70,10 +70,9 @@ class ImagesStripTests(unittest.TestCase):
             dialog.return_value.exec.return_value = QtWidgets.QDialog.Rejected
             self.tab._stock_selected()
             self.assertEqual(len(dialog.call_args.args[1]), 3)
-            self.assertEqual(dialog.call_args.kwargs["recent_paths"], ())
+            self.assertEqual(len(dialog.call_args.kwargs["recent_paths"]), 1)
+            self.assertEqual(dialog.call_args.kwargs["start_source"], "stock")
             self.assertEqual(len(dialog.call_args.kwargs["all_stock_paths"]), 12)
-            self.tab._all_stock_images()
-            self.assertEqual(len(dialog.call_args.args[1]), 12)
 
     def test_import_history_retains_each_type_and_original_gif_after_project_switch(self):
         gif = fixture.ImagesWorkspaceTests.gif(self)
@@ -221,11 +220,10 @@ class ImagesStripTests(unittest.TestCase):
                 with mock.patch("Image_tab.StockImageDialog") as dialog:
                     dialog.return_value.exec.return_value = QtWidgets.QDialog.Rejected
                     self.tab._choose_images()
+                self.assertEqual(len(dialog.call_args.args[1]), 3)
                 if cleared:
-                    self.assertEqual(len(dialog.call_args.args[1]), 3)
                     self.assertEqual(dialog.call_args.kwargs["recent_paths"], ())
                 else:
-                    self.assertEqual(dialog.call_args.args[1], ())
                     self.assertEqual(dialog.call_args.kwargs["recent_paths"],
                                      tuple(Path(p) for p, _ in expected[page["type"]]))
 
@@ -250,7 +248,8 @@ class ImagesStripTests(unittest.TestCase):
                     QtTest.QTest.keyClick(view, QtCore.Qt.Key_End)
                     self.assertEqual(view.currentRow(), 9)
                     chosen.append(view.currentItem().data(QtCore.Qt.UserRole))
-                    QtTest.QTest.keyClick(view, QtCore.Qt.Key_Return)
+                    self.assertFalse(dialog.fit_preview.pixmap().isNull())
+                    QtTest.QTest.mouseClick(dialog.apply_button, QtCore.Qt.LeftButton)
                 QtCore.QTimer.singleShot(0, dialog, pick)
         view = self.tab.page_list
         view.scrollToItem(view.item(1))
@@ -330,14 +329,24 @@ class ImagesStripTests(unittest.TestCase):
         original_asset = self.page(clicked)['artwork']['asset']
         previous = self.page(self.ids[-1])["artwork"]
         path = self.image()
+        previewed = []
+
+        def apply():
+            dialog = QtWidgets.QApplication.activeModalWidget()
+            previewed.append((dialog.sources.tabText(dialog.sources.currentIndex()),
+                              dialog.fit_preview.pixmap().isNull(), self.page(clicked)["artwork"]["asset"]))
+            QtTest.QTest.mouseClick(dialog.apply_button, QtCore.Qt.LeftButton)
+
         def pick(*args):
             self.session.select_page(self.ids[-1])
+            QtCore.QTimer.singleShot(0, self.tab, apply)
             return str(path), "Images"
         point = navigator.visualItemRect(navigator.item(1)).center()
         with mock.patch.object(QtWidgets.QFileDialog, "getOpenFileName", side_effect=pick) as dialog:
             QtTest.QTest.mouseDClick(navigator.viewport(), QtCore.Qt.LeftButton, pos=point)
             dialog.assert_called_once()
             self.wait_for(lambda: self.tab._image_import_thread is None)
+        self.assertEqual(previewed, [("Browse Files", False, original_asset)])
         self.assertNotEqual(self.page(clicked)["artwork"]["asset"], original_asset)
         with Image.open(self.tab.artwork.resolve_asset(clicked)) as imported, Image.open(path) as source:
             self.assertEqual(imported.size, source.size)
@@ -351,7 +360,7 @@ class ImagesStripTests(unittest.TestCase):
         other = self.page(self.second)
         menu = self.tab._page_menu(self.first)
         actions = {action.text(): action for action in menu.actions()}
-        for label in ("Import image…", "Stock Images", "View All Stock Images",
+        for label in ("Choose Artwork…", "Rename page…", "Prompt History…",
                       "Clear page artwork", "Delete page…", "Add page", "Prompt Writer",
                       "Edit letter text", "Move left", "Move right"):
             self.assertIn(label, actions)
@@ -369,9 +378,9 @@ class ImagesStripTests(unittest.TestCase):
     def test_old_context_menu_cannot_act_on_replaced_project(self):
         self.select(self.ids[0])
         menu = self.tab._page_menu(self.ids[0])
-        action = next(a for a in menu.actions() if a.text() == "Import image…")
+        action = next(a for a in menu.actions() if a.text() == "Choose Artwork…")
         self.session.replace(create_project(), asset_root=self.root)
-        with mock.patch.object(self.tab, "_browse_selected") as browse:
+        with mock.patch.object(self.tab, "_choose_images") as browse:
             action.trigger()
             browse.assert_not_called()
         menu.deleteLater()
@@ -397,18 +406,48 @@ class ImagesStripTests(unittest.TestCase):
         self.session.replace(create_project(), asset_root=self.root)
         self.pump()
         strip_y = self.tab.page_list.y()
-        for widget in (self.tab.pwrite_fab, self.tab.name_edit, self.tab.type_combo):
+        for widget in (self.tab.pwrite_fab, self.tab.name_edit, self.tab.type_combo, self.tab.transition_combo):
             rect = QtCore.QRect(widget.mapTo(self.tab, QtCore.QPoint()), widget.size())
             self.assertLess(rect.bottom(), strip_y)
         self.assertLess(self.tab.pwrite_fab.x(), self.tab.name_edit.x())
         self.assertTrue(self.tab.add_button.isVisibleTo(self.tab))
-        self.assertFalse(any(button.text() == "Page actions"
-                             for button in self.tab.findChildren(QtWidgets.QAbstractButton)))
+        self.assertTrue(self.tab.page_actions_button.isVisible())
+        self.assertEqual(self.tab.page_actions_button.accessibleName(), "Page actions")
         for button in (self.tab.import_button, self.tab.stock_button,
                        self.tab.duplicate_button, self.tab.delete_button, self.tab.more_button,
                        self.tab.undo_button):
             self.assertFalse(button.isVisibleTo(self.tab))
         self.assertFalse(self.tab.limit_label.isVisibleTo(self.tab))
+
+    def test_visible_card_menu_and_title_rename_the_selected_page(self):
+        from images_grid import _title_rect
+        from ui_dialogs import LetterSmithInputDialog
+
+        self.select(self.first)
+        actions = []
+
+        def inspect_menu():
+            menu = QtWidgets.QApplication.activePopupWidget()
+            actions.extend(action.text() for action in menu.actions())
+            menu.close()
+
+        QtCore.QTimer.singleShot(0, self.tab, inspect_menu)
+        QtTest.QTest.mouseClick(self.tab.page_actions_button, QtCore.Qt.LeftButton)
+        self.assertIn("Duplicate page", actions)
+        self.assertIn("Delete page…", actions)
+        self.assertIn("Rename page…", actions)
+
+        def rename():
+            dialog = next(dialog for dialog in self.tab.findChildren(LetterSmithInputDialog) if dialog.isVisible())
+            dialog.input.setText("Renamed from card")
+            QtTest.QTest.mouseClick(dialog.accept_button, QtCore.Qt.LeftButton)
+
+        QtCore.QTimer.singleShot(0, self.tab, rename)
+        strip = self.tab.page_list
+        QtTest.QTest.mouseDClick(strip.viewport(), QtCore.Qt.LeftButton,
+                                pos=_title_rect(strip.visualItemRect(strip.currentItem())).center())
+        self.assertEqual(self.page(self.first)["name"], "Renamed from card")
+        self.assertEqual(self.page(self.second)["name"], "Repeated Letter")
 
     def test_page_fields_are_compact_inline_and_leave_room_for_artwork_launcher(self):
         for width, height in ((1200, 760), (900, 480), (560, 700)):
@@ -416,7 +455,7 @@ class ImagesStripTests(unittest.TestCase):
             self.pump()
             name = self.tab.name_edit
             self.assertLessEqual(name.width(), name.fontMetrics().horizontalAdvance('Optional page name') + 40)
-            for label, field in zip(self.tab._field_labels, (name, self.tab.type_combo)):
+            for label, field in zip(self.tab._field_labels, (name, self.tab.type_combo, self.tab.transition_combo)):
                 label_rect = QtCore.QRect(label.mapTo(self.tab, QtCore.QPoint()), label.size())
                 field_rect = QtCore.QRect(field.mapTo(self.tab, QtCore.QPoint()), field.size())
                 self.assertLess(label_rect.right(), field_rect.left())

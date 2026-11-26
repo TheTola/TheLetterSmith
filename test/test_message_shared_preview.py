@@ -107,6 +107,63 @@ class SharedMessagesPreviewTests(unittest.TestCase):
         self.wait_for(lambda: self.preview.viewed_page_id == page_id)
         self.wait_for(lambda: self.js("return !!document.querySelector('.text-wall.is-open');"))
 
+    def test_images_preview_turn_plays_the_selected_effect_in_the_real_viewer(self):
+        from PySide6.QtWebEngineCore import QWebEngineScript
+        from Image_tab import ImageTab
+        from message_shared_preview import SharedMessagePreview
+
+        self.tab.hide()
+        tab = ImageTab(self.root)
+        tab.resize(1040, 680)
+        tab.show()
+        last_page = self.session.project.pages[-1]["id"]
+        self.session.select_page(last_page)
+        tab.transition_combo.setCurrentIndex(tab.transition_combo.findData("envelope"))
+        tab.transition_combo.activated.emit(tab.transition_combo.currentIndex())
+        before = self.session.project.to_dict()
+        errors = []
+        original_preview = self.preview
+
+        def inspect_dialog():
+            dialog = tab._turn_dialog
+            try:
+                self.preview = dialog.findChild(SharedMessagePreview)
+                observe_turn = QWebEngineScript()
+                observe_turn.setInjectionPoint(QWebEngineScript.DocumentReady)
+                observe_turn.setWorldId(QWebEngineScript.MainWorld)
+                observe_turn.setSourceCode("""
+                    const stage = document.getElementById('letter-preview');
+                    const canvas = document.getElementById('turn');
+                    if (stage && canvas) new MutationObserver(() => {
+                      if (!canvas.hidden && canvas.width > 0) {
+                        window.observedTurn = [stage.dataset.turnEffect, window.LetterSmithViewer.currentPageId()];
+                      }
+                    }).observe(stage, {attributes:true, attributeFilter:['data-turn-effect']});
+                """)
+                self.preview.view.page().scripts().insert(observe_turn)
+                self.wait_for(lambda: self.preview.view.isVisible(), "Turn viewer did not open", timeout=20)
+                self.wait_for(lambda: self.preview.viewed_page_id == last_page, "Turn did not reach the last page")
+                self.assertEqual(self.js("return window.observedTurn || null;"), ["envelope", self.b])
+                self.assertTrue(self.preview.view.page().isAudioMuted())
+            except Exception as error:
+                errors.append(error)
+            finally:
+                self.preview = original_preview
+                dialog.reject()
+
+        try:
+            QtCore.QTimer.singleShot(0, tab, inspect_dialog)
+            tab.preview_turn_button.click()
+            if errors:
+                raise errors[0]
+            self.assertEqual(self.session.selected_page_id, last_page)
+            self.assertEqual(self.session.project.to_dict(), before)
+            self.assertIsNone(tab._turn_dialog)
+        finally:
+            tab.close()
+            tab.deleteLater()
+            QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+
     def test_real_shared_viewer_binds_letters_animates_gif_and_scrolls_without_changing_documents(self):
         self.open_preview(self.a)
         self.assertIn("Letter A", self.js("return document.querySelector('.text-wall.is-open .text-wall-content').textContent;"))

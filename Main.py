@@ -27,6 +27,11 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
+if sys.argv[1:2] == ["--lettersmith-language-worker"]:
+    from language_ai import run_worker as _run_language_worker
+
+    raise SystemExit(_run_language_worker())
+
 if sys.argv[1:2] == ["--lettersmith-message-import-worker"]:
     from message_import import run_worker as _run_message_import_worker
 

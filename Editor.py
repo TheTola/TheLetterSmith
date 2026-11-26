@@ -49,6 +49,7 @@ import shutil
 import time
 import uuid
 from bisect import bisect_right
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Optional
@@ -97,7 +98,7 @@ from config import (
     USER_PAGES_DIR,
     MESSAGE_HTML_FILE,
 )
-from language_service import get_language_service
+from language_service import get_language_service, is_automatic_spelling_fix
 from letter_page import (
     MESSAGE_RENDER_FONT_FAMILY,
     MESSAGE_RENDER_FONT_SIZE,
@@ -113,14 +114,16 @@ from letter_page import (
     effective_letter_page_opacity,
     normalize_letter_page_preset,
     normalized_letter_page_settings,
+    surface_rgb_at,
 )
-from message_format import normalize_ultralinks_in_document
+from message_format import message_plain_text, normalize_ultralinks_in_document
 from message_resources import load_message_image
 from project_save import ProjectNotReadyError, ProjectSaveService
 from project_state import ProjectStateController
 from project_paths import application_paths
 from ui_sounds import EDITOR_WINDOW_OBJECT_NAME, UiSound, play_ui_sound
 from editor_diagnostics import record_editor_failure
+from editor_document_tools import can_move_list_item, link_spans, move_list_item, visible_text_runs
 from message_html import (
     embed_lettersmith_style_state,
     extract_lettersmith_style_state,
@@ -167,6 +170,7 @@ TOOLBAR_ICON_SIZE = QSize(16, 16)
 DEFAULT_FONT_SIZE = MESSAGE_RENDER_FONT_SIZE
 FONT_SIZE_MIN, FONT_SIZE_MAX = 1, 100
 FONT_SIZE_STEP = 1
+READABILITY_SELECTION_PROPERTY = int(QtGui.QTextFormat.UserProperty) + 240
 
 
 def _toolbar_symbol_font(base: QFont, symbol: str) -> QFont:
@@ -265,6 +269,9 @@ class FindReplaceDialog(LetterSmithDialog):
         self.replace_input = QLineEdit(placeholderText="Replace with…")
         self.match_case = QCheckBox("Match case")
         self.match_case.setChecked(False)
+        self.selection_only = QCheckBox("Selection Only")
+        self._scope = QTextCursor()
+        self.selection_only.setEnabled(False)
         self.status_label = QLabel("")
         self.status_label.setObjectName("findStatus")
 
@@ -277,6 +284,7 @@ class FindReplaceDialog(LetterSmithDialog):
 
         opts = QHBoxLayout()
         opts.addWidget(self.match_case)
+        opts.addWidget(self.selection_only)
         opts.addStretch(1)
         opts.addWidget(self.status_label)
 
@@ -302,6 +310,7 @@ class FindReplaceDialog(LetterSmithDialog):
 
         self.find_input.textChanged.connect(self._clear_status)
         self.match_case.toggled.connect(self._clear_status)
+        self.selection_only.toggled.connect(self._clear_status)
         colors = self.colors
         self.setStyleSheet(
             self.styleSheet()
@@ -320,6 +329,10 @@ class FindReplaceDialog(LetterSmithDialog):
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
+        self._scope = self._editor.textCursor()
+        self.selection_only.setEnabled(self._scope.hasSelection())
+        if not self._scope.hasSelection():
+            self.selection_only.setChecked(False)
         self.find_input.setFocus(Qt.OtherFocusReason)
         self.find_input.selectAll()
 
@@ -340,6 +353,11 @@ class FindReplaceDialog(LetterSmithDialog):
             flags |= QTextDocument.FindBackward
         return flags
 
+    def _within_scope(self, cursor):
+        return (not cursor.isNull() and (not self.selection_only.isChecked() or
+                self._scope.selectionStart() <= cursor.selectionStart()
+                <= cursor.selectionEnd() <= self._scope.selectionEnd()))
+
     def _find(self, *, backward: bool) -> bool:
         term = self.find_input.text()
         if not term:
@@ -357,19 +375,22 @@ class FindReplaceDialog(LetterSmithDialog):
             )
         else:
             start_cursor.setPosition(cur.position())
+        if not self._within_scope(start_cursor):
+            start_cursor.setPosition(self._scope.selectionEnd() if backward else self._scope.selectionStart())
 
         found = doc.find(term, start_cursor, flags)
         wrapped = False
 
-        if found.isNull():
+        if not self._within_scope(found):
             wrapped = True
             boundary = QTextCursor(doc)
-            boundary.movePosition(
-                QTextCursor.End if backward else QTextCursor.Start
-            )
+            if self.selection_only.isChecked():
+                boundary.setPosition(self._scope.selectionEnd() if backward else self._scope.selectionStart())
+            else:
+                boundary.movePosition(QTextCursor.End if backward else QTextCursor.Start)
             found = doc.find(term, boundary, flags)
 
-        if found.isNull():
+        if not self._within_scope(found):
             play_ui_sound(UiSound.ERROR)
             self.status_label.setText("No matches found.")
             return False
@@ -403,8 +424,15 @@ class FindReplaceDialog(LetterSmithDialog):
             if self.match_case.isChecked()
             else selected.casefold() == term.casefold()
         )
-        if cur.hasSelection() and matches:
-            cur.insertText(self.replace_input.text())
+        if cur.hasSelection() and matches and self._within_scope(cur):
+            first, last = self._scope.selectionStart(), self._scope.selectionEnd()
+            end = cur.selectionEnd()
+            describe = getattr(self._editor, "describe_edit", None)
+            with (describe("Replace text") if describe else nullcontext()):
+                cur.insertText(self.replace_input.text())
+            if self.selection_only.isChecked():
+                self._scope.setPosition(first)
+                self._scope.setPosition(last + cur.position() - end, QTextCursor.KeepAnchor)
             self._editor.setTextCursor(cur)
         self.find_next()
 
@@ -499,6 +527,7 @@ class UltralinkDialog(QDialog):
 class RichTextEdit(QTextEdit):
     language_refresh_requested = QtCore.Signal()
     document_edit_finished = QtCore.Signal()
+    edit_history_changed = QtCore.Signal()
 
     def __init__(
         self,
@@ -516,9 +545,69 @@ class RichTextEdit(QTextEdit):
         self._language_service = language_service
         self._language_issues: tuple[object, ...] = ()
         self._ignored_language_words: set[str] = set()
+        self._edit_name = None
+        self._edit_names: dict[int, str] = {}
+        document = self.document()
+        document.undoCommandAdded.connect(self._remember_edit_name)
+        document.contentsChanged.connect(self._sync_edit_history)
         self.setAcceptRichText(True)
         self.setAcceptDrops(True)
         self.viewport().setMouseTracking(True)
+
+    @contextmanager
+    def describe_edit(self, name: str):
+        previous, self._edit_name = self._edit_name, name
+        try:
+            yield
+        finally:
+            self._edit_name = previous
+
+    def _remember_edit_name(self) -> None:
+        steps = self.document().availableUndoSteps()
+        # A new edit after Undo replaces the abandoned redo branch.
+        while self._edit_names and next(reversed(self._edit_names)) >= steps:
+            self._edit_names.popitem()
+        self._edit_names[steps] = self._edit_name or "Edit text"
+
+    def _sync_edit_history(self) -> None:
+        document = self.document()
+        if not document.isUndoAvailable() and not document.isRedoAvailable():
+            self._edit_names.clear()
+        self.edit_history_changed.emit()
+
+    def history_action_text(self, redo: bool) -> str:
+        document = self.document()
+        steps = document.availableUndoSteps()
+        if redo:
+            base = "Redo"
+            index = min((index for index in self._edit_names if index > steps), default=None)
+            name = self._edit_names.get(index) if document.isRedoAvailable() else None
+        else:
+            base = "Undo"
+            name = self._edit_names.get(steps) if document.isUndoAvailable() else None
+        return f"{base} {name}" if name else base
+
+    def copy_without_formatting(self) -> None:
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            QtWidgets.QApplication.clipboard().setText(cursor.selection().toPlainText())
+
+    def createStandardContextMenu(self, position=None):
+        menu = (super().createStandardContextMenu() if position is None
+                else super().createStandardContextMenu(position))
+        for index, action in enumerate(menu.actions()):
+            name = action.objectName()
+            if name == "edit-copy":
+                plain = QAction("Copy Without Formatting", menu)
+                plain.setEnabled(self.textCursor().hasSelection())
+                plain.triggered.connect(self.copy_without_formatting)
+                following = menu.actions()[index + 1:]
+                menu.insertAction(following[0] if following else None, plain)
+            elif name in ("edit-undo", "edit-redo"):
+                label = self.history_action_text(name == "edit-redo")
+                _title, separator, shortcut = action.text().partition("\t")
+                action.setText(label + separator + shortcut)
+        return menu
 
     def loadResource(self, resource_type: int, name: QtCore.QUrl):
         if self.resource_roots is None:
@@ -529,9 +618,16 @@ class RichTextEdit(QTextEdit):
 
     @property
     def language_issues(self) -> tuple[object, ...]:
+        binding = getattr(self, "_proofreading_binding", None)
+        if binding is not None:
+            return binding.issues
         return self._language_issues
 
     def set_language_issues(self, issues) -> None:
+        binding = getattr(self, "_proofreading_binding", None)
+        if binding is not None:
+            binding.set_issues(issues)
+            return
         filtered = tuple(
             issue
             for issue in issues
@@ -595,10 +691,16 @@ class RichTextEdit(QTextEdit):
         return str(getattr(issue, "text", "")).strip().casefold()
 
     def is_language_issue_ignored(self, issue) -> bool:
+        binding = getattr(self, "_proofreading_binding", None)
+        if binding is not None:
+            return binding.is_issue_ignored(issue)
         key = self._language_issue_key(issue)
         return bool(key and key in self._ignored_language_words)
 
     def replace_language_issue(self, issue, replacement: str) -> bool:
+        binding = getattr(self, "_proofreading_binding", None)
+        if binding is not None:
+            return binding.replace_issue(issue, replacement)
         replacement = str(replacement or "")
         start = int(getattr(issue, "start", -1))
         end = int(getattr(issue, "end", -1))
@@ -625,6 +727,11 @@ class RichTextEdit(QTextEdit):
         edit_cursor: Optional[QTextCursor] = None,
         emit_refresh: bool = True,
     ) -> int:
+        binding = getattr(self, "_proofreading_binding", None)
+        if binding is not None:
+            return binding.apply_replacements(
+                issues, edit_cursor=edit_cursor, emit_refresh=emit_refresh,
+            )
         replacements = sorted(
             (
                 issue
@@ -667,6 +774,11 @@ class RichTextEdit(QTextEdit):
         return applied
 
     def ignore_language_issue(self, issue) -> None:
+        binding = getattr(self, "_proofreading_binding", None)
+        if binding is not None:
+            self._ignored_language_words.add(self._language_issue_key(issue))
+            binding.ignore_issue(issue)
+            return
         word = str(getattr(issue, "text", "")).strip()
         key = word.casefold()
         if key:
@@ -684,6 +796,9 @@ class RichTextEdit(QTextEdit):
         self.set_language_issues(self._language_issues)
 
     def add_language_issue_to_dictionary(self, issue) -> bool:
+        binding = getattr(self, "_proofreading_binding", None)
+        if binding is not None:
+            return binding.add_to_dictionary(issue)
         if self._language_service is None:
             return False
         word = str(getattr(issue, "text", "")).strip()
@@ -808,16 +923,39 @@ class RichTextEdit(QTextEdit):
             super().dropEvent(event)
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.matches(QKeySequence.Cut):
+            label = "Cut"
+        elif event.key() in (Qt.Key_Backspace, Qt.Key_Delete):
+            label = "Delete text"
+        elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            label = "Insert paragraph"
+        else:
+            label = "Typing"
         try:
-            controller = getattr(self, "named_style_controller", None)
-            if controller is not None and controller.handle_key_press(event):
-                return
-            super().keyPressEvent(event)
+            with self.describe_edit(label):
+                controller = getattr(self, "named_style_controller", None)
+                if controller is None or not controller.handle_key_press(event):
+                    super().keyPressEvent(event)
         finally:
             self.document_edit_finished.emit()
 
+    def inputMethodEvent(self, event: QtGui.QInputMethodEvent) -> None:
+        dictation = getattr(self, "_dictation_binding", None)
+        with self.describe_edit("Dictation" if dictation and dictation.inserting else "Typing"):
+            super().inputMethodEvent(event)
+
     def insertFromMimeData(self, source: QMimeData) -> None:
-        if source.hasImage():
+        try:
+            with self.describe_edit("Paste"):
+                self._paste_contents(source)
+        finally:
+            self.document_edit_finished.emit()
+
+    def _paste_contents(self, source: QMimeData) -> None:
+        # Clipboard selections may offer HTML together with an image or URL.
+        # The rich selection takes precedence over the standalone media payload.
+        has_html = source.hasHtml()
+        if source.hasImage() and (not has_html or not message_plain_text(source.html())):
             img = source.imageData()
             if isinstance(img, QImage) and not img.isNull():
                 assets_dir = self._assets_dir()
@@ -834,7 +972,7 @@ class RichTextEdit(QTextEdit):
                 self.insert_image_html(rel, 320)
                 return
 
-        if source.hasUrls():
+        if not has_html and source.hasUrls():
             for url in source.urls():
                 p = Path(url.toLocalFile())
                 if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"):
@@ -850,7 +988,6 @@ class RichTextEdit(QTextEdit):
         finally:
             if controller is not None:
                 controller.after_paste(context)
-            self.document_edit_finished.emit()
 
 
 class FontSizeSpinBox(QSpinBox):
@@ -935,30 +1072,31 @@ class EditorSurface(QFrame):
             for center, edge in zip(definition.center_rgb, definition.edge_rgb)
         )
 
-    def readability_backgrounds(self) -> tuple[tuple[int, int, int], ...]:
-        """Return representative composited backgrounds for live contrast checks."""
-        samples = ((0.50, 0.43), (0.20, 0.25), (0.80, 0.75))
-        background = self._scaled_background()
-        image = background.toImage() if background is not None else None
-        if image is not None and not image.isNull():
-            image = image.convertToFormat(QImage.Format_RGB32)
+    def readability_samples(self):
+        """Sample the artwork at the same locations as the contrast check."""
+        image = self.readability_image()
+        for x, y in ((0.50, 0.43), (0.20, 0.25), (0.80, 0.75)):
+            yield x, y, self._artwork_at(image, x * (self.width() - 1), y * (self.height() - 1))
 
-        backgrounds: list[tuple[int, int, int]] = []
-        alpha = self._opacity / 100.0
-        for x_fraction, y_fraction in samples:
-            if image is None or image.isNull():
-                wall_rgb = (14, 14, 18)
-            else:
-                x = max(0, min(image.width() - 1, round(
-                    (image.width() - self.width()) / 2 + (self.width() - 1) * x_fraction)))
-                y = max(0, min(image.height() - 1, round(
-                    (image.height() - self.height()) / 2 + (self.height() - 1) * y_fraction)))
-                color = image.pixelColor(x, y)
-                wall_rgb = (color.red(), color.green(), color.blue())
-            backgrounds.append(
-                composite_rgb(wall_rgb, self._overlay_color(x_fraction, y_fraction), alpha)
-            )
-        return tuple(backgrounds)
+    def readability_image(self):
+        background = self._scaled_background()
+        return background.toImage() if background is not None else None
+
+    def _artwork_at(self, image, x, y):
+        if image is None or image.isNull():
+            return 14, 14, 18
+        x = max(0, min(image.width() - 1, (image.width() - self.width()) // 2 + round(x)))
+        y = max(0, min(image.height() - 1, (image.height() - self.height()) // 2 + round(y)))
+        color = image.pixelColor(x, y)
+        return color.red(), color.green(), color.blue()
+
+    def readability_background_at(self, image, x, y):
+        ink = self._overlay_color(x / max(1, self.width() - 1), y / max(1, self.height() - 1))
+        return composite_rgb(self._artwork_at(image, x, y), ink, self._opacity / 100)
+
+    def readability_backgrounds(self) -> tuple[tuple[int, int, int], ...]:
+        return tuple(composite_rgb(rgb, self._overlay_color(x, y), self._opacity / 100)
+                     for x, y, rgb in self.readability_samples())
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         width_scale = self.width() / float(MESSAGE_RENDER_WIDTH or 1)
@@ -1023,9 +1161,11 @@ class Editor(QDialog):
         document_label: str = "",
         display_settings: Optional[dict] = None,
         paper_colors: Optional[dict] = None,
+        find_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(parent)
         self._save_callback = save_callback
+        self._find_callback = find_callback
         self._bound_document = save_callback is not None
         self._embedded = bool(embedded)
         self._document_label = str(document_label)
@@ -1130,6 +1270,10 @@ class Editor(QDialog):
         self._language_check_timer.setSingleShot(True)
         self._language_check_timer.setInterval(550)
         self._language_check_timer.timeout.connect(self._refresh_language_issues)
+        self._contrast_timer = QtCore.QTimer(self)
+        self._contrast_timer.setSingleShot(True)
+        self._contrast_timer.setInterval(90)
+        self._contrast_timer.timeout.connect(self._highlight_low_contrast)
 
         self.setWindowTitle(self._document_label or "Letter Editor")
         self.setObjectName(EDITOR_WINDOW_OBJECT_NAME)
@@ -1272,7 +1416,20 @@ class Editor(QDialog):
             "Live contrast check for the current text color against the letter artwork."
         )
         hb.addWidget(self.readability_indicator)
+        if self._embedded:
+            self.dictation_status = QLabel()
+            self.dictation_status.setAccessibleName("Dictation status")
+            self._dictation.status_changed.connect(self.dictation_status.setText)
+            hb.addWidget(self.dictation_status)
+            if self._bound_document:
+                self._build_selection_actions()
         hb.addStretch()
+        self.editor_settings_button = QToolButton(self)
+        self.editor_settings_button.setText("Editor Settings")
+        self.editor_settings_button.clicked.connect(
+            self._guarded_action("Editor Settings", self.open_editor_settings)
+        )
+        hb.addWidget(self.editor_settings_button)
 
         btn_save = QPushButton("Save")
         self.btn_save = btn_save
@@ -1308,6 +1465,9 @@ class Editor(QDialog):
             control.installEventFilter(self)
             if control.lineEdit() is not None:
                 control.lineEdit().installEventFilter(self)
+        self.editor.viewport().installEventFilter(self)
+        self.editor.verticalScrollBar().valueChanged.connect(self._schedule_contrast_highlight)
+        self.editor.horizontalScrollBar().valueChanged.connect(self._schedule_contrast_highlight)
         self.editor.cursorPositionChanged.connect(self._sync_current_format)
         self.editor.selectionChanged.connect(self._sync_current_format)
         self.editor.cursorPositionChanged.connect(self._update_readability_indicator)
@@ -1403,9 +1563,43 @@ class Editor(QDialog):
         self.editor_surface.set_wall_pixmap(pixmap)
         self._update_readability_indicator()
 
+    def suggest_paper(self, preview_contrast=None):
+        cursor = QTextCursor(self.editor.document())
+        cursor.select(QTextCursor.Document)
+        if not cursor.selectedText().replace("\uFFFC", "").strip():
+            return None
+        colors = tuple((color.red(), color.green(), color.blue())
+                       for color in self._selected_text_colors(cursor))
+        if not colors:
+            return None
+        samples = tuple(self.editor_surface.readability_samples())
+        preset, opacity, _ink = self._editor_background_setting()
+
+        def score(paper, percent):
+            backgrounds = [composite_rgb(rgb, surface_rgb_at(paper, x, y), percent / 100)
+                           for x, y, rgb in samples]
+            return min(contrast_ratio(color, background) for color in colors for background in backgrounds)
+
+        current = score(preset, opacity)
+        if current >= 4.5 and (preview_contrast is None or preview_contrast >= 4.5):
+            return None
+        best, suggestion = min(current, preview_contrast) if preview_contrast is not None else current, None
+        papers = tuple(key for key in dict.fromkeys((preset, "paper", "white", "black")) if key != "clear")
+        for percent in range(5, 101, 5):
+            for paper in papers:
+                if (paper, percent) == (preset, opacity):
+                    continue
+                ratio = score(paper, percent)
+                if ratio >= 4.5:
+                    return paper, percent, ratio
+                if ratio > best + 0.05:
+                    best, suggestion = ratio, (paper, percent, ratio)
+        return suggestion
+
     def _update_readability_indicator(self, *_args: object) -> None:
         if not hasattr(self, "readability_indicator") or self._closing:
             return
+        self._schedule_contrast_highlight()
         try:
             _preset, _opacity, fallback = self._editor_background_setting()
             cursor = self.editor.textCursor()
@@ -1447,7 +1641,41 @@ class Editor(QDialog):
         except Exception as error:
             self._record_failure("update readability indicator", error)
 
+    def _schedule_contrast_highlight(self, *_args) -> None:
+        if not self._closing:
+            self._contrast_timer.start()
+
+    def _highlight_low_contrast(self) -> None:
+        if self._closing or not self.editor.isVisible():
+            return
+        editor, surface = self.editor, self.editor_surface
+        selections = [item for item in editor.extraSelections()
+                      if not item.format.property(READABILITY_SELECTION_PROPERTY)]
+        image = surface.readability_image()
+        if image is not None:
+            origin = editor.viewport().mapTo(surface, QtCore.QPoint())
+            ink = QColor(self._editor_background_setting()[2])
+            for start, end, char_format, rect in visible_text_runs(editor):
+                foreground = self._format_foreground_color(char_format, ink)
+                rgb = foreground.red(), foreground.green(), foreground.blue()
+                y = origin.y() + rect.center().y()
+                samples = (rect.left() + rect.width() * fraction for fraction in (0.2, 0.5, 0.8))
+                if all(contrast_ratio(rgb, surface.readability_background_at(image, origin.x() + x, y)) >= 4.5
+                       for x in samples):
+                    continue
+                item = QTextEdit.ExtraSelection()
+                item.cursor = self._range_cursor(start, end)
+                item.format.setBackground(QColor(244, 174, 64, 120))
+                item.format.setProperty(READABILITY_SELECTION_PROPERTY, True)
+                selections.append(item)
+        editor.setExtraSelections(selections)
+
     def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if (hasattr(self, "editor") and watched is self.editor.viewport()
+                and event.type() in (QtCore.QEvent.Resize, QtCore.QEvent.Show)):
+            self._schedule_contrast_highlight()
+            if hasattr(self, "selection_actions"):
+                self._position_selection_actions()
         if watched is getattr(self, "font_controls", None) and event.type() in (
             QtCore.QEvent.LayoutRequest, QtCore.QEvent.FontChange,
             QtCore.QEvent.StyleChange,
@@ -1476,6 +1704,60 @@ class Editor(QDialog):
                 return True
         return super().eventFilter(watched, event)
 
+    def _build_selection_actions(self) -> None:
+        frame = self.selection_actions = QFrame(self.editor.viewport())
+        frame.setObjectName("selectionActions")
+        frame.setStyleSheet(
+            "QFrame#selectionActions{background:palette(window);"
+            "border:1px solid palette(mid);border-radius:6px;}"
+        )
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(3, 2, 3, 2)
+        row.setSpacing(2)
+        lists = QToolButton(frame)
+        lists.setText("List")
+        lists.setFocusPolicy(Qt.NoFocus)
+        lists.setPopupMode(QToolButton.InstantPopup)
+        lists.setMenu(self.btn_lists.menu())
+        row.addWidget(lists)
+        link = QToolButton(frame)
+        link.setText("Link")
+        link.setFocusPolicy(Qt.NoFocus)
+        link.clicked.connect(self.act_add_edit_link.trigger)
+        row.addWidget(link)
+        note = QToolButton(frame)
+        note.setText("Pop-up Note")
+        note.setFocusPolicy(Qt.NoFocus)
+        note.clicked.connect(self._guarded_action(
+            "Pop-up note", lambda: self.open_ultralink_dialog(anchor=note)
+        ))
+        row.addWidget(note)
+        self.selection_link, self.selection_note = link, note
+        frame.hide()
+        self.editor.selectionChanged.connect(self._position_selection_actions)
+        self.editor.cursorPositionChanged.connect(self._position_selection_actions)
+        self.editor.verticalScrollBar().valueChanged.connect(self._position_selection_actions)
+        self.editor.horizontalScrollBar().valueChanged.connect(self._position_selection_actions)
+
+    def _position_selection_actions(self, *_args) -> None:
+        frame = self.selection_actions
+        viewport = self.editor.viewport()
+        rect = self.editor.cursorRect()
+        if (not self.editor.textCursor().hasSelection()
+                or not viewport.rect().intersects(rect) or self.editor.isReadOnly()):
+            frame.hide()
+            return
+        self.selection_link.setEnabled(self.act_add_edit_link.isEnabled())
+        self.selection_note.setEnabled(self.btn_ultralink.isEnabled())
+        frame.adjustSize()
+        x = max(2, min(rect.left(), viewport.width() - frame.width() - 2))
+        y = rect.top() - frame.height() - 4
+        if y < 2:
+            y = rect.bottom() + 4
+        frame.move(x, min(y, viewport.height() - frame.height() - 2))
+        frame.show()
+        frame.raise_()
+
     def _sync_current_format(self) -> None:
         self.named_styles.sync_empty_insertion_format()
         self._sync_format(self.editor.currentCharFormat())
@@ -1496,7 +1778,10 @@ class Editor(QDialog):
                 action.setChecked(bool(alignment & expected))
                 del blocker
         if hasattr(self, "spacing_actions"):
-            selected = self._export_line_spacing
+            block_format = self.editor.textCursor().blockFormat()
+            selected = (block_format.lineHeight() / 100
+                        if block_format.lineHeightType() == QTextBlockFormat.ProportionalHeight.value
+                        else None)
             for multiplier, action in self.spacing_actions.items():
                 blocker = QtCore.QSignalBlocker(action)
                 action.setChecked(
@@ -1504,6 +1789,9 @@ class Editor(QDialog):
                     and abs(float(selected) - multiplier) < 0.001
                 )
                 del blocker
+        if hasattr(self, "list_move_actions"):
+            for direction, action in self.list_move_actions.items():
+                action.setEnabled(not self.editor.isReadOnly() and can_move_list_item(self.editor, direction))
 
     def _run_editor_action(
         self,
@@ -1514,7 +1802,8 @@ class Editor(QDialog):
         if self._closing:
             return
         try:
-            callback()
+            with self.editor.describe_edit(label):
+                callback()
         except Exception as error:
             self._record_failure(f"editor action: {label}", error)
             show_lettersmith_message(
@@ -1569,6 +1858,59 @@ class Editor(QDialog):
             "Change font size",
             lambda: self.set_font_size(size),
         )
+
+    def _add_paragraph_preview(self, menu, choices, format_change):
+        preview = RichTextEdit(self.project_root, menu, resource_roots=self._resource_roots,
+                               missing_resources=self._missing_resources)
+        preview.setAccessibleName("Paragraph preview")
+        preview.setReadOnly(True)
+        preview.setFocusPolicy(Qt.NoFocus)
+        preview.setAttribute(Qt.WA_TransparentForMouseEvents)
+        preview.setMinimumWidth(320)
+        preview.setFixedHeight(105)
+        preview.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        widget_action = QWidgetAction(menu)
+        widget_action.setDefaultWidget(preview)
+        menu.addSeparator()
+        menu.addAction(widget_action)
+
+        def show_paragraph():
+            source = QTextCursor(self.editor.textCursor().block())
+            source.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+            preview.clear()
+            preview.document().setDefaultFont(self.editor.document().defaultFont())
+            cursor = preview.textCursor()
+            cursor.insertFragment(QtGui.QTextDocumentFragment(source))
+            original = source.blockFormat()
+            original.clearProperty(QtGui.QTextFormat.ObjectIndex)
+            cursor.setBlockFormat(original)
+            preset, _opacity, ink = self._editor_background_setting()
+            red, green, blue = LETTER_PAGE_PRESETS[preset].base_rgb
+            preview.setStyleSheet(f"QTextEdit{{background:rgb({red},{green},{blue});color:{ink};}}")
+
+        def hover(action):
+            show_paragraph()
+            if action in choices:
+                cursor = preview.textCursor()
+                block_format = cursor.blockFormat()
+                format_change(block_format, choices[action])
+                cursor.setBlockFormat(block_format)
+
+        menu.aboutToShow.connect(show_paragraph)
+        menu.hovered.connect(hover)
+        return preview
+
+    def _sync_edit_history_actions(self) -> None:
+        for redo, action in ((False, self.act_undo), (True, self.act_redo)):
+            label = self.editor.history_action_text(redo)
+            shortcut = action.shortcut().toString(QKeySequence.NativeText)
+            tooltip = f"{label} ({shortcut})"
+            action.setToolTip(tooltip)
+            action.setStatusTip(tooltip)
+            widget = self.toolbar.widgetForAction(action)
+            if widget is not None:
+                widget.setAccessibleName(label)
+                widget.setToolTip(tooltip)
 
     def _build_toolbar_actions(self) -> None:
         self.act_salutation = QAction("Salutation", self)
@@ -1654,6 +1996,16 @@ class Editor(QDialog):
         self.act_number_list.triggered.connect(
             self._guarded_action("Numbered list", self.insert_number_list)
         )
+        list_menu.addSeparator()
+        self.list_move_actions = {}
+        for direction, label in ((-1, "Move List Item Up"), (1, "Move List Item Down")):
+            action = QAction(label, self)
+            list_menu.addAction(action)
+            action.triggered.connect(self._guarded_action(
+                label, lambda direction=direction: move_list_item(self.editor, direction)
+            ))
+            self.list_move_actions[direction] = action
+        list_menu.aboutToShow.connect(self._sync_block_actions)
 
         self.btn_lists.setMenu(list_menu)
 
@@ -1697,6 +2049,10 @@ class Editor(QDialog):
             self.spacing_actions[multiplier] = action
 
         self.btn_spacing.setMenu(sp_menu)
+        self.spacing_preview = self._add_paragraph_preview(
+            sp_menu, {action: value for value, action in self.spacing_actions.items()},
+            self._set_paragraph_spacing,
+        )
 
         # Align dropdown
         self.btn_align = QToolButton(self)
@@ -1708,6 +2064,7 @@ class Editor(QDialog):
         self.alignment_action_group = QActionGroup(self)
         self.alignment_action_group.setExclusive(True)
         self.alignment_actions: dict[str, QAction] = {}
+        alignment_choices = {}
         for label, alignment in (
             ("Left", Qt.AlignLeft),
             ("Center", Qt.AlignCenter),
@@ -1723,7 +2080,11 @@ class Editor(QDialog):
                 )
             )
             self.alignment_actions[label.casefold()] = action
+            alignment_choices[action] = alignment
         self.btn_align.setMenu(menu_align)
+        self.alignment_preview = self._add_paragraph_preview(
+            menu_align, alignment_choices, QTextBlockFormat.setAlignment
+        )
 
         # Color
         self.act_color = QAction("Color", self)
@@ -1764,6 +2125,12 @@ class Editor(QDialog):
         self.act_remove_link.setShortcut(QKeySequence("Ctrl+Shift+K"))
         self.act_remove_link.triggered.connect(
             self._guarded_action("Remove link", self.remove_link)
+        )
+        link_menu.addSeparator()
+        self.act_page_links = QAction("Links on This Page…", self)
+        link_menu.addAction(self.act_page_links)
+        self.act_page_links.triggered.connect(
+            self._guarded_action("Links on this page", self.open_page_links)
         )
         self.btn_links.setToolTip(
             f"Add/edit link ({self.act_add_edit_link.shortcut().toString(QKeySequence.NativeText)})"
@@ -1873,6 +2240,36 @@ class Editor(QDialog):
             widget.setToolTip(tooltip)
             widget.setFont(_toolbar_symbol_font(widget.font(), action.text()))
             widget.setMinimumWidth(38)
+        self.editor.edit_history_changed.connect(self._sync_edit_history_actions)
+        self._sync_edit_history_actions()
+
+        self.toolbar.addSeparator()
+        self.btn_dictate = QToolButton(self)
+        self.btn_dictate.setObjectName("editorDictationButton")
+        self.btn_dictate.setMinimumSize(44, 36)
+        self.btn_dictate.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.btn_dictate.setFocusPolicy(Qt.NoFocus)
+        self.toolbar.addWidget(self.btn_dictate)
+        from dictation import attach_dictation
+
+        self._dictation = attach_dictation(
+            self.editor, button=self.btn_dictate, label="Dictate letter",
+            allow_queued_restart=self._bound_document,
+        )
+        self._dictation.enable_toggle_shortcut("Ctrl+Shift+M")
+        self.btn_proofread = QToolButton(self)
+        self.btn_proofread.setObjectName("editorProofreadingButton")
+        self.btn_proofread.setMinimumSize(38, 36)
+        self.btn_proofread.setFocusPolicy(Qt.NoFocus)
+        self.toolbar.addWidget(self.btn_proofread)
+        from proofreading import attach_proofreading
+
+        self._proofreading = attach_proofreading(
+            self.editor, service=self._language_service, context="prose",
+            protected_terms=self._language_protected_terms,
+            identity=lambda: (id(self), self._closing), button=self.btn_proofread,
+        )
+        self._proofreading.enable_next_suggestion_shortcut("F7", previous_key="Shift+F7")
 
         # Font family + size
         self.font_combo = QFontComboBox()
@@ -2037,15 +2434,30 @@ class Editor(QDialog):
         row_action.setDefaultWidget(row)
         self.named_style_menu.addAction(row_action)
         self.named_style_menu.addSeparator()
-        options = self.named_style_menu.addMenu("Options")
+        options = self._style_options_menu = QMenu("Options", self.named_style_menu)
+        self.named_style_menu.addMenu(options)
+        self._style_save_actions = {}
+        self._style_rename_actions = {}
         for slot in (1, 2, 3):
-            action = options.addAction(f"Save current style set to Style {slot}")
-            action.triggered.connect(
+            save = QAction(f"Save current style set to Style {slot}…", self)
+            options.addAction(save)
+            save.triggered.connect(
                 self._guarded_action(
                     f"Save Style {slot}",
-                    lambda slot=slot: self._save_style_slot(slot),
+                    lambda slot=slot: self._prompt_save_style_slot(slot),
                 )
             )
+            self._style_save_actions[slot] = save
+        options.addSeparator()
+        for slot in (1, 2, 3):
+            rename = QAction(f"Rename Style {slot}…", self)
+            options.addAction(rename)
+            rename.triggered.connect(
+                self._guarded_action(
+                    f"Rename Style {slot}", lambda slot=slot: self._rename_style_slot(slot)
+                )
+            )
+            self._style_rename_actions[slot] = rename
         self.named_style_menu.aboutToShow.connect(self._refresh_named_style_menu)
         self.btn_named_style.setMenu(self.named_style_menu)
         self._sync_named_style_selector()
@@ -2093,6 +2505,12 @@ class Editor(QDialog):
                 "Select uniformly formatted text or place the cursor in representative text."
             )
         for slot, button in self._style_slot_buttons.items():
+            name = self._style_slots.name(slot)
+            menu_name = name.replace("&", "&&")
+            self._style_save_actions[slot].setText(f"Save current style set to {menu_name}…")
+            self._style_rename_actions[slot].setText(f"Rename {menu_name}…")
+            button.setText(f"Change Style to\n{menu_name}")
+            button.setAccessibleName(f"Change Style to {name}")
             try:
                 saved_set = self._style_slots.load(slot)
                 occupied = saved_set is not None
@@ -2102,11 +2520,12 @@ class Editor(QDialog):
                 button.setToolTip("Saved style set is invalid or unsupported.")
             else:
                 button.setToolTip(
-                    f"Change Style to Style {slot}" if occupied
+                    f"Change Style to {name}" if occupied
                     else "Empty — save the current style set through Options."
                 )
             set_slot_style_preview(button, saved_set)
             button.setEnabled(occupied)
+            self._style_rename_actions[slot].setEnabled(occupied)
 
     def _apply_named_style(self, key: str) -> None:
         self.named_styles.apply_style(key)
@@ -2132,15 +2551,31 @@ class Editor(QDialog):
         self._schedule_autosave()
         self.editor.setFocus(Qt.OtherFocusReason)
 
-    def _save_style_slot(self, slot: int) -> None:
+    def _prompt_save_style_slot(self, slot: int) -> None:
+        name, accepted = LetterSmithInputDialog.get_text(
+            self, "Save Style Set", "Style set name", text=self._style_slots.name(slot)
+        )
+        if accepted:
+            self._save_style_slot(slot, name=name)
+
+    def _rename_style_slot(self, slot: int) -> None:
+        name, accepted = LetterSmithInputDialog.get_text(
+            self, "Rename Style Set", "Style set name", text=self._style_slots.name(slot)
+        )
+        if accepted:
+            self._style_slots.rename(slot, name)
+            self._refresh_named_style_menu()
+
+    def _save_style_slot(self, slot: int, *, name: str | None = None) -> None:
         active = self.named_styles.active_set
         try:
-            self._style_slots.save(slot, active)
+            self._style_slots.save(slot, active, name=name)
         except StyleSetOverwriteRequired:
+            existing = self._style_slots.name(slot)
             confirmation = LetterSmithConfirmationDialog(
                 self,
-                title=f"Replace Style {slot}?",
-                question=f"Replace the saved Style {slot} set with the current styles?",
+                title=f"Replace {existing}?",
+                question=f"Replace the saved {existing} set with the current styles?",
                 primary_text="Replace",
                 secondary_text="Keep Saved Set",
                 secondary_accepts=True,
@@ -2151,7 +2586,7 @@ class Editor(QDialog):
             confirmation.exec()
             if confirmation.choice != "primary":
                 return
-            self._style_slots.save(slot, active, overwrite=True)
+            self._style_slots.save(slot, active, overwrite=True, name=name)
         self._refresh_named_style_menu()
 
 
@@ -2232,6 +2667,9 @@ class Editor(QDialog):
     def _apply_safe_language_corrections(self) -> int:
         if self._language_service is None:
             return 0
+        dictation = getattr(self.editor, "_dictation_binding", None)
+        if dictation is not None and dictation.active:
+            return 0
         edit_cursor = QTextCursor(self.editor.document())
         edit_cursor.beginEditBlock()
         applied = 0
@@ -2248,11 +2686,7 @@ class Editor(QDialog):
                     for issue in issues
                     if getattr(issue, "replacement", None) is not None
                     and not self.editor.is_language_issue_ignored(issue)
-                    and (
-                        bool(getattr(issue, "auto_fix", False))
-                        or str(getattr(issue, "confidence", "")).casefold()
-                        == "high"
-                    )
+                    and is_automatic_spelling_fix(issue)
                 )
                 if not safe_issues:
                     break
@@ -2541,6 +2975,8 @@ class Editor(QDialog):
         self._closing = True
         self._autosave_timer.stop()
         self._language_check_timer.stop()
+        self._contrast_timer.stop()
+        self._proofreading.cancel()
         if self._find_dialog is not None:
             self._find_dialog.hide()
         watcher = getattr(self, "_settings_watcher", None)
@@ -2652,14 +3088,67 @@ class Editor(QDialog):
     # Commands
     # ──────────────────────────────────────────────────────────────────────
 
+    def _custom_greetings(self) -> list[str]:
+        values = self.settings.value("greetings/custom", [])
+        if not isinstance(values, (list, tuple)):
+            return []
+        return [value.strip() for value in values if isinstance(value, str) and value.strip()]
+
+    def open_editor_settings(self) -> None:
+        dialog = LetterSmithDialog(self, title="Editor Settings", width=480)
+        label = QLabel("Custom greetings (one per line)", dialog)
+        greetings = QPlainTextEdit(dialog)
+        greetings.setPlainText("\n".join(self._custom_greetings()))
+        greetings.setAccessibleName("Custom greetings")
+        label.setBuddy(greetings)
+        dialog.content_layout.addWidget(label)
+        dialog.content_layout.addWidget(greetings)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel, dialog
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog.content_layout.addWidget(buttons)
+        try:
+            if dialog.exec() == QDialog.Accepted:
+                values = [line.strip() for line in greetings.toPlainText().splitlines() if line.strip()]
+                self.settings.setValue("greetings/custom", values)
+                self.settings.sync()
+                if self.settings.status() != QSettings.NoError:
+                    raise OSError("Could not save custom greetings.")
+        finally:
+            dialog.deleteLater()
+
     def insert_salutation(self) -> None:
+        greetings = self._custom_greetings()
+        if len(greetings) > 1:
+            dialog = LetterSmithDialog(self, title="Choose Greeting", width=440)
+            choices = QtWidgets.QListWidget(dialog)
+            choices.addItems(greetings)
+            choices.setAccessibleName("Custom greetings")
+            choices.setCurrentRow(0)
+            choices.itemDoubleClicked.connect(dialog.accept)
+            dialog.content_layout.addWidget(choices)
+            buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel, dialog)
+            buttons.addButton("Insert", QtWidgets.QDialogButtonBox.AcceptRole)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            dialog.content_layout.addWidget(buttons)
+            accepted = dialog.exec() == QDialog.Accepted
+            greeting = choices.currentItem().text() if accepted and choices.currentItem() else ""
+            dialog.deleteLater()
+            if not greeting:
+                return
+        else:
+            greeting = greetings[0] if greetings else f"Dear {self.recipient_name},"
         active_cursor = self.editor.textCursor()
         active_block_format = QTextBlockFormat(active_cursor.blockFormat())
-        self.named_styles.insert_salutation(
-            f"Dear {self.recipient_name},", active_block_format
-        )
+        self.named_styles.insert_salutation(greeting, active_block_format)
 
     def open_find_replace(self) -> None:
+        if self._find_callback is not None:
+            self._find_callback()
+            return
         if self._find_dialog is None:
             self._find_dialog = FindReplaceDialog(self)
         self._find_dialog.show()
@@ -2669,53 +3158,62 @@ class Editor(QDialog):
         self._find_dialog.find_input.setFocus(Qt.OtherFocusReason)
         self._find_dialog.find_input.selectAll()
 
-    def _anchor_cursor_at_position(self, position: int) -> Optional[QTextCursor]:
-        """Return the complete link at a document position, if one exists."""
+    def open_page_links(self) -> None:
         document = self.editor.document()
-        spans: list[tuple[int, int, str]] = []
-        block = document.begin()
-        while block.isValid():
-            iterator = block.begin()
-            while not iterator.atEnd():
-                fragment = iterator.fragment()
-                if fragment.isValid():
-                    fmt = fragment.charFormat()
-                    href = fmt.anchorHref() if fmt.isAnchor() else ""
-                    if href:
-                        spans.append(
-                            (
-                                fragment.position(),
-                                fragment.position() + fragment.length(),
-                                href,
-                            )
-                        )
-                iterator += 1
-            block = block.next()
+        revision = document.revision()
+        dialog = LetterSmithDialog(self, title="Links on This Page", width=590)
+        tree = QtWidgets.QTreeWidget(dialog)
+        tree.setHeaderLabels(["Text", "Destination or note"])
+        tree.setAccessibleName("Links on this page")
+        groups = {}
+        for start, end, href in link_spans(document):
+            note = ultralink_message_from_href(href)
+            key = "Ultra Links" if note is not None else "Website links"
+            if key not in groups:
+                groups[key] = QtWidgets.QTreeWidgetItem(tree, [key])
+                groups[key].setExpanded(True)
+            cursor = self._range_cursor(start, end)
+            text = cursor.selection().toPlainText()
+            item = QtWidgets.QTreeWidgetItem(groups[key], [text, href if note is None else note])
+            item.setData(0, Qt.UserRole, (start, end))
+        if not groups:
+            dialog.content_layout.addWidget(QLabel("No links on this page.", dialog))
+            tree.hide()
+        else:
+            tree.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+            dialog.content_layout.addWidget(tree, 1)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close, dialog)
+        jump = buttons.addButton("Jump to Link", QtWidgets.QDialogButtonBox.AcceptRole)
+        jump.setEnabled(False)
+        tree.currentItemChanged.connect(lambda item, _: jump.setEnabled(bool(item and item.data(0, Qt.UserRole))))
+        tree.itemDoubleClicked.connect(lambda item, _: dialog.accept() if item.data(0, Qt.UserRole) else None)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog.content_layout.addWidget(buttons)
+        if groups:
+            tree.setCurrentItem(next(iter(groups.values())).child(0))
+            dialog.resize(640, 430)
+        if dialog.exec() == QDialog.Accepted and not self._closing and self.editor.document() is document and document.revision() == revision:
+            selection = tree.currentItem().data(0, Qt.UserRole)
+            if selection:
+                self.editor.setTextCursor(self._range_cursor(*selection))
+                self.editor.ensureCursorVisible()
+                self.editor.setFocus(Qt.OtherFocusReason)
+        dialog.deleteLater()
 
-        match_index: Optional[int] = None
-        for index, (start, end, _href) in enumerate(spans):
-            if start <= position < end or (
-                position > 0 and start <= position - 1 < end
-            ):
-                match_index = index
-                break
-        if match_index is None:
-            return None
-
-        start, end, href = spans[match_index]
-        left = match_index - 1
-        while left >= 0 and spans[left][1] == start and spans[left][2] == href:
-            start = spans[left][0]
-            left -= 1
-        right = match_index + 1
-        while right < len(spans) and spans[right][0] == end and spans[right][2] == href:
-            end = spans[right][1]
-            right += 1
-
+    def _range_cursor(self, start, end) -> QTextCursor:
+        document = self.editor.document()
         cursor = QTextCursor(document)
         cursor.setPosition(start)
         cursor.setPosition(end, QTextCursor.KeepAnchor)
         return cursor
+
+    def _anchor_cursor_at_position(self, position: int) -> Optional[QTextCursor]:
+        """Return the complete link at or just before a document position."""
+        for start, end, _href in link_spans(self.editor.document()):
+            if start <= position < end or start <= position - 1 < end:
+                return self._range_cursor(start, end)
+        return None
 
     def _link_target_cursor(self) -> Optional[QTextCursor]:
         cursor = QTextCursor(self.editor.textCursor())
@@ -2976,7 +3474,7 @@ class Editor(QDialog):
         self._update_ultralink_button_style()
         self._update_ultralink_action()
 
-    def open_ultralink_dialog(self) -> None:
+    def open_ultralink_dialog(self, *, anchor=None) -> None:
         editor_cursor = QTextCursor(self.editor.textCursor())
         existing_cursor = self._ultralink_target_cursor()
         target = existing_cursor or (
@@ -3008,11 +3506,8 @@ class Editor(QDialog):
             parent=self,
         )
         dialog.adjustSize()
-        dialog.move(
-            self.btn_ultralink.mapToGlobal(
-                QtCore.QPoint(0, self.btn_ultralink.height())
-            )
-        )
+        button = anchor or self.btn_ultralink
+        dialog.move(button.mapToGlobal(QtCore.QPoint(0, button.height())))
         if dialog.exec() != QDialog.Accepted:
             return
         applied_color = self.ultralink_color
@@ -3419,56 +3914,28 @@ class Editor(QDialog):
         c.createList(lf)
         c.endEditBlock()
 
+    @staticmethod
+    def _set_paragraph_spacing(block_format, multiplier: float) -> None:
+        percent = max(50.0, min(400.0, float(multiplier) * 100.0))
+        block_format.setLineHeight(percent, QTextBlockFormat.ProportionalHeight.value)
+
     def set_line_spacing(self, multiplier: float) -> None:
-        self._export_line_spacing = float(multiplier)
-
-        pct = float(max(0.5, float(multiplier)) * 100.0)
-        pct = max(50.0, min(400.0, pct))
-        height_type = QTextBlockFormat.ProportionalHeight.value
-
-        cursor = self.editor.textCursor()
-
-        if not cursor.hasSelection():
-            bf = cursor.blockFormat()
-            bf.setLineHeight(pct, height_type)
-            cursor.setBlockFormat(bf)
-            self.editor.setTextCursor(cursor)
-            return
-
-        start = cursor.selectionStart()
-        end = cursor.selectionEnd()
-
-        doc = self.editor.document()
-        work = QTextCursor(doc)
-        work.beginEditBlock()
-        try:
-            work.setPosition(start)
-            blk = work.block()
-
-            work.setPosition(end)
-            end_blk = work.block()
-
-            while blk.isValid():
-                bc = QTextCursor(blk)
-                bf = bc.blockFormat()
-                bf.setLineHeight(pct, height_type)
-                bc.setBlockFormat(bf)
-
-                if blk == end_blk:
-                    break
-                blk = blk.next()
-        finally:
-            work.endEditBlock()
+        block_format = QTextBlockFormat()
+        self._set_paragraph_spacing(block_format, multiplier)
+        self.editor.textCursor().mergeBlockFormat(block_format)
 
     # ──────────────────────────────────────────────────────────────────────
     # Misc
     # ──────────────────────────────────────────────────────────────────────
 
     def update_word_count(self) -> None:
-        t = self.editor.toPlainText()
-        w = len([s for s in t.split() if s.strip()])
-        c = len(t)
-        self.word_label.setText(f"Words: {w:,}  |  Chars: {c:,}")
+        text = self.editor.toPlainText()
+        count = f"Words: {len(text.split()):,}  |  Chars: {len(text):,}"
+        cursor = self.editor.textCursor()
+        if cursor.hasSelection():
+            selected = cursor.selection().toPlainText().replace("\uFFFC", "")
+            count += f"  |  Selected: {len(selected.split()):,} words"
+        self.word_label.setText(count)
 
     def _sync_format(self, fmt: QTextCharFormat) -> None:
         try:

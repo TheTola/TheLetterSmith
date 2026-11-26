@@ -294,11 +294,12 @@ class ProjectLifecycle(QtCore.QObject):
             self.finish()
         return self._resolve("New Project", activate)
 
-    def open_saved(self, entry):
+    def open_saved(self, entry, *, revision=None, as_template=False):
         if not self._begin():
             return False
         def open_candidate():
-            if not self.window.forge_tab.saved_projects._read_and_open(entry, finished=self.finish):
+            if not self.window.forge_tab.saved_projects._read_and_open(
+                    entry, finished=self.finish, revision=revision, as_template=as_template):
                 self.finish()
         return self._resolve("Open Project", open_candidate)
 

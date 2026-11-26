@@ -53,6 +53,9 @@ class SoundRestoreLockTests(unittest.TestCase):
             _tab_active=False,
             _shutdown=False,
             _preview=mock.Mock(),
+            _waveform=mock.Mock(),
+            library=mock.Mock(),
+            player=mock.Mock(),
             _sound_disk_revision=((1, 1, 1),),
             _active_sound_revision=("same",),
             _current_sound_disk_revision=mock.Mock(
@@ -67,6 +70,9 @@ class SoundRestoreLockTests(unittest.TestCase):
 
         self.assertTrue(sound_tab._tab_active)
         sound_tab._preview.set_tab_active.assert_called_once_with(True)
+        sound_tab._waveform.set_source.assert_called_once_with(
+            sound_tab.library.path_for.return_value,
+        )
         sound_tab.reload_project_from_disk.assert_not_called()
 
     def test_tab_activation_reloads_once_after_sound_files_change(self) -> None:
@@ -74,6 +80,9 @@ class SoundRestoreLockTests(unittest.TestCase):
             _tab_active=False,
             _shutdown=False,
             _preview=mock.Mock(),
+            _waveform=mock.Mock(),
+            library=mock.Mock(),
+            player=mock.Mock(),
             _sound_disk_revision=((1, 1, 1),),
             _active_sound_revision=("same",),
             _current_sound_disk_revision=mock.Mock(
@@ -93,6 +102,9 @@ class SoundRestoreLockTests(unittest.TestCase):
             _tab_active=False,
             _shutdown=False,
             _preview=mock.Mock(),
+            _waveform=mock.Mock(),
+            library=mock.Mock(),
+            player=mock.Mock(),
             _sound_disk_revision=((1, 1, 1),),
             _active_sound_revision=("before",),
             _current_sound_disk_revision=mock.Mock(
@@ -112,6 +124,7 @@ class SoundRestoreLockTests(unittest.TestCase):
             _tab_active=True,
             player=mock.Mock(),
             _preview=mock.Mock(),
+            _waveform=mock.Mock(),
             play_btn=mock.Mock(),
             _save_volume=mock.Mock(),
             _status_timer=mock.Mock(),
@@ -124,6 +137,7 @@ class SoundRestoreLockTests(unittest.TestCase):
         self.assertFalse(sound_tab._tab_active)
         sound_tab.player.stop.assert_called_once_with(reset_position=True)
         sound_tab._preview.set_tab_active.assert_called_once_with(False)
+        sound_tab._waveform.set_source.assert_called_once_with(None)
         sound_tab.play_btn.setText.assert_called_once_with("▶")
         sound_tab._save_volume.assert_called_once_with()
         sound_tab._status_timer.stop.assert_called_once_with()

@@ -961,6 +961,12 @@ class MessageTab(QtWidgets.QWidget):
             self.title_recipient_container,
             (self.title_input, self.name_input, self.url_input),
         )
+        self._title_warning_timer = QtCore.QTimer(self)
+        self._title_warning_timer.setSingleShot(True)
+        self._title_warning_timer.setInterval(150)
+        self._title_warning_timer.timeout.connect(self._warn_duplicate_title)
+        self.title_input.textChanged.connect(lambda: self._title_warning_timer.start())
+        self.name_input.textChanged.connect(lambda: self._title_warning_timer.start())
 
         self.title_input.editingFinished.connect(self._save_settings)
         self.name_input.editingFinished.connect(self._save_settings)
@@ -1088,6 +1094,12 @@ class MessageTab(QtWidgets.QWidget):
             layout.addWidget(field, row, column + 1, 1, 1 if index < 2 else 3)
             field.setMinimumWidth(0)
             field.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        warning = QtWidgets.QLabel()
+        warning.setStyleSheet("color:#ffac9d;font-weight:600;")
+        warning.setWordWrap(True)
+        warning.hide()
+        layout.addWidget(warning, 2, 0, 1, 4)
+        fields[0]._duplicate_title_warning = warning
         layout.setColumnStretch(1, 1)
         layout.setColumnStretch(3, 1)
         container.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
@@ -1114,7 +1126,25 @@ class MessageTab(QtWidgets.QWidget):
             self._style_identity_field(source)
             fields.append(field)
         self._layout_identity_fields(panel, fields)
+        self._warn_duplicate_title()
         return panel
+
+    def _warn_duplicate_title(self):
+        from project_paths import ProjectPathError, ProjectPathResolver
+        identity = self.project_state.identity
+        title, name = self.title_input.text().strip(), self.name_input.text().strip()
+        text = ""
+        if title and name and identity.project_id:
+            resolver = ProjectPathResolver(self.project_root)
+            try:
+                if resolver.find_title_conflict_for_name(name, title, project_id=identity.project_id):
+                    text = "This recipient already has a letter with that title."
+            except (OSError, ValueError, ProjectPathError):
+                pass
+        for field in (self.title_input, *getattr(self.title_input, "_identity_mirrors", ())):
+            field._duplicate_title_warning.setText(text)
+            field._duplicate_title_warning.setVisible(bool(text))
+            field.setAccessibleDescription(text)
 
     def _restore_identity_text(self, field, value):
         # Restoration is not an edit. Signal-blocked source updates must also
@@ -1122,6 +1152,8 @@ class MessageTab(QtWidgets.QWidget):
         for view in (field, *getattr(field, "_identity_mirrors", ())):
             with QtCore.QSignalBlocker(view):
                 view.setText(str(value or ""))
+        if field in (self.title_input, self.name_input) and hasattr(self, "_title_warning_timer"):
+            self._title_warning_timer.start()
 
     def set_compact_layout(self, compact: bool) -> None:
         """Reduce control geometry without moving controls above the preview."""
@@ -1919,6 +1951,9 @@ class MessageTab(QtWidgets.QWidget):
             recipient = identity.recipient_display_name
             self.name_input.setText(recipient)
             self.settings.update(identity.as_settings())
+            workspace = getattr(self, "messages_workspace", None)
+            if workspace is not None and recipient != current_recipient:
+                workspace.remember_recipient_change(current_recipient, recipient)
 
         self.settings["recipient_title"] = title
         self.settings["recipient_name"] = recipient

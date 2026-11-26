@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -10,9 +12,12 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from Editor import Editor
 from letter_page import LETTER_PAGE_PRESET_LABELS, normalized_letter_page_settings
 from message_document_import import message_resources, stage_import_html
+from message_format import message_plain_text
+from message_history import list_revisions, read_revision, record_draft
 from message_html import sanitize_message_html
+from message_page_tools import recipient_name_edits, replace_text_ranges
 from project_paths import application_paths
-from ui_dialogs import LetterSmithConfirmationDialog
+from ui_dialogs import LetterSmithConfirmationDialog, LetterSmithDialog
 
 
 class ReadabilityControls(QtWidgets.QWidget):
@@ -57,8 +62,14 @@ class ReadabilityControls(QtWidgets.QWidget):
         self.contrast = QtWidgets.QLabel(self)
         self.contrast.setAccessibleName("Letter contrast")
         self.contrast.setVisible(not editor)
+        self.suggestion = None
+        self.suggest_button = None
         if not editor:
+            self.suggest_button = QtWidgets.QToolButton(self)
+            self.suggest_button.hide()
             row.addWidget(self.contrast)
+            row.addWidget(self.suggest_button)
+            self.suggest_button.clicked.connect(self.apply_suggestion)
         row.addStretch(1)
         self.zoom = QtWidgets.QSpinBox(self)
         self.zoom.setRange(25, 200)
@@ -102,11 +113,18 @@ class ReadabilityControls(QtWidgets.QWidget):
             editor.set_paper_text_color(key, color)
             self.workspace.readability_changed.emit()
 
+    def apply_suggestion(self):
+        if self.suggestion is not None:
+            preset, opacity, _ratio = self.suggestion
+            self.workspace.set_readability({"message_overlay_preset": preset, "message_overlay_opacity": opacity})
+
     def sync(self, *_):
         workspace = self.workspace
         self.setEnabled(workspace.page_id is not None and not workspace._failed)
         if workspace.page_id is None:
             self.contrast.clear()
+            if self.suggest_button is not None:
+                self.suggest_button.hide()
             return
         preset, opacity, _, _ = normalized_letter_page_settings(
             workspace._display_settings())
@@ -131,6 +149,13 @@ class ReadabilityControls(QtWidgets.QWidget):
                 ratio = workspace._preview_contrast
                 self.contrast.setText("Contrast good" if ratio >= 4.5 else "Contrast reduced" if ratio >= 3 else "Low contrast")
                 self.contrast.setToolTip(f"Lowest sampled contrast in the visible page: {ratio:.1f}:1.")
+            if self.suggest_button is not None:
+                self.suggestion = editor.suggest_paper(workspace._preview_contrast)
+                self.suggest_button.setVisible(self.suggestion is not None)
+                if self.suggestion is not None:
+                    paper, percent, ratio = self.suggestion
+                    self.suggest_button.setText(f"Try {LETTER_PAGE_PRESET_LABELS[paper]} · {percent}%")
+                    self.suggest_button.setToolTip(f"Apply suggested paper. Estimated contrast {ratio:.1f}:1.")
 
 
 @dataclass
@@ -138,6 +163,14 @@ class _Binding:
     target: object
     document: dict
     label: str
+
+
+@dataclass(frozen=True)
+class _ReviewPage:
+    target: object
+    document: dict
+    label: str
+    text: str
 
 
 class MessagesWorkspace(QtWidgets.QWidget):
@@ -160,6 +193,8 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self._last_letter = None
         self._seen_session = session.session_id
         self._views = {}
+        self._recipient_change = None
+        self._pending_drafts = {}
         self._committing = False
         self._refreshing = False
         self._dirty = False
@@ -186,7 +221,9 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self._render_pool = QtCore.QThreadPool(self)
         self._render_pool.setMaxThreadCount(1)
         self._render_tasks = {}
-        cache = application_paths(self.project_root).cache_root / "messages"
+        paths = application_paths(self.project_root)
+        self._history_root = paths.recovery_root / "message-drafts"
+        cache = paths.cache_root / "messages"
         cache.mkdir(parents=True, exist_ok=True)
         self._preview_path = cache / f"{uuid4().hex}.png"
 
@@ -200,6 +237,12 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.selector.setMaximumWidth(320)
         header.addWidget(self.selector)
         header.addStretch(1)
+        self.preview_device = QtWidgets.QComboBox(self)
+        self.preview_device.setAccessibleName("Preview device")
+        self.preview_device.addItem("Page View", None)
+        self.preview_device.addItem("Phone View", (390, 844))
+        self.preview_device.addItem("Desktop View", (1440, 900))
+        header.addWidget(self.preview_device)
         self.preview_toggle = QtWidgets.QPushButton("Preview")
         self.preview_toggle.setCheckable(True)
         self.preview_toggle.setChecked(True)
@@ -223,7 +266,20 @@ class MessagesWorkspace(QtWidgets.QWidget):
         self.recover_button = QtWidgets.QPushButton("Discard draft and reload")
         self.recover_button.clicked.connect(self.discard_draft)
         self.recover_button.hide()
-        for widget in (self.save_button, self.recover_button):
+        self.update_name_button = QtWidgets.QPushButton("Update Name in Messages")
+        self.update_name_button.clicked.connect(self.update_name)
+        self.copy_style_button = QtWidgets.QToolButton()
+        self.copy_style_button.setText("Copy Style From")
+        self.copy_style_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.copy_style_menu = QtWidgets.QMenu(self.copy_style_button)
+        self.copy_style_menu.aboutToShow.connect(self.populate_style_sources)
+        self.copy_style_button.setMenu(self.copy_style_menu)
+        self.proofread_letter_button = QtWidgets.QPushButton("Proofread Letter")
+        self.proofread_letter_button.clicked.connect(self.proofread_letter)
+        self.history_button = QtWidgets.QPushButton("Draft History")
+        self.history_button.clicked.connect(self.open_draft_history)
+        for widget in (self.save_button, self.recover_button, self.update_name_button,
+                       self.copy_style_button, self.proofread_letter_button, self.history_button):
             actions.addWidget(widget)
         actions.addStretch(1)
         layout.addWidget(self.actions)
@@ -266,6 +322,11 @@ class MessagesWorkspace(QtWidgets.QWidget):
             self.shared_preview.contrast_changed.connect(self._update_preview_contrast)
             preview_layout.addWidget(self.shared_preview, 1)
             self.shared_preview.hide()
+            self.preview_device.currentIndexChanged.connect(
+                lambda _: self.shared_preview.set_device(self.preview_device.currentData())
+            )
+        else:
+            self.preview_device.hide()
         self.zoom = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.zoom.setRange(25, 200)
         self.zoom.setValue(100)
@@ -299,6 +360,10 @@ class MessagesWorkspace(QtWidgets.QWidget):
 
     def _label(self, index, page):
         return f"Page {index} of {len(self.session.project.pages)} — {page['name'] or 'Letter'} · Letter"
+
+    @staticmethod
+    def _picker_label(label, html):
+        return label if message_plain_text(html) or message_resources(html) else f"{label} · Empty"
 
     def _error(self, message):
         self._failed = True
@@ -336,6 +401,9 @@ class MessagesWorkspace(QtWidgets.QWidget):
                     return
                 self._last_letter = None
                 self._views.clear()
+                self._recipient_change = None
+                self.update_name_button.setToolTip("")
+                self._pending_drafts.clear()
             ids = [page["id"] for _, page in letters]
             preferred = requested if requested is not None else self.session.selected_page_id
             selected = preferred if preferred in ids else self._last_letter if self._last_letter in ids else next(iter(ids), None)
@@ -364,13 +432,17 @@ class MessagesWorkspace(QtWidgets.QWidget):
             with QtCore.QSignalBlocker(self.selector):
                 self.selector.clear()
                 for index, page in letters:
-                    self.selector.addItem(self._label(index, page), page["id"])
+                    label = self._picker_label(self._label(index, page), page["message"]["html"])
+                    self.selector.addItem(label, page["id"])
+                    self.selector.setItemData(self.selector.count() - 1, label, QtCore.Qt.ToolTipRole)
                 self.selector.setCurrentIndex(self.selector.findData(selected))
             has_letter = selected is not None
             self.empty.setVisible(not has_letter)
             self.splitter.setVisible(has_letter)
             self.actions.setVisible(has_letter)
             self.selector.setEnabled(has_letter)
+            self.preview_device.setEnabled(has_letter)
+            self.copy_style_button.setEnabled(len(letters) > 1)
             self.style_panel.setVisible(has_letter)
             from project_model import MAX_PAGES
             self.add_button.setEnabled(len(self.session.project.pages) < MAX_PAGES)
@@ -397,7 +469,8 @@ class MessagesWorkspace(QtWidgets.QWidget):
                                      resource_roots=self._resource_roots(), document_label=label,
                                      missing_resources=self._missing_resources(),
                                      display_settings=self._display_settings(selected),
-                                     paper_colors=document.get("settings", {}).get("editor_paper_colors"))
+                                     paper_colors=document.get("settings", {}).get("editor_paper_colors"),
+                                     find_callback=self.find_in_letter)
                 self.editor.bound_error.connect(self._error)
                 self.editor.editor.currentCharFormatChanged.connect(self.readability_changed)
                 self.editor.editor.textChanged.connect(self.readability_changed)
@@ -464,6 +537,310 @@ class MessagesWorkspace(QtWidgets.QWidget):
                 return candidate
         return None
 
+    @staticmethod
+    def _with_html(document, html):
+        resources = list(document.get("resources", []))
+        for reference in message_resources(html):
+            if reference not in resources:
+                resources.append(reference)
+        return {**document, "html": html, "resources": resources}
+
+    def tool_parent(self):
+        return self.editor.window() if self.editor is not None and self.editor.isVisible() else self
+
+    def _review_page(self, index, page):
+        page_id = page["id"]
+        target = self.session.capture_target(page_id, fields=("type", "message", "$order"), include_shared=False)
+        document = QtGui.QTextDocument()
+        message = self.session.project.get_message(page_id)
+        document.setHtml(sanitize_message_html(message["html"]))
+        return _ReviewPage(target, message, f"Page {index} · {page['name'] or 'Letter'}", document.toPlainText())
+
+    def review_pages(self):
+        if self.page_id is None or not self.save():
+            return ()
+        try:
+            return tuple(self._review_page(index, page) for index, page in self._letters())
+        except (KeyError, ValueError, RuntimeError) as error:
+            self.notice.setText(str(error))
+            return ()
+
+    def _detached_editor(self, page):
+        return Editor(sanitize_message_html(page.document["html"]), parent=self, embedded=True,
+                      save_callback=lambda _: True, resource_roots=self._resource_roots(),
+                      missing_resources=self._missing_resources(),
+                      display_settings=self._display_settings(page.target.page_id),
+                      paper_colors=page.document.get("settings", {}).get("editor_paper_colors"))
+
+    def _apply_reviewed_documents(self, pages, documents, notice):
+        if not self.save():
+            return False
+
+        def apply(model, _page_id):
+            if any(not self.session.target_is_current(page.target) for page in pages):
+                raise ValueError("Letter pages changed. Open the review again before applying changes.")
+            for page_id, document in documents.items():
+                model.update_message(page_id, document)
+
+        self._committing = True
+        try:
+            if not self.session.apply_result(pages[0].target, apply):
+                self.notice.setText("Letter pages changed. Open the review again before applying changes.")
+                return False
+            for page in pages:
+                page_id = page.target.page_id
+                if page_id in documents:
+                    self._queue_draft(page_id, page.document["html"], documents[page_id]["html"])
+        except (KeyError, ValueError, RuntimeError) as error:
+            self.notice.setText(str(error))
+            return False
+        finally:
+            self._committing = False
+        self.refresh(self.page_id)
+        self._dirty = True
+        if self.save():
+            if not self._pending_drafts:
+                self.notice.setText(notice)
+            self.owner.project_changed.emit()
+            return True
+        return False
+
+    def apply_text_edits(self, pages, edits, notice):
+        documents = {}
+        try:
+            for page in pages:
+                changes = tuple(edit for edit in edits.get(page.target.page_id, ()) if edit.text != edit.replacement)
+                if not changes:
+                    continue
+                detached = self._detached_editor(page)
+                try:
+                    replace_text_ranges(detached.editor, changes)
+                    documents[page.target.page_id] = self._with_html(page.document, detached._prepared_html())
+                finally:
+                    detached.dispose_document()
+                    detached.deleteLater()
+        except (KeyError, ValueError, RuntimeError) as error:
+            self.notice.setText(str(error))
+            return False
+        if not documents:
+            self.notice.setText("No changes to apply.")
+            return True
+        return self._apply_reviewed_documents(pages, documents, notice)
+
+    def apply_selection_edits(self, page, edits):
+        if (self.editor is None or self.page_id != page.target.page_id or not self.save()
+                or not self.session.target_is_current(page.target)
+                or self.editor.editor.toPlainText() != page.text):
+            self.notice.setText("The selection changed. Reopen Find and Replace to review it.")
+            return False
+        editor = self.editor.editor
+        try:
+            changes = tuple(edit for edit in edits if edit.text != edit.replacement)
+            with editor.describe_edit("Replace text"):
+                replace_text_ranges(editor, changes)
+        except ValueError as error:
+            self.notice.setText(str(error))
+            return False
+        return self.save()
+
+    def open_match(self, page, match):
+        if not self.session.target_is_current(page.target) or not self.open_page(page.target.page_id):
+            return False
+        editor = self.editor.editor
+        text = editor.toPlainText()
+        if text[match.start:match.end] != match.text:
+            return False
+        offsets = editor._python_to_qt_offsets(text)
+        cursor = editor.textCursor()
+        cursor.setPosition(offsets[match.start])
+        cursor.setPosition(offsets[match.end], QtGui.QTextCursor.KeepAnchor)
+        editor.setTextCursor(cursor)
+        editor.ensureCursorVisible()
+        return True
+
+    def find_in_letter(self):
+        from message_review_dialog import LetterSearchDialog
+
+        if self.editor is None or not self.save():
+            return
+        selected = self.editor.editor.textCursor().selectedText()
+        dialog = LetterSearchDialog(self, selected if len(selected.splitlines()) == 1 else "")
+        dialog.exec()
+        dialog.deleteLater()
+
+    def remember_recipient_change(self, previous, new):
+        if self._recipient_change and self._recipient_change[1] == previous:
+            previous = self._recipient_change[0]
+        self._recipient_change = (previous, new) if previous and previous != new else None
+        tooltip = f"Change {previous} to {new} on every Letter page." if self._recipient_change else ""
+        self.update_name_button.setToolTip(tooltip)
+        if self.editor is not None:
+            self.editor.recipient_name = new
+
+    def update_name(self):
+        pages = self.review_pages()
+        if not pages:
+            return
+        if self._recipient_change:
+            self._rewrite_recipient(pages, *self._recipient_change)
+            return
+        dialog = LetterSmithDialog(self.tool_parent(), title="Update Name in Messages")
+        form = QtWidgets.QFormLayout()
+        old_name = QtWidgets.QLineEdit()
+        new_name = QtWidgets.QLineEdit(self.owner.name_input.text().strip())
+        form.addRow("Previous recipient name", old_name)
+        form.addRow("New recipient name", new_name)
+        dialog.content_layout.addLayout(form)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel)
+        update = buttons.addButton("Update Name", QtWidgets.QDialogButtonBox.AcceptRole)
+
+        def check_names():
+            before, after = old_name.text().split(), new_name.text().split()
+            update.setEnabled(bool(before and after and before != after))
+
+        old_name.textChanged.connect(check_names)
+        new_name.textChanged.connect(check_names)
+        check_names()
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog.content_layout.addWidget(buttons)
+        old_name.setFocus()
+        old_name.selectAll()
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            self._rewrite_recipient(pages, old_name.text(), new_name.text())
+        dialog.deleteLater()
+
+    def _rewrite_recipient(self, pages, previous, new):
+        edits = {page.target.page_id: recipient_name_edits(page.text, previous, new) for page in pages}
+        changed = sum(bool(changes) for changes in edits.values())
+        if not changed:
+            self.notice.setText("The previous name was not found in the Letter pages.")
+            return
+        scope = "1 Letter page" if changed == 1 else f"{changed} Letter pages"
+        if self.apply_text_edits(pages, edits, f"Recipient name updated on {scope}."):
+            self._recipient_change = None
+            self.update_name_button.setToolTip("")
+
+    def populate_style_sources(self):
+        self.copy_style_menu.clear()
+        for index, page in self._letters():
+            page_id = page["id"]
+            if page_id == self.page_id:
+                continue
+            action = self.copy_style_menu.addAction(f"Page {index} · {page['name'] or 'Letter'}")
+            action.triggered.connect(lambda _checked=False, source=page_id: self.copy_style_from(source))
+
+    def copy_style_from(self, source_id):
+        pages = self.review_pages()
+        source = next((page for page in pages if page.target.page_id == source_id), None)
+        if source is None or self.editor is None or self.page_id == source_id:
+            return False
+        detached = None
+        try:
+            detached = self._detached_editor(source)
+            if self.editor._unsupported_style_state or detached._unsupported_style_state:
+                raise ValueError("Update LetterSmith before copying styles from or to this page.")
+            styles = detached.named_styles.page_style_set()
+            if not self.session.target_is_current(source.target) or not self.session.target_is_current(self.binding.target):
+                raise ValueError("A Letter page changed. Choose the style source again.")
+            self.editor.named_styles.apply_page_style_set(styles)
+            if self.save():
+                self.notice.setText(f"Style copied from {source.label}.")
+                return True
+        except (KeyError, ValueError, RuntimeError) as error:
+            self.notice.setText(str(error))
+        finally:
+            if detached is not None:
+                detached.dispose_document()
+                detached.deleteLater()
+        return False
+
+    def proofread_letter(self):
+        from message_review_dialog import LetterProofreadingDialog
+
+        pages = self.review_pages()
+        if not pages or self.editor is None:
+            return
+        binding = self.editor._proofreading
+        try:
+            dialog = LetterProofreadingDialog(self, pages, binding.service, binding._terms(), binding._ignored)
+        except (ValueError, RuntimeError, OSError) as error:
+            self.notice.setText(f"Could not proofread the letter. {error}")
+            return
+        dialog.exec()
+        dialog.deleteLater()
+
+    def _draft_path(self, page_id):
+        key = json.dumps([self.session.project.project_id, page_id]).encode()
+        return self._history_root / sha256(key).hexdigest()[:32] / "message.html"
+
+    def _queue_draft(self, page_id, before, after):
+        first = self._pending_drafts.get(page_id, (before, after))[0]
+        if first != after:
+            self._pending_drafts[page_id] = (first, after)
+        else:
+            self._pending_drafts.pop(page_id, None)
+
+    def _write_drafts(self):
+        for page_id, (before, after) in tuple(self._pending_drafts.items()):
+            path = self._draft_path(page_id)
+            try:
+                if before.strip():
+                    record_draft(path, before, reason="before-edit")
+                record_draft(path, after)
+            except (OSError, ValueError) as error:
+                self.notice.setText(f"Draft saved. Could not write draft history. {error}")
+            else:
+                del self._pending_drafts[page_id]
+
+    def open_draft_history(self):
+        page_id = self.page_id
+        if page_id is None or not self.save():
+            return
+        page = next((self._review_page(index, page) for index, page in self._letters() if page["id"] == page_id), None)
+        if page is None:
+            return
+        path = self._draft_path(page_id)
+        dialog = LetterSmithDialog(self.tool_parent(), title=f"Draft History · {page.label}", width=560)
+        drafts = QtWidgets.QListWidget()
+        drafts.setAccessibleName("Autosaved drafts")
+        preview = QtWidgets.QPlainTextEdit()
+        preview.setReadOnly(True)
+        preview.setAccessibleName("Draft preview")
+        dialog.content_layout.addWidget(drafts, 1)
+        dialog.content_layout.addWidget(preview, 1)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        restore = buttons.addButton("Restore Draft", QtWidgets.QDialogButtonBox.AcceptRole)
+        restore.setEnabled(False)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog.content_layout.addWidget(buttons)
+        content = None
+
+        def preview_draft(item, _previous):
+            nonlocal content
+            try:
+                content = read_revision(path, item.data(QtCore.Qt.UserRole)) if item is not None else None
+                preview.setPlainText(message_plain_text(content) if content is not None else "")
+                restore.setEnabled(content is not None and content != page.document["html"])
+            except (OSError, ValueError) as error:
+                content = None
+                preview.setPlainText(str(error))
+                restore.setEnabled(False)
+
+        drafts.currentItemChanged.connect(preview_draft)
+        for revision in list_revisions(path):
+            item = QtWidgets.QListWidgetItem(revision.display_name, drafts)
+            item.setData(QtCore.Qt.UserRole, str(revision.path))
+        if drafts.count():
+            drafts.setCurrentRow(0)
+        else:
+            preview.setPlainText("No drafts saved for this page yet.")
+        dialog.resize(620, 460)
+        if dialog.exec() == QtWidgets.QDialog.Accepted and content is not None:
+            self._apply_reviewed_documents((page,), {page_id: self._with_html(page.document, content)}, "Draft restored.")
+        dialog.deleteLater()
+
     def _commit_html(self, binding, html):
         html = sanitize_message_html(html)
         document = dict(binding.document)
@@ -474,16 +851,13 @@ class MessagesWorkspace(QtWidgets.QWidget):
                 **document.get("settings", {}),
                 "editor_paper_colors": self.editor.paper_colors(),
             }
-        resources = list(document.get("resources", []))
-        for reference in message_resources(html):
-            if reference not in resources:
-                resources.append(reference)
-        document["resources"] = resources
+        document = self._with_html(document, html)
         self._committing = True
         try:
             if not self.session.apply_result(binding.target, lambda model, page_id: model.update_message(page_id, document)):
                 self._error("The original message changed or its project was replaced. Newer content was not overwritten.")
                 return False
+            self._queue_draft(binding.target.page_id, binding.document["html"], html)
             binding.document = self.session.project.get_message(binding.target.page_id)
             binding.target = self.session.capture_target(binding.target.page_id, fields=("type", "message"), include_shared=False)
             self.owner.current_html = html
@@ -491,6 +865,11 @@ class MessagesWorkspace(QtWidgets.QWidget):
             self._failed = False
             self.recover_button.hide()
             self.notice.setText("Saving draft…")
+            index = self.selector.findData(binding.target.page_id)
+            if index >= 0:
+                label = self._picker_label(binding.label, html)
+                self.selector.setItemText(index, label)
+                self.selector.setItemData(index, label, QtCore.Qt.ToolTipRole)
             self._save_timer.start()
             self._render_gate.invalidate(accepting=True)
             self._preview_timer.start()
@@ -514,6 +893,8 @@ class MessagesWorkspace(QtWidgets.QWidget):
         if self.editor is not None and not self.editor.flush_document():
             return False
         if not self._dirty:
+            if not self._failed and self._pending_drafts:
+                self._write_drafts()
             return not self._failed
         self._committing = True
         try:
@@ -522,6 +903,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
             self._failed = False
             self.recover_button.hide()
             self.notice.setText("Draft saved.")
+            self._write_drafts()
             return True
         except (ValueError, RuntimeError, OSError) as error:
             self._error(f"Could not save: {error}")
@@ -582,6 +964,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
             self.binding = None
             self._failed = False
             self._dirty = False
+            self._pending_drafts.clear()
             self.refresh()
 
     def clear_text(self):
@@ -811,6 +1194,7 @@ class MessagesWorkspace(QtWidgets.QWidget):
                 model.update_message(identity, merged)
             if not self.session.apply_result(target, apply):
                 return False
+            self._queue_draft(target.page_id, original["html"], merged["html"])
             self._dirty = True
             self._review_import = None
             self.review_button.hide()

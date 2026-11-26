@@ -94,21 +94,20 @@ from ui_theme import (
     apply_tab_heading_style,
     minimum_button_text_size,
 )
-from transactional_io import file_change_token
+from transactional_io import atomic_write_json, file_change_token
 
 
 PREVIEW_MODE_KEY = "forge_preview_mode"
 FORGE_ACTION_FONT_POINT_SIZE = 13.0
 FORGE_GEOMETRY_SCALE = 0.9
 PREVIEW_MODES = (
-    ("Portrait", "portrait"),
-    ("Landscape", "landscape"),
-    ("Browser", "window"),
+    ("Desktop / Tablet", "window"),
+    ("Phone", "portrait"),
 )
-PREVIEW_MODE_DESCRIPTIONS = {
-    "portrait": " ",
-    "landscape": " ",
-    "window": "",
+EXPORT_FORMATS = {
+    "zip": ("ZIP Package", ".zip", "Send a downloadable folder. Extract it and open index.html offline."),
+    "html": ("Single HTML", ".html", "Send one self-contained file that opens directly in a browser."),
+    "publish_zip": ("Website ZIP", ".zip", "Extract the files into a static web host's site folder."),
 }
 _GITHUB_WARNING_BACKGROUND = "#0d1117"
 _GITHUB_WARNING_BORDER = "#58a6ff"
@@ -441,7 +440,7 @@ def _require_display_revision(directory: Path, project_id: str, fingerprint: str
         raise _ForgeOperationError("The prepared presentation changed. Prepare publishing again.")
 
 
-def _stage_publish_display(project_root: Path, play_dir: Path, render_input):
+def _stage_publish_display(project_root: Path, play_dir: Path, render_input, authored=None):
     """Retain the exact public payload across authentication and later edits."""
     from forge_render import copy_display_output
 
@@ -451,6 +450,22 @@ def _stage_publish_display(project_root: Path, play_dir: Path, render_input):
     try:
         payload = copy_display_output(play_dir, Path(temporary.name) / "display")
         _require_display_revision(payload, render_input.project_id, render_input.source_fingerprint)
+        if authored is not None:
+            from forge_render import capture_render
+            from project_repository import ProjectRepository
+            from project_session import ProjectSession
+            repository = ProjectRepository(Path(temporary.name) / ".lettersmith-project")
+            try:
+                stored = repository.save(authored, asset_root=render_input.asset_root, fallback_asset_root=render_input.project_root)
+                session = ProjectSession(stored.project, project_root=stored.asset_root, asset_root=stored.asset_root)
+                try:
+                    if capture_render(session, "display", presentation_root=project_root).source_fingerprint != render_input.source_fingerprint:
+                        raise ValueError("Authored snapshot differs from the prepared presentation")
+                    atomic_write_json(Path(temporary.name) / "authored-verified.json", {"revision": stored.revision})
+                finally:
+                    session.close()
+            except (OSError, ValueError, RuntimeError):
+                _LOGGER.warning("Could not retain the authored revision for publication", exc_info=True)
     except Exception:
         temporary.cleanup()
         raise
@@ -492,7 +507,7 @@ def _publication_fields_from_result(publish_result: PublishResult) -> dict:
     return publication
 
 
-def _record_verified_publication(project_root: Path, context: tuple | None, publication: dict) -> None:
+def _record_verified_publication(project_root: Path, context: tuple | None, publication: dict, *, authored_root=None) -> Path | None:
     """Persist confirmed transport success even if shutdown drops the UI callback."""
     if publication_status(publication) != "published":
         raise _ForgeOperationError("Publishing completed without a verified public page.")
@@ -506,6 +521,38 @@ def _record_verified_publication(project_root: Path, context: tuple | None, publ
         SettingsStore(project_root).update_fields(publication)
 
     _apply_forge_context(project_root, context, record)
+    from datetime import timezone
+    from project_repository import ProjectRepository, _json
+    from saved_letter_versions import letter_state, write_letter_state
+
+    project_id = context[2] if context else SettingsStore(project_root).get("project_id", "")
+    previous = letter_state(project_root, project_id, "live")
+    key = previous.get("revision_key", "") if previous.get("publication") == publication else ""
+    stored = None
+    if authored_root is not None:
+        try:
+            root = Path(authored_root)
+            verified = _json(root / "authored-verified.json", optional=True).get("revision")
+            if verified:
+                repository = ProjectRepository(root / ".lettersmith-project")
+                stored = repository.load_revision(verified)
+                key = repository.version_key(stored.revision, ignore_page_ids=True)
+        except (OSError, ValueError, RuntimeError):
+            _LOGGER.warning("Could not identify the verified authored revision", exc_info=True)
+    if previous.get("publication") != publication or previous.get("revision_key") != key:
+        try:
+            write_letter_state(project_root, project_id, "live", {
+                "publication": publication, "revision_key": key, "recorded_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except OSError:
+            _LOGGER.warning("Could not store the verified link for %s", project_id, exc_info=True)
+    if stored is not None:
+        from project_save import ProjectSaveService
+        try:
+            return ProjectSaveService(project_root, ProjectStateController(project_root)).retain_published_revision(stored)
+        except (OSError, ValueError, RuntimeError):
+            _LOGGER.warning("Could not add the published revision to the Saved List", exc_info=True)
+    return None
 
 
 class _ForgeOperationError(RuntimeError):
@@ -536,7 +583,7 @@ class _TaskWorker(QtCore.QObject):
 
 
 class _PreviewModeDelegate(QtWidgets.QStyledItemDelegate):
-    """Two-line, high-contrast entries for the Preview format menu."""
+    """High-contrast entries for the Preview format menu."""
 
     def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
         super().__init__(parent)
@@ -547,8 +594,6 @@ class _PreviewModeDelegate(QtWidgets.QStyledItemDelegate):
         self._hover_background = QtGui.QColor(colors.hover)
         self._selected_background = QtGui.QColor(colors.active)
         self._text_color = QtGui.QColor(colors.text)
-        self._detail_color = QtGui.QColor(colors.muted_text)
-        self._selected_detail_color = QtGui.QColor(colors.highlight)
 
     def sizeHint(
         self,
@@ -556,7 +601,7 @@ class _PreviewModeDelegate(QtWidgets.QStyledItemDelegate):
         index: QtCore.QModelIndex,
     ) -> QtCore.QSize:
         del option, index
-        return QtCore.QSize(150, 52)
+        return QtCore.QSize(150, 34)
 
     def paint(
         self,
@@ -580,27 +625,13 @@ class _PreviewModeDelegate(QtWidgets.QStyledItemDelegate):
         )
         painter.fillRect(option.rect.adjusted(2, 2, -2, -2), background)
 
-        text_color = self._text_color
-        detail_color = (
-            self._selected_detail_color
-            if selected
-            else self._detail_color
-        )
         title_font = QtGui.QFont(option.font)
         title_font.setBold(True)
         title_font.setPointSizeF(max(9.5, title_font.pointSizeF()))
         painter.setFont(title_font)
-        painter.setPen(text_color)
-        title_rect = option.rect.adjusted(12, 6, -10, -24)
+        painter.setPen(self._text_color)
+        title_rect = option.rect.adjusted(12, 0, -10, 0)
         painter.drawText(title_rect, Qt.AlignLeft | Qt.AlignVCenter, str(index.data()))
-
-        detail_font = QtGui.QFont(option.font)
-        detail_font.setPointSizeF(max(8.0, detail_font.pointSizeF() - 1.0))
-        painter.setFont(detail_font)
-        painter.setPen(detail_color)
-        detail_rect = option.rect.adjusted(12, 27, -10, -5)
-        detail = str(index.data(Qt.UserRole + 1) or "")
-        painter.drawText(detail_rect, Qt.AlignLeft | Qt.AlignVCenter, detail)
         painter.restore()
 
 
@@ -924,6 +955,48 @@ class SavedLetterCard(QtWidgets.QFrame):
         super().keyPressEvent(event)
 
 
+class _CurtainPreview(QtWidgets.QWidget):
+    def __init__(self, cover, left, right, color, parent=None):
+        super().__init__(parent)
+        self.setAccessibleName("Current cover and opening curtains")
+        self.cover, self.panels, self.color = cover, (left, right), color
+        self.progress = 0.0
+        self.animation = QtCore.QVariantAnimation(self)
+        self.animation.setStartValue(0.0)
+        self.animation.setEndValue(1.0)
+        self.animation.setDuration(1500)
+        self.animation.setEasingCurve(QtCore.QEasingCurve.InOutCubic)
+        self.animation.valueChanged.connect(self._move_curtains)
+
+    def replay(self):
+        self.animation.stop()
+        self._move_curtains(0.0)
+        self.animation.start()
+
+    def _move_curtains(self, value):
+        self.progress = value
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+        painter.fillRect(self.rect(), self.color)
+        self._draw_image(painter, self.cover, Qt.KeepAspectRatio)
+        for direction, panel in zip((-1, 1), self.panels):
+            shift = direction * self.width() * self.progress
+            painter.save()
+            painter.setClipRect(QtCore.QRectF(self.rect()).translated(shift, 0))
+            self._draw_image(painter, panel, Qt.KeepAspectRatioByExpanding, shift)
+            painter.restore()
+
+    def _draw_image(self, painter, image, aspect, shift=0):
+        size = QtCore.QSizeF(image.size())
+        size.scale(QtCore.QSizeF(self.size()), aspect)
+        target = QtCore.QRectF((self.width() - size.width()) / 2 + shift,
+                               (self.height() - size.height()) / 2, size.width(), size.height())
+        painter.drawImage(target, image, QtCore.QRectF(image.rect()))
+
+
 class ReadinessWindow(QtWidgets.QFrame):
     correction_requested = QtCore.Signal(str, str)
 
@@ -978,16 +1051,6 @@ class ReadinessWindow(QtWidgets.QFrame):
         layout.addWidget(self.items_scroll, 1)
 
         self._missing_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for item in evaluate_readiness(self.project_root).items:
-            button = QtWidgets.QPushButton(item.label)
-            button.setCursor(Qt.PointingHandCursor)
-            button.clicked.connect(
-                lambda _checked=False, tab=item.correction_tab,
-                target=item.correction_target:
-                self._request_correction(tab, target)
-            )
-            self.items_layout.addWidget(button)
-            self._missing_buttons[item.key] = button
         self._apply_theme_base()
 
     def apply_theme_assets(self, service: ThemeService) -> None:
@@ -1043,14 +1106,21 @@ class ReadinessWindow(QtWidgets.QFrame):
             "font:700 10pt 'Segoe UI';"
         )
 
-        missing = {item.key: item for item in result.missing_items}
-        for key, button in self._missing_buttons.items():
-            item = missing.get(key)
-            button.setVisible(item is not None)
-            if item is None:
-                continue
+        missing = sorted(result.missing_items, key=lambda item: not item.required)
+        previous = self._missing_buttons
+        self._missing_buttons = {}
+        for button in previous.values():
+            self.items_layout.removeWidget(button)
+        for item in missing:
+            button = previous.pop(item.key, None)
+            if button is None:
+                button = QtWidgets.QPushButton(self.items)
+                button.setCursor(Qt.PointingHandCursor)
+                button.clicked.connect(lambda _checked=False, key=item.key: self._correct_item(key))
+            self.items_layout.addWidget(button)
+            self._missing_buttons[item.key] = button
             color = colors.error if item.required else colors.warning
-            button.setText(item.label)
+            button.setText(item.label if item.required else f"{item.label} (optional)")
             set_control_help(button, item.detail)
             button.setStyleSheet(
                 "QPushButton{text-align:center;padding:6px 8px;font-weight:700;"
@@ -1060,11 +1130,22 @@ class ReadinessWindow(QtWidgets.QFrame):
                 f"border-color:{colors.accent};}}"
                 f"QPushButton:focus{{border:1px solid {colors.accent};}}"
             )
+            button.show()
+        for button in previous.values():
+            button.hide()
+            button.deleteLater()
 
         self.items_scroll.setVisible(bool(missing))
         self._resize_to_content()
         if self.isVisible():
             self.position_near_image_area()
+
+    def _correct_item(self, key: str) -> None:
+        if self._last_result is None:
+            return
+        item = next((item for item in self._last_result.missing_items if item.key == key), None)
+        if item is not None:
+            self._request_correction(item.correction_tab, item.correction_target)
 
     def position_near_image_area(self) -> None:
         """Anchor the tool below the preview without constraining Forge."""
@@ -1265,6 +1346,7 @@ class ForgeTab(QtWidgets.QWidget):
     project_restored = QtCore.Signal(dict)
     letter_loaded = QtCore.Signal(dict)
     preview_requested = QtCore.Signal(str, str)
+    preview_format_changed = QtCore.Signal(str)
     preview_failed = QtCore.Signal()
     preview_files_release_requested = QtCore.Signal()
     project_files_release_requested = QtCore.Signal()
@@ -1494,13 +1576,9 @@ class ForgeTab(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(0, self._validate_github_account_async)
 
     def _saved_preview_mode(self, snapshot: dict | None = None) -> str:
-        if snapshot is None:
-            value = self.settings.get(PREVIEW_MODE_KEY, "landscape")
-        else:
-            value = snapshot.get(PREVIEW_MODE_KEY, "landscape")
-        value = str(value).strip()
-        valid = {mode for _label, mode in PREVIEW_MODES}
-        return value if value in valid else "landscape"
+        settings = self.settings if snapshot is None else snapshot
+        value = str(settings.get(PREVIEW_MODE_KEY, "window")).strip().casefold()
+        return "portrait" if value in {"portrait", "phone"} else "window"
 
     def _init_ui(self) -> None:
         self.setObjectName("ForgeWorkflow")
@@ -1653,9 +1731,7 @@ class ForgeTab(QtWidgets.QWidget):
             "Last project", ButtonTier.SMALL, "AButton.png"
         )
         self.last_project_button.setObjectName("SavedLetterLastProject")
-        self.last_project_button.clicked.connect(
-            lambda: self.window().open_last_project()
-        )
+        self.last_project_button.clicked.connect(self._open_last_saved_project)
         saved_header.addWidget(self.last_project_button)
         self.saved_delete_toggle = QtWidgets.QToolButton()
         self.saved_delete_toggle.setObjectName("SavedLetterDeleteToggle")
@@ -1683,6 +1759,24 @@ class ForgeTab(QtWidgets.QWidget):
         )
         saved_header.addWidget(self.saved_delete_toggle)
         saved_layout.addLayout(saved_header)
+
+        self.last_project_target = QtWidgets.QLabel()
+        self.last_project_target.setTextFormat(Qt.PlainText)
+        self.last_project_target.setWordWrap(True)
+        self.last_project_target.setAccessibleName("Last project target")
+        self._last_saved_project = None
+        saved_layout.addWidget(self.last_project_target)
+        self.saved_search = QtWidgets.QLineEdit()
+        self.saved_search.setPlaceholderText("Search by title or recipient")
+        self.saved_search.setAccessibleName("Search saved letters by title or recipient")
+        self.saved_search.setClearButtonEnabled(True)
+        self.saved_search.textChanged.connect(self._filter_saved_letters)
+        saved_layout.addWidget(self.saved_search)
+        self.saved_no_matches = QtWidgets.QLabel("No matching letters")
+        self.saved_no_matches.setAlignment(Qt.AlignCenter)
+        self.saved_no_matches.hide()
+        saved_layout.addWidget(self.saved_no_matches)
+        self._rendered_saved_query = ""
 
         self.saved_scroll = QtWidgets.QScrollArea()
         self.saved_scroll.setObjectName("SavedLettersScroll")
@@ -1857,7 +1951,7 @@ class ForgeTab(QtWidgets.QWidget):
         self.preview_mode = _PreviewModeCombo()
         set_control_help(
             self.preview_mode,
-            "Choose the screen shape used when previewing the finished letter.",
+            "Preview the finished letter in a browser-sized frame or with phone controls.",
         )
         self.preview_mode.setEnabled(False)
         self.preview_mode.currentIndexChanged.connect(
@@ -1888,7 +1982,15 @@ class ForgeTab(QtWidgets.QWidget):
         self.curtain_styles.bind(self.curtain_style_selector)
         self.curtain_style_selector.set_choices_available(False)
         self.curtain_style_selector.setEnabled(False)
-        curtain_controls.addWidget(self.curtain_style_selector)
+        curtain_row = QtWidgets.QHBoxLayout()
+        curtain_row.addWidget(self.curtain_style_selector, 1)
+        self.curtain_preview_btn = QtWidgets.QToolButton()
+        self.curtain_preview_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
+        self.curtain_preview_btn.setFixedSize(34, 34)
+        set_control_help(self.curtain_preview_btn, "Preview curtains opening over your cover.", accessible_name="Preview Curtains")
+        self.curtain_preview_btn.clicked.connect(self.preview_curtains)
+        curtain_row.addWidget(self.curtain_preview_btn)
+        curtain_controls.addLayout(curtain_row)
         format_row.addLayout(curtain_controls, 1)
         self._sync_curtain_style()
 
@@ -1976,7 +2078,7 @@ class ForgeTab(QtWidgets.QWidget):
         self.publish_btn.clicked.connect(self.publish_letter)
         actions.addWidget(self.publish_btn, 10)
         self.open_published_btn = self._action_button(
-            "Open Letter", "ForgeOpenAction", "CLbutton.png"
+            "Open Published", "ForgeOpenAction", "CLbutton.png"
         )
         set_control_help(
             self.open_published_btn,
@@ -1984,6 +2086,11 @@ class ForgeTab(QtWidgets.QWidget):
         )
         self.open_published_btn.clicked.connect(self.open_published_letter)
         actions.addWidget(self.open_published_btn, 9)
+        self.copy_link_btn = self._tier_button("Copy Link", ButtonTier.SMALL, "BButton.png")
+        set_control_help(self.copy_link_btn, "Copy the verified published address.", accessible_name="Copy Link")
+        self.copy_link_btn.clicked.connect(self.copy_published_link)
+        self.copy_link_btn.hide()
+        actions.addWidget(self.copy_link_btn)
         self._long_action_artwork = (
             (self.preview_btn, "ALbutton.png"),
             (self.publish_btn, "BLbutton.png"),
@@ -2077,6 +2184,7 @@ class ForgeTab(QtWidgets.QWidget):
             (self.unpublish_btn, ButtonTier.SMALL),
             (self.github_account_btn, ButtonTier.SMALL),
             (self.export_btn, ButtonTier.SMALL),
+            (self.copy_link_btn, ButtonTier.SMALL),
         ):
             button.setProperty(BUTTON_GEOMETRY_SCALE_PROPERTY, 0.65 if compact else FORGE_GEOMETRY_SCALE)
             button.apply_theme_assets()
@@ -2201,6 +2309,7 @@ class ForgeTab(QtWidgets.QWidget):
             self.load_stock_btn,
             self.github_account_btn,
             self.export_btn,
+            self.copy_link_btn,
             self.preview_btn,
             self.publish_btn,
             self.unpublish_btn,
@@ -2249,6 +2358,10 @@ class ForgeTab(QtWidgets.QWidget):
         )
         self.preview_mode.apply_theme_tokens(colors)
         self.curtain_style_selector.apply_theme_tokens(colors)
+        self.curtain_preview_btn.setStyleSheet(
+            f"QToolButton{{background:{colors.control_background};border:1px solid {colors.border};border-radius:5px;}}"
+            f"QToolButton:hover{{background:{colors.hover};}} QToolButton:disabled{{border-color:transparent;}}"
+        )
         self.readiness_window.apply_theme_tokens(colors)
 
         uses_dark_text = _relative_luminance(colors.text) < 0.5
@@ -2362,6 +2475,85 @@ class ForgeTab(QtWidgets.QWidget):
         self._set_status(
             f"Curtain style set to {CURTAIN_STYLE_LABELS[style]}."
         )
+
+    def _curtain_cover(self) -> Path | None:
+        from config import USER_PAGES_DIR
+        from project_repository import ProjectRepositoryError, _safe_file
+        from project_session import peek_project_session
+
+        session = peek_project_session(self.project_root)
+        if session is None:
+            return next((candidate for suffix in (".gif", ".png")
+                         if (candidate := self.project_root / USER_PAGES_DIR / f"cover{suffix}").is_file()), None)
+        page = next((page for page in session.project.pages
+                     if page["type"] == "cover" and page["artwork"].get("asset")), None)
+        if page is not None:
+            for root in dict.fromkeys((session.asset_root, self.project_root)):
+                if root is None:
+                    continue
+                try:
+                    path = _safe_file(root, page["artwork"]["asset"])
+                    if path.is_file():
+                        return path
+                except ProjectRepositoryError:
+                    continue
+        return None
+
+    def preview_curtains(self) -> None:
+        from config import USER_CONTROLS_DIR
+        from curtain_color import curtain_rgb_for_style, write_tinted_curtain_image
+
+        if self._busy:
+            return
+        cover = self._curtain_cover()
+        if cover is None:
+            self._set_status("Add cover artwork to preview the curtains.", error=True)
+            return
+        style = self.curtain_styles.current_style
+        context = _forge_project_context(self.project_root)
+        controls = self.project_root / USER_CONTROLS_DIR
+
+        def read_image(path):
+            reader = QtGui.QImageReader(str(path))
+            reader.setAutoTransform(True)
+            size = reader.size()
+            if size.isValid() and (size.width() > 1200 or size.height() > 1200):
+                size.scale(1200, 1200, Qt.KeepAspectRatio)
+                reader.setScaledSize(size)
+            image = reader.read()
+            if image.isNull():
+                raise _ForgeOperationError(f"Could not read curtain preview artwork: {path.name}.")
+            return image
+
+        def task():
+            rgb = curtain_rgb_for_style((cover,), style)
+            with tempfile.TemporaryDirectory(prefix="curtains-") as temporary:
+                panels = []
+                for filename in ("cleft.png", "cright.png"):
+                    tinted = Path(temporary) / filename
+                    write_tinted_curtain_image(controls / filename, tinted, rgb)
+                    panels.append(read_image(tinted))
+                return read_image(cover), *panels, QtGui.QColor(*rgb).darker(150)
+
+        def show(images):
+            if not _forge_context_is_current(self.project_root, context) or self._curtain_cover() != cover:
+                return
+            dialog = QtWidgets.QDialog(self)
+            dialog.setAttribute(Qt.WA_DeleteOnClose)
+            dialog.setWindowTitle(f"Preview Curtains — {CURTAIN_STYLE_LABELS[style]}")
+            dialog.resize(540, 480 if self._preview_mode == "portrait" else 360)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            preview = _CurtainPreview(*images, dialog)
+            layout.addWidget(preview, 1)
+            buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+            replay = buttons.addButton("Replay", QtWidgets.QDialogButtonBox.ActionRole)
+            replay.clicked.connect(preview.replay)
+            buttons.rejected.connect(dialog.close)
+            layout.addWidget(buttons)
+            dialog.show()
+            QtCore.QTimer.singleShot(180, preview, preview.replay)
+
+        self._start_operation("Preparing curtain preview…", task, show, "The curtains could not be previewed.", quiet=True)
 
     def _sync_publishing_controls(self) -> None:
         configuration = github_application_configuration()
@@ -3111,17 +3303,14 @@ class ForgeTab(QtWidgets.QWidget):
             if self.preview_mode.count() == 0:
                 for label, mode in PREVIEW_MODES:
                     self.preview_mode.addItem(label, mode)
-                    self.preview_mode.setItemData(
-                        self.preview_mode.count() - 1,
-                        PREVIEW_MODE_DESCRIPTIONS[mode],
-                        Qt.UserRole + 1,
-                    )
             current = self.preview_mode.findData(self._preview_mode)
             self.preview_mode.setCurrentIndex(current)
         self.preview_mode.setEnabled(available and not self._busy)
         self.preview_mode._arrow.setVisible(available)
-        self.curtain_style_selector.set_choices_available(available)
-        self.curtain_style_selector.setEnabled(available and not self._busy)
+        has_cover = self._curtain_cover() is not None
+        self.curtain_style_selector.set_choices_available(available or has_cover)
+        self.curtain_style_selector.setEnabled((available or has_cover) and not self._busy)
+        self.curtain_preview_btn.setEnabled(has_cover and not self._busy)
 
     def _github_sign_in_warning_active(self) -> bool:
         return bool(
@@ -3316,6 +3505,9 @@ class ForgeTab(QtWidgets.QWidget):
             self.open_published_btn,
         ):
             button.setVisible(not publishing_active)
+        copy_available = publication_valid and not protected and snapshot.get(PUBLICATION_VERIFIED_KEY) is True
+        self.copy_link_btn.setVisible(copy_available and not publishing_active)
+        self.copy_link_btn.setEnabled(copy_available and not self._busy and not self._publication_operation)
         self.unpublish_btn.setVisible(published)
         self.unpublish_btn.setAccessibleName("Unpublish Letter")
         set_control_help(
@@ -3384,9 +3576,9 @@ class ForgeTab(QtWidgets.QWidget):
             "Stock Letters" if stock_mode else "Load letter"
         )
         self.last_project_button.setVisible(not stock_mode)
-        self.last_project_button.setEnabled(
-            callable(getattr(self.window(), "open_last_project", None))
-        )
+        self.last_project_target.setVisible(not stock_mode)
+        self.saved_search.setVisible(not stock_mode)
+        self._update_last_saved_project(self._rendered_catalog_entries if not stock_mode and self._rendered_catalog_mode == "saved" else ())
         self.saved_delete_toggle.hide()
         self.refresh_saved_letters(
             force_reconcile=not stock_mode or self._catalog_dirty
@@ -3434,6 +3626,24 @@ class ForgeTab(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(0, self._layout_saved_cards)
         if not stock_mode:
             QtCore.QTimer.singleShot(0, self.saved_projects.github_library.refresh)
+
+    def _open_last_saved_project(self) -> None:
+        if self._last_saved_project is not None and self.last_project_button.isEnabled():
+            self.window().open_last_project(entry=self._last_saved_project)
+
+    def _update_last_saved_project(self, entries) -> None:
+        entry = SavedLetterCatalog.last_project(entries)
+        self._last_saved_project = entry
+        text = f"Last project · {entry.title}" if entry else "No saved project yet"
+        if entry and entry.recipient:
+            text += f" · {entry.recipient}"
+        self.last_project_target.setText(text)
+        self.last_project_button.setEnabled(bool(entry and not self._busy and not self._catalog_reconcile_active
+                                                 and callable(getattr(self.window(), "open_last_project", None))))
+
+    def _filter_saved_letters(self) -> None:
+        if self._rendered_catalog_mode == self._saved_panel_mode == "saved":
+            self._render_saved_letter_entries(self._rendered_catalog_entries, "saved")
 
     def repair_duplicate_autosave_ids(self) -> tuple[tuple[Path, str], ...]:
         """Repair independent autosave copies while preserving the active path."""
@@ -3496,6 +3706,9 @@ class ForgeTab(QtWidgets.QWidget):
     ) -> None:
         if mode != self._saved_panel_mode:
             return
+        query = self.saved_search.text().strip() if mode == "saved" else ""
+        if mode == "saved":
+            self._update_last_saved_project(entries)
         selected_path = (
             str(self._selected_saved_letter.path)
             if self._selected_saved_letter is not None
@@ -3507,13 +3720,15 @@ class ForgeTab(QtWidgets.QWidget):
             self._catalog_rendered
             and self._rendered_catalog_mode == mode
             and entries == self._rendered_catalog_entries
+            and query == self._rendered_saved_query
         ):
             self._watch_saved_letter_paths(entries)
             if hasattr(self, "saved_projects"):
                 self.saved_projects.github_library.sync_cards()
             return
-        recent_entries = entries[:RECENT_SAVED_LETTER_LIMIT]
-        archived_entries = entries[RECENT_SAVED_LETTER_LIMIT:]
+        visible_entries = tuple(entry for entry in entries if SavedLetterCatalog.matches_query(entry, query)) if query else entries
+        recent_entries = visible_entries[:RECENT_SAVED_LETTER_LIMIT]
+        archived_entries = visible_entries[RECENT_SAVED_LETTER_LIMIT:]
         retained_cards = {
             card.entry.path: card
             for card in self._saved_cards
@@ -3555,11 +3770,12 @@ class ForgeTab(QtWidgets.QWidget):
         self._refresh_saved_archive(
             archived_entries,
             selected_path,
-            all_entries=entries,
+            all_entries=visible_entries,
         )
         self._layout_saved_cards()
         self._watch_saved_letter_paths(entries)
         self._rendered_catalog_entries = entries
+        self._rendered_saved_query = query
         self._rendered_catalog_mode = mode
         self._catalog_rendered = True
         self._pending_scroll_position = (horizontal, vertical)
@@ -3567,6 +3783,12 @@ class ForgeTab(QtWidgets.QWidget):
         if hasattr(self, "saved_projects"):
             self.saved_projects.github_library.sync_cards()
             self.saved_projects.selected_changed()
+        self._update_saved_search_empty()
+
+    def _update_saved_search_empty(self) -> None:
+        controller = getattr(self, "saved_projects", None)
+        self.saved_no_matches.setVisible(bool(self._saved_panel_mode == "saved" and self.saved_search.text().strip()
+            and not self._saved_cards and not (controller and controller.github_library.cards)))
 
     def _start_catalog_reconciliation(
         self,
@@ -3645,6 +3867,8 @@ class ForgeTab(QtWidgets.QWidget):
 
     def _set_catalog_interaction_enabled(self, enabled: bool) -> None:
         active = bool(enabled) and not self._busy
+        self.last_project_button.setEnabled(bool(active and self._last_saved_project
+                                                 and callable(getattr(self.window(), "open_last_project", None))))
         for card in self._saved_cards:
             card.setEnabled(active)
         for widget in (
@@ -4444,10 +4668,10 @@ class ForgeTab(QtWidgets.QWidget):
     def _preview_mode_changed(self) -> None:
         if not self._readiness_result.can_preview:
             return
-        mode = str(self.preview_mode.currentData() or "landscape")
+        mode = str(self.preview_mode.currentData() or "window")
         self._preview_mode = mode
         self.settings.update_fields({PREVIEW_MODE_KEY: mode})
-        self.request_preview()
+        self.preview_format_changed.emit(mode)
 
     def _current_play_index(self) -> Optional[Path]:
         try:
@@ -4473,7 +4697,7 @@ class ForgeTab(QtWidgets.QWidget):
 
     @property
     def operation_in_progress(self) -> bool:
-        return self._busy
+        return self._busy or bool(self._publication_operation)
 
     def request_preview(self) -> None:
         index = self.current_play_index()
@@ -4524,8 +4748,10 @@ class ForgeTab(QtWidgets.QWidget):
 
     def show_export_menu(self) -> None:
         menu = QtWidgets.QMenu(self)
-        for label, output_format in (("ZIP Package…", "zip"), ("Single HTML…", "html"), ("Website ZIP…", "publish_zip")):
-            action = menu.addAction(label)
+        menu.setToolTipsVisible(True)
+        for output_format, (label, _extension, description) in EXPORT_FORMATS.items():
+            action = menu.addAction(label + "…")
+            action.setToolTip(description)
             action.triggered.connect(lambda _checked=False, kind=output_format: self.export_letter(kind))
         menu.exec(self.export_btn.mapToGlobal(self.export_btn.rect().bottomLeft()))
         menu.deleteLater()
@@ -4535,33 +4761,85 @@ class ForgeTab(QtWidgets.QWidget):
             return
         if not self._flush_prompt_writer_state() or self._required_gate(for_publish=True) is None:
             return
-        from forge_render import capture_render, export_render
+        from config import safe_folder_name
+        from forge_render import capture_render, export_render, render_is_current
+        from portable_export import PortableExportError
         from project_session import get_project_session
+        from transactional_io import PathTransaction, atomic_copy_file
 
         session = get_project_session(self.project_root)
         context = _forge_project_context(self.project_root)
         render = capture_render(session, "display")
-        extension = ".html" if output_format == "html" else ".zip"
-        label = "Single HTML (*.html)" if output_format == "html" else "ZIP Package (*.zip)"
-        name = generate.play_bundle_directory(self.project_root).name
+        label, extension, description = EXPORT_FORMATS[output_format]
+        name = safe_folder_name(render.snapshot["metadata"].get("recipient_title"), "Letter")
         if output_format == "publish_zip":
             name += "-website"
-        filename, _filter = QtWidgets.QFileDialog.getSaveFileName(self, "Export Letter", name + extension, label)
-        if not filename:
-            return
-        destination = Path(filename)
-        if destination.suffix.casefold() != extension:
-            self._set_status(f"Choose a filename ending in {extension}.", error=True)
-            return
 
-        def task():
+        def estimate():
             _require_forge_context(self.project_root, context)
-            path = export_render(session, destination, output_format=output_format, render_input=render,
-                                 cancelled=lambda: QtCore.QThread.currentThread().isInterruptionRequested())
-            return path, context, render.source_fingerprint
+            root = application_paths(self.project_root).temporary_root
+            root.mkdir(parents=True, exist_ok=True)
+            temporary = tempfile.TemporaryDirectory(prefix="forge-export-", dir=root)
+            try:
+                path = export_render(session, Path(temporary.name) / ("letter" + extension), output_format=output_format,
+                                     render_input=render, cancelled=QtCore.QThread.currentThread().isInterruptionRequested)
+                return temporary, path, path.stat().st_size
+            except PortableExportError as error:
+                temporary.cleanup()
+                raise _ForgeOperationError(str(error)) from error
+            except Exception:
+                temporary.cleanup()
+                raise
 
-        self._start_operation("Exporting letter…", task, self._export_completed,
-                              "Export failed. Any previous export was preserved.")
+        def choose_destination(prepared):
+            temporary, path, size = prepared
+            if not render_is_current(session, render):
+                temporary.cleanup()
+                self._set_status("The letter changed. Prepare a new export.", error=True)
+                return
+            size_label = f"{size / 1024:.0f} KB" if size < 1024**2 else f"{size / 1024**2:.1f} MB"
+            review = LetterSmithConfirmationDialog(
+                self, title=label, question=f"{description}\n\nEstimated size {size_label}",
+                primary_text="Choose File", secondary_text="Cancel", width=460,
+            )
+            if review.exec() != QtWidgets.QDialog.Accepted:
+                temporary.cleanup()
+                return
+            filename, _filter = QtWidgets.QFileDialog.getSaveFileName(self, "Export Letter", name + extension, f"{label} (*{extension})")
+            if not filename:
+                temporary.cleanup()
+                return
+            destination = Path(filename)
+            if destination.suffix.casefold() != extension:
+                temporary.cleanup()
+                self._set_status(f"Choose a filename ending in {extension}.", error=True)
+                return
+
+            def save_export():
+                transaction = PathTransaction(destination, unique_staging=True)
+                try:
+                    atomic_copy_file(path, transaction.prepare())
+
+                    def commit(_model, _page_id):
+                        if not render_is_current(session, render) or QtCore.QThread.currentThread().isInterruptionRequested():
+                            raise _ForgeOperationError("The project changed or the export was canceled. Prepare a new export.")
+                        transaction.commit()
+
+                    if not session.apply_result(render.targets[0], commit):
+                        raise _ForgeOperationError("The project changed. Prepare a new export.")
+                except Exception:
+                    transaction.abort()
+                    raise
+                finally:
+                    temporary.cleanup()
+                return destination, context, render.source_fingerprint
+
+            self._start_operation("Saving export…", save_export, self._export_completed,
+                                  "Export failed. Any previous export was preserved.")
+
+        self._start_operation("Preparing export and calculating size…", estimate,
+                              lambda prepared: self._defer_until_idle(lambda: choose_destination(prepared)),
+                              "The export could not be prepared.")
 
     def _export_completed(self, result: object) -> None:
         path, context, fingerprint = result
@@ -4782,6 +5060,12 @@ class ForgeTab(QtWidgets.QWidget):
         try:
             project_context = _forge_project_context(self.project_root)
             render_input = _capture_forge_render(self.project_root, output_mode="display")
+            authored = None
+            if render_input is not None and project_context[0] is not None:
+                from project_model import ProjectModel
+                snapshot = project_context[0].project.to_dict()
+                if snapshot["revision"] == render_input.revision and snapshot["project_id"] == render_input.project_id:
+                    authored = ProjectModel.from_dict(snapshot)
             message = None if render_input is not None else (
                 read_text_normalized(message_path)
                 if message_path.is_file()
@@ -4829,13 +5113,20 @@ class ForgeTab(QtWidgets.QWidget):
                 for key in ("recipient_name", "recipient_title"):
                     if key in render_input.snapshot["metadata"]:
                         metadata[key] = render_input.snapshot["metadata"][key]
+                from project_repository import selected_sound_tracks
+                pages = render_input.snapshot["pages"]
+                metadata["_publication_summary"] = {
+                    "pages": len(pages),
+                    "message_pages": sum(bool((page.get("message") or {}).get("html", "").strip()) for page in pages),
+                    "tracks": len(selected_sound_tracks(render_input.snapshot["sound"])),
+                }
             record_saved_letter_activity(play_path)
             snapshot = self._publication_connection_snapshot()
             session = snapshot.session
             access = snapshot.access
             completed_fingerprint = _forge_source_fingerprint(self.project_root)
             prepared_output = (
-                _stage_publish_display(self.project_root, play_path, render_input)
+                _stage_publish_display(self.project_root, play_path, render_input, authored)
                 if render_input is not None else None
             )
             return (
@@ -5032,7 +5323,8 @@ class ForgeTab(QtWidgets.QWidget):
             if getattr(publish_result, "success", False) and _forge_context_is_current(self.project_root, project_context):
                 publication = _publication_fields_from_result(publish_result)
                 if publication_status(publication) == "published":
-                    _record_verified_publication(self.project_root, project_context, publication)
+                    snapshot_path = _record_verified_publication(self.project_root, project_context, publication,
+                                                                 authored_root=getattr(prepared_output, "name", None))
                     try:
                         def save_matching_snapshot():
                             if project_context is not None and project_context[0] is not None:
@@ -5041,10 +5333,8 @@ class ForgeTab(QtWidgets.QWidget):
                                     raise _ForgeOperationError("The current draft differs from the published presentation.")
                             return save_published_snapshot(play_dir, self.project_root, publication)
 
-                        snapshot_path = _apply_forge_context(
-                            self.project_root, project_context,
-                            save_matching_snapshot,
-                        )
+                        if snapshot_path is None:
+                            snapshot_path = _apply_forge_context(self.project_root, project_context, save_matching_snapshot)
                     except Exception:
                         _LOGGER.exception(
                             "The published recovery copy could not be saved."
@@ -5182,30 +5472,36 @@ class ForgeTab(QtWidgets.QWidget):
         ):
             return
         metadata = self.settings.snapshot()
+        project_context = _forge_project_context(self.project_root)
         if publication_status(metadata) != "published":
             self._set_status("This letter is not published.")
             return
+        title = str(metadata.get("recipient_title") or "Untitled Letter")
+        url = normalize_published_page_url(metadata.get(PUBLISHED_PAGE_URL_KEY, ""))
         confirmation = LetterSmithConfirmationDialog(
             self,
             title="Unpublish Letter",
-            question=(
-                "Remove this letter from the web? The local letter and all of "
-                "its files will remain untouched."
-            ),
-            primary_text="Yes",
-            secondary_text="No",
+            question=f'Remove “{title}” from this address?\n\n{url}',
+            primary_text="Unpublish",
+            secondary_text="Cancel",
             destructive_primary=True,
             click_outside_dismiss=False,
+            width=490,
         )
+        confirmation.message_label.setTextFormat(Qt.PlainText)
         if confirmation.exec() != QtWidgets.QDialog.Accepted:
             self._set_status("Unpublishing canceled.")
             return
+        if not _forge_context_is_current(self.project_root, project_context):
+            self._set_status("The project changed. Review the current letter before unpublishing.", error=True)
+            return
+        metadata["_confirmed_unpublish_url"] = url
         index = self._current_play_index()
         play_dir = index.parent if index is not None else None
 
         def task() -> tuple:
             snapshot = self._publication_connection_snapshot()
-            return dict(metadata), play_dir, snapshot.session, snapshot.access
+            return dict(metadata), play_dir, snapshot.session, snapshot.access, project_context
 
         self._begin_publication_activity(
             "unpublish",
@@ -5220,10 +5516,11 @@ class ForgeTab(QtWidgets.QWidget):
         )
 
     def _unpublish_prepared(self, result: object) -> None:
-        metadata, play_dir, session, access = tuple(result)
+        metadata, play_dir, session, access, *contexts = tuple(result)
         self._pending_unpublish_context = (
             dict(metadata),
             Path(play_dir) if play_dir is not None else None,
+            *contexts,
         )
         self._pending_unpublish_retry_attempt = 0
         if not isinstance(session, GitHubSession):
@@ -5270,7 +5567,12 @@ class ForgeTab(QtWidgets.QWidget):
         if current_session is None:
             return
         session = current_session
-        metadata, play_dir = context
+        metadata, play_dir, *contexts = context
+        project_context = contexts[0] if contexts else None
+        if not _forge_context_is_current(self.project_root, project_context):
+            self._abort_publication_activity("unpublish")
+            self._set_status("The project changed. Start unpublishing again from the current project.", error=True)
+            return
 
         def task() -> tuple:
             api = self._github_service.authorized_api(session)
@@ -5284,9 +5586,24 @@ class ForgeTab(QtWidgets.QWidget):
                 connection_generation=connection_snapshot.generation,
                 cancelled=lambda: (
                     QtCore.QThread.currentThread().isInterruptionRequested()
+                    or not _forge_context_is_current(self.project_root, project_context)
                 ),
             )
-            return play_dir, publisher.unpublish(dict(metadata))
+            result = publisher.unpublish(dict(metadata))
+            if getattr(result, "success", False):
+                from datetime import timezone
+                from saved_letter_versions import write_letter_state
+                from settings_store import empty_publication_settings
+                publication = empty_publication_settings()
+                if metadata.get(PROJECT_PUBLISHED_AT_KEY):
+                    publication[PROJECT_PUBLISHED_AT_KEY] = metadata[PROJECT_PUBLISHED_AT_KEY]
+                try:
+                    write_letter_state(self.project_root, metadata.get("project_id"), "live", {
+                        "publication": publication, "recorded_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                except OSError:
+                    _LOGGER.warning("Could not store the verified withdrawal", exc_info=True)
+            return play_dir, result
 
         self._update_publication_activity(
             "Removing the public copy and verifying withdrawal…"
@@ -5323,6 +5640,8 @@ class ForgeTab(QtWidgets.QWidget):
         self._pending_unpublish_retry_attempt = 0
         self.published_url_changed.emit("")
         self.refresh_project_state()
+        if getattr(self, "saved_panel", None) is not None and self.saved_panel.isVisible():
+            self.refresh_saved_letters(force_reconcile=True)
         if play_dir is not None and Path(play_dir).is_dir():
             try:
                 update_saved_publication_metadata(
@@ -5567,6 +5886,16 @@ class ForgeTab(QtWidgets.QWidget):
             set_control_help(self.open_published_btn, disabled)
         self._update_letter_action_button_states()
 
+    def copy_published_link(self) -> None:
+        snapshot = self.settings.snapshot()
+        if (self.is_protected_project(snapshot) or snapshot.get(PUBLICATION_VERIFIED_KEY) is not True
+                or not self._known_valid_publication(snapshot)):
+            self._set_status("No verified published link is available.", error=True)
+            return
+        url = normalize_published_page_url(snapshot[PUBLISHED_PAGE_URL_KEY])
+        QtGui.QGuiApplication.clipboard().setText(url)
+        self._set_status("Published link copied.")
+
     def _published_url_unavailable(self, snapshot: dict | None = None) -> bool:
         if snapshot is None:
             snapshot = self.settings.snapshot()
@@ -5751,10 +6080,14 @@ class ForgeTab(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(0, self.ensure_preview_current)
 
     def _set_busy(self, busy: bool) -> None:
+        self.saved_search.setEnabled(not busy)
+        self._update_last_saved_project(self._rendered_catalog_entries if self._saved_panel_mode == "saved" else ())
         controller = getattr(self, "saved_projects", None)
         if controller is not None:
             controller.menu.setEnabled(not busy)
-            controller.open_button.setEnabled(not busy and bool(self._selected_saved_letter and self._selected_saved_letter.valid))
+            controller.selected_changed()
+            if busy:
+                controller.open_button.setEnabled(False)
         for card in self._saved_cards:
             card.setEnabled(not busy)
         self.saved_archive_recipient.setEnabled(not busy)

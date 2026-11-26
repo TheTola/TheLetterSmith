@@ -18,6 +18,7 @@ import random
 import re
 import shutil
 import time
+from contextlib import nullcontext
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1454,15 +1455,11 @@ def _file_signature(path: Path) -> Optional[Tuple[int, int]]:
     return stat.st_mtime_ns, stat.st_size
 
 
-def _candidate_paths_for(name: str | Path) -> List[Path]:
-    path = Path(name)
-    if not path.is_absolute():
-        path = application_paths().bundled_prompt_writer_root / path.name
-    return [path.resolve()]
-
-
 def _read_list_file(name: str | Path) -> Tuple[List[str], Optional[Path], Optional[Tuple[int, int]]]:
-    p = _candidate_paths_for(name)[0]
+    p = Path(name)
+    if not p.is_absolute():
+        p = application_paths().bundled_prompt_writer_path(p.name)
+    p = p.resolve()
     try:
         if not p.exists() or not p.is_file():
             LOGGER.error("Prompt Writer module list is missing: %s", p)
@@ -1709,7 +1706,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self._hide_timer.timeout.connect(self._finish_close_animation)
         self._animation_generation = 0
 
-        role_lines, _ = _read_list_file_cached(self._default_modules_dir() / "role.txt")
+        role_lines, _ = _read_list_file_cached(self._module_path("role.txt"))
         seeded_role = _clean_choice_line(role_lines[0]) if role_lines and any(l.strip() for l in role_lines) else "Artist"
 
         default_format = (
@@ -1851,7 +1848,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
             return
         self._writing = True
         try:
-            self.session.project.update_prompt(self._view_page_id, {"text": self._view_spec.preview_widget.toPlainText()})
+            self.session.project.update_prompt(self._view_page_id, {"text": self._view_spec.preview_widget.toPlainText()},
+                                               history_group="manual")
         finally:
             self._writing = False
         self._authored_change()
@@ -2035,7 +2033,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
 
 
     def _module_path(self, name: str) -> Path:
-        return self._builtin_modules_dir() / name
+        return self.application_paths.bundled_prompt_writer_path(name)
 
     # -----------------------
     # Persistence
@@ -2080,12 +2078,6 @@ class PromptWriterPanel(QtWidgets.QWidget):
         }
         return combos[key]
 
-    def _default_modules_dir(self) -> Path:
-        return self._builtin_modules_dir()
-
-    def _builtin_modules_dir(self) -> Path:
-        return self.application_paths.bundled_prompt_writer_root.resolve()
-
     def _user_modules_dir(self) -> Path:
         return self.application_paths.prompt_writer_content_root.resolve()
 
@@ -2096,7 +2088,7 @@ class PromptWriterPanel(QtWidgets.QWidget):
         config = self._managed_list_config(key)
         filename = config["primary_name"]
         user_path = self._user_modules_dir() / filename
-        return user_path if user_path.is_file() else self._builtin_modules_dir() / filename
+        return user_path if user_path.is_file() else self._module_path(filename)
 
     def _managed_list_write_path(self, key: str) -> Path:
         config = self._managed_list_config(key)
@@ -2182,12 +2174,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
                 result.append(replace(entry, text=text, is_user=in_user_group))
             return result
 
-        builtin_path = self._builtin_modules_dir() / config["primary_name"]
+        builtin_path = self._module_path(config["primary_name"])
         bundled = parse(builtin_path)
         builtins = [entry for entry in bundled if not entry.is_user]
         builtin_keys = {_managed_entry_key(entry.text) for entry in builtins if not entry.is_header}
         legacy_path = self._resolve_managed_list_path(key)
-        legacy = parse(legacy_path)
+        legacy = bundled if legacy_path == builtin_path else parse(legacy_path)
         custom = [entry.text for entry in legacy if not entry.is_header and
                   (entry.is_user or _managed_entry_key(entry.text) not in builtin_keys)]
         if key == "color":
@@ -2705,6 +2697,10 @@ class PromptWriterPanel(QtWidgets.QWidget):
             new_session = self._view_session_id != self.session.session_id
             new_binding = selected != self._view_page_id or new_session
             if new_binding:
+                for widget in (
+                    self.txt_global, self._view_spec.detail_widget, self._view_spec.preview_widget,
+                ):
+                    self._cancel_field_dictation(widget)
                 for dialog in tuple(self._list_manager_dialogs.values()):
                     dialog.close()
             if self._view_session_id != self.session.session_id:
@@ -2772,12 +2768,41 @@ class PromptWriterPanel(QtWidgets.QWidget):
             self._state_persistence_suspended = False
 
     @staticmethod
+    def _cancel_field_dictation(widget):
+        binding = getattr(widget, "_dictation_binding", None)
+        if binding is not None:
+            binding.cancel()
+
+    def _attach_shared_prompt_dictation(self):
+        from dictation import attach_dictation
+
+        attach_dictation(self.txt_global, label="Dictate shared prompt directions")
+
+    @staticmethod
     def _restore_text(widget, text, new_binding=False):
         # Qt normalizes displayed line endings. Identical refreshes must retain
         # the cursor, selection and undo history, including historical CRLF.
         displayed = text.replace("\r\n", "\n").replace("\r", "\n")
         if new_binding or widget.toPlainText() != displayed:
-            widget.setPlainText(text)
+            PromptWriterPanel._cancel_field_dictation(widget)
+            binding = getattr(widget, "_proofreading_binding", None)
+            with binding.suspend() if binding is not None else nullcontext():
+                widget.setPlainText(text)
+
+    def _attach_prompt_proofreading(self, widget, key):
+        from proofreading import attach_proofreading
+
+        return attach_proofreading(
+            widget, service=self._language_service, context="prompt",
+            protected_terms=lambda: tuple(
+                str(self._data.get(name, "")) for name in ("subject", "type", "color")
+                if self._data.get(name)
+            ),
+            identity=lambda: (
+                self.session.session_id, key, self._shutdown,
+                self._state_persistence_suspended, self.session.is_restoring,
+            ),
+        )
 
 
     def _restore_persisted_state(self) -> bool:
@@ -2788,6 +2813,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
     # UI
     # -----------------------
     def _build_ui(self):
+        from dictation import attach_dictation
+
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(0)
@@ -3100,6 +3127,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
         self.txt_global.setPlaceholderText("Add ideas that should be applied across every image in the set.")
         self.txt_global.setMinimumHeight(92)
         self.txt_global.setMaximumHeight(132)
+        self._attach_shared_prompt_dictation()
+        self._attach_prompt_proofreading(self.txt_global, "global")
         _set_help(
             self.txt_global,
             "Anything written here is added to every generated image prompt, so use it for shared ideas, mood, setting, or details that should apply across the full set.",
@@ -3168,6 +3197,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
             editor.document().setDocumentMargin(6)
             editor.setMinimumHeight(76)
             editor.setMaximumHeight(96)
+            attach_dictation(editor, label="Dictate page directions")
+            self._attach_prompt_proofreading(editor, (page.key, "directions"))
             editor.setPlaceholderText(
                 f"Add details that should apply only to {page.output_filename}."
             )
@@ -3297,6 +3328,8 @@ class PromptWriterPanel(QtWidgets.QWidget):
             editor.setMinimumHeight(140)
             editor.setMaximumHeight(16777215)
             editor.document().setDocumentMargin(8)
+            attach_dictation(editor, label="Dictate prompt")
+            self._attach_prompt_proofreading(editor, (page.key, "text"))
             bl.addWidget(editor)
             image_label = QtWidgets.QLabel()
             image_label.setAlignment(Qt.AlignCenter)
@@ -3920,7 +3953,12 @@ class PromptWriterPanel(QtWidgets.QWidget):
         widget = page.preview_widget
         if widget is None:
             return
-        widget.setExtraSelections([])
+        from proofreading import PROOFREADING_SELECTION_PROPERTY
+
+        widget.setExtraSelections([
+            selection for selection in widget.extraSelections()
+            if selection.format.property(PROOFREADING_SELECTION_PROPERTY)
+        ])
         plain = widget.toPlainText()
         choices = {}
         page_id = page.key if page.key != "current" else self._view_page_id
@@ -4167,15 +4205,17 @@ class PromptWriterPanel(QtWidgets.QWidget):
     ) -> None:
         if widget.toPlainText() == text:
             return
-        blocker = QtCore.QSignalBlocker(widget)
-        cursor = QtGui.QTextCursor(widget.document())
-        cursor.beginEditBlock()
-        try:
-            cursor.select(QtGui.QTextCursor.Document)
-            cursor.insertText(text)
-        finally:
-            cursor.endEditBlock()
-            blocker.unblock()
+        binding = getattr(widget, "_proofreading_binding", None)
+        with binding.suspend() if binding is not None else nullcontext():
+            blocker = QtCore.QSignalBlocker(widget)
+            cursor = QtGui.QTextCursor(widget.document())
+            cursor.beginEditBlock()
+            try:
+                cursor.select(QtGui.QTextCursor.Document)
+                cursor.insertText(text)
+            finally:
+                cursor.endEditBlock()
+                blocker.unblock()
 
     def _on_generate(self):
         if self._view_page_id is not None:

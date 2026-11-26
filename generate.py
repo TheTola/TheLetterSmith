@@ -8,7 +8,7 @@
 #         pages/      (cover/letter/wall/back)
 #         controls/   (npage/ppage/cleft/cright/volon/voloff/showmessageicon)
 #         message/    (message.html, message.png optional)
-#         sounds/     (single track or playlist, glissando, flip1..flip10)
+#         sounds/     (single track or playlist, glissando, transitions/)
 #
 # Source-of-truth on disk:
 #   User content:
@@ -48,6 +48,7 @@ from urllib.parse import unquote, urlsplit
 
 from Template import TEMPLATE_HTML, TEMPLATE_CSS, TEMPLATE_JS, template_for_pages
 from page_layout import load_pages, page_files
+from page_transitions import TRANSITION_SOUNDS
 from curtain_cache import CurtainVariantCache, load_curtain_variant_cache
 from curtain_color import (
     curtain_variant_rgbs,
@@ -110,8 +111,6 @@ from config import (
     MUSIC_FILE,
     USER_MESSAGE_DIR,
     GLISS_FILE,
-    FLIP_PREFIX,
-    FLIP_COUNT,
 )
 
 # App-owned SFX live here (relative to the application resource root).
@@ -546,30 +545,26 @@ def _validate_template_placeholders() -> None:
 
 
 def _sfx_names() -> list[str]:
-    names = [GLISS_FILE]
-    for i in range(1, FLIP_COUNT + 1):
-        names.append(f"{FLIP_PREFIX}{i}.mp3")
-    return names
+    cues = dict.fromkeys(name for sources in TRANSITION_SOUNDS.values() for name in sources)
+    return [GLISS_FILE, *cues]
 
 
 def _resolve_sfx_sources(project_root: Path) -> dict[str, Path]:
-    paths = application_paths(project_root)
-    directories = (paths.app_resource_path(APP_SOUNDS_DIR),)
+    root = application_paths(project_root).app_resource_path(APP_SOUNDS_DIR)
+    directories: dict[Path, dict[str, Path]] = {}
     resolved: dict[str, Path] = {}
-    for directory in directories:
-        if not directory.is_dir():
-            continue
-        available = {
-            path.name.casefold(): path
-            for path in directory.iterdir()
-            if path.is_file() and not path.is_symlink()
-        }
-        for name in _sfx_names():
-            if name in resolved:
-                continue
-            source = available.get(name.casefold())
-            if source is not None:
-                resolved[name] = source
+    for name in _sfx_names():
+        relative = Path(name)
+        directory = root / relative.parent
+        if directory not in directories:
+            directories[directory] = {
+                path.name.casefold(): path
+                for path in (directory.iterdir() if directory.is_dir() else ())
+                if path.is_file() and not path.is_symlink()
+            }
+        source = directories[directory].get(relative.name.casefold())
+        if source is not None:
+            resolved[name] = source
     return resolved
 
 
@@ -629,6 +624,7 @@ def play_bundle_directory(project_root: str | Path) -> Path:
         title=title,
         project_id=project_id,
         active_play_dir=active_value,
+        preserve_saved=session is not None,
     )
     if (
         str(build) != active_value
@@ -1084,12 +1080,14 @@ def build_play_bundle_to(
     )
     starting_vol = _starting_volume_from_settings(settings)
     project_id = ensure_project_identity(pr)
+    from project_session import peek_project_session
     bp = plan_build(
         pr,
         recipient=recipient,
         title=title,
         project_id=project_id,
         play_dir_override=target,
+        preserve_saved=peek_project_session(pr) is not None,
     )
     reuse_root = (
         Path(reuse_play_directory).resolve()

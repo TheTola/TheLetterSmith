@@ -579,10 +579,10 @@ class ImageAnimationTests(unittest.TestCase):
             self.assertIn("--duration-overlay:180ms", styles)
             self.assertIn("--duration-curtain:1500ms", styles)
             self.assertIn(".text-wall.is-open{opacity:1", styles)
-            self.assertIn("#turnShadow{position:absolute", styles)
+            self.assertIn("#turn{position:absolute", styles)
             self.assertIn("#slideshow.page-turning .nav-button", styles)
             self.assertIn("const goingNext = target > idx", script)
-            self.assertIn("const eased = motion.ease(raw)", script)
+            self.assertIn("frame(goingNext ? progress : 1 - progress)", script)
             self.assertIn("if (!started || flipping", script)
             self.assertIn('"playback_mode": "ping_pong"', index)
             self.assertIn('"animation_enabled": false', index)
@@ -803,48 +803,50 @@ class ImageAnimationTests(unittest.TestCase):
             self.assertEqual(record["processing"]["max_dimension"], 2048)
             self.assertEqual(record["thumbnail_file"], "cover.thumbnail.gif")
 
-    def test_stock_image_tray_is_compact_frameless_and_single_click(self) -> None:
-        paths = tuple(Path(f"stock-{index}.png") for index in range(3))
-        dialog = StockImageDialog("Cover Page", paths)
-        try:
-            self.assertTrue(dialog.windowFlags() & QtCore.Qt.Popup)
-            self.assertTrue(dialog.windowFlags() & QtCore.Qt.FramelessWindowHint)
-            self.assertLessEqual(dialog.width(), dialog.screen().availableGeometry().width())
-            self.assertGreater(dialog.height(), dialog._images.iconSize().height())
-            self.assertIsNone(dialog.findChild(QtWidgets.QDialogButtonBox))
-            self.assertIsNone(dialog._recent_images)
-            self.assertEqual(dialog._images.count(), 3)
-
-            item = dialog._images.item(1)
-            dialog._images.itemClicked.emit(item)
-
-            self.assertEqual(dialog.result(), QtWidgets.QDialog.Accepted)
-            self.assertEqual(dialog.selected_path(), paths[1])
-        finally:
-            dialog.close()
-
-        browse_dialog = StockImageDialog("Cover Page", paths, allow_browse=True)
-        try:
-            self.assertEqual(browse_dialog._images.count(), 3)
-            self.assertIsNone(browse_dialog._recent_images)
-            self.assertIn("Stock images", [label.text() for label in browse_dialog.findChildren(QtWidgets.QLabel)])
-        finally:
-            browse_dialog.close()
+    def test_artwork_picker_previews_positioned_cover_fit_before_applying(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "wide.png"
+            image = Image.new("RGB", (240, 120), "red")
+            image.paste("blue", (120, 0, 240, 120))
+            image.save(source)
+            placement = {"canvas": {"width": 120, "height": 240}, "fit": "cover", "position": {"x": 1, "y": .5}}
+            dialog = StockImageDialog("Cover Page", (source,), allow_browse=True, placement=placement)
+            try:
+                self.assertEqual([dialog.sources.tabText(i) for i in range(dialog.sources.count())],
+                                 ["Recent", "Stock", "Browse Files"])
+                self.assertLessEqual(dialog.width(), dialog.screen().availableGeometry().width())
+                frame = dialog.fit_preview.pixmap().toImage()
+                self.assertAlmostEqual(frame.width() / frame.height(), .5, places=2)
+                self.assertEqual(frame.pixelColor(frame.rect().center()).name(), "#0000ff")
+                self.assertIsNone(dialog.selected_path())
+                self.assertIn("Crop to fill", dialog.fit_note.text())
+                dialog.apply_button.click()
+                self.assertEqual(dialog.selected_path(), source)
+            finally:
+                dialog.close()
 
     def test_stock_images_remain_available_alongside_recent_images(self) -> None:
-        stock = Path("stock.png")
-        recent = Path("recent.png")
-        dialog = StockImageDialog("Cover", (stock,), recent_paths=(recent,),
-                                  recent_labels=("Previous import",), allow_browse=True)
-        try:
-            self.assertEqual(dialog._images.count(), 1)
-            self.assertEqual(dialog._recent_images.count(), 1)
-            dialog._images.itemClicked.emit(dialog._images.item(0))
-            self.assertEqual(dialog.selected_path(), stock)
-            self.assertEqual(dialog.result(), QtWidgets.QDialog.Accepted)
-        finally:
-            dialog.close()
-            dialog.deleteLater()
+        with tempfile.TemporaryDirectory() as directory:
+            stock, recent, extra = (Path(directory) / name for name in ("stock.png", "recent.png", "extra.png"))
+            for path in (stock, recent, extra):
+                self._write_png(path)
+            dialog = StockImageDialog("Cover", (stock,), recent_paths=(recent,), all_stock_paths=(stock, extra),
+                                      recent_labels=("Previous import",), allow_browse=True)
+            try:
+                self.assertEqual(dialog.sources.currentIndex(), 0)
+                self.assertEqual(dialog._recent_images.count(), 1)
+                dialog.sources.setCurrentIndex(1)
+                self.assertEqual(dialog._images.count(), 1)
+                dialog.findChild(QtWidgets.QCheckBox).setChecked(True)
+                self.assertEqual(dialog._images.count(), 2)
+                dialog._images.setCurrentRow(1)
+                self.assertIsNone(dialog.selected_path())
+                dialog.apply_button.click()
+                self.assertEqual(dialog.selected_path(), extra)
+            finally:
+                dialog.close()
+                dialog.deleteLater()
 
     def test_recent_images_are_limited_to_each_project_slot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -870,9 +872,8 @@ class ImageAnimationTests(unittest.TestCase):
                 self.assertLessEqual(dialog.height(), dialog.screen().availableGeometry().height())
                 self.assertEqual(dialog._images.count(), 3)
                 self.assertEqual(dialog._recent_images.count(), 3)
-                self.assertIn("Recently used · 3 images",
-                              [label.text() for label in dialog.findChildren(QtWidgets.QLabel)])
-                dialog._recent_images.itemClicked.emit(dialog._recent_images.item(0))
+                self.assertEqual(dialog.sources.tabText(0), "Recent")
+                dialog.apply_button.click()
                 self.assertEqual(dialog.selected_path(), paths[1])
             finally:
                 dialog.close()
@@ -953,11 +954,16 @@ class ImageAnimationTests(unittest.TestCase):
             self.assertTrue(tab.stock_button.isEnabled())
 
     def test_image_and_message_imports_open_in_downloads(self) -> None:
+        def cancel_browse(*_args):
+            picker = QtWidgets.QApplication.activeModalWidget()
+            QtCore.QTimer.singleShot(0, picker, picker.reject)
+            return "", ""
+
         with tempfile.TemporaryDirectory() as directory, _workspace_tab(directory) as image_tab:
             with (
                 mock.patch("images_workspace.QtCore.QStandardPaths.writableLocation",
                            return_value="C:/Users/Test/Downloads"),
-                mock.patch.object(QtWidgets.QFileDialog, "getOpenFileName", return_value=("", "")) as image_chooser,
+                mock.patch.object(QtWidgets.QFileDialog, "getOpenFileName", side_effect=cancel_browse) as image_chooser,
             ):
                 image_tab._browse_selected()
             self.assertEqual(image_chooser.call_args.args[2], "C:/Users/Test/Downloads")
@@ -991,6 +997,35 @@ class ImageAnimationTests(unittest.TestCase):
             self.addCleanup(reopened.deleteLater)
             self.assertEqual(reopened.speed.currentText(), "Custom…")
             self.assertEqual(reopened.custom_speed.value(), 225)
+
+    def test_gif_settings_replay_starts_at_frame_zero_with_unsaved_timing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "replay.gif"
+            self._write_gif(path, durations=(80, 100), loop=None)
+            dialog = ImageSettingsDialog("Cover", animated_gif=True, embedded_play_count=1, preview_path=path)
+            dialog.show()
+            try:
+                dialog.speed.setCurrentText("150%")
+                dialog.play_count.setCurrentText("2")
+                dialog.start_delay.setValue(.18)
+                dialog.loop_pause.setValue(.10)
+                card = dialog._gif_preview
+                self.assertTrue(card.isVisible())
+                deadline = time.monotonic() + 3
+                while card._preview_phase != "end" and time.monotonic() < deadline:
+                    QtTest.QTest.qWait(15)
+                self.assertEqual(card._preview_phase, "end")
+                self.assertEqual(card._completed_cycles, 2)
+                self.assertEqual(card._movie.currentFrameNumber(), 1)
+                QtTest.QTest.mouseClick(dialog.replay_button, QtCore.Qt.LeftButton)
+                self.assertEqual(card._movie.currentFrameNumber(), 0)
+                self.assertEqual(card._movie.speed(), 150)
+                self.assertEqual(card._preview_phase, "start")
+                self.assertEqual(card._completed_cycles, 0)
+                self.assertGreater(card._preview_timer.remainingTime(), 0)
+            finally:
+                dialog.reject()
+                dialog.deleteLater()
 
     def test_thumbnail_frame_uses_each_theme_secondary_color(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

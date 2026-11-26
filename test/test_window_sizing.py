@@ -472,8 +472,8 @@ class WindowSizingTests(unittest.TestCase):
                                 self.assertFalse(window.preview_frame.isVisibleTo(window))
                                 workspace = window.message_tab.messages_workspace
                                 self.assertTrue(workspace.isVisibleTo(window))
-                            controls = ((sound.stock_btn, sound.archive_btn,
-                                         sound.play_btn, sound.volume, sound.status,
+                            controls = ((sound.play_btn, sound.timeline, sound.volume, sound.status,
+                                         sound.preview_controls.volume, sound.preview_controls.mute,
                                          *((sound.single_action_btn, sound.create_playlist_btn) if mode == 0
                                            else (sound.add_track_btn, sound.clear_btn)))
                                         if index == 1 else
@@ -528,7 +528,7 @@ class WindowSizingTests(unittest.TestCase):
                                                 sign_in_warning=False)
                 tab.unpublish_btn.show()
                 fonts = [button.font().toString() for button in buttons]
-                for mode in ("landscape", "portrait", "window"):
+                for mode in ("window", "portrait"):
                     window._forge_preview_mode = mode
                     for size in ((1400, 900), (900, 480), (960, 516),
                                  (1024, 540), (960, 840), (960, 900),

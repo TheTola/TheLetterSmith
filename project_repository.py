@@ -6,6 +6,7 @@ generation. Old generations remain available for recovery and page deletion undo
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ import json
 import logging
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import threading
 import uuid
 
@@ -134,6 +136,13 @@ def _owned_pages(payload: dict) -> list[dict]:
     return pages
 
 
+def _owned_artwork(pages):
+    for page in pages:
+        for artwork in (page.get("artwork"), page.get("recovery", {}).get("cleared_artwork")):
+            if isinstance(artwork, dict):
+                yield artwork
+
+
 def _resource_references(payload: dict) -> set[str]:
     references: set[str] = set()
     def resource(value):
@@ -146,8 +155,10 @@ def _resource_references(payload: dict) -> set[str]:
         elif isinstance(value, list):
             for item in value:
                 resource(item)
-    for page in _owned_pages(payload):
-        resource(page.get("artwork", {}).get("asset"))
+    pages = _owned_pages(payload)
+    for artwork in _owned_artwork(pages):
+        resource(artwork.get("asset"))
+    for page in pages:
         for message in (page.get("message"), page.get("recovery", {}).get("inactive_message")):
             if isinstance(message, dict):
                 resource(message.get("resources", []))
@@ -164,15 +175,92 @@ def _resource_references(payload: dict) -> set[str]:
     return references
 
 
+def _revision_id(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 16 and all(c in "0123456789abcdef" for c in value)
+
+
+def editable_version_key(payload: dict, manifest: dict, *, include_publication: bool = False,
+                         ignore_page_ids: bool = False) -> str:
+    """Compare authored state and media independently of save bookkeeping."""
+    document = deepcopy(payload)
+    document.pop("revision", None)
+    publication = document.pop("publication", {})
+    meta = document["metadata"]
+    title, recipient_title = meta.get("title"), meta.get("recipient_title")
+    if not title or not recipient_title or title == recipient_title:
+        meta["title"] = title or recipient_title or ""
+        meta.pop("recipient_title", None)
+    if meta.get("document_type") in {"saved_letter", "project_autosave"}:
+        for key in ("document_type", "schema_version", "project_schema_version", "settings", "sound", "readiness",
+                    "editable_assets", "prompt_writer", "source_fingerprint", "cover_thumbnail_path",
+                    "cover_thumbnail_signature", "autosave_reason", "completed_tabs"):
+            meta.pop(key, None)
+    for field in ("metadata", "shared_settings", "presentation"):
+        values = document[field]
+        for key in tuple(values):
+            if key.startswith(("published_", "publication_")) or key in {
+                "project_id", "recipient_id", "recipient_display_name", "recipient_normalized_key",
+                "saved_at", "last_saved_at", "last_activity_at", "project_created_at", "project_published_at",
+                "active_play_dir", "protected_project_kind", "protected_project_master_path",
+            } or (field != "metadata" and key in {"recipient_name", "recipient_title"}):
+                values.pop(key)
+    for key in ("legacy_workspace_snapshot", "legacy_authored_snapshot", "legacy_source", "legacy_source_format"):
+        document["extensions"].pop(key, None)
+    document["extensions"].pop("resource_files", None)
+    for page in _owned_pages(document):
+        if ignore_page_ids:
+            page.pop("id", None)
+        page.pop("revision", None)
+        page.pop("preview_stale", None)
+        for key in ("legacy_key", "legacy_type", "message_association"):
+            page.get("recovery", {}).pop(key, None)
+    document["recovery"].pop("migration", None)
+    document["recovery"].pop("missing_resources", None)
+    from config import STARTING_VOLUME
+    sound = document["sound"]
+    if sound.get("volume") is None:
+        settings = document["shared_settings"]
+        sound["volume"] = settings.get("music_volume", settings.get("starting_volume", STARTING_VOLUME))
+    for key in ("version", "playlist_expanded", "selected_track_id", "selected_track_index"):
+        sound.pop(key, None)
+    for key, value in {"mode": "single", "muted": False, "single_track_id": "", "tracks": [], "playlist": []}.items():
+        if sound.get(key) == value:
+            sound.pop(key)
+    # Compatibility views may add alternate paths for already-owned assets.
+    references = _resource_references(document)
+    files = {path: digest for path, digest in manifest["files"].items() if path in references}
+    additional = sorted(set(manifest["files"].values()) - set(files.values()))
+    if include_publication:
+        from settings_store import empty_publication_settings
+        defaults = empty_publication_settings()
+        document["publication"] = {key: value for key, value in publication.items()
+                                   if key not in defaults or value != defaults[key]}
+    value = {"project": document, "files": files, "additional_resources": additional,
+             "missing": sorted(manifest.get("missing", []))}
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def selected_sound_tracks(sound) -> tuple:
+    records = sound.get("tracks", ())
+    by_id = {str(item.get("track_id", "")): item for item in records if isinstance(item, Mapping)}
+    if "playlist" in sound or "single_track_id" in sound:
+        ids = sound.get("playlist", ()) if sound.get("mode") == "playlist" else (sound.get("single_track_id"),)
+        return tuple(by_id.get(str(key), {"track_id": str(key), "missing": True}) for key in ids if key)
+    return tuple(item for item in records if isinstance(item, Mapping))
+
+
+def sound_track_reference(track) -> str:
+    return str(track.get("asset") or ("gallery/sounds/" + str(track["filename"]) if track.get("filename") else ""))
+
+
 def _active_audio_sources(root: Path, *, state: dict | None = None) -> tuple[list[dict], dict[str, Path]]:
-    """Resolve only this project's selected archive/stock tracks, read-only."""
+    """Resolve this project's selected and retained audio assets, read-only."""
     from project_paths import application_paths
-    from sound_model import hash_file
+    from sound_model import ProjectSoundState, hash_file, processed_dir
     paths = application_paths(root)
     state = state if state is not None else _json(paths.project_sound_state_file, optional=True)
     previous = {item.get("track_id"): item for item in state.get("tracks", []) if isinstance(item, dict)}
-    ids = list(state.get("playlist", [])) if state.get("mode") == "playlist" else [state.get("single_track_id")]
-    ids = [item for item in ids if isinstance(item, str) and item]
+    ids = ProjectSoundState.from_dict(state).normalize().referenced_track_ids()
     if not ids:
         return [], {}
     def optional_catalog(path: Path) -> dict:
@@ -184,7 +272,8 @@ def _active_audio_sources(root: Path, *, state: dict | None = None) -> tuple[lis
             _LOGGER.warning("Reusable sound catalog is unavailable; retaining selected track IDs as missing: %s", path)
             return {}
 
-    library = optional_catalog(paths.music_archive_root / "library.json").get("tracks", {})
+    library = optional_catalog(paths.music_library_file).get("tracks", {})
+    processed_root = processed_dir(root)
     stock = optional_catalog(paths.stock_root / "stock_manifest.json").get("music", [])
     records, sources = [], {}
     for track_id in ids:
@@ -194,7 +283,7 @@ def _active_audio_sources(root: Path, *, state: dict | None = None) -> tuple[lis
             if record.get("source_kind") == "stock" and record.get("resource_file"):
                 source = _safe_file(paths.stock_root, record["resource_file"])
             elif record.get("processed_file"):
-                source = _safe_file(paths.music_archive_root / "processed", record["processed_file"])
+                source = _safe_file(processed_root, record["processed_file"])
         if source is None:
             for candidate in stock if isinstance(stock, list) else []:
                 if not isinstance(candidate, dict) or not candidate.get("filename"):
@@ -237,16 +326,55 @@ class ProjectRepository:
         revision = head.get("revision", "")
         if head.get("format") != "lettersmith.project-head" or head.get("version") != 1:
             raise ProjectRepositoryError("unsupported_schema", "Unsupported project generation pointer.", path=self.pointer)
-        if not isinstance(revision, str) or len(revision) != 16 or any(c not in "0123456789abcdef" for c in revision):
+        if not _revision_id(revision):
             raise ProjectRepositoryError("invalid_document", "Invalid project generation identity.", path=self.pointer)
+        history = head.get("history", [revision])
+        if (not isinstance(history, list) or not all(_revision_id(item) for item in history)
+                or len(set(history)) != len(history) or revision not in history):
+            raise ProjectRepositoryError("invalid_document", "Invalid project revision history.", path=self.pointer)
         return head
 
     def load(self, *, allow_missing: bool = False) -> StoredProject:
-        from project_model import ProjectModel
         head = self._head()
         if not head:
             raise ProjectRepositoryError("not_found", "No committed project exists.", path=self.directory)
-        generation = _safe_file(self.directory, f"g/{head['revision']}")
+        return self._load_generation(head["revision"], allow_missing=allow_missing)
+
+    def revision_history(self) -> tuple[str, ...]:
+        return self._revision_history(self._head())
+
+    def _revision_history(self, head: dict) -> tuple[str, ...]:
+        if not head:
+            return ()
+        if "history" in head:
+            return tuple(head["history"])
+        # Older repositories recorded only the head. Keep older generations,
+        # excluding incomplete staging and generations newer than the commit.
+        current = head["revision"]
+        cutoff = self.pointer.stat().st_mtime_ns
+        historical = []
+        for candidate in (self.directory / "g").iterdir():
+            if candidate.name != current and _revision_id(candidate.name) and not is_link_or_reparse_point(candidate):
+                document = candidate / "project.json"
+                if document.is_file() and (candidate / "resources.json").is_file():
+                    modified = document.stat().st_mtime_ns
+                    if modified <= cutoff:
+                        historical.append((modified, candidate.name))
+        return (*[revision for _, revision in sorted(historical)], current)
+
+    def load_revision(self, revision: str, *, allow_missing: bool = False, verify_resources: bool = True) -> StoredProject:
+        if revision not in self.revision_history():
+            raise ProjectRepositoryError("not_found", "This saved revision is no longer available.", path=self.directory)
+        return self._load_generation(revision, allow_missing=allow_missing, verify_resources=verify_resources)
+
+    def version_key(self, revision: str, *, include_publication: bool = False, ignore_page_ids: bool = False) -> str:
+        generation = _safe_file(self.directory, f"g/{revision}")
+        return editable_version_key(_json(generation / "project.json"), _json(generation / "resources.json"),
+                                    include_publication=include_publication, ignore_page_ids=ignore_page_ids)
+
+    def _load_generation(self, revision: str, *, allow_missing: bool, verify_resources: bool = True) -> StoredProject:
+        from project_model import ProjectModel
+        generation = _safe_file(self.directory, f"g/{revision}")
         payload = _json(generation / "project.json")
         try:
             project = ProjectModel.from_dict(payload)
@@ -263,6 +391,8 @@ class ProjectRepository:
         missing = list(payload.get("recovery", {}).get("missing_resources", []))
         for relative, digest in manifest.get("files", {}).items():
             candidate = _safe_file(generation, relative)
+            if not verify_resources:
+                continue
             try:
                 actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
             except OSError as error:
@@ -275,12 +405,13 @@ class ProjectRepository:
         if missing:
             payload["recovery"]["missing_resources"] = list(dict.fromkeys(missing))
             project = ProjectModel.from_dict(payload)
-        return StoredProject(project, head["revision"], generation, _json(generation / "migration.json", optional=True))
+        return StoredProject(project, revision, generation, _json(generation / "migration.json", optional=True))
 
     def save(self, project, *, asset_root: str | Path,
              expected_revision: str | None = None,
              fallback_asset_root: str | Path | None = None,
-             migration_report: dict | None = None) -> StoredProject:
+             migration_report: dict | None = None,
+             track_history: bool = False, make_current: bool = True, ignore_page_ids: bool = False) -> StoredProject:
         from project_model import ProjectModel
         payload = project.to_dict()
         ProjectModel.from_dict(payload)
@@ -288,9 +419,8 @@ class ProjectRepository:
         if fallback_asset_root is not None:
             source_roots.append(Path(fallback_asset_root).resolve())
         sound = payload.get("sound", {})
-        assigned = sound.get("playlist", []) if sound.get("mode") == "playlist" else [sound.get("single_track_id")]
         external_audio = {}
-        if any(isinstance(track_id, str) and track_id for track_id in assigned):
+        if sound.get("playlist") or sound.get("single_track_id"):
             resolved, external_audio = _active_audio_sources(source_roots[0], state=sound)
             previous = {track.get("track_id"): track for track in sound.get("tracks", []) if isinstance(track, dict)}
             # Direct canonical assignment APIs may not have visited Sound yet.
@@ -312,8 +442,13 @@ class ProjectRepository:
             sound["tracks"] = portable
         with _writer_lock(self.directory):
             head = self._head()
-            if (head.get("revision") or None) != expected_revision:
+            current = head.get("revision")
+            conflict = current != expected_revision
+            if conflict and not track_history:
                 raise ProjectConflictError("revision_conflict", "Project changed on disk; reload before saving.", path=self.pointer)
+            if not make_current and (not track_history or not current):
+                raise ValueError("A saved project is required before recording background revisions.")
+            history = self._revision_history(head) if track_history or "history" in head else ()
             revision = uuid.uuid4().hex[:16]
             generation = self.directory / "g" / revision
             staging = self.directory / "g" / (".s-" + revision)
@@ -330,8 +465,9 @@ class ProjectRepository:
             files = {}
             missing = []
             known_missing = set(payload.get("recovery", {}).get("missing_resources", []))
-            owned_pages = _owned_pages(payload)
-            artwork_references = {page.get("artwork", {}).get("asset") for page in owned_pages}
+            artwork_references = {}
+            for artwork in _owned_artwork(_owned_pages(payload)):
+                artwork_references.setdefault(artwork.get("asset"), []).append(artwork)
             for relative in sorted(_resource_references(payload)):
                 candidates = [_safe_file(root, relative) for root in source_roots]
                 if relative in known_missing:
@@ -353,9 +489,8 @@ class ProjectRepository:
                     stored_relative = relative
                     if relative in artwork_references:
                         stored_relative = f"a/{digest[:32]}{source.suffix.lower()}"
-                        for page in owned_pages:
-                            if page.get("artwork", {}).get("asset") == relative:
-                                page["artwork"]["asset"] = stored_relative
+                        for artwork in artwork_references[relative]:
+                            artwork["asset"] = stored_relative
                     destinations = {stored_relative}
                     # Rich HTML and other resource owners retain their exact
                     # paths even when the same bytes are also page artwork.
@@ -373,13 +508,35 @@ class ProjectRepository:
                 payload["recovery"]["missing_resources"] = missing
             else:
                 payload["recovery"].pop("missing_resources", None)
+            manifest = {"version": 1, "files": files, "missing": missing}
+            if track_history and current:
+                key = editable_version_key(payload, manifest, include_publication=True, ignore_page_ids=ignore_page_ids)
+                candidates = (current,) if conflict else dict.fromkeys((current, *reversed(history)))
+                for candidate in candidates:
+                    try:
+                        if key != self.version_key(candidate, include_publication=True, ignore_page_ids=ignore_page_ids):
+                            continue
+                        existing = self._load_generation(candidate, allow_missing=False)
+                    except (KeyError, OSError, ValueError, ProjectRepositoryError):
+                        _LOGGER.warning("Cannot reuse invalid project generation %s", candidate, exc_info=True)
+                        continue
+                    shutil.rmtree(staging)
+                    if make_current and current != candidate:
+                        atomic_write_json(self.pointer, {**head, "revision": candidate, "history": list(history)})
+                    return existing
+            if conflict:
+                shutil.rmtree(staging)
+                raise ProjectConflictError("revision_conflict", "Project changed on disk; reload before saving.", path=self.pointer)
             atomic_write_json(staging / "project.json", payload)
-            atomic_write_json(staging / "resources.json", {"version": 1, "files": files, "missing": missing})
+            atomic_write_json(staging / "resources.json", manifest)
             atomic_write_json(staging / "migration.json", report)
             # Reparse serialized bytes before the one visible commit operation.
             ProjectModel.from_dict(_json(staging / "project.json"))
             _replace_directory_path(staging, generation)
-            atomic_write_json(self.pointer, {"format": "lettersmith.project-head", "version": 1, "revision": revision})
+            pointer = {"format": "lettersmith.project-head", "version": 1, "revision": revision if make_current else current}
+            if track_history or history:
+                pointer["history"] = [*history, revision]
+            atomic_write_json(self.pointer, pointer)
             return StoredProject(ProjectModel.from_dict(payload), revision, generation, report)
 
 
@@ -423,14 +580,14 @@ def finish_activation(project_root: str | Path) -> None:
         _LOGGER.warning("Completed activation journal could not be removed: %s", marker, exc_info=True)
 
 
-def legacy_workspace_payload(project_root: str | Path, *, saved: bool = False) -> dict:
+def legacy_workspace_payload(project_root: str | Path, *, saved: bool = False, autosave: bool = False) -> dict:
     from config import MESSAGE_ASSETS_DIR, PLAY_METADATA_FILE, USER_MESSAGE_DIR, USER_PAGES_DIR
     from page_layout import LAYOUT_FILE
     from settings_store import SettingsStore
     from sound_model import project_sound_path
     root = Path(project_root).resolve()
-    pages = root / ("gallery/pages" if saved else USER_PAGES_DIR)
-    message = root / ("gallery/message" if saved else USER_MESSAGE_DIR) / "message.html"
+    pages = root / ("pages" if autosave else "gallery/pages" if saved else USER_PAGES_DIR)
+    message = root / ("message" if autosave else "gallery/message" if saved else USER_MESSAGE_DIR) / "message.html"
     metadata = _json(root / PLAY_METADATA_FILE, optional=True) if saved else {}
     layout = _json(pages / LAYOUT_FILE, optional=True)
     if layout and layout.get("version") != 1:
@@ -461,7 +618,8 @@ def legacy_workspace_payload(project_root: str | Path, *, saved: bool = False) -
     prompt = _json(root / "prompt_writer_state.json", optional=True)
     if saved and isinstance(metadata.get("prompt_writer"), dict):
         prompt = metadata["prompt_writer"].get("state", prompt)
-    sound_path = root / "gallery/sounds/lettersmith-sound.json" if saved else project_sound_path(root)
+    sound_path = (root / "sounds/project_sound.json" if autosave else
+                  root / "gallery/sounds/lettersmith-sound.json" if saved else project_sound_path(root))
     sound = _json(sound_path, optional=True)
     if not saved:
         sound["tracks"] = _active_audio_sources(root)[0]
@@ -498,9 +656,9 @@ def legacy_workspace_payload(project_root: str | Path, *, saved: bool = False) -
             "prompt_writer_state": prompt, "sound": sound}
 
 
-def read_legacy_project(project_root: str | Path, *, saved: bool = False):
+def read_legacy_project(project_root: str | Path, *, saved: bool = False, autosave: bool = False):
     from project_migration import migrate_project
-    payload = legacy_workspace_payload(project_root, saved=saved)
+    payload = legacy_workspace_payload(project_root, saved=saved, autosave=autosave)
     result = migrate_project(payload, source_format="legacy_saved" if saved else "legacy_active")
     result.report.locations["source"] = str(Path(project_root).resolve())
     document = result.project.to_dict()
@@ -573,6 +731,8 @@ def sync_legacy_workspace(project, project_root: str | Path):
                 if (before_page is None or before_page["artwork"].get(field) != value
                         or (field == "asset" and current.get("asset_signatures", {}).get(key) != previous.get("asset_signatures", {}).get(key))):
                     page["artwork"][field] = deepcopy(value)
+            if page["artwork"].get("asset"):
+                page["recovery"].pop("cleared_artwork", None)
             page["preview_stale"] = True
         if prompt_changed:
             # The legacy writer persists a whole envelope. Resolve page changes

@@ -79,6 +79,9 @@
       "Settings.gif"
     ],
     "sounds": [
+      "glissando.mp3"
+    ],
+    "sounds/transitions/classic": [
       "flip1.mp3",
       "flip2.mp3",
       "flip3.mp3",
@@ -88,8 +91,21 @@
       "flip7.mp3",
       "flip8.mp3",
       "flip9.mp3",
-      "flip10.mp3",
-      "glissando.mp3"
+      "flip10.mp3"
+    ],
+    "sounds/transitions/shuffle_deal": [
+      "deal.mp3",
+      "return.mp3"
+    ],
+    "sounds/transitions/pixelate": [
+      "dissolve-reveal.mp3"
+    ],
+    "sounds/transitions/envelope": [
+      "open-letter.mp3",
+      "return-letter.mp3"
+    ],
+    "sounds/transitions/curtain": [
+      "close-open.mp3"
     ],
     "sounds/App sounds": [
       "Blip.mp3",
@@ -148,6 +164,115 @@
     {
       "source": "tools/FFmpeg-PROVENANCE.txt",
       "destination": "tools"
+    },
+    {
+      "source": "build/dictation-runtime/dictation.exe",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "build/dictation-runtime/ggml-base.dll",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "build/dictation-runtime/ggml-cpu-alderlake.dll",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "build/dictation-runtime/ggml-cpu-cannonlake.dll",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "build/dictation-runtime/ggml-cpu-cascadelake.dll",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "build/dictation-runtime/ggml-cpu-haswell.dll",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "build/dictation-runtime/ggml-cpu-icelake.dll",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "build/dictation-runtime/ggml-cpu-sandybridge.dll",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "build/dictation-runtime/ggml-cpu-skylakex.dll",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "build/dictation-runtime/ggml-cpu-sse42.dll",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "build/dictation-runtime/ggml-cpu-x64.dll",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "build/dictation-runtime/ggml.dll",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "build/dictation-runtime/whisper.dll",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "build/dictation-runtime/LICENSE-whisper.txt",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "dictation_runtime_hashes.json",
+      "destination": "resources/dictation-runtime",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "source": "language_runtime_hashes.json",
+      "destination": "resources/language-runtime"
     }
   ],
   "binaries": [
@@ -183,6 +308,10 @@
   ],
   "hidden_imports": [
     "Nexus",
+    "language_ai",
+    "language_runtime",
+    "language_model_setup",
+    "proofreading",
     "certifi",
     "PySide6.QtWebEngineCore",
     "PySide6.QtWebEngineWidgets",

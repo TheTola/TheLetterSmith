@@ -159,7 +159,7 @@ _COVER_THUMBNAIL_RELATIVE = Path("gallery/pages/cover.thumbnail.png")
 _COVER_THUMBNAIL_SOURCE_KEY = "cover_thumbnail_source_signature"
 _COVER_THUMBNAIL_CACHE_VERSION = 1
 _COVER_THUMBNAIL_SIZE = (336, 184)
-_SAVED_CATALOG_INDEX_SCHEMA_VERSION = 4
+_SAVED_CATALOG_INDEX_SCHEMA_VERSION = 5
 _SAVED_CATALOG_INDEX_RELATIVE = Path(
     "saved_letters",
     "catalog-v3.json",
@@ -432,6 +432,10 @@ class SavedLetter:
     @property
     def summary(self) -> str:
         return f"{self.page_count} pages · {self.letter_count} letter pages"
+
+    @property
+    def deleted(self) -> bool:
+        return self.recovery and bool(re.fullmatch(r"Deleted Project [0-9a-f]{32}", self.path.name))
 
     @property
     def created_sort_date(self) -> date:
@@ -857,6 +861,7 @@ class SavedLetterCatalog:
                 self._entries = cached
                 return self._entries
         entries: list[SavedLetter] = []
+        from saved_letter_reconciliation import CONSOLIDATED_LETTERS, reconcile_saved_letters, saved_archives
         previous_entries = self._entries or self._load_index() or ()
         seen: set[Path] = set()
         validator = SavedLetterRestorer(self.project_root)
@@ -872,24 +877,30 @@ class SavedLetterCatalog:
         for root, recovery, example, stock in sources:
             if not root.is_dir():
                 continue
+            archive = root / CONSOLIDATED_LETTERS if recovery else None
             # Editable snapshots need no generated HTML or complete presentation.
             for repository in root.rglob(".lettersmith-project"):
                 path = repository.parent.resolve()
+                if archive is not None and path.is_relative_to(archive):
+                    continue
                 if (path / "lettersmith-display.json").is_file():
                     continue
                 if path in seen or not path.is_relative_to(root.resolve()) or any(
-                        part.startswith((".s-", ".letter-load-")) or ".build-" in part for part in path.relative_to(root).parts):
+                        part == ".forge" or part.startswith((".s-", ".letter-load-")) or ".build-" in part for part in path.relative_to(root).parts):
                     continue
                 seen.add(path)
                 entries.append(self._entry(path, recovery=recovery, example=example, stock=stock))
             for index in root.rglob("index.html"):
                 path = index.parent.resolve()
+                if archive is not None and path.is_relative_to(archive):
+                    continue
                 try:
                     relative = path.relative_to(root)
                 except ValueError:
                     continue
                 if any(
-                    ".build-staging" in part
+                    part == ".forge"
+                    or ".build-staging" in part
                     or ".build-backup" in part
                     or part.startswith(".letter-load-")
                     for part in relative.parts
@@ -927,8 +938,12 @@ class SavedLetterCatalog:
                     continue
                 seen.add(path)
                 entries.append(entry)
+        consolidated = set()
+        if not self.stock_only:
+            entries = reconcile_saved_letters(self, entries)
+            consolidated = {Path(record["source"]) for record in saved_archives(self.recovery_root)}
         for entry in previous_entries:
-            if entry.path not in seen and not entry.path.exists():
+            if entry.path not in seen and entry.path not in consolidated and not entry.path.exists():
                 entries.append(replace(entry, valid=False, warning="Saved location is missing. Restore its folder to reopen this project."))
         if self.stock_only:
             entries.sort(
@@ -980,14 +995,19 @@ class SavedLetterCatalog:
         return self._entries
 
     def search(self, query: str) -> tuple[SavedLetter, ...]:
-        needle = (query or "").strip().casefold()
-        if not needle:
-            return self.list_entries()
-        return tuple(
-            entry
-            for entry in self.list_entries()
-            if needle in f"{entry.recipient} {entry.title}".casefold()
-        )
+        return tuple(entry for entry in self.list_entries() if self.matches_query(entry, query))
+
+    @staticmethod
+    def matches_query(entry, query: str) -> bool:
+        needle = " ".join(query.split()).casefold()
+        return any(needle in " ".join(value.split()).casefold() for value in (entry.title, entry.recipient))
+
+    @staticmethod
+    def last_project(entries, project_id: str = "") -> SavedLetter | None:
+        eligible = (entry for entry in entries if entry.canonical and entry.valid
+                    and not (entry.example or entry.stock or entry.recovery)
+                    and (not project_id or entry.project_id == project_id))
+        return max(eligible, key=lambda entry: entry.modified_at.timestamp(), default=None)
 
     @staticmethod
     def _natural_sort_key(value: str) -> tuple[tuple[int, object], ...]:
@@ -1041,7 +1061,7 @@ class SavedLetterCatalog:
             )
 
         try:
-            if entry.canonical and target.parent == self.play_root / "Editable Projects":
+            if entry.canonical and not entry.recovery:
                 from project_save import ProjectSaveService
                 from project_state import ProjectStateController
                 ProjectSaveService(self.project_root, ProjectStateController(self.project_root)).trash_saved_project(entry)
@@ -1366,7 +1386,8 @@ class SavedLetterCatalog:
                 stored = repository.load(allow_missing=True)
                 data = stored.project.to_dict()
                 metadata = data["metadata"]
-                publication = data["publication"]
+                from saved_letter_versions import effective_publication
+                publication = effective_publication(self.project_root, data["project_id"], data["publication"])
                 publication_state = "Unpublished"
                 if publication.get(PUBLISHED_PAGE_URL_KEY):
                     publication_state = "Publication status unknown / unverified"
@@ -1399,6 +1420,7 @@ class SavedLetterCatalog:
                     cover_path=cover, published_url=str(publication.get(PUBLISHED_PAGE_URL_KEY, "")),
                     project_id=data["project_id"], recipient_id=str(metadata.get("recipient_id", "")),
                     project_created_at=str(metadata.get(PROJECT_CREATED_AT_KEY, "")),
+                    project_published_at=str(publication.get(PROJECT_PUBLISHED_AT_KEY) or publication.get(PUBLISHED_AT_KEY) or ""),
                     canonical=True, storage_revision=stored.revision, content_revision=data["revision"],
                     saved_publication_state=publication_state,
                     page_count=len(pages), letter_count=sum(page["type"] == "letter" for page in pages),
@@ -1416,6 +1438,11 @@ class SavedLetterCatalog:
                                    published_url="", cover_path=None, canonical=True, valid=False, warning=str(error),
                                    recovery=recovery, example=example, stock=stock)
         metadata = _read_metadata(path)
+        from saved_letter_versions import effective_publication
+        publication = effective_publication(self.project_root, metadata.get("project_id"), metadata)
+        verified_receipt = publication is not metadata
+        if verified_receipt:
+            metadata = {**metadata, **publication}
         recipient = self._display_text(metadata.get("recipient_name"))
         title = self._display_text(metadata.get("recipient_title"))
         if not title:
@@ -1472,7 +1499,7 @@ class SavedLetterCatalog:
             ).strip(),
             publication_verified=(
                 metadata.get(PUBLICATION_VERIFIED_KEY) is True
-                and _bundle_matches_publication(path, metadata)
+                and (verified_receipt or _bundle_matches_publication(path, metadata))
             ),
             published_source_fingerprint=str(
                 metadata.get(PUBLISHED_SOURCE_FINGERPRINT_KEY, "")

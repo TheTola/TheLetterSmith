@@ -5,6 +5,8 @@ from pathlib import Path
 from language_service import (
     LANGUAGE_CUSTOM_DICTIONARY_KEY,
     LanguageService,
+    LanguageIssue,
+    is_automatic_spelling_fix,
     clear_language_service_cache,
     get_language_service,
 )
@@ -14,6 +16,21 @@ from settings_store import SettingsStore
 
 
 class LanguageServiceTests(unittest.TestCase):
+    def test_mixed_mode_only_automatically_fixes_established_spelling(self):
+        spelling = LanguageIssue(0, 3, "teh", "spelling", "typo", ("the",), "the", "high", True)
+        grammar = LanguageIssue(0, 1, "a", "grammar", "article", ("an",), "an", "high", True)
+        uncertain = LanguageIssue(0, 3, "wrd", "spelling", "word", ("word",), "word")
+        self.assertTrue(is_automatic_spelling_fix(spelling))
+        self.assertFalse(is_automatic_spelling_fix(grammar))
+        self.assertFalse(is_automatic_spelling_fix(uncertain))
+
+    def test_ai_protected_words_share_custom_and_ignored_dictionary_entries(self):
+        self.service.add_to_dictionary("Karaethon")
+        self.service.ignore_word("beutiful")
+        self.assertIn("Karaethon", self.service.protected_words)
+        self.assertIn("beutiful", self.service.protected_words)
+        self.assertIn("kintsugi", self.service.protected_words)
+
     def setUp(self) -> None:
         clear_language_service_cache()
         self.holder = tempfile.TemporaryDirectory()

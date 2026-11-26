@@ -28,6 +28,20 @@ class RestoredWriterTests(unittest.TestCase):
         with mock.patch('test_prompt_writer_pages.PromptWriterPanel', PromptWriterPanel):
             prompt_fixture.PromptWriterPageTests.setUp(self)
 
+    def test_proofreading_covers_dictation_fields_and_preserves_programmatic_loads(self):
+        self.assertTrue(hasattr(self.panel.txt_global, '_proofreading_binding'))
+        for page_id, fields in self.panel._page_fields.items():
+            for name in ('directions', 'output'):
+                editor = fields[name]
+                self.assertTrue(hasattr(editor, '_proofreading_binding'))
+                self.assertIs(editor._proofreading_binding.service, self.panel._language_service)
+            text = 'Saved beutiful wrds 🌲\n'
+            self.session.project.update_prompt(page_id, {'directions': text})
+            self.assertEqual(self.panel._page_fields[page_id]['directions'].toPlainText(), text)
+        self.assertFalse(hasattr(self.panel.cmb_subject, '_proofreading_binding'))
+        self.assertFalse(hasattr(self.panel.cmb_type, '_proofreading_binding'))
+        self.assertFalse(hasattr(self.panel.cmb_color, '_proofreading_binding'))
+
     def test_all_ten_pages_edit_together_without_selector_or_dimensions(self):
         self.session.replace(create_project(['cover'] + ['illustration']*8 + ['end_page']), asset_root=self.root)
         self.panel.resize(1100, 760)
@@ -120,7 +134,7 @@ class RestoredWriterTests(unittest.TestCase):
     def test_shipped_prompt_seeds_do_not_request_multiple_images_or_portrait_framing(self):
         from pathlib import Path
         from prompt_writer_project import compose_page
-        modules = Path(__file__).resolve().parents[1] / 'Prompter' / 'modules'
+        modules = Path(__file__).resolve().parents[1] / 'resources' / 'prompt_writer'
         roles = (modules / 'role.txt').read_text(encoding='utf-8').splitlines()
         orders = (modules / 'order.txt').read_text(encoding='utf-8').splitlines()
         page_id = self.ids[2]
@@ -173,8 +187,110 @@ class RestoredWriterTests(unittest.TestCase):
                 self.app.processEvents()  # Deliver native clipboard ownership notifications.
                 self.assertEqual(self.app.clipboard().text(), current,
                                  (index, fields['copy'].isEnabled(), self.panel.workspace_status.text()))
-                self.assertEqual(self.panel._copy_all_prompts_text(), self.panel.current_page_prompt(selected))
-                self.app.processEvents()
+
+        self.session.project.reorder_pages(list(reversed(self.ids)))
+        self.panel.generated_section.set_expanded(False)
+        self.assertTrue(self.panel.copy_all_button.isVisibleTo(self.panel))
+        self.assertTrue(self.panel.copy_all_button.isEnabled())
+        self.panel.copy_all_button.click()
+        self.app.processEvents()
+        project = self.session.project
+        from prompt_writer_project import page_label
+        expected = '\n\n'.join(f"Page {index} — {page_label(project, page['id'])}\n{page['prompt']['text']}"
+                               for index, page in enumerate(project.pages, 1))
+        self.assertEqual(self.app.clipboard().text(), expected, self.panel.workspace_status.text())
+        self.assertEqual(self.panel._view_page_id, selected)
+
+    def test_named_style_preset_reloads_across_letters_and_updates_all_prompts_immediately(self):
+        from prompt_writer_project import load_style_presets
+
+        self.session.replace(create_project(['cover', 'illustration']), asset_root=self.root)
+        panel = self.panel
+        style = {'subject': 'Sunlit gardens', 'type': 'Watercolor', 'color': 'Silver and teal'}
+        panel.cmb_subject.setCurrentText(style['subject'])
+        self.assertTrue(all(style['subject'] in fields['output'].toPlainText()
+                            for fields in panel._page_fields.values()))
+        panel.cmb_type.setCurrentText(style['type'])
+        panel.cmb_color.setCurrentText(style['color'])
+        panel._refresh_style_presets_menu()
+        with mock.patch('prompt_writer_workspace.LetterSmithInputDialog.get_text', return_value=('  Garden & sky  ', True)):
+            panel.style_presets_menu.actions()[0].trigger()
+        self.assertEqual(load_style_presets(panel._style_presets_path), {'Garden & sky': style})
+
+        self.session.replace(create_project(['cover', 'letter', 'end_page']), asset_root=self.root)
+        panel.cmb_subject.setCurrentText('Earlier scene')
+        panel.txt_global.setPlainText('Add a small lantern.')
+        panel._refresh_style_presets_menu()
+        next(action for action in panel.style_presets_menu.actions() if action.text() == 'Garden && sky').trigger()
+        self.assertEqual([panel.cmb_subject.currentText(), panel.cmb_type.currentText(), panel.cmb_color.currentText()],
+                         list(style.values()))
+        self.assertEqual(panel.txt_global.toPlainText(), 'Add a small lantern.')
+        for fields in panel._page_fields.values():
+            output = fields['output'].toPlainText()
+            for value in (*style.values(), 'Add a small lantern.'):
+                self.assertIn(value, output)
+            self.assertNotIn('Earlier scene', output)
+
+    def test_single_microphone_tracks_the_focused_field_and_queues_restart(self):
+        from test_dictation import _Speech
+
+        panel = self.panel
+        panel.resize(1100, 760)
+        panel.show()
+        panel.activateWindow()
+        first = panel._page_fields[self.ids[1]]['directions']
+        second = panel._page_fields[self.ids[3]]['directions']
+        first.setFocus()
+        self.app.processEvents()
+        visible = [button for button in panel.findChildren(QtWidgets.QToolButton)
+                   if button.objectName() in {'dictationButton', 'writerDictationButton'} and button.isVisibleTo(panel)]
+        self.assertEqual(visible, [panel.dictation_button])
+        self.assertIn(first.accessibleName(), panel.dictation_status.text())
+        speech = _Speech()
+        manager = SimpleNamespace(active=None, speech=speech, ensure_model=lambda _parent: True)
+        with mock.patch('dictation._manager', return_value=manager):
+            QtTest.QTest.mouseClick(panel.dictation_button, QtCore.Qt.LeftButton)
+            self.assertIs(manager.active, first._dictation_binding)
+            speech.callbacks[-1]({'event': 'ready'})
+            self.assertIn('Listening', panel.dictation_status.text())
+            self.assertIn(first.accessibleName(), panel.dictation_status.text())
+            QtTest.QTest.mouseClick(panel.dictation_button, QtCore.Qt.LeftButton)
+            self.assertEqual(speech.stopped, ['session-1'])
+            QtTest.QTest.mouseClick(panel.dictation_button, QtCore.Qt.LeftButton)
+            self.assertIn('Restart queued', panel.dictation_status.text())
+            speech.callbacks[0]({'event': 'final', 'text': 'First take'})
+            speech.callbacks[0]({'event': 'done'})
+            self.assertEqual(len(speech.callbacks), 2)
+            self.assertIn('First take', first.toPlainText())
+            self.assertIs(manager.active, first._dictation_binding)
+            second.setFocus()
+            self.app.processEvents()
+            self.assertIn('session-2', speech.canceled)
+            self.assertIn(second.accessibleName(), panel.dictation_status.text())
+            QtTest.QTest.mouseClick(panel.dictation_button, QtCore.Qt.LeftButton)
+            self.assertIs(manager.active, second._dictation_binding)
+            second._dictation_binding.cancel()
+
+    def test_f8_selects_the_next_proofreading_suggestion_without_editing(self):
+        from language_service import LanguageIssue
+
+        panel = self.panel
+        panel.show()
+        panel.activateWindow()
+        field = panel._page_fields[self.ids[0]]['directions']
+        original = '🌲 teh path to recieve the letter'
+        field.setPlainText(original)
+        field.setFocus()
+        field.moveCursor(QtGui.QTextCursor.Start)
+        self.app.processEvents()
+        proofreading = field._proofreading_binding
+        proofreading.set_issues(tuple(LanguageIssue(original.index(word), original.index(word) + len(word),
+                                                      word, 'spelling', 'Spelling suggestion.')
+                                      for word in ('teh', 'recieve')))
+        for expected in ('teh', 'recieve', 'teh'):
+            QtTest.QTest.keyClick(field, QtCore.Qt.Key_F8)
+            self.assertEqual(field.textCursor().selectedText(), expected)
+        self.assertEqual(field.toPlainText(), original)
 
     def test_sections_preserve_live_state_and_header_access_across_navigation(self):
         project = create_project(['cover'] + ['illustration'] * 5 + ['end_page'])
@@ -814,28 +930,61 @@ panel.shutdown()
         self.panel.attach_browser(browser)
         self.panel._show_conversation()
         browser.submit_prompt.assert_not_called()
+        self.assertFalse(self.panel.service_prompt.isVisibleTo(self.panel))
+        last_sent = None
         with mock.patch.object(self.panel, '_write_prompt_clipboard') as copy:
             for index, identity in enumerate((first, second, second)):
                 self.panel._page_fields[identity]['directions'].setPlainText('Latest scene ' + str(index))
                 self.panel._service_buttons[identity].click()
-                current = self.panel.current_page_prompt(identity)
+                current = self.panel.current_page_prompt(identity).strip()
                 self.assertEqual(browser.submit_prompt.call_args.args[0], current)
                 self.assertEqual(self.panel._image_destination, identity)
-                self.assertEqual(self.panel.service_prompt.toPlainText(), current)
+                if last_sent is not None:
+                    self.assertEqual(self.panel.service_prompt.toPlainText(), last_sent)
                 self.assertTrue(all(not button.isEnabled() for button in self.panel._service_buttons.values()))
                 self.panel._service_buttons[cover].click()
                 self.assertEqual(browser.submit_prompt.call_count, index + 1)
                 callbacks[-1](True, 'Prompt sent.')
+                self.assertTrue(self.panel.service_prompt.isVisibleTo(self.panel))
+                self.assertEqual(self.panel.service_prompt.toPlainText(), current)
+                last_sent = current
                 self.assertFalse(self.panel._site_request_in_progress)
                 self.assertTrue(all(button.isEnabled() for button in self.panel._service_buttons.values()))
             copy.assert_not_called()
         self.panel._service_buttons[first].click()
         callbacks[-1](False, 'Provider is busy.')
         self.assertIn('Provider is busy', self.panel._site_status.text())
+        self.assertEqual(self.panel.service_prompt.toPlainText(), last_sent)
         self.panel._service_buttons[second].click()
         callbacks[0](False, 'Old result')
         self.assertTrue(self.panel._site_request_in_progress)
         callbacks[-1](True, 'Prompt sent.')
+
+    def test_confirmed_service_prompt_preserves_the_sent_wording_and_page_name(self):
+        self.session.replace(create_project(['cover', 'illustration']), asset_root=self.root)
+        project = self.session.project
+        cover, page_id = [page['id'] for page in project.pages]
+        project.rename_page(page_id, 'Moonlit lake')
+        wording = '  Draw a moonlit lake.\n\n  Keep the dim stars.  '
+        project.update_prompt(page_id, {'text': wording, 'resolved_components': {}})
+        callbacks = []
+        browser = SimpleNamespace(provider='Gemini', view=QtWidgets.QWidget(), set_approval_target=mock.Mock(),
+            submit_prompt=mock.Mock(side_effect=lambda text, callback: callbacks.append(callback)))
+        self.addCleanup(browser.view.deleteLater)
+        self.panel.attach_browser(browser)
+        self.panel._show_conversation()
+        self.panel._service_buttons[page_id].click()
+        self.assertEqual(browser.submit_prompt.call_args.args[0], wording.strip())
+        self.assertFalse(self.panel.service_prompt.isVisibleTo(self.panel))
+        project.rename_page(page_id, 'Renamed after sending')
+        project.update_prompt(page_id, {'text': 'An unsent edit.'})
+        self.panel.select_page(cover)
+        callbacks[-1](True, 'Prompt sent to Gemini.')
+        self.assertEqual(self.panel.sent_prompt_title.text(), 'Sent to Gemini · Page 2 — Moonlit lake')
+        self.assertEqual(self.panel.service_prompt.toPlainText(), wording.strip())
+        self.assertTrue(self.panel.service_prompt.isVisibleTo(self.panel))
+        self.session.replace(create_project(), asset_root=self.root)
+        self.assertFalse(self.panel.service_prompt.isVisibleTo(self.panel))
 
     def test_page_cards_wrap_and_drag_without_accidental_clicks(self):
         from prompt_writer_browser import PAGE_CARD_MIME

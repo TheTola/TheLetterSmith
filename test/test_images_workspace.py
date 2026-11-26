@@ -201,7 +201,19 @@ class ImagesWorkspaceTests(unittest.TestCase):
         event.source.return_value = navigator
         event.mimeData.return_value = mime
         event.position.return_value = QtCore.QPointF(navigator.visualItemRect(navigator.item(2)).center())
+        navigator.dragMoveEvent(event)
+        self.assertEqual(self.list_ids(), self.ids)
+        self.assertEqual(navigator._insertion_gap(navigator._drag_point, navigator._drag_row), 3)
+        viewport = navigator.viewport()
+        gap_cell = navigator.visualItemRect(navigator.item(3))
+        x = max(3, min(gap_cell.left(), viewport.width() - 4))
+        marker = viewport.grab()
+        scale = marker.devicePixelRatio()
+        self.assertEqual(marker.toImage().pixelColor(round(x * scale), round(gap_cell.center().y() * scale)),
+                         navigator.palette().highlight().color())
+        event.reset_mock()
         navigator.dropEvent(event)
+        self.assertIsNone(navigator._drag_point)
         self.assertEqual(self.list_ids()[:3], [self.ids[1], self.ids[2], self.ids[0]])
         after = self.page(self.ids[0])
         for field in ('id', 'type', 'artwork', 'message'):
@@ -249,8 +261,13 @@ class ImagesWorkspaceTests(unittest.TestCase):
     def test_type_round_trip_hides_and_restores_message_and_preserves_prompt_and_artwork(self):
         original = self.page(self.first)
         self.select(self.first)
-        self.tab.change_page_type(self.first, "illustration")
+        self.assertTrue(self.tab.type_note.isVisible())
+        self.assertIn("hides", self.tab.type_note.text())
+        selector = self.tab.type_combo
+        selector.setCurrentIndex(selector.findData("illustration"))
+        selector.activated.emit(selector.currentIndex())
         self.assertIsNone(self.page(self.first)["message"])
+        self.assertIn("Message hidden", self.tab.type_note.text())
         self.assertFalse(self.tab.message_button.isEnabled())
         self.assertEqual(self.page(self.first)["artwork"], original["artwork"])
         self.assertEqual(self.page(self.first)["prompt"]["text"], original["prompt"]["text"])
@@ -260,6 +277,12 @@ class ImagesWorkspaceTests(unittest.TestCase):
         self.assertTrue(self.tab.message_button.isEnabled())
 
     def test_clear_image_preserves_page_message_prompt_and_other_letter(self):
+        self.select(self.first)
+        self.import_and_wait(self.first, self.gif())
+        self.session.project.update_artwork(self.first, {
+            "placement": {"fit": "cover", "x": 12},
+            "animation": {"speed_percent": 150, "start_delay_ms": 500, "play_count": 2},
+        })
         original, other = self.page(self.first), self.page(self.second)
         original_file = self.tab.artwork.resolve_asset(self.first)
         self.tab.clear_page_image(self.first)
@@ -270,6 +293,14 @@ class ImagesWorkspaceTests(unittest.TestCase):
         self.assert_same_content(self.page(self.second), other)
         self.assertTrue(original_file.exists())
         self.assertEqual(len(self.list_ids()), 5)
+        stored = active_project_repository(self.root).load()
+        self.session.replace(stored.project, storage_revision=stored.revision, asset_root=stored.asset_root)
+        self.select(self.first)
+        self.assertTrue(self.tab.restore_artwork_button.isVisible())
+        QtTest.QTest.mouseClick(self.tab.restore_artwork_button, QtCore.Qt.LeftButton)
+        self.assertEqual(self.page(self.first)["artwork"], original["artwork"])
+        self.assertEqual(self.tab.artwork.resolve_asset(self.first).read_bytes(), original_file.read_bytes())
+        self.assertFalse(self.tab.restore_artwork_button.isVisible())
 
     def test_invalid_and_aborted_staging_leave_old_artwork_intact(self):
         original = self.page(self.first)
@@ -398,7 +429,7 @@ class ImagesWorkspaceTests(unittest.TestCase):
         self.assertIsNone(self.page(page_id)["prompt"]["text"])
         self.assertIn("Ready", self.row_text(page_id))
         self.tab.clear_page_image(page_id)
-        self.assertIn("Image missing", self.row_text(page_id))
+        self.assertIn("Artwork cleared", self.row_text(page_id))
         self.session.project.update_message(self.first, empty_message())
         self.assertIn("Ready", self.row_text(self.first))
         self.assertIn("Ready", self.row_text(self.second))
@@ -411,14 +442,62 @@ class ImagesWorkspaceTests(unittest.TestCase):
         self.assertNotIn(self.first, self.list_ids())
         self.assertIn(self.session.selected_page_id, self.list_ids())
         self.assertTrue(source.exists())
-        self.tab.undo_delete()
+        self.assertTrue(self.tab.undo_button.isVisible())
+        QtTest.QTest.mouseClick(self.tab.undo_button, QtCore.Qt.LeftButton)
+        self.assertFalse(self.tab.undo_button.isVisible())
         self.assertEqual(self.list_ids(), self.ids)
         self.assertEqual(self.page(self.first)["message"], original["message"])
         self.assertEqual(self.page(self.first)["artwork"], original["artwork"])
         self.assertEqual(self.page(self.first)["prompt"]["text"], original["prompt"]["text"])
 
+    def test_prompt_history_restores_earlier_exact_wording_through_page_menu(self):
+        self.select(self.first)
+        project = self.session.project
+        earlier = "  Exact earlier artwork prompt\n雪  "
+        project.replace_prompt(self.first, {"text": earlier, "resolved_components": {"generated_text": earlier}})
+        project.replace_prompt(self.first, {"text": "Second wording"})
+        project.replace_prompt(self.first, {"text": "Current wording"})
+        other_prompt = self.page(self.second)["prompt"]
+        project.update_prompt(self.first, {"directions": "Keep these directions"})
+        menu = self.tab._page_menu(self.first)
+        action = next(action for action in menu.actions() if action.text() == "Prompt History…")
+        self.assertTrue(action.isEnabled())
+        restored = []
+
+        def choose():
+            dialog = QtWidgets.QApplication.activeModalWidget()
+            selector = dialog.findChild(QtWidgets.QComboBox)
+            selector.setCurrentIndex(1)
+            restored.append(dialog.findChild(QtWidgets.QPlainTextEdit).toPlainText())
+            button = next(button for button in dialog.findChildren(QtWidgets.QPushButton)
+                          if button.text() == "Restore Prompt")
+            QtTest.QTest.mouseClick(button, QtCore.Qt.LeftButton)
+
+        QtCore.QTimer.singleShot(0, self.tab, choose)
+        action.trigger()
+        menu.deleteLater()
+        self.assertEqual(restored, [earlier])
+        saved = active_project_repository(self.root).load().project
+        self.assertEqual(saved.get_prompt(self.first)["text"], earlier)
+        self.assertEqual(saved.get_prompt(self.first)["directions"], "Keep these directions")
+        self.assertNotIn("generated_text", saved.get_prompt(self.first)["resolved_components"])
+        self.assertIn("Current wording", saved.prompt_history(self.first))
+        self.assertEqual(saved.get_prompt(self.second), other_prompt)
+
     def test_save_reload_and_new_project_do_not_restore_previous_content(self):
         self.import_and_wait(self.first, self.gif())
+        self.select(self.ids[0])
+        transition = self.tab.transition_combo
+        self.assertTrue(transition.isVisible())
+        self.assertTrue(transition.isEnabled())
+        self.assertEqual(transition.currentData(), "classic")
+        transition.setCurrentIndex(transition.findData("envelope"))
+        transition.activated.emit(transition.currentIndex())
+        stored_project = active_project_repository(self.root).load().project
+        self.assertEqual(stored_project.letter_transition, "envelope")
+        self.assertTrue(all("transition" not in page for page in stored_project.pages))
+        self.select(self.first)
+        self.assertEqual(transition.currentData(), "envelope")
         self.tab.reorder_pages(list(reversed(self.ids)))
         self.session.save(sync_workspace=False)
         stored = active_project_repository(self.root).load()
@@ -431,6 +510,8 @@ class ImagesWorkspaceTests(unittest.TestCase):
         self.tab.refresh_from_disk()
         self.assertEqual(self.session.project.to_dict(), expected)
         self.assertEqual(self.list_ids(), list(reversed(self.ids)))
+        self.select(self.first)
+        self.assertEqual(transition.currentData(), "envelope")
         self.assertEqual(self.tab.artwork.resolve_asset(self.first).read_bytes(), expected_gif)
         self.assertEqual(self.page(self.second)["message"]["html"], '<p><b>Message B</b> — café</p>')
 
@@ -446,6 +527,7 @@ class ImagesWorkspaceTests(unittest.TestCase):
             self.assertTrue(self.tab.page_list.isVisible())
             self.assertGreater(self.tab.page_list.width(), 0)
             self.assertTrue(self.tab.name_edit.isVisible())
+            self.assertTrue(self.tab.transition_combo.isVisible())
             self.assertEqual(self.list_ids(), self.ids)
 
     def test_same_path_replacement_refreshes_only_valid_media(self):

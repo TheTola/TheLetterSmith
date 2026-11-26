@@ -307,12 +307,17 @@ class SavedStyleSetStore:
         raw = self.raw_slot(slot)
         return None if raw is None else NamedStyleSet.from_dict(raw)
 
+    def name(self, slot: int) -> str:
+        value = self.settings.get(self._slot_key(slot) + "_name")
+        return (value.strip() if isinstance(value, str) else "") or f"Style {slot}"
+
     def save(
         self,
         slot: int,
         style_set: NamedStyleSet,
         *,
         overwrite: bool = False,
+        name: str | None = None,
     ) -> bool:
         """Write only one slot; confirm changed contents before overwrite."""
         key = self._slot_key(slot)
@@ -320,14 +325,26 @@ class SavedStyleSetStore:
             raise InvalidStyleSetError("Invalid active style set")
         payload = style_set.to_dict()
         current = self.settings.get(key)
+        updates = {key: payload}
         if current is not None:
             existing = NamedStyleSet.from_dict(current)
             if existing == style_set:
-                return False
-            if not overwrite:
+                updates.clear()
+            elif not overwrite:
                 raise StyleSetOverwriteRequired(f"Style {slot} already has a saved set")
-        self.settings.update_fields({key: payload})
+        if name is not None:
+            name_key = key + "_name"
+            clean_name = name.strip()
+            if clean_name != (self.settings.get(name_key) or ""):
+                updates[name_key] = clean_name
+        if not updates:
+            return False
+        self.settings.update_fields(updates)
         return True
+
+    def rename(self, slot: int, name: str) -> bool:
+        saved = self.load(slot)
+        return saved is not None and self.save(slot, saved, name=name)
 
 
 def validate_document_style_state(

@@ -3,6 +3,12 @@
 # Purpose: HTML/CSS/JS templates for the eLetter viewer
 # ===============================
 
+import json
+
+from desktop_viewer import DESKTOP_VIEWER_CSS, DESKTOP_VIEWER_JS
+from page_turn import PAGE_TURN_JS
+from page_transitions import PAGE_EFFECTS_JS, TRANSITION_SOUNDS
+
 TEMPLATE_HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
@@ -27,6 +33,11 @@ TEMPLATE_HTML = r"""
     <img id="curtain-left"  src="gallery/controls/cleft.png"  alt="" aria-hidden="true" decoding="async" fetchpriority="high">
     <img id="curtain-right" src="gallery/controls/cright.png" alt="" aria-hidden="true" decoding="async" fetchpriority="high">
     <span id="begin-button" contenteditable="false">Tap to Begin</span>
+    <div id="phone-start-controls" hidden>
+      <button id="phone-open" class="hud-button" type="button">Open Letter</button>
+      <button id="phone-start-sound" class="hud-button" type="button" aria-label="Sound" aria-pressed="false">Sound Off</button>
+      <button id="phone-start-over" class="hud-button" type="button" hidden>Start Over</button>
+    </div>
   </div>
   <div
     id="title-banner"
@@ -53,12 +64,7 @@ TEMPLATE_HTML = r"""
   >Fullscreen</button>
 
   <div id="slideshow" aria-hidden="true">
-    <div id="turn" aria-hidden="true">
-      <div class="sheet sheet-front visible" id="sheetFront">
-        <img id="turnFrontImg" alt="">
-      </div>
-    </div>
-    <div id="turnShadow" aria-hidden="true"></div>
+    <canvas id="turn" aria-hidden="true" hidden></canvas>
 
     <section class="slide active" data-index="0" id="slide-0">
       <img src="gallery/pages/cover.png" alt="Cover Page" decoding="async" fetchpriority="high">
@@ -119,6 +125,13 @@ TEMPLATE_HTML = r"""
     >
       <img src="gallery/controls/showmessageicon.png" alt="" aria-hidden="true" decoding="async">
     </button>
+
+    <div id="phone-controls" hidden>
+      <div id="phone-page-actions">
+        <button id="phone-finish" class="hud-button" type="button" hidden>Finish</button>
+      </div>
+      <div id="phone-navigation" role="group" aria-label="Letter navigation and sound"></div>
+    </div>
   </div>
 
   <div id="volume-control" aria-hidden="true">
@@ -190,6 +203,7 @@ TEMPLATE_CSS = r"""
   --duration-hover:150ms;
   --duration-overlay:180ms;
   --duration-major:640ms;
+  --duration-page-turn:1250ms;
   --duration-curtain:1500ms;
   --duration-attention:2000ms;
   --ease-standard:cubic-bezier(.2,.8,.2,1);
@@ -230,8 +244,7 @@ button{margin:0;border:0;background:none;color:inherit}
   opacity:0;visibility:hidden;pointer-events:none;
   transition:opacity var(--motion-major);
   background:var(--stage-backdrop);
-  perspective:6000px;
-  transform-style:preserve-3d;
+  isolation:isolate;
 }
 body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 
@@ -280,7 +293,7 @@ body.stage-ready #slideshow{opacity:1;visibility:visible;pointer-events:auto}
 .nav-button img{width:var(--nav-size);height:var(--nav-size)}
 .nav-button[disabled]{opacity:.35;cursor:not-allowed;filter:grayscale(1);box-shadow:none}
 .nav-button[disabled]:hover{transform:translateY(-50%)}
-#slideshow.page-turning .nav-button{pointer-events:none}
+#slideshow.page-turning .nav-button{opacity:0;pointer-events:none}
 
 #viewer-actions{position:absolute;top:var(--corner-offset);left:var(--corner-offset);display:flex;align-items:center;pointer-events:none;z-index:107}
 #viewer-actions-left{display:flex;align-items:center;gap:8px}
@@ -339,23 +352,106 @@ body.stage-ready #volume-control{opacity:1;visibility:visible;pointer-events:aut
 #volume-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;background:var(--accent-strong);border-radius:50%;cursor:pointer;border:2px solid #fff;box-shadow:0 0 0 4px rgba(0,255,255,.12)}
 #volume-slider::-moz-range-thumb{width:16px;height:16px;background:var(--accent-strong);border:2px solid #fff;border-radius:50%;cursor:pointer;box-shadow:0 0 0 4px rgba(0,255,255,.12)}
 
-#turn{position:absolute;left:0;top:0;width:0;height:0;opacity:0;pointer-events:none;overflow:hidden;border-radius:var(--page-radius);z-index:40;transform-style:preserve-3d;backface-visibility:hidden;will-change:transform,opacity}
-.sheet{position:absolute;inset:0;overflow:hidden;border-radius:var(--page-radius);transform-style:preserve-3d;backface-visibility:hidden;transform-origin:0 50%;--edgeA:0;--glintA:0;--edgeDirection:90deg;--glintX:92%}
-.sheet img{display:block;width:100%;height:100%;object-fit:contain;border-radius:var(--page-radius)}
-.sheet.hidden{opacity:0;visibility:hidden}
-.sheet.visible{opacity:1;visibility:visible}
-.sheet::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(var(--edgeDirection),rgba(255,255,255,0) 60%,rgba(255,255,255,var(--edgeA)) 86%,rgba(255,255,255,0) 100%);mix-blend-mode:screen}
-.sheet::before{content:"";position:absolute;inset:-10%;pointer-events:none;background:radial-gradient(320px 220px at var(--glintX) 45%,rgba(255,255,255,var(--glintA)) 0%,rgba(255,255,255,0) 62%);mix-blend-mode:overlay}
-#turnShadow{position:absolute;left:0;top:0;width:0;height:0;pointer-events:none;z-index:39;opacity:0;border-radius:var(--page-radius);overflow:hidden;--sx:88%;--sd:.04;--sb:8px;background:radial-gradient(110% 82% at var(--sx) 55%,rgba(0,0,0,var(--sd)) 0%,rgba(0,0,0,0) 64%);filter:blur(var(--sb));will-change:background,filter}
+#turn{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:40;background:var(--stage-backdrop)}
+#letter-preview[data-turn-effect="pixelate"] :is(#viewer-actions,#fullscreen-button,#volume-control,#page-navigation,#open-text,#title-banner){visibility:hidden}
 
 @media (max-width: 900px){:root{--nav-size:clamp(48px,8vw,66px);--wall-gap:clamp(18px,4vw,30px)}.text-wall-content{font-size:clamp(16px,1.8vw,18px)}}
 @media (max-width: 640px){:root{--nav-offset:4px;--nav-size:34px;--nav-pad:4px;--icon-size:34px;--close-size:38px;--corner-offset:12px;--control-rail:50px;--bottom-control-rail:60px;--page-side-rail:50px}#prev,#next{top:50%}#volume-control{left:var(--corner-offset);right:auto;bottom:calc(5px + env(safe-area-inset-bottom));padding:4px;transform:none}body.stage-ready #volume-control{transform:none}#viewer-actions{top:10px;left:10px}#viewer-actions-left{gap:5px}#viewer-actions .viewer-action,#fullscreen-button{height:32px;padding:0 8px;font-size:10px}#fullscreen-button{top:10px;right:10px}#open-text{left:auto;right:var(--corner-offset);bottom:calc(5px + env(safe-area-inset-bottom));transform:none}.text-wall{width:calc(100% - (2 * var(--wall-gap)));max-height:calc(100% - var(--control-rail) - var(--bottom-control-rail))}#volume-control.slider-open #volume-slider{width:min(28vw,64px)}}
 @media (max-width: 220px){:root{--page-side-rail:58px}#viewer-actions .viewer-action,#fullscreen-button{width:34px;padding:0;font-size:0}#restart-button::before{content:"Γå╗";font-size:18px}#mute-button::before{content:"≡ƒöç";font-size:15px}#mute-button[aria-pressed="true"]::before{content:"≡ƒöè"}#fullscreen-button::before{content:"Γ¢╢";font-size:17px}}
 @media (max-height: 420px){:root{--nav-offset:4px;--nav-size:34px;--nav-pad:4px;--icon-size:32px;--close-size:34px;--corner-offset:8px;--control-rail:48px;--bottom-control-rail:52px;--page-side-rail:50px;--wall-gap:10px;--wall-frame-pad:8px;--wall-block-pad:14px;--wall-inline-pad:12px}#viewer-actions{top:8px;left:8px}#viewer-actions-left{gap:5px}#viewer-actions .viewer-action,#fullscreen-button{height:30px;padding:0 8px;font-size:10px}#fullscreen-button{top:8px;right:8px}#volume-control{bottom:6px;padding:3px}#open-text{bottom:6px}.text-wall-content{font-size:15px;line-height:1.45}}
 @media (prefers-reduced-motion: reduce){*,*::before,*::after{scroll-behavior:auto !important}#slideshow,#volume-control,#open-text,#close-text,.text-wall,#volume-slider{transition:none}#begin-button{animation:none}#curtain-overlay.is-visible,#curtain-overlay.is-visible #curtain-left,#curtain-overlay.is-visible #curtain-right,#title-banner.is-showing,#title-banner.is-hiding{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
-"""
 
-TEMPLATE_JS = r"""
+#letter-preview.phone-viewer{
+  --phone-top:max(8px,env(safe-area-inset-top));
+  --phone-bottom:max(8px,env(safe-area-inset-bottom));
+  --phone-left:max(8px,env(safe-area-inset-left));
+  --phone-right:max(8px,env(safe-area-inset-right));
+  --phone-bar-height:52px;
+  --phone-actions-height:50px;
+  --control-rail:calc(var(--phone-top) + 48px);
+  --bottom-control-rail:calc(var(--phone-bottom) + var(--phone-bar-height) + 6px);
+}
+@supports (height:100dvh){#letter-preview.phone-viewer{height:100dvh}}
+:is(#phone-start-controls,#phone-controls)[hidden],.phone-viewer [hidden]{display:none !important}
+.phone-viewer .slide.phone-page-actions{--bottom-control-rail:calc(var(--phone-bottom) + var(--phone-bar-height) + var(--phone-actions-height) + 6px)}
+.phone-viewer .slide:not(.has-canvas) > img,.phone-viewer .canvas-bounds{left:var(--phone-left);right:var(--phone-right)}
+.phone-viewer .slide:not(.has-canvas) > img{max-width:calc(100% - var(--phone-left) - var(--phone-right))}
+.phone-viewer .slide > img{touch-action:pan-y pinch-zoom;user-select:none;-webkit-user-drag:none}
+.phone-viewer :is(.hud-button,.nav-button,#page-selector){touch-action:manipulation}
+.phone-viewer #begin-button,.phone-viewer .slide.asset-failed::after{display:none}
+.phone-viewer #curtain-overlay{z-index:10003}
+#phone-start-controls{
+  position:absolute;inset:var(--phone-top) var(--phone-right) var(--phone-bottom) var(--phone-left);z-index:10001;
+  display:grid;grid-template-columns:repeat(2,max-content);place-content:center;gap:10px;pointer-events:none;
+}
+#phone-start-controls button{pointer-events:auto}
+#phone-start-over{grid-column:1 / -1;justify-self:center}
+.phone-viewer #phone-open,.phone-viewer #open-text,.phone-viewer #phone-finish{
+  border-color:rgba(155,255,251,.5);background:#142f3a;
+}
+.phone-viewer #viewer-actions{top:var(--phone-top);left:var(--phone-left)}
+.phone-viewer #fullscreen-button{top:var(--phone-top);right:var(--phone-right)}
+.phone-viewer :is(#phone-start-controls,#phone-controls,.phone-reader-tools,.phone-artwork-retry) .hud-button,
+.phone-viewer #viewer-actions .viewer-action,.phone-viewer #fullscreen-button{
+  width:auto;min-width:44px;height:44px;padding:0 12px;font:700 13px/1 var(--font-ui);white-space:nowrap;
+}
+#phone-controls{position:absolute;left:var(--phone-left);right:var(--phone-right);bottom:var(--phone-bottom);z-index:109;display:flex;flex-direction:column;align-items:center;gap:6px;pointer-events:none}
+#phone-page-actions,#phone-navigation{display:flex;align-items:center;justify-content:center;gap:6px;pointer-events:auto}
+#phone-navigation{height:var(--phone-bar-height);max-width:100%;padding:4px;border:1px solid var(--hud-border);border-radius:var(--pill-radius);background:#10141e;box-shadow:var(--hud-shadow);gap:4px}
+.phone-viewer #phone-navigation .nav-button{position:relative;inset:auto;transform:none;width:44px;height:44px;padding:6px}
+.phone-viewer #phone-navigation .nav-button img{width:100%;height:100%}
+.phone-viewer #slideshow.page-turning .nav-button{opacity:.35}
+.phone-viewer #page-navigation{position:relative;inset:auto;transform:none;max-width:none;min-width:62px;min-height:44px;justify-content:center;padding:0 6px;background:none;white-space:nowrap}
+.phone-viewer #page-navigation:focus-within{outline:2px solid #fff}
+.phone-viewer #page-navigation:has(#page-selector)::after{content:"";width:5px;height:5px;border-right:1px solid;border-bottom:1px solid;transform:translateY(-2px) rotate(45deg);pointer-events:none}
+.phone-viewer #page-selector{position:absolute;inset:0;width:100%;max-width:none;height:100%;opacity:0;cursor:pointer}
+.phone-viewer #volume-control,.phone-viewer #volume-control.slider-open{position:relative;inset:auto;transform:none;padding:0;border:0;background:none;box-shadow:none;backdrop-filter:none}
+.phone-viewer #volume-icon{width:44px;padding:0}
+.phone-viewer #volume-icon-img{width:30px;height:30px;padding:0}
+.phone-viewer #volume-slider{display:none}
+.phone-viewer #volume-control.slider-open #volume-slider{
+  display:block;position:absolute;right:0;bottom:calc(100% + var(--phone-actions-height) + 12px);
+  width:112px;height:24px;background:#29313d;box-shadow:0 0 0 8px #10141e;
+}
+.phone-viewer #open-text{position:relative;inset:auto;transform:none}
+.phone-viewer #open-text:not(.is-visible){display:none}
+.phone-viewer #phone-finish:disabled{opacity:.5}
+.phone-viewer .phone-artwork-retry{position:absolute;inset:var(--control-rail) var(--phone-right) var(--bottom-control-rail) var(--phone-left);display:grid;place-items:center;pointer-events:none}
+.phone-viewer .phone-artwork-retry button{pointer-events:auto}
+.phone-viewer .slide:not(.active) .phone-artwork-retry{visibility:hidden}
+.phone-viewer[data-turn-effect="pixelate"] #phone-navigation :is(#page-navigation,#volume-control){visibility:visible}
+
+.phone-viewer.phone-reading :is(#phone-controls,#viewer-actions,#fullscreen-button,.phone-artwork-retry){display:none}
+.phone-viewer .text-wall,.phone-viewer .text-wall.is-open{
+  inset:0;z-index:200;display:flex;flex-direction:column;width:auto;height:auto;max-height:none;margin:0;
+  padding:var(--phone-top) var(--phone-right) var(--phone-bottom) var(--phone-left);overflow:hidden;
+  border:0;border-radius:0;transform:none;--message-overlay-surface-opacity:1 !important;
+}
+.phone-viewer .text-wall::before,.phone-viewer .message-overflow-note{display:none}
+.phone-reader-tools{display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:0 4px 8px;border-bottom:1px solid var(--message-overlay-border)}
+.phone-viewer .phone-reader-tools .hud-button:disabled{opacity:.45;cursor:default}
+.phone-viewer .phone-reader-tools :is(.close-text,#close-text){position:static;flex:none;margin:0 0 0 4px;font-size:24px}
+.phone-viewer .text-wall-viewport{position:relative;inset:auto;flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;touch-action:pan-y pinch-zoom}
+.phone-viewer .text-wall-content{
+  width:auto;min-height:0;max-width:44rem;padding:16px clamp(8px,4vw,24px) 24px;
+  font-size:18px;line-height:1.6;zoom:var(--phone-reading-scale,1);
+}
+.phone-viewer .text-wall-content *{min-width:0 !important;overflow-wrap:anywhere !important}
+.phone-viewer .text-wall-content :is(pre,[style*="white-space:nowrap"],[style*="white-space:pre;"]){white-space:pre-wrap !important}
+.phone-viewer .text-wall-content table{table-layout:fixed;width:100% !important}
+
+@media (orientation:landscape) and (min-width:620px){
+  #letter-preview.phone-viewer{--phone-actions-height:0px}
+  #phone-controls{flex-direction:row-reverse;justify-content:center}
+}
+""" + DESKTOP_VIEWER_CSS
+
+TRANSITION_SOUNDS_JS = "const TRANSITION_SOUNDS = " + json.dumps({
+    style: ["gallery/sounds/" + filename for filename in filenames]
+    for style, filenames in TRANSITION_SOUNDS.items()
+}) + ";\n"
+
+TEMPLATE_JS = TRANSITION_SOUNDS_JS + PAGE_EFFECTS_JS + PAGE_TURN_JS + DESKTOP_VIEWER_JS + r"""
 document.addEventListener('DOMContentLoaded', () => {
   const overlay   = document.getElementById('curtain-overlay');
   const cLeft     = document.getElementById('curtain-left');
@@ -370,18 +466,36 @@ document.addEventListener('DOMContentLoaded', () => {
   const muteBtn = document.getElementById('mute-button');
   const fullscreenBtn = document.getElementById('fullscreen-button');
   const letterPreviewEl = document.getElementById('letter-preview');
+  const userAgent = navigator.userAgent;
+  const forgePreview = window.letterSmithForgePreview;
+  // A narrow viewport or a touch screen can also belong to a desktop or tablet.
+  const phoneViewer = forgePreview?.phone ?? (
+    !/\b(?:iPad|Tablet)\b/i.test(userAgent) && (
+      /\b(?:iPhone|iPod|Windows Phone)\b/i.test(userAgent) ||
+      (/\bAndroid\b/i.test(userAgent) && (navigator.userAgentData?.mobile || /\bMobile\b/i.test(userAgent)))
+    )
+  );
+  const desktopViewer = !phoneViewer && !navigator.userAgentData?.mobile &&
+    !/\b(?:Android|iPad|Tablet|Mobile)\b/i.test(userAgent) && navigator.userAgentData?.platform !== 'Android' &&
+    !(navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) &&
+    !window.matchMedia('(pointer: coarse) and (hover: none)').matches;
+  const letterTransition = letterPreviewEl.dataset.transition || 'classic';
   const turn = document.getElementById('turn');
-  const turnShadow = document.getElementById('turnShadow');
-  const sheetFront = document.getElementById('sheetFront');
-  const imgFront = document.getElementById('turnFrontImg');
 
   const legacyWall = document.getElementById('textWall');
   const messageWalls = Array.from(document.querySelectorAll('.text-wall'));
   let wall         = legacyWall;
   let closeText    = document.getElementById('close-text');
   const openText   = document.getElementById('open-text');
-  const pageIndicator = document.getElementById('page-indicator');
-  const pageSelector = document.getElementById('page-selector');
+  let pageIndicator = document.getElementById('page-indicator');
+  const pageSelector = desktopViewer ? null : document.getElementById('page-selector');
+  const phoneStartControls = document.getElementById('phone-start-controls');
+  const phoneOpenBtn = document.getElementById('phone-open');
+  const phoneStartSound = document.getElementById('phone-start-sound');
+  const phoneStartOver = document.getElementById('phone-start-over');
+  const phoneControls = document.getElementById('phone-controls');
+  const phonePageActions = document.getElementById('phone-page-actions');
+  const phoneFinish = document.getElementById('phone-finish');
 
   const slideshowEl = document.getElementById('slideshow');
   const volumeControl = document.getElementById('volume-control');
@@ -389,7 +503,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const volIconImg = document.getElementById('volume-icon-img');
   let music       = document.getElementById('bg-music');
   let musicStandby = document.getElementById('bg-music-standby');
-  const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const reducedMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+  const prefersReducedMotion = reducedMotionQuery.matches;
   const motionStyles = getComputedStyle(document.documentElement);
   function motionDuration(property, fallbackMs){
     const raw = motionStyles.getPropertyValue(property).trim();
@@ -404,6 +519,7 @@ document.addEventListener('DOMContentLoaded', () => {
     duration: Object.freeze({
       overlay: motionDuration('--duration-overlay', 180),
       major: motionDuration('--duration-major', 640),
+      pageTurn: motionDuration('--duration-page-turn', 1250),
       curtain: motionDuration('--duration-curtain', 1500),
     }),
     easing: Object.freeze({
@@ -411,7 +527,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }),
     ease(value){
       const t = clamp(value, 0, 1);
-      return t * t * t * (t * ((t * 6) - 15) + 10);
+      return t * t * (3 - 2 * t);
     },
   });
   const curtainIntroRevealMs = prefersReducedMotion ? 80 : motion.duration.major;
@@ -436,6 +552,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let wallRevealTimer = null;
   let wallRevealUnlockTimer = null;
   let slider = null;
+  let desktopControls = null;
   let stageReady = false;
   let introStarted = false;
   let titleBannerStarted = false;
@@ -451,6 +568,17 @@ document.addEventListener('DOMContentLoaded', () => {
   const musicLoopDelayMs = 1200;
   const playbackIdentity = document.body.dataset.playbackId;
   const muteStorageKey = 'lettersmith.viewerMuted' + (playbackIdentity ? ':' + playbackIdentity : '');
+  const phoneProgressKey = 'lettersmith.phoneProgress:' + (playbackIdentity || location.pathname);
+  const phoneReadingScales = [1, 1.15, 1.32, 1.52, 1.75, 2];
+  let phoneProgress = phoneViewer ? loadPhoneProgress() : null;
+  let phoneReadingSize = phoneProgress?.size ?? 0;
+  let phoneScrollPositions = phoneProgress?.scroll ?? [];
+  let phoneProgressTimer = null;
+  let phoneFinishing = false;
+  let phoneFinishTimer = null;
+  let phoneReplay = false;
+  const phoneReaderViewports = new Map();
+  const recoveredImageSources = new Map();
   let viewerMuted = loadViewerMuted();
   let currentVolume = loadVolume0to100();
   let playbackVisible = true;
@@ -460,14 +588,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const playbackTimers = new Set();
   const playbackFrames = new Set();
   const ownedAudio = new Set([music, musicStandby].filter(Boolean));
+  const musicGains = new Map();
+  let phoneAudioContext = null;
 
-  const flipPool = [
-    'gallery/sounds/flip1.mp3', 'gallery/sounds/flip2.mp3',
-    'gallery/sounds/flip3.mp3', 'gallery/sounds/flip4.mp3',
-    'gallery/sounds/flip5.mp3', 'gallery/sounds/flip6.mp3',
-    'gallery/sounds/flip7.mp3', 'gallery/sounds/flip8.mp3',
-    'gallery/sounds/flip9.mp3', 'gallery/sounds/flip10.mp3',
-  ];
   const glissSrc = 'gallery/sounds/glissando.mp3';
   const deferredAssets = [
     ...slides.slice(1).map((slide) => ({ as: 'image', href: slide.querySelector('img').getAttribute('src') })),
@@ -477,12 +600,12 @@ document.addEventListener('DOMContentLoaded', () => {
     { as: 'image', href: 'gallery/controls/voloff.png' },
     { as: 'image', href: 'gallery/controls/showmessageicon.png' },
     ...((Array.isArray(MUSIC_PLAYLIST) ? MUSIC_PLAYLIST : []).map((href) => ({ as: 'audio', href, type: 'audio/mpeg' }))),
-    ...flipPool.map((href) => ({ as: 'audio', href, type: 'audio/mpeg' })),
-    ...Object.values(IMAGE_ANIMATIONS).flatMap((config) => (
+    ...Object.values(TRANSITION_SOUNDS).flat().map((href) => ({ as: 'audio', href, type: 'audio/mpeg' })),
+    ...(phoneViewer && prefersReducedMotion ? [] : Object.values(IMAGE_ANIMATIONS).flatMap((config) => (
       Array.isArray(config.frames)
         ? config.frames.map((href) => ({ as: 'image', href }))
         : []
-    )),
+    ))),
   ];
 
   function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
@@ -499,6 +622,173 @@ document.addEventListener('DOMContentLoaded', () => {
       handler(e);
     });
   }
+
+  function loadPhoneProgress(){
+    try{
+      const saved = JSON.parse(localStorage.getItem(phoneProgressKey));
+      if (!Number.isInteger(saved?.page) || saved.page < 0 || saved.page >= TOTAL) return null;
+      return {
+        page: saved.page,
+        reading: saved.reading === true,
+        size: Number.isInteger(saved.size) ? clamp(saved.size, 0, phoneReadingScales.length - 1) : 0,
+        scroll: Array.isArray(saved.scroll) ? saved.scroll.slice(0, TOTAL).map(position => (
+          Number.isFinite(position?.top) && Number.isFinite(position.range) && Number.isFinite(position.width)
+            ? position : null
+        )) : [],
+      };
+    }catch(_){ return null; }
+  }
+  function savePhoneProgress(){
+    clearTimeout(phoneProgressTimer);
+    phoneProgressTimer = null;
+    if (!phoneViewer || !started || phoneFinishing) return;
+    const reading = letterPreviewEl.classList.contains('phone-reading');
+    if (reading) rememberPhoneScroll(phoneReaderViewports.get(wall));
+    phoneProgress = {page:idx, reading, size:phoneReadingSize, scroll:phoneScrollPositions};
+    try{ localStorage.setItem(phoneProgressKey, JSON.stringify(phoneProgress)); }catch(_){ }
+  }
+  function clearPhoneProgress(){
+    clearTimeout(phoneProgressTimer);
+    phoneProgressTimer = null;
+    phoneProgress = null;
+    phoneScrollPositions = [];
+    try{ localStorage.removeItem(phoneProgressKey); }catch(_){ }
+  }
+  function syncPhoneStartControls(replay = false){
+    phoneOpenBtn.textContent = replay ? 'Replay' : phoneProgress ? 'Continue' : 'Open Letter';
+    phoneStartOver.hidden = !phoneProgress;
+    phoneStartControls.hidden = false;
+  }
+  function hasWallMessage(item){
+    return !!item && (item.dataset.hasMessage === undefined ? HAS_MESSAGE : item.dataset.hasMessage === 'true');
+  }
+  function rememberPhoneScroll(viewport){
+    phoneScrollPositions[idx] = {
+      top: viewport.scrollTop,
+      range: viewport.scrollHeight - viewport.clientHeight,
+      width: viewport.clientWidth,
+    };
+  }
+  function syncPhoneReading(open){
+    const viewport = phoneReaderViewports.get(wall);
+    const wasOpen = letterPreviewEl.classList.contains('phone-reading');
+    if (wasOpen && !open) rememberPhoneScroll(viewport);
+    letterPreviewEl.classList.toggle('phone-reading', open);
+    wall.inert = !open;
+    if (open && !wasOpen){
+      setSliderOpen(false);
+      const position = phoneScrollPositions[idx];
+      viewport.scrollTop = position?.width === viewport.clientWidth ? position.top :
+        position?.range > 0 ? (position.top / position.range) * (viewport.scrollHeight - viewport.clientHeight) : 0;
+    }
+  }
+  function installPhoneReader(){
+    const sizeButtons = [];
+    function applySize(){
+      letterPreviewEl.style.setProperty('--phone-reading-scale', phoneReadingScales[phoneReadingSize]);
+      for (const [smaller, larger] of sizeButtons){
+        smaller.disabled = phoneReadingSize === 0;
+        larger.disabled = phoneReadingSize === phoneReadingScales.length - 1;
+      }
+    }
+    function changeSize(step){
+      const viewport = phoneReaderViewports.get(wall);
+      const range = viewport.scrollHeight - viewport.clientHeight;
+      const scrollRatio = range > 0 ? viewport.scrollTop / range : 0;
+      phoneReadingSize = clamp(phoneReadingSize + step, 0, phoneReadingScales.length - 1);
+      applySize();
+      viewport.scrollTop = scrollRatio * (viewport.scrollHeight - viewport.clientHeight);
+      savePhoneProgress();
+    }
+    function sizeButton(label, name, step){
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'hud-button';
+      button.textContent = label;
+      button.setAttribute('aria-label', name);
+      button.addEventListener('click', () => changeSize(step));
+      return button;
+    }
+    for (const item of messageWalls){
+      let viewport = item.querySelector('.text-wall-viewport');
+      if (!viewport){
+        viewport = document.createElement('div');
+        viewport.className = 'text-wall-viewport';
+        viewport.tabIndex = 0;
+        viewport.setAttribute('role', 'region');
+        viewport.setAttribute('aria-label', 'Message text');
+        viewport.append(item.querySelector('.text-wall-content'));
+        item.append(viewport);
+      }
+      phoneReaderViewports.set(item, viewport);
+      item.inert = true;
+      item.setAttribute('aria-modal', 'true');
+      const toolbar = document.createElement('div');
+      toolbar.className = 'phone-reader-tools';
+      const smaller = sizeButton('A−', 'Decrease text size', -1);
+      const larger = sizeButton('A+', 'Increase text size', 1);
+      sizeButtons.push([smaller, larger]);
+      toolbar.append(smaller, larger, item.querySelector('.hud-button-close'));
+      item.prepend(toolbar);
+      viewport.addEventListener('scroll', () => {
+        if (item !== wall || !item.classList.contains('is-open') || phoneProgressTimer !== null) return;
+        phoneProgressTimer = setTimeout(savePhoneProgress, 150);
+      }, {passive:true});
+    }
+    applySize();
+  }
+  function installPhoneControls(){
+    letterPreviewEl.classList.add('phone-viewer');
+    document.querySelector('meta[name="viewport"]').content += ', viewport-fit=cover';
+    overlay.removeAttribute('tabindex');
+    overlay.removeAttribute('role');
+    overlay.removeAttribute('aria-labelledby');
+    if (fullscreenBtn && !document.fullscreenEnabled) fullscreenBtn.hidden = true;
+    slideshowEl.inert = true;
+
+    let pageNavigation = document.getElementById('page-navigation');
+    if (!pageNavigation){
+      pageNavigation = document.createElement('div');
+      pageNavigation.id = 'page-navigation';
+      pageIndicator = document.createElement('span');
+      pageIndicator.id = 'page-indicator';
+      pageIndicator.setAttribute('role', 'status');
+      pageIndicator.setAttribute('aria-live', 'polite');
+      pageNavigation.append(pageIndicator);
+    }
+    document.getElementById('phone-navigation').append(prevBtn, pageNavigation, nextBtn, muteBtn, volumeControl);
+    muteBtn.setAttribute('aria-label', 'Sound');
+    phonePageActions.prepend(openText);
+    openText.textContent = 'Read Message';
+    openText.title = 'Read Message';
+    openText.setAttribute('aria-label', 'Read message');
+    for (const [index, slide] of slides.entries()){
+      const message = messageWalls.find(item => item.dataset.pageId && item.dataset.pageId === slide.dataset.pageId) ||
+        (slide.dataset.pageType === 'wall' ? legacyWall : null);
+      slide.classList.toggle('phone-page-actions', index === TOTAL - 1 || hasWallMessage(message));
+    }
+    phoneControls.hidden = false;
+    syncPhoneStartControls();
+    installPhoneReader();
+
+    let swipe = null;
+    slideshowEl.addEventListener('pointerdown', event => {
+      swipe = event.pointerType === 'touch' && event.isPrimary && event.target === slideImageEl(slides[idx])
+        ? {id:event.pointerId, x:event.clientX, y:event.clientY} : null;
+    }, {passive:true});
+    slideshowEl.addEventListener('pointerup', event => {
+      if (!swipe || event.pointerId !== swipe.id) return;
+      const dx = event.clientX - swipe.x;
+      const dy = event.clientY - swipe.y;
+      swipe = null;
+      if (Math.abs(dx) >= 44 && Math.abs(dx) > 1.4 * Math.abs(dy)) go(dx < 0 ? 1 : -1);
+    }, {passive:true});
+    slideshowEl.addEventListener('pointercancel', () => { swipe = null; }, {passive:true});
+    reducedMotionQuery.addEventListener('change', () => {
+      if (started && !phoneFinishing) activateImageAnimation(idx);
+    });
+  }
+  if (phoneViewer) installPhoneControls();
 
   function installAdaptiveMicroContrast(wall){
     const content = wall.querySelector('.text-wall-content');
@@ -906,20 +1196,59 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function slideImageEl(slide){ return slide ? slide.querySelector('img') : null; }
-  function slideImageSrc(slide){
-    const image = slideImageEl(slide);
-    return image ? image.getAttribute('src') || '' : '';
-  }
   function markSlideAssetFailed(slide, img){
     if (!slide || slide.classList.contains('asset-failed')) return;
     slide.classList.add('asset-failed');
     slide.dataset.fallbackLabel = img?.getAttribute('alt') || 'Page image unavailable';
+    desktopControls?.updateArtwork();
   }
 
+  function installPhoneImageRetry(slide, img){
+    const index = Number(slide.dataset.index);
+    const fallback = document.createElement('div');
+    fallback.className = 'phone-artwork-retry';
+    fallback.hidden = true;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'hud-button';
+    button.textContent = 'Retry Image';
+    button.setAttribute('aria-label', `Retry Image — ${img.alt}`);
+    fallback.append(button);
+    slide.append(fallback);
+    let failedSource = '';
+    let retry = 0;
+    function showFailure(){
+      failedSource ||= img.getAttribute('src') || '';
+      cancelImageAnimation(index, false);
+      markSlideAssetFailed(slide, img);
+      button.disabled = false;
+      button.textContent = 'Retry Image';
+      fallback.hidden = false;
+    }
+    img.addEventListener('error', showFailure);
+    img.addEventListener('load', () => {
+      if (!failedSource) return;
+      recoveredImageSources.set(failedSource, img.getAttribute('src'));
+      failedSource = '';
+      slide.classList.remove('asset-failed');
+      fallback.hidden = true;
+      if (started && idx === index && !phoneFinishing) activateImageAnimation(index);
+    });
+    button.addEventListener('click', () => {
+      if (!failedSource) return;
+      const url = new URL(failedSource, location.href);
+      if (/^(https?|file):$/.test(url.protocol)) url.searchParams.set('retry', `${Date.now()}-${++retry}`);
+      button.disabled = true;
+      button.textContent = 'Retrying…';
+      img.src = url.href;
+    });
+    if (img.complete && img.naturalWidth === 0) showFailure();
+  }
   function installImageFallbacks(){
     slides.forEach((slide) => {
       const img = slideImageEl(slide);
       if (!img) return;
+      if (phoneViewer){ installPhoneImageRetry(slide, img); return; }
       const handleError = () => markSlideAssetFailed(slide, img);
       img.addEventListener('error', handleError, { once: true });
       if (img.complete && img.naturalWidth === 0) handleError();
@@ -964,13 +1293,16 @@ document.addEventListener('DOMContentLoaded', () => {
     return Array.isArray(config.frames) && config.frames.length > 1 ? config : null;
   }
 
-  function cancelImageAnimation(slideIndex){
+  function setAnimationImageSource(image, source){
+    if (source) image.src = recoveredImageSources.get(source) || source;
+  }
+  function cancelImageAnimation(slideIndex, restorePoster = true){
     const state = imageAnimationStates.get(slideIndex);
     if (!state) return;
     state.cancelled = true;
     if (state.timer !== null) clearTimeout(state.timer);
-    if (state.config.render_mode === 'native_gif' && state.config.preview_source){
-      state.image.src = state.config.preview_source;
+    if (restorePoster && state.config.render_mode === 'native_gif'){
+      setAnimationImageSource(state.image, state.config.preview_source);
     }
     state.timer = null;
     imageAnimationStates.delete(slideIndex);
@@ -978,8 +1310,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function showImageAnimationFrame(state, frameIndex){
     if (state.cancelled) return;
-    const source = state.config.frames[frameIndex];
-    if (source) state.image.src = source;
+    setAnimationImageSource(state.image, state.config.frames[frameIndex]);
   }
 
   function imageFrameDuration(state, frameIndex){
@@ -1056,26 +1387,26 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function prepareImageAnimation(slideIndex){
+    const slide = slides[slideIndex];
     const config = imageAnimationConfig(slideIndex);
-    if (!config) return;
+    if (!config || (phoneViewer && slide.classList.contains('asset-failed'))) return;
     cancelImageAnimation(slideIndex);
-    const image = slideImageEl(slides[slideIndex]);
+    const image = slideImageEl(slide);
     if (!image) return;
-    if (config.render_mode === 'native_gif') image.src = config.preview_source;
-    else if (config.frames[0]) image.src = config.frames[0];
+    setAnimationImageSource(image, config.render_mode === 'native_gif' ? config.preview_source : config.frames[0]);
   }
 
   function activateImageAnimation(slideIndex){
+    const slide = slides[slideIndex];
     const config = imageAnimationConfig(slideIndex);
-    if (!config) return;
-    cancelImageAnimation(slideIndex);
-    const image = slideImageEl(slides[slideIndex]);
-    if (!image) return;
-    if (config.animation_enabled === false){
-      if (config.render_mode === 'native_gif') image.src = config.preview_source;
-      else if (config.frames[0]) image.src = config.frames[0];
+    if (!config || (phoneViewer && slide.classList.contains('asset-failed'))) return;
+    if (config.animation_enabled === false || (phoneViewer && reducedMotionQuery.matches)){
+      prepareImageAnimation(slideIndex);
       return;
     }
+    cancelImageAnimation(slideIndex);
+    const image = slideImageEl(slide);
+    if (!image) return;
     const state = {
       cancelled: false,
       timer: null,
@@ -1086,7 +1417,7 @@ document.addEventListener('DOMContentLoaded', () => {
     };
     imageAnimationStates.set(slideIndex, state);
     if (config.render_mode === 'native_gif'){
-      image.src = config.source;
+      setAnimationImageSource(image, config.source);
       return;
     }
     showImageAnimationFrame(state, 0);
@@ -1104,7 +1435,8 @@ document.addEventListener('DOMContentLoaded', () => {
     setHiddenState(volumeControl, false);
     document.body.classList.add('stage-ready');
     const requestedIndex = slides.findIndex((slide) => slide.dataset.pageId === requestedPageId);
-    setActiveIndex(Math.max(0, requestedIndex), { playSound: false });
+    const fallbackIndex = forgePreview ? idx : 0;
+    setActiveIndex(requestedIndex < 0 ? fallbackIndex : requestedIndex, { playSound: false });
   }
 
   function startCurtainIntro(){
@@ -1172,6 +1504,8 @@ document.addEventListener('DOMContentLoaded', () => {
         message:`Page ${Number(slide.dataset.index) + 1} — ${slide.dataset.pageName}: Message continues in the scrollable text area.`,
         severity:'warning',feature:'messages',blocks_output:false,blocks_preview:false});
     }
+    desktopControls?.updateArtwork();
+    desktopControls?.restorePosition();
     const changed = JSON.stringify(issues) !== JSON.stringify(layoutIssues);
     layoutIssues = issues;
     if (changed) window.dispatchEvent(new CustomEvent('lettersmith-layout', {detail:issues.map((item) => ({...item}))}));
@@ -1187,9 +1521,12 @@ document.addEventListener('DOMContentLoaded', () => {
   scheduleCanvasLayouts();
   function syncPageNavigation(){
     const slide = slides[idx];
+    if (desktopViewer) slides.forEach((item) => setHiddenState(item, item !== slide));
     if (pageIndicator && slide){
       const name = slide.dataset.pageName || slide.querySelector('img')?.alt || '';
-      pageIndicator.textContent = `Page ${idx + 1} of ${TOTAL}${name ? ' — ' + name : ''}`;
+      const description = `Page ${idx + 1} of ${TOTAL}${name ? ' — ' + name : ''}`;
+      pageIndicator.textContent = phoneViewer ? `${idx + 1} / ${TOTAL}` : description;
+      if (phoneViewer) pageIndicator.setAttribute('aria-label', description);
     }
     if (pageSelector) pageSelector.value = String(idx);
   }
@@ -1198,10 +1535,15 @@ document.addEventListener('DOMContentLoaded', () => {
     btn.setAttribute('aria-disabled', disabled ? 'true' : 'false');
   }
   function syncButtons(){
-    const locked = !started || introControlsLocked || wallRevealLocked || flipping;
+    const locked = !started || introControlsLocked || wallRevealLocked || flipping || phoneFinishing;
     setDisabled(prevBtn, locked || idx === 0);
     setDisabled(nextBtn, locked || idx === TOTAL - 1);
     if (pageSelector) setDisabled(pageSelector, locked);
+    desktopControls?.updateArtwork();
+    if (phoneViewer){
+      phoneFinish.hidden = !started || idx !== TOTAL - 1;
+      setDisabled(phoneFinish, locked);
+    }
   }
 
   function clearWallRevealTimers(){
@@ -1217,6 +1559,8 @@ document.addEventListener('DOMContentLoaded', () => {
     closeText.classList.toggle('is-visible', open);
     setHiddenState(closeText, !open);
     setExpandedState(openText, open);
+    if (phoneViewer) syncPhoneReading(open);
+    desktopControls?.trackMessage(open ? wall : null);
     if (open){
       adaptiveMicroContrast.schedule();
       setTimeout(()=>adaptiveMicroContrast.schedule(),motion.duration.overlay+24);
@@ -1224,6 +1568,8 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   function hideWallDuringRevealDelay(){
     if (!wall) return;
+    if (phoneViewer) syncPhoneReading(false);
+    desktopControls?.trackMessage(null);
     wall.classList.remove('is-open');
     openText.classList.remove('is-visible');
     closeText.classList.remove('is-visible');
@@ -1252,8 +1598,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }, wallRevealDelayMs);
   }
   function syncWallUI(){
-    const hasMessage = wall && (wall.dataset.hasMessage === undefined ? HAS_MESSAGE : wall.dataset.hasMessage === 'true');
-    if (!hasMessage || !isWallPage()){
+    const hasMessage = hasWallMessage(wall) && isWallPage();
+    if (phoneViewer) phonePageActions.hidden = !hasMessage && idx !== TOTAL - 1;
+    if (!hasMessage){
       clearWallRevealTimers();
       wallRevealLocked = false;
       wall?.classList.remove('is-open');
@@ -1266,7 +1613,7 @@ document.addEventListener('DOMContentLoaded', () => {
       syncButtons();
       return;
     }
-    if (wallClosedByUser){
+    if (phoneViewer || wallClosedByUser){
       clearWallRevealTimers();
       wallRevealLocked = false;
       setWallOpen(false);
@@ -1276,20 +1623,30 @@ document.addEventListener('DOMContentLoaded', () => {
     beginWallRevealSequence();
   }
 
-  function playOneShot(src, volume01){
-    if (!playbackAllowed()) return;
+  function playOneShot(src, volume01, offset = 0){
+    if (!playbackAllowed() || (phoneViewer && (viewerMuted || currentVolume === 0 || phoneFinishing))) return;
     try{
-      const a = ownTransientAudio(new Audio(src));
+      const a = new Audio(src);
       a.preload = 'auto';
       a.volume = clamp(volume01, 0, 1);
       a.muted = viewerMuted || currentVolume === 0;
-      playOwnedAudio(a);
+      if (offset > 0) a.currentTime = offset;
+      const release = () => ownedAudio.delete(a);
+      a.addEventListener('error', release, {once:true});
+      ownTransientAudio(a);
+      playOwnedAudio(a, release);
     }catch(_){ }
   }
-  function playFlip(){
-    const pick = flipPool[Math.floor(Math.random() * flipPool.length)];
-    const vol = music ? clamp(music.volume, 0, 1) : 0.5;
-    playOneShot(pick, vol);
+  function playTurnSound(goingNext, animated){
+    const sounds = TRANSITION_SOUNDS[letterTransition];
+    if (!sounds?.length) return;
+    if (letterTransition === 'classic'){
+      const pick = sounds[Math.floor(Math.random() * sounds.length)];
+      playOneShot(pick, music ? musicLevel(music) : 0.5);
+      return;
+    }
+    // Direct jumps and reduced motion use the closing phrase of the cue.
+    playOneShot(sounds[goingNext ? 0 : sounds.length - 1], currentVolume / 100, animated ? 0 : .86);
   }
 
   function setActiveIndex(newIdx, opts = {}){
@@ -1299,146 +1656,112 @@ document.addEventListener('DOMContentLoaded', () => {
       syncPageNavigation();
       syncButtons();
       syncWallUI();
+      if (phoneViewer) savePhoneProgress();
       return;
     }
+    desktopControls?.resetZoom();
     clearWallRevealTimers();
     wallRevealLocked = false;
     hideWallDuringRevealDelay();
     document.querySelectorAll('.ultralink-tooltip.is-visible').forEach((item) => item.classList.remove('is-visible'));
-    cancelImageAnimation(idx);
+    const previous = idx;
+    cancelImageAnimation(previous);
     prepareImageAnimation(target);
     idx = target;
     selectMessageWall();
     syncPageNavigation();
     slides.forEach((s, i) => {
       s.classList.toggle('active', i === idx);
-      s.classList.remove('peek');
-      s.classList.remove('ghost');
+      s.classList.remove('ghost', 'peek');
     });
     if (isWallPage()) wallClosedByUser = false;
-    if (opts.playSound !== false) playFlip();
+    if (opts.playSound !== false) playTurnSound(target > previous, false);
     syncButtons();
     syncWallUI();
     if (started) activateImageAnimation(idx);
+    if (phoneViewer) savePhoneProgress();
   }
 
-  function activeSlide(){ return slides[idx]; }
-  function activeImageRect(){
-    const image = slideImageEl(activeSlide());
-    if (!image) return null;
-    const rect = image.getBoundingClientRect();
-    return rect.width > 2 && rect.height > 2 ? rect : null;
-  }
-  function placeTurn(rect){
-    for (const element of [turn, turnShadow]){
-      element.style.left = `${rect.left}px`;
-      element.style.top = `${rect.top}px`;
-      element.style.width = `${rect.width}px`;
-      element.style.height = `${rect.height}px`;
-    }
-  }
-  function setTurnVisible(visible){
-    turn.style.opacity = visible ? '1' : '0';
-    turnShadow.style.opacity = visible ? '1' : '0';
-  }
-  function setTurnRotation(degrees, progress, direction){
-    turn.style.transformOrigin = '0% 50%';
-    turn.style.transform = `rotateY(${degrees}deg)`;
-    const amount = clamp(Math.abs(degrees) / 180, 0, 1);
-    const edge = Math.pow(Math.sin(amount * Math.PI), 1.2);
-    const glint = Math.pow(Math.sin(amount * Math.PI), 2);
-    const shadowProgress = clamp(progress, 0, 1);
-    const shadowX = direction > 0
-      ? 88 - (76 * shadowProgress)
-      : 12 + (76 * shadowProgress);
-    sheetFront.style.setProperty('--edgeA', String(0.28 * edge));
-    sheetFront.style.setProperty('--glintA', String(0.22 * glint));
-    sheetFront.style.setProperty('--edgeDirection', direction > 0 ? '90deg' : '270deg');
-    sheetFront.style.setProperty('--glintX', direction > 0 ? '92%' : '8%');
-    turnShadow.style.setProperty('--sx', `${shadowX}%`);
-    turnShadow.style.setProperty('--sd', String(0.04 + (0.16 * edge)));
-    turnShadow.style.setProperty('--sb', `${8 + (8 * edge)}px`);
-  }
-  function finishTurn(currentSlide, targetSlide, targetIndex){
-    currentSlide.classList.remove('ghost');
-    targetSlide.classList.remove('peek');
-    setActiveIndex(targetIndex, { playSound: false });
-    setTurnVisible(false);
-    for (const element of [turn, turnShadow]){
-      element.style.width = '0px';
-      element.style.height = '0px';
-    }
+  function clearTurn(){
+    turn.hidden = true;
+    turn.width = turn.height = 0;
     slideshowEl.classList.remove('page-turning');
     slideshowEl.setAttribute('aria-busy', 'false');
+    delete letterPreviewEl.dataset.turnEffect;
     flipping = false;
-    syncButtons();
   }
-  function flipTo(targetIndex){
-    if (!started || flipping || introControlsLocked || wallRevealLocked) return;
+  function finishTurn(targetIndex){
+    setActiveIndex(targetIndex, { playSound: false });
+    // Keep the last frame until the newly active DOM page has had a paint.
+    requestAnimationFrame(() => {
+      if (!flipping) return;
+      clearTurn();
+      syncButtons();
+    });
+  }
+  function flipTo(targetIndex, preview = false){
+    if (!started || flipping || introControlsLocked || wallRevealLocked || phoneFinishing) return;
     const target = clamp(targetIndex, 0, TOTAL - 1);
     if (target === idx) return;
-    const rect = activeImageRect();
-    if (!rect || prefersReducedMotion){
-      playFlip();
+    desktopControls?.resetZoom();
+    const goingNext = target > idx;
+    const currentSlide = slides[idx];
+    const pageSlide = slides[Math.max(idx, target)];
+    let frame = null;
+    const reduceMotion = phoneViewer ? reducedMotionQuery.matches : prefersReducedMotion;
+    const missingArtwork = phoneViewer && [currentSlide, slides[target]].some(slide => slide.classList.contains('asset-failed'));
+    if ((!reduceMotion || preview) && !missingArtwork){
+      prepareImageAnimation(target);
+      const leafIndex = Math.min(idx, target);
+      const leafSlide = slides[leafIndex];
+      const isCover = leafSlide.dataset.pageType === 'cover' || leafIndex === 0;
+      try{
+        frame = createPageTurn(turn, slideshowEl, slideImageEl(leafSlide), slideImageEl(pageSlide), isCover, letterTransition, [cLeft, cRight]);
+        if (frame && !frame(goingNext ? 0 : 1)) frame = null;
+      }catch(error){
+        console.warn('Page turn could not start.', error);
+        frame = null;
+      }
+    }
+    playTurnSound(goingNext, !!frame);
+    if (!frame){
       setActiveIndex(target, { playSound: false });
+      turn.width = turn.height = 0;
       return;
     }
 
     flipping = true;
     syncButtons();
+    hideWallDuringRevealDelay();
     slideshowEl.classList.add('page-turning');
     slideshowEl.setAttribute('aria-busy', 'true');
-
-    const goingNext = target > idx;
-    const direction = goingNext ? 1 : -1;
-    const currentSlide = slides[idx];
-    const targetSlide = slides[target];
-    prepareImageAnimation(target);
-    placeTurn(rect);
-    sheetFront.classList.remove('hidden');
-    sheetFront.classList.add('visible');
-    imgFront.src = goingNext
-      ? slideImageSrc(currentSlide)
-      : slideImageSrc(targetSlide);
-    const turningImageStyle = getComputedStyle(slideImageEl(goingNext ? currentSlide : targetSlide));
-    imgFront.style.objectFit = turningImageStyle.objectFit;
-    imgFront.style.objectPosition = turningImageStyle.objectPosition;
-
-    if (goingNext){
-      targetSlide.classList.add('peek');
-      currentSlide.classList.add('ghost');
-      setTurnRotation(0, 0, direction);
-    } else {
-      setTurnRotation(-180, 0, direction);
-    }
-    setTurnVisible(true);
-    playFlip();
-
-    const duration = motion.duration.major;
+    letterPreviewEl.dataset.turnEffect = letterTransition;
+    currentSlide.classList.add('ghost');
+    slides[target].classList.add('peek');
+    turn.hidden = false;
     const startedAt = performance.now();
     function animate(now){
-      const raw = clamp((now - startedAt) / duration, 0, 1);
-      const eased = motion.ease(raw);
-      const degrees = goingNext
-        ? -180 * eased
-        : -180 + (180 * eased);
-      setTurnRotation(degrees, eased, direction);
-      if (raw < 1){
-        requestAnimationFrame(animate);
-        return;
+      if (!flipping) return;
+      const raw = clamp((now - startedAt) / motion.duration.pageTurn, 0, 1);
+      let progress = raw;
+      if (letterTransition === 'classic'){
+        progress = raw < .5 ? motion.ease(raw / .46) / 2 : .5 + motion.ease((raw - .54) / .46) / 2;
       }
-      finishTurn(currentSlide, targetSlide, target);
+      try{
+        if (frame(goingNext ? progress : 1 - progress) && raw < 1){
+          requestAnimationFrame(animate);
+          return;
+        }
+      }catch(error){
+        console.warn('Page turn interrupted.', error);
+      }
+      finishTurn(target);
     }
     requestAnimationFrame(animate);
   }
-  window.addEventListener('resize', () => {
-    if (!flipping) return;
-    const rect = activeImageRect();
-    if (rect) placeTurn(rect);
-  });
 
   function go(delta){
-    if (!started || introControlsLocked || wallRevealLocked || flipping) return;
+    if (!started || introControlsLocked || wallRevealLocked || flipping || phoneFinishing) return;
     const target = clamp(idx + delta, 0, TOTAL - 1);
     if (target === idx) return;
     dismissTitleBanner();
@@ -1489,16 +1812,28 @@ document.addEventListener('DOMContentLoaded', () => {
     const muted = viewerMuted || vv === 0;
     [music, musicStandby].forEach((audio) => {
       if (!audio) return;
-      audio.volume = vol01;
+      setMusicLevel(audio, vol01);
     });
     ownedAudio.forEach(audio => { audio.muted = muted; });
     volIconImg.src = muted ? 'gallery/controls/voloff.png' : 'gallery/controls/volon.png';
-    volIcon.setAttribute('aria-label', muted ? 'Audio muted. Toggle volume slider' : 'Toggle volume slider');
+    const soundLabel = desktopViewer ? (muted ? 'Sound (muted)' : 'Sound')
+      : (muted ? 'Audio muted. Toggle volume slider' : 'Toggle volume slider');
+    volIcon.setAttribute('aria-label', soundLabel);
     if (slider) slider.value = String(vv);
+    if (phoneViewer) syncMuteButton();
   }
 
   function syncMuteButton(){
     if (!muteBtn) return;
+    if (phoneViewer){
+      const soundOn = !viewerMuted && currentVolume > 0;
+      for (const button of [phoneStartSound, muteBtn]){
+        button.textContent = soundOn ? 'Sound On' : 'Sound Off';
+        button.setAttribute('aria-pressed', String(soundOn));
+        button.title = soundOn ? 'Mute letter audio' : 'Unmute letter audio';
+      }
+      return;
+    }
     const label = viewerMuted ? 'Unmute' : 'Mute';
     const description = viewerMuted ? 'Unmute letter audio' : 'Mute letter audio';
     muteBtn.textContent = label;
@@ -1511,7 +1846,17 @@ document.addEventListener('DOMContentLoaded', () => {
     viewerMuted = !!muted;
     saveViewerMuted();
     setVolume0to100(currentVolume);
-    syncMuteButton();
+    if (!phoneViewer) syncMuteButton();
+  }
+  function togglePhoneSound(){
+    const enable = viewerMuted || currentVolume === 0;
+    if (enable && currentVolume === 0) currentVolume = loadVolume0to100() || 50;
+    setViewerMuted(!enable);
+    if (enable && started && !introControlsLocked && !phoneFinishing && music?.paused && ensureInitialMusicSource()){
+      preparePhoneAudioGain();
+      playbackRequested = true;
+      playOwnedAudio(music);
+    }
   }
 
   function playbackAllowed(generation = playbackGeneration){
@@ -1577,9 +1922,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (started && introControlsLocked){
       introControlsLocked = false;
       overlay.remove();
+      if (phoneViewer) slideshowEl.inert = false;
       syncButtons();
     }
     setVolume0to100(currentVolume);
+    if (dispose && phoneAudioContext) phoneAudioContext.close().catch(() => {});
   }
   window.letterSmithPlayback = Object.freeze({
     setVisible(visible){
@@ -1592,9 +1939,20 @@ document.addEventListener('DOMContentLoaded', () => {
     },
   });
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) stopPlayback();
+    if (!document.hidden) return;
+    if (phoneViewer) savePhoneProgress();
+    stopPlayback();
   });
-  window.addEventListener('pagehide', () => window.letterSmithPlayback.shutdown());
+  window.addEventListener('pagehide', event => {
+    if (phoneViewer){
+      savePhoneProgress();
+      if (event.persisted){ stopPlayback(); return; }
+    }
+    window.letterSmithPlayback.shutdown();
+  });
+  window.addEventListener('pageshow', event => {
+    if (phoneViewer && event.persisted) resetPhoneLetter(phoneReplay || phoneFinishing);
+  });
 
   function musicSources(){
     return Array.isArray(MUSIC_PLAYLIST) ? MUSIC_PLAYLIST.filter((value) => typeof value === 'string' && value) : [];
@@ -1610,6 +1968,49 @@ document.addEventListener('DOMContentLoaded', () => {
   function nextMusicIndex(sources){
     if (!sources.length) return -1;
     return (musicPlaylistIndex + 1) % sources.length;
+  }
+  function musicLevel(audio){ return musicGains.get(audio)?.gain.value ?? audio.volume; }
+  function setMusicLevel(audio, value){
+    const gain = musicGains.get(audio);
+    if (gain) gain.gain.value = value;
+    else audio.volume = value;
+  }
+  function preparePhoneAudioGain(){
+    // iPhone can lock element volume. Route same-origin or embedded music through a gain node.
+    if (!phoneAudioContext && window.CSS?.supports('selector(:volume-locked)') && music.matches(':volume-locked') &&
+        (location.protocol !== 'file:' || musicSources().every(source => source.startsWith('data:')))){
+      try{
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        phoneAudioContext = new AudioContext();
+        for (const audio of [music, musicStandby].filter(Boolean)){
+          const gain = phoneAudioContext.createGain();
+          gain.gain.value = audio.volume;
+          audio.volume = 1;
+          phoneAudioContext.createMediaElementSource(audio).connect(gain);
+          gain.connect(phoneAudioContext.destination);
+          musicGains.set(audio, gain);
+        }
+      }catch(_){ }
+    }
+    if (phoneAudioContext && phoneAudioContext.state !== 'running'){
+      phoneAudioContext.resume().catch(() => {});
+    }
+  }
+  function primePhoneSoundtrack(){
+    if (!ensureInitialMusicSource()) return;
+    preparePhoneAudioGain();
+    // A click can authorize playback for each element before the curtain cue ends.
+    const sources = musicSources();
+    const players = [music];
+    if (musicStandby && sources.length > 1 && Number(MUSIC_CROSSFADE_MS) > 0){
+      musicStandby.src = sources[nextMusicIndex(sources)];
+      players.push(musicStandby);
+    }
+    for (const audio of players){
+      audio.muted = true;
+      setMusicLevel(audio, 0);
+      playOwnedAudio(audio);
+    }
   }
   function installPlaylistListeners(audio){
     if (!audio) return;
@@ -1649,7 +2050,7 @@ document.addEventListener('DOMContentLoaded', () => {
       try{
         if (!music.getAttribute('src') || !music.src.endsWith(wanted)) music.src = wanted;
         music.currentTime = 0;
-        music.volume = clamp(currentVolume / 100, 0, 1);
+        setMusicLevel(music, clamp(currentVolume / 100, 0, 1));
         music.muted = viewerMuted || currentVolume === 0;
         playOwnedAudio(music);
       }catch(_){ }
@@ -1665,7 +2066,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const muted = viewerMuted || target === 0;
     musicStandby.src = sources[nextIndex];
     musicStandby.currentTime = 0;
-    musicStandby.volume = 0;
+    setMusicLevel(musicStandby, 0);
     musicStandby.muted = muted;
     const duration = Math.max(120, Number(MUSIC_CROSSFADE_MS) || 1000);
     const startedAt = performance.now();
@@ -1677,8 +2078,8 @@ document.addEventListener('DOMContentLoaded', () => {
       const t = clamp((now - startedAt) / duration, 0, 1);
       const volume = clamp(currentVolume / 100, 0, 1);
       const effectiveMuted = viewerMuted || volume === 0;
-      music.volume = volume * (1 - t);
-      musicStandby.volume = volume * t;
+      setMusicLevel(music, volume * (1 - t));
+      setMusicLevel(musicStandby, volume * t);
       if (t < 1){ animatePlayback(step); return; }
       music.pause();
       music.currentTime = 0;
@@ -1686,9 +2087,9 @@ document.addEventListener('DOMContentLoaded', () => {
       music = musicStandby;
       musicStandby = previous;
       musicPlaylistIndex = nextIndex;
-      music.volume = volume;
+      setMusicLevel(music, volume);
       music.muted = effectiveMuted;
-      musicStandby.volume = volume;
+      setMusicLevel(musicStandby, volume);
       musicStandby.muted = effectiveMuted;
       playlistTransitioning = false;
     }
@@ -1696,12 +2097,13 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   installPlaylistListeners(music);
   installPlaylistListeners(musicStandby);
-  if (!musicSources().length && volumeControl) volumeControl.style.display = 'none';
+  if (!desktopViewer && !musicSources().length && volumeControl) volumeControl.style.display = 'none';
   function setSliderOpen(open){
     const shouldOpen = !!open;
     volumeControl.classList.toggle('slider-open', shouldOpen);
     setExpandedState(volIcon, shouldOpen);
     if (slider) setHiddenState(slider, !shouldOpen);
+    desktopControls?.setSoundOpen(shouldOpen);
   }
 
   function glissDurationMs(audioEl){
@@ -1723,7 +2125,7 @@ document.addEventListener('DOMContentLoaded', () => {
     void cLeft.offsetWidth;
     cLeft.style.animation = `curtainLeftOut ${openMs}ms ${motion.easing.emphasized} forwards`;
     cRight.style.animation = `curtainRightOut ${openMs}ms ${motion.easing.emphasized} forwards`;
-    setTimeout(() => {
+    schedulePlayback(() => {
       overlay.style.pointerEvents = 'none';
       overlay.setAttribute('aria-hidden', 'true');
       overlay.remove();
@@ -1768,17 +2170,106 @@ document.addEventListener('DOMContentLoaded', () => {
       titleBanner.setAttribute('aria-hidden', 'true');
     }, titleBannerFadeOutMs);
   }
-  function openCurtain(){
-    if (started || !playbackAllowed()) return;
-    const generation = playbackGeneration;
+  function beginLetter(){
     started = true;
-    introControlsLocked = true;
     syncButtons();
     revealStage();
     activateImageAnimation(idx);
     overlay.removeAttribute('tabindex');
     if (fullscreenBtn) fullscreenBtn.inert = false;
-    runTitleBanner();
+    desktopControls?.start();
+  }
+  function resetPhoneLetter(replay){
+    clearTimeout(phoneFinishTimer);
+    phoneFinishTimer = null;
+    started = false;
+    introControlsLocked = false;
+    phoneFinishing = false;
+    phoneReplay = replay;
+    stopPlayback();
+    musicPlaylistIndex = 0;
+    dismissTitleBanner();
+    titleBannerStarted = false;
+    clearTurn();
+    cancelImageAnimation(idx);
+    setActiveIndex(0, {playSound:false, force:true});
+    setSliderOpen(false);
+    stageReady = false;
+    document.body.classList.remove('stage-ready');
+    slideshowEl.inert = true;
+    setHiddenState(slideshowEl, true);
+    setHiddenState(volumeControl, true);
+    if (fullscreenBtn) fullscreenBtn.inert = true;
+    overlay.style.animation = 'none';
+    overlay.style.opacity = '1';
+    overlay.style.background = '';
+    overlay.style.pointerEvents = '';
+    for (const panel of [cLeft, cRight]){
+      panel.style.animation = 'none';
+      panel.style.opacity = '1';
+      panel.style.transform = 'translateX(0)';
+    }
+    letterPreviewEl.append(overlay);
+    setHiddenState(overlay, false);
+    syncPhoneStartControls(replay);
+    phoneOpenBtn.focus({preventScroll:true});
+  }
+  function finishPhoneLetter(){
+    if (phoneFinish.disabled || phoneFinish.hidden) return;
+    phoneFinishing = true;
+    clearPhoneProgress();
+    dismissTitleBanner();
+    setSliderOpen(false);
+    syncButtons();
+    slideshowEl.inert = true;
+    if (fullscreenBtn) fullscreenBtn.inert = true;
+
+    playbackRequested = false;
+    playlistTransitioning = false;
+    clearTimeout(playlistTransitionTimer);
+    playbackTimers.delete(playlistTransitionTimer);
+    playlistTransitionTimer = null;
+    const duration = reducedMotionQuery.matches ? 140 : motion.duration.curtain;
+    const fading = [music, musicStandby].filter(audio => audio && !audio.paused).map(audio => [audio, musicLevel(audio)]);
+    const startedAt = performance.now();
+    function fade(now){
+      const progress = clamp((now - startedAt) / Math.min(duration, musicFadeMs), 0, 1);
+      for (const [audio, level] of fading) setMusicLevel(audio, level * (1 - progress));
+      if (progress < 1){
+        animatePlayback(fade);
+      } else {
+        for (const [audio] of fading) audio.pause();
+      }
+    }
+    if (fading.length) animatePlayback(fade);
+
+    overlay.style.pointerEvents = '';
+    overlay.style.animation = 'none';
+    for (const panel of [cLeft, cRight]) panel.style.animation = 'none';
+    letterPreviewEl.append(overlay);
+    void overlay.offsetWidth;
+    cLeft.style.animation = `curtainLeftOut ${duration}ms ${motion.easing.emphasized} reverse both`;
+    cRight.style.animation = `curtainRightOut ${duration}ms ${motion.easing.emphasized} reverse both`;
+    if (overlay.classList.contains('curtain-fallback')){
+      overlay.style.background = '';
+      overlay.style.animation = `curtainIntroFadeIn ${duration}ms ${motion.easing.emphasized} both`;
+    }
+    phoneFinishTimer = setTimeout(() => resetPhoneLetter(true), duration);
+  }
+  function openCurtain(progress = null, resumePreview = false){
+    if (started || phoneFinishing || !playbackAllowed()) return;
+    const generation = playbackGeneration;
+    introControlsLocked = true;
+    beginLetter();
+    if (phoneViewer){
+      phoneReplay = false;
+      phoneStartControls.hidden = true;
+      setActiveIndex(progress?.page ?? (forgePreview ? idx : 0), {playSound:false});
+      if (progress?.reading && isWallPage() && hasWallMessage(wall)) setWallOpen(true);
+      savePhoneProgress();
+      primePhoneSoundtrack();
+    }
+    if (!resumePreview) runTitleBanner();
 
     let musicStarted = false;
     let glissDone = false;
@@ -1789,6 +2280,10 @@ document.addEventListener('DOMContentLoaded', () => {
     function tryUnlockIntroControls(){
       if (!glissDone || !curtainDone) return;
       introControlsLocked = false;
+      if (phoneViewer){
+        slideshowEl.inert = false;
+        if (wall?.classList.contains('is-open')) closeText?.focus({preventScroll:true});
+      }
       syncButtons();
     }
     function startMusicAfterGliss(){
@@ -1797,7 +2292,8 @@ document.addEventListener('DOMContentLoaded', () => {
       glissDone = true;
       if (safetyTimer !== null){ clearTimeout(safetyTimer); playbackTimers.delete(safetyTimer); safetyTimer = null; }
       const v = currentVolume;
-      setVolume0to100(v);
+      if (phoneViewer) musicStandby?.pause();
+      else setVolume0to100(v);
       if (!ensureInitialMusicSource()){
         tryUnlockIntroControls();
         return;
@@ -1805,15 +2301,16 @@ document.addEventListener('DOMContentLoaded', () => {
       playbackRequested = true;
       try{
         music.currentTime = 0;
-        music.volume = 0;
+        setMusicLevel(music, 0);
         music.muted = viewerMuted || v === 0;
         playOwnedAudio(music);
       }catch(_){ }
       const start = performance.now();
       function fadeStep(now){
+        if (!playbackRequested) return;
         const t = clamp((now - start) / musicFadeMs, 0, 1);
         const e = t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t + 2, 2)/2;
-        music.volume = clamp(currentVolume / 100, 0, 1) * e;
+        setMusicLevel(music, clamp(currentVolume / 100, 0, 1) * e);
         if (t < 1) animatePlayback(fadeStep);
       }
       animatePlayback(fadeStep);
@@ -1826,12 +2323,25 @@ document.addEventListener('DOMContentLoaded', () => {
         curtainDone = true;
         tryUnlockIntroControls();
       });
-      try{
-        g.currentTime = 0;
-        playOwnedAudio(g, startMusicAfterGliss);
-      }catch(_){ startMusicAfterGliss(); }
+      if (g){
+        try{
+          g.currentTime = 0;
+          playOwnedAudio(g, startMusicAfterGliss);
+        }catch(_){ startMusicAfterGliss(); }
+      }
       const glissWaitMs = Math.max(openMs, glissDurationMs(g));
       safetyTimer = schedulePlayback(startMusicAfterGliss, glissWaitMs + glissSafetyPadMs);
+    }
+    if (resumePreview){
+      overlay.remove();
+      curtainDone = true;
+      startMusicAfterGliss();
+      return;
+    }
+    if (phoneViewer && (viewerMuted || currentVolume === 0)){
+      beginGlissAndCurtain(null);
+      startMusicAfterGliss();
+      return;
     }
     try{
       const g = ownTransientAudio(new Audio(glissSrc));
@@ -1840,6 +2350,7 @@ document.addEventListener('DOMContentLoaded', () => {
       g.muted = viewerMuted || currentVolume === 0;
       g.addEventListener('ended', startMusicAfterGliss, { once: true });
       g.addEventListener('error', () => { beginGlissAndCurtain(g); startMusicAfterGliss(); }, { once: true });
+      if (phoneViewer){ beginGlissAndCurtain(g); return; }
       g.addEventListener('loadedmetadata', () => beginGlissAndCurtain(g), { once: true });
       g.load();
       schedulePlayback(() => beginGlissAndCurtain(g), 250);
@@ -1852,14 +2363,22 @@ document.addEventListener('DOMContentLoaded', () => {
   // Suppress native caret placement/selection; only the completed click starts
   // playback, keeping the gesture on the overlay until release (including touch).
   overlay.addEventListener('pointerdown', (e) => {
+    if (phoneViewer) return;
     e.preventDefault();
     e.stopPropagation();
   });
   bindPress(overlay, (e) => {
+    if (phoneViewer) return;
     e.preventDefault();
     e.stopPropagation();
     if (!e.repeat) openCurtain();
   });
+  if (phoneViewer){
+    phoneOpenBtn.addEventListener('click', () => openCurtain(phoneProgress));
+    phoneStartOver.addEventListener('click', () => { clearPhoneProgress(); openCurtain({page:0}); });
+    phoneStartSound.addEventListener('click', togglePhoneSound);
+    phoneFinish.addEventListener('click', finishPhoneLetter);
+  }
   prevBtn.addEventListener('click', () => go(-1));
   nextBtn.addEventListener('click', () => go(1));
   if (pageSelector){
@@ -1880,17 +2399,46 @@ document.addEventListener('DOMContentLoaded', () => {
       setActiveIndex(target, {playSound:false});
       return true;
     },
+    previewTurn(fromId, toId){
+      const from = slides.findIndex(slide => slide.dataset.pageId === String(fromId));
+      const to = slides.findIndex(slide => slide.dataset.pageId === String(toId));
+      if (from < 0 || to < 0 || Math.abs(from - to) !== 1 || flipping) return false;
+      requestAnimationFrame(() => {
+        if (!playbackAllowed() || flipping) return;
+        if (!started){
+          requestedPageId = String(fromId);
+          introStarted = true;
+          beginLetter();
+          overlay.remove();
+        }
+        dismissTitleBanner();
+        setActiveIndex(from, {playSound:false});
+        clearWallRevealTimers();
+        unlockWallReveal();
+        const images = [from, to].map(index => slideImageEl(slides[index]));
+        Promise.allSettled(images.map(image => image?.decode())).then(() => {
+          if (idx === from && playbackAllowed()) flipTo(to, true);
+        });
+      });
+      return true;
+    },
     currentPageId(){ return slides[idx]?.dataset.pageId || null; },
     layoutIssues(){ updateCanvasLayouts(); return layoutIssues.map((item) => ({...item})); },
   });
   if (restartBtn){
     restartBtn.addEventListener('click', () => {
-      window.location.reload();
+      if (phoneViewer){
+        clearPhoneProgress();
+        resetPhoneLetter(false);
+      } else {
+        window.location.reload();
+      }
     });
   }
   if (muteBtn){
     muteBtn.addEventListener('click', () => {
-      setViewerMuted(!viewerMuted);
+      if (phoneViewer) togglePhoneSound();
+      else setViewerMuted(!viewerMuted);
     });
   }
   if (fullscreenBtn){
@@ -1914,7 +2462,14 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
   window.addEventListener('keydown', (e) => {
-    if (!started || introControlsLocked || wallRevealLocked) return;
+    if (!started || introControlsLocked || wallRevealLocked || phoneFinishing) return;
+    if (phoneViewer){
+      if (letterPreviewEl.classList.contains('phone-reading')){
+        if (e.key === 'Escape') closeText?.click();
+        return;
+      }
+    }
+    if ((phoneViewer || desktopViewer) && e.target instanceof Element && e.target.closest('select,input')) return;
     if (e.key === 'ArrowLeft'){
       e.preventDefault();
       go(-1);
@@ -1938,6 +2493,7 @@ document.addEventListener('DOMContentLoaded', () => {
       setWallOpen(false);
       wallClosedByUser = true;
       syncButtons();
+      if (phoneViewer) savePhoneProgress();
       openText.focus({preventScroll:true});
     });
   });
@@ -1948,6 +2504,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setWallOpen(true);
     wallClosedByUser = false;
     syncButtons();
+    if (phoneViewer) savePhoneProgress();
     closeText?.focus({preventScroll:true});
   });
   bindPress(volIcon, () => {
@@ -1958,6 +2515,16 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   ensureSlider();
+  if (desktopViewer){
+    desktopControls = installDesktopViewer(letterPreviewEl, {
+      slideshow:slideshowEl, volumeControl, slider, muteButton:muteBtn, soundButton:volIcon,
+      fullscreenButton:fullscreenBtn, openText,
+      currentArtwork:() => slideImageEl(slides[idx]),
+      canZoom:() => started && !introControlsLocked && !flipping,
+      closeSound:() => setSliderOpen(false),
+    });
+    pageIndicator = desktopControls.pageIndicator;
+  }
   setSliderOpen(false);
   syncMuteButton();
   setVolume0to100(loadVolume0to100());
@@ -1974,7 +2541,19 @@ document.addEventListener('DOMContentLoaded', () => {
     console.error('Ultralink setup failed', error);
   }
   installImageFallbacks();
-  waitForCriticalAssets().finally(startCurtainIntro);
+  if (forgePreview){
+    forgePreview.position = () => [idx, started && !phoneFinishing];
+    if (Number.isInteger(forgePreview.page) && forgePreview.page >= 0 && forgePreview.page < TOTAL){
+      setActiveIndex(forgePreview.page, {playSound:false});
+    }
+  }
+  if (forgePreview?.opened && playbackAllowed()){
+    introStarted = true;
+    warmDeferredAssets();
+    openCurtain({page:idx}, true);
+  } else {
+    waitForCriticalAssets().finally(startCurtainIntro);
+  }
 });
 """
 
@@ -2001,7 +2580,7 @@ def template_for_pages(pages):
     return TEMPLATE_HTML[:start] + "\n".join(sections) + overlay + TEMPLATE_HTML[end:]
 
 
-def template_for_project_pages(pages, *, template_html=None):
+def template_for_project_pages(pages, *, template_html=None, transition=None):
     """Compose canonical render DTOs without changing authored documents.
 
     ``message_html`` must already be sanitized and its resources packaged.
@@ -2014,6 +2593,7 @@ def template_for_project_pages(pages, *, template_html=None):
     from pathlib import PurePosixPath
     from urllib.parse import unquote, urlsplit
 
+    from page_transitions import normalize_page_transition
     from project_model import PAGE_TYPES, resolve_page_layout
 
     pages = tuple(pages)
@@ -2094,7 +2674,8 @@ def template_for_project_pages(pages, *, template_html=None):
         '<select id="page-selector" aria-label="Go to page" disabled>'
         + "".join(options) + '</select></div>\n'
     )
-    prefix = base[:start]
+    prefix = base[:start].replace('<main id="letter-preview">',
+                                 f'<main id="letter-preview" data-transition="{normalize_page_transition(transition)}">', 1)
     if pages:
         prefix = prefix.replace('href="gallery/pages/cover.png"',
                                 f'href="{html.escape(str(pages[0]["source"]), quote=True)}"')

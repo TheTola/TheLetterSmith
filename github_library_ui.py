@@ -115,6 +115,7 @@ class GitHubLibraryController(QtCore.QObject):
     _listing_ready = QtCore.Signal(int, object)
     _cover_ready = QtCore.Signal(int, str, object)
     REFRESH_TIMEOUT_MS = 60000
+    DOWNLOAD_TIMEOUT_MS = 120000
 
     def __init__(self, controller):
         super().__init__(controller)
@@ -126,6 +127,15 @@ class GitHubLibraryController(QtCore.QObject):
         self.selected_id = ""
         self.account = None
         self.working = False
+        self._download_thread = self._download_worker = None
+        self._download_cancel = Event()
+        self._download_success = None
+        self._download_context = None
+        self._selection_key = None
+        self._selection_revision = 0
+        self._download_timer = QtCore.QTimer(self)
+        self._download_timer.setSingleShot(True)
+        self._download_timer.timeout.connect(self._download_timed_out)
         self.covers = {}
         self._refresh_thread = None
         self._refresh_worker = None
@@ -157,6 +167,8 @@ class GitHubLibraryController(QtCore.QObject):
         return snapshot.session if snapshot.state == GitHubConnectionState.CONNECTED else None
 
     def account_changed(self, snapshot):
+        if self._download_context != (getattr(snapshot.account, "account_id", None), snapshot.generation):
+            self._download_cancel.set()
         if snapshot.account is None or snapshot.account.account_id != self.account:
             self._refresh_cancel.set()
             self.rows.clear()
@@ -199,6 +211,8 @@ class GitHubLibraryController(QtCore.QObject):
     def download_selected(self):
         downloaded = self.downloads.get(self.selected_id)
         row = self.selected()
+        if downloaded is None and row and not row[0].backup:
+            downloaded = self._download_for(row[0])
         if downloaded:
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(downloaded[1] / "index.html")))
             return
@@ -239,7 +253,7 @@ class GitHubLibraryController(QtCore.QObject):
 
         def work():
             library = GitHubLibrary(session, self.forge._github_service.authorized_api(session), cancelled=cancelled,
-                                    store=DestinationStore(self.forge.project_root))
+                                    store=DestinationStore(self.forge.project_root), project_root=self.forge.project_root)
             return operation(library)
 
         def finished(value):
@@ -260,6 +274,97 @@ class GitHubLibraryController(QtCore.QObject):
             self.update_selection()
 
         return self.controller._run(activity, work, finished, failed=failed, quiet=quiet)
+
+    def _run_download(self, activity, operation, success):
+        session = self._session()
+        if session is None or self.working or self._download_thread is not None or self.forge._shutdown or self.forge._busy:
+            return False
+        from Forge_Tab import _TaskWorker
+        self._refresh_cancel.set()
+        self._refresh_timer.stop()
+        self._retry_pending = False
+        self.account = session.account.account_id
+        context = self._download_context = (self.account, self.forge._github_service.snapshot.generation)
+        cancel = self._download_cancel = Event()
+        deadline = monotonic() + self.DOWNLOAD_TIMEOUT_MS / 1000
+        self._download_success = success
+        self.working = True
+        self.status.setStyleSheet("")
+        self.status.setText(activity)
+        self.status.show()
+        self.retry_button.hide()
+
+        def cancelled():
+            snapshot = self.forge._github_service.snapshot
+            return (cancel.is_set() or snapshot.session is None
+                    or (snapshot.session.account.account_id, snapshot.generation) != context)
+
+        def load():
+            api = self.forge._github_service.authorized_api(session)
+            if hasattr(api, "timeout"):
+                api.timeout = min(api.timeout, 10.0)
+            library = GitHubLibrary(session, api, cancelled=cancelled,
+                store=DestinationStore(self.forge.project_root), deadline=deadline)
+            result = operation(library)
+            library._check()
+            return result
+
+        thread = self._download_thread = QtCore.QThread(self)
+        worker = self._download_worker = _TaskWorker(load)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._download_succeeded, QtCore.Qt.QueuedConnection)
+        worker.failed.connect(self._download_failed, QtCore.Qt.QueuedConnection)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit, QtCore.Qt.DirectConnection)
+        thread.finished.connect(self._download_finished, QtCore.Qt.QueuedConnection)
+        self.update_selection()
+        self._download_timer.start(self.DOWNLOAD_TIMEOUT_MS)
+        thread.start()
+        return True
+
+    def _download_is_current(self):
+        snapshot = self.forge._github_service.snapshot
+        return (not self.forge._shutdown and not self._download_cancel.is_set()
+                and snapshot.session is not None
+                and self._download_context == (snapshot.session.account.account_id, snapshot.generation))
+
+    @QtCore.Slot(object)
+    def _download_succeeded(self, result):
+        self._download_timer.stop()
+        if self._download_is_current() and self._download_success is not None:
+            self.status.hide()
+            try:
+                self._download_success(result)
+            except Exception as error:
+                self._download_failed(str(error), "", False)
+
+    @QtCore.Slot(str, str, bool)
+    def _download_failed(self, message, _technical, _safe):
+        self._download_timer.stop()
+        if self._download_is_current():
+            self.status.setText(message + " Your local letters remain available. Open the GitHub letter again to retry.")
+            self.status.setStyleSheet(badge_style("error"))
+            self.status.show()
+
+    def _download_timed_out(self):
+        self._download_failed("The GitHub download took too long.", "", False)
+        self._download_cancel.set()
+
+    @QtCore.Slot()
+    def _download_finished(self):
+        self._download_timer.stop()
+        thread = self._download_thread
+        self._download_thread = self._download_worker = self._download_success = None
+        self.working = False
+        if thread is not None:
+            thread.deleteLater()
+        if not self.forge._shutdown:
+            self.update_selection()
+
+    def _open_context(self):
+        session = self.controller.session
+        return self._selection_revision, session.session_id, session.project.revision
 
     def refresh(self):
         if self.working or self.forge._shutdown or self.forge._saved_panel_mode == "stock":
@@ -439,25 +544,34 @@ class GitHubLibraryController(QtCore.QObject):
 
     def shutdown(self, timeout_ms=None):
         self._refresh_timer.stop()
+        self._download_timer.stop()
         self._retry_pending = self._awaiting_auth = False
         self._refresh_cancel.set()
-        thread = self._refresh_thread
-        if thread is not None and thread.isRunning():
+        self._download_cancel.set()
+        deadline = None if timeout_ms is None else monotonic() + max(0, timeout_ms) / 1000
+        threads = [thread for thread in (self._refresh_thread, self._download_thread)
+                   if thread is not None and thread.isRunning()]
+        for thread in threads:
             thread.requestInterruption()
             thread.quit()
-            return thread.wait() if timeout_ms is None else thread.wait(max(0, timeout_ms))
-        return True
+        stopped = True
+        for thread in threads:
+            remaining = None if deadline is None else max(0, int((deadline - monotonic()) * 1000))
+            stopped = (thread.wait() if remaining is None else thread.wait(remaining)) and stopped
+        return stopped
 
     def sync_cards(self):
+        from saved_letters import SavedLetterCatalog
         for card in self.cards:
             self.forge.saved_cards_layout.removeWidget(card)
             card.deleteLater()
         self.cards = []
         self.downloads = downloaded_presentations(self.download_root)
         if self.forge._saved_panel_mode != "stock":
+            query = self.forge.saved_search.text().strip()
             local_ids = {entry.project_id for entry in self.forge._rendered_catalog_entries}
             for project_id, row in self.rows.items():
-                if project_id in local_ids:
+                if project_id in local_ids or not SavedLetterCatalog.matches_query(row[0], query):
                     continue
                 card = GitHubLetterCard(*row[:4], self.forge.saved_cards_widget)
                 card.customContextMenuRequested.connect(
@@ -469,6 +583,8 @@ class GitHubLibraryController(QtCore.QObject):
                 card.show()
             session = self._session()
             for key, (copy, path, owner) in self.downloads.items():
+                if not SavedLetterCatalog.matches_query(copy, query):
+                    continue
                 online = self.rows.get(copy.project_id)
                 if (online and session and owner.casefold() == session.account.login.casefold()
                         and online[0].presentation):
@@ -492,11 +608,17 @@ class GitHubLibraryController(QtCore.QObject):
                     service.apply_semantic_styles(card)
         self.forge._layout_saved_cards()
         self.update_selection()
+        self.forge._update_saved_search_empty()
+        self.controller.refresh_revision_history()
 
     def update_selection(self):
         local = self.forge._selected_saved_letter
         if local is not None:
             self.selected_id = ""
+        selection = (local.path if local is not None else None, self.selected_id)
+        if selection != self._selection_key:
+            self._selection_key = selection
+            self._selection_revision += 1
         row = self.selected()
         ready = row is not None and not self.working and not self.forge._busy
         self.open_action.setEnabled(bool(ready and row[0].presentation))
@@ -504,11 +626,13 @@ class GitHubLibraryController(QtCore.QObject):
         self.controller.open_button.setText("Open Project")
         if local is None:
             downloaded = self.downloads.get(self.selected_id)
+            if downloaded is None and row and not row[0].backup:
+                downloaded = self._download_for(row[0])
             self.controller.open_button.setEnabled(bool(ready or (downloaded and
-                (downloaded[1] / "index.html").is_file() and not self.working and not self.forge._busy)))
+                (downloaded[1] / "index.html").is_file() and not self.forge._busy)))
         for card in self.cards:
             card.set_selected(card.key == self.selected_id)
-            card.setEnabled(not self.working)
+            card.setEnabled(not self.forge._busy and (not self.working or self._download_thread is not None))
         for card in self.forge._saved_cards:
             from library_status import local_badges
             location, publication = local_badges(card.entry)
@@ -524,16 +648,16 @@ class GitHubLibraryController(QtCore.QObject):
         if not row or not row[0].backup or self.working:
             return
         project = row[0]
+        context = self._open_context()
         def completed(path):
-            self.forge._refresh_catalog_entry(path)
-            self.selected_id = ""
-            self.forge._selected_saved_letter = self.forge.catalog._entry(path)
-            self.controller.selected_changed()
             def open_downloaded():
-                selected = self.forge._selected_saved_letter
-                if selected is not None and selected.path == path:
+                if context == self._open_context() and self._download_is_current():
+                    self.selected_id = ""
+                    self.forge._selected_saved_letter = self.forge.catalog._entry(path)
+                    self.controller.selected_changed()
                     self.controller.open_selected()
             self.forge._defer_until_idle(open_downloaded)
+            self.forge._refresh_catalog_entry(path)
         def retrieve(library):
             current = self._latest(library, project.project_id)
             if not current.backup:
@@ -542,21 +666,27 @@ class GitHubLibraryController(QtCore.QObject):
             if destination.exists():
                 return destination
             return library.download_project(current.backup, self.controller.service.editable_root)
-        return self._run("Opening project…", retrieve, completed)
+        return self._run_download("Downloading project…", retrieve, completed)
 
     def download_presentation(self):
         row = self.selected()
         if not row or not row[0].presentation or self.working:
             return
+        context = self._open_context()
         def completed(path):
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path / "index.html")))
-            self.forge._defer_until_idle(self.refresh)
+            def open_downloaded():
+                if context == self._open_context() and self._download_is_current():
+                    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path / "index.html")))
+            self.forge._defer_until_idle(open_downloaded)
+            project, _location, _kind, version, version_kind, copies = row
+            self.rows[project.project_id] = (project, "Local + GitHub", "local", version, version_kind, copies)
+            self.sync_cards()
         def retrieve(library):
             current = self._latest(library, row[0].project_id)
             if not current.presentation:
                 raise ValueError("This published letter is no longer available on GitHub.")
             return library.download_presentation(current.presentation, self.download_root)
-        return self._run("Opening letter…", retrieve, completed)
+        return self._run_download("Downloading letter…", retrieve, completed)
 
     @staticmethod
     def _latest(library, project_id):
@@ -590,6 +720,7 @@ class GitHubLibraryController(QtCore.QObject):
                 return
         def completed(_project_id):
             self.controller._status("Project backed up to GitHub.")
+            self.controller.refresh_revision_history()
             self.forge._defer_until_idle(self.refresh)
         self._run("Backing up editable project…",
             lambda library: library.backup_project(capture, expected_marker=remote.marker_sha if remote else ""), completed)

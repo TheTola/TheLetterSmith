@@ -92,7 +92,7 @@ def _project_sound_views(session, sound: dict, *, update_sound: bool = False) ->
     records = {} if levels_only else load_library(root)
     original_records = {key: record.to_dict() for key, record in records.items()}
     state = ProjectSoundState.from_dict(sound).normalize()
-    used = set(state.ordered_track_ids())
+    used = set(state.referenced_track_ids())
     try:
         for track in (() if levels_only else sound.get("tracks", [])):
             track_id = track.get("track_id")
@@ -215,8 +215,8 @@ def update_project_sound(session, patch: dict) -> dict:
         before = project_sound_snapshot(session)
         sound = {**before, **deepcopy(patch)}
         sound.update(ProjectSoundState.from_dict(sound).normalize().to_dict())
-        old_ids = ProjectSoundState.from_dict(before).ordered_track_ids()
-        new_ids = ProjectSoundState.from_dict(sound).ordered_track_ids()
+        old_ids = ProjectSoundState.from_dict(before).referenced_track_ids()
+        new_ids = ProjectSoundState.from_dict(sound).referenced_track_ids()
         if new_ids != old_ids or not sound.get("tracks"):
             previous = {track.get("track_id"): track for track in sound.get("tracks", [])}
             resolved, _sources = _active_audio_sources(session.project_root, state=sound)
@@ -262,7 +262,11 @@ def consumer_issue(root, consumer: str = "output") -> str:
         if consumer == "output" and {"tracks": [], **data["sound"]} != {"tracks": [], **authored.get("sound", previous.get("sound", {}))}:
             return "The project sound assignment changed through the page APIs. Reload the saved project before preview or export."
         previous_presentation = authored.get("presentation", previous.get("presentation", previous.get("metadata", {}).get("presentation", {})))
-        if data["presentation"] and data["presentation"] != previous_presentation:
+        # Page turns are handled by the canonical viewer, outside the legacy editor views.
+        presentation = {key: value for key, value in data["presentation"].items() if key != "transition"}
+        if isinstance(previous_presentation, dict):
+            previous_presentation = {key: value for key, value in previous_presentation.items() if key != "transition"}
+        if presentation and presentation != previous_presentation:
             return "This project has presentation settings that the current viewer cannot represent. The project is preserved."
         if session.project.to_dict()["recovery"].get("unresolved_associations"):
             return "Resolve the preserved legacy content associations before preview or export."

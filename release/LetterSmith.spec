@@ -32,12 +32,24 @@ for name in MANIFEST["prompt_writer_files"]:
     )
 
 for item in MANIFEST["data_directories"] + MANIFEST["data_files"]:
+    if ("macos" if IS_MACOS else "windows") not in item.get("platforms", ("windows", "macos")):
+        continue
     datas.append(
         (str(PROJECT_ROOT / item["source"]), item["destination"])
     )
 
 datas += collect_data_files("spellchecker")
 datas += collect_data_files("certifi", includes=["cacert.pem"])
+
+if not IS_MACOS:
+    # Keep the verified speech DLLs together; PyInstaller must not rewrite them.
+    import subprocess
+
+    subprocess.run(
+        [sys.executable, str(PROJECT_ROOT / "tools/build_dictation.py"), "--check"],
+        cwd=PROJECT_ROOT,
+        check=True,
+    )
 
 binaries_config = MACOS["binaries"] if IS_MACOS else MANIFEST["binaries"]
 binaries = [

@@ -9,7 +9,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from image_animation import INDEX_TO_SLOT, inspect_gif, normalize_gif_settings
 from page_layout import PAGE_INDICES
-from project_model import PAGE_TYPES, MIN_PAGES, MAX_PAGES
+from page_transitions import PAGE_TRANSITIONS
+from project_model import PAGE_TYPES, MIN_PAGES, MAX_PAGES, ProjectLayoutError, resolve_page_layout
 from project_paths import application_paths
 from project_session import get_project_session
 from page_artwork import PageArtworkController
@@ -41,45 +42,8 @@ class PageNavigator(QtWidgets.QListWidget):
         self.setStyleSheet("QListWidget:focus { border: 2px solid palette(highlight); }")
 
     def dropEvent(self, event):
-        if self.viewMode() == QtWidgets.QListView.IconMode and event.source() is self:
-            identity = bytes(event.mimeData().data(self._PAGE_MIME)).decode('utf-8')
-            ids = [self.item(row).data(QtCore.Qt.UserRole) for row in range(self.count())]
-            if identity in ids:
-                destination = self.indexAt(event.position().toPoint()).row()
-                if destination < 0:
-                    destination = len(ids)-1
-                ids.remove(identity)
-                ids.insert(destination, identity)
-                self.order_changed.emit(ids)
-                event.setDropAction(QtCore.Qt.MoveAction)
-                event.accept()
-            return
         super().dropEvent(event)
         self.order_changed.emit([self.item(row).data(QtCore.Qt.UserRole) for row in range(self.count())])
-
-    def startDrag(self, actions):
-        if self.viewMode() != QtWidgets.QListView.IconMode:
-            return super().startDrag(actions)
-        if self.currentItem() is None:
-            return
-        mime = QtCore.QMimeData()
-        mime.setData(self._PAGE_MIME, self.currentItem().data(QtCore.Qt.UserRole).encode('utf-8'))
-        drag = QtGui.QDrag(self)
-        drag.setMimeData(mime)
-        drag.setPixmap(self.currentItem().icon().pixmap(80, 100))
-        drag.exec(QtCore.Qt.MoveAction)
-
-    def dragEnterEvent(self, event):
-        if event.source() is self and event.mimeData().hasFormat(self._PAGE_MIME):
-            event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
-
-    def dragMoveEvent(self, event):
-        if event.source() is self and event.mimeData().hasFormat(self._PAGE_MIME):
-            event.acceptProposedAction()
-        else:
-            super().dragMoveEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -224,6 +188,12 @@ class ImageTab(QtWidgets.QWidget):
             self.type_combo.addItem(definition.label, kind)
         self.type_combo.setToolTip("Changing a Letter to another type hides its message and retains it for restoration. Artwork and exact prompt text are preserved.")
         identity.addRow("Type", self.type_combo)
+        self.transition_combo = QtWidgets.QComboBox()
+        self.transition_combo.setAccessibleName("Letter transition")
+        self.transition_combo.setToolTip("Applies to every page turn in this letter.")
+        for transition, label in PAGE_TRANSITIONS.items():
+            self.transition_combo.addItem(label, transition)
+        identity.addRow("Letter transition", self.transition_combo)
         main.addLayout(identity)
         self.artwork_layout = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.LeftToRight)
         self.artwork_layout.setSpacing(12)
@@ -323,6 +293,7 @@ class ImageTab(QtWidgets.QWidget):
         self.name_edit.textEdited.connect(self._edit_name)
         self.name_edit.editingFinished.connect(lambda: self._run(self.flush_pending_edits))
         self.type_combo.activated.connect(lambda: self._run(lambda: self.change_page_type(self.session.selected_page_id, self.type_combo.currentData())))
+        self.transition_combo.activated.connect(lambda: self._run(self._set_letter_transition))
         self.animation_mode.activated.connect(lambda: self._run(self._set_animation_mode))
         self.session_event.connect(self._session_changed)
         self.session.add_listener(self.session_event.emit)
@@ -483,6 +454,7 @@ class ImageTab(QtWidgets.QWidget):
         row = self.page_list.currentRow()
         self.up_button.setEnabled(row > 0)
         self.down_button.setEnabled(0 <= row < count-1)
+        self.transition_combo.setCurrentIndex(self.transition_combo.findData(self.session.project.letter_transition))
         self.undo_button.setEnabled(bool(self._undo) and count < MAX_PAGES)
         for control in (self.name_edit, self.type_combo, self.import_button, self.stock_button, self.pwrite_fab):
             control.setEnabled(selected_page is not None)
@@ -615,6 +587,12 @@ class ImageTab(QtWidgets.QWidget):
         self.session.project.change_page_type(page_id, kind)
         self._commit("page_type")
 
+    def _set_letter_transition(self):
+        transition = self.transition_combo.currentData()
+        self._prepare_page_operation()
+        if self.session.project.set_letter_transition(transition):
+            return self._commit("letter_transition")
+
     def delete_page(self, page_id, confirm=True):
         self._prepare_page_operation()
         page = self.session.project.get_page(page_id)
@@ -650,6 +628,12 @@ class ImageTab(QtWidgets.QWidget):
         if self.artwork.clear_image(page_id):
             self._commit("image_cleared")
             return True
+        return False
+
+    def restore_page_image(self, page_id):
+        self._prepare_page_operation()
+        if self.artwork.restore_image(page_id):
+            return self._commit("image_restored")
         return False
 
     def _legacy_page_id(self, index):
@@ -744,24 +728,13 @@ class ImageTab(QtWidgets.QWidget):
             result.abort()
 
     def _browse_selected(self, *_args):
-        from Image_tab import _downloads_directory
-        self._prepare_page_operation()
-        identity = self.session.selected_page_id
-        if identity is None:
-            return
-        target = self.artwork.capture_target(identity)
-        path, _filter = QtWidgets.QFileDialog.getOpenFileName(self, "Import Image", _downloads_directory(), "Images (*.png *.jpg *.jpeg *.bmp *.gif)")
-        if path:
-            self._run(lambda: self.import_image(identity, path, target=target))
+        return self._choose_images(start_source="browse")
 
     def _stock_selected(self):
-        return self._choose_images(stock_only=True)
+        return self._choose_images(start_source="stock")
 
-    def _all_stock_images(self):
-        return self._choose_images(stock_only=True, all_stock=True)
-
-    def _choose_images(self, *, stock_only=False, all_stock=False):
-        from Image_tab import StockImageDialog, STOCK_IMAGE_FILES, _downloads_directory
+    def _choose_images(self, *, start_source=None):
+        from Image_tab import StockImageDialog, STOCK_IMAGE_FILES
         self._prepare_page_operation()
         identity = self.session.selected_page_id
         if identity is None:
@@ -769,26 +742,31 @@ class ImageTab(QtWidgets.QWidget):
         target = self.artwork.capture_target(identity)
         page = self.session.project.get_page(identity)
         slot = PAGE_TYPES[page["type"]].artwork_template
-        directory = application_paths(self.project_root).stock_images_root / slot
+        stock_root = application_paths(self.project_root).stock_images_root
+        directory = stock_root / slot
         files = tuple(path for name in STOCK_IMAGE_FILES[PAGE_INDICES[slot]] if (path := directory / name).is_file())
-        all_files = tuple(path for path in sorted(application_paths(self.project_root).stock_images_root.rglob("*"))
+        all_files = tuple(path for path in sorted(stock_root.rglob("*"))
                           if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".bmp"})
-        if all_stock:
-            files = all_files
-        history = () if stock_only else recent_type_images(self.project_root, page["type"])
-        recent = tuple((Path(value), label) for value, label in history if Path(value).is_file())
-        dialog = StockImageDialog(PAGE_TYPES[page["type"]].label, () if recent else files, self, allow_browse=True,
+        recent = tuple((Path(value), label) for value, label in recent_type_images(self.project_root, page["type"])
+                       if Path(value).is_file())
+        # Import clears page-local placement and inherits the layout of this page.
+        page["artwork"]["placement"] = {}
+        try:
+            placement = resolve_page_layout(page, self.session.project.resolve_settings(identity))["artwork"]
+        except ProjectLayoutError:
+            placement = None
+        dialog = StockImageDialog(page["name"] or PAGE_TYPES[page["type"]].label, files, self, allow_browse=True,
                                   recent_paths=tuple(path for path, label in recent),
                                   recent_labels=tuple(label for path, label in recent),
-                                  all_stock_paths=all_files if not all_stock else ())
-        if dialog.exec() != QtWidgets.QDialog.Accepted:
-            return
-        if dialog.browse_requested:
-            path, _filter = QtWidgets.QFileDialog.getOpenFileName(self, "Import Image", _downloads_directory(), "Images (*.png *.jpg *.jpeg *.bmp *.gif)")
-        else:
-            path = dialog.selected_path()
-        if path:
-            self._run(lambda: self.import_image(identity, str(path), target=target))
+                                  all_stock_paths=all_files, start_source=start_source, placement=placement)
+        try:
+            if dialog.exec() == QtWidgets.QDialog.Accepted and (path := dialog.selected_path()):
+                if not self.session.target_is_current(target):
+                    self.status.setText("The original page changed while the artwork picker was open.")
+                    return
+                self.import_image(identity, str(path), target=target)
+        finally:
+            dialog.deleteLater()
 
     def _set_animation_mode(self):
         self._prepare_page_operation()
@@ -812,19 +790,16 @@ class ImageTab(QtWidgets.QWidget):
         if path is None:
             return
         page = self.session.project.get_page(identity)
-        def preview(settings):
-            if self.session.target_is_current(target) and self.session.selected_page_id == identity:
-                self.card.set_asset_path(str(path), animated_gif=True, settings=settings)
-                self.card.settings_btn.hide()
         dialog = ImageSettingsDialog(page["name"] or PAGE_TYPES[page["type"]].label, animated_gif=True,
                                      settings=page["artwork"]["animation"], embedded_play_count=inspect_gif(path).embedded_play_count,
-                                     preview_callback=preview, parent=self)
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
-            if self.session.apply_result(target, lambda model, identity: model.update_artwork(identity, {"animation": dialog.gif_settings()})):
-                self._commit("animation")
-                self.animation_settings_changed.emit(PAGE_INDICES.get(page["recovery"].get("legacy_key"), 0))
-        self._preview_key = None
-        self.refresh_cards()
+                                     preview_path=path, parent=self)
+        try:
+            if dialog.exec() == QtWidgets.QDialog.Accepted:
+                if self.session.apply_result(target, lambda model, identity: model.update_artwork(identity, {"animation": dialog.gif_settings()})):
+                    self._commit("animation")
+                    self.animation_settings_changed.emit(PAGE_INDICES.get(page["recovery"].get("legacy_key"), 0))
+        finally:
+            dialog.deleteLater()
 
     def request_prompt(self):
         if not self.flush_pending_edits():

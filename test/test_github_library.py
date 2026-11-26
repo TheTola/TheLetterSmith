@@ -141,6 +141,7 @@ class GitHubLibraryTests(unittest.TestCase):
         preview = self.library.cover_preview(project, self.root / "covers")
         self.assertEqual(preview.read_bytes(), artwork)
         self.assertTrue(all(method == "GET" for method, _, _ in self.api.calls))
+
         self.publication()
         copy = self.library.discover()[0][0].presentation
         files = {copy.prefix + "/" + name: self.api.blobs[sha] for name, sha, size in copy.files}
@@ -155,6 +156,16 @@ class GitHubLibraryTests(unittest.TestCase):
         downloaded = self.library.download_presentation(presentation, self.root / "downloads")
         from publishing.github_library import presentation_cover
         self.assertEqual(presentation_cover(presentation, downloaded).read_bytes(), artwork)
+
+    def test_backup_records_matching_revision_and_time_after_verification(self):
+        from saved_letter_versions import letter_state
+        self.library.project_root = self.root
+        self.library.backup_project(self.capture)
+        backup = self.library.discover()[0][0].backup
+        state = letter_state(self.root, self.project.project_id, "backup")
+        self.assertEqual(state["timestamp"], backup.timestamp)
+        self.assertEqual(state["revision_key"], backup.revision_key)
+        self.assertTrue(backup.revision_key)
 
     def test_public_discovery_download_is_pinned_and_does_not_upload(self):
         self.publication()
@@ -446,6 +457,264 @@ class GitHubLibraryUiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(len(self.library.cards), 0)
         self.assertFalse(self.library.open_action.isEnabled())
+
+    def wait_until(self, condition):
+        deadline = QtCore.QDeadlineTimer(5000)
+        while not condition() and not deadline.hasExpired():
+            self.app.processEvents()
+            sleep(0.01)
+        self.assertTrue(condition(), f"busy={self.forge._busy}, status={self.forge.status.text()}, "
+                        f"details={self.library.status.text()}")
+
+    def local_letter(self):
+        project = self.fixture.project.independent_copy()
+        directory = self.forge.saved_projects.service.editable_root / project.project_id
+        ProjectRepository(directory / ".lettersmith-project").save(project, asset_root=self.fixture.root)
+        self.forge._refresh_catalog_entry(directory)
+        self.forge.refresh_saved_letters(force_reconcile=True)
+        self.wait_until(lambda: any(card.entry.project_id == project.project_id for card in self.forge._saved_cards))
+        return self.forge.catalog._entry(directory)
+
+    def open_local_letter(self, entry):
+        card = next(card for card in self.forge._saved_cards if card.entry.path == entry.path)
+        self.assertTrue(card.isEnabled())
+        QtTest.QTest.mouseClick(card, QtCore.Qt.LeftButton)
+        self.assertTrue(self.forge.saved_projects.open_button.isEnabled())
+        QtTest.QTest.mouseClick(self.forge.saved_projects.open_button, QtCore.Qt.LeftButton)
+        self.wait_until(lambda: not self.forge._busy and
+                        self.forge.saved_projects.session.project.project_id == entry.project_id)
+
+    def test_slow_downloads_allow_local_open_and_do_not_replace_it_on_completion(self):
+        entry = self.local_letter()
+        for editable in (False, True):
+            with self.subTest(editable=editable):
+                if editable:
+                    self.fixture.library.backup_project(self.fixture.capture)
+                self.forge.saved_panel.show()
+                self.library.refresh()
+                self.settle()
+                self.library.select(self.fixture.project.project_id)
+                release, entered = Event(), Event()
+                method = 'download_project' if editable else 'download_presentation'
+                download = getattr(GitHubLibrary, method)
+                def stalled(library, *args, **kwargs):
+                    entered.set()
+                    release.wait(10)
+                    return download(library, *args, **kwargs)
+                with mock.patch.object(GitHubLibrary, method, stalled), mock.patch(
+                        'github_library_ui.QtGui.QDesktopServices.openUrl') as opened:
+                    try:
+                        self.assertTrue(self.library.download_selected())
+                        self.wait_until(entered.is_set)
+                        self.assertFalse(self.forge._busy)
+                        self.open_local_letter(entry)
+                        self.forge.saved_projects.session.project.update_project_data('metadata', {'title': 'Saved during download'})
+                        self.forge.saved_projects.save()
+                        self.wait_until(lambda: not self.forge._busy)
+                        stored = ProjectRepository(entry.path / '.lettersmith-project').load()
+                        self.assertEqual(stored.project.to_dict()['metadata']['title'], 'Saved during download')
+                        current = self.forge.saved_projects.session.project.to_dict()
+                        self.assertTrue(self.library.working)
+                    finally:
+                        release.set()
+                        self.settle()
+                    self.assertEqual(self.forge.saved_projects.session.project.to_dict(), current)
+                    opened.assert_not_called()
+                self.assertTrue(ProjectRepository(entry.path / '.lettersmith-project').exists)
+
+    def test_download_errors_leave_local_letters_usable_and_allow_retry(self):
+        entry = self.local_letter()
+        self.library.refresh()
+        self.settle()
+        for code in ('network', 'github_unavailable', 'authentication'):
+            with self.subTest(code=code):
+                self.forge.saved_panel.show()
+                self.library.select(self.fixture.project.project_id)
+                with mock.patch.object(self.fixture.api, 'request', side_effect=GitHubOperationError(code, code)):
+                    self.assertTrue(self.library.download_selected())
+                    self.settle()
+                self.assertIn(code, self.library.status.text())
+                self.assertFalse(self.forge._busy)
+                self.open_local_letter(entry)
+        self.forge.saved_panel.show()
+        self.library.select(self.fixture.project.project_id)
+        with mock.patch('github_library_ui.QtGui.QDesktopServices.openUrl') as opened:
+            self.assertTrue(self.library.download_selected())
+            self.settle()
+            opened.assert_called_once()
+
+    def test_download_timeout_suppresses_late_open_and_waits_before_retry(self):
+        entry = self.local_letter()
+        self.library.refresh()
+        self.settle()
+        self.library.select(self.fixture.project.project_id)
+        release, entered = Event(), Event()
+        request = self.fixture.api.request
+        def stalled(*args, **kwargs):
+            entered.set()
+            release.wait(10)
+            return request(*args, **kwargs)
+        self.library.DOWNLOAD_TIMEOUT_MS = 5000
+        with mock.patch.object(self.fixture.api, 'request', side_effect=stalled) as calls, mock.patch(
+                'github_library_ui.QtGui.QDesktopServices.openUrl') as opened:
+            try:
+                self.library.download_selected()
+                self.wait_until(entered.is_set)
+                self.library._download_timer.start(50)
+                QtTest.QTest.qWait(100)
+                self.assertIn('too long', self.library.status.text())
+                self.library.download_selected()
+                self.assertEqual(calls.call_count, 1)
+                self.open_local_letter(entry)
+            finally:
+                release.set()
+                self.settle()
+            opened.assert_not_called()
+        self.library.DOWNLOAD_TIMEOUT_MS = 5000
+        self.forge.saved_panel.show()
+        self.library.select(self.fixture.project.project_id)
+        with mock.patch('github_library_ui.QtGui.QDesktopServices.openUrl') as opened:
+            self.library.download_selected()
+            self.settle()
+            opened.assert_called_once()
+
+    def test_download_completion_preserves_edits_without_selection_change(self):
+        self.library.refresh()
+        self.settle()
+        self.library.select(self.fixture.project.project_id)
+        release, entered = Event(), Event()
+        download = GitHubLibrary.download_presentation
+        def stalled(library, *args):
+            entered.set()
+            release.wait(10)
+            return download(library, *args)
+        with mock.patch.object(GitHubLibrary, 'download_presentation', stalled), mock.patch(
+                'github_library_ui.QtGui.QDesktopServices.openUrl') as opened:
+            try:
+                self.library.download_selected()
+                self.wait_until(entered.is_set)
+                self.forge.saved_projects.session.project.update_project_data('metadata', {'title': 'New local edits'})
+                current = self.forge.saved_projects.session.project.to_dict()
+            finally:
+                release.set()
+                self.settle()
+            opened.assert_not_called()
+            self.assertEqual(self.forge.saved_projects.session.project.to_dict(), current)
+
+    def test_download_account_change_cancels_import(self):
+        from publishing.github_auth import GitHubConnectionSnapshot, GitHubConnectionState
+        self.fixture.library.backup_project(self.fixture.capture)
+        self.library.refresh()
+        self.settle()
+        self.library.select(self.fixture.project.project_id)
+        release, entered = Event(), Event()
+        download = GitHubLibrary.download_project
+        def stalled(library, *args):
+            entered.set()
+            release.wait(10)
+            return download(library, *args)
+        with mock.patch.object(GitHubLibrary, 'download_project', stalled):
+            try:
+                self.library.download_selected()
+                self.wait_until(entered.is_set)
+                self.connection.snapshot = GitHubConnectionSnapshot(GitHubConnectionState.DISCONNECTED)
+                self.forge._github_state_changed.emit(self.connection.snapshot)
+            finally:
+                release.set()
+                self.settle()
+        destination = self.forge.saved_projects.service.editable_root / self.fixture.project.project_id
+        self.assertFalse(destination.exists())
+        self.assertFalse(self.forge._busy)
+
+    def test_shutdown_tracks_and_cancels_download_worker(self):
+        self.library.refresh()
+        self.settle()
+        self.library.select(self.fixture.project.project_id)
+        release, entered = Event(), Event()
+        download = GitHubLibrary.download_presentation
+        def stalled(library, *args):
+            entered.set()
+            release.wait(10)
+            return download(library, *args)
+        with mock.patch.object(GitHubLibrary, 'download_presentation', stalled), mock.patch(
+                'github_library_ui.QtGui.QDesktopServices.openUrl') as opened:
+            try:
+                self.library.download_selected()
+                self.wait_until(entered.is_set)
+                self.assertFalse(self.library.shutdown(timeout_ms=0))
+            finally:
+                release.set()
+                self.settle()
+            self.assertTrue(self.library.shutdown(timeout_ms=1000))
+            opened.assert_not_called()
+
+    def test_slow_discovery_allows_local_open_before_late_listing(self):
+        entry = self.local_letter()
+        release, entered = Event(), Event()
+        request = self.fixture.api.request
+        def stalled(*args, **kwargs):
+            entered.set()
+            release.wait(10)
+            return request(*args, **kwargs)
+        with mock.patch.object(self.fixture.api, 'request', side_effect=stalled):
+            try:
+                self.library.refresh()
+                self.wait_until(entered.is_set)
+                self.open_local_letter(entry)
+                current = self.forge.saved_projects.session.project.to_dict()
+            finally:
+                release.set()
+                self.settle()
+        self.assertEqual(self.forge.saved_projects.session.project.to_dict(), current)
+
+    def test_discovery_failures_and_offline_mode_keep_local_projects_openable(self):
+        from publishing.github_auth import GitHubConnectionSnapshot, GitHubConnectionState
+        entry = self.local_letter()
+        for code in ('network', 'github_unavailable', 'authentication'):
+            with self.subTest(code=code):
+                self.forge.saved_panel.show()
+                with mock.patch.object(self.fixture.api, 'request', side_effect=GitHubOperationError(code, code)):
+                    self.library.refresh()
+                    self.settle()
+                    self.open_local_letter(entry)
+        self.connection.snapshot = GitHubConnectionSnapshot(GitHubConnectionState.DISCONNECTED)
+        self.forge._github_state_changed.emit(self.connection.snapshot)
+        self.forge.saved_panel.show()
+        with mock.patch.object(self.fixture.api, 'request') as request:
+            self.library.refresh()
+            self.open_local_letter(entry)
+            request.assert_not_called()
+
+    def test_all_projects_local_do_not_need_remote_discovery(self):
+        entry = self.local_letter()
+        self.fixture.api.repos.clear()
+        self.library.refresh()
+        self.settle()
+        self.assertFalse(self.library.cards)
+        self.open_local_letter(entry)
+
+    def test_downloaded_letter_opens_during_another_remote_download_without_network(self):
+        copy = self.fixture.library.discover()[0][0].presentation
+        path = self.fixture.library.download_presentation(copy, self.library.download_root)
+        self.library.refresh()
+        self.settle()
+        release, entered = Event(), Event()
+        def stalled(_library):
+            entered.set()
+            release.wait(10)
+        try:
+            self.library._run_download('Downloading another letter…', stalled, lambda _value: None)
+            self.wait_until(entered.is_set)
+            self.library.select(self.fixture.project.project_id)
+            self.assertTrue(self.forge.saved_projects.open_button.isEnabled())
+            with mock.patch.object(self.fixture.api, 'request') as request, mock.patch(
+                    'github_library_ui.QtGui.QDesktopServices.openUrl') as opened:
+                QtTest.QTest.mouseClick(self.forge.saved_projects.open_button, QtCore.Qt.LeftButton)
+                self.assertEqual(opened.call_args.args[0].toLocalFile(), str(path / 'index.html').replace('\\', '/'))
+                request.assert_not_called()
+        finally:
+            release.set()
+            self.settle()
 
     def test_listing_is_usable_before_slow_covers_and_refresh_does_not_overlap(self):
         release, entered = Event(), Event()

@@ -9,7 +9,6 @@ import unittest
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from PySide6 import QtCore, QtTest, QtWidgets
@@ -126,12 +125,12 @@ class SoundArchivePreviewTests(unittest.TestCase):
                 tab.library.replace_records(records)
                 tab.library.changed.emit()
                 tab.volume.setValue(23)
+                tab.preview_controls.volume.setValue(19)
+                tab.preview_controls.mute.setChecked(True)
                 if state != "empty":
                     tab.project_sound.set_single("handoff-0")
                     if playlist:
                         tab.project_sound.add_to_playlist(["handoff-1"])
-                    if not tab.player.is_muted():
-                        tab.mute_btn.click()
                     self._wait_for(lambda: tab.player.player.duration() > 5000, "Song A did not load")
                     if state != "stopped":
                         tab.player.play()
@@ -158,8 +157,8 @@ class SoundArchivePreviewTests(unittest.TestCase):
             dialog = ArchiveDialog(
                 tab.library, lambda: set(tab.project_sound.ordered_ids()),
                 tab._delete_archive_track, multi_select=False, parent=tab,
+                initial_source="archive",
             )
-        dialog.preview_output.setMuted(True)
         overlaps = []
 
         def check_overlap(_state):
@@ -241,7 +240,7 @@ class SoundArchivePreviewTests(unittest.TestCase):
                 self.assertEqual(source_changes.count(), 0)
                 self.assertEqual(tab.volume.value(), 23)
                 self.assertTrue(tab.player.is_muted())
-                self.assertAlmostEqual(tab.player.outputs[tab.player.active_slot].volume(), 0.23, places=2)
+                self.assertAlmostEqual(tab.player.outputs[tab.player.active_slot].volume(), 0.19, places=2)
 
     def test_archive_handoff_does_not_start_paused_stopped_or_missing_music(self) -> None:
         for state in ("paused", "stopped", "empty"):
@@ -459,30 +458,66 @@ class SoundArchivePreviewTests(unittest.TestCase):
             finally:
                 tab.close()
 
-    def test_sound_buttons_open_separate_user_and_stock_selectors(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            tab = SoundTab(Path(directory))
-            try:
-                tab.resize(960, 720)
-                tab.show()
-                self.app.processEvents()
-                with mock.patch.object(tab, "_open_music_selector") as selector:
-                    tab.single_action_btn.click()
-                    tab.project_sound.state.mode = "playlist"
-                    tab._refresh_ui()
-                    tab.add_track_btn.click()
-                    tab.stock_btn.click()
-                self.assertEqual(tab.stock_btn.text(), "Stock Music")
+    def test_sound_buttons_open_one_picker_with_all_three_sources(self) -> None:
+        with self._handoff_tab(state="empty") as tab:
+            choices = []
+
+            def open_picker(dialog):
+                self.assertEqual(dialog.windowTitle(), "Add Music")
                 self.assertEqual(
-                    selector.call_args_list,
-                    [
-                        mock.call(user_music=True),
-                        mock.call(user_music=True),
-                        mock.call(user_music=False),
-                    ],
+                    [dialog.source_tabs.tabText(index) for index in range(dialog.source_tabs.count())],
+                    ["Files", "Stock Music", "Music Archive"],
                 )
+                choices.append(dialog.choose_btn.text())
+                return QtWidgets.QDialog.Rejected
+
+            with mock.patch.object(ArchiveDialog, "exec", open_picker):
+                tab.import_btn.click()
+                tab.project_sound.set_single("handoff-0")
+                tab.single_action_btn.click()
+                tab.project_sound.create_playlist()
+                tab.add_track_btn.click()
+            self.assertEqual(choices, ["Use Track", "Use Track", "Add to Playlist"])
+
+    def test_picker_favorites_sort_first_and_archive_tags_are_searchable(self) -> None:
+        with self._handoff_tab(state="empty") as tab:
+            dialog = ArchiveDialog(tab.library, set, lambda _track_id: False,
+                                   multi_select=False, parent=tab, initial_source="archive")
+            try:
+                with mock.patch.object(dialog, "_preview"):
+                    dialog.sort.setCurrentIndex(dialog.sort.findData("name"))
+                    dialog.refresh()
+                    dialog.table.selectRow(1)
+                    dialog.favorite_btn.click()
+                    self.assertEqual(dialog.table.item(0, 0).text(), "★  Song 1")
+                    with mock.patch("sound_tab.LetterSmithInputDialog.get_text",
+                                    return_value=("dream pop, Calm, calm", True)):
+                        dialog.tags_btn.click()
+                    dialog.search.setText("calm DREAM")
+                    dialog.refresh()
+                    self.assertEqual(dialog.table.rowCount(), 1)
+                    self.assertEqual(dialog.table.item(0, 3).text(), "dream pop, Calm")
+                    archived = load_library(tab.project_root)["handoff-1"]
+                    self.assertTrue(archived.favorite)
+                    self.assertEqual(archived.tags, ["dream pop", "Calm"])
+
+                    stock_fixture = Path(__file__).resolve().parents[1] / "resources" / "stock"
+                    stock_root = tab.project_root / "resources" / "stock"
+                    shutil.copytree(stock_fixture / "music", stock_root / "music")
+                    shutil.copyfile(stock_fixture / "stock_manifest.json", stock_root / "stock_manifest.json")
+                    stock = [track for track in load_library(tab.project_root).values()
+                             if track.source_kind == "stock"]
+                    tab.library.replace_records(load_library(tab.project_root))
+                    dialog.source_tabs.setCurrentIndex(1)
+                    self.assertGreaterEqual(len(stock), 2)
+                    dialog.table.selectRow(1)
+                    stock_id = dialog.selected_ids()[0]
+                    dialog.favorite_btn.click()
+                    self.assertEqual(dialog.table.item(0, 0).data(QtCore.Qt.UserRole), stock_id)
+                    self.assertTrue(load_library(tab.project_root)[stock_id].favorite)
+                    self.assertTrue(dialog.tags_btn.isHidden())
             finally:
-                tab.close()
+                dialog.close()
 
     def test_archive_preview_loops_until_explicitly_stopped(self) -> None:
         dialog = ArchiveDialog(
@@ -764,28 +799,39 @@ class SoundArchivePreviewTests(unittest.TestCase):
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
-    def test_add_music_opens_in_downloads(self) -> None:
-        tab = SimpleNamespace(
-            project_sound=SimpleNamespace(
-                state=SimpleNamespace(mode="single")
-            ),
-            _remember_music_folder=mock.Mock(),
-            _start_import=mock.Mock(),
-        )
-        with (
-            mock.patch(
-                "sound_tab.QtCore.QStandardPaths.writableLocation",
-                return_value="C:/Users/Test/Downloads",
-            ),
-            mock.patch.object(
-                QtWidgets.QFileDialog,
-                "getOpenFileName",
-                return_value=("", ""),
-            ) as choose,
-        ):
-            SoundTab._choose_new_files(tab)
+    def test_files_browse_downloads_and_preview_before_import(self) -> None:
+        with self._handoff_tab(state="stopped") as tab:
+            path = str(tab.library.path_for("handoff-1"))
+            before = tab.project_sound.state.to_dict()
 
-        self.assertEqual(choose.call_args.args[2], "C:/Users/Test/Downloads")
+            def choose_file(dialog):
+                dialog.browse_btn.click()
+                import_music.assert_not_called()
+                dialog.preview_controls.volume.setValue(62)
+                dialog.preview_controls.mute.setChecked(False)
+                self.assertAlmostEqual(dialog.preview_output.volume(), .62)
+                self.assertFalse(dialog.preview_output.isMuted())
+                dialog.preview_controls.mute.setChecked(True)
+                dialog.preview_btn.click()
+                self._wait_for(lambda: dialog.preview_player.isPlaying(), "File preview did not start")
+                self.assertEqual(Path(dialog.preview_player.source().toLocalFile()), Path(path))
+                self.assertEqual(tab.project_sound.state.to_dict(), before)
+                import_music.assert_not_called()
+                dialog.choose_btn.click()
+                return dialog.result()
+
+            with (
+                mock.patch("sound_tab.QtCore.QStandardPaths.writableLocation",
+                           return_value="C:/Users/Test/Downloads"),
+                mock.patch.object(QtWidgets.QFileDialog, "getOpenFileName", return_value=(path, "")) as browse,
+                mock.patch.object(ArchiveDialog, "exec", choose_file),
+                mock.patch.object(tab, "_start_import") as import_music,
+            ):
+                tab._open_music_selector(initial_source="files")
+            self.assertEqual(browse.call_args.args[2], "C:/Users/Test/Downloads")
+            import_music.assert_called_once_with([path])
+            self.assertEqual(tab.preview_controls.volume.value(), 62)
+            self.assertTrue(tab.player.is_muted())
 
 
 if __name__ == "__main__":

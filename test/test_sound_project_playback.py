@@ -83,8 +83,7 @@ class SoundProjectPlaybackTests(unittest.TestCase):
             self._playlist()
         tab = SoundTab(self.root)
         self.tabs.append(tab)
-        if not tab.player.is_muted():
-            tab.mute_btn.click()
+        tab.preview_controls.mute.setChecked(True)
         return tab
 
     def _assert_sources_unchanged(self) -> None:
@@ -369,24 +368,30 @@ class SoundProjectPlaybackTests(unittest.TestCase):
         self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-0"])
         self.assertEqual(tab.playlist_list.count(), 1)
         self.assertIn("synthetic-1", tab.library.records)
+        self.assertTrue(tab.undo_playlist_btn.isVisible())
+        QtTest.QTest.keyClick(tab.playlist_list, QtCore.Qt.Key_Z, QtCore.Qt.ControlModifier)
+        self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-0", "synthetic-1"])
+        tab.undo_playlist_btn.click()
+        self.assertEqual(load_project_state(self.root).playlist, ["synthetic-1", "synthetic-0"])
         self._assert_sources_unchanged()
 
     def test_space_activates_focused_buttons_and_only_transports_focused_playlist(self) -> None:
         tab = self._tab()
         self._show_tab(tab)
-        tab.player.set_muted(False)
+        tab.preview_controls.mute.setChecked(False)
         with mock.patch.object(tab.player, "play") as play:
             tab.mute_btn.setFocus()
             self.app.processEvents()
             QtTest.QTest.keyClick(tab.mute_btn, QtCore.Qt.Key_Space)
-            self.assertTrue(tab.player.is_muted())
+            self.assertTrue(tab.project_sound.state.muted)
+            self.assertFalse(tab.player.is_muted())
             play.assert_not_called()
 
             with mock.patch.object(tab, "_open_music_selector") as selector:
                 tab.add_track_btn.setFocus()
                 self.app.processEvents()
                 QtTest.QTest.keyClick(tab.add_track_btn, QtCore.Qt.Key_Space)
-                selector.assert_called_once_with(user_music=True)
+                selector.assert_called_once_with()
                 play.assert_not_called()
 
             tab.playlist_list.setFocus()
@@ -407,17 +412,24 @@ class SoundProjectPlaybackTests(unittest.TestCase):
         self.assertEqual(settings["music_volume"], tab.volume.value())
         self.assertEqual(settings["starting_volume"], tab.volume.value())
         self.assertEqual(changes.count(), 1)
-        tab.player.set_muted(False)
+        tab.preview_controls.mute.setChecked(False)
+        settings = json.loads((self.root / "settings.json").read_text(encoding="utf-8"))
         tab.mute_btn.click()
-        self.assertTrue(tab.player.is_muted())
+        self.assertFalse(tab.player.is_muted())
         self.assertEqual(json.loads((self.root / "settings.json").read_text(encoding="utf-8")),
                          {**settings, "music_muted": True})
         self.assertEqual(tab.session.project.to_dict()["sound"]["volume"], settings["music_volume"])
         self.assertTrue(tab.session.project.to_dict()["sound"]["muted"])
+        tab.preview_controls.volume.setValue(64)
+        tab.preview_controls.mute.setChecked(True)
+        self.assertAlmostEqual(tab.player._volume, .64)
+        self.assertTrue(tab.player.is_muted())
+        self.assertEqual(tab.session.project.to_dict()["sound"]["volume"], settings["music_volume"])
         tab.shutdown()
         reopened = SoundTab(self.root)
         self.tabs.append(reopened)
         self.assertEqual(reopened.volume.value(), settings["music_volume"])
+        self.assertAlmostEqual(reopened.player._volume, .64)
         self.assertTrue(reopened.player.is_muted())
         self.assertFalse(reopened.player.is_playing())
 
@@ -438,7 +450,8 @@ class SoundProjectPlaybackTests(unittest.TestCase):
         self.assertEqual(changes.count(), 0)
         self.assertEqual(tab.project_sound.ordered_ids(), [])
         self.assertFalse(tab.player.is_playing())
-        self.assertFalse(tab.player.is_muted())
+        self.assertTrue(tab.player.is_muted())
+        self.assertFalse(tab.project_sound.state.muted)
         self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8")), settings)
 
     def test_audio_settings_preserve_pages_and_running_queue(self) -> None:
@@ -446,7 +459,6 @@ class SoundProjectPlaybackTests(unittest.TestCase):
         before = tab.session.project.pages
         with mock.patch.object(tab.player, "set_queue", wraps=tab.player.set_queue) as queue:
             tab.volume.setValue(41)
-            tab.player.set_muted(False)
             tab.mute_btn.click()
             queue.assert_not_called()
         self.assertEqual(tab.session.project.pages, before)
@@ -456,7 +468,7 @@ class SoundProjectPlaybackTests(unittest.TestCase):
     def test_mute_adopts_queued_canonical_volume_before_event_delivery(self) -> None:
         tab = self._tab()
         tab.volume.setValue(20)
-        expected_muted = not tab.player.is_muted()
+        expected_muted = not tab.project_sound.state.muted
         worker = threading.Thread(target=lambda: tab.session.project.update_project_data("sound", {"volume": 73}))
         worker.start()
         worker.join(2)
@@ -466,8 +478,8 @@ class SoundProjectPlaybackTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(tab.session.project.to_dict()["sound"]["volume"], 73)
         self.assertEqual(tab.volume.value(), 73)
-        self.assertAlmostEqual(tab.player._volume, 0.73)
-        self.assertEqual(tab.player.is_muted(), expected_muted)
+        self.assertAlmostEqual(tab.player._volume, 0.35)
+        self.assertTrue(tab.player.is_muted())
         self.assertEqual(tab.session.project.to_dict()["sound"]["muted"], expected_muted)
 
     def test_late_import_after_sound_edit_then_revert_stays_in_archive(self) -> None:
@@ -499,19 +511,20 @@ class SoundProjectPlaybackTests(unittest.TestCase):
         from saved_letters import SavedLetterRestorer
         tab = self._tab()
         tab.volume.setValue(34)
-        tab.player.set_muted(False)
         tab.mute_btn.click()
         tab.project_sound.reorder_playlist(["synthetic-1", "synthetic-0"])
         saved = tab.session.save(sync_workspace=False)
         tab.session.replace(create_project(["letter", "letter"]), asset_root=self.root)
         self.assertEqual(tab.project_sound.ordered_ids(), [])
         self.assertFalse(tab.player.is_playing())
-        self.assertFalse(tab.player.is_muted())
+        self.assertTrue(tab.player.is_muted())
+        self.assertFalse(tab.project_sound.state.muted)
         SavedLetterRestorer(self.root).restore_canonical(saved)
         tab.reload_project_from_disk()
         self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-1", "synthetic-0"])
         self.assertEqual(tab.volume.value(), 34)
         self.assertTrue(tab.player.is_muted())
+        self.assertTrue(tab.project_sound.state.muted)
         self.assertFalse(tab.player.is_playing())
         self._assert_sources_unchanged()
 
@@ -538,8 +551,8 @@ class SoundProjectPlaybackTests(unittest.TestCase):
     def test_music_workflow_visibility_preserves_song_and_returns_to_empty(self) -> None:
         tab = self._tab(playlist=False)
         self._show_tab(tab)
-        self.assertTrue(tab.archive_btn.isVisible())
         self.assertTrue(tab.import_btn.isVisible())
+        self.assertEqual(tab.import_btn.text(), "Add Music")
         for button in (tab.single_action_btn, tab.create_playlist_btn,
                        tab.add_track_btn, tab.convert_single_btn, tab.clear_btn):
             self.assertFalse(button.isVisible())
@@ -592,9 +605,12 @@ class SoundProjectPlaybackTests(unittest.TestCase):
         self.assertEqual(tab.project_sound.state.mode, "single")
         self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-1"])
         self.assertEqual(load_project_state(self.root).single_track_id, "synthetic-1")
-        with mock.patch.object(tab, "_open_user_music_for_current_mode"):
+        self.assertEqual(load_project_state(self.root).playlist, ["synthetic-0", "synthetic-1"])
+        self.assertEqual(tab.create_playlist_btn.text(), "Restore Playlist")
+        with mock.patch.object(tab, "_open_user_music_for_current_mode") as picker:
             tab._create_playlist()
-        self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-1"])
+            picker.assert_not_called()
+        self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-0", "synthetic-1"])
         self._assert_sources_unchanged()
 
     def test_conversion_distinguishes_songs_with_the_same_title(self) -> None:
@@ -611,6 +627,58 @@ class SoundProjectPlaybackTests(unittest.TestCase):
         self.assertEqual(tab.project_sound.ordered_ids(), ["synthetic-1"])
         self.assertEqual(load_project_state(self.root).single_track_id, "synthetic-1")
         self._assert_sources_unchanged()
+
+    def test_retained_playlist_restores_from_a_portable_project(self) -> None:
+        from types import SimpleNamespace
+        from forge_render import _selected_tracks
+        from saved_letters import SavedLetterRestorer
+
+        tab = self._tab()
+        ordered = ["synthetic-1", "synthetic-0"]
+        tab.project_sound.reorder_playlist(ordered)
+        tab.project_sound.convert_to_single("synthetic-0")
+        saved = tab.session.save(sync_workspace=False)
+        snapshot = saved.project.to_dict()
+        self.assertEqual(snapshot["sound"]["playlist"], ordered)
+        self.assertEqual(
+            [track["track_id"] for track in _selected_tracks(SimpleNamespace(snapshot=snapshot))],
+            ["synthetic-0"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            restored_root = Path(directory)
+            try:
+                SavedLetterRestorer(restored_root).restore_canonical(saved)
+                sound = ProjectSound(restored_root, SoundLibrary(restored_root))
+                self.assertEqual(sound.ordered_ids(), ["synthetic-0"])
+                sound.create_playlist()
+                self.assertEqual(sound.ordered_ids(), ordered)
+                self.assertEqual(sound.missing_track_ids(), [])
+            finally:
+                release_project_session(restored_root)
+
+    def test_waveform_shows_track_dynamics_and_seeks_on_click(self) -> None:
+        path = processed_dir(self.root) / "synthetic-0.wav"
+        with wave.open(str(path), "wb") as output:
+            output.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
+            output.writeframes(bytes(16_000) + b"\x00\x40\x00\xc0" * 4000)
+        record = self.library.records["synthetic-0"]
+        record.content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        record.duration_seconds = 2
+        save_library(self.root, self.library.records)
+        tab = self._tab(playlist=False)
+        tab.project_sound.set_single("synthetic-0")
+        self._show_tab(tab)
+        timer = QtCore.QElapsedTimer()
+        timer.start()
+        while (not tab.timeline._waveform or tab.timeline.maximum() < 2000) and timer.elapsed() < 3000:
+            QtTest.QTest.qWait(20)
+        peaks = tab.timeline._waveform
+        self.assertTrue(peaks)
+        self.assertLess(max(peaks[:len(peaks) // 3]), max(peaks[-len(peaks) // 3:]))
+        position = QtCore.QPoint(tab.timeline.width() * 3 // 4, tab.timeline.height() // 2)
+        QtTest.QTest.mouseClick(tab.timeline, QtCore.Qt.LeftButton, pos=position)
+        self.assertGreater(tab.player.player.position(), 1300)
+        self.assertLess(tab.player.player.position(), 1700)
 
     def test_conversion_and_clear_ignore_a_changed_soundtrack(self) -> None:
         tab = self._tab()

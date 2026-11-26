@@ -164,6 +164,7 @@ def _sanitation_settings(manifest: dict[str, Any]) -> dict[str, Any]:
 
 def _manifest_entries(
     manifest: dict[str, Any],
+    platform_name: str | None = None,
 ) -> Iterator[tuple[Path, str]]:
     app_relative_root = _safe_destination(
         manifest.get("application_resources_root")
@@ -179,6 +180,8 @@ def _manifest_entries(
         yield (prompt_root / name).resolve(), "resources/prompt_writer"
 
     for item in manifest["data_directories"] + manifest["data_files"]:
+        if _release_platform(platform_name) not in item.get("platforms", ("windows", "macos")):
+            continue
         yield _project_path(item["source"]), str(item["destination"])
 
 
@@ -210,7 +213,7 @@ def _all_payload_files(
 ) -> tuple[Path, ...]:
     files: dict[Path, None] = {}
     for source, _destination in (
-        list(_manifest_entries(manifest))
+        list(_manifest_entries(manifest, platform_name))
         + list(_binary_entries(manifest, platform_name))
     ):
         for path in _files_under(source):
@@ -248,7 +251,7 @@ def _expected_payload_destinations(
     platform_name: str | None = None,
 ) -> dict[str, Path]:
     expected: dict[str, Path] = {}
-    entries = list(_manifest_entries(manifest)) + list(
+    entries = list(_manifest_entries(manifest, platform_name)) + list(
         _binary_entries(manifest, platform_name)
     )
     for source, destination_text in entries:
@@ -355,7 +358,7 @@ def _validate_allowlist(
 ) -> tuple[Path, ...]:
     blocked = {str(value).casefold() for value in manifest["forbidden_path_parts"]}
     seen_destinations: set[tuple[str, str]] = set()
-    entries = list(_manifest_entries(manifest)) + list(
+    entries = list(_manifest_entries(manifest, platform_name)) + list(
         _binary_entries(manifest, platform_name)
     )
     for source, destination in entries:
@@ -738,11 +741,44 @@ def _validate_private_binary_markers(files: Iterable[Path]) -> None:
             ) from error
 
 
+def _dictation_build(*, check: bool) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, str(PROJECT_ROOT / "tools/build_dictation.py")]
+    if check:
+        command.append("--check")
+    try:
+        return subprocess.run(
+            command,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60 if check else 600,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReleaseValidationError("The offline dictation engine could not be prepared.") from error
+
+
+def _provision_dictation_runtime() -> None:
+    if _dictation_build(check=True).returncode == 0:
+        return
+    result = _dictation_build(check=False)
+    if result.returncode != 0:
+        raise ReleaseValidationError(
+            "The offline dictation engine build failed: " + (result.stderr.strip() or result.stdout.strip())
+        )
+
+
 def validate_release_inputs(
     platform_name: str | None = None,
 ) -> dict[str, int]:
     manifest = _load_json(MANIFEST_PATH)
     _validate_identity(manifest)
+    if _release_platform(platform_name) == "windows":
+        result = _dictation_build(check=True)
+        if result.returncode != 0:
+            raise ReleaseValidationError(
+                "Build the offline dictation engine with tools/build_dictation.py before release validation."
+            )
     source_files = _production_source_files(manifest)
     payload_files = _validate_allowlist(manifest, platform_name)
     _validate_application_resources(manifest)
@@ -1033,6 +1069,7 @@ def build_release(
         provision_ffmpeg("windows", source_dir=ffmpeg_source_dir)
     except FFmpegProvisionError as error:
         raise ReleaseValidationError(str(error)) from error
+    _provision_dictation_runtime()
     if importlib.util.find_spec("PyInstaller") is None:
         raise ReleaseValidationError(
             "PyInstaller is not installed. Install requirements.txt only "
@@ -1122,6 +1159,7 @@ def main() -> int:
         from release.provision_ffmpeg import FFmpegProvisionError, provision_ffmpeg
 
         provision_ffmpeg("windows", source_dir=args.ffmpeg_source_dir)
+        _provision_dictation_runtime()
         summary = validate_release_inputs()
         print(
             "Release inputs validated: "

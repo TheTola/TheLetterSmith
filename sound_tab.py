@@ -10,6 +10,8 @@ import logging
 import os
 import shutil
 import tempfile
+from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from time import monotonic
 from typing import Callable, Optional
@@ -42,6 +44,7 @@ from project_state import ProjectStateController
 from project_session import get_project_session, peek_project_session
 from project_consumers import project_sound_snapshot, project_sound_views, update_project_sound
 from recent_media import recent_media, remember_media
+from settings_store import SettingsStore
 
 from sound_model import (
     ProjectSoundState,
@@ -56,6 +59,7 @@ from sound_model import (
     library_path,
     load_library,
     load_project_state,
+    normalize_track_tags,
     originals_dir,
     processed_dir,
     project_sound_path,
@@ -68,6 +72,7 @@ from sound_model import (
 )
 
 from sound_preview import SoundPreviewWidget
+from sound_waveform import SoundWaveform
 from performance_trace import performance_timed
 from transactional_io import file_change_token
 from ui_dialogs import (
@@ -131,9 +136,13 @@ VALID_AUDIO_EXTS = {
     ".m4a",
     ".flac",
 }
+AUDIO_FILES_FILTER = "Audio Files (*.mp3 *.wav *.ogg *.aac *.m4a *.flac)"
 
 ANALYSIS_SETTINGS_KEY = "enable_sound_analysis"
 LAST_MUSIC_FOLDER_KEY = "last_music_folder"
+PREVIEW_VOLUME_KEY = "sound_preview_volume"
+PREVIEW_MUTED_KEY = "sound_preview_muted"
+DEFAULT_PREVIEW_VOLUME = 35
 CROSSFADE_MS = 1000
 LOOP_DELAY_MS = 1200
 _ARTWORK_ALPHA_THRESHOLD = 10
@@ -290,17 +299,6 @@ def _read_settings(
     return {}
 
 
-def _write_settings(
-    project_root: Path,
-    settings: dict,
-) -> None:
-    atomic_write_json(
-        project_root
-        / SETTINGS_FILE,
-        settings,
-    )
-
-
 def _analysis_requested(
     project_root: Path,
 ) -> bool:
@@ -321,6 +319,9 @@ class CleanSlider(
     Horizontal slider without the platform's inactive gray rail.
     """
 
+    _HANDLE_RADIUS = 8.0
+    _TRACK_INSET = _HANDLE_RADIUS + 1.0
+
     def __init__(
         self,
         parent: Optional[QtWidgets.QWidget] = None,
@@ -330,6 +331,7 @@ class CleanSlider(
             parent,
         )
         self._theme_tokens: object | None = None
+        self._waveform = b""
 
         self.setAttribute(
             Qt.WA_TranslucentBackground,
@@ -346,6 +348,10 @@ class CleanSlider(
 
     def apply_theme_assets(self, service: object | None = None) -> None:
         self._theme_tokens = getattr(service, "tokens", None)
+        self.update()
+
+    def set_waveform(self, peaks: bytes) -> None:
+        self._waveform = peaks
         self.update()
 
     def sizeHint(
@@ -376,16 +382,15 @@ class CleanSlider(
             True,
         )
 
-        radius = 8.0
-        left = radius + 1.0
+        radius = self._HANDLE_RADIUS
+        left = self._TRACK_INSET
 
         right = max(
             left,
             float(
                 self.width()
             )
-            - radius
-            - 1.0,
+            - left,
         )
 
         span = max(
@@ -442,7 +447,22 @@ class CleanSlider(
         )
         outline_color.setAlpha(255 if self.isEnabled() else 110)
 
-        if center_x > left:
+        if self._waveform and span:
+            count = min(len(self._waveform), max(1, int(span / 3)))
+            inactive_color = QtGui.QColor(str(getattr(tokens, "muted_text", "#93a8bd")))
+            inactive_color.setAlpha(155)
+            for index in range(count):
+                start = index * len(self._waveform) // count
+                end = (index + 1) * len(self._waveform) // count
+                x = left + span * (index + 0.5) / count
+                height = 1 + 10 * max(self._waveform[start:end]) / 255
+                painter.setPen(QtGui.QPen(
+                    active_color if x <= center_x else inactive_color,
+                    2.0, Qt.SolidLine, Qt.RoundCap,
+                ))
+                painter.drawLine(QtCore.QPointF(x, center_y - height),
+                                 QtCore.QPointF(x, center_y + height))
+        elif center_x > left:
             pen = QtGui.QPen(
                 active_color,
                 3.0,
@@ -484,6 +504,84 @@ class CleanSlider(
             radius,
             radius,
         )
+
+class WaveformSlider(CleanSlider):
+    def _seek_to(self, event: QtGui.QMouseEvent) -> None:
+        span = max(1, int(self.width() - 2 * self._TRACK_INSET))
+        position = round(event.position().x() - self._TRACK_INSET)
+        value = QtWidgets.QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), position, span)
+        self.setSliderPosition(value)
+        event.accept()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton and self.maximum() > self.minimum():
+            self.setFocus(Qt.MouseFocusReason)
+            self.setSliderDown(True)
+            self._seek_to(event)
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self.isSliderDown():
+            self._seek_to(event)
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton and self.isSliderDown():
+            self._seek_to(event)
+            self.setSliderDown(False)
+        else:
+            super().mouseReleaseEvent(event)
+
+
+class _PreviewVolumeControls(QtWidgets.QWidget):
+    changed = QtCore.Signal(int, bool)
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        row = QtWidgets.QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(5)
+        row.addWidget(QtWidgets.QLabel("Preview volume"))
+        self.volume = CleanSlider()
+        self.volume.setAccessibleName("Preview volume")
+        self.volume.setRange(0, 100)
+        self.volume.setFixedWidth(90)
+        self.value_label = QtWidgets.QLabel()
+        self.value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.value_label.setFixedWidth(34)
+        self.mute = QtWidgets.QToolButton()
+        self.mute.setCheckable(True)
+        self.mute.setFixedSize(32, 28)
+        self.mute.setStyleSheet("padding: 0; min-width: 0; min-height: 0;")
+        row.addWidget(self.volume)
+        row.addWidget(self.value_label)
+        row.addWidget(self.mute)
+        self.set_levels(DEFAULT_PREVIEW_VOLUME, False)
+        self.volume.valueChanged.connect(self._changed)
+        self.mute.toggled.connect(self._changed)
+
+    def set_levels(self, volume: int, muted: bool) -> None:
+        with QtCore.QSignalBlocker(self.volume), QtCore.QSignalBlocker(self.mute):
+            self.volume.setValue(volume)
+            self.mute.setChecked(muted)
+        self._refresh()
+
+    def _changed(self) -> None:
+        self._refresh()
+        self.changed.emit(self.volume.value(), self.mute.isChecked())
+
+    def _refresh(self) -> None:
+        muted = self.mute.isChecked()
+        self.value_label.setText(f"{self.volume.value()}%")
+        self.mute.setIcon(self.style().standardIcon(
+            QtWidgets.QStyle.SP_MediaVolumeMuted if muted else QtWidgets.QStyle.SP_MediaVolume
+        ))
+        text = "Unmute preview" if muted else "Mute preview"
+        self.mute.setToolTip(text)
+        self.mute.setAccessibleName(text)
+
 
 class ArtworkButton(QtWidgets.QPushButton):
     """PNG-backed standard-tier button."""
@@ -1297,6 +1395,24 @@ class SoundLibrary(
 
         self.changed.emit()
 
+    def set_favorite(self, track_id: str, favorite: bool) -> None:
+        record = self.get(track_id)
+        if record is not None and record.favorite != favorite:
+            self._save_track_metadata(replace(record, favorite=favorite))
+
+    def set_tags(self, track_id: str, tags: list[str]) -> None:
+        record = self.get(track_id)
+        if record is not None and record.source_kind != "stock":
+            clean = normalize_track_tags(tags)
+            if clean != record.tags:
+                self._save_track_metadata(replace(record, tags=clean))
+
+    def _save_track_metadata(self, record: TrackRecord) -> None:
+        records = {**self.records, record.track_id: record}
+        save_library(self.project_root, records)
+        self.records = records
+        self.changed.emit()
+
     def delete_track(
         self,
         track_id: str,
@@ -1402,6 +1518,7 @@ class ProjectSound(
         self.library = library
 
         self._saving = False
+        self._playlist_undo: list[tuple[list[str], str]] = []
         session = peek_project_session(self.project_root)
         if session is not None:
             project_sound_views(session)
@@ -1547,6 +1664,8 @@ class ProjectSound(
         self.state = loaded
         self._normalize_available_tracks()
         current = self.state.to_dict()
+        if any(current[key] != previous[key] for key in ("mode", "playlist")):
+            self._playlist_undo.clear()
         if current != persisted:
             save_project_state(self.project_root, self.state)
         self._persisted_state = current
@@ -1561,6 +1680,8 @@ class ProjectSound(
         self,
         track_id: str,
     ) -> None:
+        if self.state.mode == "playlist":
+            self._playlist_undo.clear()
         self.state.mode = "single"
 
         if (
@@ -1575,8 +1696,6 @@ class ProjectSound(
 
         else:
             self.state.single_track_id = ""
-
-        self.state.playlist = []
 
         self.state.selected_track_id = (
             self.state.single_track_id
@@ -1593,13 +1712,8 @@ class ProjectSound(
 
         self.state.mode = "playlist"
 
-        if first:
-            self.state.playlist = [
-                first
-            ]
-
-        else:
-            self.state.playlist = []
+        if not self.state.playlist and first:
+            self.state.playlist = [first]
 
         self.state.single_track_id = ""
         self.state.selected_track_id = first
@@ -1614,6 +1728,7 @@ class ProjectSound(
         if self.state.mode != "playlist":
             self.create_playlist()
 
+        previous_count = len(self.state.playlist)
         for track_id in track_ids:
             if (
                 self.library.path_for(
@@ -1626,6 +1741,8 @@ class ProjectSound(
                 self.state.playlist.append(
                     track_id
                 )
+        if len(self.state.playlist) != previous_count:
+            self._playlist_undo.clear()
 
         if (
             not self.state.selected_track_id
@@ -1642,39 +1759,56 @@ class ProjectSound(
         track_ids: list[str],
     ) -> None:
         # Reordering must retain unavailable entries just like playable ones.
-        if len(track_ids) != len(self.state.playlist) or set(track_ids) != set(self.state.playlist):
-            return
-        self.state.playlist = list(track_ids)
-
-        self.save()
+        if Counter(track_ids) == Counter(self.state.playlist):
+            self._edit_playlist(list(track_ids))
 
     def remove_from_playlist(
         self,
         track_id: str,
+        *,
+        row: int | None = None,
     ) -> None:
-        was_present = track_id in self.state.playlist
-        self.state.playlist = [
-            item
-            for item
-            in self.state.playlist
-            if item != track_id
-        ]
-
-        if (
-            self.state.selected_track_id
-            == track_id
-        ):
-            if self.state.playlist:
-                self.state.selected_track_id = (
-                    self.state.playlist[0]
-                )
-
-            else:
-                self.state.selected_track_id = ""
-
-        changed = self.save()
-        if was_present and changed:
+        playlist = self.state.playlist
+        if row is None:
+            tracks = [item for item in playlist if item != track_id]
+        elif 0 <= row < len(playlist) and playlist[row] == track_id:
+            tracks = playlist[:row] + playlist[row + 1:]
+        else:
+            return
+        if self._edit_playlist(tracks):
             play_ui_sound(UiSound.REMOVED)
+
+    @property
+    def can_undo_playlist_edit(self) -> bool:
+        return self.state.mode == "playlist" and bool(self._playlist_undo)
+
+    def discard_playlist_undo(self) -> None:
+        self._playlist_undo.clear()
+
+    def _edit_playlist(self, tracks: list[str]) -> bool:
+        if self.state.mode != "playlist" or tracks == self.state.playlist:
+            return False
+        before = (self.state.playlist, self.state.selected_track_id)
+        self._playlist_undo.append(before)
+        self.state.playlist = tracks
+        try:
+            return self.save()
+        except Exception:
+            self.state.playlist, self.state.selected_track_id = self._playlist_undo.pop()
+            raise
+
+    def undo_playlist_edit(self) -> bool:
+        if not self.can_undo_playlist_edit:
+            return False
+        current = (self.state.playlist, self.state.selected_track_id)
+        previous = self._playlist_undo.pop()
+        self.state.playlist, self.state.selected_track_id = previous
+        try:
+            return self.save()
+        except Exception:
+            self.state.playlist, self.state.selected_track_id = current
+            self._playlist_undo.append(previous)
+            raise
 
     def select_track(
         self,
@@ -1707,15 +1841,16 @@ class ProjectSound(
         if chosen not in self.state.playlist:
             return
         # Retain the chosen assignment even if its source is unavailable.
+        self._playlist_undo.clear()
         self.state.mode = "single"
         self.state.single_track_id = chosen
-        self.state.playlist = []
         self.state.selected_track_id = chosen
         self.save()
 
     def clear(
         self,
     ) -> None:
+        self._playlist_undo.clear()
         self.state = ProjectSoundState()
         self.save()
 
@@ -1723,6 +1858,8 @@ class ProjectSound(
         self,
         track_id: str,
     ) -> None:
+        if track_id in self.state.playlist:
+            self._playlist_undo.clear()
         self.state.remove_usage(
             track_id
         )
@@ -3141,6 +3278,17 @@ QListWidget::item:selected {{
     background: {active};
     color: {highlight};
 }}
+QTabBar::tab {{
+    background: {background};
+    color: {text};
+    border: 1px solid {border};
+    padding: 8px 13px;
+}}
+QTabBar::tab:selected {{
+    background: {active};
+    border-bottom-color: {accent};
+    color: {highlight};
+}}
 QTableWidget::item {{
     border-bottom: 1px solid {border};
     padding: 8px 10px;
@@ -3170,6 +3318,7 @@ class _ClickOutsidePopup(
     """Frameless popup that dismisses without consuming the outside click."""
 
     previewRequested = QtCore.Signal()
+    previewSettingsChanged = QtCore.Signal(int, bool)
 
     def __init__(
         self,
@@ -3180,6 +3329,9 @@ class _ClickOutsidePopup(
             Qt.Popup | Qt.FramelessWindowHint,
         )
         self._outside_filter_installed = False
+        self._previewing_id = ""
+        self._previewing_title = ""
+        self.chosen_files: list[str] = []
 
     def showEvent(
         self,
@@ -3189,7 +3341,7 @@ class _ClickOutsidePopup(
             event
         )
         application = QtWidgets.QApplication.instance()
-        if application is not None and not self._outside_filter_installed:
+        if application is not None and self.windowType() == Qt.Popup and not self._outside_filter_installed:
             application.installEventFilter(
                 self
             )
@@ -3210,26 +3362,59 @@ class _ClickOutsidePopup(
 
     def _init_preview_controls(self, layout: QtWidgets.QVBoxLayout) -> None:
         row = QtWidgets.QHBoxLayout()
-        self.preview_btn = QtWidgets.QPushButton("Preview Track")
-        self.stop_preview_btn = QtWidgets.QPushButton("Stop Preview")
-        self.preview_label = QtWidgets.QLabel("Preview volume: 35%")
-        self.preview_label.setWordWrap(True)
+        self.preview_btn = QtWidgets.QPushButton("Preview")
+        self.stop_preview_btn = QtWidgets.QPushButton("Stop")
+        self.preview_btn.setAccessibleName("Preview track")
+        self.stop_preview_btn.setAccessibleName("Stop preview")
+        self.preview_label = QtWidgets.QLabel()
+        self.preview_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        self.preview_controls = _PreviewVolumeControls()
+        self.preview_controls.changed.connect(self.set_preview_levels)
+        self.preview_controls.changed.connect(self.previewSettingsChanged)
         self.preview_btn.clicked.connect(self._preview)
         self.stop_preview_btn.clicked.connect(self._stop_preview)
         row.addWidget(self.preview_btn)
         row.addWidget(self.stop_preview_btn)
         row.addWidget(self.preview_label, 1)
+        row.addWidget(self.preview_controls)
         layout.insertLayout(max(0, layout.count() - 1), row)
         self.preview_player.playbackStateChanged.connect(self._preview_state_changed)
+        self.set_preview_levels(DEFAULT_PREVIEW_VOLUME, False)
         self._preview_state_changed(self.preview_player.playbackState())
 
+    def set_preview_levels(self, volume: int, muted: bool) -> None:
+        self.preview_controls.set_levels(volume, muted)
+        self.preview_output.setVolume(volume / 100)
+        self.preview_output.setMuted(muted)
+
     def _preview_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
-        record = self.library.get(self._previewing_id) if self._previewing_id else None
-        playing = state == QMediaPlayer.PlayingState and record is not None
-        self.preview_label.setText(
-            f"Previewing: {record.display_title} • 35%" if playing else "Preview volume: 35%"
-        )
-        self.stop_preview_btn.setEnabled(playing)
+        playing = state == QMediaPlayer.PlayingState
+        label = f"Previewing: {self._previewing_title}" if playing and self._previewing_title else ""
+        self.preview_label.setText(label)
+        self.preview_label.setToolTip(label)
+        self.stop_preview_btn.setEnabled(bool(self._previewing_id))
+
+    def _play_preview(self, track_id: str, path: Path | None, title: str) -> None:
+        if path is None:
+            self._stop_preview()
+            return
+        if track_id == self._previewing_id and self.preview_player.playbackState() == QMediaPlayer.PlayingState:
+            return
+        if track_id != self._previewing_id:
+            self._stop_preview()
+        self.previewRequested.emit()
+        self._previewing_id = track_id
+        self._previewing_title = title
+        self.preview_player.setSource(QUrl.fromLocalFile(str(path)))
+        self.preview_player.play()
+        self._preview_state_changed(self.preview_player.playbackState())
+
+    def _stop_preview(self) -> None:
+        self._previewing_id = ""
+        self._previewing_title = ""
+        self.preview_player.stop()
+        self.preview_player.setSource(QUrl())
+        self._preview_state_changed(self.preview_player.playbackState())
 
     def apply_theme_assets(
         self,
@@ -3253,6 +3438,7 @@ class _ClickOutsidePopup(
                 theme_service
             )
         )
+        self.preview_controls.volume.apply_theme_assets(theme_service)
 
     def _remove_outside_filter(self) -> None:
         application = QtWidgets.QApplication.instance()
@@ -3309,6 +3495,9 @@ class ArchiveDialog(
         *,
         multi_select: bool,
         parent: Optional[QtWidgets.QWidget] = None,
+        initial_source: str | None = None,
+        recent_track_ids: tuple[str, ...] = (),
+        files: tuple[str, ...] = (),
     ) -> None:
         super().__init__(
             parent
@@ -3319,10 +3508,16 @@ class ArchiveDialog(
         self.delete_callback = (
             delete_callback
         )
-        self.setWindowTitle(
-            "Archive"
-        )
-        self.setAccessibleName("Archive")
+        self._picker = initial_source is not None
+        self._source = initial_source or "archive"
+        self._multi_select = multi_select
+        self._files = list(dict.fromkeys(files if multi_select else files[:1]))
+        self._recent_order = {track_id: index for index, track_id in enumerate(recent_track_ids)}
+        title = "Add Music" if self._picker else "Archive"
+        if self._picker:
+            self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setWindowTitle(title)
+        self.setAccessibleName(title)
 
         self.resize(
             760,
@@ -3333,25 +3528,33 @@ class ArchiveDialog(
             self
         )
 
-        self.heading = QtWidgets.QLabel(
-            "Archive"
-        )
+        self.heading = QtWidgets.QLabel(title)
         self.heading.setObjectName(
             "MusicPopupHeading"
         )
         root.addWidget(
             self.heading
         )
+        if self._picker:
+            self.source_tabs = QtWidgets.QTabBar()
+            self.source_tabs.setAccessibleName("Music source")
+            self.source_tabs.setExpanding(False)
+            for source, label in (("files", "Files"), ("stock", "Stock Music"), ("archive", "Music Archive")):
+                index = self.source_tabs.addTab(label)
+                self.source_tabs.setTabData(index, source)
+                if source == self._source:
+                    self.source_tabs.setCurrentIndex(index)
+            root.addWidget(self.source_tabs)
 
         top = QtWidgets.QHBoxLayout()
 
         self.search = QtWidgets.QLineEdit()
         self.search.setToolTip(
-            "Filter your archived music by title or filename."
+            "Search by title, filename, or tags."
         )
 
         self.search.setPlaceholderText(
-            "Search archive…"
+            "Search music…"
         )
 
         self.sort = QtWidgets.QComboBox()
@@ -3359,6 +3562,8 @@ class ArchiveDialog(
             "Choose how archived music is ordered."
         )
 
+        if self._recent_order:
+            self.sort.addItem("Recently used", "used")
         self.sort.addItem(
             "Recently added",
             "recent",
@@ -3382,14 +3587,17 @@ class ArchiveDialog(
         top.addWidget(
             self.sort
         )
+        self.browse_btn = QtWidgets.QPushButton("Browse Files…")
+        self.browse_btn.clicked.connect(self._browse_files)
+        top.addWidget(self.browse_btn, 0, Qt.AlignLeft)
 
         root.addLayout(
             top
         )
 
-        self.table = QtWidgets.QTableWidget(0, 3)
+        self.table = QtWidgets.QTableWidget(0, 4 if self._picker else 3)
         self.table.setToolTip(
-            "Select a song to preview it; double-click to use it."
+            "Select a song to preview it."
         )
 
         self.table.setHorizontalHeaderLabels(
@@ -3397,7 +3605,7 @@ class ArchiveDialog(
                 "Title",
                 "Duration",
                 "Added",
-            ]
+            ] + (["Tags"] if self._picker else [])
         )
         self.table.verticalHeader().hide()
 
@@ -3411,6 +3619,8 @@ class ArchiveDialog(
                 column,
                 QtWidgets.QHeaderView.ResizeToContents,
             )
+        if self._picker:
+            self.table.setColumnWidth(3, 150)
 
         self.table.setSelectionBehavior(
             QtWidgets.QAbstractItemView.SelectRows
@@ -3442,7 +3652,8 @@ class ArchiveDialog(
 
         self.table.itemSelectionChanged.connect(self._selection_changed)
         self.table.cellClicked.connect(lambda _row, _column: self._preview())
-        self.table.doubleClicked.connect(lambda _index: self._choose())
+        if not self._picker:
+            self.table.doubleClicked.connect(lambda _index: self._choose())
 
         root.addWidget(
             self.table,
@@ -3464,6 +3675,10 @@ class ArchiveDialog(
         self.delete_btn.setToolTip(
             "Remove the selected music from your archive."
         )
+        self.favorite_btn = QtWidgets.QPushButton("Star")
+        self.favorite_btn.clicked.connect(self._toggle_favorite)
+        self.tags_btn = QtWidgets.QPushButton("Edit Tags…")
+        self.tags_btn.clicked.connect(self._edit_tags)
 
         if multi_select:
             choose_text = "Add to Playlist"
@@ -3474,12 +3689,16 @@ class ArchiveDialog(
         self.choose_btn = QtWidgets.QPushButton(
             choose_text
         )
+        if self._picker:
+            self.choose_btn.setAutoDefault(False)
         self.choose_btn.setToolTip(
             "Add the selected archive music to this letter."
             if multi_select
             else "Use the selected archive song for this letter."
         )
 
+        buttons.addWidget(self.favorite_btn)
+        buttons.addWidget(self.tags_btn)
         buttons.addWidget(
             self.rename_btn
         )
@@ -3491,6 +3710,10 @@ class ArchiveDialog(
         buttons.addStretch(
             1
         )
+        if self._picker:
+            cancel = QtWidgets.QPushButton("Cancel")
+            cancel.clicked.connect(self.reject)
+            buttons.addWidget(cancel)
 
         buttons.addWidget(
             self.choose_btn
@@ -3502,10 +3725,6 @@ class ArchiveDialog(
 
         self.preview_output = QAudioOutput(
             self
-        )
-
-        self.preview_output.setVolume(
-            0.35
         )
 
         self.preview_player = QMediaPlayer(
@@ -3521,8 +3740,6 @@ class ArchiveDialog(
         self.preview_player.errorOccurred.connect(
             self._preview_failed
         )
-
-        self._previewing_id = ""
 
         self._init_preview_controls(root)
 
@@ -3555,27 +3772,78 @@ class ArchiveDialog(
             self.refresh
         )
 
+        if self._picker:
+            self.source_tabs.currentChanged.connect(self._change_source)
+        self._refresh_source_controls()
         self.refresh()
 
         self.apply_theme_assets()
 
+    def _refresh_source_controls(self) -> None:
+        files = self._source == "files"
+        archive = self._source == "archive"
+        self.browse_btn.setVisible(files)
+        self.search.setVisible(not files)
+        self.sort.setVisible(archive)
+        self.favorite_btn.setVisible(not files)
+        for button in (self.tags_btn, self.rename_btn, self.delete_btn):
+            button.setVisible(archive)
+        self.table.horizontalHeaderItem(0).setText("File" if files else "Title")
+        self.table.setColumnHidden(1, files)
+        self.table.setColumnHidden(2, not archive)
+        if self._picker:
+            self.table.setColumnHidden(3, not archive)
+
+    def _change_source(self, index: int) -> None:
+        self._stop_preview()
+        self._source = self.source_tabs.tabData(index)
+        with QtCore.QSignalBlocker(self.search), QtCore.QSignalBlocker(self.table):
+            self.search.clear()
+            self.table.clearSelection()
+        self._refresh_source_controls()
+        self.refresh()
+
+    def _browse_files(self) -> None:
+        self._stop_preview()
+        if self._multi_select:
+            paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+                self, "Choose Music", _downloads_directory(), AUDIO_FILES_FILTER,
+            )
+        else:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Choose Music", _downloads_directory(), AUDIO_FILES_FILTER,
+            )
+            paths = [path] if path else []
+        if paths:
+            self._files = list(dict.fromkeys(paths))
+            with QtCore.QSignalBlocker(self.table):
+                self.table.clearSelection()
+            self.refresh()
+
+    def _selected_path(self, track_id: str) -> Path | None:
+        path = Path(track_id) if self._source == "files" else self.library.path_for(track_id)
+        return path if path is not None and path.is_file() else None
+
     def _selection_changed(self, *, preview: bool = True) -> None:
-        selected_ids = self.selected_ids()
-        has_selection = bool(selected_ids)
-        selected_records = [
-            record
-            for track_id in selected_ids
-            if (record := self.library.get(track_id)) is not None
+        selected = self.selected_ids()
+        records = [] if self._source == "files" else [
+            record for track_id in selected if (record := self.library.get(track_id)) is not None
         ]
-        editable = bool(selected_records) and all(
-            record.source_kind != "stock"
-            for record in selected_records
-        )
-        self.rename_btn.setEnabled(editable and len(selected_records) == 1)
+        one_record = records[0] if len(records) == 1 else None
+        editable = bool(records) and all(record.source_kind != "stock" for record in records)
+        self.rename_btn.setEnabled(editable and one_record is not None)
+        self.tags_btn.setEnabled(editable and one_record is not None)
         self.delete_btn.setEnabled(editable)
-        self.choose_btn.setEnabled(has_selection)
-        if has_selection and preview:
-            self._preview()
+        self.favorite_btn.setEnabled(one_record is not None)
+        self.favorite_btn.setText("Unstar" if one_record and one_record.favorite else "Star")
+        paths = [self._selected_path(track_id) for track_id in selected]
+        self.preview_btn.setEnabled(any(paths))
+        self.choose_btn.setEnabled(bool(selected) and (not self._picker or all(paths)))
+        if preview:
+            if selected:
+                self._preview()
+            else:
+                self._stop_preview()
 
     def _refresh_after_filter_change(self) -> None:
         self._stop_preview()
@@ -3584,112 +3852,62 @@ class ArchiveDialog(
     def _preview_failed(self, _error: QMediaPlayer.Error, message: str) -> None:
         if not self._previewing_id:
             return
-        _LOGGER.warning("Archive preview failed: %s", message)
+        _LOGGER.warning("Music preview failed: %s", message)
         self._stop_preview()
-        show_lettersmith_message(self, "Music Preview", "This track could not be previewed. Check the source or repair Music Archive.")
+        show_lettersmith_message(self, "Music Preview", "This track could not be previewed. Check its source.")
 
-    def refresh(
-        self,
-    ) -> None:
-        self._filter_refresh_timer.stop()
-        query = (
-            self.search
-            .text()
-            .strip()
-            .casefold()
-        )
-
-        records = self.library.all_records(
-            str(
-                self.sort.currentData()
-                or "recent"
-            )
-        )
-
+    def _library_rows(self) -> list[tuple[str, list[str], str]]:
+        query = self.search.text().casefold().split()
+        sort_mode = "name" if self._source == "stock" else self.sort.currentData() or "recent"
         records = [
-            record
-            for record in records
-            if record.source_kind != "stock"
+            record for record in self.library.all_records("recent" if sort_mode == "used" else sort_mode)
+            if (record.source_kind == "stock") == (self._source == "stock")
         ]
+        if sort_mode == "used":
+            records.sort(key=lambda record: self._recent_order.get(record.track_id, len(self._recent_order)))
+        records.sort(key=lambda record: not record.favorite)
+        rows = []
+        for record in records:
+            search_fields = (record.display_title, record.original_name, *record.tags)
+            if not all(any(term in value.casefold() for value in search_fields) for term in query):
+                continue
+            title = f"★  {record.display_title}" if record.favorite else record.display_title
+            cells = [title, _format_duration(record.duration_seconds), record.added_at[:10]]
+            if self._picker:
+                cells.append(", ".join(record.tags))
+            rows.append((record.track_id, cells, record.original_name))
+        return rows
 
-        if query:
-            records = [
-                record
-                for record
-                in records
-                if (
-                    query
-                    in record.display_title.casefold()
-                    or query
-                    in record.original_name.casefold()
-                )
-            ]
+    def refresh(self) -> None:
+        self._filter_refresh_timer.stop()
+        selected = set(self.selected_ids())
+        if self._source == "files":
+            rows = [(path, [Path(path).name], path) for path in self._files]
+            if not selected:
+                selected = set(self._files)
+        else:
+            rows = self._library_rows()
+            if not self._picker and not selected:
+                selected = self.used_ids()
 
-        selection_blocker = QtCore.QSignalBlocker(self.table)
-        self.table.clearContents()
-        self.table.setRowCount(
-            len(
-                records
-            )
-        )
-
-        used = self.used_ids()
-
-        for row, record in enumerate(
-            records
-        ):
-            title = QtWidgets.QTableWidgetItem(
-                record.display_title
-            )
-
-            title.setData(
-                Qt.UserRole,
-                record.track_id,
-            )
-
-            self.table.setItem(
-                row,
-                0,
-                title,
-            )
-
-            self.table.setItem(
-                row,
-                1,
-                QtWidgets.QTableWidgetItem(
-                    _format_duration(
-                        record.duration_seconds
-                    )
-                ),
-            )
-
-            self.table.setItem(
-                row,
-                2,
-                QtWidgets.QTableWidgetItem(
-                    record.added_at[:10]
-                ),
-            )
-
-        self.table.resizeRowsToContents()
-        self.table.clearSelection()
-        selection_model = self.table.selectionModel()
-        model = self.table.model()
-        if selection_model is not None and model is not None:
+        with QtCore.QSignalBlocker(self.table):
+            self.table.clearContents()
+            self.table.setRowCount(len(rows))
             selection = QtCore.QItemSelection()
-            for row, record in enumerate(records):
-                if record.track_id in used:
-                    selection.select(
-                        model.index(row, 0),
-                        model.index(row, self.table.columnCount() - 1),
-                    )
-            if not selection.isEmpty():
-                selection_model.select(
-                    selection,
-                    QtCore.QItemSelectionModel.ClearAndSelect
-                    | QtCore.QItemSelectionModel.Rows,
-                )
-        del selection_blocker
+            model = self.table.model()
+            for row, (track_id, cells, tooltip) in enumerate(rows):
+                for column, cell in enumerate(cells):
+                    item = QtWidgets.QTableWidgetItem(cell)
+                    item.setToolTip(tooltip if column == 0 else cell)
+                    self.table.setItem(row, column, item)
+                    if column == 0:
+                        item.setData(Qt.UserRole, track_id)
+                if track_id in selected:
+                    selection.select(model.index(row, 0), model.index(row, self.table.columnCount() - 1))
+            self.table.resizeRowsToContents()
+            self.table.selectionModel().select(
+                selection, QtCore.QItemSelectionModel.ClearAndSelect | QtCore.QItemSelectionModel.Rows,
+            )
         self._selection_changed(preview=False)
 
     def selected_ids(
@@ -3730,59 +3948,62 @@ class ArchiveDialog(
             if track_id
         ]
 
-    def _choose(
-        self,
-    ) -> None:
+    def _choose(self) -> None:
         track_ids = self.selected_ids()
+        if not track_ids or (self._picker and not all(self._selected_path(track_id) for track_id in track_ids)):
+            return
+        self._stop_preview()
+        if self._source == "files":
+            self.chosen_files = track_ids
+        else:
+            self.tracksChosen.emit(track_ids)
+        self.accept()
 
-        if track_ids:
-            self._stop_preview()
-            self.tracksChosen.emit(
-                track_ids
-            )
-
-            self.accept()
-
-    def _preview(
-        self,
-    ) -> None:
+    def _preview(self) -> None:
         track_ids = self.selected_ids()
-
         if not track_ids:
             return
+        current = self.table.item(self.table.currentRow(), 0)
+        current_id = current.data(Qt.UserRole) if current is not None else ""
+        track_id = current_id if current_id in track_ids else track_ids[0]
+        path = self._selected_path(track_id)
+        if self._source == "files":
+            title = Path(track_id).name
+        else:
+            record = self.library.get(track_id)
+            title = record.display_title if record is not None else track_id
+        self._play_preview(track_id, path, title)
 
-        track_id = track_ids[0]
-
-        if (
-            self._previewing_id == track_id
-            and self.preview_player.playbackState()
-            == QMediaPlayer.PlayingState
-        ):
+    def _toggle_favorite(self) -> None:
+        track_ids = self.selected_ids()
+        if self._source == "files" or len(track_ids) != 1:
             return
-
-        if self._previewing_id != track_id:
-            self._stop_preview()
-
-        path = self.library.path_for(
-            track_id
-        )
-
-        if path is None:
+        record = self.library.get(track_ids[0])
+        if record is None:
             return
+        try:
+            self.library.set_favorite(record.track_id, not record.favorite)
+        except OSError:
+            _LOGGER.exception("Could not save track favorite.")
+            show_lettersmith_message(self, "Music Archive", "The favorite could not be saved.")
 
-        self.previewRequested.emit()
-        self.preview_player.setSource(
-            QUrl.fromLocalFile(
-                str(
-                    path
-                )
-            )
+    def _edit_tags(self) -> None:
+        track_ids = self.selected_ids()
+        if self._source != "archive" or len(track_ids) != 1:
+            return
+        record = self.library.get(track_ids[0])
+        if record is None:
+            return
+        tags, accepted = LetterSmithInputDialog.get_text(
+            self, "Edit Track Tags", "Tags separated by commas",
+            text=", ".join(record.tags), accept_text="Save",
         )
-
-        self._previewing_id = (
-            track_id
-        )
-        self.preview_player.play()
+        if accepted:
+            try:
+                self.library.set_tags(record.track_id, tags.split(","))
+            except OSError:
+                _LOGGER.exception("Could not save track tags.")
+                show_lettersmith_message(self, "Music Archive", "The tags could not be saved.")
 
     def _rename(
         self,
@@ -3815,11 +4036,6 @@ class ArchiveDialog(
                 record.track_id,
                 title,
             )
-
-    def _stop_preview(self) -> None:
-        self.preview_player.stop()
-        self.preview_player.setSource(QUrl())
-        self._previewing_id = ""
 
     def _delete(
         self,
@@ -4082,27 +4298,9 @@ class StockMusicDialog(
         if not track_ids:
             return
         track_id = track_ids[0]
-        if (
-            self._previewing_id == track_id
-            and self.preview_player.playbackState()
-            == QMediaPlayer.PlayingState
-        ):
-            return
-        if self._previewing_id != track_id:
-            self._stop_preview()
-        path = self.library.path_for(
-            track_id
-        )
-        if path is None:
-            return
-        self.previewRequested.emit()
-        self.preview_player.setSource(
-            QUrl.fromLocalFile(
-                str(path)
-            )
-        )
-        self._previewing_id = track_id
-        self.preview_player.play()
+        record = self.library.get(track_id)
+        if record is not None:
+            self._play_preview(track_id, self.library.path_for(track_id), record.display_title)
 
     def _preview_failed(
         self,
@@ -4114,13 +4312,6 @@ class StockMusicDialog(
         _LOGGER.warning("Music preview failed: %s", message)
         self._stop_preview()
         show_lettersmith_message(self, "Music Preview", "This track could not be previewed. Check that its source is available.")
-
-    def _stop_preview(self) -> None:
-        self.preview_player.stop()
-        self.preview_player.setSource(
-            QUrl()
-        )
-        self._previewing_id = ""
 
     def closeEvent(
         self,
@@ -4414,6 +4605,7 @@ class SoundTab(QtWidgets.QWidget):
             resolver=project_paths,
         )
         self.session = get_project_session(self.project_root)
+        self._settings = SettingsStore(self.project_root)
 
         self.library = SoundLibrary(
             self.project_root,
@@ -4430,6 +4622,8 @@ class SoundTab(QtWidgets.QWidget):
             self.library.path_for,
             self,
         )
+        self._waveform = SoundWaveform(self)
+        self._recipient_muted = self.project_sound.state.muted
 
         self._tab_active = False
 
@@ -4499,6 +4693,8 @@ class SoundTab(QtWidgets.QWidget):
 
         self._compact_layout = False
         self._init_ui()
+        self._waveform.peaksChanged.connect(self.timeline.set_waveform)
+        self._load_preview_levels()
         self._connect_signals()
         self._reload_player_queue()
         self._refresh_ui(refresh_playlist=False, refresh_track=False)
@@ -4527,6 +4723,7 @@ class SoundTab(QtWidgets.QWidget):
         if self.project_sound._saving:
             return
         if signature[0] != previous[0]:
+            self.project_sound.discard_playlist_undo()
             self.prepare_for_project_restore()
         assignment_keys = ("mode", "single_track_id", "playlist", "selected_track_id", "tracks")
         assignment_changed = any(signature[1].get(key) != previous[1].get(key) for key in assignment_keys)
@@ -4543,18 +4740,17 @@ class SoundTab(QtWidgets.QWidget):
             self.volume.setValue(snapshot["volume"])
         self._last_saved_volume = self.volume.value()
         self.volume_value.setText(f"{self.volume.value()}%")
-        self.player.set_volume(self.volume.value())
-        self.player.set_muted(snapshot["muted"])
+        self._recipient_muted = snapshot["muted"]
         self._refresh_mute_control()
 
     def _refresh_mute_control(self) -> None:
-        muted = self.player.is_muted()
+        muted = self._recipient_muted
         self.mute_btn.setText("\U0001F507" if muted else "\U0001F50A")
         self._set_transport_icon(
             self.mute_btn,
             QtWidgets.QStyle.SP_MediaVolumeMuted if muted else QtWidgets.QStyle.SP_MediaVolume
         )
-        self.mute_btn.setToolTip("Unmute project soundtrack" if muted else "Mute project soundtrack (saved)")
+        self.mute_btn.setToolTip("Unmute recipient soundtrack" if muted else "Mute recipient soundtrack")
         self.mute_btn.setAccessibleName(self.mute_btn.toolTip())
 
     def _set_transport_icon(self, button: QtWidgets.QToolButton, symbol) -> None:
@@ -4585,8 +4781,6 @@ class SoundTab(QtWidgets.QWidget):
                 None,
             )
         for name in (
-            "stock_btn",
-            "archive_btn",
             "import_btn",
             "add_track_btn",
             "convert_single_btn",
@@ -4605,6 +4799,8 @@ class SoundTab(QtWidgets.QWidget):
                     theme_service
                 )
         self._transport_theme_tokens = getattr(theme_service, "tokens", None)
+        for slider in (self.timeline, self.volume, self.preview_controls.volume):
+            slider.apply_theme_assets(theme_service)
         for button, symbol in (
             (self.prev_btn, QtWidgets.QStyle.SP_MediaSkipBackward),
             (self.play_btn, QtWidgets.QStyle.SP_MediaPause if self.player.is_playing()
@@ -4651,8 +4847,6 @@ class SoundTab(QtWidgets.QWidget):
             "padding: 3px 6px; min-height: 18px;" if compact else ""
         )
         for button, tier in (
-            (self.stock_btn, ButtonTier.MEDIUM),
-            (self.archive_btn, ButtonTier.MEDIUM),
             (self.import_btn, ButtonTier.MEDIUM),
             (self.clear_btn, ButtonTier.MEDIUM),
             (self.add_track_btn, ButtonTier.MEDIUM),
@@ -4763,36 +4957,6 @@ class SoundTab(QtWidgets.QWidget):
         header.addWidget(self.heading)
         header.addStretch(1)
 
-        self.stock_btn = ThemedArtworkButton(
-            "Stock Music",
-            self.project_root,
-            "AButton.png",
-            tier=ButtonTier.MEDIUM,
-        )
-
-        self.stock_btn.setToolTip(
-            "Choose a bundled stock song for this letter."
-        )
-
-        self.stock_btn.setAccessibleName(
-            "Stock Music"
-        )
-
-        self.archive_btn = ThemedArtworkButton(
-            "Open Music Archive",
-            self.project_root,
-            "AButton.png",
-            tier=ButtonTier.MEDIUM,
-        )
-
-        self.archive_btn.setToolTip(
-            "Choose from music you previously imported."
-        )
-
-        self.archive_btn.setAccessibleName(
-            "Music Archive"
-        )
-
         self.clear_btn = ThemedArtworkButton(
             "Clear",
             self.project_root,
@@ -4811,19 +4975,10 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         self.import_btn = ThemedArtworkButton(
-            "Import Music", self.project_root, "AButton.png", tier=ButtonTier.MEDIUM,
+            "Add Music", self.project_root, "AButton.png", tier=ButtonTier.MEDIUM,
         )
         self.import_btn.setToolTip(
-            "Import music into Music Archive and select it for this project."
-        )
-        self.import_btn.clicked.connect(self._choose_new_files)
-
-        header.addWidget(
-            self.stock_btn
-        )
-
-        header.addWidget(
-            self.archive_btn
+            "Choose from files, stock music, or Music Archive."
         )
 
         header.addWidget(
@@ -4878,8 +5033,6 @@ class SoundTab(QtWidgets.QWidget):
             1,
         )
 
-        self.playback_heading = QtWidgets.QLabel("Playback and Settings")
-        self.playback_heading.setStyleSheet("font-size: 11pt; font-weight: 600;")
         self.playback_panel = QtWidgets.QFrame()
         self.playback_panel.setObjectName("soundPlaybackPanel")
         self.playback_panel.setStyleSheet(
@@ -4890,14 +5043,14 @@ class SoundTab(QtWidgets.QWidget):
         playback_layout.setContentsMargins(12, 10, 12, 10)
         playback_layout.setSpacing(4)
         playback_header = QtWidgets.QHBoxLayout()
-        playback_header.addWidget(self.playback_heading, 1)
+        playback_header.setContentsMargins(4, 0, 4, 0)
         playback_layout.addLayout(playback_header)
 
         self.now_playing = QtWidgets.QLabel(
             "No music selected"
         )
         self.now_playing.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
-        self.now_playing.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.now_playing.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         self.now_playing.setStyleSheet(
             """
@@ -4907,7 +5060,7 @@ class SoundTab(QtWidgets.QWidget):
             """
         )
 
-        playback_header.addWidget(self.now_playing, 2)
+        playback_header.addWidget(self.now_playing, 1)
 
         transport = QtWidgets.QHBoxLayout()
         transport.setContentsMargins(4, 4, 4, 4)
@@ -4968,10 +5121,13 @@ class SoundTab(QtWidgets.QWidget):
             "font-size: 10pt;"
         )
 
-        self.timeline = CleanSlider()
+        self.timeline = WaveformSlider()
         self.timeline.setToolTip(
-            "Drag to move to another point in the current song."
+            "Click or drag to seek in the current song."
         )
+        self.timeline.setAccessibleName("Playback timeline")
+        self.timeline.setSingleStep(1000)
+        self.timeline.setPageStep(10_000)
 
         self.timeline.setRange(
             0,
@@ -4992,15 +5148,15 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         self.mute_btn.setToolTip(
-            "Mute project soundtrack (saved)"
+            "Mute recipient soundtrack"
         )
-        self.mute_btn.setAccessibleName("Mute project soundtrack")
+        self.mute_btn.setAccessibleName("Mute recipient soundtrack")
 
         self.volume = CleanSlider()
         self.volume.setToolTip(
-            "Project soundtrack volume, saved from 0 to 100."
+            "Starting volume for the recipient."
         )
-        self.volume.setAccessibleName("Project soundtrack volume")
+        self.volume.setAccessibleName("Recipient volume")
         self.volume_value = QtWidgets.QLabel()
         self.volume_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.volume_value.setFixedWidth(38)
@@ -5058,17 +5214,15 @@ class SoundTab(QtWidgets.QWidget):
             self.total
         )
 
-        transport.addWidget(
-            self.mute_btn
-        )
-
-        transport.addWidget(
-            self.volume
-        )
-        transport.addWidget(self.volume_value)
+        playback_header.addWidget(QtWidgets.QLabel("Recipient volume"))
+        playback_header.addWidget(self.volume)
+        playback_header.addWidget(self.volume_value)
+        playback_header.addWidget(self.mute_btn)
         self.volume_value.setText(f"{self.volume.value()}%")
         self.volume.valueChanged.connect(lambda value: self.volume_value.setText(f"{value}%"))
 
+        self.preview_controls = _PreviewVolumeControls()
+        transport.addWidget(self.preview_controls)
         playback_layout.addLayout(
             transport
         )
@@ -5102,11 +5256,20 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         self.cancel_job_btn.hide()
+        self.undo_playlist_btn = QtWidgets.QPushButton("Undo")
+        self.undo_playlist_btn.setAccessibleName("Undo playlist edit")
+        self.undo_playlist_btn.setToolTip("Undo the last playlist move or removal.")
+        self.undo_playlist_btn.setStyleSheet("padding: 0 8px; min-height: 22px;")
+        self.undo_playlist_btn.hide()
+        self._undo_shortcut = QtGui.QShortcut(QtGui.QKeySequence.Undo, self)
+        self._undo_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._undo_shortcut.activated.connect(self._undo_playlist_edit)
 
         status_row.addWidget(
             self.status,
             1,
         )
+        status_row.addWidget(self.undo_playlist_btn)
 
         status_row.addWidget(
             self.cancel_job_btn
@@ -5207,7 +5370,7 @@ class SoundTab(QtWidgets.QWidget):
             "AButton.png",
         )
         self.single_action_btn.setToolTip(
-            "Choose music from your computer or recently used songs."
+            "Choose from files, stock music, or Music Archive."
         )
         apply_button_tier(self.single_action_btn, ButtonTier.MEDIUM)
         ensure_button_text_fits(self.single_action_btn)
@@ -5295,17 +5458,17 @@ class SoundTab(QtWidgets.QWidget):
         self.playlist_summary.setStyleSheet("color: #93a8bd; font-size: 9pt;")
 
         self.add_track_btn = ThemedArtworkButton(
-            "Add to Playlist", self.project_root, "AButton.png", tier=ButtonTier.MEDIUM,
+            "Add Music", self.project_root, "AButton.png", tier=ButtonTier.MEDIUM,
         )
         self.add_track_btn.setToolTip(
-            "Choose music from your computer or recently used songs."
+            "Choose from files, stock music, or Music Archive."
         )
 
         self.convert_single_btn = ThemedArtworkButton(
             "Convert to Single Track", self.project_root, "AButton.png", tier=ButtonTier.MEDIUM,
         )
         self.convert_single_btn.setToolTip(
-            "Choose which song to keep as the project's single track."
+            "Play one song and keep this playlist for later."
         )
 
         self.playlist_list = QtWidgets.QListWidget()
@@ -5396,13 +5559,9 @@ class SoundTab(QtWidgets.QWidget):
             self._open_user_music_for_current_mode
         )
 
-        self.archive_btn.clicked.connect(
-            self._open_archive_for_current_mode
-        )
-
-        self.stock_btn.clicked.connect(
-            self._open_stock_for_current_mode
-        )
+        self.import_btn.clicked.connect(self._open_user_music_for_current_mode)
+        self.undo_playlist_btn.clicked.connect(self._undo_playlist_edit)
+        self.preview_controls.changed.connect(self._save_preview_levels)
 
         self.convert_single_btn.clicked.connect(
             self._convert_to_single
@@ -5439,7 +5598,7 @@ class SoundTab(QtWidgets.QWidget):
             self._save_volume
         )
 
-        self.timeline.sliderMoved.connect(
+        self.timeline.valueChanged.connect(
             self.player.seek
         )
 
@@ -5587,16 +5746,7 @@ class SoundTab(QtWidgets.QWidget):
         self._last_saved_volume = value
         self._restore_sound_controls()
 
-    def _volume_changed(self, value: int) -> None:
-        value = max(
-            0,
-            min(
-                100,
-                int(value),
-            ),
-        )
-
-        self.player.set_volume(value)
+    def _volume_changed(self, _value: int) -> None:
         self._save_volume()
 
         # Notify Nexus so the Forge preview adopts the new volume.
@@ -5605,7 +5755,7 @@ class SoundTab(QtWidgets.QWidget):
     def _toggle_mute(self) -> None:
         if self.session.is_restoring:
             return
-        muted = not self.player.is_muted()
+        muted = not project_sound_snapshot(self.session)["muted"]
         self.project_sound.state.muted = muted
         try:
             self.project_sound.persist_state()
@@ -5623,6 +5773,27 @@ class SoundTab(QtWidgets.QWidget):
             if muted
             else "unmuted"
         )
+
+    def _load_preview_levels(self) -> None:
+        try:
+            volume = int(self._settings.get(PREVIEW_VOLUME_KEY, DEFAULT_PREVIEW_VOLUME))
+        except (TypeError, ValueError, OverflowError):
+            volume = DEFAULT_PREVIEW_VOLUME
+        self._apply_preview_levels(
+            max(0, min(100, volume)), self._settings.get(PREVIEW_MUTED_KEY, False) is True,
+        )
+
+    def _apply_preview_levels(self, volume: int, muted: bool) -> None:
+        self.preview_controls.set_levels(volume, muted)
+        self.player.set_volume(volume)
+        self.player.set_muted(muted)
+
+    def _save_preview_levels(self, volume: int, muted: bool) -> None:
+        self._apply_preview_levels(volume, muted)
+        try:
+            self._settings.update_fields({PREVIEW_VOLUME_KEY: volume, PREVIEW_MUTED_KEY: muted})
+        except OSError:
+            _LOGGER.exception("Could not save preview audio preferences.")
 
     def _project_state_changed(self) -> None:
         self._session_sound_signature = (self.session.session_id, project_sound_snapshot(self.session))
@@ -5670,19 +5841,6 @@ class SoundTab(QtWidgets.QWidget):
             self.project_sound.state.selected_track_id,
         )
 
-        if hasattr(
-            self,
-            "volume",
-        ):
-            volume = self.volume.value()
-
-        else:
-            volume = self._load_volume()
-
-        self.player.set_volume(
-            volume
-        )
-
     def _refresh_ui(
         self,
         *,
@@ -5696,7 +5854,7 @@ class SoundTab(QtWidgets.QWidget):
         self.playlist_summary.setVisible(playlist_active)
         self.add_track_btn.setVisible(playlist_active)
         self.convert_single_btn.setVisible(playlist_active)
-        self.clear_btn.setVisible(has_tracks)
+        self.clear_btn.setVisible(has_tracks or bool(state.playlist))
         self.import_btn.setVisible(not has_tracks)
         self.single_action_btn.setVisible(has_tracks and not playlist_active)
 
@@ -5729,9 +5887,14 @@ class SoundTab(QtWidgets.QWidget):
 
             has_single_track = bool(state.single_track_id)
 
-            self.create_playlist_btn.setVisible(
-                has_single_track
+            has_retained_playlist = bool(state.playlist)
+            self.create_playlist_btn.setVisible(has_single_track or has_retained_playlist)
+            self.create_playlist_btn.setText("Restore Playlist" if has_retained_playlist else "Create Playlist")
+            self.create_playlist_btn.setToolTip(
+                "Switch back to the saved playlist." if has_retained_playlist
+                else "Keep this song and add more tracks as a playlist."
             )
+            ensure_button_text_fits(self.create_playlist_btn)
 
             if record is None:
                 self.single_title.setText(
@@ -5844,7 +6007,7 @@ class SoundTab(QtWidgets.QWidget):
                     getattr(self.window(), "theme_service", None)
                 )
                 widget.removeRequested.connect(
-                    self.project_sound.remove_from_playlist
+                    lambda _track_id, row_item=item: self._remove_playlist_row(row_item)
                 )
                 item.setSizeHint(QtCore.QSize(274, 44))
                 self.playlist_list.addItem(item)
@@ -5891,24 +6054,29 @@ class SoundTab(QtWidgets.QWidget):
             self._playlist_item_activated(item)
 
     def _move_selected_track(self, offset: int) -> None:
-        item = self.playlist_list.currentItem()
-        if item is None or self._button_busy:
+        index = self.playlist_list.currentRow()
+        if index < 0 or self._button_busy:
             return
         track_ids = self.project_sound.ordered_ids()
-        track_id = item.data(Qt.UserRole)
-        if track_id not in track_ids:
+        if index >= len(track_ids):
             return
-        index = track_ids.index(track_id)
         target = index + offset
         if 0 <= target < len(track_ids):
             track_ids[index], track_ids[target] = track_ids[target], track_ids[index]
             self.project_sound.reorder_playlist(track_ids)
             self._refresh_playlist()
+            self.playlist_list.setCurrentRow(target)
 
     def _remove_selected_track(self) -> None:
-        item = self.playlist_list.currentItem()
+        self._remove_playlist_row(self.playlist_list.currentItem())
+
+    def _remove_playlist_row(self, item: QtWidgets.QListWidgetItem | None) -> None:
         if item is not None and not self._button_busy:
-            self.project_sound.remove_from_playlist(item.data(Qt.UserRole))
+            self.project_sound.remove_from_playlist(item.data(Qt.UserRole), row=self.playlist_list.row(item))
+
+    def _undo_playlist_edit(self) -> None:
+        if not self._button_busy and not self.session.is_restoring:
+            self.project_sound.undo_playlist_edit()
 
     def _playlist_item_activated(
         self,
@@ -5995,20 +6163,21 @@ class SoundTab(QtWidgets.QWidget):
         )
 
         self.timeline.setEnabled(
-            has_tracks
+            playable
         )
         self.mute_btn.setEnabled(playable)
         self.volume.setEnabled(True)
+        can_undo = self.project_sound.can_undo_playlist_edit and not busy
+        self.undo_playlist_btn.setVisible(can_undo)
+        self._undo_shortcut.setEnabled(can_undo)
 
         self.clear_btn.set_action_state(
-            broken=not has_tracks,
+            broken=not self.project_sound.state.referenced_track_ids(),
             invisible=busy,
         )
         for button in (
             self.single_action_btn,
             self.create_playlist_btn,
-            self.archive_btn,
-            self.stock_btn,
             self.import_btn,
             self.add_track_btn,
             self.convert_single_btn,
@@ -6018,84 +6187,11 @@ class SoundTab(QtWidgets.QWidget):
                 invisible=busy,
             )
 
-    def _choose_new_files(
-        self,
-    ) -> None:
-        start = _downloads_directory()
-
-        if (
-            self.project_sound
-            .state
-            .mode
-            == "playlist"
-            and self.project_sound.ordered_ids()
-        ):
-            paths, _selected_filter = (
-                QtWidgets.QFileDialog
-                .getOpenFileNames(
-                    self,
-                    "Add Playlist Tracks",
-                    start,
-                    (
-                        "Audio Files "
-                        "(*.mp3 *.wav *.ogg "
-                        "*.aac *.m4a *.flac)"
-                    ),
-                )
-            )
-
-        else:
-            path, _selected_filter = (
-                QtWidgets.QFileDialog
-                .getOpenFileName(
-                    self,
-                    "Choose Music",
-                    start,
-                    (
-                        "Audio Files "
-                        "(*.mp3 *.wav *.ogg "
-                        "*.aac *.m4a *.flac)"
-                    ),
-                )
-            )
-
-            if path:
-                paths = [
-                    path
-                ]
-
-            else:
-                paths = []
-
-        if paths:
-            self._remember_music_folder(
-                paths[0]
-            )
-
-            self._start_import(
-                paths
-            )
-
-    def _remember_music_folder(
-        self,
-        path: str,
-    ) -> None:
-        settings = _read_settings(
-            self.project_root
-        )
-
-        settings[
-            LAST_MUSIC_FOLDER_KEY
-        ] = str(
-            Path(
-                path
-            ).resolve().parent
-        )
-
-        _write_settings(
-            self.project_root,
-            settings,
-        )
+    def _remember_music_folder(self, path: str) -> None:
+        try:
+            self._settings.update_fields({LAST_MUSIC_FOLDER_KEY: str(Path(path).resolve().parent)})
+        except OSError:
+            _LOGGER.exception("Could not save the recent music folder.")
 
     def _start_import(
         self,
@@ -6295,84 +6391,71 @@ class SoundTab(QtWidgets.QWidget):
         if self._repair_worker is not None:
             self._repair_worker.cancel()
 
-    def _open_archive_for_current_mode(
-        self,
-    ) -> None:
-        dialog = ArchiveDialog(
-            self.library,
-            lambda:
-                set(
-                    self.project_sound
-                    .ordered_ids()
-                ),
-            self._delete_archive_track,
-            multi_select=(
-                self.project_sound
-                .state
-                .mode
-                == "playlist"
-                and bool(self.project_sound.ordered_ids())
-            ),
-            parent=self,
-        )
-
-        self._exec_music_popup(dialog)
-
-    def _open_stock_for_current_mode(
-        self,
-    ) -> None:
-        self._open_music_selector(user_music=False)
+    def _open_archive_for_current_mode(self) -> None:
+        self._open_music_selector(initial_source="archive")
 
     def _open_user_music_for_current_mode(self) -> None:
-        self._open_music_selector(user_music=True)
+        self._open_music_selector()
 
-    def _open_music_selector(self, *, user_music: bool) -> None:
-        dialog = StockMusicDialog(
+    def _open_music_selector(
+        self,
+        *,
+        initial_source: str | None = None,
+        files: tuple[str, ...] = (),
+    ) -> None:
+        if self._button_busy or self._shutdown or self.session.is_restoring:
+            return
+        if initial_source is None:
+            initial_source = "archive" if any(
+                record.source_kind != "stock" for record in self.library.records.values()
+            ) else "files"
+        dialog = ArchiveDialog(
             self.library,
-            multi_select=(
-                self.project_sound
-                .state
-                .mode
-                == "playlist"
-                and bool(self.project_sound.ordered_ids())
-            ),
+            lambda: set(self.project_sound.ordered_ids()),
+            self._delete_archive_track,
+            multi_select=self.project_sound.state.mode == "playlist" and bool(self.project_sound.ordered_ids()),
             parent=self,
+            initial_source=initial_source,
             recent_track_ids=tuple(
                 track_id for track_id, _label in recent_media(
-                    self.project_root,
-                    self.project_state.identity.project_id,
-                    "music",
+                    self.project_root, self.project_state.identity.project_id, "music",
                 )
-                if self.library.path_for(track_id) is not None
-            ) if user_music else (),
-            allow_browse=user_music,
+            ),
+            files=files,
         )
-
         self._exec_music_popup(dialog)
-
-        if dialog.browse_requested:
-            self._choose_new_files()
 
     def _exec_music_popup(self, dialog: ArchiveDialog | StockMusicDialog) -> None:
         context = self._project_context()
         target = self.session.capture_project_target(fields=("sound",))
         chosen: list[str] = []
+        dialog.set_preview_levels(self.preview_controls.volume.value(), self.preview_controls.mute.isChecked())
+        dialog.previewSettingsChanged.connect(self._save_preview_levels)
         dialog.previewRequested.connect(self.player.pause_for_preview)
         dialog.tracksChosen.connect(chosen.extend)
         try:
             dialog.exec()
         finally:
-            # Release the preview before allowing normal playback to resume.
             dialog._stop_preview()
             self.player.resume_after_preview(
                 resume=not self._shutdown and self._tab_active and context == self._project_context()
                 and self.session.project_target_is_current(target)
             )
             dialog.deleteLater()
-        if chosen and not self._shutdown and context == self._project_context():
-            # Applying a new letter selection retains its existing transport behavior.
-            if not self.session.apply_project_result(target, lambda _model: self._archive_tracks_chosen(chosen)):
-                self._show_status("The project soundtrack changed; no tracks were assigned.", persistent=True)
+
+        if self._shutdown or context != self._project_context():
+            return
+        if dialog.chosen_files:
+            def import_files(_model):
+                self._remember_music_folder(dialog.chosen_files[0])
+                self._start_import(dialog.chosen_files)
+            applied = self.session.apply_project_result(target, import_files)
+        elif chosen:
+            applied = self.session.apply_project_result(target, lambda _model: self._archive_tracks_chosen(chosen))
+        else:
+            return
+        if not applied:
+            self._show_status("The project soundtrack changed; no tracks were assigned.", persistent=True)
 
     def _project_context(self) -> tuple[str, int]:
         session = peek_project_session(self.project_root)
@@ -6470,11 +6553,11 @@ class SoundTab(QtWidgets.QWidget):
             confirmation.exec()
 
             if confirmation.choice == "secondary":
-                self.project_sound.remove_usage(
-                    track_id
-                )
-
-                play_ui_sound(UiSound.REMOVED)
+                if self.project_sound.state.mode == "playlist" and track_id in self.project_sound.state.playlist:
+                    self.project_sound.remove_from_playlist(track_id)
+                else:
+                    self.project_sound.remove_usage(track_id)
+                    play_ui_sound(UiSound.REMOVED)
 
                 return False
 
@@ -6505,6 +6588,10 @@ class SoundTab(QtWidgets.QWidget):
         deleted = self.library.delete_track(
             track_id
         )
+
+        if deleted:
+            self.project_sound.discard_playlist_undo()
+            self._sync_transport_enabled()
 
         if not deleted:
             self.project_sound.state = (
@@ -6661,13 +6748,15 @@ class SoundTab(QtWidgets.QWidget):
     def _create_playlist(
         self,
     ) -> None:
-        if self.project_sound.state.mode == "playlist" or not self.project_sound.ordered_ids():
+        state = self.project_sound.state
+        if state.mode == "playlist" or not state.referenced_track_ids():
             return
-        previous_mode = self.project_sound.state.mode
+        restoring = bool(state.playlist)
         self.project_sound.create_playlist()
-        if self.project_sound.state.mode != previous_mode:
+        if self.project_sound.state.mode == "playlist":
             play_ui_sound(UiSound.BLIP)
-            self._open_user_music_for_current_mode()
+            if not restoring:
+                self._open_user_music_for_current_mode()
 
     def _convert_to_single(
         self,
@@ -6700,7 +6789,7 @@ class SoundTab(QtWidgets.QWidget):
             dialog = LetterSmithConfirmationDialog(
                 self,
                 title="Convert to Single Track",
-                question="Choose the song to keep. Other songs remain in Music Archive.",
+                question="Choose the song to play. You can switch back to this playlist later.",
                 primary_text="Keep Song",
                 secondary_text="Cancel",
                 click_outside_dismiss=False,
@@ -6739,7 +6828,7 @@ class SoundTab(QtWidgets.QWidget):
     def _clear_project_sound(
         self,
     ) -> None:
-        if not self.project_sound.ordered_ids():
+        if not self.project_sound.state.referenced_track_ids():
             return
         target = self.session.capture_project_target(fields=("sound",))
 
@@ -6864,6 +6953,7 @@ class SoundTab(QtWidgets.QWidget):
         else:
             preview_path = ""
 
+        self._waveform.set_source(path if self._tab_active else None)
         next_analysis_key = str(path.resolve()) if path is not None else ""
         if next_analysis_key != self._analysis_key:
             self._analysis_key = ""
@@ -6920,15 +7010,10 @@ class SoundTab(QtWidgets.QWidget):
         else:
             maximum_position = position
 
-        self.timeline.setValue(
-            max(
-                0,
-                min(
-                    position,
-                    maximum_position,
-                ),
+        if not self.timeline.isSliderDown():
+            self.timeline.setValue(
+                max(0, min(position, maximum_position))
             )
-        )
 
         self.timeline.blockSignals(
             False
@@ -7115,15 +7200,8 @@ class SoundTab(QtWidgets.QWidget):
         ):
             paths = paths[:1]
 
-        self._remember_music_folder(
-            paths[0]
-        )
-
-        self._start_import(
-            paths
-        )
-
         event.acceptProposedAction()
+        self._open_music_selector(initial_source="files", files=tuple(paths))
 
     def shared_preview_widget(
         self,
@@ -7179,6 +7257,7 @@ class SoundTab(QtWidgets.QWidget):
                 != self._active_sound_revision
             ):
                 self.reload_project_from_disk()
+            self._waveform.set_source(self.library.path_for(self.player.current_track_id))
 
         except Exception:
             self._tab_active = False
@@ -7194,6 +7273,7 @@ class SoundTab(QtWidgets.QWidget):
         self._preview.set_tab_active(
             False
         )
+        self._waveform.set_source(None)
 
         self.player.stop(
             reset_position=True
@@ -7210,6 +7290,7 @@ class SoundTab(QtWidgets.QWidget):
         self._tab_active = False
 
     def release_current_file_handle(self) -> None:
+        self._waveform.set_source(None)
         self.player.stop(
             reset_position=True
         )
@@ -7268,10 +7349,6 @@ class SoundTab(QtWidgets.QWidget):
             reset_position=True
         )
 
-        self.player.set_muted(
-            False
-        )
-
         self.project_sound.clear()
 
         self._preview.set_audio_file(
@@ -7301,14 +7378,6 @@ class SoundTab(QtWidgets.QWidget):
 
         self.play_btn.setText(
             "▶"
-        )
-
-        self.mute_btn.setText(
-            "\U0001F50A"
-        )
-
-        self.mute_btn.setToolTip(
-            "Mute music"
         )
 
         self._refresh_ui()
@@ -7371,14 +7440,12 @@ class SoundTab(QtWidgets.QWidget):
         to the Sound tab.
         """
 
-        if (
-            self.project_sound.state.mode
-            == "playlist"
-        ):
+        if self.project_sound.state.mode == "playlist" and self.project_sound.ordered_ids():
             target = self.add_track_btn
-
-        else:
+        elif self.project_sound.ordered_ids():
             target = self.single_action_btn
+        else:
+            target = self.import_btn
 
         target.setFocus(
             Qt.OtherFocusReason

@@ -52,6 +52,37 @@ def legacy_fixture(*, count=4):
 
 
 class ProjectModelTests(unittest.TestCase):
+    def test_legacy_page_transitions_migrate_to_one_letter_choice(self):
+        payload = five_page_project().to_dict()
+        payload["pages"][1]["transition"] = "curtain"
+        payload["pages"][2]["transition"] = "pixelate"
+        project = ProjectModel.from_dict(payload)
+        self.assertEqual(project.letter_transition, "curtain")
+        self.assertEqual(project.to_dict()["presentation"]["transition"], "curtain")
+        self.assertNotIn("transition", payload["presentation"])
+        project.reorder_pages([page["id"] for page in reversed(project.pages)])
+        self.assertEqual(project.letter_transition, "curtain")
+        self.assertTrue(project.set_letter_transition("classic"))
+        self.assertEqual(ProjectModel.from_dict(project.to_dict()).letter_transition, "classic")
+
+    def test_prompt_history_groups_typing_and_keeps_five_prior_wordings(self):
+        from unittest.mock import patch
+
+        project = create_project()
+        first, second = [page["id"] for page in project.pages[:2]]
+        with patch("project_model.monotonic", return_value=10):
+            project.update_prompt(first, {"text": "Generated"}, history_group="generated")
+            project.update_prompt(first, {"text": "D"}, history_group="manual")
+            project.update_prompt(first, {"text": "Draft"}, history_group="manual")
+        self.assertEqual(project.prompt_history(first), ("Generated",))
+        for version in range(6):
+            project.replace_prompt(first, {"text": f"Version {version}"})
+        saved = ProjectModel.from_dict(project.to_dict())
+        self.assertEqual(saved.prompt_history(first), tuple(f"Version {version}" for version in range(4, -1, -1)))
+        self.assertEqual(saved.prompt_history(second), ())
+        self.assertTrue(saved.restore_prompt_version(first, "Version 1"))
+        self.assertEqual(saved.prompt_history(first), ("Version 5", "Version 4", "Version 3", "Version 2", "Version 0"))
+
     def test_prompt_recovery_shared_resolution_and_geometry(self):
         project = create_project(["letter", "end_page"])
         page_id = project.pages[0]["id"]

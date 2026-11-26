@@ -1,6 +1,7 @@
 """Saved Letters controls; authored state and persistence stay in shared services."""
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 import tempfile
 
@@ -12,8 +13,121 @@ from project_session import ProjectSession, get_project_session
 from saved_letters import SavedLetter
 
 
+class SavedVersionsDialog(QtWidgets.QDialog):
+    def __init__(self, parent, entry, versions):
+        super().__init__(parent)
+        self.setWindowTitle("Compare Versions — " + entry.title)
+        self.resize(860, 620)
+        self.versions = versions
+        self.revision = None
+        layout = QtWidgets.QVBoxLayout(self)
+        columns = QtWidgets.QHBoxLayout()
+        self.choices, self.panes = [], []
+        for side, selected in (("left", 1), ("right", 0)):
+            column = QtWidgets.QVBoxLayout()
+            choice = QtWidgets.QComboBox()
+            choice.setAccessibleName(f"Choose {side} version")
+            for index, version in enumerate(versions):
+                metadata = version.project.to_dict()["metadata"]
+                try:
+                    when = datetime.fromisoformat(metadata["saved_at"]).astimezone()
+                except (KeyError, TypeError, ValueError):
+                    when = datetime.fromtimestamp((version.asset_root / "project.json").stat().st_mtime).astimezone()
+                label = when.strftime("%b %d, %Y · %H:%M:%S")
+                choice.addItem(f"{label} · {'Current save' if index == 0 else version.revision[:7]}")
+            choice.setCurrentIndex(selected)
+            choice.currentIndexChanged.connect(self._update_comparison)
+            column.addWidget(choice)
+            pane = QtWidgets.QScrollArea()
+            pane.setWidgetResizable(True)
+            pane.setAccessibleName(f"{side.title()} version contents")
+            column.addWidget(pane, 1)
+            open_button = QtWidgets.QPushButton(f"Open {side} version")
+            open_button.clicked.connect(lambda _checked=False, combo=choice: self._open(combo.currentIndex()))
+            column.addWidget(open_button)
+            self.choices.append(choice)
+            self.panes.append(pane)
+            columns.addLayout(column, 1)
+        layout.addLayout(columns, 1)
+        self.differences = QtWidgets.QLabel()
+        self.differences.setWordWrap(True)
+        layout.addWidget(self.differences)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._update_comparison()
+
+    def _open(self, index):
+        self.revision = self.versions[index].revision
+        self.accept()
+
+    @staticmethod
+    def _label(text, *, heading=False):
+        label = QtWidgets.QLabel(text)
+        label.setTextFormat(QtCore.Qt.PlainText)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        if heading:
+            font = label.font()
+            font.setBold(True)
+            label.setFont(font)
+        return label
+
+    def _update_comparison(self):
+        from message_format import message_plain_text
+        from project_model import PAGE_TYPES
+        from project_repository import _safe_file, selected_sound_tracks, sound_track_reference
+
+        left, right = [self.versions[choice.currentIndex()] for choice in self.choices]
+        left_data, right_data = (version.project.to_dict() for version in (left, right))
+        labels = {"sound": "Soundtrack",
+                  "shared_settings": "Shared settings", "presentation": "Presentation", "prompt_settings": "Prompt settings"}
+        changed = [label for key, label in labels.items() if left_data[key] != right_data[key]]
+        details = [(data["metadata"].get("title"), data["metadata"].get("recipient_title"),
+                    data["metadata"].get("recipient_name")) for data in (left_data, right_data)]
+        pages = [[{key: value for key, value in page.items() if key not in {"revision", "preview_stale", "id", "recovery"}}
+                  for page in data["pages"]] for data in (left_data, right_data)]
+        if details[0] != details[1]:
+            changed.insert(0, "Letter details")
+        if pages[0] != pages[1]:
+            changed.insert(0, "Pages or page content")
+        self.differences.setText("Differences · " + ", ".join(changed) if changed else
+                                 "Same version" if left.revision == right.revision else "Other project details changed")
+        for pane, stored, data in zip(self.panes, (left, right), (left_data, right_data)):
+            content = QtWidgets.QWidget()
+            rows = QtWidgets.QVBoxLayout(content)
+            metadata = data["metadata"]
+            rows.addWidget(self._label(str(metadata.get("title") or metadata.get("recipient_title") or "Untitled letter"), heading=True))
+            if metadata.get("recipient_name"):
+                rows.addWidget(self._label(f"For {metadata['recipient_name']}"))
+            tracks = [str(track.get("display_title") or track.get("original_name") or Path(sound_track_reference(track)).name
+                          or track.get("track_id", "Unavailable track")) for track in selected_sound_tracks(data["sound"])]
+            rows.addWidget(self._label("Soundtrack · " + (", ".join(tracks) or "None")))
+            for position, page in enumerate(data["pages"], 1):
+                rows.addWidget(self._label(f"{position}. {page['name'] or PAGE_TYPES[page['type']].label}", heading=True))
+                if asset := page["artwork"].get("asset"):
+                    reader = QtGui.QImageReader(str(_safe_file(stored.asset_root, asset)))
+                    size = reader.size()
+                    if size.isValid():
+                        size.scale(152, 120, QtCore.Qt.KeepAspectRatio)
+                        reader.setScaledSize(size)
+                    image = reader.read()
+                    if not image.isNull():
+                        artwork = QtWidgets.QLabel()
+                        artwork.setAccessibleName(f"Page {position} artwork")
+                        artwork.setPixmap(QtGui.QPixmap.fromImage(image))
+                        rows.addWidget(artwork)
+                if page["message"] is not None:
+                    rows.addWidget(self._label(message_plain_text(page["message"]["html"]).strip() or "Empty message"))
+                if prompt := page["prompt"].get("text"):
+                    rows.addWidget(self._label("Artwork prompt\n" + prompt))
+            rows.addStretch(1)
+            pane.setWidget(content)
+
+
 class SavedProjectsController(QtCore.QObject):
     changed = QtCore.Signal()
+    revisions_loaded = QtCore.Signal(object, object, object)
 
     def __init__(self, forge):
         super().__init__(forge)
@@ -22,6 +136,35 @@ class SavedProjectsController(QtCore.QObject):
         self.previews = []
         self.github_library = None
         layout = forge.saved_panel.layout()
+        self.history_panel = QtWidgets.QWidget()
+        history_layout = QtWidgets.QVBoxLayout(self.history_panel)
+        history_layout.setContentsMargins(0, 0, 0, 0)
+        history_layout.setSpacing(4)
+        self.history_title = QtWidgets.QLabel()
+        self.history_title.setTextFormat(QtCore.Qt.PlainText)
+        history_layout.addWidget(self.history_title)
+        self.history_list = QtWidgets.QTreeWidget()
+        self.history_list.setHeaderLabels(("Date", "Changes", "Status"))
+        self.history_list.setAccessibleName("Saved letter revisions")
+        self.history_list.setRootIsDecorated(False)
+        self.history_list.setMaximumHeight(126)
+        self.history_list.header().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self.history_list.resizeColumnToContents(0)
+        history_layout.addWidget(self.history_list)
+        self.history_backup = QtWidgets.QLabel()
+        self.history_backup.setTextFormat(QtCore.Qt.PlainText)
+        self.history_backup.setWordWrap(True)
+        history_layout.addWidget(self.history_backup)
+        self.history_live = QtWidgets.QLineEdit()
+        self.history_live.setReadOnly(True)
+        self.history_live.setAccessibleName("Verified live letter link")
+        history_layout.addWidget(self.history_live)
+        layout.addWidget(self.history_panel)
+        self.history_panel.hide()
+        self._history_key = None
+        self._history_pool = QtCore.QThreadPool(self)
+        self._history_pool.setMaxThreadCount(1)
+        self.revisions_loaded.connect(self._show_revision_history, QtCore.Qt.QueuedConnection)
         self.details = QtWidgets.QLabel()
         self.details.setTextFormat(QtCore.Qt.PlainText)
         self.details.setWordWrap(True)
@@ -35,10 +178,22 @@ class SavedProjectsController(QtCore.QObject):
         self.open_button.setDefault(True)
         self.open_button.clicked.connect(self.open_selected)
         row.addWidget(self.open_button)
+        self.restore_button = QtWidgets.QPushButton("Restore")
+        self.restore_button.clicked.connect(self.restore_selected)
+        row.addWidget(self.restore_button)
+        self.compare_button = QtWidgets.QPushButton("Compare Versions")
+        self.compare_button.clicked.connect(self.compare_selected)
+        row.addWidget(self.compare_button)
+        self.template_button = QtWidgets.QPushButton("Use as Template")
+        self.template_button.clicked.connect(self.use_stock_template)
+        row.addWidget(self.template_button)
         self.menu = QtWidgets.QMenu(forge.saved_panel)
         self.preview_action = self.menu.addAction("Preview Saved Version", self.preview_selected)
+        self.compare_action = self.menu.addAction("Compare Versions", self.compare_selected)
+        self.template_action = self.menu.addAction("Use as Template", self.use_stock_template)
         self.duplicate_action = self.menu.addAction("Duplicate Saved Version", self.duplicate_selected)
         self.rename_action = self.menu.addAction("Rename Saved Project", self.rename_selected)
+        self.restore_action = self.menu.addAction("Restore Deleted Letter", self.restore_selected)
         self.delete_action = self.menu.addAction("Delete Saved Project (keep recovery copy)", self.delete_selected)
         self.menu.addSeparator()
         self.copy_action = self.menu.addAction("Save a Copy of Open Project…", lambda: self.save(copy=True))
@@ -154,7 +309,23 @@ class SavedProjectsController(QtCore.QObject):
             return
         entry = self.forge._selected_saved_letter
         valid = isinstance(entry, SavedLetter) and entry.valid
+        deleted = valid and entry.deleted
+        self.open_button.setVisible(not deleted)
         self.open_button.setEnabled(valid)
+        self.restore_button.setVisible(deleted)
+        self.restore_button.setEnabled(deleted and not self.forge._busy)
+        self.restore_action.setVisible(deleted)
+        self.restore_action.setEnabled(self.restore_button.isEnabled())
+        stock = self.forge._saved_panel_mode == "stock"
+        self.template_button.setVisible(stock)
+        self.template_action.setVisible(stock)
+        self.template_button.setEnabled(valid and entry.stock and not self.forge._busy)
+        self.template_action.setEnabled(self.template_button.isEnabled())
+        can_compare = valid and entry.canonical and not (entry.stock or entry.example or entry.recovery)
+        self.compare_button.setVisible(not stock)
+        self.compare_action.setVisible(not stock)
+        self.compare_button.setEnabled(can_compare and not self.forge._busy)
+        self.compare_action.setEnabled(self.compare_button.isEnabled())
         self.preview_action.setEnabled(valid)
         self.duplicate_action.setEnabled(valid)
         editable = valid and entry.canonical and not (entry.example or entry.stock or entry.recovery)
@@ -167,6 +338,88 @@ class SavedProjectsController(QtCore.QObject):
             current = card.entry.project_id == self.session.project.project_id and card.entry.path.resolve() == active_path
             card.setProperty("currentProject", current)
         self.github_library.update_selection()
+        self.refresh_revision_history()
+
+    def refresh_revision_history(self):
+        entry = self.forge._selected_saved_letter
+        if not isinstance(entry, SavedLetter) or not entry.valid or entry.stock or entry.example or not self.forge.saved_panel.isVisible():
+            self._history_key = None
+            self.history_panel.hide()
+            self._history_pool.clear()
+            return
+        from saved_letter_versions import letter_state
+        row = self.github_library.rows.get(entry.project_id)
+        backup = row[0].backup if row else None
+        receipt = letter_state(self.forge.project_root, entry.project_id, "backup")
+        try:
+            history_stamp = (entry.path / ".lettersmith-project/current.json").stat().st_mtime_ns
+        except OSError:
+            history_stamp = None
+        key = (entry, history_stamp, getattr(backup, "marker_sha", ""), receipt.get("timestamp"))
+        if key == self._history_key:
+            return
+        self._history_key = key
+        self._history_pool.clear()
+        self.history_title.setText(entry.title)
+        self.history_list.clear()
+        self.history_list.setVisible(entry.canonical)
+        self.history_backup.hide()
+        url = entry.published_url if entry.publication_verified and entry.published else ""
+        self.history_live.setText(url)
+        self.history_live.setToolTip(url)
+        self.history_live.setVisible(bool(url))
+        self.history_panel.setVisible(bool(entry.canonical or url or backup or receipt))
+        if entry.canonical:
+            self.history_list.addTopLevelItem(QtWidgets.QTreeWidgetItem(("Reading revisions…",)))
+        root, service, completed = self.forge.project_root, self.service, self.revisions_loaded
+
+        def load():
+            from saved_letter_versions import summarize_revisions
+            try:
+                versions = service.saved_revisions(entry) if entry.canonical else ()
+                summaries, recorded_backup = summarize_revisions(root, entry, versions, backup)
+                completed.emit(key, summaries, recorded_backup)
+            except (OSError, ValueError, RuntimeError, KeyError):
+                completed.emit(key, None, {})
+
+        self._history_pool.start(load)
+
+    def _show_revision_history(self, key, rows, backup):
+        if key != self._history_key or not self.forge.saved_panel.isVisible():
+            return
+        from saved_letter_versions import saved_date
+        entry = key[0]
+        self.history_list.clear()
+        live_count = sum(item.live for item in rows or ())
+        for item in rows or ():
+            labels = []
+            if item.revision == entry.storage_revision:
+                labels.append("Current save")
+            if item.live:
+                labels.append("Live" if live_count == 1 else "Matches live presentation")
+            if item.backed_up:
+                labels.append("GitHub backup")
+            when = item.date.astimezone().strftime("%b %d, %Y %H:%M:%S")
+            row = QtWidgets.QTreeWidgetItem((when, item.changes, " · ".join(labels)))
+            row.setToolTip(0, f"Revision {item.revision[:8]}")
+            row.setToolTip(1, item.changes)
+            self.history_list.addTopLevelItem(row)
+        if rows is None:
+            self.history_list.addTopLevelItem(QtWidgets.QTreeWidgetItem(("Revisions unavailable",)))
+        self.history_list.setVisible(bool(rows) or rows is None)
+        self.history_list.resizeColumnToContents(0)
+        backup_date = saved_date(backup.get("timestamp"), None)
+        message = ""
+        if backup_date:
+            match = next((item for item in rows or () if item.backed_up), None)
+            key = match.revision if match else backup.get("revision_key") or backup.get("digest", "")
+            message = "GitHub backup · " + backup_date.astimezone().strftime("%b %d, %Y %H:%M:%S")
+            if key:
+                message += f" · Revision {key[:8]}"
+        if self.history_live.text() and not live_count and entry.published_source_fingerprint:
+            message = "\n".join(filter(None, (message, f"Live revision · {entry.published_source_fingerprint[:8]}")))
+        self.history_backup.setText(message)
+        self.history_backup.setVisible(bool(message))
 
     def show_context_menu(self, card, point):
         if self.forge._busy:
@@ -183,11 +436,40 @@ class SavedProjectsController(QtCore.QObject):
         if entry is None and (self.github_library.selected() is not None
                               or self.github_library.selected_id in self.github_library.downloads):
             return self.github_library.download_selected()
+        if isinstance(entry, SavedLetter) and entry.deleted:
+            return self.restore_selected()
+        return self._open_entry(entry)
+
+    def use_stock_template(self):
+        entry = self.forge._selected_saved_letter
+        if isinstance(entry, SavedLetter) and entry.stock:
+            return self._open_entry(entry, as_template=True)
+        return False
+
+    def compare_selected(self):
+        entry = self.forge._selected_saved_letter
+        if not isinstance(entry, SavedLetter) or not entry.valid or not entry.canonical:
+            return False
+
+        def show(versions):
+            if len(versions) < 2:
+                self._status("This letter has one distinct saved version.")
+                return
+            dialog = SavedVersionsDialog(self.forge.window(), entry, versions)
+            if dialog.exec() == QtWidgets.QDialog.Accepted:
+                self._open_entry(entry, revision=dialog.revision)
+            dialog.deleteLater()
+
+        return self._run("Reading saved versions…", lambda: self.service.saved_revisions(entry),
+                         lambda versions: self.forge._defer_until_idle(lambda: show(versions)))
+
+    def _open_entry(self, entry, *, revision=None, as_template=False):
         if not isinstance(entry, SavedLetter) or not entry.valid or self.forge._busy:
             return False
         lifecycle = getattr(self.forge.window(), "project_lifecycle", None)
+        options = {"revision": revision, "as_template": as_template} if revision or as_template else {}
         if lifecycle is not None:
-            return lifecycle.open_saved(entry)
+            return lifecycle.open_saved(entry, **options)
         if not self._flush():
             return False
         if self.service.has_unsaved_editable_changes():
@@ -198,14 +480,14 @@ class SavedProjectsController(QtCore.QObject):
             if choice == QtWidgets.QMessageBox.Cancel:
                 return False
             if choice == QtWidgets.QMessageBox.Save:
-                return self.save(after=lambda: self._read_and_open(entry))
-        return self._read_and_open(entry)
+                return self.save(after=lambda: self._read_and_open(entry, **options))
+        return self._read_and_open(entry, **options)
 
-    def _read_and_open(self, entry, *, finished=None):
-        origin, revision = self.session.session_id, self.session.project.revision
+    def _read_and_open(self, entry, *, finished=None, revision=None, as_template=False):
+        origin, origin_revision = self.session.session_id, self.session.project.revision
 
         def loaded(candidate):
-            if not self._flush() or (origin, revision) != (self.session.session_id, self.session.project.revision):
+            if not self._flush() or (origin, origin_revision) != (self.session.session_id, self.session.project.revision):
                 self._status("The open project changed while loading. Its edits were kept; open the saved project again.", error=True)
                 if finished is not None:
                     finished(False)
@@ -214,9 +496,9 @@ class SavedProjectsController(QtCore.QObject):
             try:
                 if not self.forge._release_project_files_for_restore():
                     return
-                if not self._flush() or (origin, revision) != (self.session.session_id, self.session.project.revision):
+                if not self._flush() or (origin, origin_revision) != (self.session.session_id, self.session.project.revision):
                     raise RuntimeError("New edits arrived during the transition; retry opening")
-                stored = self.service.open_saved_project(entry, loaded=candidate)
+                stored = self.service.open_saved_project(entry, loaded=candidate, revision=revision, as_template=as_template)
                 self.forge._last_play_dir = None
                 payload = {"project_id": stored.project.project_id, "title": entry.title, "play_dir": str(entry.path)}
                 self.forge.project_restored.emit(payload)
@@ -228,7 +510,7 @@ class SavedProjectsController(QtCore.QObject):
                 if view_errors:
                     self._status("Project activated and retained, but these views need reopening: " + ", ".join(view_errors), error=True)
                     return
-                self._status("Project opened.")
+                self._status("Stock template opened." if as_template else "Project opened.")
             except Exception as error:
                 retained = ("The previous project is retained." if origin == self.session.session_id else
                             "The activated project is recoverable; reopen the application to restore its views.")
@@ -238,7 +520,7 @@ class SavedProjectsController(QtCore.QObject):
                 if finished is not None:
                     finished()
 
-        return self._run("Reading saved project…", lambda: self.service.read_saved_project(entry), loaded, failed=finished)
+        return self._run("Reading saved project…", lambda: self.service.read_saved_project(entry, revision=revision), loaded, failed=finished)
 
     def duplicate_selected(self):
         entry = self.forge._selected_saved_letter
@@ -253,11 +535,24 @@ class SavedProjectsController(QtCore.QObject):
         self._run("Duplicating saved project…", lambda: self.service.duplicate_saved_project(entry), copied)
 
     def rename_selected(self):
+        from project_paths import ProjectPathError
         entry = self.forge._selected_saved_letter
         if not isinstance(entry, SavedLetter):
             return
-        title, accepted = QtWidgets.QInputDialog.getText(self.forge, "Rename Saved Project", "Display title:", text=entry.title)
-        if not accepted or title == entry.title:
+        dialog = QtWidgets.QInputDialog(self.forge)
+        dialog.setWindowTitle("Rename Saved Project")
+        dialog.setLabelText("Display title")
+        dialog.setTextValue(entry.title)
+
+        def warn(value):
+            try:
+                conflict = self.service.resolver.find_title_conflict_for_name(entry.recipient, value, project_id=entry.project_id)
+            except (OSError, ValueError, ProjectPathError):
+                conflict = None
+            dialog.setLabelText("Display title\nThis recipient already has a letter with that title." if conflict else "Display title")
+
+        dialog.textValueChanged.connect(warn)
+        if dialog.exec() != QtWidgets.QDialog.Accepted or (title := dialog.textValue()) == entry.title:
             return
         origin, revision = self.session.session_id, self.session.project.revision
         clean_active = entry.project_id == self.session.project.project_id and not self.service.has_unsaved_editable_changes()
@@ -296,8 +591,23 @@ class SavedProjectsController(QtCore.QObject):
             self.forge._selected_saved_letter = None
             self.forge.refresh_saved_letters(force_reconcile=True)
             self.selected_changed()
-            self._status("Saved project moved to Recovery. Open or duplicate its recovery copy to keep editing.")
+            self._status("Saved project moved to Recovery. Select Restore to return it to the Saved List.")
         return self._run("Deleting saved project…", lambda: self.forge.catalog.delete(entry), deleted)
+
+    def restore_selected(self):
+        entry = self.forge._selected_saved_letter
+        if not isinstance(entry, SavedLetter) or not entry.valid or not entry.deleted:
+            return False
+
+        def restored(destination):
+            catalog = self.forge.catalog
+            catalog.refresh_entry(entry.path)
+            catalog.refresh_entry(destination)
+            self.forge._selected_saved_letter = catalog._entry(destination)
+            self.forge.refresh_saved_letters(force_reconcile=True)
+            self._status("Letter restored to the Saved List.")
+
+        return self._run("Restoring deleted letter…", lambda: self.service.restore_deleted_project(entry), restored)
 
     def preview_selected(self):
         entry = self.forge._selected_saved_letter
@@ -345,32 +655,60 @@ class SavedProjectsController(QtCore.QObject):
             return
         dialog = QtWidgets.QDialog(self.forge.window())
         dialog.setWindowTitle("Recover Content — Open Project")
-        dialog.resize(540, 440)
+        dialog.resize(760, 440)
         layout = QtWidgets.QVBoxLayout(dialog)
         source = QtWidgets.QComboBox()
         destination = QtWidgets.QComboBox()
-        preview = QtWidgets.QPlainTextEdit()
-        preview.setReadOnly(True)
+        source.setAccessibleName("Recovered content")
+        destination.setAccessibleName("Destination page")
         for item in items:
             source.addItem(f'{item["kind"].title()}: {item["key"] or "Unassigned legacy message"}')
         layout.addWidget(source)
-        layout.addWidget(preview, 1)
-        layout.addWidget(QtWidgets.QLabel("Destination page:"))
         layout.addWidget(destination)
+        comparison = QtWidgets.QHBoxLayout()
+        panes = []
+        for label in ("Recovered text", "Current destination text"):
+            column = QtWidgets.QVBoxLayout()
+            column.addWidget(QtWidgets.QLabel(label))
+            preview = QtWidgets.QPlainTextEdit()
+            preview.setAccessibleName(label)
+            preview.setReadOnly(True)
+            column.addWidget(preview)
+            panes.append(preview)
+            comparison.addLayout(column, 1)
+        layout.addLayout(comparison, 1)
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        apply = buttons.button(QtWidgets.QDialogButtonBox.Ok)
+        apply.setText("Apply Recovery")
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
+        pages = {page["id"]: page for page in self.session.project.pages}
+
+        def content(kind, value):
+            if kind == "message":
+                from message_format import message_plain_text
+                return message_plain_text(value.get("html", "") if isinstance(value, dict) else str(value or ""))
+            return str((value.get("text") if isinstance(value, dict) else value) or "")
+
+        def show_destination():
+            page = pages.get(destination.currentData())
+            kind = items[source.currentIndex()]["kind"]
+            panes[1].setPlainText(content(kind, page[kind]) or "Empty" if page else "")
+            apply.setEnabled(page is not None)
+
         def selected(index):
             item = items[index]
-            value = item["value"]
-            preview.setPlainText(str(value.get("html", value.get("text", value)) if isinstance(value, dict) else value))
-            destination.clear()
-            destination.addItem("Choose a destination…", None)
-            for number, page in enumerate(self.session.project.pages, 1):
-                if item["kind"] == "prompt" or page["type"] == "letter":
-                    destination.addItem(f'{number}. {page["name"] or page["type"]} · {page["id"][:8]}', page["id"])
+            panes[0].setPlainText(content(item["kind"], item["value"]))
+            with QtCore.QSignalBlocker(destination):
+                destination.clear()
+                destination.addItem("Choose a destination page…", None)
+                for number, page in enumerate(pages.values(), 1):
+                    if item["kind"] == "prompt" or page["type"] == "letter":
+                        destination.addItem(f'{number}. {page["name"] or page["type"]}', page["id"])
+            show_destination()
         source.currentIndexChanged.connect(selected)
+        destination.currentIndexChanged.connect(show_destination)
         selected(0)
         origin, revision = self.session.session_id, self.session.project.revision
         if dialog.exec() != QtWidgets.QDialog.Accepted or destination.currentData() is None:
@@ -409,9 +747,14 @@ class SavedProjectsController(QtCore.QObject):
             self._status(str(error), error=True)
 
     def prepare_for_shutdown(self):
+        self._history_pool.clear()
         return all(preview.release() for _dialog, preview, _session, _temporary in tuple(self.previews))
 
     def shutdown(self):
+        self._history_key = None
+        self._history_pool.clear()
+        if not self._history_pool.waitForDone(5000):
+            return False
         for dialog, preview, session, temporary in tuple(self.previews):
             if not preview.shutdown():
                 return False

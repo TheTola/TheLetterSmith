@@ -16,14 +16,19 @@ import logging
 import math
 from types import MappingProxyType
 from threading import RLock
+from time import monotonic
 from typing import Any, Callable, Iterable, Mapping
 from uuid import uuid4
+
+from page_transitions import DEFAULT_PAGE_TRANSITION, normalize_page_transition
 
 
 FORMAT = "lettersmith.project"
 SCHEMA_VERSION = 3
 MIN_PAGES = 2
 MAX_PAGES = 10
+_PROMPT_HISTORY_LIMIT = 5
+_PROMPT_EDIT_INTERVAL = 1.0
 _PROJECT_DATA_FIELDS = ("metadata", "shared_settings", "prompt_settings", "sound",
                         "presentation", "publication", "recovery", "extensions")
 _LOGGER = logging.getLogger(__name__)
@@ -146,6 +151,13 @@ def _validate_message(value: object) -> dict[str, Any]:
     return document
 
 
+def _validate_artwork(artwork: dict[str, Any]) -> None:
+    if artwork.get("asset") is not None and not isinstance(artwork["asset"], str):
+        raise ProjectModelError("Artwork asset must be text or null")
+    for field in ("placement", "animation"):
+        _object(artwork.get(field, {}), f"artwork.{field}")
+
+
 def _validate_page(value: object) -> dict[str, Any]:
     page = _object(value, "page")
     if not isinstance(page.get("id"), str) or not page["id"].strip():
@@ -157,11 +169,9 @@ def _validate_page(value: object) -> dict[str, Any]:
         _object(page.get(field), f"page.{field}")
     if "inactive_message" in page["recovery"]:
         _validate_message(page["recovery"]["inactive_message"])
-    artwork = page["artwork"]
-    if artwork.get("asset") is not None and not isinstance(artwork["asset"], str):
-        raise ProjectModelError("Artwork asset must be text or null")
-    for field in ("placement", "animation"):
-        _object(artwork.get(field, {}), f"artwork.{field}")
+    if "cleared_artwork" in page["recovery"]:
+        _validate_artwork(_object(page["recovery"]["cleared_artwork"], "cleared artwork"))
+    _validate_artwork(page["artwork"])
     prompt = page["prompt"]
     if prompt.get("text") is not None and not isinstance(prompt["text"], str):
         raise ProjectModelError("Prompt text must be text or null")
@@ -308,6 +318,13 @@ class ProjectModel:
             raise ProjectModelError("Page IDs must be unique")
         for field in _PROJECT_DATA_FIELDS:
             _object(data.get(field), field)
+        presentation = data["presentation"]
+        if "transition" not in presentation:
+            for page in pages:
+                transition = normalize_page_transition(page.get("transition"))
+                if transition != DEFAULT_PAGE_TRANSITION:
+                    presentation["transition"] = transition
+                    break
         _validate_project_recovery(data["recovery"])
         revision = data.get("revision", 0)
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
@@ -320,6 +337,7 @@ class ProjectModel:
         self._input_versions: dict[tuple[str, str], int] = {}
         self._project_input_versions: dict[str, int] = {}
         self._listeners: list[Callable[[ModelChange], None]] = []
+        self._prompt_edit_bursts: dict[str, tuple[str, str | None, float]] = {}
 
     @contextmanager
     def mutation_scope(self):
@@ -594,6 +612,7 @@ class ProjectModel:
         index = self._data["pages"].index(page)
         record = DeletionRecord(self.project_id, deepcopy(page), index)
         self._data["pages"].pop(index)
+        self._prompt_edit_bursts.pop(page_id, None)
         self._data["recovery"].setdefault("deleted_pages", []).append({"page": deepcopy(page), "index": index})
         self._project_data_changed(("recovery",))
         self._invalidate_order_prompts()
@@ -651,6 +670,27 @@ class ProjectModel:
     @_mutating
     def update_artwork(self, page_id: str, patch: Mapping[str, Any]) -> None:
         self._update_field(page_id, "artwork", patch, "artwork")
+        if patch.get("asset") and self._page(page_id)["recovery"].pop("cleared_artwork", None) is not None:
+            self._changed("project_data", [page_id], stale=False, fields=("recovery",))
+
+    @_mutating
+    def clear_artwork(self, page_id: str) -> bool:
+        page = self._page(page_id)
+        if not page["artwork"].get("asset"):
+            return False
+        page["recovery"]["cleared_artwork"] = deepcopy(page["artwork"])
+        self.update_artwork(page_id, {"asset": None, "media_type": None, "placement": {}, "animation": {}})
+        return True
+
+    @_mutating
+    def restore_artwork(self, page_id: str) -> bool:
+        page = self._page(page_id)
+        artwork = page["recovery"].get("cleared_artwork", {})
+        if page["artwork"].get("asset") or not artwork.get("asset"):
+            return False
+        page["artwork"] = page["recovery"].pop("cleared_artwork")
+        self._changed("artwork", [page_id], fields=("artwork", "recovery"))
+        return True
 
     @_reading
     def get_message(self, page_id: str) -> dict[str, Any] | None:
@@ -673,23 +713,85 @@ class ProjectModel:
     def get_prompt(self, page_id: str) -> dict[str, Any]:
         return self.get_page(page_id)["prompt"]
 
+    def _prompt_versions(self, page_id: str) -> dict[str, dict]:
+        recovery = self._page(page_id)["recovery"]
+        older = recovery.get("prompt_history")
+        snapshots = [recovery.get("previous_prompt")]
+        if isinstance(older, list):
+            snapshots.extend(older[:_PROMPT_HISTORY_LIMIT - 1])
+        versions = {}
+        for snapshot in snapshots:
+            text = snapshot.get("text") if isinstance(snapshot, dict) else None
+            if isinstance(text, str) and text.strip():
+                versions.setdefault(text, snapshot)
+        return versions
+
+    @_reading
+    def prompt_history(self, page_id: str) -> tuple[str, ...]:
+        current = self._page(page_id)["prompt"].get("text")
+        return tuple(text for text in self._prompt_versions(page_id) if text != current)
+
+    def _remember_prompt(self, page_id: str, previous: dict, *, keep_empty: bool = False) -> bool:
+        text = previous.get("text")
+        if not keep_empty and (not isinstance(text, str) or not text.strip()):
+            return False
+        page = self._page(page_id)
+        versions = self._prompt_versions(page_id)
+        versions.pop(text, None)
+        versions.pop(page["prompt"].get("text"), None)
+        update = {"previous_prompt": previous}
+        if versions or "prompt_history" in page["recovery"]:
+            update["prompt_history"] = list(versions.values())[:_PROMPT_HISTORY_LIMIT - 1]
+        if all(page["recovery"].get(key) == value for key, value in update.items()):
+            return False
+        page["recovery"].update(deepcopy(update))
+        return True
+
     @_mutating
-    def update_prompt(self, page_id: str, patch: Mapping[str, Any]) -> None:
+    def update_prompt(self, page_id: str, patch: Mapping[str, Any], *, history_group: str | None = None) -> None:
         value = _object(patch, "prompt")
         if any(key in value for key in ("directions", "overrides", "options")) and "stale" not in value:
             value["stale"] = True
-        self._update_field(page_id, "prompt", value, "prompt")
+        page = self.get_page(page_id)
+        previous = page["prompt"]
+        page["prompt"] = {**previous, **value}
+        _validate_page(page)
+        if previous == page["prompt"]:
+            return
+        self._page(page_id)["prompt"] = page["prompt"]
+        fields = ("prompt",)
+        if previous.get("text") != page["prompt"].get("text"):
+            last_group, last_text, last_edit = self._prompt_edit_bursts.pop(page_id, (None, None, 0.0))
+            now = monotonic()
+            if history_group is not None:
+                self._prompt_edit_bursts[page_id] = (history_group, page["prompt"].get("text"), now)
+            new_version = (history_group is None or last_group != history_group
+                           or last_text != previous.get("text") or now - last_edit >= _PROMPT_EDIT_INTERVAL)
+            if new_version and self._remember_prompt(page_id, previous):
+                fields += ("recovery",)
+        self._changed("prompt", [page_id], fields=fields)
 
     @_mutating
     def replace_prompt(self, page_id: str, patch: Mapping[str, Any]) -> None:
-        """Explicit build: retain one exact previous snapshot in page recovery."""
-        page = self.get_page(page_id)
-        previous = deepcopy(page["prompt"])
-        page["prompt"].update(_object(patch, "prompt"))
-        _validate_page(page)
-        if previous.get("text") is not None:
-            self.update_page_recovery(page_id, {"previous_prompt": previous})
+        """Retain the exact wording before an explicit build."""
+        previous = self.get_prompt(page_id)
         self.update_prompt(page_id, patch)
+        self._prompt_edit_bursts.pop(page_id, None)
+        if (previous.get("text") == patch.get("text", previous.get("text"))
+                and self._remember_prompt(page_id, previous)):
+            self._changed("prompt", [page_id], stale=False, fields=("recovery",))
+
+    @_mutating
+    def restore_prompt_version(self, page_id: str, text: str) -> bool:
+        previous = self._prompt_versions(page_id).get(text)
+        if previous is None or self._page(page_id)["prompt"].get("text") == text:
+            return False
+        components = previous.get("resolved_components")
+        components = dict(components) if isinstance(components, dict) else {}
+        # Restored wording is authored text. Live generation resumes on an explicit build.
+        components.pop("generated_text", None)
+        self.update_prompt(page_id, {"text": text, "resolved_components": components, "stale": True})
+        return True
 
     @_mutating
     def restore_previous_prompt(self, page_id: str) -> bool:
@@ -701,7 +803,8 @@ class ProjectModel:
         self.update_prompt(page_id, {"text": previous["text"],
                                     "resolved_components": previous.get("resolved_components", {}),
                                     "stale": True})
-        self.update_page_recovery(page_id, {"previous_prompt": page["prompt"]})
+        if self._remember_prompt(page_id, page["prompt"], keep_empty=True):
+            self._changed("prompt", [page_id], stale=False, fields=("recovery",))
         return True
 
     @_mutating
@@ -747,6 +850,20 @@ class ProjectModel:
     @_mutating
     def update_shared_settings(self, patch: Mapping[str, Any]) -> None:
         self.update_project_data("shared_settings", patch)
+
+    @property
+    @_reading
+    def letter_transition(self) -> str:
+        return normalize_page_transition(self._data["presentation"].get("transition"))
+
+    @_mutating
+    def set_letter_transition(self, transition: str) -> bool:
+        if normalize_page_transition(transition) != transition:
+            raise ProjectModelError("Unsupported letter transition")
+        if self._data["presentation"].get("transition", DEFAULT_PAGE_TRANSITION) == transition:
+            return False
+        self.update_project_data("presentation", {"transition": transition})
+        return True
 
     @_mutating
     def update_project_data(self, field: str, patch: Mapping[str, Any]) -> None:

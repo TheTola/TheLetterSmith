@@ -652,7 +652,8 @@ class GitHubPagesPublisher(Publisher):
             prefix = self.destination.prefix + public_path + "/"
             url = self.destination.url(public_path)
             saved_url = f"{_safe_pages_url(metadata.get(PUBLISHED_PAGE_URL_KEY, ''))}/"
-            if saved_url != url:
+            confirmed_url = f"{_safe_pages_url(metadata.get('_confirmed_unpublish_url', saved_url))}/"
+            if saved_url != url or confirmed_url != url:
                 raise GitHubOperationError(
                     "publication_conflict",
                     "The saved public link does not match this letter's GitHub publication identity.",

@@ -158,6 +158,9 @@ class PageArtworkController:
     def resolve_asset(self, page_id: str) -> Path | None:
         """Resolve a canonical relative reference within saved/workspace roots."""
         raw = self.session.project.get_page(page_id)["artwork"].get("asset")
+        return self._resolve_reference(raw)
+
+    def _resolve_reference(self, raw: str | None) -> Path | None:
         if not raw:
             return None
         if raw in self.session.project.to_dict()["recovery"].get("missing_resources", []):
@@ -184,6 +187,20 @@ class PageArtworkController:
     def clear_image(self, page_id: str) -> bool:
         """Clear only this page's artwork state; retain all source media."""
         target = self.capture_target(page_id)
-        return self.session.apply_result(target, lambda project, captured_id: project.update_artwork(
-            captured_id, {"asset": None, "media_type": None, "placement": {}, "animation": {}},
-        ))
+        if not self.session.project.get_page(page_id)["artwork"].get("asset"):
+            return False
+        return self.session.apply_result(target, ProjectModel.clear_artwork)
+
+    def restore_image(self, page_id: str) -> bool:
+        target = self.capture_target(page_id)
+
+        def restore(project: ProjectModel, identity: str) -> None:
+            page = project.get_page(identity)
+            reference = page["recovery"].get("cleared_artwork", {}).get("asset")
+            if not reference or page["artwork"].get("asset"):
+                raise ValueError("There is no cleared artwork to restore.")
+            if self._resolve_reference(reference) is None:
+                raise ValueError("The cleared artwork file is missing.")
+            project.restore_artwork(identity)
+
+        return self.session.apply_result(target, restore)

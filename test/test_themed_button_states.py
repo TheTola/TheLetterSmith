@@ -442,15 +442,13 @@ class ThemedButtonStateTests(unittest.TestCase):
         self.assertEqual(image.session.project.to_dict(), before)
 
         for button in (sound.single_action_btn, sound.create_playlist_btn,
-                       sound.archive_btn, sound.import_btn, sound.add_track_btn,
-                       sound.convert_single_btn, sound.clear_btn):
+                       sound.import_btn, sound.add_track_btn, sound.convert_single_btn, sound.clear_btn):
             self.assertEqual(button._artwork_filename, "AButton.png")
-            self.assertEqual(button.height(), sound.archive_btn.height())
+            self.assertEqual(button.height(), sound.import_btn.height())
         self.assertEqual(sound.single_action_btn.text(), "Replace Music")
         self.assertTrue(sound.single_action_btn.isHidden())
         self.assertTrue(sound.single_action_btn.isEnabled())
-        self.assertTrue(sound.stock_btn.isEnabled())
-        self.assertTrue(sound.archive_btn.isEnabled())
+        self.assertTrue(sound.import_btn.isEnabled())
         self.assertFalse(sound.clear_btn.isEnabled())
         self.assertFalse(sound.play_btn.isEnabled())
         self.assertFalse(sound.mute_btn.isEnabled())
@@ -768,8 +766,8 @@ class ThemedButtonStateTests(unittest.TestCase):
         self.assertTrue(sound.clear_btn.is_invisible)
         for button in (
             sound.single_action_btn,
-            sound.stock_btn,
-            sound.archive_btn,
+            sound.import_btn,
+            sound.add_track_btn,
         ):
             self.assertEqual(button.semantic_state, ButtonSemanticState.NORMAL)
             self.assertTrue(button.is_invisible)
@@ -781,8 +779,8 @@ class ThemedButtonStateTests(unittest.TestCase):
         )
         self.assertFalse(sound.clear_btn.is_invisible)
         self.assertTrue(sound.single_action_btn.isEnabled())
-        self.assertTrue(sound.stock_btn.isEnabled())
-        self.assertTrue(sound.archive_btn.isEnabled())
+        self.assertTrue(sound.import_btn.isEnabled())
+        self.assertTrue(sound.add_track_btn.isEnabled())
 
     def test_sound_tab_uses_spacious_shared_layout_metrics(self) -> None:
         sound = SoundTab(self.root)

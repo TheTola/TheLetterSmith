@@ -49,7 +49,7 @@ class PageViewerTests(unittest.TestCase):
         self.fail(f"Viewer did not reach expected state: {source}")
 
     @contextmanager
-    def canonical_view(self, pages, *, initial_muted=None, initial_volume=0):
+    def canonical_view(self, pages, *, transition=None, initial_muted=None, initial_volume=0, reduced_motion=True, seed_sfx=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             gallery = root / "gallery/pages"
@@ -60,6 +60,10 @@ class PageViewerTests(unittest.TestCase):
             controls.mkdir()
             for name in ("cleft", "cright", "bannerman", "ppage", "npage", "volon", "voloff", "showmessageicon"):
                 Image.new("RGBA", (24, 24), "#404050").save(controls / f"{name}.png")
+            if seed_sfx:
+                from generate import _seed_sfx_into_build
+                _seed_sfx_into_build(project_root=Path(__file__).resolve().parents[1],
+                                     sounds_dst=root / "gallery/sounds", seed_sfx=True)
             shell = TEMPLATE_HTML
             for key, value in {
                 "CSP_NONCE": "canonical-page-test", "TITLE": "Independent pages",
@@ -71,14 +75,14 @@ class PageViewerTests(unittest.TestCase):
                 shell = shell.replace("{{" + key + "}}", value)
             if initial_muted is not None:
                 shell = shell.replace('<body>', f'<body data-initial-muted="{str(initial_muted).lower()}" data-playback-id="{root.name}">')
-            (root / "index.html").write_text(template_for_project_pages(pages, template_html=shell), encoding="utf-8")
+            (root / "index.html").write_text(template_for_project_pages(pages, template_html=shell, transition=transition), encoding="utf-8")
             (root / "styles.css").write_text(TEMPLATE_CSS, encoding="utf-8")
             (root / "script.js").write_text(TEMPLATE_JS, encoding="utf-8")
-            with self.output_view(root / "index.html"):
+            with self.output_view(root / "index.html", reduced_motion=reduced_motion):
                 yield root
 
     @contextmanager
-    def output_view(self, entry, *, native_start=False):
+    def output_view(self, entry, *, native_start=False, reduced_motion=True):
         self.view = QWebEngineView()
         self.view.resize(1000, 700)
         script = QWebEngineScript()
@@ -95,9 +99,9 @@ class PageViewerTests(unittest.TestCase):
             window.addEventListener('securitypolicyviolation', event => cspErrors.push(event.violatedDirective));
             const nativeMatch = window.matchMedia.bind(window);
             window.matchMedia = query => query.includes('prefers-reduced-motion')
-              ? {matches:true, addEventListener(){}, removeEventListener(){}}
+              ? {matches:REDUCED_MOTION, addEventListener(){}, removeEventListener(){}}
               : nativeMatch(query);
-        ''')
+        '''.replace("REDUCED_MOTION", str(reduced_motion).lower()))
         self.view.page().scripts().insert(script)
         self.view.show()
         try:
@@ -178,8 +182,8 @@ class PageViewerTests(unittest.TestCase):
                 self.wait_for("return LetterSmithViewer.currentPageId() === 'art';")
                 self.assertEqual(self.js("return document.getElementById('page-indicator').textContent;"), "Page 4 of 5 — Artwork")
                 self.assertEqual(self.js("return document.querySelectorAll('.text-wall.is-open').length;"), 0)
-                self.wait_for("return !document.getElementById('page-selector').disabled;")
-                self.js("const selector=document.getElementById('page-selector'); selector.value='0'; selector.dispatchEvent(new Event('change')); return true;")
+                self.assertTrue(self.js("return !document.getElementById('page-selector');"))
+                self.assertTrue(self.js("return LetterSmithViewer.goToPage('cover');"))
                 self.wait_for("return LetterSmithViewer.currentPageId() === 'cover';")
                 self.assertFalse(self.js("return LetterSmithViewer.goToPage('deleted-page');"))
 
@@ -190,12 +194,123 @@ class PageViewerTests(unittest.TestCase):
         ]
         with self.canonical_view(pages):
             self.assertEqual(self.js("return document.querySelectorAll('.text-wall').length;"), 0)
+            self.view.resize(390, 844)
+            self.wait_for("""
+                const artwork = document.querySelector('.slide.active > img').getBoundingClientRect();
+                const prev = document.getElementById('prev').getBoundingClientRect();
+                const next = document.getElementById('next').getBoundingClientRect();
+                return innerWidth === 390 && Math.abs(artwork.left + artwork.width / 2 - 195) < 1
+                    && Math.abs(artwork.top + artwork.height / 2 - 422) < 1
+                    && artwork.left - prev.right > 0 && artwork.left - prev.right < 14
+                    && next.left - artwork.right > 0 && next.left - artwork.right < 14;
+            """)
+            self.assertTrue(self.js("""
+                const artwork = document.querySelector('.slide.active > img');
+                const fittedWidth = artwork.getBoundingClientRect().width;
+                const zoom = document.querySelector('[aria-label="Zoom in"]');
+                zoom.click();
+                const magnified = artwork.getBoundingClientRect().width > fittedWidth;
+                document.querySelector('[aria-label="Reset zoom"]').click();
+                const reset = artwork.getBoundingClientRect().width === fittedWidth;
+                zoom.click();
+                return magnified && reset && artwork.classList.contains('artwork-zoomed');
+            """))
             self.js("document.getElementById('next').click(); return true;")
             self.wait_for("return LetterSmithViewer.currentPageId() === 'last';")
+            self.assertTrue(self.js("return !document.querySelector('.artwork-zoomed');"))
             self.assertTrue(self.js("return document.getElementById('next').disabled;"))
             self.assertEqual(self.js("return document.getElementById('page-indicator').textContent;"), "Page 2 of 2 — Last")
 
+    def test_classic_page_turn_opens_a_spread_and_can_reverse(self):
+        pages = [
+            {"id": "cover", "type": "cover", "name": "Cover", "source": "gallery/pages/cover.png", "color": "#804040"},
+            {"id": "inside", "type": "illustration", "name": "Inside", "source": "gallery/pages/inside.png", "color": "#204060"},
+        ]
+        with self.canonical_view(pages, reduced_motion=False, seed_sfx=True):
+            self.assertTrue(self.js("""
+                document.getElementById('next').click();
+                return !document.getElementById('turn').hidden
+                  && document.getElementById('slideshow').getAttribute('aria-busy') === 'true'
+                  && document.getElementById('next').disabled
+                  && !document.getElementById('page-selector')
+                  && LetterSmithViewer.currentPageId() === 'cover';
+            """))
+            self.assertRegex(self.js("return viewerAudio.at(-1).src;"), r"/transitions/classic/flip(?:[1-9]|10)\.mp3$")
+            self.wait_for("""
+                const canvas = document.getElementById('turn');
+                if (canvas.hidden) return false;
+                const stage = canvas.getBoundingClientRect();
+                const cover = document.querySelector('.slide.active > img').getBoundingClientRect();
+                const x = (cover.left - stage.left - cover.width * .45) * canvas.width / stage.width;
+                const y = (cover.top - stage.top + cover.height / 2) * canvas.height / stage.height;
+                const pixel = canvas.getContext('2d').getImageData(x, y, 1, 1).data;
+                return pixel[0] > 20 && pixel[3] > 230;
+            """)
+            self.view.resize(390, 844)
+            self.wait_for("return LetterSmithViewer.currentPageId() === 'inside' && !document.getElementById('prev').disabled;")
+            self.assertTrue(self.js("""
+                const canvas = document.getElementById('turn');
+                return canvas.hidden && canvas.width === 0
+                  && !document.querySelector('.slide.ghost, .slide.peek')
+                  && document.getElementById('slideshow').getAttribute('aria-busy') === 'false';
+            """))
+            self.assertTrue(self.js("""
+                window.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowLeft'}));
+                return !document.getElementById('turn').hidden && LetterSmithViewer.currentPageId() === 'inside';
+            """))
+            self.wait_for("return LetterSmithViewer.currentPageId() === 'cover' && !document.getElementById('next').disabled;")
+            self.assertTrue(self.js("return document.getElementById('turn').hidden;"))
+
+    def test_letter_transition_plays_on_every_page_boundary(self):
+        pages = [
+            {"id": name, "type": "illustration", "source": f"gallery/pages/{name}.png", "color": color}
+            for name, color in (("first", "navy"), ("second", "orange"), ("third", "white"))
+        ]
+        def assert_cue(cue):
+            self.assertTrue(self.js(f"""
+                const audio = viewerAudio.at(-1);
+                return audio.src.endsWith('/gallery/sounds/transitions/{cue}')
+                    && audio.muted && Math.abs(audio.volume - .37) < 1e-6;
+            """))
+            self.wait_for("return viewerAudio.at(-1).readyState >= 2 && !viewerAudio.at(-1).error;")
+
+        for mode, forward, reverse in (
+            ("shuffle_deal", "shuffle_deal/deal.mp3", "shuffle_deal/return.mp3"),
+            ("pixelate", "pixelate/dissolve-reveal.mp3", "pixelate/dissolve-reveal.mp3"),
+            ("envelope", "envelope/open-letter.mp3", "envelope/return-letter.mp3"),
+            ("curtain", "curtain/close-open.mp3", "curtain/close-open.mp3"),
+        ):
+            with self.subTest(mode=mode), self.canonical_view(pages, transition=mode, initial_muted=True,
+                                                             initial_volume=37, reduced_motion=False, seed_sfx=True):
+                self.assertTrue(self.js("return !document.querySelector('.slide[data-transition]');"))
+                for destination in ("second", "third"):
+                    self.assertEqual(self.js("""
+                        document.getElementById('next').click();
+                        return document.getElementById('letter-preview').dataset.turnEffect;
+                    """), mode)
+                    if mode == "pixelate":
+                        self.wait_for("""
+                            const canvas = document.getElementById('turn');
+                            if (canvas.hidden) return false;
+                            const paint = canvas.getContext('2d');
+                            const hiddenControls = ['restart-button', 'fullscreen-button', 'page-navigation']
+                                .every(id => getComputedStyle(document.getElementById(id)).visibility === 'hidden');
+                            return hiddenControls && [paint.getImageData(10, 10, 1, 1),
+                                paint.getImageData(canvas.width / 2, canvas.height / 2, 1, 1)]
+                                .every(({data}) => data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 255);
+                        """)
+                    assert_cue(forward)
+                    self.wait_for(f"return LetterSmithViewer.currentPageId() === '{destination}' && !document.getElementById('prev').disabled;")
+                    self.assertTrue(self.js("return document.getElementById('turn').hidden;"))
+                self.assertEqual(self.js("""
+                    document.getElementById('prev').click();
+                    return document.getElementById('letter-preview').dataset.turnEffect;
+                """), mode)
+                assert_cue(reverse)
+                self.wait_for("return LetterSmithViewer.currentPageId() === 'second' && !document.getElementById('next').disabled;")
+
     def test_real_layouts_zip_and_single_html_work_without_source_project(self):
+        import base64
         import wave
         import zipfile
         from test_forge_render import ForgeRenderTests
@@ -218,6 +333,7 @@ class PageViewerTests(unittest.TestCase):
                 frames = [Image.new('RGB', (400, 600), color) for color in ('#306080', '#803060')]
                 frames[0].save(fixture.root / 'cover.gif', save_all=True, append_images=frames[1:], duration=[100, 160], loop=0)
                 fixture.project.update_artwork(pages[0]['id'], {'asset': 'cover.gif'})
+                fixture.project.set_letter_transition('pixelate')
                 fixture.project.update_message(a, {**fixture.project.get_message(a), 'layout': canvas_layout(),
                     'html': '<p style="font-size:24px"><b>Message A — red artwork</b></p>' + '<p>Readable overflowing message paragraph.</p>' * 18})
                 fixture.project.update_message(b, {**fixture.project.get_message(b),
@@ -238,6 +354,8 @@ class PageViewerTests(unittest.TestCase):
                 display = copy_display_output(built, detached / 'display')
                 archive_path = export_render(fixture.session, detached / 'letter.zip')
                 standalone = export_render(fixture.session, detached / 'letter.html', output_format='html')
+                cue_path = 'gallery/sounds/transitions/pixelate/dissolve-reveal.mp3'
+                cue_uri = 'data:audio/mpeg;base64,' + base64.b64encode((built / cue_path).read_bytes()).decode('ascii')
                 with zipfile.ZipFile(archive_path) as archive:
                     archive.extractall(detached / 'unpacked')
             finally:
@@ -262,10 +380,16 @@ class PageViewerTests(unittest.TestCase):
                         self.assertTrue(after['src'].startswith('data:audio/'))
                     self.wait_for("return !document.getElementById('next').disabled;")
                     self.js("document.getElementById('next').click(); return true;")
+                    self.assertEqual(self.js("return document.getElementById('letter-preview').dataset.transition;"), 'pixelate')
+                    self.assertTrue(self.js("return document.getElementById('turn').hidden;"))
                     self.wait_for("return viewerAudio.length > 1 && viewerAudio[viewerAudio.length-1].readyState >= 2;")
+                    self.assertGreaterEqual(self.js("return viewerAudio.at(-1).currentTime;"), .85)
                     self.assertTrue(self.js("return viewerAudio.every(audio=>!audio.error);"))
                     if mode == 'html':
                         self.assertTrue(self.js("return viewerAudio.every(audio=>audio.src.startsWith('data:audio/'));"))
+                        self.assertEqual(self.js("return viewerAudio.at(-1).src;"), cue_uri)
+                    else:
+                        self.assertTrue(self.js(f"return viewerAudio.at(-1).src.endsWith('/{cue_path}');"))
                     for page_id, expected, x, y, font in ((a, 'Message A', 40, 130, '24px'), (b, 'Message B', 80, 330, '30px')):
                         self.wait_for("return !document.getElementById('prev').disabled;")
                         self.js('LetterSmithViewer.goToPage(' + json.dumps(page_id) + '); return true;')
@@ -311,11 +435,27 @@ class PageViewerTests(unittest.TestCase):
             {"id": "last", "type": "end_page", "source": "gallery/pages/last.png"},
         ]
         with self.canonical_view(pages, initial_muted=True, initial_volume=37):
+            self.assertTrue(self.js("""
+                const sound = document.getElementById('volume-icon');
+                const settings = document.getElementById(sound.getAttribute('aria-controls'));
+                const actions = document.getElementById('viewer-actions');
+                return actions.contains(sound) && actions.contains(document.getElementById('fullscreen-button'))
+                    && settings.hidden && settings.contains(document.getElementById('mute-button'))
+                    && settings.contains(document.getElementById('volume-slider'));
+            """))
             self.assertEqual(self.js("return document.getElementById('mute-button').textContent;"), "Unmute")
             self.assertTrue(self.js("return Array.from(document.querySelectorAll('audio')).every(audio=>audio.muted && audio.volume === .37);"))
+            self.js("document.getElementById('volume-icon').click(); return true;")
+            self.assertTrue(self.js("return !document.getElementById('desktop-sound-settings').hidden;"))
             self.js("document.getElementById('mute-button').click(); return true;")
             self.assertEqual(self.js("return document.getElementById('mute-button').textContent;"), "Mute")
             self.assertTrue(self.js("return Array.from(document.querySelectorAll('audio')).every(audio=>!audio.muted && audio.volume === .37);"))
+            self.assertTrue(self.js("""
+                const volume = document.getElementById('volume-slider');
+                volume.value = '62';
+                volume.dispatchEvent(new Event('input'));
+                return Array.from(document.querySelectorAll('audio')).every(audio=>audio.volume === .62);
+            """))
             loaded=[]
             loop=QtCore.QEventLoop()
             self.view.loadFinished.connect(lambda ok: (loaded.append(ok), loop.quit()))

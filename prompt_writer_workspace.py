@@ -1,12 +1,13 @@
 """Full-page presentation of the existing, canonical Prompt Writer controller."""
+from dataclasses import dataclass
 import uuid
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from PromptWriterPanel import PromptWriterPanel as _PromptWriterPanel, PageSpec
 from project_model import PAGE_TYPES
-from prompt_writer_project import resolve_page_prompt, page_label
-from ui_dialogs import LetterSmithConfirmationDialog
+from prompt_writer_project import load_style_presets, page_label, resolve_page_prompt, save_style_preset
+from ui_dialogs import LetterSmithConfirmationDialog, LetterSmithInputDialog
 from prompt_writer_colors import (category_colors, display_color, ensure_page_colors,
                                   surface_colors, surface_stylesheet)
 
@@ -130,7 +131,7 @@ class _CollapsibleSection(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
-        header = QtWidgets.QHBoxLayout()
+        self.header = header = QtWidgets.QHBoxLayout()
         self.title = QtWidgets.QLabel(title)
         self.title.setWordWrap(True)
         font = self.title.font()
@@ -163,6 +164,13 @@ class _CollapsibleSection(QtWidgets.QWidget):
         self.toggle.setAccessibleName(self.toggle.text() + ' — ' + self.title.text())
 
 
+@dataclass(frozen=True)
+class _SentPrompt:
+    provider: str
+    page: str
+    text: str
+
+
 class PromptWriterPanel(_PromptWriterPanel):
     def __init__(self, parent=None, **kwargs):
         self._workspace_ready = False
@@ -176,6 +184,8 @@ class PromptWriterPanel(_PromptWriterPanel):
         self._handoff_serial = 0
         self._card_drop_serial = 0
         self._introduced_services = set()
+        self._sent_prompt = None
+        self._dictation_target = None
         self._live_refreshing = False
         self._prompt_errors = {}
         self._semantic_controls = []
@@ -224,6 +234,23 @@ class PromptWriterPanel(_PromptWriterPanel):
         heading.addWidget(self.prompts_button)
         heading.addWidget(self.service_button)
         root.addLayout(heading)
+        self.dictation_bar = QtWidgets.QWidget()
+        dictation_layout = QtWidgets.QHBoxLayout(self.dictation_bar)
+        dictation_layout.setContentsMargins(0, 0, 0, 0)
+        self.dictation_button = QtWidgets.QToolButton()
+        self.dictation_button.setObjectName('writerDictationButton')
+        self.dictation_button.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.dictation_button.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+        self.dictation_button.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.dictation_button.clicked.connect(self._toggle_dictation)
+        self.dictation_button.customContextMenuRequested.connect(self._show_dictation_menu)
+        dictation_layout.addWidget(self.dictation_button)
+        self.dictation_status = QtWidgets.QLabel()
+        self.dictation_status.setTextFormat(QtCore.Qt.PlainText)
+        self.dictation_status.setAccessibleName('Prompt Writer dictation target')
+        self.dictation_status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        dictation_layout.addWidget(self.dictation_status, 1)
+        root.addWidget(self.dictation_bar)
         self.workspace_status = QtWidgets.QLabel()
         self.workspace_status.setWordWrap(True)
         self.workspace_status.setTextFormat(QtCore.Qt.PlainText)
@@ -243,6 +270,10 @@ class PromptWriterPanel(_PromptWriterPanel):
         form.setSpacing(12)
         self.target_selector.hide()
         self.generated_section = _CollapsibleSection('Generated Prompts', preview=True)
+        self.copy_all_button = QtWidgets.QPushButton('Copy All')
+        self.copy_all_button.setToolTip('Copy the current prompts in page order.')
+        self.copy_all_button.clicked.connect(self._copy_all_prompts)
+        self.generated_section.header.insertWidget(self.generated_section.header.count() - 1, self.copy_all_button)
         self.output_heading = self.generated_section.title
         self.outputs_container = QtWidgets.QWidget()
         self.outputs_layout = QtWidgets.QVBoxLayout(self.outputs_container)
@@ -285,6 +316,13 @@ class PromptWriterPanel(_PromptWriterPanel):
             self._semantic_controls.append((manage, semantic_key))
             label.show()
             combo.show()
+        self.style_presets_button = QtWidgets.QToolButton()
+        self.style_presets_button.setText('Style Presets')
+        self.style_presets_button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.style_presets_menu = QtWidgets.QMenu(self.style_presets_button)
+        self.style_presets_menu.aboutToShow.connect(self._refresh_style_presets_menu)
+        self.style_presets_button.setMenu(self.style_presets_menu)
+        self.style_section.body_layout.addWidget(self.style_presets_button, 0, QtCore.Qt.AlignLeft)
         form.addWidget(self.style_section)
         self.guidance_layout = options = _FlowLayout(spacing=10)
         self.guidance_groups = []
@@ -351,12 +389,17 @@ class PromptWriterPanel(_PromptWriterPanel):
         self.destination_selector.setParent(self.conversation_bar)
         self.destination_selector.hide()
         self.destination_selector.activated.connect(lambda: self._activate_service_page(self.destination_selector.currentData()))
+        self.sent_prompt_title = QtWidgets.QLabel()
+        self.sent_prompt_title.setTextFormat(QtCore.Qt.PlainText)
+        self.sent_prompt_title.setWordWrap(True)
+        self.sent_prompt_title.hide()
+        service_layout.addWidget(self.sent_prompt_title)
         self.service_prompt = QtWidgets.QPlainTextEdit()
         self.service_prompt.setReadOnly(True)
-        self.service_prompt.setAccessibleName('Ready when you are — current page prompt')
-        self.service_prompt.setFixedHeight(76)
-        self.service_prompt.setParent(self.conversation_bar)
+        self.service_prompt.setAccessibleName('Sent artwork prompt')
+        self.service_prompt.setFixedHeight(84)
         self.service_prompt.hide()
+        service_layout.addWidget(self.service_prompt)
         self.handoff_status = QtWidgets.QLabel()
         self.handoff_status.setWordWrap(True)
         self.handoff_status.hide()
@@ -492,6 +535,114 @@ class PromptWriterPanel(_PromptWriterPanel):
             self._set_workspace_status('Save failed. Your prompt edits are still open; retry before leaving.')
         return saved
 
+    @property
+    def _style_presets_path(self):
+        return self.application_paths.prompt_writer_content_root / 'style_presets.json'
+
+    def _refresh_style_presets_menu(self):
+        menu = self.style_presets_menu
+        menu.clear()
+        menu.addAction('Save Current Style…', self._save_current_style)
+        try:
+            presets = load_style_presets(self._style_presets_path)
+        except (OSError, ValueError) as error:
+            self._set_workspace_status(str(error))
+            return
+        if presets:
+            menu.addSeparator()
+        session_id = self.session.session_id
+        for name, style in sorted(presets.items(), key=lambda item: item[0].casefold()):
+            menu.addAction(name.replace('&', '&&'),
+                           lambda _checked=False, values=style: self._apply_style_preset(values, session_id))
+
+    def _save_current_style(self):
+        if self.session.is_restoring:
+            return
+        style = self.session.project.to_dict()['prompt_settings']
+        session_id = self.session.session_id
+        name, accepted = LetterSmithInputDialog.get_text(self, 'Save Style Preset', 'Preset name')
+        if not accepted or session_id != self.session.session_id:
+            return
+        try:
+            save_style_preset(self._style_presets_path, name, style)
+        except (OSError, ValueError) as error:
+            self._set_workspace_status(str(error))
+        else:
+            self._set_workspace_status(f'Saved style preset “{name.strip()}”.')
+
+    def _apply_style_preset(self, style, session_id):
+        if (self._shutdown or self._state_persistence_suspended or self.session.is_restoring
+                or session_id != self.session.session_id):
+            return
+        # The session event reloads the three controls and refreshes every live prompt.
+        self.session.project.update_project_data('prompt_settings', style)
+        self._authored_change()
+
+    def _attach_shared_prompt_dictation(self):
+        self._attach_workspace_dictation(self.txt_global)
+
+    def _attach_workspace_dictation(self, editor):
+        from dictation import attach_dictation
+
+        binding = attach_dictation(editor, button=QtGui.QAction(editor), allow_queued_restart=True)
+        binding.status_changed.connect(self._refresh_dictation_control)
+        editor.installEventFilter(self)
+
+    def _attach_prompt_proofreading(self, widget, key):
+        binding = super()._attach_prompt_proofreading(widget, key)
+        if not widget._dictation_binding.embedded:
+            binding.enable_next_suggestion_shortcut('F8')
+        return binding
+
+    def eventFilter(self, watched, event):
+        if self._workspace_ready and not self._shutdown:
+            binding = getattr(watched, '_dictation_binding', None)
+            if binding is not None and not binding.embedded:
+                if event.type() == QtCore.QEvent.FocusIn:
+                    self._dictation_target = binding
+                    self._refresh_dictation_control()
+                elif event.type() in (QtCore.QEvent.Show, QtCore.QEvent.Hide,
+                                     QtCore.QEvent.EnabledChange, QtCore.QEvent.ReadOnlyChange):
+                    QtCore.QTimer.singleShot(0, self, self._refresh_dictation_control)
+        return super().eventFilter(watched, event)
+
+    def _refresh_dictation_control(self, _status=''):
+        if not self._workspace_ready or self._shutdown:
+            return
+        shared = self.txt_global._dictation_binding
+        binding = self._dictation_target
+        if binding is None or not binding.valid_target():
+            binding = shared if shared.valid_target() else None
+        self._dictation_target = binding
+        action = (binding or shared).button
+        self.dictation_button.setIcon(action.icon())
+        self.dictation_button.setEnabled(binding is not None and action.isEnabled())
+        if binding is None:
+            target = 'Focus a prompt field'
+        else:
+            target = binding.editor.accessibleName()
+            if binding.active:
+                target = f'{action.text()} · {target}'
+        self.dictation_status.setText(target)
+        self.dictation_status.setToolTip(target)
+        tooltip = f'{target}\n{action.toolTip()}' if binding is not None else target
+        self.dictation_button.setToolTip(tooltip)
+        self.dictation_button.setAccessibleName(f'{action.text()} · {target}' if binding is None or not binding.active else target)
+
+    def _toggle_dictation(self):
+        self._refresh_dictation_control()
+        if self._dictation_target is not None:
+            self._dictation_target.toggle()
+
+    def _show_dictation_menu(self, position):
+        binding = self._dictation_target
+        if binding is None:
+            return
+        menu = QtWidgets.QMenu(self.dictation_button)
+        menu.addAction('Dictation settings…', binding.configure)
+        menu.exec(self.dictation_button.mapToGlobal(position))
+        menu.deleteLater()
+
     def reload_project_state(self):
         if not self.session.is_restoring:
             revision = self.session.project.revision
@@ -547,6 +698,8 @@ class PromptWriterPanel(_PromptWriterPanel):
             self._handoff_serial += 1
             self._site_request_in_progress = False
             self._introduced_services.clear()
+            self._sent_prompt = None
+            self._dictation_target = None
             self.generated_section.set_expanded(False)
             for section in self.editing_sections:
                 section.set_expanded(True)
@@ -566,6 +719,8 @@ class PromptWriterPanel(_PromptWriterPanel):
                 directions.setMinimumHeight(90)
                 directions.setMaximumHeight(160)
                 directions.setPlaceholderText('Describe the scene and composition for this page.')
+                self._attach_workspace_dictation(directions)
+                self._attach_prompt_proofreading(directions, (page_id, 'directions'))
                 direction_layout.addWidget(directions)
                 output_card = QtWidgets.QGroupBox()
                 output_layout = QtWidgets.QVBoxLayout(output_card)
@@ -573,6 +728,8 @@ class PromptWriterPanel(_PromptWriterPanel):
                 output.setMinimumHeight(230)
                 output.setMaximumHeight(360)
                 output.setPlaceholderText('The prompt updates automatically from this page’s settings.')
+                self._attach_workspace_dictation(output)
+                self._attach_prompt_proofreading(output, (page_id, 'text'))
                 output_layout.addWidget(output)
                 actions = QtWidgets.QHBoxLayout()
                 status = QtWidgets.QLabel()
@@ -605,6 +762,7 @@ class PromptWriterPanel(_PromptWriterPanel):
         self._refresh_workspace_status()
         self.refresh_semantic_palette()
         self._refresh_service_state()
+        self._refresh_dictation_control()
 
     def _arrange_directions(self):
         for index, fields in enumerate(self._page_fields.values()):
@@ -625,7 +783,7 @@ class PromptWriterPanel(_PromptWriterPanel):
             return
         self._writing = True
         try:
-            self.session.project.update_prompt(page_id, {key: editor.toPlainText()})
+            self.session.project.update_prompt(page_id, {key: editor.toPlainText()}, history_group='manual')
         finally:
             self._writing = False
         self._authored_change()
@@ -694,14 +852,31 @@ class PromptWriterPanel(_PromptWriterPanel):
     def _copy_prompt(self, page_identifier):
         try:
             text = self.current_page_prompt(page_identifier)
-            QtWidgets.QApplication.clipboard().setText(text)
+            self._write_prompt_clipboard(text)
             return text
         except (KeyError, ValueError, RuntimeError, OSError) as error:
             self._set_workspace_status(str(error))
             return ''
 
     def _copy_all_prompts_text(self):
-        return self._copy_prompt(self._view_page_id)
+        try:
+            if self.session.is_restoring or self._generation_in_progress:
+                raise RuntimeError('Wait for the prompts to finish updating.')
+            self._refresh_live_prompts()
+            if self._prompt_errors:
+                return ''
+            project = self.session.project
+            pages = project.pages
+            if any(page['prompt']['text'] is None for page in pages):
+                raise RuntimeError('Wait for the prompts to finish updating.')
+            text = '\n\n'.join(f"Page {index} — {page_label(project, page['id'])}\n{page['prompt']['text']}"
+                               for index, page in enumerate(pages, 1))
+            if text:
+                self._write_prompt_clipboard(text)
+            return text
+        except (KeyError, ValueError, RuntimeError, OSError) as error:
+            self._set_workspace_status(str(error))
+            return ''
 
     def _page_input_changed(self, *args):
         super()._page_input_changed(*args)
@@ -724,11 +899,14 @@ class PromptWriterPanel(_PromptWriterPanel):
             self._refresh_workspace_status()
 
     def _refresh_workspace_status(self):
-        self.service_button.setEnabled(bool(self.session.project.pages) and not self.session.is_restoring)
+        pages = self.session.project.pages
+        ready = bool(pages) and not self.session.is_restoring
+        self.service_button.setEnabled(ready)
+        self.copy_all_button.setEnabled(ready and not self._generation_in_progress)
         for button in self._service_buttons.values():
             button.setEnabled(not self._site_request_in_progress)
         self._refresh_section_summaries()
-        for page in self.session.project.pages:
+        for page in pages:
             fields = self._page_fields.get(page['id'])
             if fields is None:
                 continue
@@ -787,10 +965,14 @@ class PromptWriterPanel(_PromptWriterPanel):
                 self._browser.pageCardDropped.disconnect(self._on_page_card_dropped)
             except (RuntimeError, TypeError):
                 pass
+        if browser is not self._browser:
+            self._handoff_serial += 1
+            self._site_request_in_progress = False
+            self._sent_prompt = None
         super().attach_browser(browser, image_tab)
         if hasattr(browser, 'pageCardDropped'):
             browser.pageCardDropped.connect(self._on_page_card_dropped)
-        self._bind_image_target(self._view_page_id)
+        self._refresh_service_state()
 
     def _on_page_card_dropped(self, card, position):
         page_id = getattr(card, 'page_id', None)
@@ -820,6 +1002,8 @@ class PromptWriterPanel(_PromptWriterPanel):
         self.conversation_bar.setVisible(service_visible)
         self.prompts_button.setVisible(service_visible)
         self.service_button.setVisible(not service_visible)
+        self.dictation_bar.setVisible(not service_visible)
+        self._refresh_dictation_control()
 
     def _show_writer(self):
         self._card_drop_serial += 1
@@ -861,6 +1045,7 @@ class PromptWriterPanel(_PromptWriterPanel):
     def _refresh_service_state(self):
         if not self._workspace_ready or self.session.is_restoring:
             return
+        showing_sent = self._refresh_sent_prompt()
         page_id = self._view_page_id
         if page_id not in self._page_fields:
             return
@@ -871,13 +1056,10 @@ class PromptWriterPanel(_PromptWriterPanel):
         label = self._service_page_label(page_id)
         self.service_destination_label.setText('Images for ' + label)
         self.service_destination_label.setStyleSheet(f'color:{self._page_prompt_color(page_id)};')
-        self.service_prompt.setAccessibleName('Ready when you are — ' + label)
-        text = self.session.project.get_prompt(page_id)['text'] or ''
-        if self.service_prompt.toPlainText() != text:
-            self.service_prompt.setPlainText(text)
-        page = self.session.project.get_page(page_id)
-        self._highlight_saved_prompt(PageSpec(page_id, label, '', PAGE_TYPES[page['type']].artwork_template,
-            '', '', detail_widget=self._page_fields[page_id]['directions'], preview_widget=self.service_prompt))
+        if not showing_sent:
+            text = self.session.project.get_prompt(page_id)['text'] or ''
+            if self.service_prompt.toPlainText() != text:
+                self.service_prompt.setPlainText(text)
         for index, (identity, button) in enumerate(self._service_buttons.items(), 1):
             name = self._service_page_label(identity)
             short_name = button.fontMetrics().elidedText(name, QtCore.Qt.ElideRight, 138).replace('&', '&&')
@@ -885,6 +1067,19 @@ class PromptWriterPanel(_PromptWriterPanel):
             button.setToolTip(name + '\nDrag into the message box or click to send.')
             button.setAccessibleName(f'Page {index} — Generate image for {name}')
             button.setChecked(identity == page_id)
+
+    def _refresh_sent_prompt(self):
+        sent = self._sent_prompt
+        visible = sent is not None and sent.provider == getattr(self._browser, 'provider', None)
+        self.sent_prompt_title.setVisible(visible)
+        self.service_prompt.setVisible(visible)
+        if visible:
+            title = f'Sent to {sent.provider} · {sent.page}'
+            self.sent_prompt_title.setText(title)
+            self.service_prompt.setAccessibleName(title)
+            if self.service_prompt.toPlainText() != sent.text:
+                self.service_prompt.setPlainText(sent.text)
+        return visible
 
     def _show_handoff_status(self, message):
         self.handoff_status.setText(message)
@@ -894,9 +1089,16 @@ class PromptWriterPanel(_PromptWriterPanel):
     @staticmethod
     def _write_prompt_clipboard(text):
         clipboard = QtWidgets.QApplication.clipboard()
-        clipboard.setText(text)
-        if clipboard.text() != text:
-            raise OSError('Clipboard did not retain the prompt.')
+        # Let Qt service Windows clipboard messages before retrying an unavailable clipboard.
+        for delay in (0, 30, 60, 120):
+            if delay:
+                wait = QtCore.QEventLoop()
+                QtCore.QTimer.singleShot(delay, wait.quit)
+                wait.exec(QtCore.QEventLoop.ExcludeUserInputEvents)
+            clipboard.setText(text)
+            if clipboard.text() == text:
+                return
+        raise OSError('Clipboard did not retain the prompt.')
 
     def _activate_service_page(self, page_id):
         if self._site_request_in_progress:
@@ -976,23 +1178,34 @@ class PromptWriterPanel(_PromptWriterPanel):
             return
         self._bind_image_target(page_id)
         self._show_conversation()
-        self._submit_service_prompt(prompt)
+        position = self.session.project.prompt_context(page_id)['position']
+        self._submit_service_prompt(prompt, page=f'Page {position} — {self._service_page_label(page_id)}')
 
-    def _submit_service_prompt(self, prompt, *, introduction=False):
+    def _submit_service_prompt(self, prompt, *, introduction=False, page=None):
         if self._browser is None or self._site_request_in_progress:
+            return
+        # Use the same text that the browser submits to the provider's composer.
+        prompt = prompt.strip()
+        if not prompt:
             return
         self._site_request_in_progress = True
         self._handoff_serial += 1
         serial, session_id = self._handoff_serial, self.session.session_id
         browser = self._browser
+        provider = browser.provider
+        sent = _SentPrompt(provider, page, prompt) if page is not None else None
         self._handoff_timer.stop()
         self.handoff_status.hide()
         self._site_status.setText('Sending project introduction…' if introduction
-                                  else 'Sending prompt to ' + browser.provider + '…')
+                                  else 'Sending prompt to ' + provider + '…')
         self._site_status.show()
         self._sync_action_button_states()
         def completed(ok, message):
             if serial != self._handoff_serial or session_id != self.session.session_id or browser is not self._browser:
+                return
+            if provider != browser.provider:
+                self._on_provider_submission(False, 'The image service changed while sending the prompt.')
+                self._refresh_sent_prompt()
                 return
             if introduction and ok:
                 self._introduced_services.add(self._service_introduction_key())
@@ -1001,6 +1214,9 @@ class PromptWriterPanel(_PromptWriterPanel):
                 self._site_status.setText('Project introduction sent. Choose a page when ready.' if ok else message)
                 self._sync_action_button_states()
             else:
+                if ok and sent is not None:
+                    self._sent_prompt = sent
+                    self._refresh_sent_prompt()
                 self._on_provider_submission(ok, message)
         try:
             browser.submit_prompt(prompt, completed)

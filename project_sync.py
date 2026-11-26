@@ -10,7 +10,12 @@ import hashlib
 import json
 from pathlib import Path
 
-from project_paths import application_paths
+from project_paths import (
+    MUSIC_FILE_NAME,
+    WORKSPACE_MESSAGE_DIR,
+    WORKSPACE_PAGES_DIR,
+    application_paths,
+)
 from typing import Iterable
 
 _SAMPLE_SIZE = 64 * 1024
@@ -71,32 +76,32 @@ def file_fingerprint(path: str | Path) -> str:
     return _sampled_file_digest(Path(path))
 
 def image_fingerprint(project_root: str | Path) -> str:
-    root = Path(project_root).resolve()
-    pages = root / "gallery" / "user" / "pages"
+    root = application_paths(project_root).workspace_root
+    pages = root / WORKSPACE_PAGES_DIR
     return _paths_digest(root, _files_under(pages))
 
 
 def message_fingerprint(project_root: str | Path) -> str:
-    root = Path(project_root).resolve()
-    message_dir = root / "gallery" / "user" / "message"
+    root = application_paths(project_root).workspace_root
+    message_dir = root / WORKSPACE_MESSAGE_DIR
     return _paths_digest(root, _files_under(message_dir))
 
 
 def sound_fingerprint(project_root: str | Path) -> str:
-    root = Path(project_root).resolve()
-    sound_dir = root / "gallery" / "user" / "sounds"
+    paths = application_paths(project_root)
+    root = paths.workspace_root
+    sound_dir = paths.workspace_sounds_root
 
     # Only current project sound files and manifests affect Forge. The reusable
     # archive can be large and does not need to invalidate the current letter.
     candidates: list[Path] = []
-    for name in ("music.mp3", "current.json", "playlist.json", "manifest.json"):
+    for name in (MUSIC_FILE_NAME, "current.json", "playlist.json", "manifest.json"):
         candidate = sound_dir / name
         if candidate.is_file():
             candidates.append(candidate)
 
-    archive = sound_dir / "appssong"
-    for name in ("current.json", "playlist.json"):
-        candidate = archive / name
+    current_manifest = paths.current_sound_manifest_file
+    for candidate in (current_manifest, current_manifest.with_name("playlist.json")):
         if candidate.is_file():
             candidates.append(candidate)
 
@@ -104,8 +109,9 @@ def sound_fingerprint(project_root: str | Path) -> str:
 
 
 def settings_fingerprint(project_root: str | Path) -> str:
-    root = Path(project_root).resolve()
-    path = application_paths(root).settings_file
+    paths = application_paths(project_root)
+    root = paths.workspace_root
+    path = paths.settings_file
     if not path.is_file():
         return _paths_digest(root, (path,))
 

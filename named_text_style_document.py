@@ -521,6 +521,64 @@ class NamedTextStyleDocument:
         # Loading is verbatim: it does not run Normal-text font propagation.
         self._load_definitions(style_set)
 
+    def page_style_set(self) -> NamedStyleSet:
+        """Include the actual body formatting of manually styled pages."""
+        block = self.editor.document().begin()
+        while block.isValid():
+            if _style_key(block) in (None, "normal_text") and block.text().strip():
+                fragments = self._text_fragments(block)
+                if fragments:
+                    _, _, fmt = fragments[0]
+                    definition = self._definition_from_format(fmt)
+                    if not fmt.hasProperty(QTextFormat.ForegroundBrush):
+                        definition = replace(definition, font_color=self.active_set.get("normal_text").font_color)
+                    return NamedStyleSet({
+                        **self.active_set.definitions,
+                        "normal_text": replace(definition, paragraph=_paragraph_definition(block)),
+                    })
+            block = block.next()
+        return self.active_set
+
+    def apply_page_style_set(self, style_set: NamedStyleSet) -> None:
+        """Copy typography and spacing while keeping list structure and links."""
+        font_bits = _BITS["font_family"] | _BITS["font_size"] | _BITS["font_color"]
+
+        def change(_work: QTextCursor) -> None:
+            self._write_root_set(style_set)
+            self.active_set = style_set
+            block = self.editor.document().begin()
+            while block.isValid():
+                key = _style_key(block) or "normal_text"
+                definition = style_set.get(key)
+                self._set_block_style(block, key)
+                paragraph = definition.paragraph or style_set.get("normal_text").paragraph
+                if paragraph is not None:
+                    self._format_paragraph(block, replace(
+                        _paragraph_definition(block),
+                        line_height=paragraph.line_height, line_height_type=paragraph.line_height_type,
+                        top_margin=paragraph.top_margin, bottom_margin=paragraph.bottom_margin,
+                        left_margin=paragraph.left_margin, right_margin=paragraph.right_margin,
+                        text_indent=paragraph.text_indent,
+                    ))
+
+                def apply_fonts(fmt):
+                    preserve = _ALL_BITS & ~font_bits
+                    if fmt.isAnchor():
+                        preserve |= _BITS["font_color"]
+                    overrides = self._remove_redundant_bits(fmt, definition, preserve)
+                    _apply_definition(fmt, definition, skip_bits=preserve)
+                    _set_override_bits(fmt, overrides)
+                    return fmt
+
+                for start, end, fmt in self._text_fragments(block):
+                    self._replace_span(start, end, apply_fonts(fmt), self.editor.document())
+                cursor = QTextCursor(block)
+                cursor.setBlockCharFormat(apply_fonts(cursor.blockCharFormat()))
+                block = block.next()
+
+        self._run_edit(change)
+        self.sync_empty_insertion_format()
+
     def _load_definitions(
         self,
         style_set: NamedStyleSet,

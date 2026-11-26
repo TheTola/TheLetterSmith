@@ -15,18 +15,21 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from config import MUSIC_FILE, USER_SOUNDS_DIR
-from project_paths import application_paths
+from project_paths import (
+    AUDIO_ANALYSIS_DIR_NAME as ANALYSIS_DIR_NAME,
+    AUDIO_CURRENT_MANIFEST_NAME as CURRENT_MANIFEST_NAME,
+    AUDIO_LIBRARY_FILE_NAME as LIBRARY_FILE_NAME,
+    AUDIO_ORIGINALS_DIR_NAME as ORIGINALS_DIR_NAME,
+    AUDIO_PROCESSED_DIR_NAME as PROCESSED_DIR_NAME,
+    AUDIO_PROJECT_STATE_NAME as PROJECT_SOUND_FILE_NAME,
+    WORKSPACE_SOUND_STATE_DIR,
+    application_paths,
+)
 from protected_projects import STOCK_PROJECT_KIND, protected_project_kind
 from transactional_io import file_change_token, set_path_hidden
 
 SOUND_MODEL_VERSION = 2
-ARCHIVE_DIR_NAME = "appssong"
-ORIGINALS_DIR_NAME = "originals"
-PROCESSED_DIR_NAME = "processed"
-ANALYSIS_DIR_NAME = "analysis"
-LIBRARY_FILE_NAME = "library.json"
-PROJECT_SOUND_FILE_NAME = "project_sound.json"
-CURRENT_MANIFEST_NAME = "current.json"
+ARCHIVE_DIR_NAME = WORKSPACE_SOUND_STATE_DIR.name
 BUILD_SOUND_MANIFEST_NAME = "lettersmith-sound.json"
 ATOMIC_REPLACE_TIMEOUT_SECONDS = 2.0
 MAX_INVALID_BACKUPS = 8
@@ -57,7 +60,7 @@ def utc_now_text() -> str:
 
 
 def user_sounds_dir(project_root: str | Path) -> Path:
-    return Path(project_root).resolve() / USER_SOUNDS_DIR
+    return application_paths(project_root).workspace_sounds_root
 
 
 def archive_root(project_root: str | Path) -> Path:
@@ -88,7 +91,7 @@ def analysis_cache_path(
 
 
 def library_path(project_root: str | Path) -> Path:
-    path = archive_root(project_root) / LIBRARY_FILE_NAME
+    path = application_paths(project_root).music_library_file
     set_path_hidden(path)
     return path
 
@@ -110,10 +113,7 @@ def current_music_path(project_root: str | Path) -> Path:
 
 
 def ensure_sound_dirs(project_root: str | Path) -> None:
-    user_sounds_dir(project_root).mkdir(parents=True, exist_ok=True)
-    originals_dir(project_root).mkdir(parents=True, exist_ok=True)
-    processed_dir(project_root).mkdir(parents=True, exist_ok=True)
-    analysis_dir(project_root).mkdir(parents=True, exist_ok=True)
+    application_paths(project_root).ensure_sound_dirs()
 
 
 def atomic_write_json(path: str | Path, payload: dict) -> None:
@@ -249,6 +249,14 @@ def display_title_from_name(name: str) -> str:
     return title or "Untitled Track"
 
 
+def normalize_track_tags(values: Iterable[str]) -> list[str]:
+    tags = {}
+    for value in values:
+        if isinstance(value, str) and (tag := " ".join(value.split())):
+            tags.setdefault(tag.casefold(), tag)
+    return list(tags.values())
+
+
 @dataclass
 class TrackRecord:
     track_id: str
@@ -261,9 +269,12 @@ class TrackRecord:
     added_at: str = field(default_factory=utc_now_text)
     source_kind: str = "user"
     resource_file: str = ""
+    favorite: bool = False
+    tags: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, payload: dict) -> "TrackRecord":
+        tags = payload.get("tags")
         return cls(
             track_id=str(payload.get("track_id", "")).strip(),
             content_hash=str(payload.get("content_hash", "")).strip(),
@@ -279,6 +290,8 @@ class TrackRecord:
                 else "user"
             ),
             resource_file=str(payload.get("resource_file", "")).strip(),
+            favorite=payload.get("favorite") is True,
+            tags=normalize_track_tags(tags) if isinstance(tags, list) else [],
         )
 
     def to_dict(self) -> dict:
@@ -319,7 +332,6 @@ class ProjectSoundState:
         if valid_ids is not None and self.selected_track_id not in valid_ids:
             self.selected_track_id = ""
         if self.mode == "single":
-            self.playlist = []
             self.selected_track_id = self.single_track_id
         elif self.selected_track_id not in self.playlist:
             self.selected_track_id = self.playlist[0] if self.playlist else ""
@@ -359,6 +371,13 @@ class ProjectSoundState:
         if self.mode == "playlist":
             return list(self.playlist)
         return [self.single_track_id] if self.single_track_id else []
+
+    def referenced_track_ids(self) -> list[str]:
+        """Include the retained playlist when collecting the editor's audio assets."""
+        active = self.ordered_track_ids()
+        if self.mode == "playlist":
+            return active
+        return active + [track_id for track_id in dict.fromkeys(self.playlist) if track_id not in active]
 
     def is_using(self, track_id: str) -> bool:
         return track_id == self.single_track_id or track_id in self.playlist
@@ -551,10 +570,15 @@ def load_library(project_root: str | Path) -> dict[str, TrackRecord]:
             records[record.track_id] = record
         else:
             repaired = True
+    stock_records = _load_stock_records(project_root)
+    stock_favorites = payload.get("stock_favorites", [])
+    if isinstance(stock_favorites, list):
+        for track_id in stock_favorites:
+            if isinstance(track_id, str) and track_id in stock_records:
+                stock_records[track_id].favorite = True
     if repaired and path.is_file():
         _backup_invalid_json(path)
-        save_library(project_root, records)
-    stock_records = _load_stock_records(project_root)
+        save_library(project_root, {**records, **stock_records})
     stock_hashes = {
         record.content_hash
         for record in stock_records.values()
@@ -587,6 +611,10 @@ def save_library(project_root: str | Path, records: dict[str, TrackRecord]) -> N
                 key: record.to_dict()
                 for key, record in sorted(user_records.items())
             },
+            "stock_favorites": sorted(
+                key for key, record in records.items()
+                if record.source_kind == "stock" and key not in user_records and record.favorite
+            ),
         },
     )
 
@@ -787,14 +815,10 @@ def sync_current_compatibility(
         music.unlink(missing_ok=True)
         manifest.unlink(missing_ok=True)
         return changed
-    current_rel = (
-        f"{USER_SOUNDS_DIR}/{MUSIC_FILE}"
-        if record.source_kind == "stock"
-        else (
-            f"{USER_SOUNDS_DIR}/{ARCHIVE_DIR_NAME}/"
-            f"{PROCESSED_DIR_NAME}/{record.processed_file}"
-        )
-    )
+    workspace = application_paths(project_root).workspace_root
+    current_rel = f"{USER_SOUNDS_DIR}/{MUSIC_FILE}"
+    if record.source_kind != "stock" and source.is_relative_to(workspace):
+        current_rel = source.relative_to(workspace).as_posix()
     source_stat = source.stat()
     existing = read_json(manifest, {})
     try:

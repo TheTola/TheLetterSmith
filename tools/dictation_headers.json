@@ -1,0 +1,16 @@
+{
+  "revision": "d1be6fde11ac6e0407606b4e42fe72d34add8037",
+  "files": {
+    "whisper.h": "a7d19f7feb5be52426628ff07e0602de28a30dc4312d0d0603e1e536753f76dd",
+    "ggml.h": "12ee71f99db7db9b353bc02b1fbb57c344ee17c01ac5fb7952b41a637a747ea9",
+    "ggml-cpu.h": "316279e004cdeb8e6ef78599acb602bf79a8abdf897fed9fd1914808c1518c6e",
+    "ggml-backend.h": "5791edae1fb7622027621d15bc7a160198bd3b75ed8f96d06cb7b85e2b873756",
+    "ggml-alloc.h": "d114067f9099c4a0e2bbc0625c676d4894d9cf0ea27168ee072c7de0e71bb51d"
+  },
+  "licenses": {
+    "LICENSE-whisper.txt": {
+      "path": "LICENSE",
+      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+    }
+  }
+}

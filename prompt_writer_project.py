@@ -4,9 +4,45 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+import json
 import re
 
 from project_model import PAGE_TYPES, ProjectModel
+from transactional_io import safe_write_json
+
+
+STYLE_FIELDS = ('subject', 'type', 'color')
+
+
+def load_style_presets(path):
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(payload, dict) or payload.get('version') != 1 or not isinstance(payload.get('presets'), dict):
+        raise ValueError('The style preset library is invalid.')
+    presets = payload['presets']
+    names = set()
+    for name, style in presets.items():
+        if (not name.strip() or name.casefold() in names or not isinstance(style, dict)
+                or set(style) != set(STYLE_FIELDS) or not all(isinstance(value, str) for value in style.values())):
+            raise ValueError('The style preset library contains an invalid preset.')
+        names.add(name.casefold())
+    return presets
+
+
+def save_style_preset(path, name, style):
+    name = name.strip()
+    if not name:
+        raise ValueError('Enter a name for the style preset.')
+    choices = {key: style.get(key, '') for key in STYLE_FIELDS}
+    if not all(isinstance(value, str) for value in choices.values()):
+        raise ValueError('Choose text values for the preset’s subject, style, and palette.')
+    presets = load_style_presets(path)
+    if any(existing.casefold() == name.casefold() for existing in presets):
+        raise ValueError('A style preset with that name already exists.')
+    presets[name] = choices
+    safe_write_json(path, {'version': 1, 'presets': presets})
 
 
 def page_label(project, page_id):
@@ -99,7 +135,8 @@ def resolve_page_prompt(project, page_id, factory, guidance_phrases):
     resolved = project.resolve_prompt_components(factory)
     generated, components = compose_page(project, page_id, resolved, guidance_phrases)
     text = generated if prompt['text'] is None or previous is None else merge_live_prompt(previous, prompt['text'], generated)
-    project.update_prompt(page_id, {'text': text, 'resolved_components': components, 'stale': False})
+    project.update_prompt(page_id, {'text': text, 'resolved_components': components, 'stale': False},
+                          history_group='generated')
     return text
 
 

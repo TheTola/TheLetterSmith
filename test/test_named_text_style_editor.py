@@ -104,7 +104,8 @@ class NamedTextStyleEditorTests(unittest.TestCase):
         self.assertEqual(actions[8].text(), "Options")
         self.assertEqual(
             [item.text() for item in actions[8].menu().actions()],
-            [f"Save current style set to Style {i}" for i in (1, 2, 3)],
+            [f"Save current style set to Style {i}…" for i in (1, 2, 3)]
+            + [""] + [f"Rename Style {i}…" for i in (1, 2, 3)],
         )
         self.assertIsNot(editor.btn_named_style, editor.font_combo)
         editor._refresh_named_style_menu()
